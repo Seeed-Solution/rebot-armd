@@ -197,6 +197,7 @@ pub struct PublishedConfig {
     #[cfg(feature = "policy-runtime")]
     pub policy_ledger_path: Option<PathBuf>,
     pub fallback_measured_positions: Vec<f32>,
+    pub cell: Option<Arc<crate::cell::CellContext>>,
 }
 
 impl PublishedConfig {
@@ -279,6 +280,7 @@ impl PublishedConfig {
             #[cfg(feature = "policy-runtime")]
             policy_ledger_path: inner.policy_ledger_path.clone(),
             fallback_measured_positions: inner.measured_positions.clone(),
+            cell: inner.cell.clone(),
         }
     }
 
@@ -550,6 +552,7 @@ impl PublishedConfig {
         if let Some(t) = caps.teach.as_mut() {
             t.episodes = self.episodes.enabled();
         }
+        caps.cell = self.cell.as_ref().map(|c| c.capabilities());
         caps
     }
 

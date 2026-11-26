@@ -232,6 +232,7 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/sandbox/telemetry", post(sandbox::post_telemetry).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/observation", get(rest::get_observation))
         .route("/api/v1/observation/schema", get(rest::get_observation_schema))
+        .route("/api/v1/cell/status", get(rest::get_cell_status))
         .route("/api/v1/torque", post(rest::set_torque))
         .route("/api/v1/arm", post(rest::set_torque))
         .route("/api/v1/heartbeat", post(rest::heartbeat))
@@ -389,6 +390,7 @@ async fn gate_executor_owner(
                             path,
                             "/api/v1/observation"
                                 | "/api/v1/observation/schema"
+                                | "/api/v1/cell/status"
                                 | "/api/v1/auth/status"
                                 | "/api/v1/diagnostics"
                                 | "/api/v1/diagnostics/tick"

@@ -17,6 +17,8 @@ struct CliArgs {
     owner: Option<String>,
     port: Option<u16>,
     config: Option<String>,
+    cell: Option<String>,
+    cell_host: Option<String>,
     tool: Option<String>,
     tool_info: Option<String>,
     robot: Option<String>,
@@ -46,6 +48,8 @@ where
                 --follower-port <PORT>       CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
                 --owner <OWNER>              control-loop owner: legacy (default) or executor (explicit opt-in for rebot-dm and mock; or ARMD_RT_OWNER)\n\
                 --config <JSON>              ArmConfig profile (must match follower joint count)\n\
+                --cell <JSON>                Multi-arm cell topology file (rebot-cell/v1; or ARMD_CELL; off by default)\n\
+                --cell-host <ID>             Local host ID inside --cell hosts map (or ARMD_CELL_HOST; default auto-identify)\n\
                 --tool <JSON>                Tool pack manifest (tool.json; or ARMD_TOOL)\n\
                 --tool-info <JSON>           Validate tool.json and print single-line summary JSON to stdout\n\
                 --robot <ID>                 Target robot profile for --tool-info (b601dm, so101, so100, b601rs)\n\
@@ -76,6 +80,8 @@ where
                 | "--owner"
                 | "--port"
                 | "--config"
+                | "--cell"
+                | "--cell-host"
                 | "--tool"
                 | "--tool-info"
                 | "--robot"
@@ -101,6 +107,18 @@ where
                 cli.owner = Some(value);
             }
             "--config" => cli.config = Some(value),
+            "--cell" => {
+                if value.trim().is_empty() {
+                    return Err("--cell must not be empty".into());
+                }
+                cli.cell = Some(value);
+            }
+            "--cell-host" => {
+                if value.trim().is_empty() {
+                    return Err("--cell-host must not be empty".into());
+                }
+                cli.cell_host = Some(value);
+            }
             "--tool" => {
                 if value.is_empty() {
                     return Err("--tool must not be empty".into());
@@ -225,19 +243,27 @@ fn resolve_serial_port(requested: Option<&str>) -> String {
     "/dev/ttySC0".to_string()
 }
 
+#[cfg(test)]
 fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<ArmConfig, String> {
+    resolve_follower_config_with_path(follower, config_path).map(|(cfg, _)| cfg)
+}
+
+fn resolve_follower_config_with_path(
+    follower: &str,
+    config_path: Option<&str>,
+) -> Result<(ArmConfig, Option<std::path::PathBuf>), String> {
     let expected_dof = match follower {
         "rebot-dm" => Some(7),
         "rebot-rs" | "so-arm101" | "so-arm100" | "fashionstar" | "star-arm102" => Some(6),
         "sim" | "mock" => None,
         other => return Err(format!("Unknown follower model: {other}")),
     };
-    let mut config = if let Some(path) = config_path {
+    let (mut config, loaded_profile_path) = if let Some(path) = config_path {
         let config = ArmConfig::from_profile_file(path)?;
         if config.kinematics.is_none() || config.workspace.is_none() {
             tracing::warn!("Profile {path} has no kinematics/workspace: the Cartesian workspace check and Cartesian actions are off");
         }
-        config
+        (config, Some(std::path::PathBuf::from(path)))
     } else if follower == "rebot-rs" {
         return Err(
             "Follower 'rebot-rs' requires --config <path> (e.g. profiles/rebot_b601_rs.json); refusing to fall back to unconfigured defaults"
@@ -258,11 +284,11 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
         let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
             .unwrap_or(&candidates[1]);
         tracing::info!("Loaded profile for {follower} from {path}");
-        ArmConfig::from_profile_file(path)?
+        (ArmConfig::from_profile_file(path)?, Some(std::path::PathBuf::from(path)))
     } else if follower == "rebot-dm" || follower == "sim" {
-        ArmConfig::rebot_dm()
+        (ArmConfig::rebot_dm(), None)
     } else {
-        ArmConfig::default()
+        (ArmConfig::default(), None)
     };
     config.validate()?;
     if expected_dof.is_some_and(|dof| config.dof != dof) {
@@ -273,7 +299,7 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
         ));
     }
     config.validate_step1_driver_parity(follower)?;
-    Ok(config)
+    Ok((config, loaded_profile_path))
 }
 
 fn apply_cli_tool(config: ArmConfig, cli_tool: Option<&str>) -> Result<ArmConfig, String> {
@@ -310,6 +336,107 @@ fn run_tool_info(path: &str, robot: Option<&str>) -> Result<String, String> {
     let pack = armd::tool::load_tool_file(path)?;
     let summary = armd::tool::resolve_tool_config_summary(&pack, robot)?;
     serde_json::to_string(&summary).map_err(|e| format!("serialize tool info: {e}"))
+}
+
+fn resolve_cell_context(
+    cli: &CliArgs,
+    config: &ArmConfig,
+    loaded_profile_path: Option<&std::path::Path>,
+    follower: &str,
+    port: u16,
+) -> Result<Option<Arc<armd::cell::CellContext>>, String> {
+    let env_cell = std::env::var("ARMD_CELL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let env_cell_host = std::env::var("ARMD_CELL_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    resolve_cell_context_with_env(
+        cli,
+        config,
+        loaded_profile_path,
+        follower,
+        port,
+        env_cell.as_deref(),
+        env_cell_host.as_deref(),
+    )
+}
+
+fn resolve_cell_context_with_env(
+    cli: &CliArgs,
+    config: &ArmConfig,
+    loaded_profile_path: Option<&std::path::Path>,
+    follower: &str,
+    port: u16,
+    env_cell: Option<&str>,
+    env_cell_host: Option<&str>,
+) -> Result<Option<Arc<armd::cell::CellContext>>, String> {
+    let cell_host = cli
+        .cell_host
+        .as_deref()
+        .or(env_cell_host)
+        .or(config.cell_host.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let cell_path = if let Some(p) = cli.cell.as_deref() {
+        Some(std::path::PathBuf::from(p))
+    } else if let Some(p) = env_cell {
+        Some(std::path::PathBuf::from(p))
+    } else if let Some(p) = config.cell.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let candidate = std::path::Path::new(p);
+        if candidate.is_absolute() {
+            Some(candidate.to_path_buf())
+        } else if let Some(dir) = loaded_profile_path.and_then(std::path::Path::parent).filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir.join(candidate))
+        } else {
+            Some(candidate.to_path_buf())
+        }
+    } else {
+        None
+    };
+
+    let Some(path) = cell_path else {
+        if cell_host.is_some() {
+            return Err(
+                "--cell-host / ARMD_CELL_HOST / profile cell_host requires a cell config (--cell, ARMD_CELL, or profile 'cell')"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
+
+    let cell_cfg = armd::cell::CellConfig::from_json_file(&path)?;
+    let resolved_hw_device = match follower {
+        "rebot-rs" | "rebot-dm" => Some(cli.follower_port.as_deref().unwrap_or("can0").to_string()),
+        "so-arm101" | "so-arm100" => Some(resolve_serial_port(cli.follower_port.as_deref())),
+        "fashionstar" | "star-arm102" => {
+            Some(cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0").to_string())
+        }
+        "mock" | "sim" => None,
+        _ => None,
+    };
+    let local_port = (port != 0).then_some(port);
+    let ctx = armd::cell::CellContext::resolve_local(
+        cell_cfg,
+        cell_host,
+        local_port,
+        config,
+        resolved_hw_device.as_deref(),
+    )?;
+    info!(
+        "Loaded cell '{}' from {} (host={}, role={}, arm={:?}, coordinator={}, digest={})",
+        ctx.config.cell_id,
+        path.display(),
+        ctx.local_host_id,
+        ctx.local_role(),
+        ctx.local_arm_id,
+        ctx.config.coordinator,
+        ctx.config_digest
+    );
+    Ok(Some(Arc::new(ctx)))
 }
 
 /// The system allocator, timed on the control thread with `ARMD_ALLOC_TIMING=1`
@@ -732,7 +859,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_rt_owner.as_deref(),
     )?;
     armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
-    let config = resolve_follower_config(follower, cli.config.as_deref())?;
+    let (config, loaded_profile_path) =
+        resolve_follower_config_with_path(follower, cli.config.as_deref())?;
     let mut config = apply_cli_tool(config, cli.tool.as_deref())?;
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -756,6 +884,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(_) => 8765,
         },
     };
+    // Validate optional multi-arm cell config before binding ports or mounting hardware.
+    let cell_context = resolve_cell_context(&cli, &config, loaded_profile_path.as_deref(), follower, port)?;
     // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
     let bind_ip: std::net::IpAddr = match std::env::var("ARMD_BIND_HOST") {
         Ok(s) if !s.trim().is_empty() => s
@@ -783,6 +913,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before the control loop: frees retired observations, feeds telemetry and recordings
     supervisor.start_dispatcher()?;
     supervisor.set_follower(follower).await;
+    if let Some(cell_ctx) = cell_context {
+        supervisor.set_cell(Some(cell_ctx)).await?;
+    }
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
     let episodes = armd::recording::EpisodeStore::resolve(cli.episodes_dir.as_deref());
     match episodes.dir() {
@@ -1758,5 +1891,38 @@ mod shutdown_tests {
         .err()
         .expect("mock executor startup failure must fail fast");
         assert!(mock_err.contains("Failed to start RT executor"), "{mock_err}");
+    }
+
+    #[test]
+    fn cli_cell_args_parse_and_resolve_precedence() {
+        let cli = parse_cli_args_from(["--cell", "cell.json", "--cell-host", "recamera_left"]).unwrap();
+        assert_eq!(cli.cell.as_deref(), Some("cell.json"));
+        assert_eq!(cli.cell_host.as_deref(), Some("recamera_left"));
+
+        assert!(parse_cli_args_from(["--cell"]).is_err());
+        assert!(parse_cli_args_from(["--cell", "   "]).is_err());
+        assert!(parse_cli_args_from(["--cell-host"]).is_err());
+        assert!(parse_cli_args_from(["--cell-host", "  "]).is_err());
+
+        // Without any cell config, returns Ok(None) (zero overhead default).
+        let cfg = ArmConfig::rebot_dm();
+        assert!(resolve_cell_context_with_env(&CliArgs::default(), &cfg, None, "mock", 8765, None, None)
+            .unwrap()
+            .is_none());
+
+        // Orphan cell_host without cell path fails closed.
+        assert!(resolve_cell_context_with_env(
+            &CliArgs {
+                cell_host: Some("recamera_left".into()),
+                ..Default::default()
+            },
+            &cfg,
+            None,
+            "mock",
+            8765,
+            None,
+            None
+        )
+        .is_err());
     }
 }

@@ -926,6 +926,8 @@ pub(crate) enum RtRestingCheck {
 
 pub struct SupervisorInner {
     pub config: ArmConfig,
+    /// Optional startup-resolved multi-arm cell context (off by default, never touched on RT).
+    pub(crate) cell: Option<Arc<crate::cell::CellContext>>,
     pub safety: SafetyManager,
     pub held: Option<HeldObject>,
     /// Preallocated reusable `HeldObject::label` buffer on RT (0 alloc / 0 free).
@@ -2484,6 +2486,7 @@ impl SupervisorInner {
             lease_generation_counter: 0,
             boot_id: crate::rt_core::broker::BootId::process(),
             schema_revision: 0,
+            cell: None,
             gripper_stalled: false,
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
@@ -4022,6 +4025,7 @@ impl SupervisorInner {
         }
         schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
         if let Some(t) = schema.capabilities.teach.as_mut() { t.episodes = self.episodes.enabled(); }
+        schema.capabilities.cell = self.cell.as_ref().map(|c| c.capabilities());
         schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
         schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(self.zero_convention).ok());
         schema
@@ -12553,6 +12557,9 @@ pub struct ArmSupervisor {
     detached_torque_pending_atomic: Arc<AtomicBool>,
     /// Shared counter of forbidden `DriverLock` attempts on `armd-control`.
     driver_lock_attempts: Arc<AtomicU64>,
+    /// Startup-resolved multi-arm cell context mirrored off the supervisor lock for read-only
+    /// `GET /api/v1/cell/status` without touching RT or control-loop locks (off by default).
+    cell: std::sync::RwLock<Option<Arc<crate::cell::CellContext>>>,
     /// Process-wide / supervisor-wide lock-free internal-fault lane (DRV-F1 / FU-PANIC).
     internal_fault_lane: Arc<crate::panic_coord::InternalFaultLane>,
     /// Shared SAFE-HOLD control block for the legacy control loop.
@@ -13200,6 +13207,7 @@ impl ArmSupervisor {
             headless_detached_drain_active: Arc::new(AtomicBool::new(false)),
             detached_torque_pending_atomic,
             driver_lock_attempts,
+            cell: std::sync::RwLock::new(None),
             internal_fault_lane,
             legacy_safe_hold: Arc::clone(&legacy_safe_hold),
             active_writer: std::sync::Mutex::new(WriterEndpoint::Legacy {
@@ -15499,6 +15507,36 @@ impl ArmSupervisor {
         let mut inner = self.inner.write().await;
         if self.check_legacy_under_guard(&inner).is_ok() {
             inner.follower = Some(name.to_string());
+        }
+    }
+
+    /// Attaches (or clears) the startup-resolved multi-arm cell context before control-loop
+    /// ownership transfers to the RT executor.
+    pub async fn set_cell(
+        &self,
+        cell: Option<Arc<crate::cell::CellContext>>,
+    ) -> Result<(), ArmError> {
+        let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
+        inner.cell = cell.clone();
+        inner.refresh_schema_cache();
+        *self.cell.write().unwrap_or_else(|e| e.into_inner()) = cell;
+        let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
+        let gen = self.inner.generation();
+        self.published_config.publish(snap, gen);
+        Ok(())
+    }
+
+    /// Returns the active startup-resolved cell context, or `None` in single-arm mode.
+    pub fn cell_context(&self) -> Option<Arc<crate::cell::CellContext>> {
+        self.cell.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Read-only status snapshot for `GET /api/v1/cell/status` (off-RT, zero supervisor lock).
+    pub fn cell_status(&self) -> crate::cell::CellStatusResponse {
+        match self.cell_context() {
+            Some(ctx) => ctx.status_response(),
+            None => crate::cell::CellStatusResponse::disabled(),
         }
     }
 
