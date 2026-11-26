@@ -1261,6 +1261,81 @@ async fn dual_owner_zero_check_timeout_and_torque_cap_speed_limit_parity() {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Obstructed seek: current contract (legacy parity) accepts the obstruction stall as zero
+// ---------------------------------------------------------------------------
+
+/// Pins the 1.6.1 contract: an obstruction that stalls the seek before the jaw stop ends the
+/// check as `done` with the obstruction position as `stop_rad` / `offset_rad` (here inside
+/// `threshold_rad`, so `pass=true`). Both owners must agree.
+/// See the `FOLLOW-UP:` note at the completion site in `SupervisorInner::finish_action`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_owner_zero_check_obstructed_seek_stall_accepted_parity() {
+    // Obstruction 0.08 rad before the jaw stop: inside `threshold_rad`, so it also passes.
+    const OBSTRUCTION_Q: f32 = -0.08;
+    let mut results: Vec<(RtOwner, Value)> = Vec::new();
+    for owner in [RtOwner::Legacy, RtOwner::Executor] {
+        let drv = ZeroCheckDriver::new(-0.30);
+        drv.state.lock().unwrap().stall_stop_q = Some(OBSTRUCTION_Q);
+        let drv_clone = drv.clone();
+        let rig = DualRig::start(
+            owner,
+            OperatorAuth::disabled(),
+            |_| {},
+            move |inner| {
+                inner.measured_positions[6] = -0.30;
+                inner.commanded_positions[6] = -0.30;
+                inner.target_positions[6] = -0.30;
+                inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(drv_clone)));
+            },
+            PersistTestHooks::default(),
+        )
+        .await;
+
+        let mut ws = connect_ws(rig.addr, None).await;
+        let gen = acquire_lease(&mut ws, "c-obstruct", false).await;
+        let epoch = rig.sup.get_observation().await.epoch_id;
+        let ack_t = send_cmd(&mut ws, gen, epoch, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(ack_t["type"], "command_ack", "{owner:?}: {ack_t}");
+        let epoch = rig.sup.get_observation().await.epoch_id;
+
+        let (_, term, _) = run_cmd_to_terminal(
+            &mut ws,
+            gen,
+            epoch,
+            "/api/v1/action/gripper_zero_check",
+            json!({"threshold_rad": 0.10, "store_offset": false}),
+            Duration::from_secs(8),
+        )
+        .await;
+        // Current contract: the obstruction stall is accepted (not CALIBRATION_OBSTRUCTED).
+        assert_eq!(term["state"], "done", "{owner:?}: {term}");
+        assert!(term["code"].is_null(), "{owner:?}: {term}");
+        assert!(
+            (term["stop_rad"].as_f64().unwrap() - f64::from(OBSTRUCTION_Q)).abs() < 0.03,
+            "{owner:?}: stop_rad must be the obstruction position: {term}"
+        );
+        assert!(
+            (term["offset_rad"].as_f64().unwrap() - f64::from(OBSTRUCTION_Q)).abs() < 0.03,
+            "{owner:?}: {term}"
+        );
+        assert_eq!(term["pass"], json!(true), "{owner:?}: {term}");
+        rig.wait_zero_check_ctx_empty("obstructed_seek").await;
+        rig.assert_zero_rt_allocs("obstructed_seek");
+        rig.shutdown().await;
+        results.push((owner, term));
+    }
+    let (_, legacy) = &results[0];
+    let (_, exec) = &results[1];
+    for key in ["state", "code", "pass"] {
+        assert_eq!(legacy[key], exec[key], "{key}: legacy {legacy} vs executor {exec}");
+    }
+    for key in ["stop_rad", "offset_rad"] {
+        let (l, e) = (legacy[key].as_f64().unwrap(), exec[key].as_f64().unwrap());
+        assert!((l - e).abs() < 0.01, "{key}: legacy {l} vs executor {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 7. Executor cancellation: Stop, Lease Loss, and E-Stop + session slot reuse
 // ---------------------------------------------------------------------------
 

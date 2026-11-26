@@ -717,6 +717,12 @@ impl SupervisorInner {
                 let sess_id = params.session_id;
                 let mut handed_off_stream = false;
                 if state == "done" {
+                    // FOLLOW-UP: open contract question (kept for 1.6.1 parity with legacy on both
+                    // owners): a stall against an obstruction ends the seek as `done` and the stall
+                    // position is taken as the mechanical zero (`stop_rad`, `offset_rad`, and with
+                    // `store_offset` the stored offset). Should an obstructed seek be told apart
+                    // from the jaw stop (e.g. `CALIBRATION_OBSTRUCTED`) instead of being accepted?
+                    // Pinned by `dual_owner_zero_check_obstructed_seek_stall_accepted_parity`.
                     let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
                     let offset_rad = stop_rad - params.base_closed_rad;
                     let pass = offset_rad.abs() <= params.threshold_rad;
