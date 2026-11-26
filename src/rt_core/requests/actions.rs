@@ -4020,7 +4020,7 @@ fn install_gripper_zero_check_rt(
     )?
     .with_ceiling_torque_estimate(ceiling_est);
     let duration = motion.expected_duration();
-    let motion_timeout_s = motion.timeout_s;
+    let motion_timeout_s = motion.hard_timeout_s();
     let target_g = motion.target;
     let wire_vel_ceiling = motion.wire_velocity_ceiling();
 

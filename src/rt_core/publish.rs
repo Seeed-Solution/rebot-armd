@@ -783,6 +783,8 @@ fn copy_into<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
 pub struct ObservationSpares {
     pub action_msg: String,
     pub prev_action_msg: String,
+    pub action_durability_warning: String,
+    pub prev_action_durability_warning: String,
     #[cfg(feature = "policy-runtime")]
     pub policy_obs: Option<crate::model::PolicyObservation>,
     #[cfg(feature = "policy-runtime")]
@@ -794,6 +796,8 @@ impl ObservationSpares {
         Self {
             action_msg: String::with_capacity(256),
             prev_action_msg: String::with_capacity(256),
+            action_durability_warning: String::with_capacity(256),
+            prev_action_durability_warning: String::with_capacity(256),
             #[cfg(feature = "policy-runtime")]
             policy_obs: Some(crate::model::PolicyObservation::preallocated_rt()),
             #[cfg(feature = "policy-runtime")]
@@ -1086,6 +1090,18 @@ impl StatePublisher {
         }
         if spares.prev_action_msg.capacity() > slot.spares.prev_action_msg.capacity() {
             slot.spares.prev_action_msg = std::mem::take(&mut spares.prev_action_msg);
+        }
+        if spares.action_durability_warning.capacity()
+            > slot.spares.action_durability_warning.capacity()
+        {
+            slot.spares.action_durability_warning =
+                std::mem::take(&mut spares.action_durability_warning);
+        }
+        if spares.prev_action_durability_warning.capacity()
+            > slot.spares.prev_action_durability_warning.capacity()
+        {
+            slot.spares.prev_action_durability_warning =
+                std::mem::take(&mut spares.prev_action_durability_warning);
         }
         #[cfg(feature = "policy-runtime")]
         {

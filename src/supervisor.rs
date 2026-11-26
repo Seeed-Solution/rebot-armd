@@ -1669,32 +1669,53 @@ pub(crate) struct J7PosForceGate {
 fn sync_action_obs(
     dst: &mut Option<ActionStatus>,
     src: Option<&ActionStatus>,
-    spare: Option<&mut String>,
+    spare: Option<(&mut String, &mut String)>,
 ) {
+    let swap_opt_str = |src_present: bool, dst_field: &mut Option<String>, sp: &mut String| {
+        match (src_present, dst_field.is_some()) {
+            (true, false) if sp.capacity() > 0 => {
+                *dst_field = Some(std::mem::take(sp));
+            }
+            (false, true) => {
+                if let Some(old) = dst_field.take() {
+                    if old.capacity() > sp.capacity() {
+                        *sp = old;
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
     match (src, dst.as_mut()) {
         (Some(s), Some(d)) => {
-            if let Some(sp) = spare {
-                match (s.message.is_some(), d.message.is_some()) {
-                    (true, false) if sp.capacity() > 0 => {
-                        d.message = Some(std::mem::take(sp));
-                    }
-                    (false, true) => {
-                        if let Some(old) = d.message.take() {
-                            if old.capacity() > sp.capacity() {
-                                *sp = old;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            if let Some((sp_msg, sp_warn)) = spare {
+                swap_opt_str(s.message.is_some(), &mut d.message, sp_msg);
+                swap_opt_str(
+                    s.durability_warning.is_some(),
+                    &mut d.durability_warning,
+                    sp_warn,
+                );
             }
             d.clone_from(s);
         }
         (Some(s), None) => {
-            if let (Some(src_msg), Some(sp)) = (s.message.as_deref(), spare) {
-                if sp.capacity() >= src_msg.len() {
+            if let Some((sp_msg, sp_warn)) = spare {
+                let msg_fits = s
+                    .message
+                    .as_deref()
+                    .is_none_or(|m| sp_msg.capacity() >= m.len());
+                let warn_fits = s
+                    .durability_warning
+                    .as_deref()
+                    .is_none_or(|w| sp_warn.capacity() >= w.len());
+                if msg_fits && warn_fits && (s.message.is_some() || s.durability_warning.is_some()) {
                     let mut blank = ActionStatus::blank();
-                    blank.message = Some(std::mem::take(sp));
+                    if s.message.is_some() {
+                        blank.message = Some(std::mem::take(sp_msg));
+                    }
+                    if s.durability_warning.is_some() {
+                        blank.durability_warning = Some(std::mem::take(sp_warn));
+                    }
                     blank.clone_from(s);
                     *dst = Some(blank);
                     return;
@@ -1703,10 +1724,15 @@ fn sync_action_obs(
             *dst = Some(s.clone());
         }
         (None, Some(d)) => {
-            if let Some(sp) = spare {
+            if let Some((sp_msg, sp_warn)) = spare {
                 if let Some(old) = d.message.take() {
-                    if old.capacity() > sp.capacity() {
-                        *sp = old;
+                    if old.capacity() > sp_msg.capacity() {
+                        *sp_msg = old;
+                    }
+                }
+                if let Some(old) = d.durability_warning.take() {
+                    if old.capacity() > sp_warn.capacity() {
+                        *sp_warn = old;
                     }
                 }
             }
@@ -4840,6 +4866,13 @@ impl SupervisorInner {
             obs.ensure_rt_safety_text_spare();
             obs.gravity_torques.reserve(arm_dof);
             obs.motor_errors.reserve(dof);
+            if let Some(gz) = obs.gripper_zero.as_mut() {
+                // Pre-size for longest state ("calib_invalid", 13 bytes) so state transitions
+                // ("ok" -> "checked" / "out_of_range" / "calib_invalid") never realloc on RT.
+                if gz.state.capacity() < 16 {
+                    gz.state.reserve(16 - gz.state.len());
+                }
+            }
             obs
         };
         (Box::new(make_one()), make_one(), make_one(), make_one())
@@ -4941,7 +4974,10 @@ impl SupervisorInner {
         out.feedback_valid = self.hardware_feedback_fresh(Duration::from_millis(250));
         out.commanded_positions.clone_from(&self.commanded_positions);
         let (action_spare, prev_action_spare) = match spares.as_mut() {
-            Some(s) => (Some(&mut s.action_msg), Some(&mut s.prev_action_msg)),
+            Some(s) => (
+                Some((&mut s.action_msg, &mut s.action_durability_warning)),
+                Some((&mut s.prev_action_msg, &mut s.prev_action_durability_warning)),
+            ),
             None => (None, None),
         };
         sync_action_obs(&mut out.action, self.last_action.as_ref(), action_spare);
