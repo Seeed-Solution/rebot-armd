@@ -840,8 +840,11 @@ async fn non_control_panic_fences_commands_parks_to_rest_disables_and_latches_na
         let (sup, bus) = make_energized_dm_supervisor(rest_pose, None, true);
         sup.set_lease_enabled(false).await;
         sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        // Run the executor at the profile's real 50 Hz (20 ms) control period rather than a 5 ms
+        // (200 Hz) period whose 3 ms TX budget after DAMIAO_TX_RELEASE_PUBLISH_MARGIN (2 ms)
+        // spuriously expires on a non-RT test thread under host CPU load.
         let handle = sup
-            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(20)))
             .await
             .unwrap();
         wait_until_async(Duration::from_secs(2), "executor running", || {
@@ -854,16 +857,31 @@ async fn non_control_panic_fences_commands_parks_to_rest_disables_and_latches_na
             .trigger_non_control_panic("tokio-worker-exec"));
         assert!(sup.internal_fault_fenced());
 
-        wait_until_async(
-            Duration::from_secs(4),
-            "executor parked, disabled, and latched named fault",
-            || {
-                bus.with(|s| s.push_all_feedback());
-                sup.internal_fault_lane().outcome() == InternalFaultParkOutcome::ParkedAndDisabled
-                    && sup.internal_fault_lane().fault_latched()
-            },
-        )
-        .await;
+        let dl_b = Instant::now() + Duration::from_secs(6);
+        while !(sup.internal_fault_lane().outcome() == InternalFaultParkOutcome::ParkedAndDisabled
+            && sup.internal_fault_lane().fault_latched())
+        {
+            let outcome = sup.internal_fault_lane().outcome();
+            assert_ne!(
+                outcome,
+                InternalFaultParkOutcome::HoldingFallback,
+                "executor non-control panic unexpectedly fell back to HoldingFallback (obs={:?})",
+                handle.observation_async().await
+            );
+            assert!(
+                Instant::now() < dl_b,
+                "timed out waiting for: executor parked, disabled, and latched named fault (outcome={outcome:?}, steps={})",
+                handle.stats().steps.load(Ordering::Relaxed),
+            );
+            // FakeBus already generates immediate feedback on every TX; only seed feedback if the
+            // RX queue is empty so polling does not flood bus.rx or contend on the bus mutex.
+            bus.with(|s| {
+                if s.rx.is_empty() {
+                    s.push_all_feedback();
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let obs = handle.observation_async().await.unwrap();
         assert!(!obs.is_torqued);
         let fault = obs.fault.expect("executor internal fault latched");
