@@ -15035,28 +15035,28 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // after RX (`unsent_mask == 0` and `pf_refresh.is_none()`), confirm immediately without
         // emitting redundant urgent holds so Step 5 sends the release's single normal control
         // batch (with end-of-release watchdog fallback if any motor's normal output is deferred
-        // or absent).
+        // or absent). Do not consume retry windows here so retries preserve `fail_on_error = false`.
         if unsent_mask == 0 && pf_refresh.is_none() {
+            let all_mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
             let (confirmed_mask, all_post_fb, fault) = self.enable_confirm_snapshot(0);
-            let now = self.now();
-            match window.service(now, confirmed_mask, all_post_fb, fault) {
-                Service::Confirmed => return Ok(self.finish_enable_confirmed(window.started)),
-                Service::Fault { .. } => {
-                    let e = self
-                        .check_hardware_status()
-                        .err()
-                        .unwrap_or(ArmDriverError::MotorHardwareFault {
-                            joint: 0,
-                            motor_id: 0,
-                            status: 0xFF,
-                        });
-                    self.enable_failed();
-                    return Err(e);
+            if fault.is_some() || (all_post_fb && (confirmed_mask & all_mask) == all_mask) {
+                let now = self.now();
+                match window.service(now, confirmed_mask, all_post_fb, fault) {
+                    Service::Confirmed => return Ok(self.finish_enable_confirmed(window.started)),
+                    Service::Fault { .. } => {
+                        let e = self
+                            .check_hardware_status()
+                            .err()
+                            .unwrap_or(ArmDriverError::MotorHardwareFault {
+                                joint: 0,
+                                motor_id: 0,
+                                status: 0xFF,
+                            });
+                        self.enable_failed();
+                        return Err(e);
+                    }
+                    Service::Retry { .. } | Service::Wait { .. } => {}
                 }
-                Service::Retry { mask, .. } => {
-                    unsent_mask |= mask;
-                }
-                Service::Wait { .. } => {}
             }
         }
 

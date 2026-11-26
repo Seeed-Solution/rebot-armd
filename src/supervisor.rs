@@ -11671,11 +11671,23 @@ impl SupervisorInner {
             && !output_tx_cap_expired
         {
             let release_cap = self.active_tx_cutoff.map(|c| c.drv_release_cap);
-            if let Some(mut drv) = self.write_driver_for_tick() {
-                if let Some(cap) = release_cap {
-                    drv.set_tx_release_deadline(Some(cap));
+            let use_try = self.rt_executor_owned || self.nonblocking_driver_release;
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
+            if let Some(d) = self.driver.as_mut() {
+                let run_fb = |drv: &mut dyn ArmDriver| {
+                    if let Some(cap) = release_cap {
+                        drv.set_tx_release_deadline(Some(cap));
+                    }
+                    drv.service_release_watchdog_fallback();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    shadow_rt.drain_from_driver(drv);
+                };
+                if use_try {
+                    let _ = d.try_with_mut(run_fb);
+                } else {
+                    let _ = d.with_mut(run_fb);
                 }
-                drv.service_release_watchdog_fallback();
             }
         }
         let action_deadline_refused_at = match tick_output {
