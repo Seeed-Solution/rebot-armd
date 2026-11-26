@@ -5659,13 +5659,17 @@ fn sync_prep_env_from_published(sup: &ArmSupervisor, motion_config_rev: Option<u
         next.poses = pub_cfg.poses.list.clone();
         next.sequences = pub_cfg.sequences.clone();
         next.grasp_setup = pub_cfg.config.grasp.clone();
+        next.camera_calibrated = pub_cfg.camera_calibrated();
+        next.joint_zero_offsets = pub_cfg.joint_zero_offsets.clone();
         next.workspace_revision = pub_cfg.workspace_revision;
+        next.calibration_revision = pub_cfg.calibration_revision;
         next.poses_revision = pub_cfg.poses.revision;
         next.sequences_revision = pub_cfg.sequences.revision;
         next.grasp_setup_revision = pub_cfg.grasp_setup_revision;
         next.gripper_calib_revision = pub_cfg.gripper_calib_revision;
         sup.hub().update_prep_env(Arc::new(next));
     }
+    sup.hub().update_service_identity_from_config(&pub_cfg);
     if let Some(cur_mc) = sup.hub().motion_config() {
         let mut next_mc = (*cur_mc).clone();
         next_mc.config = pub_cfg.config.clone();

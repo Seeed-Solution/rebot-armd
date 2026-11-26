@@ -436,6 +436,7 @@ impl SupervisorInner {
     }
 
     pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
+        self.bump_motion_generation();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let reason = match policy {

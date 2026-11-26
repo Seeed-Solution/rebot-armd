@@ -34,10 +34,10 @@ use config::*;
 mod servo;
 #[allow(unused_imports)]
 use servo::*;
-mod dispatch;
+pub(crate) mod dispatch;
 use dispatch::{
-    AdmissionClass, AuthRequirement, DispatchHandler, FrameKind, LeaseFreeCtx, LeaseRequirement,
-    OwnerDispatchCtx, ReplyPolicy, UrgentEStopCtx, UrgentStopCtx,
+    AdmissionClass, AuthRequirement, DispatchHandler, ExecutorWsRoute, FrameKind, LeaseFreeCtx,
+    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy, UrgentEStopCtx, UrgentStopCtx,
 };
 
 /// Initialises the WS dispatch tables ahead of the first connection (see
@@ -2832,8 +2832,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let _ = worker_reg_rx.wait_for(|v| v.is_some()).await;
             }
             let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            let (frame_kind, entry) = dispatch::classify(&value);
+            let fault_avail = entry.map_or(crate::api::routes::FaultAvailability::Fenced, |e| e.fault);
             if recv_supervisor.internal_fault_fenced()
-                && !matches!(raw_kind, "release_lease" | "heartbeat" | "auth")
+                && fault_avail == crate::api::routes::FaultAvailability::Fenced
             {
                 let mut reply = json!({
                     "type": "command_reject",
@@ -2850,7 +2852,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 continue;
             }
-            let (frame_kind, entry) = dispatch::classify(&value);
             // Unified table-bound async session handlers (`acquire_lease`, `release_lease`)
             // dispatched strictly through `entry.handler` (single authority in `dispatch.rs`).
             let owner_mode = recv_supervisor.owner_mode();
@@ -2945,184 +2946,210 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
             }
-            // Fail closed before any legacy lock/reader path (including depth/teach) whenever
-            // `ArmCore` is not owned by the legacy supervisor lock.
+            // Registry-driven executor dispatch (no sequential owner probing; unknown / LegacyOnly
+            // fail closed before any legacy lock/reader path whenever `ArmCore` is not legacy-owned).
             if owner_mode != crate::supervisor::OWNER_LEGACY {
                 if owner_mode == crate::supervisor::OWNER_EXECUTOR {
-                    if let Some(opt_reply) = servo::handle_executor_ws_servo(
-                        frame_kind,
-                        &value,
-                        stamp,
-                        received_at,
-                        recv_conn_id,
-                        &recv_connection,
-                        &recv_generation,
-                        &recv_client_label,
-                        &mut streaming_servo,
-                        &mut cmd_servo,
-                        &mut last_sequence,
-                        &mut last_ordinary_request,
-                        &recv_supervisor,
-                        &servo_reply_sink,
-                    )
-                    .await
-                    {
-                        if let Some(reply) = opt_reply {
-                            if !worker_writer.send_ordinary_control(reply).await {
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    if let Some(opt_reply) = config::handle_executor_ws_command(
-                        frame_kind,
-                        entry,
-                        &value,
-                        stamp,
-                        recv_conn_id,
-                        &recv_connection,
-                        &recv_generation,
-                        &recv_client_label,
-                        &mut last_ordinary_request,
-                        &ws_auth,
-                        &recv_supervisor,
-                        &recv_deps,
-                        &recv_calib,
-                        &ack_tx,
-                        &worker_tasks,
-                    )
-                    .await
-                    {
-                        if let Some(reply) = opt_reply {
-                            if !worker_writer.send_ordinary_control(reply).await {
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    let motion_or_action = match motion::handle_executor_ws_motion(
-                        frame_kind,
-                        entry,
-                        &value,
-                        stamp,
-                        recv_conn_id,
-                        &recv_connection,
-                        &recv_generation,
-                        &recv_client_label,
-                        &mut last_ordinary_request,
-                        &recv_supervisor,
-                        &worker_closing,
-                        &worker_command_reply_pending,
-                        &worker_ack_tracker,
-                    )
-                    .await
-                    {
-                        Some(disp) => Some(disp),
-                        None => {
-                            actions::handle_executor_ws_action(
-                                frame_kind,
-                                entry,
-                                &value,
-                                stamp,
-                                recv_conn_id,
-                                &recv_connection,
-                                &recv_generation,
-                                &recv_client_label,
-                                &mut last_ordinary_request,
-                                &ws_auth,
-                                &recv_supervisor,
-                                &recv_deps,
-                                &recv_calib,
-                                &worker_closing,
-                                &worker_command_reply_pending,
-                                &worker_ack_tracker,
-                                &worker_tasks,
-                            )
-                            .await
-                        }
-                    };
-                    if let Some(action_disp) = motion_or_action {
-                        match action_disp {
-                            actions::ExecutorActionDispatch::Reply {
-                                reply,
-                                gate,
-                                ack_guard,
-                            } => {
-                                if matches!(
-                                    reply.get("type").and_then(Value::as_str),
-                                    Some("command_ack" | "preset_ack")
-                                ) {
-                                    if let Some(aid) = reply.get("action_id").and_then(Value::as_u64) {
-                                        worker_ack_tracker.mark_ack_queued_for_wire(aid);
-                                    }
-                                    if gate.is_some() {
-                                        let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
-                                        if delay_ms > 0 {
-                                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    if let Some(exec_route) = entry.map(|e| e.executor_route) {
+                        match exec_route {
+                            ExecutorWsRoute::None | ExecutorWsRoute::Unified => {}
+                            ExecutorWsRoute::Servo => {
+                                if let Some(opt_reply) = servo::handle_executor_ws_servo(
+                                    frame_kind,
+                                    &value,
+                                    stamp,
+                                    received_at,
+                                    recv_conn_id,
+                                    &recv_connection,
+                                    &recv_generation,
+                                    &recv_client_label,
+                                    &mut streaming_servo,
+                                    &mut cmd_servo,
+                                    &mut last_sequence,
+                                    &mut last_ordinary_request,
+                                    &recv_supervisor,
+                                    &servo_reply_sink,
+                                )
+                                .await
+                                {
+                                    if let Some(reply) = opt_reply {
+                                        if !worker_writer.send_ordinary_control(reply).await {
+                                            break;
                                         }
                                     }
+                                    continue;
                                 }
-                                let sent = worker_writer.send_ordinary_control(reply).await;
-                                if sent {
-                                    if let Some(ag) = ack_guard {
-                                        if ag.confirm_enqueued() {
-                                            if let Some(h) = recv_supervisor.executor_handle() {
-                                                h.pump_broker_replies();
+                            }
+                            ExecutorWsRoute::ConfigOrCalib => {
+                                if let Some(opt_reply) = config::handle_executor_ws_command(
+                                    frame_kind,
+                                    entry,
+                                    &value,
+                                    stamp,
+                                    recv_conn_id,
+                                    &recv_connection,
+                                    &recv_generation,
+                                    &recv_client_label,
+                                    &mut last_ordinary_request,
+                                    &ws_auth,
+                                    &recv_supervisor,
+                                    &recv_deps,
+                                    &recv_calib,
+                                    &ack_tx,
+                                    &worker_tasks,
+                                )
+                                .await
+                                {
+                                    if let Some(reply) = opt_reply {
+                                        if !worker_writer.send_ordinary_control(reply).await {
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            ExecutorWsRoute::Motion | ExecutorWsRoute::Action => {
+                                let motion_or_action = match exec_route {
+                                    ExecutorWsRoute::Motion => {
+                                        motion::handle_executor_ws_motion(
+                                            frame_kind,
+                                            entry,
+                                            &value,
+                                            stamp,
+                                            recv_conn_id,
+                                            &recv_connection,
+                                            &recv_generation,
+                                            &recv_client_label,
+                                            &mut last_ordinary_request,
+                                            &recv_supervisor,
+                                            &worker_closing,
+                                            &worker_command_reply_pending,
+                                            &worker_ack_tracker,
+                                        )
+                                        .await
+                                    }
+                                    ExecutorWsRoute::Action => {
+                                        actions::handle_executor_ws_action(
+                                            frame_kind,
+                                            entry,
+                                            &value,
+                                            stamp,
+                                            recv_conn_id,
+                                            &recv_connection,
+                                            &recv_generation,
+                                            &recv_client_label,
+                                            &mut last_ordinary_request,
+                                            &ws_auth,
+                                            &recv_supervisor,
+                                            &recv_deps,
+                                            &recv_calib,
+                                            &worker_closing,
+                                            &worker_command_reply_pending,
+                                            &worker_ack_tracker,
+                                            &worker_tasks,
+                                        )
+                                        .await
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                if let Some(action_disp) = motion_or_action {
+                                    match action_disp {
+                                        actions::ExecutorActionDispatch::Reply {
+                                            reply,
+                                            gate,
+                                            ack_guard,
+                                        } => {
+                                            if matches!(
+                                                reply.get("type").and_then(Value::as_str),
+                                                Some("command_ack" | "preset_ack")
+                                            ) {
+                                                if let Some(aid) =
+                                                    reply.get("action_id").and_then(Value::as_u64)
+                                                {
+                                                    worker_ack_tracker.mark_ack_queued_for_wire(aid);
+                                                }
+                                                if gate.is_some() {
+                                                    let delay_ms = TEST_DEFERRED_ACK_DELAY_MS
+                                                        .load(Ordering::Relaxed);
+                                                    if delay_ms > 0 {
+                                                        tokio::time::sleep(Duration::from_millis(
+                                                            delay_ms,
+                                                        ))
+                                                        .await;
+                                                    }
+                                                }
+                                            }
+                                            let sent =
+                                                worker_writer.send_ordinary_control(reply).await;
+                                            if sent {
+                                                if let Some(ag) = ack_guard {
+                                                    if ag.confirm_enqueued() {
+                                                        if let Some(h) =
+                                                            recv_supervisor.executor_handle()
+                                                        {
+                                                            h.pump_broker_replies();
+                                                        }
+                                                    }
+                                                }
+                                                drop(gate);
+                                            } else {
+                                                if let Some(ag) = ack_guard {
+                                                    ag.abandon_closed();
+                                                } else {
+                                                    worker_ack_tracker.mark_socket_closed();
+                                                }
+                                                drop(gate);
+                                                break;
                                             }
                                         }
+                                        actions::ExecutorActionDispatch::Macro(check) => {
+                                            macro_check = Some(check);
+                                        }
+                                        actions::ExecutorActionDispatch::Closed => {
+                                            break;
+                                        }
                                     }
-                                    drop(gate);
-                                } else {
-                                    if let Some(ag) = ack_guard {
-                                        ag.abandon_closed();
-                                    } else {
-                                        worker_ack_tracker.mark_socket_closed();
-                                    }
-                                    drop(gate);
-                                    break;
+                                    continue;
                                 }
                             }
-                            actions::ExecutorActionDispatch::Macro(check) => {
-                                macro_check = Some(check);
-                            }
-                            actions::ExecutorActionDispatch::Closed => {
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    #[cfg(feature = "policy-runtime")]
-                    if let Some(opt_reply) = policy::handle_executor_ws_policy(
-                        frame_kind,
-                        entry,
-                        &value,
-                        stamp,
-                        recv_conn_id,
-                        &recv_connection,
-                        &recv_generation,
-                        &recv_client_label,
-                        &mut last_ordinary_request,
-                        &ws_auth,
-                        &recv_supervisor,
-                        &recv_sandbox,
-                        &recv_deps,
-                        &ack_tx,
-                        &worker_ws_closed,
-                        &pending_policy_loads,
-                        &worker_tasks,
-                    )
-                    .await
-                    {
-                        if let Some(reply) = opt_reply {
-                            if !worker_writer.send_ordinary_control(reply).await {
-                                break;
+                            #[cfg(feature = "policy-runtime")]
+                            ExecutorWsRoute::Policy => {
+                                if let Some(opt_reply) = policy::handle_executor_ws_policy(
+                                    frame_kind,
+                                    entry,
+                                    &value,
+                                    stamp,
+                                    recv_conn_id,
+                                    &recv_connection,
+                                    &recv_generation,
+                                    &recv_client_label,
+                                    &mut last_ordinary_request,
+                                    &ws_auth,
+                                    &recv_supervisor,
+                                    &recv_sandbox,
+                                    &recv_deps,
+                                    &ack_tx,
+                                    &worker_ws_closed,
+                                    &pending_policy_loads,
+                                    &worker_tasks,
+                                )
+                                .await
+                                {
+                                    if let Some(reply) = opt_reply {
+                                        if !worker_writer.send_ordinary_control(reply).await {
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
                             }
                         }
-                        continue;
                     }
                 }
                 if let Some(reply) = executor_routing_reject(&value, owner_mode) {
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
+                    if !worker_writer.send_ordinary_control(reply).await {
+                        break;
+                    }
                 }
                 continue;
             }

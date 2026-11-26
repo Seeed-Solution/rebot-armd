@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
 use crate::api::rest::ApiError;
+use crate::api::routes::{FaultAvailability, RouteOwnership};
 use crate::supervisor::{AdmissionStamp, ArmSupervisor, SupervisorInner};
 
 use super::{
@@ -23,7 +24,7 @@ use super::{
 
 /// Normalized inbound WebSocket frame kind, preserving exact alias precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum FrameKind {
+pub enum FrameKind {
     /// `type: "estop"` or `type: "e_stop"`.
     EStop,
     /// `type: "auth"`.
@@ -65,9 +66,9 @@ impl FrameKind {
 
 /// Primary lookup key in the unified WS dispatch table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct DispatchKey {
-    pub(super) kind: FrameKind,
-    pub(super) path: Option<&'static str>,
+pub(crate) struct DispatchKey {
+    pub(crate) kind: FrameKind,
+    pub(crate) path: Option<&'static str>,
 }
 
 impl DispatchKey {
@@ -106,7 +107,7 @@ pub(super) enum AdmissionClass {
 
 /// Lease validation rule enforced before running a handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LeaseRequirement {
+pub(crate) enum LeaseRequirement {
     /// No motion lease required (e.g. `estop`, `auth`, `acquire_lease`, depth measure, lease-free teach).
     None,
     /// Active lease required, except `/api/v1/action/grasp` with `body.dry_run == true`.
@@ -541,15 +542,72 @@ pub(super) enum DispatchHandler {
     Owner(fn(&mut OwnerDispatchCtx<'_>) -> Option<OwnerReply>),
 }
 
+/// Direct RT-executor dispatch target for a WS entry (replaces sequential owner probing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExecutorWsRoute {
+    /// Not routed on the RT executor (`RouteOwnership::LegacyOnly`).
+    None,
+    /// Dispatched via unified / owner-agnostic lane (`UrgentEStop`, `UrgentStop`, `Auth`,
+    /// `Heartbeat`, `SessionAsync`, `CommandAsync`).
+    Unified,
+    /// Direct dispatch to `servo::handle_executor_ws_servo`.
+    Servo,
+    /// Direct dispatch to `config::handle_executor_ws_command` (config, calibration, gravity_comp).
+    ConfigOrCalib,
+    /// Direct dispatch to `motion::handle_executor_ws_motion`.
+    Motion,
+    /// Direct dispatch to `actions::handle_executor_ws_action`.
+    Action,
+    /// Direct dispatch to `policy::handle_executor_ws_policy`.
+    #[cfg(feature = "policy-runtime")]
+    Policy,
+}
+
 /// One row of the unified WS dispatch table.
 #[derive(Clone, Copy)]
-pub(super) struct DispatchEntry {
-    pub(super) key: DispatchKey,
+pub(crate) struct DispatchEntry {
+    pub(crate) key: DispatchKey,
     pub(super) handler: DispatchHandler,
+    pub(crate) handler_name: &'static str,
     pub(super) admission: AdmissionClass,
     pub(super) lease: LeaseRequirement,
     pub(super) auth: AuthRequirement,
     pub(super) reply: ReplyPolicy,
+    pub(crate) ownership: RouteOwnership,
+    pub(crate) fault: FaultAvailability,
+    pub(super) executor_route: ExecutorWsRoute,
+}
+
+impl DispatchEntry {
+    /// Projects this WS dispatch row into the unified [`crate::api::routes::RouteSpec`].
+    pub(crate) fn route_spec(&self) -> crate::api::routes::RouteSpec {
+        use crate::api::routes::{LeasePolicy, OperatorPolicy, RouteSpec};
+        let operator = match self.auth {
+            AuthRequirement::None => OperatorPolicy::None,
+            AuthRequirement::Operator(_) => OperatorPolicy::Required,
+            AuthRequirement::OwnerGrant(_) => OperatorPolicy::OwnerGrant,
+            AuthRequirement::Conditional(_) | AuthRequirement::ConditionalLeaseFree(_) => {
+                OperatorPolicy::Conditional
+            }
+            AuthRequirement::InHandler => OperatorPolicy::InHandler,
+        };
+        let lease = match self.lease {
+            LeaseRequirement::None => LeasePolicy::None,
+            LeaseRequirement::Required => LeasePolicy::Required,
+            LeaseRequirement::RequiredExceptDryRun => LeasePolicy::RequiredExceptDryRun,
+            LeaseRequirement::RequiredExplicitGeneration => LeasePolicy::RequiredExplicitGeneration,
+            LeaseRequirement::RequiredAllowZeroGeneration => {
+                LeasePolicy::RequiredAllowZeroGeneration
+            }
+        };
+        RouteSpec {
+            handler: self.handler_name,
+            ownership: self.ownership,
+            operator,
+            lease,
+            fault: self.fault,
+        }
+    }
 }
 
 /// Core urgent and auth lane entries (`estop`/`e_stop`, `auth`, `/api/v1/motion/stop`).
@@ -557,26 +615,38 @@ const CORE_ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::EStop),
         handler: DispatchHandler::UrgentEStop(super::handle_urgent_estop_frame),
+        handler_name: "ws::handle_urgent_estop_frame",
         admission: AdmissionClass::UrgentEStop,
         lease: LeaseRequirement::None,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::UrgentEStop,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Allowed,
+        executor_route: ExecutorWsRoute::Unified,
     },
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::Auth),
         handler: DispatchHandler::Auth(super::handle_auth_frame),
+        handler_name: "ws::handle_auth_frame",
         admission: AdmissionClass::Auth,
         lease: LeaseRequirement::None,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::AuthAck,
+        ownership: RouteOwnership::OwnerAgnostic,
+        fault: FaultAvailability::Allowed,
+        executor_route: ExecutorWsRoute::Unified,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/motion/stop"),
         handler: DispatchHandler::UrgentStop(super::handle_urgent_stop_frame),
+        handler_name: "ws::handle_urgent_stop_frame",
         admission: AdmissionClass::UrgentStop,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::UrgentStop,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Allowed,
+        executor_route: ExecutorWsRoute::Unified,
     },
 ];
 
@@ -593,24 +663,41 @@ fn all_family_slices() -> &'static [&'static [DispatchEntry]] {
     ]
 }
 
-/// Validate that every table row's `(handler, admission, lease, reply)` metadata is mutually
-/// consistent with executable routing at table initialization time.
+/// Iterates every registered WS [`DispatchEntry`] across all family tables (used by `api::routes`).
+pub(crate) fn all_entries() -> impl Iterator<Item = &'static DispatchEntry> {
+    all_family_slices().iter().flat_map(|slice| slice.iter())
+}
+
+/// Validate that every table row's `(handler, admission, lease, reply, ownership, executor_route)`
+/// metadata is mutually consistent with executable routing at table initialization time.
 fn validate_entry(entry: &DispatchEntry) {
+    assert!(!entry.handler_name.is_empty(), "{:?}", entry.key);
+    match entry.ownership {
+        RouteOwnership::LegacyOnly => {
+            assert_eq!(entry.executor_route, ExecutorWsRoute::None, "{:?}", entry.key);
+        }
+        RouteOwnership::OwnerAgnostic | RouteOwnership::ExecutorRequest => {
+            assert_ne!(entry.executor_route, ExecutorWsRoute::None, "{:?}", entry.key);
+        }
+    }
     match entry.handler {
         DispatchHandler::UrgentEStop(_) => {
             assert_eq!(entry.admission, AdmissionClass::UrgentEStop, "{:?}", entry.key);
             assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::UrgentEStop, "{:?}", entry.key);
+            assert_eq!(entry.executor_route, ExecutorWsRoute::Unified, "{:?}", entry.key);
         }
         DispatchHandler::UrgentStop(_) => {
             assert_eq!(entry.admission, AdmissionClass::UrgentStop, "{:?}", entry.key);
             assert_eq!(entry.lease, LeaseRequirement::Required, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::UrgentStop, "{:?}", entry.key);
+            assert_eq!(entry.executor_route, ExecutorWsRoute::Unified, "{:?}", entry.key);
         }
         DispatchHandler::Auth(_) => {
             assert_eq!(entry.admission, AdmissionClass::Auth, "{:?}", entry.key);
             assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::AuthAck, "{:?}", entry.key);
+            assert_eq!(entry.executor_route, ExecutorWsRoute::Unified, "{:?}", entry.key);
         }
         DispatchHandler::Heartbeat(_) => {
             assert_eq!(entry.admission, AdmissionClass::Heartbeat, "{:?}", entry.key);
@@ -626,10 +713,12 @@ fn validate_entry(entry: &DispatchEntry) {
                 "{:?}",
                 entry.key
             );
+            assert_eq!(entry.executor_route, ExecutorWsRoute::Unified, "{:?}", entry.key);
         }
         DispatchHandler::SessionAsync(_) => {
             assert_eq!(entry.admission, AdmissionClass::OrdinarySession, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::LeaseReply, "{:?}", entry.key);
+            assert_eq!(entry.executor_route, ExecutorWsRoute::Unified, "{:?}", entry.key);
         }
         DispatchHandler::CommandAsync(_) => {
             assert!(
@@ -651,11 +740,13 @@ fn validate_entry(entry: &DispatchEntry) {
                 entry.key
             );
             assert_eq!(entry.reply, ReplyPolicy::CommandImmediate, "{:?}", entry.key);
+            assert_eq!(entry.executor_route, ExecutorWsRoute::Unified, "{:?}", entry.key);
         }
         DispatchHandler::LeaseFree(_) => {
             assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);
             assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::CommandDeferred, "{:?}", entry.key);
+            assert_eq!(entry.executor_route, ExecutorWsRoute::None, "{:?}", entry.key);
         }
         DispatchHandler::Owner(_) => {
             assert!(
@@ -681,6 +772,7 @@ fn validate_entry(entry: &DispatchEntry) {
                 "Owner handler has incompatible reply policy: {:?}",
                 entry.key
             );
+            assert_ne!(entry.executor_route, ExecutorWsRoute::Unified, "{:?}", entry.key);
         }
     }
 }
@@ -896,10 +988,14 @@ mod tests {
         let bad = DispatchEntry {
             key: DispatchKey::command("/api/v1/bad_lease_free"),
             handler: DispatchHandler::LeaseFree(dummy),
+            handler_name: "dummy",
             admission: AdmissionClass::Ordinary,
             lease: LeaseRequirement::Required,
             auth: AuthRequirement::None,
             reply: ReplyPolicy::CommandDeferred,
+            ownership: RouteOwnership::LegacyOnly,
+            fault: FaultAvailability::Fenced,
+            executor_route: ExecutorWsRoute::None,
         };
         validate_entry(&bad);
     }

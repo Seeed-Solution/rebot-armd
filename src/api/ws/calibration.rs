@@ -6,59 +6,35 @@
 #[allow(unused_imports)]
 use super::*;
 use super::dispatch::{
-    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, ExecutorWsRoute,
     LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
+use crate::api::routes::{FaultAvailability, RouteOwnership};
+
+macro_rules! calib_entry {
+    ($path:expr) => {
+        DispatchEntry {
+            key: DispatchKey::command($path),
+            handler: DispatchHandler::Owner(dispatch_calibration_entry),
+            handler_name: "ws::calibration::dispatch_calibration_entry",
+            admission: AdmissionClass::Ordinary,
+            lease: LeaseRequirement::Required,
+            auth: AuthRequirement::Operator(None),
+            reply: ReplyPolicy::CommandDeferred,
+            ownership: RouteOwnership::ExecutorRequest,
+            fault: FaultAvailability::Fenced,
+            executor_route: ExecutorWsRoute::ConfigOrCalib,
+        }
+    };
+}
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
-    DispatchEntry {
-        key: DispatchKey::command("/api/v1/calibration/apply"),
-        handler: DispatchHandler::Owner(dispatch_calibration_entry),
-        admission: AdmissionClass::Ordinary,
-        lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
-        reply: ReplyPolicy::CommandDeferred,
-    },
-    DispatchEntry {
-        key: DispatchKey::command("/api/v1/calibration/restore"),
-        handler: DispatchHandler::Owner(dispatch_calibration_entry),
-        admission: AdmissionClass::Ordinary,
-        lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
-        reply: ReplyPolicy::CommandDeferred,
-    },
-    DispatchEntry {
-        key: DispatchKey::command(crate::motor_zero::PATH),
-        handler: DispatchHandler::Owner(dispatch_calibration_entry),
-        admission: AdmissionClass::Ordinary,
-        lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
-        reply: ReplyPolicy::CommandDeferred,
-    },
-    DispatchEntry {
-        key: DispatchKey::command(crate::motor_zero::RESTORE_PATH),
-        handler: DispatchHandler::Owner(dispatch_calibration_entry),
-        admission: AdmissionClass::Ordinary,
-        lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
-        reply: ReplyPolicy::CommandDeferred,
-    },
-    DispatchEntry {
-        key: DispatchKey::command(crate::mit::TIMEOUT_PATH),
-        handler: DispatchHandler::Owner(dispatch_calibration_entry),
-        admission: AdmissionClass::Ordinary,
-        lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
-        reply: ReplyPolicy::CommandDeferred,
-    },
-    DispatchEntry {
-        key: DispatchKey::command(crate::mit::QUALIFICATION_PATH),
-        handler: DispatchHandler::Owner(dispatch_calibration_entry),
-        admission: AdmissionClass::Ordinary,
-        lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
-        reply: ReplyPolicy::CommandDeferred,
-    },
+    calib_entry!("/api/v1/calibration/apply"),
+    calib_entry!("/api/v1/calibration/restore"),
+    calib_entry!(crate::motor_zero::PATH),
+    calib_entry!(crate::motor_zero::RESTORE_PATH),
+    calib_entry!(crate::mit::TIMEOUT_PATH),
+    calib_entry!(crate::mit::QUALIFICATION_PATH),
 ];
 
 /// Returns true if `path` is one of the WS calibration / motor-zero / joint-zero / MIT endpoints.

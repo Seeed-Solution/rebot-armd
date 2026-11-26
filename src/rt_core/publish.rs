@@ -30,7 +30,7 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::macro_action::{ContactWatch, SubState};
 use crate::model::{ArmObservation, HolderLabel, ObservationSchema};
@@ -258,12 +258,19 @@ pub struct PublishedOwnerMeta {
     pub arm: ArmId,
     pub boot: BootId,
     pub authority: Authority,
+    /// Monotonic control-release sequence counter of the active owner (0 before first tick).
+    pub control_release_seq: u64,
+    /// Monotonic generation bumped on every motion lifecycle transition (trajectory, servo,
+    /// gravity comp, stop, E-stop, clear-fault).
+    pub motion_generation: u64,
     pub calibration_revision: u64,
+    pub collision_revision: u64,
     pub poses_revision: u64,
     pub sequences_revision: u64,
     pub grasp_setup_revision: u64,
     pub gripper_calib_revision: u64,
     pub power_budget_revision: u64,
+    pub tool_commissioning_revision: u64,
     pub tool_digest_hash: u64,
     pub motion_active: bool,
     pub config_inhibited: bool,
@@ -288,12 +295,16 @@ impl Default for PublishedOwnerMeta {
             arm: ArmId::LOCAL,
             boot: BootId(0),
             authority: Authority::default(),
+            control_release_seq: 0,
+            motion_generation: 0,
             calibration_revision: 0,
+            collision_revision: 0,
             poses_revision: 0,
             sequences_revision: 0,
             grasp_setup_revision: 0,
             gripper_calib_revision: 0,
             power_budget_revision: 0,
+            tool_commissioning_revision: 0,
             tool_digest_hash: 0,
             motion_active: false,
             config_inhibited: false,
@@ -311,6 +322,381 @@ impl Default for PublishedOwnerMeta {
             held: None,
             macro_state: PublishedMacroState::default(),
         }
+    }
+}
+
+/// Coherent revision vector captured atomically from a single RT [`Snapshot`] slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceRevisions {
+    pub workspace: u64,
+    pub motion_config: u64,
+    pub calibration: u64,
+    pub collision: u64,
+    pub poses: u64,
+    pub sequences: u64,
+    pub grasp_setup: u64,
+    pub gripper_calib: u64,
+    pub power_budget: u64,
+    pub tool_commissioning: u64,
+    pub tool_digest_hash: u64,
+}
+
+impl ServiceRevisions {
+    pub fn from_snapshot(snap: &Snapshot) -> Self {
+        let o = &snap.rt.owner;
+        Self {
+            workspace: o.authority.config_revision,
+            motion_config: snap.rt.motion_config_revision,
+            calibration: o.calibration_revision,
+            collision: o.collision_revision,
+            poses: o.poses_revision,
+            sequences: o.sequences_revision,
+            grasp_setup: o.grasp_setup_revision,
+            gripper_calib: o.gripper_calib_revision,
+            power_budget: o.power_budget_revision,
+            tool_commissioning: o.tool_commissioning_revision,
+            tool_digest_hash: o.tool_digest_hash,
+        }
+    }
+}
+
+/// Off-RT arm identity and static/joint-zero descriptors paired with RT [`Snapshot`] by
+/// `(arm, boot, tool_digest_hash, calibration_revision)`.
+///
+/// Never allocated, mutated, or locked on `armd-control`. Live RT-changing fields such as
+/// `zero_convention` and `has_zero_reference` are taken exclusively from `Snapshot::owner`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceIdentity {
+    pub arm: ArmId,
+    pub boot: BootId,
+    pub profile_id: Option<String>,
+    pub follower: Option<String>,
+    pub dof: usize,
+    pub arm_dof: usize,
+    pub control_frequency_hz: u32,
+    pub joint_names: Vec<String>,
+    pub tool_id: String,
+    pub tool_config_digest: String,
+    pub tool_digest_hash: u64,
+    pub tool_is_stock: bool,
+    pub joint_zero_offsets: Vec<f32>,
+    /// Exact `calibration_revision` corresponding to `joint_zero_offsets`.
+    pub calibration_revision: u64,
+}
+
+impl ServiceIdentity {
+    pub fn from_inner(inner: &crate::supervisor::SupervisorInner) -> Self {
+        Self {
+            arm: inner.core.id(),
+            boot: inner.boot_id,
+            profile_id: inner.config.profile_id.clone(),
+            follower: inner.follower.clone(),
+            dof: inner.config.dof,
+            arm_dof: inner.config.arm_dof(),
+            control_frequency_hz: inner.config.control_frequency_hz.max(1),
+            joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
+            tool_id: inner.config.active_tool.id.clone(),
+            tool_config_digest: inner.config.active_tool.config_digest.clone(),
+            tool_digest_hash: super::ops::tool_digest_hash(&inner.config.active_tool.config_digest),
+            tool_is_stock: inner.config.active_tool.is_stock,
+            joint_zero_offsets: inner.joint_zero_offsets.clone(),
+            calibration_revision: inner.calibration_revision,
+        }
+    }
+
+    pub fn from_published_config(
+        arm: ArmId,
+        boot: BootId,
+        cfg: &super::requests::config::PublishedConfig,
+    ) -> Self {
+        Self {
+            arm,
+            boot,
+            profile_id: cfg.config.profile_id.clone(),
+            follower: cfg.follower.clone(),
+            dof: cfg.config.dof,
+            arm_dof: cfg.config.arm_dof(),
+            control_frequency_hz: cfg.config.control_frequency_hz.max(1),
+            joint_names: cfg.config.limits.iter().map(|l| l.name.clone()).collect(),
+            tool_id: cfg.config.active_tool.id.clone(),
+            tool_config_digest: cfg.config.active_tool.config_digest.clone(),
+            tool_digest_hash: super::ops::tool_digest_hash(&cfg.config.active_tool.config_digest),
+            tool_is_stock: cfg.config.active_tool.is_stock,
+            joint_zero_offsets: cfg.joint_zero_offsets.clone(),
+            calibration_revision: cfg.calibration_revision,
+        }
+    }
+
+    /// True iff this off-RT identity matches the sampled RT [`PublishedOwnerMeta`] on every
+    /// authenticating key (`arm`, `boot`, `tool_digest_hash`, `calibration_revision`).
+    #[inline]
+    pub fn matches_owner_meta(&self, owner: &PublishedOwnerMeta) -> bool {
+        self.arm == owner.arm
+            && self.boot == owner.boot
+            && self.tool_digest_hash == owner.tool_digest_hash
+            && self.calibration_revision == owner.calibration_revision
+    }
+}
+
+/// Caller requirements for [`StateHub::read_services`] (fail-closed on any unmet predicate).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReadRequirements {
+    /// Minimum `SampleMeta::generation` (used to bind reads past an executor handoff boundary).
+    pub min_generation: Option<u64>,
+    /// Minimum `SampleMeta::seq` (StateHub publication sequence).
+    pub min_publish_seq: Option<u64>,
+    /// Minimum `PublishedOwnerMeta::control_release_seq`.
+    pub min_release_seq: Option<u64>,
+    /// Require `now <= snap.meta.valid_until`.
+    pub require_within_valid_until: bool,
+    /// Maximum allowed age `now - snap.meta.sampled_at`.
+    pub max_snapshot_age: Option<Duration>,
+    /// Require `PublishedOwnerMeta::feedback_valid == true`.
+    pub require_feedback_valid: bool,
+    /// Require every arm joint (`0..arm_dof`) to carry a receive instant with
+    /// `now - rx_instant <= max_feedback_age`.
+    pub max_feedback_age: Option<Duration>,
+    /// Require command/mode inactivity (no active trajectory, servo target, gravity comp,
+    /// active/loading policy, pending unload, torque transition, or calibration busy).
+    pub require_motion_idle: bool,
+    /// Require every arm joint's measured speed `|v_i| <= max_arm_joint_speed` (rad/s).
+    pub max_arm_joint_speed: Option<f32>,
+    /// Require and attach an off-RT [`ActionPrepEnv`](super::requests::actions::ActionPrepEnv)
+    /// authenticated against the sampled RT `PublishedOwnerMeta` (workspace, calibration, poses,
+    /// sequences, grasp_setup, gripper_calib, power_budget, tool_digest_hash).
+    pub require_prep_env: bool,
+}
+
+impl Default for ReadRequirements {
+    fn default() -> Self {
+        Self {
+            min_generation: None,
+            min_publish_seq: None,
+            min_release_seq: None,
+            require_within_valid_until: true,
+            max_snapshot_age: None,
+            require_feedback_valid: false,
+            max_feedback_age: None,
+            require_motion_idle: false,
+            max_arm_joint_speed: None,
+            require_prep_env: false,
+        }
+    }
+}
+
+impl ReadRequirements {
+    /// Relaxed coherent read: accepts any published sample with coherent identity (even if
+    /// `valid_until` elapsed), suitable for post-run metadata / sandbox identity reads.
+    pub const fn identity() -> Self {
+        Self {
+            min_generation: None,
+            min_publish_seq: None,
+            min_release_seq: None,
+            require_within_valid_until: false,
+            max_snapshot_age: None,
+            require_feedback_valid: false,
+            max_feedback_age: None,
+            require_motion_idle: false,
+            max_arm_joint_speed: None,
+            require_prep_env: false,
+        }
+    }
+
+    /// Requires a live, valid-until snapshot with confirmed fresh feedback within `max_age`.
+    pub const fn fresh_feedback(max_age: Duration) -> Self {
+        Self {
+            min_generation: None,
+            min_publish_seq: None,
+            min_release_seq: None,
+            require_within_valid_until: true,
+            max_snapshot_age: Some(max_age),
+            require_feedback_valid: true,
+            max_feedback_age: Some(max_age),
+            require_motion_idle: false,
+            max_arm_joint_speed: None,
+            require_prep_env: false,
+        }
+    }
+
+    /// Requirements for stationary measurement / calibration hover capture.
+    pub const fn measure(max_feedback_age: Duration, max_joint_speed: f32) -> Self {
+        Self {
+            min_generation: None,
+            min_publish_seq: None,
+            min_release_seq: None,
+            require_within_valid_until: true,
+            max_snapshot_age: Some(max_feedback_age),
+            require_feedback_valid: true,
+            max_feedback_age: Some(max_feedback_age),
+            require_motion_idle: true,
+            max_arm_joint_speed: Some(max_joint_speed),
+            require_prep_env: true,
+        }
+    }
+}
+
+/// Fail-closed error returned by [`StateHub::read_services`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceReadError {
+    NoSnapshot,
+    IdentityUnavailable,
+    PrepEnvUnavailable,
+    GenerationNotReached { required: u64, actual: u64 },
+    SequenceNotReached { required: u64, actual: u64 },
+    ReleaseSequenceNotReached { required: u64, actual: u64 },
+    SnapshotExpired,
+    SnapshotStale { age_ms: u64, max_ms: u64 },
+    IdentityMismatch,
+    PrepEnvMismatch,
+    FeedbackInvalid,
+    FeedbackStale { joint: usize },
+    MotionActive,
+    JointMoving { joint: usize },
+}
+
+impl std::fmt::Display for ServiceReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSnapshot => write!(f, "no published control snapshot is available"),
+            Self::IdentityUnavailable => write!(f, "service identity metadata is not initialized"),
+            Self::PrepEnvUnavailable => write!(f, "planning environment metadata is unavailable"),
+            Self::GenerationNotReached { required, actual } => {
+                write!(f, "snapshot generation {actual} is older than required {required}")
+            }
+            Self::SequenceNotReached { required, actual } => {
+                write!(f, "snapshot publish sequence {actual} is older than required {required}")
+            }
+            Self::ReleaseSequenceNotReached { required, actual } => {
+                write!(f, "control release sequence {actual} is older than required {required}")
+            }
+            Self::SnapshotExpired => write!(f, "published snapshot exceeded its valid_until horizon"),
+            Self::SnapshotStale { age_ms, max_ms } => {
+                write!(f, "published snapshot age {age_ms} ms exceeds {max_ms} ms limit")
+            }
+            Self::IdentityMismatch => {
+                write!(f, "off-RT service identity revisions do not match published RT snapshot")
+            }
+            Self::PrepEnvMismatch => {
+                write!(f, "off-RT planning environment revisions do not match published RT snapshot")
+            }
+            Self::FeedbackInvalid => write!(f, "hardware feedback is not currently valid"),
+            Self::FeedbackStale { joint } => {
+                write!(f, "joint {} feedback is missing or stale", joint + 1)
+            }
+            Self::MotionActive => write!(f, "arm motion or transition is active"),
+            Self::JointMoving { joint } => {
+                write!(f, "joint {} measured speed exceeds standstill limit", joint + 1)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServiceReadError {}
+
+impl From<ServiceReadError> for crate::supervisor::ArmError {
+    fn from(err: ServiceReadError) -> Self {
+        match err {
+            ServiceReadError::MotionActive | ServiceReadError::JointMoving { .. } => {
+                crate::supervisor::ArmError::Rejected {
+                    status: 409,
+                    code: "ARM_MOVING".into(),
+                    message: err.to_string(),
+                }
+            }
+            ServiceReadError::IdentityMismatch | ServiceReadError::PrepEnvMismatch => {
+                crate::supervisor::ArmError::Rejected {
+                    status: 409,
+                    code: "SNAPSHOT_STALE".into(),
+                    message: err.to_string(),
+                }
+            }
+            ServiceReadError::FeedbackInvalid | ServiceReadError::FeedbackStale { .. } => {
+                crate::supervisor::ArmError::Rejected {
+                    status: 503,
+                    code: "FEEDBACK_STALE".into(),
+                    message: err.to_string(),
+                }
+            }
+            _ => crate::supervisor::ArmError::Rejected {
+                status: 503,
+                code: "OBSERVATION_UNAVAILABLE".into(),
+                message: err.to_string(),
+            },
+        }
+    }
+}
+
+/// Coherent off-RT service view built from a single RT [`Snapshot`] slot and authenticated
+/// off-RT identity/planning metadata.
+///
+/// Field provenance:
+/// - All live state, revisions, `boot`, `arm`, `release_seq`, `motion_generation`,
+///   `applied_stop_generation`, `zero_convention`, and `has_zero_reference` come exclusively
+///   from the sampled triple-buffer `snapshot`.
+/// - `identity` carries off-RT profile/follower/tool/joint descriptors authenticated against
+///   `snapshot.rt.owner` by `(arm, boot, tool_digest_hash, calibration_revision)`.
+/// - `prep_env` is present only when requested via `ReadRequirements::require_prep_env` and
+///   authenticated by `ActionPrepEnv::matches_owner_meta(&snapshot.rt.owner)`.
+#[derive(Debug, Clone)]
+pub struct ServiceSnapshot {
+    pub boot: BootId,
+    pub arm: ArmId,
+    /// Monotonic `StateHub` publication sequence (`snapshot.meta.seq`).
+    pub publish_seq: u64,
+    /// Control-release sequence captured in the same RT slot (`snapshot.rt.owner.control_release_seq`).
+    pub release_seq: u64,
+    pub captured_at: Instant,
+    pub valid_until: Instant,
+    pub feedback_valid: bool,
+    /// Oldest arm-joint feedback age at `captured_at` (`None` if `arm_dof == 0` or any arm joint
+    /// had no receive instant).
+    pub feedback_age_at_capture: Option<Duration>,
+    pub motion_generation: u64,
+    /// True when an active trajectory or servo target is present.
+    pub motion_active: bool,
+    /// True when no trajectory, servo target, gravity comp, policy run/load, pending unload,
+    /// torque transition, or calibration transaction is active.
+    pub motion_idle: bool,
+    /// Applied stop generation captured in the same RT slot (`snapshot.rt.stop_generation`).
+    pub applied_stop_generation: u64,
+    pub epoch_id: u64,
+    pub lease_generation: u64,
+    pub zero_convention: crate::joint_zero::ZeroConvention,
+    pub has_zero_reference: bool,
+    pub revisions: ServiceRevisions,
+    pub identity: Arc<ServiceIdentity>,
+    pub snapshot: Arc<Snapshot>,
+    pub prep_env: Option<Arc<super::requests::actions::ActionPrepEnv>>,
+}
+
+impl ServiceSnapshot {
+    /// Worst-case arm-joint feedback age at `now` (`None` if `arm_dof == 0` or any arm joint
+    /// lacks a receive instant).
+    pub fn feedback_age_at(&self, now: Instant) -> Option<Duration> {
+        let arm_dof = self.identity.arm_dof;
+        if arm_dof == 0 || self.snapshot.rt.feedback_instants.len() < arm_dof {
+            return None;
+        }
+        let mut oldest = Duration::ZERO;
+        for slot in &self.snapshot.rt.feedback_instants[..arm_dof] {
+            let rx = (*slot)?;
+            oldest = oldest.max(now.saturating_duration_since(rx));
+        }
+        Some(oldest)
+    }
+
+    /// Maximum absolute measured velocity across arm joints `0..arm_dof` (rad/s), or `f32::INFINITY`
+    /// if any arm joint velocity is non-finite.
+    pub fn max_arm_joint_speed(&self) -> f32 {
+        let arm_dof = self.identity.arm_dof;
+        let mut max_v = 0.0f32;
+        for &v in self.snapshot.rt.velocities.iter().take(arm_dof) {
+            if !v.is_finite() {
+                return f32::INFINITY;
+            }
+            max_v = max_v.max(v.abs());
+        }
+        max_v
     }
 }
 
@@ -761,6 +1147,9 @@ pub struct StateHub {
     /// Revision-tagged slow-changing planning environment published off-thread (never touched
     /// on `armd-control`; read by off-thread action preparation and macro orchestrators).
     prep_env: Mutex<Option<Arc<super::requests::actions::ActionPrepEnv>>>,
+    /// Off-RT arm identity and joint-zero metadata paired with RT `PublishedOwnerMeta` by
+    /// `(arm, boot, tool_digest_hash, calibration_revision)`. Never locked on `armd-control`.
+    service_identity: std::sync::RwLock<Option<Arc<ServiceIdentity>>>,
     /// Bounded off-RT sidecar store of `measure_multiview` measurement payloads keyed by action
     /// ID (never touched on `armd-control`; bounded to 16 entries). Attached in [`Self::refresh`]
     /// to `obs.action` and `obs.previous_action` before any snapshot or terminal is delivered.
@@ -802,6 +1191,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         motion_config: std::sync::RwLock::new(None),
         schema_cache: Mutex::new(None),
         prep_env: Mutex::new(None),
+        service_identity: std::sync::RwLock::new(None),
         action_measurements: Mutex::new(std::collections::HashMap::new()),
         #[cfg(feature = "policy-runtime")]
         policy_diag_sealed: OnceLock::new(),
@@ -1146,6 +1536,197 @@ impl StateHub {
         self.prep_env.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Publishes an updated off-RT [`ServiceIdentity`] (never called on `armd-control`).
+    pub fn set_service_identity(&self, identity: Arc<ServiceIdentity>) {
+        *self
+            .service_identity
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(identity);
+    }
+
+    /// Reads the latest published off-RT [`ServiceIdentity`].
+    pub fn service_identity(&self) -> Option<Arc<ServiceIdentity>> {
+        self.service_identity
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Updates off-RT [`ServiceIdentity`] from a [`PublishedConfig`](super::requests::config::PublishedConfig),
+    /// preserving the active owner's `(arm, boot)` identity. Never called on `armd-control`.
+    pub fn update_service_identity_from_config(
+        &self,
+        cfg: &super::requests::config::PublishedConfig,
+    ) {
+        let mut g = self
+            .service_identity
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let (arm, boot) = g
+            .as_ref()
+            .map(|cur| (cur.arm, cur.boot))
+            .unwrap_or((ArmId::LOCAL, BootId(0)));
+        *g = Some(Arc::new(ServiceIdentity::from_published_config(arm, boot, cfg)));
+    }
+
+    /// Reads a coherent [`ServiceSnapshot`] from the latest triple-buffer sample and off-RT
+    /// identity/planning metadata, failing closed if any requirement in `req` or any revision
+    /// authentication check fails. Never acquires `SupervisorLock` and never blocks `armd-control`.
+    pub fn read_services(
+        &self,
+        req: ReadRequirements,
+    ) -> Result<Arc<ServiceSnapshot>, ServiceReadError> {
+        let snap = self.latest().ok_or(ServiceReadError::NoSnapshot)?;
+        let identity = self
+            .service_identity()
+            .ok_or(ServiceReadError::IdentityUnavailable)?;
+        let prep_env = if req.require_prep_env {
+            Some(self.prep_env().ok_or(ServiceReadError::PrepEnvUnavailable)?)
+        } else {
+            None
+        };
+        Self::build_service_snapshot_from(snap, identity, prep_env, req, Instant::now())
+    }
+
+    /// Single-authority validator and assembler for [`ServiceSnapshot`] shared by
+    /// [`Self::read_services`] and the legacy no-ticker read fallback.
+    pub fn build_service_snapshot_from(
+        snap: Arc<Snapshot>,
+        identity: Arc<ServiceIdentity>,
+        prep_env: Option<Arc<super::requests::actions::ActionPrepEnv>>,
+        req: ReadRequirements,
+        now: Instant,
+    ) -> Result<Arc<ServiceSnapshot>, ServiceReadError> {
+        if let Some(min_gen) = req.min_generation {
+            if snap.meta.generation < min_gen {
+                return Err(ServiceReadError::GenerationNotReached {
+                    required: min_gen,
+                    actual: snap.meta.generation,
+                });
+            }
+        }
+        if let Some(min_seq) = req.min_publish_seq {
+            if snap.meta.seq < min_seq {
+                return Err(ServiceReadError::SequenceNotReached {
+                    required: min_seq,
+                    actual: snap.meta.seq,
+                });
+            }
+        }
+        if let Some(min_rel) = req.min_release_seq {
+            if snap.rt.owner.control_release_seq < min_rel {
+                return Err(ServiceReadError::ReleaseSequenceNotReached {
+                    required: min_rel,
+                    actual: snap.rt.owner.control_release_seq,
+                });
+            }
+        }
+        if req.require_within_valid_until && now > snap.meta.valid_until {
+            return Err(ServiceReadError::SnapshotExpired);
+        }
+        if let Some(max_age) = req.max_snapshot_age {
+            let age = now.saturating_duration_since(snap.meta.sampled_at);
+            if age > max_age {
+                return Err(ServiceReadError::SnapshotStale {
+                    age_ms: age.as_millis() as u64,
+                    max_ms: max_age.as_millis() as u64,
+                });
+            }
+        }
+        if !identity.matches_owner_meta(&snap.rt.owner) {
+            return Err(ServiceReadError::IdentityMismatch);
+        }
+        let prep_env = if req.require_prep_env {
+            let env = prep_env.ok_or(ServiceReadError::PrepEnvUnavailable)?;
+            if !env.matches_owner_meta(&snap.rt.owner) {
+                return Err(ServiceReadError::PrepEnvMismatch);
+            }
+            Some(env)
+        } else {
+            None
+        };
+        if req.require_feedback_valid && !snap.rt.owner.feedback_valid {
+            return Err(ServiceReadError::FeedbackInvalid);
+        }
+        let arm_dof = identity.arm_dof;
+        let mut feedback_age_at_capture = if arm_dof > 0 && snap.rt.feedback_instants.len() >= arm_dof {
+            Some(Duration::ZERO)
+        } else {
+            None
+        };
+        if let Some(ref mut oldest_at_capture) = feedback_age_at_capture {
+            for slot in &snap.rt.feedback_instants[..arm_dof] {
+                match *slot {
+                    Some(rx) => {
+                        *oldest_at_capture =
+                            (*oldest_at_capture).max(snap.meta.sampled_at.saturating_duration_since(rx));
+                    }
+                    None => {
+                        feedback_age_at_capture = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(max_fb_age) = req.max_feedback_age {
+            if arm_dof == 0 || snap.rt.feedback_instants.len() < arm_dof {
+                return Err(ServiceReadError::FeedbackStale { joint: 0 });
+            }
+            for (joint, slot) in snap.rt.feedback_instants[..arm_dof].iter().enumerate() {
+                let Some(rx) = *slot else {
+                    return Err(ServiceReadError::FeedbackStale { joint });
+                };
+                if now.saturating_duration_since(rx) > max_fb_age {
+                    return Err(ServiceReadError::FeedbackStale { joint });
+                }
+            }
+        }
+        let motion_active = snap.rt.owner.motion_active;
+        let motion_idle = !motion_active
+            && !snap.rt.owner.gravity_comp_active
+            && !snap.rt.owner.policy_busy
+            && !snap.rt.owner.pending_normal_unload
+            && !snap.rt.owner.handover_settling
+            && !snap.owner.torque_transition_pending
+            && !snap.rt.owner.calibration_busy;
+        if req.require_motion_idle && !motion_idle {
+            return Err(ServiceReadError::MotionActive);
+        }
+        if let Some(max_speed) = req.max_arm_joint_speed {
+            if !max_speed.is_finite() || max_speed < 0.0 || arm_dof == 0 || snap.rt.velocities.len() < arm_dof {
+                return Err(ServiceReadError::JointMoving { joint: 0 });
+            }
+            for (joint, &v) in snap.rt.velocities[..arm_dof].iter().enumerate() {
+                if !v.is_finite() || v.abs() > max_speed {
+                    return Err(ServiceReadError::JointMoving { joint });
+                }
+            }
+        }
+        let revisions = ServiceRevisions::from_snapshot(&snap);
+        Ok(Arc::new(ServiceSnapshot {
+            boot: snap.rt.owner.boot,
+            arm: snap.rt.owner.arm,
+            publish_seq: snap.meta.seq,
+            release_seq: snap.rt.owner.control_release_seq,
+            captured_at: snap.meta.sampled_at,
+            valid_until: snap.meta.valid_until,
+            feedback_valid: snap.rt.owner.feedback_valid,
+            feedback_age_at_capture,
+            motion_generation: snap.rt.owner.motion_generation,
+            motion_active,
+            motion_idle,
+            applied_stop_generation: snap.rt.stop_generation,
+            epoch_id: snap.rt.owner.authority.epoch,
+            lease_generation: snap.rt.owner.authority.lease_generation,
+            zero_convention: snap.owner.zero_convention,
+            has_zero_reference: snap.owner.has_zero_reference,
+            revisions,
+            identity,
+            snapshot: snap,
+            prep_env,
+        }))
+    }
+
     /// Records an off-RT measurement payload for action `id` (bounded to `TERMINAL_FIFO_CAPACITY`
     /// entries so sidecars survive across the full terminal reservation window) and patches
     /// the cached latest snapshot if it already carries `id` without a measurement. Never called
@@ -1387,5 +1968,326 @@ mod tests {
             assert!(publisher.publish(seq, now, now + Duration::from_millis(40), o, inputs(&p, &s, &i)).is_none());
         }
         assert_eq!(hub.tick_frees(), 0);
+    }
+
+    #[test]
+    fn read_services_enforces_coherence_freshness_motion_and_live_zero_convention() {
+        let (mut publisher, hub) = state_channel(7);
+        assert_eq!(hub.read_services(ReadRequirements::identity()).unwrap_err(), ServiceReadError::NoSnapshot);
+
+        let now = Instant::now();
+        let p = [0.0f32; 7];
+        let v_still = [0.001f32; 7];
+        let v_moving = [0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let s = [1u64; 7];
+        let fresh_i = [Some(now); 7];
+        let boot = BootId(42);
+        let tool_hash = super::super::ops::tool_digest_hash("sha256:tool-a");
+
+        let mut owner_meta = PublishedOwnerMeta {
+            arm: ArmId::LOCAL,
+            boot,
+            control_release_seq: 10,
+            motion_generation: 3,
+            calibration_revision: 5,
+            collision_revision: 2,
+            poses_revision: 4,
+            sequences_revision: 6,
+            grasp_setup_revision: 7,
+            gripper_calib_revision: 8,
+            power_budget_revision: 9,
+            tool_commissioning_revision: 11,
+            tool_digest_hash: tool_hash,
+            feedback_valid: true,
+            ..PublishedOwnerMeta::default()
+        };
+        owner_meta.authority.config_revision = 12;
+        owner_meta.authority.epoch = 2;
+        owner_meta.authority.lease_generation = 1;
+
+        let mut owner_state = OwnerStateSnapshot::default();
+        owner_state.boot = boot;
+        owner_state.has_zero_reference = true;
+        owner_state.zero_convention.status = "legacy_j6";
+        owner_state.zero_convention.j6_rad = Some(1.57);
+
+        let mut rt_meta = RtMotionMeta::default();
+        rt_meta.boot_id = boot;
+        rt_meta.motion_config_revision = 13;
+        rt_meta.stop_generation = 4;
+
+        let rt = RtInputs {
+            positions: &p,
+            velocities: &v_still,
+            commanded_positions: &p,
+            commanded_velocities: &p,
+            feedback_instants: &fresh_i,
+            feedback_seqs: &s,
+            feedback_queue_bounds: &[],
+            owner: owner_meta,
+            meta: rt_meta,
+        };
+        publisher.publish_with_owner(20, now, now + Duration::from_secs(5), obs(1.0), owner_state, rt);
+
+        // Missing identity fails closed.
+        assert_eq!(
+            hub.read_services(ReadRequirements::identity()).unwrap_err(),
+            ServiceReadError::IdentityUnavailable
+        );
+
+        let base_identity = ServiceIdentity {
+            arm: ArmId::LOCAL,
+            boot,
+            profile_id: Some("rebot-dm".into()),
+            follower: Some("mock".into()),
+            dof: 7,
+            arm_dof: 6,
+            control_frequency_hz: 50,
+            joint_names: (1..=7).map(|i| format!("j{i}")).collect(),
+            tool_id: "stock".into(),
+            tool_config_digest: "sha256:tool-a".into(),
+            tool_digest_hash: tool_hash,
+            tool_is_stock: true,
+            joint_zero_offsets: vec![0.0; 7],
+            calibration_revision: 5,
+        };
+
+        // Mismatched boot / calibration_revision / tool_digest_hash all fail closed.
+        let mut wrong_boot = base_identity.clone();
+        wrong_boot.boot = BootId(99);
+        hub.set_service_identity(Arc::new(wrong_boot));
+        assert_eq!(
+            hub.read_services(ReadRequirements::identity()).unwrap_err(),
+            ServiceReadError::IdentityMismatch
+        );
+
+        let mut wrong_cal = base_identity.clone();
+        wrong_cal.calibration_revision = 4;
+        hub.set_service_identity(Arc::new(wrong_cal));
+        assert_eq!(
+            hub.read_services(ReadRequirements::identity()).unwrap_err(),
+            ServiceReadError::IdentityMismatch
+        );
+
+        let mut wrong_tool = base_identity.clone();
+        wrong_tool.tool_digest_hash = super::super::ops::tool_digest_hash("sha256:tool-b");
+        hub.set_service_identity(Arc::new(wrong_tool));
+        assert_eq!(
+            hub.read_services(ReadRequirements::identity()).unwrap_err(),
+            ServiceReadError::IdentityMismatch
+        );
+
+        // Matching identity succeeds and pulls live zero_convention + revisions from the RT slot.
+        hub.set_service_identity(Arc::new(base_identity.clone()));
+        let svc = hub
+            .read_services(ReadRequirements::fresh_feedback(Duration::from_secs(1)))
+            .expect("coherent read_services");
+        assert_eq!(svc.boot, boot);
+        assert_eq!(svc.publish_seq, 1);
+        assert_eq!(svc.release_seq, 10);
+        assert_eq!(svc.motion_generation, 3);
+        assert_eq!(svc.applied_stop_generation, 4);
+        assert_eq!(svc.epoch_id, 2);
+        assert_eq!(svc.lease_generation, 1);
+        assert!(svc.motion_idle);
+        assert_eq!(svc.zero_convention.status, "legacy_j6");
+        assert!(svc.has_zero_reference);
+        assert_eq!(svc.revisions.workspace, 12);
+        assert_eq!(svc.revisions.motion_config, 13);
+        assert_eq!(svc.revisions.calibration, 5);
+        assert_eq!(svc.revisions.collision, 2);
+        assert_eq!(svc.revisions.tool_commissioning, 11);
+        assert_eq!(svc.revisions.tool_digest_hash, tool_hash);
+
+        // Generation / release sequence bounds fail closed.
+        let mut req_gen = ReadRequirements::default();
+        req_gen.min_generation = Some(21);
+        assert_eq!(
+            hub.read_services(req_gen).unwrap_err(),
+            ServiceReadError::GenerationNotReached { required: 21, actual: 20 }
+        );
+        let mut req_rel = ReadRequirements::default();
+        req_rel.min_release_seq = Some(11);
+        assert_eq!(
+            hub.read_services(req_rel).unwrap_err(),
+            ServiceReadError::ReleaseSequenceNotReached { required: 11, actual: 10 }
+        );
+
+        // Missing prep_env when required fails closed.
+        let mut req_prep = ReadRequirements::default();
+        req_prep.require_prep_env = true;
+        assert_eq!(hub.read_services(req_prep).unwrap_err(), ServiceReadError::PrepEnvUnavailable);
+
+        // Mismatched prep_env fails closed; matching prep_env succeeds.
+        let inner_cfg = crate::supervisor::SupervisorInner::new(crate::ArmConfig::rebot_dm());
+        let mut env = super::super::requests::actions::ActionPrepEnv::from_inner(&inner_cfg);
+        hub.update_prep_env(Arc::new(env.clone()));
+        assert_eq!(hub.read_services(req_prep).unwrap_err(), ServiceReadError::PrepEnvMismatch);
+        env.workspace_revision = 12;
+        env.calibration_revision = 5;
+        env.poses_revision = 4;
+        env.sequences_revision = 6;
+        env.grasp_setup_revision = 7;
+        env.gripper_calib_revision = 8;
+        env.power_budget_revision = 9;
+        env.tool_digest_hash = tool_hash;
+        hub.update_prep_env(Arc::new(env));
+        assert!(hub.read_services(req_prep).unwrap().prep_env.is_some());
+
+        // Missing joint timestamp fails closed under max_feedback_age.
+        let mut missing_j2 = fresh_i;
+        missing_j2[2] = None;
+        let rt_missing = RtInputs {
+            positions: &p,
+            velocities: &v_still,
+            commanded_positions: &p,
+            commanded_velocities: &p,
+            feedback_instants: &missing_j2,
+            feedback_seqs: &s,
+            feedback_queue_bounds: &[],
+            owner: owner_meta,
+            meta: rt_meta,
+        };
+        publisher.publish_with_owner(21, now, now + Duration::from_secs(5), obs(2.0), owner_state, rt_missing);
+        assert_eq!(
+            hub.read_services(ReadRequirements::fresh_feedback(Duration::from_secs(1))).unwrap_err(),
+            ServiceReadError::FeedbackStale { joint: 2 }
+        );
+
+        // Gravity comp blocks motion_idle; moving joint blocks max_arm_joint_speed.
+        let mut gc_owner = owner_meta;
+        gc_owner.gravity_comp_active = true;
+        let rt_gc = RtInputs {
+            positions: &p,
+            velocities: &v_still,
+            commanded_positions: &p,
+            commanded_velocities: &p,
+            feedback_instants: &fresh_i,
+            feedback_seqs: &s,
+            feedback_queue_bounds: &[],
+            owner: gc_owner,
+            meta: rt_meta,
+        };
+        publisher.publish_with_owner(22, now, now + Duration::from_secs(5), obs(3.0), owner_state, rt_gc);
+        assert_eq!(
+            hub.read_services(ReadRequirements::measure(Duration::from_secs(1), 0.02)).unwrap_err(),
+            ServiceReadError::MotionActive
+        );
+
+        let rt_moving = RtInputs {
+            positions: &p,
+            velocities: &v_moving,
+            commanded_positions: &p,
+            commanded_velocities: &p,
+            feedback_instants: &fresh_i,
+            feedback_seqs: &s,
+            feedback_queue_bounds: &[],
+            owner: owner_meta,
+            meta: rt_meta,
+        };
+        publisher.publish_with_owner(23, now, now + Duration::from_secs(5), obs(4.0), owner_state, rt_moving);
+        assert_eq!(
+            hub.read_services(ReadRequirements::measure(Duration::from_secs(1), 0.02)).unwrap_err(),
+            ServiceReadError::JointMoving { joint: 1 }
+        );
+        // Non-finite speed limit fails closed; handover_settling blocks motion_idle.
+        let mut req_nan = ReadRequirements::default();
+        req_nan.max_arm_joint_speed = Some(f32::NAN);
+        assert_eq!(
+            hub.read_services(req_nan).unwrap_err(),
+            ServiceReadError::JointMoving { joint: 0 }
+        );
+        let mut hs_owner = owner_meta;
+        hs_owner.handover_settling = true;
+        let rt_hs = RtInputs {
+            positions: &p,
+            velocities: &v_still,
+            commanded_positions: &p,
+            commanded_velocities: &p,
+            feedback_instants: &fresh_i,
+            feedback_seqs: &s,
+            feedback_queue_bounds: &[],
+            owner: hs_owner,
+            meta: rt_meta,
+        };
+        publisher.publish_with_owner(24, now, now + Duration::from_secs(5), obs(4.5), owner_state, rt_hs);
+        assert_eq!(
+            hub.read_services(ReadRequirements::measure(Duration::from_secs(1), 0.02)).unwrap_err(),
+            ServiceReadError::MotionActive
+        );
+
+        // Expired valid_until fails closed when require_within_valid_until is true, allowed by identity().
+        let past = now - Duration::from_secs(1);
+        let rt_expired = RtInputs {
+            positions: &p,
+            velocities: &v_still,
+            commanded_positions: &p,
+            commanded_velocities: &p,
+            feedback_instants: &fresh_i,
+            feedback_seqs: &s,
+            feedback_queue_bounds: &[],
+            owner: owner_meta,
+            meta: rt_meta,
+        };
+        publisher.publish_with_owner(25, past, past, obs(5.0), owner_state, rt_expired);
+        assert_eq!(
+            hub.read_services(ReadRequirements::default()).unwrap_err(),
+            ServiceReadError::SnapshotExpired
+        );
+        assert_eq!(hub.read_services(ReadRequirements::identity()).unwrap().publish_seq, 6);
+    }
+
+    #[tokio::test]
+    async fn supervisor_read_services_works_on_legacy_and_executor_and_tracks_motion_generation() {
+        let sup = Arc::new(crate::supervisor::ArmSupervisor::new(crate::ArmConfig::rebot_dm()));
+
+        // Legacy without control ticker falls back cleanly under one read guard.
+        let legacy_svc = sup
+            .read_services(ReadRequirements::identity())
+            .await
+            .expect("legacy no-ticker read_services");
+        assert_eq!(legacy_svc.identity.dof, 7);
+        assert_eq!(legacy_svc.identity.arm_dof, 6);
+        assert!(legacy_svc.motion_idle);
+
+        // Start RT executor and wait for its first post-handoff published sample.
+        let handle = sup
+            .start_executor(super::super::executor::ExecutorConfig::for_tests(
+                Duration::from_millis(20),
+            ))
+            .await
+            .expect("start executor");
+        let mut exec_svc = None;
+        for _ in 0..50 {
+            if let Ok(s) = sup.read_services(ReadRequirements::default()).await {
+                exec_svc = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s1 = exec_svc.expect("executor must publish coherent ServiceSnapshot past handoff");
+        assert!(s1.publish_seq >= 1);
+        assert!(s1.release_seq >= 1);
+        assert_eq!(s1.identity.boot, s1.boot);
+        let gen_before = s1.motion_generation;
+
+        // Triggering E-stop bumps epoch and motion_generation on the next release.
+        let _ = sup.trigger_e_stop().await;
+        let mut s2 = None;
+        for _ in 0..50 {
+            if let Ok(s) = sup.read_services(ReadRequirements::default()).await {
+                if s.motion_generation > gen_before {
+                    s2 = Some(s);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s2 = s2.expect("motion_generation must advance after E-stop");
+        assert!(s2.motion_generation > gen_before);
+        assert!(s2.epoch_id > s1.epoch_id);
+        assert!(s2.release_seq > s1.release_seq);
+
+        handle.stop_and_join();
     }
 }

@@ -7,28 +7,38 @@
 use super::*;
 #[cfg(feature = "policy-runtime")]
 use super::dispatch::{
-    AdmissionClass, AuthRequirement, DispatchHandler, DispatchKey, LeaseRequirement,
-    OwnerDispatchCtx, OwnerReply, ReplyPolicy,
+    AdmissionClass, AuthRequirement, DispatchHandler, DispatchKey, ExecutorWsRoute,
+    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
 use super::dispatch::DispatchEntry;
+#[cfg(feature = "policy-runtime")]
+use crate::api::routes::{FaultAvailability, RouteOwnership};
 
 #[cfg(feature = "policy-runtime")]
 pub(super) const ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
         key: DispatchKey::command("/api/v1/action/policy/start"),
         handler: DispatchHandler::Owner(dispatch_policy_start),
+        handler_name: "ws::policy::dispatch_policy_start",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::Conditional(policy_start_auth_check),
         reply: ReplyPolicy::CommandDeferred,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Policy,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/action/policy/stop"),
         handler: DispatchHandler::Owner(dispatch_policy_stop),
+        handler_name: "ws::policy::dispatch_policy_stop",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::CommandImmediate,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Policy,
     },
 ];
 

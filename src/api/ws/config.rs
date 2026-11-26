@@ -13,9 +13,10 @@
 #[allow(unused_imports)]
 use super::*;
 use super::dispatch::{
-    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, ExecutorWsRoute,
     FrameKind, LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
+use crate::api::routes::{FaultAvailability, RouteOwnership};
 use crate::model::{HolderLabel, KeepoutBox};
 use crate::motion::MotionError;
 use crate::persist::PendingWrite;
@@ -32,10 +33,14 @@ macro_rules! config_entry {
         DispatchEntry {
             key: DispatchKey::command($path),
             handler: DispatchHandler::Owner(dispatch_config_entry),
+            handler_name: "ws::config::dispatch_config_entry",
             admission: AdmissionClass::Ordinary,
             lease: LeaseRequirement::Required,
             auth: AuthRequirement::Operator(None),
             reply: ReplyPolicy::CommandDeferred,
+            ownership: RouteOwnership::ExecutorRequest,
+            fault: FaultAvailability::Fenced,
+            executor_route: ExecutorWsRoute::ConfigOrCalib,
         }
     };
 }
