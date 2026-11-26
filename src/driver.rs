@@ -16007,6 +16007,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // holding the request pending (`DamiaoTorque::AwaitRestGate`) to retry on subsequent
         // releases inside the 1 s lifetime (0 `CMD_DISABLE` frames). Protective disables bypass Rule A′.
         let new_awaiting_rx_boundary = match max_rx_frames {
+            Some(0) if matches!(kind, DisableKind::DisableProtective { .. }) => {
+                // Protective disables bypass Rule A' and must run safety TX even at 0 RX.
+                self.awaiting_rx_boundary
+            }
             Some(0) => self.awaiting_rx_boundary || !self.last_read_drained,
             Some(limit) => {
                 self.last_poll_rx = None;
@@ -17902,8 +17906,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         );
         if is_disable_pre_all
             && (self.mit_fence_trip.is_some()
-                || !self.last_read_drained
-                || self.awaiting_rx_boundary)
+                || ((!self.last_read_drained || self.awaiting_rx_boundary)
+                    && !(self.in_active_control_release() && self.driver_remaining_release_rx() == 0)))
         {
             return None;
         }
@@ -17944,7 +17948,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.in_poll_torque = true;
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
-        self.rx_frame_limit = Some(self.clamp_release_rx_limit(max_rx_frames));
+        let effective_rx_limit = self.clamp_release_rx_limit(max_rx_frames);
+        self.rx_frame_limit = Some(effective_rx_limit);
         let is_enable_hs = matches!(
             self.torque_hs,
             Some(
@@ -18076,8 +18081,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             } else if is_disable_pre_all
                 && self.mit_fence_trip.is_none()
-                && self.last_read_drained
-                && !self.awaiting_rx_boundary
+                && ((self.last_read_drained && !self.awaiting_rx_boundary)
+                    || effective_rx_limit == 0)
             {
                 if let Ok(TorqueProgress::Pending { wake }) = r {
                     let _ = self.service_energized_watchdog_holds(
@@ -23882,7 +23887,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
-        self.rx_frame_limit = Some(self.clamp_release_rx_limit(max_rx_frames));
+        let effective_rx_limit = self.clamp_release_rx_limit(max_rx_frames);
+        self.rx_frame_limit = Some(effective_rx_limit);
         let r = self.receive_feedback();
         self.rx_deadline = None;
         self.rx_frame_limit = None;

@@ -1991,16 +1991,19 @@ impl CoreOps for SupervisorInner {
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> HardwarePoll {
         let now = now_fn();
-        if budget.deadline_exceeded(now) || budget.rx_remaining() == 0 {
-            if budget.rx_remaining() == 0 {
-                budget.mark_rx_exhausted();
-            }
+        if budget.deadline_exceeded(now) {
             return HardwarePoll {
                 driverless: self.driver.is_none(),
                 budget_exhausted: true,
                 torque: self.core.poll_transition(),
                 ..HardwarePoll::default()
             };
+        }
+        // RX exhaustion skips reading (`sb.max_rx_frames == 0`), but MUST NOT suppress
+        // TX-capable transition work (inline watchdog holds and protective disable retries).
+        let rx_was_zero = budget.rx_remaining() == 0;
+        if rx_was_zero {
+            budget.mark_rx_exhausted();
         }
         match self.install_driver_tx_release_cap_with_clock(budget.deadline(), now_fn) {
             crate::supervisor::DriverTxCapOutcome::Expired => HardwarePoll {
@@ -2020,7 +2023,7 @@ impl CoreOps for SupervisorInner {
                     budget,
                     before,
                     poll.rx_frames,
-                    poll.budget_exhausted,
+                    poll.budget_exhausted || rx_was_zero,
                     0,
                 );
                 poll.budget_exhausted |= budget.rx_exhausted();
@@ -2108,7 +2111,9 @@ impl CoreOps for SupervisorInner {
                 }
                 tp.rx.unwrap_or((0, false))
             }
-            None => (0, false),
+            None => self
+                .service_background_disable_with_clock(budget, now_fn)
+                .unwrap_or((0, false)),
         };
         let budget_exhausted = budget.now > budget.deadline || trans_exhausted;
         let Some(driver) = self.driver.as_ref() else {

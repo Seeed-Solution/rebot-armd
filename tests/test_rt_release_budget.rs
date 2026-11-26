@@ -1044,3 +1044,153 @@ fn clear_fault_maintenance_shares_release_ledger_and_begin_tx_tick_preserves_spe
     );
     assert_eq!(ledger2.tx_remaining(), 1);
 }
+
+#[test]
+fn zero_remaining_rx_still_runs_inline_watchdog_holds_and_protective_disable_retries() {
+    use armd::driver::{DisableKind, DisableProtectiveReason, TorqueProgress};
+
+    let clock = MockClock::new();
+    let (bus, mut drv, cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    drv.set_torque(true).expect("enable torque");
+
+    // 1. Protective disable retries at 0 remaining RX in `poll_hardware_with_budget` and
+    //    `poll_transition_wake_with_budget`: skip RX reading (0 RX consumed) while STILL
+    //    transmitting `CMD_DISABLE` retry frames!
+    bus.with(|s| {
+        s.immediate_replies = false;
+        s.rx.clear();
+        for i in 0..8u8 {
+            s.rx.push_back(stray_frame(i));
+        }
+        s.tx_log.clear();
+    });
+    let prog = drv
+        .begin_disable_torque_budgeted(
+            DisableKind::DisableProtective {
+                reason: DisableProtectiveReason::Thermal,
+            },
+            0,
+        )
+        .expect("begin protective disable");
+    assert!(matches!(prog, TorqueProgress::Pending { .. }));
+    let mut core = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+    core.lease_enabled = false;
+    core.rt_executor_owned = true;
+    core.disable_pending = true;
+
+    // Advance past DAMIAO_DISABLE_REPEAT_INTERVAL (20 ms) so the protective repeat pass is due.
+    clock.advance(Duration::from_millis(25));
+    bus.with(|s| s.tx_log.clear());
+    let rx_before = bus.with(|s| s.rx.len());
+    let t0 = clock.now();
+    // Ledger with 0 RX remaining and positive deadline/TX:
+    let mut zero_rx_ledger = ReleaseBudget::new(300, t0, t0 + Duration::from_millis(10), 0, 16);
+    let mut now_fn = || clock.now();
+    let poll = core.poll_hardware_with_budget(&mut zero_rx_ledger, &mut now_fn);
+    assert!(poll.budget_exhausted);
+    assert_eq!(
+        bus.with(|s| s.rx.len()),
+        rx_before,
+        "0 remaining RX must skip reading RX frames"
+    );
+    let disable_tx_sent = bus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE)
+            .count()
+    });
+    assert!(
+        disable_tx_sent >= 1,
+        "protective disable retries must still transmit CMD_DISABLE at 0 remaining RX (sent {disable_tx_sent})"
+    );
+
+    // 2. Inline watchdog holds during Window 2 wake (`poll_transition_wake_with_budget`) at
+    //    0 remaining RX: skip RX reading while STILL transmitting watchdog hold frames!
+    let (bus2, mut drv2, cfg2) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    drv2.set_torque(true).expect("enable torque");
+    let mut core2 = SupervisorInner::new(cfg2).with_driver(Box::new(drv2));
+    core2.lease_enabled = false;
+    core2.rt_executor_owned = true;
+    // Enter pre-all disable wait (`AwaitRestGate`) while motors are energized (RX not drained),
+    // then advance past WATCHDOG_DISABLE_FALLBACK_INTERVAL (30 ms) so inline watchdog holds are due.
+    bus2.with(|s| {
+        s.immediate_replies = false;
+        s.rx.clear();
+        for i in 0..8u8 {
+            s.rx.push_back(stray_frame(i));
+        }
+    });
+    core2
+        .driver
+        .as_mut()
+        .unwrap()
+        .try_with_mut(|d| {
+            let mut states = Vec::new();
+            let _ = d.read_joint_states_budgeted(&mut states, clock.now() + Duration::from_millis(5), 1);
+            let started_at = clock.now();
+            let p2 = d
+                .begin_disable_torque_budgeted(DisableKind::DisableRequested { started_at }, 0)
+                .expect("begin disable awaiting rest gate");
+            assert!(matches!(p2, TorqueProgress::Pending { .. }));
+        })
+        .unwrap();
+    core2.disable_pending = true;
+    // Directly invoke `poll_torque_budgeted(deadline, 0)` after 35 ms elapsed -> must emit
+    // inline watchdog holds for energized arm joints while consuming 0 RX frames.
+    clock.advance(Duration::from_millis(35));
+    bus2.with(|s| s.tx_log.clear());
+    let rx2_before = bus2.with(|s| s.rx.len());
+    let t1 = clock.now();
+    let zero_rx_wake = ReleaseBudget::new(301, t1, t1 + Duration::from_millis(10), 0, 16);
+    core2
+        .driver
+        .as_mut()
+        .unwrap()
+        .try_with_mut(|d| {
+            d.begin_control_release(301);
+            d.set_tx_release_deadline(Some(t1 + Duration::from_millis(8)));
+            let _ = d.poll_torque_budgeted(t1 + Duration::from_millis(8), zero_rx_wake.rx_remaining());
+            d.set_tx_release_deadline(None);
+        })
+        .unwrap();
+    assert_eq!(
+        bus2.with(|s| s.rx.len()),
+        rx2_before,
+        "0 remaining RX must consume 0 RX frames during inline watchdog hold poll"
+    );
+    let hold_frames = bus2.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| (0x101..=0x106).contains(&f.id))
+            .count()
+    });
+    assert_eq!(
+        hold_frames, 6,
+        "inline watchdog holds must refresh all 6 energized arm axes even at 0 remaining RX"
+    );
+
+    // 3. Also verify `poll_transition_wake_with_budget` does not early-return on 0 RX when
+    //    protective disable retries are pending (consumes 0 RX, transmits CMD_DISABLE).
+    clock.advance(Duration::from_millis(25));
+    let t3 = clock.now();
+    bus.with(|s| s.tx_log.clear());
+    let rx_wake_before = bus.with(|s| s.rx.len());
+    let mut wake_ledger = ReleaseBudget::new(303, t3, t3 + Duration::from_millis(10), 0, 16);
+    let wake_poll = core.poll_transition_wake_with_budget(&mut wake_ledger, &mut || clock.now());
+    assert!(wake_poll.budget_exhausted);
+    assert_eq!(
+        bus.with(|s| s.rx.len()),
+        rx_wake_before,
+        "Window 2 transition wake at 0 RX must not read RX frames"
+    );
+    let wake_disable_tx = bus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE)
+            .count()
+    });
+    assert!(
+        wake_disable_tx >= 1,
+        "Window 2 transition wake at 0 RX must still transmit protective CMD_DISABLE retries (sent {wake_disable_tx})"
+    );
+}

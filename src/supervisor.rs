@@ -9082,16 +9082,20 @@ impl SupervisorInner {
             (rx_frames, true)
         } else {
             let sb_t = make_sb(budget, step_now);
-            let transition_rx = if sb_t.max_rx_frames == 0 || sb_t.now > sb_t.deadline {
-                if sb_t.max_rx_frames == 0 {
-                    budget.mark_rx_exhausted();
-                }
+            let rx_zero_before_t = sb_t.max_rx_frames == 0;
+            if rx_zero_before_t {
+                budget.mark_rx_exhausted();
+            }
+            let transition_rx = if sb_t.now > sb_t.deadline {
                 if self.torque_transition.is_some() || self.disable_pending {
                     Some((0, true))
                 } else {
                     None
                 }
             } else {
+                // Zero remaining RX skips reading inside the driver (`max_rx_frames == 0`),
+                // but MUST still run TX-capable transition work (inline watchdog holds and
+                // protective disable retries).
                 let before_t = self.sync_driver_budget_before(budget);
                 let trans = self.service_torque_transition_with_clock(&sb_t, now_fn);
                 let t_rx = if let Some(tp) = trans {
@@ -9108,11 +9112,15 @@ impl SupervisorInner {
                     self.service_background_disable_with_clock(&sb_t, now_fn)
                 };
                 if let Some((tf, tex)) = t_rx {
-                    self.charge_driver_budget_after(budget, before_t, tf, tex, 0);
+                    self.charge_driver_budget_after(budget, before_t, tf, tex || rx_zero_before_t, 0);
                 } else {
-                    self.charge_driver_budget_after(budget, before_t, 0, false, 0);
+                    self.charge_driver_budget_after(budget, before_t, 0, rx_zero_before_t, 0);
                 }
-                t_rx
+                if rx_zero_before_t && (self.torque_transition.is_some() || self.disable_pending || t_rx.is_some()) {
+                    Some((t_rx.map_or(0, |(f, _)| f), true))
+                } else {
+                    t_rx
+                }
             };
             let before_rx = self.sync_driver_budget_before(budget);
             let sb_rx = make_sb(budget, now_fn());
