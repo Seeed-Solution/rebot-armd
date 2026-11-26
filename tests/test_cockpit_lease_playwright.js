@@ -101,7 +101,26 @@ async function unlockOperatorToken(port, pin) {
   return body.token;
 }
 
-async function spawnArmd(port, extraArgs = []) {
+async function allocFreePort() {
+  for (let i = 0; i < 16; i++) {
+    const port = await new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.once('error', reject);
+      srv.once('listening', () => {
+        const p = srv.address().port;
+        srv.close(() => resolve(p));
+      });
+      srv.listen(0, '127.0.0.1');
+    });
+    if (!FORBIDDEN_PORTS.has(port)) {
+      ALLOWED_PORTS.add(port);
+      return port;
+    }
+  }
+  throw new Error('Could not allocate a non-forbidden free port');
+}
+
+async function spawnArmd(port, extraArgs = [], { extraEnv = {}, waitOwnerStatus = false } = {}) {
   assertPortAllowed(port);
   if (shuttingDown) throw new Error('spawnArmd aborted: shutting down');
   await assertPortFree(port);
@@ -112,8 +131,10 @@ async function spawnArmd(port, extraArgs = []) {
     cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env, RUST_LOG: process.env.RUST_LOG || 'warn',
+      ARMD_APP_CONFIG: 'off',
       ARMD_POSES: path.join(tempStateDir, `poses_${port}.json`),
       ARMD_SEQUENCES: path.join(tempStateDir, `sequences_${port}.json`),
+      ...extraEnv,
     },
   });
   const recLog = (c) => { logs.push(c.toString('utf8')); if (logs.length > 120) logs.shift(); };
@@ -125,6 +146,12 @@ async function spawnArmd(port, extraArgs = []) {
   await waitFor(async () => {
     if (shuttingDown) throw new Error('shutting down');
     if (child.exitCode !== null) throw new Error(`armd exited early (${child.exitCode}):\n${logs.join('')}`);
+    if (waitOwnerStatus) {
+      const res = await fetch(`http://127.0.0.1:${port}/api/v1/owner/status`, { cache: 'no-store' });
+      if (!res.ok) return null;
+      const st = await res.json();
+      return st && st.effective_owner ? st : null;
+    }
     const o = await getObs(port);
     return Array.isArray(o?.positions) && o.positions.length > 0 ? o : null;
   }, { timeoutMs: 15000, intervalMs: 100, label: `armd ready on ${port}` });
@@ -579,6 +606,480 @@ async function clearEstopExternal(port, { pin = null } = {}) {
   });
 }
 
+async function runScenario9OwnerHonesty(browserInst) {
+  log('=== Scenario 9: Honest cockpit owner status, fallback banners, and up-front feature gating ===');
+  const viewports = [
+    { tag: '390', width: 390, height: 844 },
+    { tag: '1024', width: 1024, height: 768 },
+  ];
+  const langs = [
+    { code: 'zh', locale: 'zh-CN' },
+    { code: 'en', locale: 'en-US' },
+  ];
+
+  // --- 9A. Executor default (auto -> executor): stroke & hardware-executor gravity gating ---
+  {
+    const port = await allocFreePort();
+    const proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth']);
+    try {
+      const st = await (await fetch(`http://127.0.0.1:${port}/api/v1/owner/status`, { cache: 'no-store' })).json();
+      assert.equal(st.effective_owner, 'executor');
+      assert.equal(st.owner_reason, 'auto_qualified');
+      assert.equal(st.is_fallback, false);
+      assert(st.legacy_only_routes.ws.includes('/api/v1/action/gripper_calibrate'));
+
+      for (const lang of langs) {
+        for (const vp of viewports) {
+          const tag = `exec_${lang.code}_${vp.tag}`;
+          const { ctx, page, guards, rec } = await newCockpit(browserInst, port, { width: vp.width, height: vp.height, locale: lang.locale });
+          try {
+            await ctx.addInitScript((l) => { try { localStorage.setItem('lang', l); } catch (_) {} }, lang.code);
+            await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
+            await waitForCockpitLive(page);
+            await waitFn(page, () => S.ownerDiag && S.ownerDiag.effective_owner === 'executor', null, 5000);
+
+            // Normal executor hides owner banner.
+            assert.equal(await page.evaluate(() => document.getElementById('owner-banner').hidden), true, `${tag}: normal executor must hide owner banner`);
+
+            // Mock driverless executor keeps #btn-gc available (capability-driven, NOT hard-coded to owner).
+            assert.equal(await page.evaluate(() => S.caps?.gravity_comp === true && S.obs?.gravity_comp?.supported === true), true, `${tag}: mock executor should advertise gravity_comp`);
+
+            // Ensure arm is Armed + torqued so torque precondition is satisfied.
+            await ensureArmedUnleased(port, page);
+
+            // Open Settings -> Gripper calibration: #gb-run must be disabled up front with specific legacy reason.
+            await page.click('#btn-sset');
+            await waitShown(page, '#sset', 3000);
+            await page.click('#tool-gripper');
+            await waitShown(page, '#gtool', 3000);
+            await waitFn(page, () => !!document.getElementById('gb-run'), null, 3000);
+
+            const gbInfo = await page.evaluate(() => {
+              const btn = document.getElementById('gb-run');
+              const why = document.getElementById('gb-owner-why');
+              return {
+                disabled: btn?.disabled,
+                ariaDisabled: btn?.getAttribute('aria-disabled'),
+                title: btn?.title || '',
+                whyText: why?.textContent?.trim() || '',
+                sw: document.documentElement.scrollWidth,
+                iw: window.innerWidth,
+              };
+            });
+            assert.equal(gbInfo.disabled, true, `${tag}: #gb-run must be disabled on executor`);
+            assert.equal(gbInfo.ariaDisabled, 'true', `${tag}: #gb-run aria-disabled must be true`);
+            assert(gbInfo.whyText.includes('arm.armd_owner') && /legacy/i.test(gbInfo.whyText), `${tag}: #gb-owner-why missing config fix: ${gbInfo.whyText}`);
+            assert(lang.code === 'zh' ? /完整夹爪行程标定/.test(gbInfo.whyText) : /Full gripper stroke calibration/i.test(gbInfo.whyText), `${tag}: wrong lang in #gb-owner-why: ${gbInfo.whyText}`);
+            assert(gbInfo.sw <= gbInfo.iw, `${tag}: horizontal overflow in gtool (${gbInfo.sw} > ${gbInfo.iw})`);
+            const markGb = rec.mark();
+            await page.evaluate(() => { document.getElementById('gb-run')?.click(); });
+            await page.waitForTimeout(150);
+            assert.equal(rec.commands('/api/v1/action/gripper_calibrate', markGb).length, 0, `${tag}: disabled #gb-run must not send WS command`);
+
+            const strokeShot = path.join(SHOT_DIR, `owner_executor_stroke_gated_${lang.code}_${vp.tag}.png`);
+            await page.screenshot({ path: strokeShot });
+            log(`Saved screenshot: ${strokeShot}`);
+            await page.click('#gtool-close');
+            await waitHidden(page, '#gtool', 2000);
+
+            // Hardware-executor capability parity (B601-DM hardware reports gravity_comp.supported=false + EXECUTOR_CAPABILITY_UNSUPPORTED).
+            rec.hooks.onServerMsg = (m) => {
+              if (m && Array.isArray(m.positions) && m.gravity_comp) {
+                const patched = {
+                  ...m,
+                  gravity_comp: {
+                    ...m.gravity_comp,
+                    supported: false,
+                    blocker: {
+                      code: 'EXECUTOR_CAPABILITY_UNSUPPORTED',
+                      message: 'Gravity compensation hardware MIT mode-switch is not supported on the RT executor; set arm.armd_owner to legacy and restart armd',
+                    },
+                  },
+                };
+                return JSON.stringify(patched);
+              }
+              return 'forward';
+            };
+            await page.evaluate(() => { if (S.caps) S.caps.gravity_comp = false; });
+            await waitFn(page, () => S.obs?.gravity_comp?.blocker?.code === 'EXECUTOR_CAPABILITY_UNSUPPORTED', null, 4000);
+            await page.waitForTimeout(150);
+
+            const gcInfo = await page.evaluate(() => {
+              const sw = document.getElementById('btn-gc');
+              const sub = document.getElementById('gc-sub');
+              return {
+                hidden: sw?.hidden,
+                blocked: sw?.classList.contains('blocked'),
+                ariaDisabled: sw?.getAttribute('aria-disabled'),
+                subText: sub?.textContent?.trim() || '',
+                sw: document.documentElement.scrollWidth,
+                iw: window.innerWidth,
+              };
+            });
+            assert.equal(gcInfo.hidden, false, `${tag}: #btn-gc must stay visible when gated by EXECUTOR_CAPABILITY_UNSUPPORTED`);
+            assert.equal(gcInfo.blocked, true, `${tag}: #btn-gc must have .blocked`);
+            assert.equal(gcInfo.ariaDisabled, 'true', `${tag}: #btn-gc must have aria-disabled=true`);
+            assert(gcInfo.subText.includes('arm.armd_owner') && /legacy/i.test(gcInfo.subText), `${tag}: #gc-sub missing fix: ${gcInfo.subText}`);
+            assert(gcInfo.sw <= gcInfo.iw, `${tag}: horizontal overflow on gravity gated (${gcInfo.sw} > ${gcInfo.iw})`);
+
+            // Tapping #btn-gc (aria-disabled) shows toast with cause+fix and never submits /api/v1/mode/gravity_comp.
+            const markGc = rec.mark();
+            await clearToasts(page);
+            await page.locator('#btn-gc').scrollIntoViewIfNeeded();
+            await page.locator('#btn-gc').click({ force: true });
+            await page.waitForTimeout(200);
+            const gcToasts = await getToasts(page);
+            assert(gcToasts.all.includes('arm.armd_owner') && /legacy/i.test(gcToasts.all), `${tag}: tapping gated #btn-gc must toast cause+fix, got: ${gcToasts.all}`);
+            assert.equal(rec.commands('/api/v1/mode/gravity_comp', markGc).length, 0, `${tag}: gated #btn-gc must not send gravity_comp command`);
+
+            const gcShot = path.join(SHOT_DIR, `owner_executor_gravity_gated_${lang.code}_${vp.tag}.png`);
+            await page.screenshot({ path: gcShot });
+            log(`Saved screenshot: ${gcShot}`);
+
+            // Calibration wizard hand-guide button is also disabled with specific executor reason.
+            await clearToasts(page);
+            await page.evaluate(async () => { cwOpen(true); await cwLoad(); CWZ.step = 'place'; cwRender(); });
+            await waitShown(page, '#cwiz', 3000);
+            await waitFn(page, () => !!document.getElementById('cwiz-find-hand'), null, 4000);
+            const wizInfo = await page.evaluate(() => {
+              const btn = document.getElementById('cwiz-find-hand');
+              const whys = [...document.querySelectorAll('#cwiz .cwiz-why')].map((e) => e.textContent.trim()).join(' | ');
+              return { disabled: btn?.disabled, title: btn?.title || '', whys };
+            });
+            assert.equal(wizInfo.disabled, true, `${tag}: #cwiz-find-hand must be disabled when EXECUTOR_CAPABILITY_UNSUPPORTED`);
+            assert(wizInfo.whys.includes('arm.armd_owner') && /legacy/i.test(wizInfo.whys), `${tag}: wizard why missing fix: ${wizInfo.whys}`);
+            const wizShot = path.join(SHOT_DIR, `owner_executor_wizard_hand_gated_${lang.code}_${vp.tag}.png`);
+            await page.screenshot({ path: wizShot });
+            log(`Saved screenshot: ${wizShot}`);
+            await page.evaluate(() => cwOpen(false));
+
+            // Disarm/release cleanly before next viewport.
+            rec.hooks.onServerMsg = null;
+            guards.assertClean(`${tag}`);
+          } finally {
+            await ctx.close();
+          }
+        }
+      }
+    } finally {
+      await killArmd(proc);
+    }
+  }
+
+  // --- 9B. Forced OWNER_FAILED: fresh load shows owner badge + danger banner even while obs/diag are 503 ---
+  {
+    const port = await allocFreePort();
+    const proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth'], {
+      extraEnv: { ARMD_MOCK_TEST_OWNER_MODE: 'failed' },
+      waitOwnerStatus: true,
+    });
+    try {
+      const obsRes = await fetch(`http://127.0.0.1:${port}/api/v1/observation`, { cache: 'no-store' });
+      const diagRes = await fetch(`http://127.0.0.1:${port}/api/v1/diagnostics`, { cache: 'no-store' });
+      assert.equal(obsRes.status, 503, 'OWNER_FAILED must gate /api/v1/observation with 503');
+      assert.equal(diagRes.status, 503, 'OWNER_FAILED must gate /api/v1/diagnostics with 503');
+
+      for (const lang of langs) {
+        for (const vp of viewports) {
+          const tag = `failed_${lang.code}_${vp.tag}`;
+          const { ctx, page, guards } = await newCockpit(browserInst, port, { width: vp.width, height: vp.height, locale: lang.locale });
+          const badAssets = [];
+          const okAssets = [];
+          page.on('response', (resp) => {
+            try {
+              const u = new URL(resp.url());
+              if (u.pathname === '/' || u.pathname === '/favicon.ico' || u.pathname.startsWith('/assets/')) {
+                if (resp.status() >= 400) badAssets.push(`${u.pathname}:${resp.status()}`);
+                else okAssets.push(`${u.pathname}:${resp.status()}`);
+              }
+            } catch (_) {}
+          });
+          try {
+            await ctx.addInitScript((l) => { try { localStorage.setItem('lang', l); } catch (_) {} }, lang.code);
+            await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
+            await waitShown(page, '#owner-banner', 5000);
+            await waitShown(page, '#owner-badge', 5000);
+            assert.equal(badAssets.length, 0, `${tag}: cockpit shell/assets failed under OWNER_FAILED: ${JSON.stringify(badAssets)}`);
+            assert(okAssets.some((x) => x.startsWith('/assets/jmuxer.min.js:200')), `${tag}: /assets/jmuxer.min.js must load 200 under OWNER_FAILED, saw ${JSON.stringify(okAssets)}`);
+
+            const info = await page.evaluate(() => {
+              const badge = document.getElementById('owner-badge');
+              const banner = document.getElementById('owner-banner');
+              const title = document.getElementById('owner-banner-title');
+              const sub = document.getElementById('owner-banner-sub');
+              const br = banner.getBoundingClientRect();
+              const bgr = badge.getBoundingClientRect();
+              return {
+                badgeText: badge.textContent.trim(),
+                badgeCls: badge.className,
+                badgeVisible: getComputedStyle(badge).display !== 'none' && bgr.width > 0 && bgr.height > 0,
+                bannerCls: banner.className,
+                bannerRole: banner.getAttribute('role'),
+                bannerVisible: getComputedStyle(banner).display !== 'none' && br.width > 0 && br.height > 0,
+                bannerInViewport: br.left >= 0 && br.right <= window.innerWidth + 1 && br.top >= 0 && br.bottom <= window.innerHeight + 1,
+                titleText: title.textContent.trim(),
+                subText: sub.textContent.trim(),
+                obs: S.obs,
+                sw: document.documentElement.scrollWidth,
+                iw: window.innerWidth,
+              };
+            });
+            assert.equal(info.obs, null, `${tag}: observation must be null under OWNER_FAILED`);
+            assert.equal(info.badgeVisible, true, `${tag}: #owner-badge must be visible on fresh OWNER_FAILED load`);
+            assert.equal(info.bannerVisible, true, `${tag}: #owner-banner must be visible on fresh OWNER_FAILED load`);
+            assert.equal(info.bannerInViewport, true, `${tag}: #owner-banner must fit inside viewport without clipping`);
+            assert(info.bannerCls.includes('is-danger') && info.bannerRole === 'alert', `${tag}: failed banner class/role: ${info.bannerCls} ${info.bannerRole}`);
+            assert(info.subText.includes('arm.armd_owner') && /legacy/i.test(info.subText), `${tag}: failed banner must state next step: ${info.subText}`);
+            assert(lang.code === 'zh' ? /实时执行器启动失败/.test(info.titleText) : /RT executor failed to start/i.test(info.titleText), `${tag}: failed title mismatch: ${info.titleText}`);
+            assert(info.sw <= info.iw, `${tag}: horizontal overflow (${info.sw} > ${info.iw})`);
+
+            const shot = path.join(SHOT_DIR, `owner_failed_banner_${lang.code}_${vp.tag}.png`);
+            await page.screenshot({ path: shot });
+            log(`Saved screenshot: ${shot}`);
+            guards.assertClean(`${tag}`);
+          } finally {
+            await ctx.close();
+          }
+        }
+      }
+    } finally {
+      await killArmd(proc);
+    }
+  }
+
+  // --- 9C. Forced startup_fallback: fresh load shows startup fallback banner + badge in zh and en ---
+  {
+    const port = await allocFreePort();
+    const proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth'], {
+      extraEnv: { ARMD_MOCK_TEST_OWNER_MODE: 'startup_fallback' },
+    });
+    try {
+      for (const lang of langs) {
+        for (const vp of viewports) {
+          const tag = `fallback_${lang.code}_${vp.tag}`;
+          const { ctx, page, guards } = await newCockpit(browserInst, port, { width: vp.width, height: vp.height, locale: lang.locale });
+          try {
+            await ctx.addInitScript((l) => { try { localStorage.setItem('lang', l); } catch (_) {} }, lang.code);
+            await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
+            await waitForCockpitLive(page);
+            await waitShown(page, '#owner-banner', 5000);
+            await waitShown(page, '#owner-badge', 5000);
+
+            const info = await page.evaluate(() => {
+              const badge = document.getElementById('owner-badge');
+              const banner = document.getElementById('owner-banner');
+              const title = document.getElementById('owner-banner-title');
+              const sub = document.getElementById('owner-banner-sub');
+              const br = banner.getBoundingClientRect();
+              return {
+                badgeCls: badge.className,
+                bannerInViewport: br.left >= 0 && br.right <= window.innerWidth + 1,
+                titleText: title.textContent.trim(),
+                subText: sub.textContent.trim(),
+                sw: document.documentElement.scrollWidth,
+                iw: window.innerWidth,
+              };
+            });
+            assert.equal(info.bannerInViewport, true, `${tag}: startup fallback banner must fit inside viewport without clipping`);
+            assert(info.badgeCls.includes('is-fallback') && info.badgeCls.includes('is-warn'), `${tag}: fallback badge classes: ${info.badgeCls}`);
+            assert(
+              lang.code === 'zh'
+                ? /执行器启动失败，已回退到 legacy 保持状态/.test(info.titleText)
+                : /RT executor failed to start; fell back to legacy holding/i.test(info.titleText),
+              `${tag}: startup fallback title mismatch: ${info.titleText}`,
+            );
+            assert(info.subText.includes('arm.armd_owner'), `${tag}: startup fallback banner must explain next step: ${info.subText}`);
+            assert(info.sw <= info.iw, `${tag}: horizontal overflow (${info.sw} > ${info.iw})`);
+
+            const shot = path.join(SHOT_DIR, `owner_startup_fallback_banner_${lang.code}_${vp.tag}.png`);
+            await page.screenshot({ path: shot });
+            log(`Saved screenshot: ${shot}`);
+            guards.assertClean(`${tag}`);
+          } finally {
+            await ctx.close();
+          }
+        }
+      }
+    } finally {
+      await killArmd(proc);
+    }
+  }
+
+  // --- 9D. Legacy owner (--owner legacy): stroke & gravity controls remain enabled as before ---
+  {
+    const port = await allocFreePort();
+    const proc = await spawnArmd(port, ['--config', B601_CONFIG, '--owner', 'legacy', '--no-operator-auth']);
+    try {
+      const st = await (await fetch(`http://127.0.0.1:${port}/api/v1/owner/status`, { cache: 'no-store' })).json();
+      assert.equal(st.effective_owner, 'legacy');
+      assert.equal(st.owner_reason, 'explicit_cli');
+      assert.equal(st.is_fallback, false);
+
+      for (const lang of langs) {
+        for (const vp of viewports) {
+          const tag = `legacy_${lang.code}_${vp.tag}`;
+          const { ctx, page, guards } = await newCockpit(browserInst, port, { width: vp.width, height: vp.height, locale: lang.locale });
+          try {
+            await ctx.addInitScript((l) => { try { localStorage.setItem('lang', l); } catch (_) {} }, lang.code);
+            await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
+            await waitForCockpitLive(page);
+            await waitFn(page, () => S.ownerDiag && S.ownerDiag.effective_owner === 'legacy', null, 5000);
+
+            assert.equal(await page.evaluate(() => document.getElementById('owner-banner').hidden), true, `${tag}: explicit legacy must hide owner banner`);
+
+            await ensureArmedUnleased(port, page);
+
+            // Gravity switch is visible and enabled (not blocked).
+            const gcLeg = await page.evaluate(() => {
+              const sw = document.getElementById('btn-gc');
+              return { hidden: sw?.hidden, blocked: sw?.classList.contains('blocked'), ariaDisabled: sw?.getAttribute('aria-disabled') };
+            });
+            assert.equal(gcLeg.hidden, false, `${tag}: #btn-gc must be visible on legacy`);
+            assert.equal(gcLeg.blocked, false, `${tag}: #btn-gc must not be blocked on legacy`);
+            assert.equal(gcLeg.ariaDisabled, 'false', `${tag}: #btn-gc aria-disabled must be false on legacy`);
+
+            // Wizard hand-guide button is enabled on legacy.
+            await page.evaluate(async () => { cwOpen(true); await cwLoad(); CWZ.step = 'place'; cwRender(); });
+            await waitShown(page, '#cwiz', 3000);
+            await waitFn(page, () => !!document.getElementById('cwiz-find-hand'), null, 4000);
+            assert.equal(await page.evaluate(() => document.getElementById('cwiz-find-hand')?.disabled), false, `${tag}: #cwiz-find-hand must be enabled on legacy`);
+            await page.evaluate(() => cwOpen(false));
+
+            // Gripper stroke calibration button is enabled on legacy when torqued.
+            await page.click('#btn-sset');
+            await waitShown(page, '#sset', 3000);
+            await page.click('#tool-gripper');
+            await waitShown(page, '#gtool', 3000);
+            await waitFn(page, () => !!document.getElementById('gb-run'), null, 3000);
+
+            const gbLeg = await page.evaluate(() => ({
+              disabled: document.getElementById('gb-run')?.disabled,
+              hasOwnerWhy: !!document.getElementById('gb-owner-why'),
+              sw: document.documentElement.scrollWidth,
+              iw: window.innerWidth,
+            }));
+            assert.equal(gbLeg.disabled, false, `${tag}: #gb-run must be enabled on legacy when torqued`);
+            assert.equal(gbLeg.hasOwnerWhy, false, `${tag}: #gb-owner-why must not appear on legacy`);
+            assert(gbLeg.sw <= gbLeg.iw, `${tag}: horizontal overflow on legacy gtool (${gbLeg.sw} > ${gbLeg.iw})`);
+
+            const shot = path.join(SHOT_DIR, `owner_legacy_enabled_${lang.code}_${vp.tag}.png`);
+            await page.screenshot({ path: shot });
+            log(`Saved screenshot: ${shot}`);
+            await page.click('#gtool-close');
+            await waitHidden(page, '#gtool', 2000);
+            guards.assertClean(`${tag}`);
+          } finally {
+            await ctx.close();
+          }
+        }
+      }
+    } finally {
+      await killArmd(proc);
+    }
+  }
+
+  // --- 9E. Same-page lifecycle: hardware-gated executor -> restart into OWNER_FAILED -> restart into legacy (no reload) ---
+  {
+    const port = await allocFreePort();
+    let proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth']);
+    const { ctx, page, guards, rec } = await newCockpit(browserInst, port, { width: 1024, height: 768, locale: 'en-US' });
+    let simulateHwExecGravity = true;
+    await page.route('**/api/v1/observation/schema', async (route) => {
+      if (!simulateHwExecGravity) return route.continue();
+      const resp = await route.fetch();
+      if (!resp.ok()) return route.fulfill({ response: resp });
+      const body = await resp.json();
+      if (body && body.capabilities) body.capabilities.gravity_comp = false;
+      return route.fulfill({ status: resp.status(), contentType: 'application/json', body: JSON.stringify(body) });
+    });
+    rec.hooks.onServerMsg = (m) => {
+      if (simulateHwExecGravity && m && Array.isArray(m.positions) && m.gravity_comp) {
+        return JSON.stringify({
+          ...m,
+          gravity_comp: {
+            ...m.gravity_comp,
+            supported: false,
+            blocker: {
+              code: 'EXECUTOR_CAPABILITY_UNSUPPORTED',
+              message: 'Gravity compensation hardware MIT mode-switch is not supported on the RT executor; set arm.armd_owner to legacy and restart armd',
+            },
+          },
+        });
+      }
+      return 'forward';
+    };
+    try {
+      await ctx.addInitScript(() => { try { localStorage.setItem('lang', 'en'); } catch (_) {} });
+      await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
+      await waitForCockpitLive(page);
+      await waitFn(
+        page,
+        () => S.ownerDiag?.effective_owner === 'executor'
+          && S.caps?.gravity_comp === false
+          && document.getElementById('owner-banner').hidden === true
+          && document.getElementById('btn-gc').hidden === false
+          && document.getElementById('btn-gc').classList.contains('blocked'),
+        null,
+        5000,
+      );
+
+      // Restart daemon into OWNER_FAILED on the same port without reloading the page.
+      simulateHwExecGravity = false;
+      rec.hooks.onServerMsg = null;
+      await killArmd(proc);
+      proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth'], {
+        extraEnv: { ARMD_MOCK_TEST_OWNER_MODE: 'failed' },
+        waitOwnerStatus: true,
+      });
+      await waitFn(
+        page,
+        () => S.ownerDiag?.effective_owner === 'failed'
+          && document.getElementById('owner-banner').hidden === false
+          && document.getElementById('owner-banner').className.includes('is-danger'),
+        null,
+        10000,
+      );
+
+      // Restart daemon into legacy on the same port without reloading the page:
+      // failed banner clears, schema reloads (S.caps.gravity_comp=true), stroke calibration and BOTH
+      // gravity controls (#btn-gc + wizard hand-guide) are restored without a manual page reload.
+      await killArmd(proc);
+      proc = await spawnArmd(port, ['--config', B601_CONFIG, '--owner', 'legacy', '--no-operator-auth']);
+      await waitForCockpitLive(page, 15000);
+      await waitFn(
+        page,
+        () => S.ownerDiag?.effective_owner === 'legacy'
+          && S.caps?.gravity_comp === true
+          && document.getElementById('owner-banner').hidden === true
+          && document.getElementById('btn-gc').hidden === false
+          && legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null,
+        null,
+        10000,
+      );
+      await ensureArmedUnleased(port, page);
+      await waitFn(
+        page,
+        () => document.getElementById('btn-gc').hidden === false
+          && !document.getElementById('btn-gc').classList.contains('blocked')
+          && document.getElementById('btn-gc').getAttribute('aria-disabled') === 'false',
+        null,
+        5000,
+      );
+      await page.evaluate(async () => { cwOpen(true); await cwLoad(); CWZ.step = 'place'; cwRender(); });
+      await waitShown(page, '#cwiz', 3000);
+      await waitFn(page, () => document.getElementById('cwiz-find-hand')?.disabled === false, null, 4000);
+      await page.evaluate(() => cwOpen(false));
+
+      guards.assertClean('9E same-page lifecycle');
+      log('PASS Scenario 9E: same-page hw-gated executor -> OWNER_FAILED -> recovered legacy reloaded schema and restored banner, stroke, and gravity controls without reload.');
+    } finally {
+      await ctx.close();
+      await killArmd(proc);
+    }
+  }
+  log('PASS Scenario 9: owner status, OWNER_FAILED/startup_fallback banners, and executor/legacy feature gating verified (zh/en, 390/1024).');
+}
+
 async function main() {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
   log(`ARMD_BIN=${ARMD_BIN} | SHOT_DIR=${SHOT_DIR}`);
@@ -591,6 +1092,11 @@ async function main() {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
+
+    if (process.env.ONLY_OWNER_HONESTY === '1') {
+      await runScenario9OwnerHonesty(browser);
+      return;
+    }
 
     /* =====================================================================
        SCENARIOS 1–4 & 6: B601-DM mock profile on port 18877
@@ -1808,7 +2314,11 @@ async function main() {
       } finally { await ctx.close(); }
     }
 
-    log('ALL 8 COCKPIT LEASE PLAYWRIGHT E2E SCENARIOS PASSED!');
+    await killArmd(armdAuth);
+    armdAuth = null;
+    await runScenario9OwnerHonesty(browser);
+
+    log('ALL 9 COCKPIT LEASE & OWNER HONESTY PLAYWRIGHT E2E SCENARIOS PASSED!');
   } finally {
     await cleanup();
   }

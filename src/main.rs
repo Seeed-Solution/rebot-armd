@@ -997,6 +997,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         follower,
         &config,
     )?;
+    let mock_owner_test_mode = match std::env::var("ARMD_MOCK_TEST_OWNER_MODE") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            if follower != "mock" {
+                return Err(format!(
+                    "ARMD_MOCK_TEST_OWNER_MODE is only permitted with '--follower mock' (got '--follower {follower}')"
+                )
+                .into());
+            }
+            let norm = raw.trim().to_ascii_lowercase();
+            if !matches!(norm.as_str(), "failed" | "startup_fallback") {
+                return Err(format!(
+                    "ARMD_MOCK_TEST_OWNER_MODE must be 'failed' or 'startup_fallback', got {norm:?}"
+                )
+                .into());
+            }
+            Some(norm)
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("ARMD_MOCK_TEST_OWNER_MODE must be valid UTF-8".into());
+        }
+    };
     let rt_owner = resolved_owner.effective;
     if let Some(detail) = resolved_owner.fallback_detail.as_deref() {
         info!(
@@ -1208,23 +1230,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let operator_auth = resolve_operator_auth(follower, &cli)?;
     supervisor.set_operator_auth_enforced(operator_auth.is_enforced()).await;
 
-    // One owner selected at startup: legacy supervisor-lock loop (default) or the synchronous
+    // One owner selected at startup: legacy supervisor-lock loop or the synchronous
     // RT executor OS thread owning `ArmCore` and the bus with zero Tokio entry.
     let alloc_timing = std::env::var("ARMD_ALLOC_TIMING").is_ok_and(|v| v == "1");
-    let started_owner = start_control_owner_with_hooks(
-        &supervisor,
-        follower,
-        rt_owner,
-        period,
-        rt_sched,
-        memory_lock,
-        alloc_timing,
-        true,
-        armd::rt_core::executor::PanicPolicy::AbortProcess,
-        armd::rt_core::executor::PersistTestHooks::default(),
-    )
-    .await
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let started_owner = match mock_owner_test_mode.as_deref() {
+        Some("failed") => {
+            supervisor
+                .force_owner_failed_for_mock_test()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            warn!("Mock test mode: forced OWNER_FAILED (startup_failed_detached_safe_hold)");
+            StartedControlOwner {
+                executor_handle: None,
+                legacy_control_stop: None,
+                fell_back_to_legacy: false,
+            }
+        }
+        Some("startup_fallback") => {
+            supervisor
+                .set_owner_reason(armd::OwnerReason::StartupFallbackToLegacy)
+                .await;
+            let stop = spawn_legacy_control_loop(
+                &supervisor,
+                period,
+                rt_sched,
+                memory_lock,
+                alloc_timing,
+                false,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            warn!("Mock test mode: forced legacy fallback (startup_fallback_to_legacy)");
+            StartedControlOwner {
+                executor_handle: None,
+                legacy_control_stop: Some(stop),
+                fell_back_to_legacy: true,
+            }
+        }
+        Some(_) => unreachable!("ARMD_MOCK_TEST_OWNER_MODE validated before hardware mount"),
+        None => start_control_owner_with_hooks(
+            &supervisor,
+            follower,
+            rt_owner,
+            period,
+            rt_sched,
+            memory_lock,
+            alloc_timing,
+            true,
+            armd::rt_core::executor::PanicPolicy::AbortProcess,
+            armd::rt_core::executor::PersistTestHooks::default(),
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    };
     let legacy_control_stop = started_owner.legacy_control_stop;
     let executor_handle = started_owner.executor_handle;
     // Start the off-control-thread automatic gripper baseline consumer for both owners.

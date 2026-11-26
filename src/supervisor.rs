@@ -15616,6 +15616,29 @@ impl ArmSupervisor {
         }
     }
 
+    /// Mock-only test hook: transitions a driverless supervisor into `OWNER_FAILED` with
+    /// `StartupFailedDetachedSafeHold` so E2E tests can exercise fresh-load cockpit behavior
+    /// against `503 EXECUTOR_UNAVAILABLE` gating on observation/diagnostics.
+    #[doc(hidden)]
+    pub async fn force_owner_failed_for_mock_test(&self) -> Result<(), String> {
+        let guard = self.inner.write().await;
+        if guard.driver.is_some() {
+            return Err("force_owner_failed_for_mock_test refuses when a hardware driver is mounted".into());
+        }
+        self.published_config.set_available(false);
+        self.owner_reason.store(
+            crate::model::OwnerReason::StartupFailedDetachedSafeHold as u8,
+            Ordering::Release,
+        );
+        {
+            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = OwnerSlot::Failed;
+            self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+        }
+        drop(guard);
+        Ok(())
+    }
+
     /// Attaches the legacy periodic control loop's [`ExecutorStats`] so `GET /api/v1/diagnostics/tick`
     /// reports `skipped_releases`, monotonic release peaks/thresholds, and single-completion publication
     /// into [`LockFreeTickStats`] in Legacy mode.
@@ -15811,7 +15834,10 @@ impl ArmSupervisor {
         guard.refresh_schema_cache();
 
         let initial_gen = self.inner.generation();
-        let candidate_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&guard);
+        let mut candidate_pub_cfg =
+            crate::rt_core::requests::config::PublishedConfig::from_inner(&guard);
+        candidate_pub_cfg.gravity_comp_supported =
+            guard.gravity_comp_support_for_owner(true).is_ok();
         let staged_hover_jobs = guard.hover_jobs.clone();
         let staged_service_identity = Arc::new(
             crate::rt_core::publish::ServiceIdentity::from_published_config(
@@ -15952,6 +15978,10 @@ impl ArmSupervisor {
                 self.hub.set_motion_config(ready_payload.staged_motion_cfg);
                 self.hub.update_prep_env(ready_payload.staged_prep_env);
                 self.hub.set_service_identity(staged_service_identity);
+                self.hub.set_schema_cache(
+                    ready_payload.staged_schema.0,
+                    ready_payload.staged_schema.1,
+                );
                 self.hub.install_prewarm_template_and_front(
                     ready_payload.staged_obs_template,
                     ready_payload.staged_front_obs,
@@ -16210,6 +16240,7 @@ impl ArmSupervisor {
                     self.torque_shadow.wake();
                 }
                 *guard = *core;
+                guard.refresh_schema_cache();
                 guard.hover_jobs = self
                     .executor_hover_jobs
                     .lock()

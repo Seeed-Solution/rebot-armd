@@ -555,6 +555,83 @@ async fn binary_startup_precedence_auto_resolution_and_diagnostics() {
         out_so101.contains("Startup owner auto resolved to legacy (reason=auto_fallback_unqualified_follower)"),
         "expected unqualified follower fallback log line on so-arm101:\n{out_so101}"
     );
+
+    // (i) Forced OWNER_FAILED on mock: GET / and GET /api/v1/owner/status remain 200 OK while
+    //     /api/v1/observation and /api/v1/diagnostics return 503 EXECUTOR_UNAVAILABLE.
+    {
+        let (_child, port, _logs) = spawn_armd_and_wait_port(
+            &["--follower", "mock"],
+            &[("ARMD_MOCK_TEST_OWNER_MODE", "failed")],
+            &[],
+        );
+        let status_resp = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/owner/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status_resp.status(), 200);
+        let owner_st: Value = status_resp.json().await.unwrap();
+        assert_eq!(owner_st["effective_owner"], "failed");
+        assert_eq!(owner_st["owner_state"], "failed");
+        assert_eq!(owner_st["owner_reason"], "startup_failed_detached_safe_hold");
+        assert_eq!(owner_st["is_fallback"], true);
+        assert!(
+            owner_st["legacy_only_routes"]["ws"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "/api/v1/action/gripper_calibrate")
+        );
+
+        let index_resp = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(index_resp.status(), 200);
+
+        for gated in ["/api/v1/observation", "/api/v1/diagnostics"] {
+            let r = client
+                .get(format!("http://127.0.0.1:{port}{gated}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 503, "{gated} must return 503 under OWNER_FAILED");
+            let body = r.text().await.unwrap();
+            assert!(body.contains("EXECUTOR_UNAVAILABLE"), "{gated}: {body}");
+        }
+    }
+
+    // (j) Forced startup_fallback on mock: GET /api/v1/owner/status reports legacy + startup_fallback_to_legacy.
+    {
+        let (_child, port, _logs) = spawn_armd_and_wait_port(
+            &["--follower", "mock"],
+            &[("ARMD_MOCK_TEST_OWNER_MODE", "startup_fallback")],
+            &[],
+        );
+        let owner_st: Value = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/owner/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(owner_st["effective_owner"], "legacy");
+        assert_eq!(owner_st["owner_state"], "legacy");
+        assert_eq!(owner_st["owner_reason"], "startup_fallback_to_legacy");
+        assert_eq!(owner_st["is_fallback"], true);
+    }
+
+    // (k) ARMD_MOCK_TEST_OWNER_MODE is refused on any non-mock follower.
+    let err_non_mock = run_armd_expect_fail(
+        &["--follower", "so-arm101", "--follower-port", absent_serial.to_str().unwrap()],
+        &[("ARMD_MOCK_TEST_OWNER_MODE", "failed")],
+    );
+    assert!(
+        err_non_mock.contains("ARMD_MOCK_TEST_OWNER_MODE") && err_non_mock.contains("mock"),
+        "ARMD_MOCK_TEST_OWNER_MODE must refuse non-mock followers: {err_non_mock}"
+    );
 }
 
 #[test]
@@ -595,32 +672,62 @@ fn cockpit_owner_badge_shows_in_expert_and_only_on_fallback_in_simple() {
         let script = format!(
             r#"
 let lastToast = null;
-const badge = {{
+const mkEl = () => ({{
   hidden: true, textContent: '', className: '', title: '', attrs: {{}},
   setAttribute(k, v) {{ this.attrs[k] = v; }},
   addEventListener(ev, fn) {{ this['on_' + ev] = fn; }},
-  classList: {{ contains(c) {{ return badge.className.split(/\s+/).includes(c); }} }},
-}};
+  classList: {{ contains(c) {{ return this.className.split(/\s+/).includes(c); }} }},
+}});
+const badge = mkEl();
+badge.classList = {{ contains(c) {{ return badge.className.split(/\s+/).includes(c); }} }};
+const banner = mkEl();
+const bannerTitle = mkEl();
+const bannerSub = mkEl();
 const S = {{ obs: null, ownerDiag: null }};
-const $ = (id) => id === 'owner-badge' ? badge : null;
-const setText = (el, v) => {{ el.textContent = v; }};
-const setCls = (el, v) => {{ el.className = v; }};
+let liveFlag = true;
+const isLive = () => liveFlag;
+const $ = (id) => ({{ 'owner-badge': badge, 'owner-banner': banner, 'owner-banner-title': bannerTitle, 'owner-banner-sub': bannerSub }}[id] || null);
+const setText = (el, v) => {{ if (el) el.textContent = v; }};
+const setCls = (el, v) => {{ if (el) el.className = v; }};
 const toast = (msg, kind) => {{ lastToast = {{ msg, kind }}; }};
-const api = async () => ({{ effective_owner: 'failed', owner_reason: 'startup_failed_detached_safe_hold' }});
+const apiCalls = [];
+const api = async (path) => {{
+  apiCalls.push(path);
+  return {{
+    effective_owner: 'failed',
+    owner_state: 'failed',
+    owner_reason: 'startup_failed_detached_safe_hold',
+    detached_safe_hold: true,
+    legacy_only_routes: {{ rest: ['/api/v1/diagnostics/power'], ws: ['/api/v1/action/gripper_calibrate'] }},
+  }};
+}};
 const dict = {{
   'owner.badge.executor': 'RT',
   'owner.badge.legacy': 'Legacy',
   'owner.badge.fallback': 'Legacy · fallback',
   'owner.badge.failed': 'Owner · failed',
+  'owner.badge.transferring': 'Switching',
   'owner.name.executor': 'RT executor',
   'owner.name.legacy': 'Legacy loop',
   'owner.name.failed': 'Owner failed (SAFE-HOLD)',
+  'owner.name.transferring': 'Owner transferring',
   'owner.title': 'Control owner: {{owner}} ({{reason}})',
+  'owner.reason.default': 'default',
   'owner.reason.auto_qualified': 'auto qualified',
   'owner.reason.explicit_cli': 'explicit cli',
   'owner.reason.auto_fallback_mit_profile': 'mit fallback',
   'owner.reason.startup_fallback_to_legacy': 'startup fallback',
   'owner.reason.startup_failed_detached_safe_hold': 'detached safe hold',
+  'owner.banner.failed.title': 'RT executor failed to start (SAFE-HOLD)',
+  'owner.banner.failed.sub': 'Cause: {{reason}}. Set arm.armd_owner=legacy and restart.',
+  'owner.banner.failed.sub_generic': 'Cause: {{reason}}. Restart armd.',
+  'owner.banner.startup_fallback.title': 'RT executor failed to start; fell back to legacy holding: {{reason}}',
+  'owner.banner.startup_fallback.sub': 'Inspect armd logs or set arm.armd_owner=legacy.',
+  'owner.banner.auto_fallback.title': 'Auto fallback to legacy: {{reason}}',
+  'owner.banner.auto_fallback.sub': 'Use a qualified profile for RT executor.',
+  'gb.legacy_only': 'Stroke calibration needs legacy mode: set arm.armd_owner=legacy and restart.',
+  'gb.owner_unavailable': 'Control owner unavailable.',
+  'owner.legacy_only.generic': 'Requires legacy mode.',
 }};
 const t = (k, p) => {{
   let s = dict[k] ?? k;
@@ -631,45 +738,93 @@ const t = (k, p) => {{
 function assert(cond, msg) {{ if (!cond) {{ console.error(msg); process.exit(1); }} }}
 
 (async () => {{
-  // 1. Executor auto_qualified: shown in expert, NOT marked is-fallback (hidden in simple).
+  // 1. Executor auto_qualified: shown in expert, NOT marked is-fallback, banner hidden, LegacyOnly gated.
   S.obs = {{ effective_owner: 'executor', owner_reason: 'auto_qualified' }};
   renderOwnerStatus();
   assert(badge.hidden === false, 'executor badge must be unhidden');
   assert(badge.textContent === 'RT', 'executor text: ' + badge.textContent);
   assert(!badge.className.includes('is-fallback'), 'executor must not be is-fallback');
   assert(badge.attrs['aria-label'] === badge.title, 'aria-label must match title');
+  assert(banner.hidden === true, 'normal executor must hide owner banner');
+  assert(
+    legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only')?.includes('arm.armd_owner=legacy'),
+    'gripper_calibrate must be blocked on executor'
+  );
+  assert(
+    legacyOnlyRouteBlock('/api/v1/action/gripper_zero_check', 'gb.legacy_only') === null,
+    'non-LegacyOnly route must not be blocked on executor'
+  );
 
-  // 2. Explicit legacy: shown in expert, NOT marked is-fallback (hidden in simple).
+  // 2. Explicit legacy: shown in expert, NOT marked is-fallback, banner hidden, LegacyOnly allowed.
   S.obs = {{ effective_owner: 'legacy', owner_reason: 'explicit_cli' }};
   renderOwnerStatus();
   assert(badge.hidden === false, 'explicit legacy badge must be unhidden');
   assert(badge.textContent === 'Legacy', 'explicit legacy text: ' + badge.textContent);
   assert(!badge.className.includes('is-fallback'), 'explicit legacy must not be is-fallback');
+  assert(banner.hidden === true, 'explicit legacy must hide owner banner');
+  assert(
+    legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null,
+    'gripper_calibrate must be enabled on legacy'
+  );
 
-  // 3. Auto fallback to legacy (MIT): shown in expert AND marked is-fallback + is-warn (visible in simple).
+  // 3. Auto fallback to legacy (MIT): badge is-fallback + is-warn AND banner visible with cause + next step.
   S.obs = {{ effective_owner: 'legacy', owner_reason: 'auto_fallback_mit_profile' }};
   renderOwnerStatus();
   assert(badge.hidden === false, 'fallback badge must be unhidden');
   assert(badge.textContent === 'Legacy · fallback', 'fallback text: ' + badge.textContent);
   assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'fallback classes: ' + badge.className);
   assert(badge.title.includes('mit fallback'), 'fallback title: ' + badge.title);
+  assert(banner.hidden === false && bannerTitle.textContent.includes('mit fallback'), 'auto fallback banner must show');
   badge.on_click();
   assert(lastToast && lastToast.kind === 'warn' && lastToast.msg.includes('mit fallback'), 'click must surface reason via toast');
 
-  // 4. Startup DRV-F1 fallback to legacy: also marked is-fallback + is-warn.
+  // 4. Startup DRV-F1 fallback to legacy: badge + startup fallback banner visible.
   S.obs = {{ effective_owner: 'legacy', owner_reason: 'startup_fallback_to_legacy' }};
   renderOwnerStatus();
   assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'startup fallback classes: ' + badge.className);
+  assert(banner.hidden === false && bannerTitle.textContent.includes('startup fallback'), 'startup fallback banner title: ' + bannerTitle.textContent);
+  assert(bannerSub.textContent.includes('arm.armd_owner'), 'startup fallback banner must include next step');
 
-  // 5. Detached SAFE-HOLD failed owner with NO observation (OWNER_FAILED rejects /observation):
-  //    loadOwnerDiagnostics() fetches /api/v1/diagnostics and renders failed warning in expert & simple.
+  // 5. Detached SAFE-HOLD failed owner with NO observation (OWNER_FAILED rejects /observation & /diagnostics):
+  //    loadOwnerDiagnostics() fetches /api/v1/owner/status and renders failed badge + danger banner.
   S.obs = null;
   S.ownerDiag = null;
   await loadOwnerDiagnostics();
-  assert(badge.hidden === false, 'failed owner via diagnostics must be unhidden');
+  assert(apiCalls[0] === '/api/v1/owner/status', 'must query /api/v1/owner/status first, got: ' + apiCalls[0]);
+  assert(badge.hidden === false, 'failed owner via owner/status must be unhidden');
   assert(badge.textContent === 'Owner · failed', 'failed text: ' + badge.textContent);
   assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'failed classes: ' + badge.className);
   assert(badge.title.includes('detached safe hold'), 'failed title: ' + badge.title);
+  assert(banner.hidden === false && banner.className.includes('is-danger'), 'failed banner must be visible danger');
+  assert(banner.attrs.role === 'alert', 'failed banner must use role=alert');
+  assert(bannerSub.textContent.includes('detached safe hold') && bannerSub.textContent.includes('arm.armd_owner'), 'failed banner must explain cause + next step');
+
+  // 6. Dynamic capability-driven LegacyOnly gating: if armd migrates a route out of legacy_only_routes, gate lifts.
+  S.obs = {{ effective_owner: 'executor', owner_reason: 'auto_qualified' }};
+  S.ownerDiag = {{ effective_owner: 'executor', owner_reason: 'auto_qualified', legacy_only_routes: {{ rest: [], ws: [] }} }};
+  assert(legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null, 'gate must lift when route leaves legacy_only_routes');
+
+  // 7. Same-page recovery: cached failed S.ownerDiag must NOT override fresh live observations after restart into legacy or executor.
+  liveFlag = true;
+  S.ownerDiag = {{
+    effective_owner: 'failed',
+    owner_reason: 'startup_failed_detached_safe_hold',
+    detached_safe_hold: true,
+    legacy_only_routes: {{ rest: ['/api/v1/diagnostics/power'], ws: ['/api/v1/action/gripper_calibrate'] }},
+  }};
+  S.obs = {{ effective_owner: 'legacy', owner_reason: 'explicit_cli' }};
+  renderOwnerStatus();
+  assert(banner.hidden === true, 'recovery to live legacy must clear stale failed banner');
+  assert(badge.textContent === 'Legacy', 'recovery to live legacy badge: ' + badge.textContent);
+  assert(legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null, 'recovery to live legacy must unblock stroke calibration');
+
+  // 8. Same-page healthy -> OWNER_FAILED: once telemetry goes offline (liveFlag=false), refreshed failed ownerDiag wins over stale S.obs.
+  liveFlag = false;
+  S.obs = {{ effective_owner: 'executor', owner_reason: 'auto_qualified' }};
+  renderOwnerStatus();
+  assert(banner.hidden === false && banner.className.includes('is-danger'), 'offline stale obs must yield to failed ownerDiag');
+  assert(badge.textContent === 'Owner · failed', 'offline failed badge: ' + badge.textContent);
+  if (ownerDiagRetryTimer) clearTimeout(ownerDiagRetryTimer);
 }})().catch((e) => {{ console.error(e); process.exit(1); }});
 "#
         );

@@ -406,11 +406,16 @@ impl MinimalHwDriver {
 impl ArmDriver for MinimalHwDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities {
+            velocity_feedback: true,
             torque_feedback: true,
             temperature_feedback: true,
             enable_feedback: true,
             ..DriverCapabilities::default()
         }
+    }
+
+    fn supports_mit_mode_switch(&self) -> bool {
+        true
     }
 
     fn supports_rt_executor(&self) -> Result<(), &'static str> {
@@ -2049,6 +2054,12 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
     let sup_hw = Arc::new(
         ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(MinimalHwDriver::new(7))),
     );
+    // Before executor transfer (Legacy), MinimalHwDriver supports gravity_comp.
+    let leg_obs = sup_hw.observation().await.unwrap();
+    let leg_schema = sup_hw.schema().await.unwrap();
+    assert!(leg_obs.gravity_comp.supported, "legacy hardware should support gravity_comp");
+    assert!(leg_schema.capabilities.gravity_comp, "legacy schema should advertise gravity_comp");
+
     let mut ecfg_hw = ExecutorConfig::for_tests(Duration::from_millis(2));
     ecfg_hw.alloc_timing = true;
     let handle_hw = sup_hw.start_executor(ecfg_hw).await.unwrap();
@@ -2058,6 +2069,40 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let _detached_hw = sup_hw.inner().write().await;
+
+    // On RT executor with hardware driver, observation & schema capabilities must match the single
+    // converged capability predicate (`executor_blocks_hardware_gravity_comp`) and WS gate.
+    assert!(
+        armd::gravity_comp::executor_blocks_hardware_gravity_comp(true, true),
+        "single predicate must refuse hardware gravity_comp on executor"
+    );
+    assert!(
+        !armd::gravity_comp::executor_blocks_hardware_gravity_comp(true, false),
+        "single predicate must allow driverless mock gravity_comp on executor"
+    );
+    assert!(
+        !armd::gravity_comp::executor_blocks_hardware_gravity_comp(false, true),
+        "single predicate must allow hardware gravity_comp on legacy"
+    );
+    let exec_obs = sup_hw.observation().await.unwrap();
+    let exec_schema = sup_hw.schema().await.unwrap();
+    assert!(
+        !exec_obs.gravity_comp.supported,
+        "executor hardware observation must report gravity_comp.supported = false"
+    );
+    assert_eq!(
+        exec_obs.gravity_comp.blocker.as_ref().map(|b| b.code.as_str()),
+        Some("EXECUTOR_CAPABILITY_UNSUPPORTED"),
+        "executor hardware observation must report EXECUTOR_CAPABILITY_UNSUPPORTED blocker"
+    );
+    assert!(
+        !exec_schema.capabilities.gravity_comp,
+        "executor hardware schema must report capabilities.gravity_comp = false"
+    );
+    assert!(
+        !sup_hw.published_config().await.unwrap().gravity_comp_supported,
+        "executor hardware published_config must report gravity_comp_supported = false"
+    );
 
     let err_enter = gravity_comp_command(
         &sup_hw,

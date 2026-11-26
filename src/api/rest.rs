@@ -454,6 +454,46 @@ pub async fn get_observation_schema(
     Ok(Json(schema))
 }
 
+/// `RouteOwnership::LegacyOnly` endpoints published by `GET /api/v1/owner/status` directly from
+/// the unified route registry so clients can gate legacy-only controls without hard-coding routes.
+#[derive(Debug, Clone, Serialize)]
+pub struct LegacyOnlyRoutes {
+    pub rest: &'static [&'static str],
+    pub ws: &'static [&'static str],
+}
+
+/// Lock-free, never-gated owner status returned by `GET /api/v1/owner/status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OwnerStatusResponse {
+    pub effective_owner: &'static str,
+    pub owner_state: &'static str,
+    pub owner_reason: &'static str,
+    pub is_fallback: bool,
+    pub detached_safe_hold: bool,
+    pub legacy_only_routes: LegacyOnlyRoutes,
+}
+
+/// GET /api/v1/owner/status (read-only, never gated by `OWNER_FAILED`, `OWNER_TRANSFERRING`, or
+/// `internal_fault_fenced()`).
+pub async fn get_owner_status(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+) -> Json<OwnerStatusResponse> {
+    let effective = supervisor.effective_owner();
+    let reason = supervisor.owner_reason();
+    let owner_str = effective.as_str();
+    Json(OwnerStatusResponse {
+        effective_owner: owner_str,
+        owner_state: owner_str,
+        owner_reason: reason.as_str(),
+        is_fallback: reason.is_fallback() || effective == crate::model::EffectiveOwner::Failed,
+        detached_safe_hold: supervisor.has_detached_safe_hold(),
+        legacy_only_routes: LegacyOnlyRoutes {
+            rest: crate::api::routes::legacy_only_rest_routes(),
+            ws: crate::api::routes::legacy_only_ws_commands(),
+        },
+    })
+}
+
 /// GET /api/v1/cell/status (read-only; returns `{"enabled": false}` when cell mode is off).
 pub async fn get_cell_status(
     State(supervisor): State<Arc<ArmSupervisor>>,

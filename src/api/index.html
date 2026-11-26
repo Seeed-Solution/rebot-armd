@@ -840,6 +840,11 @@ body.offline .banner { display: block; }
 .gc-banner .btn.btn-gc-exit { background: #d48806; border-color: #d48806; color: #fff; font-weight: 700; }
 .gc-banner .btn.gc-rec { background: #fff; color: #1f2937; }
 .gc-banner .btn.gc-rec.rec-on { color: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
+.owner-banner { display: grid; gap: 4px; padding: 10px 12px; border-radius: var(--sc-radius-md); border: 1px solid #f59e0b; border-left: 4px solid #d48806; background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; line-height: 1.45; }
+.owner-banner[hidden] { display: none; }
+.owner-banner.is-danger { border-color: #f87171; border-left-color: var(--sc-status-danger-fg); background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+.owner-banner b { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.owner-banner small { font-size: 12px; line-height: 1.45; color: inherit; overflow-wrap: anywhere; }
 .tool-comm-banner { display: grid; gap: 3px; padding: 10px 12px; border-radius: var(--sc-radius-md); border: 1px solid #f59e0b; background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; line-height: 1.4; }
 .tool-comm-banner[hidden] { display: none; }
 .tool-comm-banner b { font-size: 13px; font-weight: 600; }
@@ -1687,6 +1692,7 @@ body::before {
   body.ui-simple .lease-status.is-own { background: rgba(239,252,232,0.85); color: var(--sc-status-normal-fg); }
   body.ui-simple .lease-status.is-other, body.ui-simple .lease-status.is-released { background: rgba(255,247,230,0.9); color: var(--sc-status-warning-fg); }
   body.ui-simple .lease-released { width: 0; min-width: 100%; box-sizing: border-box; font-size: 11px; padding: 6px 8px; border-radius: 12px; background: rgba(255,247,230,0.92); color: var(--sc-status-warning-fg); }
+  body.ui-simple .owner-banner, body.ui-simple .tool-comm-banner { width: 0; min-width: 100%; box-sizing: border-box; border-radius: 14px; }
   body.ui-simple .btn.btn-park-off, body.ui-simple .btn.btn-preempt { width: 0; min-width: 100%; box-sizing: border-box; margin-top: 0; border-radius: 16px; }
   body.ui-simple .gc-sw { width: 0; min-width: 100%; }
   body.ui-simple .gc-sw .sw-text { min-width: 0; }
@@ -2932,6 +2938,10 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
           <span id="lock-txt" data-i18n="lock.offline">遥测断开，控制已锁定</span>
         </div>
+        <div class="owner-banner" id="owner-banner" role="status" aria-live="polite" hidden>
+          <b id="owner-banner-title"></b>
+          <small id="owner-banner-sub"></small>
+        </div>
         <div class="tool-comm-banner" id="tool-comm-banner" role="status" aria-live="polite" hidden>
           <b id="tool-comm-title"></b>
           <small id="tool-comm-sub" data-i18n="tool.comm.hint">需先完成工具调试/标定后再执行常规运动。</small>
@@ -3584,7 +3594,7 @@ const I18N = {
     'gc.sticks_off': '拖动示教中摇杆已停用，请用手移动机械臂（夹爪可用）',
     'gc.b.NOT_ARMED': '先使能机械臂', 'gc.b.MOTION_BUSY': '等机械臂停稳', 'gc.b.LEASE_REQUIRED': '需要控制权', 'gc.b.GRAVITY_COMP_NOT_STATIONARY': '机械臂还在运动',
     'gc.b.FEEDBACK_STALE': '电机反馈超时', 'gc.b.ESTOP_ACTIVE': '急停已锁定', 'gc.b.FAULT_ACTIVE': '存在故障', 'gc.b.HANDOVER_SETTLING': '控制权交接中',
-    'gc.b.GRAVITY_COMP_JOINT_LIMIT': '有关节靠近限位', 'gc.b.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用', 'gc.b.DRIVER_RANGE_MISMATCH': '电机量程与配置不一致', 'gc.b.DRIVER_RANGE_UNVERIFIED': '电机量程未核对（有电机未应答）', 'gc.b.observer': '观察模式，需先接管控制权', 'gc.b.offline': '遥测断开',
+    'gc.b.GRAVITY_COMP_JOINT_LIMIT': '有关节靠近限位', 'gc.b.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用', 'gc.b.DRIVER_RANGE_MISMATCH': '电机量程与配置不一致', 'gc.b.DRIVER_RANGE_UNVERIFIED': '电机量程未核对（有电机未应答）', 'gc.b.EXECUTOR_CAPABILITY_UNSUPPORTED': '硬件拖动示教（MIT 重力补偿）暂不支持实时执行器：在应用配置（rebot-teleop.config.json）中将 arm.armd_owner 设为 legacy（或以 --owner legacy 启动）并重启 armd', 'gc.b.observer': '观察模式，需先接管控制权', 'gc.b.offline': '遥测断开',
     'gc.x.REQUESTED': '已退出拖动示教，位置已锁定', 'gc.x.STOPPED': '已停止拖动示教，位置已锁定', 'gc.x.ESTOP': '急停：已退出拖动示教并锁定位置',
     'gc.x.FAULT': '故障：已退出拖动示教并锁定位置', 'gc.x.BUS_LOSS': 'CAN 总线中断：已退出拖动示教', 'gc.x.FEEDBACK_STALE': '电机反馈超时：已退出拖动示教并锁定位置',
     'gc.x.WATCHDOG': '心跳超时：已退出拖动示教并锁定位置', 'gc.x.LEASE_LOST': '控制权丢失：已退出拖动示教并锁定位置', 'gc.x.TORQUE_LOST': '电机已失能：拖动示教结束',
@@ -3858,7 +3868,7 @@ const I18N = {
     'gc.sticks_off': 'Sticks are off while hand-guiding; move the arm by hand (gripper still works)',
     'gc.b.NOT_ARMED': 'Enable the arm first', 'gc.b.MOTION_BUSY': 'Wait until the arm stops', 'gc.b.LEASE_REQUIRED': 'Control lease required', 'gc.b.GRAVITY_COMP_NOT_STATIONARY': 'Arm is still moving',
     'gc.b.FEEDBACK_STALE': 'Motor feedback is late', 'gc.b.ESTOP_ACTIVE': 'E-Stop latched', 'gc.b.FAULT_ACTIVE': 'Fault active', 'gc.b.HANDOVER_SETTLING': 'Control handover settling',
-    'gc.b.GRAVITY_COMP_JOINT_LIMIT': 'A joint is near its limit', 'gc.b.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable', 'gc.b.DRIVER_RANGE_MISMATCH': 'Motor ranges differ from the profile', 'gc.b.DRIVER_RANGE_UNVERIFIED': 'Motor ranges not verified (a motor did not answer)', 'gc.b.observer': 'Observer mode, take over control first', 'gc.b.offline': 'Telemetry offline',
+    'gc.b.GRAVITY_COMP_JOINT_LIMIT': 'A joint is near its limit', 'gc.b.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable', 'gc.b.DRIVER_RANGE_MISMATCH': 'Motor ranges differ from the profile', 'gc.b.DRIVER_RANGE_UNVERIFIED': 'Motor ranges not verified (a motor did not answer)', 'gc.b.EXECUTOR_CAPABILITY_UNSUPPORTED': 'Hardware hand-guiding (MIT gravity comp) is not yet supported on the RT executor: set arm.armd_owner to "legacy" in app config (rebot-teleop.config.json) (or start with --owner legacy) and restart armd', 'gc.b.observer': 'Observer mode, take over control first', 'gc.b.offline': 'Telemetry offline',
     'gc.x.REQUESTED': 'Hand-guiding off, pose held', 'gc.x.STOPPED': 'Hand-guiding stopped, pose held', 'gc.x.ESTOP': 'E-Stop: hand-guiding ended, pose held',
     'gc.x.FAULT': 'Fault: hand-guiding ended, pose held', 'gc.x.BUS_LOSS': 'CAN bus lost: hand-guiding ended', 'gc.x.FEEDBACK_STALE': 'Motor feedback late: hand-guiding ended, pose held',
     'gc.x.WATCHDOG': 'Heartbeat timeout: hand-guiding ended, pose held', 'gc.x.LEASE_LOST': 'Control lost: hand-guiding ended, pose held', 'gc.x.TORQUE_LOST': 'Motors disabled: hand-guiding ended',
@@ -4158,6 +4168,8 @@ Object.assign(I18N.zh, {
   'gb.run': '空夹校准', 'gb.confirm': '夹爪内确认无物体？再点一次开始', 'gb.torque': '空夹校准需要先使能机械臂。',
   'gb.prog': '第 {i}/{n} 个行程', 'gb.start': '开始…', 'gb.done': '完成：{st}', 'gb.err': '已停止：{m}', 'gb.op': '需要操作员解锁；解锁后再点一次「空夹校准」。',
   'gb.obst': '夹爪运动受阻，未学习：{m}',
+  'gb.legacy_only': '完整夹爪行程标定需要 legacy 维护模式（当前由实时执行器控制）：在应用配置（rebot-teleop.config.json）中将 arm.armd_owner 设为 legacy（或以 --owner legacy 启动）并重启 armd。',
+  'gb.owner_unavailable': '控制循环当前不可用，无法执行空夹校准；请先按顶部横幅说明排查并重启 armd。',
 });
 Object.assign(I18N.en, {
   'tools.title': 'Tools', 'tools.order': 'Recommended order: zero → fine calibration → gripper. Camera calibration is the alternative to fine calibration.',
@@ -4180,6 +4192,8 @@ Object.assign(I18N.en, {
   'gb.run': 'Calibrate empty gripper', 'gb.confirm': 'Nothing in the jaws? Tap again to start', 'gb.torque': 'The calibration needs the arm enabled.',
   'gb.prog': 'Stroke {i}/{n}', 'gb.start': 'Starting…', 'gb.done': 'Done: {st}', 'gb.err': 'Stopped: {m}', 'gb.op': 'Needs the operator unlock; unlock, then tap "Calibrate empty gripper" again.',
   'gb.obst': 'The jaw was obstructed; nothing learned: {m}',
+  'gb.legacy_only': 'Full gripper stroke calibration requires legacy maintenance mode (RT executor currently owns the arm): set arm.armd_owner to "legacy" in app config (rebot-teleop.config.json) (or start with --owner legacy) and restart armd.',
+  'gb.owner_unavailable': 'Control owner is unavailable; follow the top banner to resolve and restart armd before calibrating.',
 });
 // motor zero tool (mz*)
 Object.assign(I18N.zh, {
@@ -4239,7 +4253,7 @@ Object.assign(I18N.zh, {
   'cw.jog.live': '标记 {n} / {min}', 'cw.find.jog.ttl': '用摇杆把相机移到标定板上方', 'cw.find.jog.ttl.b': '用摇杆把相机移到标定板（位置 B）上方',
   'cw.find.why.few': '画面中只有 {n} 个标定板标记，至少需要 {min} 个', 'cw.find.why.gc': '拖动示教中：先点「退出并锁定位置」，等机械臂锁定', 'cw.find.why.search': '正在自动寻找',
   'cw.find.gc.on': '已进入拖动示教：扶稳机械臂，补偿建立后用手把相机移到标定板上方，然后点「退出并锁定位置」', 'cw.find.gc.hint': '用手把相机移到标定板上方约 30 cm，再点「退出并锁定位置」',
-  'cw.find.gc.exiting': '正在退出拖动示教并锁定位置…', 'cw.find.hand.na': '这台机械臂不支持拖动示教（重力补偿）',
+  'cw.find.gc.exiting': '正在退出拖动示教并锁定位置…', 'cw.find.hand.na': '这台机械臂不支持拖动示教（重力补偿）', 'cw.find.hand.exec_unavail': '硬件拖动示教（重力补偿）暂不支持实时执行器：在应用配置（rebot-teleop.config.json）中将 arm.armd_owner 设为 legacy（或以 --owner legacy 启动）并重启 armd；也可使用「用摇杆移动」或「自动寻找」。',
   'cw.find.prog': '自动寻找：候选位置 {k} / {n}', 'cw.find.aiming': '已找到标定板，正在对中…', 'cw.find.at': '在第 {k} / {n} 个候选位置找到标定板，当前 {m} 个标记',
   'cw.find.found': '找到标定板：第 {k} / {n} 个候选位置，当前 {m} 个标记。机械臂停在这里。', 'cw.find.none': '{n} 个候选位置都没看到至少 {min} 个标记。请把标定板放到机械臂前方 20–45 cm 内，或用摇杆 / 拖动示教。',
   'cw.find.aborted': '自动寻找已中止（候选 {k} / {n}）：{why}',
@@ -4279,7 +4293,7 @@ Object.assign(I18N.en, {
   'cw.jog.live': 'Markers {n} / {min}', 'cw.find.jog.ttl': 'Jog the camera above the board', 'cw.find.jog.ttl.b': 'Jog the camera above the board (placement B)',
   'cw.find.why.few': 'Only {n} board markers in view, need {min}', 'cw.find.why.gc': 'Hand-guiding: tap "Exit and hold pose" first and wait until the arm is locked', 'cw.find.why.search': 'Search running',
   'cw.find.gc.on': 'Hand-guiding on: keep a hand on the arm, move the camera above the board once the ramp completes, then tap "Exit and hold pose"', 'cw.find.gc.hint': 'Move the camera by hand to about 30 cm above the board, then tap "Exit and hold pose"',
-  'cw.find.gc.exiting': 'Leaving hand-guiding and locking the pose…', 'cw.find.hand.na': 'This arm has no hand-guiding (gravity compensation)',
+  'cw.find.gc.exiting': 'Leaving hand-guiding and locking the pose…', 'cw.find.hand.na': 'This arm has no hand-guiding (gravity compensation)', 'cw.find.hand.exec_unavail': 'Hardware hand-guiding (gravity comp) is not yet supported on the RT executor: set arm.armd_owner to "legacy" in app config (rebot-teleop.config.json) (or start with --owner legacy) and restart armd, or use Jog / Search.',
   'cw.find.prog': 'Search: candidate {k} / {n}', 'cw.find.aiming': 'Board found, centring…', 'cw.find.at': 'Board found at candidate {k} / {n}, {m} markers now',
   'cw.find.found': 'Board found at candidate {k} / {n}, {m} markers in view. The arm stays here.', 'cw.find.none': 'No candidate of {n} showed at least {min} markers. Put the board 20–45 cm in front of the arm, or jog / move by hand.',
   'cw.find.aborted': 'Search aborted (candidate {k} / {n}): {why}',
@@ -4553,6 +4567,17 @@ Object.assign(I18N.zh, {
   'owner.reason.auto_fallback_dof_limit': '自动回退：自由度超出实时执行器上限',
   'owner.reason.startup_fallback_to_legacy': '启动回退：实时执行器初始化失败后切回传统保持',
   'owner.reason.startup_failed_detached_safe_hold': '启动失败：分离安全保持线程持有驱动（未切回 legacy）',
+  'owner.banner.failed.title': '实时执行器启动失败（SAFE-HOLD 安全保持）',
+  'owner.banner.failed.sub': '原因：{reason}。控制接口已锁定以防止机械臂掉电下坠。下一步：确认周围安全并扶稳机械臂，查看 armd 日志排查初始化失败；如需改用 legacy 维护模式，请在应用配置（rebot-teleop.config.json）中将 arm.armd_owner 设为 legacy 并重启 rebot-teleop / armd。',
+  'owner.banner.failed.sub_generic': '原因：{reason}。控制接口当前不可用。下一步：查看 armd 日志排查执行器启动失败原因；如需切回 legacy 维护模式，请在应用配置中将 arm.armd_owner 设为 legacy 并重启 armd。',
+  'owner.banner.transferring.title': '控制循环正在切换中',
+  'owner.banner.transferring.sub': '原因：{reason}。请稍候片刻；若长时间未恢复，请查看 armd 日志并重启服务。',
+  'owner.banner.startup_fallback.title': '执行器启动失败，已回退到 legacy 保持状态：{reason}',
+  'owner.banner.startup_fallback.sub': '当前由传统控制循环维持运行。下一步：查看 armd 日志排查执行器启动失败原因；如需保持在 legacy 维护模式，可在应用配置（rebot-teleop.config.json）中将 arm.armd_owner 设为 legacy。',
+  'owner.banner.auto_fallback.title': '已自动回退到 legacy 控制循环：{reason}',
+  'owner.banner.auto_fallback.sub': '当前配置暂不适用实时执行器，可继续在 legacy 模式下操作；如需启用实时执行器，请使用已认证从手与非 MIT 配置并重启 armd。',
+  'owner.legacy_only.generic': '此功能需要 legacy 维护模式（当前由实时执行器控制）：在应用配置（rebot-teleop.config.json）中将 arm.armd_owner 设为 legacy（或以 --owner legacy 启动）并重启 armd。',
+  'owner.unavailable.generic': '控制循环当前不可用；请先按顶部横幅说明排查并重启 armd。',
   'task.env.safety': '安全状态', 'task.env.col': '碰撞保护', 'task.env.ml': '运动限制', 'task.env.ko': '禁入区', 'task.env.poses': '已存点位',
   'task.env.col.hold': '触发保持（J{j}）', 'task.env.col.ok': '正常', 'task.env.count': '{n} 个',
   'task.env.na': '不支持', 'task.env.none': '无', 'task.env.loading': '读取中…', 'task.env.updated': '更新于 {t}', 'task.env.err': '读取失败：{list}',
@@ -4584,6 +4609,17 @@ Object.assign(I18N.en, {
   'owner.reason.auto_fallback_dof_limit': 'auto fallback: profile DOF exceeds RT executor limit',
   'owner.reason.startup_fallback_to_legacy': 'startup fallback: RT executor init failed, holding in legacy',
   'owner.reason.startup_failed_detached_safe_hold': 'startup failed: detached SAFE-HOLD holds driver',
+  'owner.banner.failed.title': 'RT executor failed to start (SAFE-HOLD)',
+  'owner.banner.failed.sub': 'Cause: {reason}. Control endpoints are fenced so the arm stays held and does not drop. Next step: keep the workspace clear and support the arm, inspect armd logs for the startup failure, or set arm.armd_owner to "legacy" in app config (rebot-teleop.config.json) and restart rebot-teleop / armd.',
+  'owner.banner.failed.sub_generic': 'Cause: {reason}. Control endpoints are unavailable. Next step: inspect armd logs for the startup failure, or set arm.armd_owner to "legacy" in app config and restart armd.',
+  'owner.banner.transferring.title': 'Control owner is transferring',
+  'owner.banner.transferring.sub': 'Cause: {reason}. Wait a moment for transfer to finish; if it stays stuck, inspect armd logs and restart the service.',
+  'owner.banner.startup_fallback.title': 'RT executor failed to start; fell back to legacy holding: {reason}',
+  'owner.banner.startup_fallback.sub': 'The legacy control loop is holding the arm. Next step: inspect armd logs for the startup failure, or set arm.armd_owner to "legacy" in app config (rebot-teleop.config.json) if you intend to stay in legacy maintenance mode.',
+  'owner.banner.auto_fallback.title': 'Auto fallback to legacy control loop: {reason}',
+  'owner.banner.auto_fallback.sub': 'This configuration is not qualified for the RT executor; you can continue operating in legacy mode. To enable the RT executor, use a qualified follower and non-MIT profile and restart armd.',
+  'owner.legacy_only.generic': 'This feature requires legacy maintenance mode (RT executor currently owns the arm): set arm.armd_owner to "legacy" in app config (rebot-teleop.config.json) (or start with --owner legacy) and restart armd.',
+  'owner.unavailable.generic': 'Control owner is unavailable; follow the top banner to resolve and restart armd.',
   'task.env.safety': 'Safety state', 'task.env.col': 'Collision guard', 'task.env.ml': 'Motion limit', 'task.env.ko': 'Keep-out boxes', 'task.env.poses': 'Saved poses',
   'task.env.col.hold': 'holding after a hit (J{j})', 'task.env.col.ok': 'normal', 'task.env.count': '{n}',
   'task.env.na': 'not supported', 'task.env.none': 'none', 'task.env.loading': 'Loading…', 'task.env.updated': 'Updated {t}', 'task.env.err': 'Failed: {list}',
@@ -5173,9 +5209,10 @@ function retireSocket(ws, { reconnect = false, markReleased = false, toastExpire
   S.detections = []; S.detLastReceivedAt = 0; clearOverlayCanvas();
   if (leaseOp) { const op = leaseOp; leaseOp = null; if (op.timer) clearTimeout(op.timer); if (op.reject) op.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' })); }
   invalidateControlIntents({ dropOp: true }); resetLease();
-  if (reconnect) scheduleReconnect(1500);
+  if (reconnect) { scheduleReconnect(1500); loadOwnerDiagnostics(); }
 }
 function applyObservation(o, fromWs) {
+  const prevObsOwner = S.obs && isValidEffectiveOwner(S.obs.effective_owner) ? S.obs.effective_owner : null;
   S.obs = o; S.obsAt = Date.now(); if (fromWs) S.wsCount++;
   if (preemptModalOpen() && !leaseOp && S.leaseGeneration == null) {
     const cur = (o.lease_holder === null || o.lease_holder === CLIENT_ID) ? null : o.lease_holder;
@@ -5184,6 +5221,10 @@ function applyObservation(o, fromWs) {
   }
   detHoldOnObs(o); depthOnObs(o); gcOnObs(o);
   renderOwnerStatus();
+  if (isValidEffectiveOwner(o.effective_owner) && (!S.ownerDiag || S.ownerDiag.effective_owner !== o.effective_owner || S.ownerDiag.owner_reason !== (typeof o.owner_reason === 'string' ? o.owner_reason : ''))) {
+    loadOwnerDiagnostics();
+  }
+  if (prevObsOwner !== o.effective_owner && typeof gtRender === 'function' && $('gtool') && !$('gtool').hidden) gtRender();
   renderMotionLimit(o); tkOnObs(o); renderPower(o); graspOnObs(o); msOnObs(o); epOnObs(o); teachOnObs(o);
   syncEpoch(o.epoch_id);
   const st = parseState(o.safety_state), wasStopped = isStopped();
@@ -5222,7 +5263,7 @@ function connectWS() {
   S.sequenceId = 0;
   ws.onopen = () => {
     if (S.ws !== ws) return;
-    if (wsOpenedOnce) loadAuthStatus();
+    if (wsOpenedOnce) { loadAuthStatus(); loadOwnerDiagnostics(); loadSchema(); }
     wsOpenedOnce = true;
   };
   // Never acquire_lease on open: the page connects read-only until explicit Enable or operator confirmation.
@@ -9162,14 +9203,18 @@ function cwRender() {
     const fd = cwEl('div', 'cwiz-find');
     fd.append(
       cwBtn(t('cw.find.jog'), () => cwJogMode(true), { id: 'cwiz-find-jog', disabled: searching || gc }),
-      cwBtn(gc ? t('gc.exit') : t('cw.find.hand'), cwHandGuide, { id: 'cwiz-find-hand', cls: gc ? 'on' : '', disabled: searching || CWZ.busy || (!gc && !cwGcSupported()) }),
+      (() => {
+        const b = cwBtn(gc ? t('gc.exit') : t('cw.find.hand'), cwHandGuide, { id: 'cwiz-find-hand', cls: gc ? 'on' : '', disabled: searching || CWZ.busy || (!gc && !cwGcSupported()) });
+        if (!gc && !cwGcSupported()) b.title = gcExecutorUnsupported() ? t('cw.find.hand.exec_unavail') : t('cw.find.hand.na');
+        return b;
+      })(),
       searching ? (() => { const b = cwBtn(t('cw.cap.stop'), null, { id: 'cwiz-find-stop', cls: 'cwiz-stop' }); bindStopButton(b, undefined, () => { CWZ.stopReq = true; cwRender(); }); return b; })()
         : cwBtn(t('cw.find.search'), cwSearch, { id: 'cwiz-find-search', disabled: CWZ.busy || gc }));
     body.appendChild(fd);
     if (gc) {
       const ph = (S.obs.gravity_comp && S.obs.gravity_comp.phase) || 'active';
       body.appendChild(cwEl('div', 'cwiz-msg ok', t('gc.ph.' + ph, { n: Math.round(((S.obs.gravity_comp && S.obs.gravity_comp.ramp) || 0) * 100) }) + ' · ' + t('cw.find.gc.hint')));
-    } else if (!cwGcSupported()) body.appendChild(cwEl('p', 'cwiz-why', t('cw.find.hand.na')));
+    } else if (!cwGcSupported()) body.appendChild(cwEl('p', 'cwiz-why', gcExecutorUnsupported() ? t('cw.find.hand.exec_unavail') : t('cw.find.hand.na')));
     if (se && (searching || se.n)) {
       const pr = cwEl('div', 'calib-prog');
       pr.appendChild(cwEl('div', 'calib-count mono', searching
@@ -9331,44 +9376,156 @@ function ownerReasonLabel(reason) {
   const translated = t(k);
   return translated === k ? String(reason) : translated;
 }
-async function loadOwnerDiagnostics() {
-  try {
-    const d = await api('/api/v1/diagnostics', undefined, { quiet: true, method: 'GET' });
-    if (d && isValidEffectiveOwner(d.effective_owner)) {
-      S.ownerDiag = {
-        effective_owner: d.effective_owner,
-        owner_reason: typeof d.owner_reason === 'string' ? d.owner_reason : '',
-      };
-      renderOwnerStatus();
-    }
-  } catch (_) {}
-}
-function renderOwnerStatus() {
-  const badge = $('owner-badge');
-  if (!badge) return;
+const DEFAULT_LEGACY_ONLY_ROUTES = { rest: ['/api/v1/diagnostics/power'], ws: ['/api/v1/action/gripper_calibrate'] };
+function effectiveOwnerState() {
   const obs = S.obs;
   const diag = S.ownerDiag;
   const obsOwner = obs && isValidEffectiveOwner(obs.effective_owner) ? obs.effective_owner : null;
   const diagOwner = diag && isValidEffectiveOwner(diag.effective_owner) ? diag.effective_owner : null;
-  const useDiag = diagOwner === 'failed' || !obsOwner;
-  const owner = useDiag ? diagOwner : obsOwner;
+  const obsLive = typeof isLive === 'function' ? isLive() : true;
+  const useObs = !!(obsOwner && obsLive);
+  const owner = useObs ? obsOwner : (diagOwner || obsOwner);
+  const reason = useObs
+    ? (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : '')
+    : (diagOwner
+      ? (diag && typeof diag.owner_reason === 'string' ? diag.owner_reason : '')
+      : (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : ''));
+  const routes = diag && diag.legacy_only_routes && typeof diag.legacy_only_routes === 'object'
+    ? diag.legacy_only_routes
+    : DEFAULT_LEGACY_ONLY_ROUTES;
+  const detachedSafeHold = !useObs && !!(diag && diag.detached_safe_hold);
+  return { owner, reason, routes, detachedSafeHold };
+}
+function isRouteLegacyOnly(routePath) {
+  if (!routePath) return false;
+  const { routes } = effectiveOwnerState();
+  const ws = Array.isArray(routes.ws) ? routes.ws : [];
+  const rest = Array.isArray(routes.rest) ? routes.rest : [];
+  return ws.includes(routePath) || rest.includes(routePath);
+}
+function legacyOnlyRouteBlock(routePath, specificKey) {
+  if (!isRouteLegacyOnly(routePath)) return null;
+  const { owner } = effectiveOwnerState();
+  if (!owner || owner === 'legacy') return null;
+  if (owner === 'failed' || owner === 'transferring') {
+    return t(specificKey === 'gb.legacy_only' ? 'gb.owner_unavailable' : 'owner.unavailable.generic');
+  }
+  return t(specificKey || 'owner.legacy_only.generic');
+}
+function syncLegacyOnlyControls() {
+  if (typeof document === 'undefined' || !document.querySelectorAll) return;
+  for (const el of document.querySelectorAll('[data-route]')) {
+    const why = legacyOnlyRouteBlock(el.dataset.route, el.dataset.legacyOnlyKey);
+    if (why) {
+      el.dataset.legacyGated = '1';
+      el.disabled = true;
+      el.setAttribute('aria-disabled', 'true');
+      el.title = why;
+    } else if (el.dataset.legacyGated === '1') {
+      delete el.dataset.legacyGated;
+      el.disabled = false;
+      el.removeAttribute('aria-disabled');
+      el.title = '';
+    }
+  }
+}
+let ownerDiagRetryTimer = null;
+let ownerDiagInflight = false;
+function scheduleOwnerDiagRetry(delayMs = 3000) {
+  if (typeof setTimeout !== 'function' || ownerDiagRetryTimer) return;
+  ownerDiagRetryTimer = setTimeout(() => { ownerDiagRetryTimer = null; loadOwnerDiagnostics(); }, delayMs);
+}
+async function loadOwnerDiagnostics() {
+  if (ownerDiagInflight) return;
+  ownerDiagInflight = true;
+  let d = null;
+  try {
+    try {
+      d = await api('/api/v1/owner/status', undefined, { quiet: true, method: 'GET' });
+    } catch (_) {
+      try {
+        d = await api('/api/v1/diagnostics', undefined, { quiet: true, method: 'GET' });
+      } catch (_) {}
+    }
+    if (d && isValidEffectiveOwner(d.effective_owner)) {
+      const prevOwner = S.ownerDiag ? S.ownerDiag.effective_owner : null;
+      const prevReason = S.ownerDiag ? S.ownerDiag.owner_reason : null;
+      const prevRoutes = S.ownerDiag ? JSON.stringify(S.ownerDiag.legacy_only_routes || null) : null;
+      const nextRoutes = d.legacy_only_routes && typeof d.legacy_only_routes === 'object' ? d.legacy_only_routes : null;
+      S.ownerDiag = {
+        effective_owner: d.effective_owner,
+        owner_state: typeof d.owner_state === 'string' ? d.owner_state : d.effective_owner,
+        owner_reason: typeof d.owner_reason === 'string' ? d.owner_reason : '',
+        detached_safe_hold: !!d.detached_safe_hold,
+        legacy_only_routes: nextRoutes,
+      };
+      renderOwnerStatus();
+      if (prevOwner !== S.ownerDiag.effective_owner || prevReason !== S.ownerDiag.owner_reason || prevRoutes !== JSON.stringify(nextRoutes)) {
+        if (prevOwner != null && prevOwner !== S.ownerDiag.effective_owner && (S.ownerDiag.effective_owner === 'executor' || S.ownerDiag.effective_owner === 'legacy') && typeof loadSchema === 'function') {
+          loadSchema();
+        }
+        if (typeof renderGc === 'function') renderGc();
+        if (typeof gtRender === 'function' && $('gtool') && !$('gtool').hidden) gtRender();
+        if (typeof cwRender === 'function' && typeof CWZ !== 'undefined' && CWZ.open) cwRender();
+      }
+      if (S.ownerDiag.effective_owner === 'transferring' || S.ownerDiag.effective_owner === 'failed') {
+        scheduleOwnerDiagRetry(2000);
+      }
+    } else {
+      scheduleOwnerDiagRetry(2000);
+    }
+  } finally {
+    ownerDiagInflight = false;
+  }
+}
+function renderOwnerStatus() {
+  const badge = $('owner-badge');
+  const banner = $('owner-banner');
+  const { owner, reason, detachedSafeHold } = effectiveOwnerState();
   if (!owner) {
-    badge.hidden = true;
+    if (badge) badge.hidden = true;
+    if (banner) banner.hidden = true;
     return;
   }
-  const reason = useDiag
-    ? (diag && typeof diag.owner_reason === 'string' ? diag.owner_reason : '')
-    : (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : '');
   const failed = owner === 'failed';
-  const fallback = failed || (owner === 'legacy' && isOwnerFallbackReason(reason));
-  badge.hidden = false;
-  setText(badge, failed ? t('owner.badge.failed') : fallback ? t('owner.badge.fallback') : t('owner.badge.' + owner));
-  setCls(badge, 'sc-status-badge plain ' + (fallback ? 'is-warn is-fallback' : owner === 'executor' ? 'is-ok' : ''));
+  const transferring = owner === 'transferring';
+  const fallback = failed || transferring || (owner === 'legacy' && isOwnerFallbackReason(reason));
   const ownerName = t('owner.name.' + owner);
-  const reasonTxt = ownerReasonLabel(reason);
-  const detail = reasonTxt ? t('owner.title', { owner: ownerName, reason: reasonTxt }) : ownerName;
-  badge.title = detail;
-  badge.setAttribute('aria-label', detail);
+  const reasonTxt = ownerReasonLabel(reason) || t('owner.reason.default');
+  const detail = reason ? t('owner.title', { owner: ownerName, reason: reasonTxt }) : ownerName;
+  if (badge) {
+    badge.hidden = false;
+    setText(badge, failed ? t('owner.badge.failed') : transferring ? t('owner.badge.transferring') : fallback ? t('owner.badge.fallback') : t('owner.badge.' + owner));
+    setCls(badge, 'sc-status-badge plain ' + (failed ? 'is-danger is-warn is-fallback' : fallback ? 'is-warn is-fallback' : owner === 'executor' ? 'is-ok' : ''));
+    badge.title = detail;
+    badge.setAttribute('aria-label', detail);
+  }
+  if (banner) {
+    if (failed) {
+      banner.hidden = false;
+      setCls(banner, 'owner-banner is-danger');
+      banner.setAttribute('role', 'alert');
+      setText($('owner-banner-title'), t('owner.banner.failed.title'));
+      const subKey = (detachedSafeHold || reason === 'startup_failed_detached_safe_hold') ? 'owner.banner.failed.sub' : 'owner.banner.failed.sub_generic';
+      setText($('owner-banner-sub'), t(subKey, { reason: reasonTxt }));
+    } else if (transferring) {
+      banner.hidden = false;
+      setCls(banner, 'owner-banner');
+      banner.setAttribute('role', 'status');
+      setText($('owner-banner-title'), t('owner.banner.transferring.title'));
+      setText($('owner-banner-sub'), t('owner.banner.transferring.sub', { reason: reasonTxt }));
+    } else if (owner === 'legacy' && isOwnerFallbackReason(reason)) {
+      banner.hidden = false;
+      setCls(banner, 'owner-banner');
+      banner.setAttribute('role', 'status');
+      const isStartup = reason === 'startup_fallback_to_legacy';
+      setText($('owner-banner-title'), t(isStartup ? 'owner.banner.startup_fallback.title' : 'owner.banner.auto_fallback.title', { reason: reasonTxt }));
+      setText($('owner-banner-sub'), t(isStartup ? 'owner.banner.startup_fallback.sub' : 'owner.banner.auto_fallback.sub'));
+    } else {
+      banner.hidden = true;
+    }
+  }
+  syncLegacyOnlyControls();
 }
 if ($('owner-badge')) $('owner-badge').addEventListener('click', () => {
   const badge = $('owner-badge');
@@ -9400,9 +9557,14 @@ function renderToolStatus() {
   }
 }
 i18nHooks.push(renderToolStatus);
+let schemaLoadSeq = 0;
+let schemaRetryTimer = null;
 async function loadSchema() {
+  const seq = ++schemaLoadSeq;
+  if (schemaRetryTimer) { clearTimeout(schemaRetryTimer); schemaRetryTimer = null; }
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
+    if (seq !== schemaLoadSeq) return;
     const oldProfile = S.profileId;
     const oldClosed = CFG.gripClosed;
     const oldOpen = CFG.gripOpen;
@@ -9448,6 +9610,8 @@ async function loadSchema() {
         if (rmaxEl) rmaxEl.textContent = Math.round(CFG.cart.reachMax * 1000);
       }
       colOnCaps(); posesOnCaps(); epOnCaps(); teachOnCaps(); V3.sceneAt = 0;
+      if (typeof renderGc === 'function') renderGc();
+      if (typeof cwRender === 'function' && typeof CWZ !== 'undefined' && CWZ.open) cwRender();
     }
     if (sc && Array.isArray(sc.model_joint_map) && sc.model_joint_map.length >= 6) applyJointMap(sc.model_joint_map);
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
@@ -9481,7 +9645,11 @@ async function loadSchema() {
       }
       applyFrame();
     }
-  } catch (_) { setTimeout(loadSchema, 3000); }
+  } catch (_) {
+    if (seq === schemaLoadSeq && !schemaRetryTimer) {
+      schemaRetryTimer = setTimeout(() => { schemaRetryTimer = null; loadSchema(); }, 3000);
+    }
+  }
 }
 
 // observation.fault.code -> { title, todo } in the current language; null for an unknown code
@@ -11254,6 +11422,7 @@ async function disableTorque({ fallback = true } = {}) {
    Gravity compensation (hand-guiding): hold 600 ms to enter, tap to exit
    ================================================================= */
 const gcOn = () => S.obs?.control_mode === 'gravity_comp';
+const gcExecutorUnsupported = () => S.obs?.gravity_comp?.blocker?.code === 'EXECUTOR_CAPABILITY_UNSUPPORTED';
 function gcBlockText() {
   if (!isLive()) return t('gc.b.offline');
   if (leaseOther() != null) return t('gc.b.observer');
@@ -11342,12 +11511,14 @@ function renderGc() {
   document.body.classList.toggle('gc', on && live);
   const sw = $('btn-gc');
   const supported = !!(gc && gc.supported) && (S.caps ? S.caps.gravity_comp !== false : true);
-  sw.hidden = !supported;
+  const execUnsup = gcExecutorUnsupported();
+  sw.hidden = !supported && !execUnsup;
   const why = on ? null : gcBlockText();
   sw.classList.toggle('on', on);
   sw.classList.toggle('blocked', !on && !!why);
   sw.setAttribute('aria-checked', String(on));
   sw.setAttribute('aria-disabled', String(!on && !!why));
+  sw.title = (!on && why) ? why : '';
   setText($('gc-sub'), on ? t('gc.exit') : why || t('gc.hold'));
   const banner = $('gc-banner');
   banner.hidden = !on || !live;
@@ -14338,16 +14509,29 @@ function gbRender(body, o) {
   body.appendChild(cwEl('p', '', t('gb.lead')));
   row(t('gb.state'), t('gb.st.' + b.state) + ' · ' + t('gb.moves', { c: b.close_moves, o: b.open_moves }));
   body.appendChild(sec);
+  const legacyWhy = legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only');
   const torqued = !!o.is_torqued;
-  if (!torqued) body.appendChild(cwEl('div', 'cwiz-msg', t('gb.torque')));
-  const armed = Date.now() < GB.armedUntil;
+  if (legacyWhy) {
+    const whyEl = cwEl('div', 'cwiz-msg', legacyWhy);
+    whyEl.id = 'gb-owner-why';
+    body.appendChild(whyEl);
+  } else if (!torqued) {
+    body.appendChild(cwEl('div', 'cwiz-msg', t('gb.torque')));
+  }
+  const armed = !legacyWhy && Date.now() < GB.armedUntil;
   const acts = cwEl('div', 'cwiz-acts');
-  acts.append(cwBtn(t(armed ? 'gb.confirm' : 'gb.run'), gbRun, { cls: armed ? 'btn-primary' : '', disabled: GB.busy || GT.busy || !torqued, id: 'gb-run', op: '/api/v1/action/gripper_calibrate' }));
+  const runBtn = cwBtn(t(armed ? 'gb.confirm' : 'gb.run'), gbRun, { cls: armed ? 'btn-primary' : '', disabled: !!legacyWhy || GB.busy || GT.busy || !torqued, id: 'gb-run', op: '/api/v1/action/gripper_calibrate' });
+  runBtn.dataset.route = '/api/v1/action/gripper_calibrate';
+  runBtn.dataset.legacyOnlyKey = 'gb.legacy_only';
+  if (legacyWhy) { runBtn.title = legacyWhy; runBtn.setAttribute('aria-disabled', 'true'); }
+  acts.append(runBtn);
   body.appendChild(acts);
   if (GB.status) body.appendChild(cwEl('div', 'cwiz-msg' + (GB.ok ? ' ok' : ''), GB.status));
 }
 async function gbRun() {
   if (GB.busy || GT.busy) return;
+  const legacyWhy = legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only');
+  if (legacyWhy) { GB.ok = false; GB.status = legacyWhy; gtRender(); return; }
   if (Date.now() >= GB.armedUntil) { GB.armedUntil = Date.now() + 4000; gtRender(); setTimeout(gtRender, 4100); return; }
   GB.armedUntil = 0; GB.busy = true; GB.ok = false; GB.status = t('gb.start'); gtRender();
   try {
@@ -14372,6 +14556,7 @@ async function gbRun() {
   } catch (e) {
     if (isCancelledErr(e)) { GB.status = ''; return; }
     GB.status = e.code === 'OPERATOR_REQUIRED' ? t('gb.op')
+      : e.code === 'EXECUTOR_ROUTING_PENDING' ? t('gb.legacy_only')
       : e.code === 'CALIBRATION_OBSTRUCTED' ? t('gb.obst', { m: e.message })
       : t('gb.err', { m: (e.code ? e.code + ': ' : '') + e.message });
   } finally { GB.busy = false; gtRender(); }

@@ -151,6 +151,14 @@ pub enum FaultAvailability {
     Fenced,
 }
 
+/// Whether a read-only route remains readable when control ownership is unavailable
+/// (`OWNER_FAILED` or `OWNER_TRANSFERRING`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerUnavailableAvailability {
+    Allowed,
+    Fenced,
+}
+
 /// Canonical capability specification stored in the route registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteSpec {
@@ -159,6 +167,7 @@ pub struct RouteSpec {
     pub operator: OperatorPolicy,
     pub lease: LeasePolicy,
     pub fault: FaultAvailability,
+    pub owner_unavailable: OwnerUnavailableAvailability,
 }
 
 /// Concrete REST route binding registered into Axum from [`REST_ROUTES`].
@@ -236,6 +245,21 @@ where
 }
 
 macro_rules! rr {
+    (GET_ALWAYS $path:expr, $h:path, $own:ident, $op:ident, $lease:ident, $fault:ident) => {
+        RestRouteEntry {
+            method: RestMethod::Get,
+            template: $path,
+            spec: RouteSpec {
+                handler: stringify!($h),
+                ownership: RouteOwnership::$own,
+                operator: OperatorPolicy::$op,
+                lease: LeasePolicy::$lease,
+                fault: FaultAvailability::$fault,
+                owner_unavailable: OwnerUnavailableAvailability::Allowed,
+            },
+            build_method: || rest_get($h, OperatorPolicy::$op),
+        }
+    };
     (GET $path:expr, $h:path, $own:ident, $op:ident, $lease:ident, $fault:ident) => {
         RestRouteEntry {
             method: RestMethod::Get,
@@ -246,6 +270,7 @@ macro_rules! rr {
                 operator: OperatorPolicy::$op,
                 lease: LeasePolicy::$lease,
                 fault: FaultAvailability::$fault,
+                owner_unavailable: OwnerUnavailableAvailability::Fenced,
             },
             build_method: || rest_get($h, OperatorPolicy::$op),
         }
@@ -260,6 +285,7 @@ macro_rules! rr {
                 operator: OperatorPolicy::$op,
                 lease: LeasePolicy::$lease,
                 fault: FaultAvailability::$fault,
+                owner_unavailable: OwnerUnavailableAvailability::Fenced,
             },
             build_method: || rest_post($h, OperatorPolicy::$op),
         }
@@ -274,6 +300,7 @@ macro_rules! rr {
                 operator: OperatorPolicy::$op,
                 lease: LeasePolicy::$lease,
                 fault: FaultAvailability::$fault,
+                owner_unavailable: OwnerUnavailableAvailability::Fenced,
             },
             build_method: || rest_delete($h, OperatorPolicy::$op),
         }
@@ -288,6 +315,7 @@ macro_rules! rr {
                 operator: OperatorPolicy::$op,
                 lease: LeasePolicy::$lease,
                 fault: FaultAvailability::$fault,
+                owner_unavailable: OwnerUnavailableAvailability::Fenced,
             },
             build_method: || rest_post_limit($h, $limit, OperatorPolicy::$op),
         }
@@ -302,6 +330,7 @@ macro_rules! rr {
                 operator: OperatorPolicy::$op,
                 lease: LeasePolicy::$lease,
                 fault: FaultAvailability::$fault,
+                owner_unavailable: OwnerUnavailableAvailability::Fenced,
             },
             build_method: || rest_post_sandbox_upload($h, OperatorPolicy::$op),
         }
@@ -323,14 +352,15 @@ static REST_ROUTES: &[RestRouteEntry] = &[
                "/api/v1/calibration/sessions",      crate::calibration_sessions::post_session, OwnerAgnostic, Required, None, Fenced),
     rr!(GET    "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::get_session,  OwnerAgnostic, None,   None, Allowed),
     rr!(DELETE "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::delete_session, OwnerAgnostic, Required, None, Fenced),
-    // Cockpit / static assets
-    rr!(GET    "/",                       super::serve_index,        OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/favicon.ico",            super::serve_favicon,      OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/jmuxer.min.js",   super::serve_jmuxer,       OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/calib_wizard.js", super::serve_calib_wizard, OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/three-urdf.min.js", super::assets::serve_three, OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/model/{*path}",   super::assets::serve_model, OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/wasm/{*path}",    super::assets::serve_wasm,  OwnerAgnostic, None, None, Allowed),
+    // Cockpit / static assets (read-only UI shell + static bundles; always readable so a fresh
+    // browser load under OWNER_FAILED / OWNER_TRANSFERRING has zero 503 asset errors).
+    rr!(GET_ALWAYS "/",                         super::serve_index,         OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/favicon.ico",              super::serve_favicon,       OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/jmuxer.min.js",     super::serve_jmuxer,        OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/calib_wizard.js",   super::serve_calib_wizard,  OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/three-urdf.min.js", super::assets::serve_three, OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/model/{*path}",     super::assets::serve_model, OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/wasm/{*path}",      super::assets::serve_wasm,  OwnerAgnostic, None, None, Allowed),
     // Sandbox
     rr!(GET    "/api/v1/sandbox/catalog",                   sandbox::get_catalog,       ExecutorRequest, None,     None, Allowed),
     rr!(POST_UPLOAD "/api/v1/sandbox/scenes",               sandbox::upload_scene,      OwnerAgnostic,   Required, None, Fenced),
@@ -354,6 +384,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     // Core observation, torque, heartbeat, motion, actions
     rr!(GET    "/api/v1/observation",               rest::get_observation,        ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/observation/schema",        rest::get_observation_schema, ExecutorRequest, None,      None,              Allowed),
+    rr!(GET_ALWAYS "/api/v1/owner/status",          rest::get_owner_status,       OwnerAgnostic,   None,      None,              Allowed),
     rr!(GET    "/api/v1/cell/status",               rest::get_cell_status,        OwnerAgnostic,   None,      None,              Allowed),
     rr!(POST   "/api/v1/torque",                    rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/arm",                       rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
@@ -442,6 +473,8 @@ struct RouteRegistry {
     rest_param: Vec<(RestMethod, &'static str, RouteSpec)>,
     ws_commands: HashMap<&'static str, RouteSpec>,
     ws_frames: HashMap<FrameKind, RouteSpec>,
+    legacy_only_rest: Vec<&'static str>,
+    legacy_only_ws: Vec<&'static str>,
 }
 
 static REGISTRY: LazyLock<RouteRegistry> = LazyLock::new(|| {
@@ -452,6 +485,8 @@ static REGISTRY: LazyLock<RouteRegistry> = LazyLock::new(|| {
     let mut rest_param = Vec::new();
     let mut ws_commands = HashMap::new();
     let mut ws_frames = HashMap::new();
+    let mut legacy_only_rest = Vec::new();
+    let mut legacy_only_ws = Vec::new();
 
     for entry in REST_ROUTES {
         assert!(
@@ -464,6 +499,11 @@ static REGISTRY: LazyLock<RouteRegistry> = LazyLock::new(|| {
             by_key.insert(key, entry.spec).is_none(),
             "duplicate REST route in capability registry: {key:?}"
         );
+        if entry.spec.ownership == RouteOwnership::LegacyOnly
+            && !legacy_only_rest.contains(&entry.template)
+        {
+            legacy_only_rest.push(entry.template);
+        }
         if entry.template.contains('{') {
             rest_param.push((entry.method, entry.template, entry.spec));
         } else {
@@ -493,6 +533,9 @@ static REGISTRY: LazyLock<RouteRegistry> = LazyLock::new(|| {
         );
         match (entry.key.kind, entry.key.path) {
             (FrameKind::Command, Some(cmd)) => {
+                if spec.ownership == RouteOwnership::LegacyOnly && !legacy_only_ws.contains(&cmd) {
+                    legacy_only_ws.push(cmd);
+                }
                 ws_commands.insert(cmd, spec);
             }
             (kind, None) => {
@@ -502,6 +545,9 @@ static REGISTRY: LazyLock<RouteRegistry> = LazyLock::new(|| {
         }
     }
 
+    legacy_only_rest.sort_unstable();
+    legacy_only_ws.sort_unstable();
+
     RouteRegistry {
         by_key,
         rest_get_exact,
@@ -510,12 +556,24 @@ static REGISTRY: LazyLock<RouteRegistry> = LazyLock::new(|| {
         rest_param,
         ws_commands,
         ws_frames,
+        legacy_only_rest,
+        legacy_only_ws,
     }
 });
 
 /// Pre-initializes the unified route registry (called once at router construction).
 pub fn prewarm_registry() {
     LazyLock::force(&REGISTRY);
+}
+
+/// Sorted list of REST templates currently classified as [`RouteOwnership::LegacyOnly`].
+pub fn legacy_only_rest_routes() -> &'static [&'static str] {
+    &REGISTRY.legacy_only_rest
+}
+
+/// Sorted list of WS command paths currently classified as [`RouteOwnership::LegacyOnly`].
+pub fn legacy_only_ws_commands() -> &'static [&'static str] {
+    &REGISTRY.legacy_only_ws
 }
 
 /// Exact lookup by [`RouteKey`] (REST method + template or WS frame kind + command).
@@ -671,12 +729,21 @@ pub(super) async fn dispatch_rest_gate(
                 .into_response()
             }
         }
-        _ => rest::ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RT executor ownership is transitioning or unavailable".into(),
-            "EXECUTOR_UNAVAILABLE".into(),
-        )
-        .into_response(),
+        _ => {
+            let allowed = spec.is_some_and(|s| {
+                s.owner_unavailable == OwnerUnavailableAvailability::Allowed
+            });
+            if allowed {
+                next.run(request).await
+            } else {
+                rest::ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "RT executor ownership is transitioning or unavailable".into(),
+                    "EXECUTOR_UNAVAILABLE".into(),
+                )
+                .into_response()
+            }
+        }
     }
 }
 
@@ -789,6 +856,17 @@ mod tests {
             lookup(RouteKey::rest(RestMethod::Get, "/api/v1/cell/status")).unwrap().ownership,
             RouteOwnership::OwnerAgnostic
         );
+        let owner_status_spec = lookup(RouteKey::rest(RestMethod::Get, "/api/v1/owner/status"))
+            .expect("/api/v1/owner/status must be registered");
+        assert_eq!(owner_status_spec.ownership, RouteOwnership::OwnerAgnostic);
+        assert_eq!(owner_status_spec.fault, FaultAvailability::Allowed);
+        assert_eq!(owner_status_spec.owner_unavailable, OwnerUnavailableAvailability::Allowed);
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Get, "/")).unwrap().owner_unavailable,
+            OwnerUnavailableAvailability::Allowed
+        );
+        assert!(legacy_only_rest_routes().contains(&LEGACY_ONLY_REST_PROBE.1));
+        assert!(legacy_only_ws_commands().contains(&LEGACY_ONLY_WS_PROBE));
         assert_eq!(
             lookup(RouteKey::rest(RestMethod::Post, crate::vision_detector::MODELS_PATH)).unwrap().ownership,
             RouteOwnership::ExecutorRequest
@@ -1108,5 +1186,144 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn owner_status_route_is_never_gated_across_owner_and_fault_states() {
+        use tower::ServiceExt;
+
+        let fetch_owner_status = |router: Router| async move {
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/v1/owner/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        // 1. Legacy owner with startup fallback reason.
+        let sup = Arc::new(ArmSupervisor::new(crate::model::ArmConfig::rebot_dm()));
+        sup.set_owner_reason(crate::model::OwnerReason::StartupFallbackToLegacy)
+            .await;
+        let router = super::super::create_router_with_detector(
+            sup.clone(),
+            proxy::DetectorUpstream::parse("http://127.0.0.1:1").unwrap(),
+            crate::auth::OperatorAuth::enforced("123456", 1800),
+        );
+        let st_leg = fetch_owner_status(router.clone()).await;
+        assert_eq!(st_leg["effective_owner"], "legacy");
+        assert_eq!(st_leg["owner_state"], "legacy");
+        assert_eq!(st_leg["owner_reason"], "startup_fallback_to_legacy");
+        assert_eq!(st_leg["is_fallback"], true);
+        assert_eq!(st_leg["detached_safe_hold"], false);
+        assert!(
+            st_leg["legacy_only_routes"]["ws"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == crate::gripper_calib::CALIBRATE_PATH)
+        );
+        assert!(
+            st_leg["legacy_only_routes"]["rest"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == LEGACY_ONLY_REST_PROBE.1)
+        );
+
+        // 2. Active RT executor + internal_fault_fenced().
+        sup.set_owner_reason(crate::model::OwnerReason::AutoQualified).await;
+        let handle = sup
+            .start_executor(crate::rt_core::executor::ExecutorConfig::for_tests(
+                std::time::Duration::from_millis(20),
+            ))
+            .await
+            .expect("start mock executor");
+        let st_exec = fetch_owner_status(router.clone()).await;
+        assert_eq!(st_exec["effective_owner"], "executor");
+        assert_eq!(st_exec["owner_state"], "executor");
+        assert_eq!(st_exec["owner_reason"], "auto_qualified");
+        assert_eq!(st_exec["is_fallback"], false);
+
+        sup.internal_fault_lane().latch_control_safe_hold_fence();
+        let st_fault = fetch_owner_status(router.clone()).await;
+        assert_eq!(st_fault["effective_owner"], "executor");
+        assert_eq!(st_fault["owner_reason"], "auto_qualified");
+        handle.stop_and_join();
+
+        // 3. OWNER_FAILED: observation & diagnostics return 503 EXECUTOR_UNAVAILABLE,
+        //    while GET / and GET /api/v1/owner/status remain 200 OK for fresh cockpit loads.
+        let sup_fail = Arc::new(ArmSupervisor::new(crate::model::ArmConfig::rebot_dm()));
+        let hooks_fail = crate::rt_core::executor::PersistTestHooks {
+            fail_init: Some(false),
+            ..Default::default()
+        };
+        let _ = sup_fail
+            .start_executor_with_hooks(
+                crate::rt_core::executor::ExecutorConfig::for_tests(std::time::Duration::from_millis(5)),
+                hooks_fail,
+            )
+            .await;
+        sup_fail
+            .set_owner_reason(crate::model::OwnerReason::StartupFailedDetachedSafeHold)
+            .await;
+        assert_eq!(sup_fail.owner_mode(), crate::supervisor::OWNER_FAILED);
+        let fail_router = super::super::create_router_with_detector(
+            sup_fail.clone(),
+            proxy::DetectorUpstream::parse("http://127.0.0.1:1").unwrap(),
+            crate::auth::OperatorAuth::enforced("123456", 1800),
+        );
+
+        let st_fail = fetch_owner_status(fail_router.clone()).await;
+        assert_eq!(st_fail["effective_owner"], "failed");
+        assert_eq!(st_fail["owner_state"], "failed");
+        assert_eq!(st_fail["owner_reason"], "startup_failed_detached_safe_hold");
+        assert_eq!(st_fail["is_fallback"], true);
+
+        for asset in ["/", "/favicon.ico", "/assets/jmuxer.min.js", "/assets/calib_wizard.js"] {
+            let asset_resp = fail_router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(asset)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                asset_resp.status().is_success(),
+                "{asset} must remain readable under OWNER_FAILED, got {}",
+                asset_resp.status()
+            );
+        }
+
+        for gated in ["/api/v1/observation", "/api/v1/diagnostics", "/api/v1/vision/mode"] {
+            let resp = fail_router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(gated)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{gated} must stay gated under OWNER_FAILED");
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("EXECUTOR_UNAVAILABLE"),
+                "{gated} must return EXECUTOR_UNAVAILABLE: {body:?}"
+            );
+        }
     }
 }
