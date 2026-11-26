@@ -232,7 +232,15 @@ A kit ships: the armd binary (unchanged core), its profile, optional sidecar pro
 `armd --follower <model> [--follower-port <port>] --config <profile>`.
 
 - Version: not versioned in code; the layout below is version 1 of this document.
-- armd reads `PORT`, `RUST_LOG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP`, `ARMD_KEEPOUT`, `ARMD_POSES`, `ARMD_COLLISION`, `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR` from the environment.
+- armd reads `PORT`, `RUST_LOG`, `ARMD_RT_OWNER`, `ARMD_APP_CONFIG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP`, `ARMD_KEEPOUT`, `ARMD_POSES`, `ARMD_COLLISION`, `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR` from the environment.
+
+#### Startup control-loop owner (for agents, tests, and packaging)
+
+- **Precedence**: CLI `--owner <auto|legacy|executor>` > env `ARMD_RT_OWNER` > config `arm.armd_owner` (top-level `armd_owner` fallback in `ARMD_APP_CONFIG` or `/userdata/local/apps/rebot-teleop.config.json`) > `auto`.
+- **`auto` rule**: selects `executor` for qualified `--follower rebot-dm` and `mock` with an eligible profile; selects `legacy` with one startup log line naming the reason for all other followers (`so-arm101`, `so-arm100`, `rebot-rs`, `fashionstar`, `star-arm102`, `sim`), MIT-configured profiles, or profiles above `MAX_DOF`.
+- **Fail-closed explicit override**: explicit `executor` (via CLI, env, or config) on an ineligible follower or profile is refused at startup with a clear error.
+- **Packaging (`K92rebot-teleop`)**: omits `--owner` unless `arm.armd_owner` is set in `/userdata/local/apps/rebot-teleop.config.json`. The gallery manifest default is `"auto"`, and upgrades preserve explicitly stored values.
+- **Diagnostics & tests**: `GET /api/v1/observation`, `GET /api/v1/diagnostics`, and `GET /api/v1/diagnostics/tick` expose `effective_owner` and `owner_reason`. Because `mock` and `rebot-dm` now default to `executor`, any test, script, or agent workflow that specifically exercises legacy-only behavior must pin `--owner legacy` or `ARMD_RT_OWNER=legacy`.
 
 The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop` 1.3.4):
 

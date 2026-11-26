@@ -73,38 +73,130 @@ const OFFLOAD_RECLAIM_CAPACITY: usize = MAINT_QUEUE_CAPACITY
     + 4
     + 2;
 
-/// Startup owner selection for `ArmCore` and the actuator bus.
+/// Effective startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RtOwner {
-    /// Legacy supervisor-lock owner (default in stage 3 step 1).
+    /// Legacy supervisor-lock owner.
     #[default]
     Legacy,
     /// Synchronous RT executor OS thread owning `SupervisorInner` and the bus driver.
     Executor,
 }
 
+/// Requested startup owner before follower and profile eligibility resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestedRtOwner {
+    /// Automatic selection: `Executor` for qualified followers (`rebot-dm`, `mock`) and eligible
+    /// profiles, `Legacy` (logged with reason) otherwise.
+    #[default]
+    Auto,
+    /// Explicitly force the legacy supervisor-lock control loop.
+    Legacy,
+    /// Explicitly require the synchronous RT executor (refused if follower or profile is ineligible).
+    Executor,
+}
+
+/// Configuration source that supplied the requested startup owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerSource {
+    Cli,
+    Env,
+    Config,
+    Default,
+}
+
+impl OwnerSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "--owner",
+            Self::Env => "ARMD_RT_OWNER",
+            Self::Config => "arm.armd_owner",
+            Self::Default => "default",
+        }
+    }
+
+    pub const fn explicit_reason(self) -> crate::model::OwnerReason {
+        match self {
+            Self::Cli => crate::model::OwnerReason::ExplicitCli,
+            Self::Env => crate::model::OwnerReason::ExplicitEnv,
+            Self::Config => crate::model::OwnerReason::ExplicitConfig,
+            Self::Default => crate::model::OwnerReason::Default,
+        }
+    }
+}
+
+/// Resolved startup owner decision, including effective owner, structured reason, and optional
+/// single-line fallback detail when `Auto` resolved to `Legacy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStartupOwner {
+    pub requested: RequestedRtOwner,
+    pub source: OwnerSource,
+    pub effective: RtOwner,
+    pub reason: crate::model::OwnerReason,
+    pub fallback_detail: Option<String>,
+}
+
+impl RequestedRtOwner {
+    fn parse_with_label(raw: &str, label: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "auto" => Ok(Self::Auto),
+            "legacy" => Ok(Self::Legacy),
+            "executor" => Ok(Self::Executor),
+            other => Err(format!(
+                "{label} must be 'auto', 'legacy', or 'executor', got {other:?}"
+            )),
+        }
+    }
+
+    /// Resolves the requested startup owner with precedence:
+    /// CLI `--owner` > `ARMD_RT_OWNER` > config `arm.armd_owner` > `Auto`.
+    pub fn resolve(
+        cli_owner: Option<&str>,
+        env_owner: Option<&str>,
+        config_owner: Option<&str>,
+    ) -> Result<(Self, OwnerSource), String> {
+        if let Some(raw) = cli_owner {
+            return Ok((Self::parse_with_label(raw, "--owner")?, OwnerSource::Cli));
+        }
+        if let Some(raw) = env_owner.map(str::trim).filter(|s| !s.is_empty()) {
+            return Ok((Self::parse_with_label(raw, "ARMD_RT_OWNER")?, OwnerSource::Env));
+        }
+        if let Some(raw) = config_owner.map(str::trim).filter(|s| !s.is_empty()) {
+            return Ok((Self::parse_with_label(raw, "arm.armd_owner")?, OwnerSource::Config));
+        }
+        Ok((Self::Auto, OwnerSource::Default))
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Legacy => "legacy",
+            Self::Executor => "executor",
+        }
+    }
+}
+
 impl RtOwner {
     pub fn from_env() -> Result<Self, String> {
-        Self::from_var(std::env::var("ARMD_RT_OWNER").ok().as_deref())
-    }
-
-    /// Resolves the startup owner with explicit precedence: CLI `--owner` > `ARMD_RT_OWNER` > `legacy`.
-    pub fn resolve(cli_owner: Option<&str>, env_owner: Option<&str>) -> Result<Self, String> {
-        if let Some(raw) = cli_owner {
-            return match raw.trim() {
-                "legacy" => Ok(Self::Legacy),
-                "executor" => Ok(Self::Executor),
-                other => Err(format!("--owner must be 'legacy' or 'executor', got {other:?}")),
-            };
+        match std::env::var_os("ARMD_RT_OWNER") {
+            None => Self::from_var(None),
+            Some(os) => match os.to_str() {
+                Some(s) => Self::from_var(Some(s)),
+                None => Err(
+                    "ARMD_RT_OWNER must be valid UTF-8 ('auto', 'legacy', or 'executor')".into(),
+                ),
+            },
         }
-        Self::from_var(env_owner)
     }
 
+    /// Parses `ARMD_RT_OWNER` into an effective owner for mock/default tests (`auto` resolves to `Executor`).
     pub fn from_var(raw: Option<&str>) -> Result<Self, String> {
         match raw.map(str::trim).filter(|s| !s.is_empty()) {
-            None | Some("legacy") => Ok(Self::Legacy),
-            Some("executor") => Ok(Self::Executor),
-            Some(other) => Err(format!("ARMD_RT_OWNER must be 'legacy' or 'executor', got {other:?}")),
+            None | Some("auto") | Some("executor") => Ok(Self::Executor),
+            Some("legacy") => Ok(Self::Legacy),
+            Some(other) => Err(format!(
+                "ARMD_RT_OWNER must be 'auto', 'legacy', or 'executor', got {other:?}"
+            )),
         }
     }
 
@@ -114,19 +206,126 @@ impl RtOwner {
             Self::Executor => "executor",
         }
     }
+
+    pub const fn to_effective(self) -> crate::model::EffectiveOwner {
+        match self {
+            Self::Legacy => crate::model::EffectiveOwner::Legacy,
+            Self::Executor => crate::model::EffectiveOwner::Executor,
+        }
+    }
 }
 
-/// Startup owner admission gate: `RtOwner::Executor` is allowed behind explicit opt-in
-/// (`--owner executor` or `ARMD_RT_OWNER=executor`) only for qualified followers
-/// (`"rebot-dm"` and driverless `"mock"`). Other followers stay gated to `legacy` until
-/// qualified.
+/// Whether `follower` is qualified to run under `RtOwner::Executor`.
+pub fn is_executor_qualified_follower(follower: &str) -> bool {
+    matches!(follower, "mock" | "rebot-dm")
+}
+
+/// Checks whether `config` is eligible for `RtOwner::Executor`.
+/// Returns `Err((reason, human_detail))` when the profile requires the legacy owner
+/// (MIT-configured profiles or DOF exceeding the RT mailbox limit).
+pub fn check_executor_profile_eligibility(
+    config: &crate::model::ArmConfig,
+) -> Result<(), (crate::model::OwnerReason, String)> {
+    if crate::mit::mit_joint_mask(config) != 0 {
+        return Err((
+            crate::model::OwnerReason::AutoFallbackMitProfile,
+            "MIT-configured profile (joint_tracking strategy 'mit') is not supported on the RT executor".into(),
+        ));
+    }
+    if config.dof > crate::rt_core::mailbox::MAX_DOF {
+        return Err((
+            crate::model::OwnerReason::AutoFallbackDofLimit,
+            format!(
+                "profile DOF {} exceeds RT executor mailbox limit {}",
+                config.dof,
+                crate::rt_core::mailbox::MAX_DOF
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Startup owner admission gate for explicit `RtOwner::Executor` requests against a follower model:
+/// only qualified followers (`"rebot-dm"` and driverless `"mock"`) are permitted.
 pub fn validate_startup_owner(owner: RtOwner, follower: &str) -> Result<(), String> {
     match owner {
         RtOwner::Legacy => Ok(()),
-        RtOwner::Executor if matches!(follower, "mock" | "rebot-dm") => Ok(()),
+        RtOwner::Executor if is_executor_qualified_follower(follower) => Ok(()),
         RtOwner::Executor => Err(format!(
-            "RT executor owner (--owner executor / ARMD_RT_OWNER=executor) is only qualified for '--follower rebot-dm' and '--follower mock' (got '--follower {follower}'); use '--owner legacy' until '{follower}' is qualified"
+            "RT executor owner (--owner executor / ARMD_RT_OWNER=executor / arm.armd_owner=executor) is only qualified for '--follower rebot-dm' and '--follower mock' (got '--follower {follower}'); use '--owner legacy' or '--owner auto' until '{follower}' is qualified"
         )),
+    }
+}
+
+/// Resolves the effective startup control-loop owner and reason with full precedence:
+/// CLI `--owner` > env `ARMD_RT_OWNER` > config `arm.armd_owner` > `Auto`.
+///
+/// - `Auto` selects `Executor` for qualified followers (`rebot-dm`, `mock`) with an eligible profile,
+///   and falls back to `Legacy` with a descriptive reason for unqualified followers (`so-arm101`,
+///   `so-arm100`, `rebot-rs`, `fashionstar`, `star-arm102`, `sim`, etc.), MIT-configured profiles,
+///   or profiles exceeding `MAX_DOF`.
+/// - An explicit `Executor` request on any ineligible follower or profile is refused with an error.
+pub fn resolve_startup_owner(
+    cli_owner: Option<&str>,
+    env_owner: Option<&str>,
+    config_owner: Option<&str>,
+    follower: &str,
+    config: &crate::model::ArmConfig,
+) -> Result<ResolvedStartupOwner, String> {
+    let (requested, source) = RequestedRtOwner::resolve(cli_owner, env_owner, config_owner)?;
+    match requested {
+        RequestedRtOwner::Legacy => Ok(ResolvedStartupOwner {
+            requested,
+            source,
+            effective: RtOwner::Legacy,
+            reason: source.explicit_reason(),
+            fallback_detail: None,
+        }),
+        RequestedRtOwner::Executor => {
+            validate_startup_owner(RtOwner::Executor, follower)?;
+            if let Err((_, detail)) = check_executor_profile_eligibility(config) {
+                return Err(format!(
+                    "RT executor owner ({}=executor) refused: {detail}; use '--owner legacy' or '--owner auto'",
+                    source.as_str()
+                ));
+            }
+            Ok(ResolvedStartupOwner {
+                requested,
+                source,
+                effective: RtOwner::Executor,
+                reason: source.explicit_reason(),
+                fallback_detail: None,
+            })
+        }
+        RequestedRtOwner::Auto => {
+            if !is_executor_qualified_follower(follower) {
+                return Ok(ResolvedStartupOwner {
+                    requested,
+                    source,
+                    effective: RtOwner::Legacy,
+                    reason: crate::model::OwnerReason::AutoFallbackUnqualifiedFollower,
+                    fallback_detail: Some(format!(
+                        "follower '{follower}' is not qualified for the RT executor (qualified: rebot-dm, mock)"
+                    )),
+                });
+            }
+            if let Err((reason, detail)) = check_executor_profile_eligibility(config) {
+                return Ok(ResolvedStartupOwner {
+                    requested,
+                    source,
+                    effective: RtOwner::Legacy,
+                    reason,
+                    fallback_detail: Some(detail),
+                });
+            }
+            Ok(ResolvedStartupOwner {
+                requested,
+                source,
+                effective: RtOwner::Executor,
+                reason: crate::model::OwnerReason::AutoQualified,
+                fallback_detail: None,
+            })
+        }
     }
 }
 
@@ -8804,6 +9003,13 @@ fn run_bounded_teardown_disable(
     let disable_timeout = hooks
         .panic_disable_timeout
         .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (pre_intent, pre_torqued, pre_stopped, pre_ts) = (
+        core.shadow_live_intent(),
+        core.is_torqued,
+        core.safety.state().is_stopped(),
+        core.cached_driver_clock_now(),
+    );
     let td_obs = Arc::clone(teardown_disable);
     let exited_obs = Arc::clone(exited);
     let cv_obs = Arc::clone(control_exited_cv);
@@ -8853,7 +9059,14 @@ fn run_bounded_teardown_disable(
     );
     if let Some(outcome) = completed {
         #[cfg(not(target_arch = "wasm32"))]
-        core.record_post_panic_disable_shadow(policy.is_some(), &outcome);
+        core.record_post_panic_disable_shadow_at(
+            policy.is_some(),
+            &outcome,
+            pre_intent,
+            pre_torqued,
+            pre_stopped,
+            pre_ts,
+        );
         outcome.log(context, effective_budget);
         if matches!(policy, Some(PanicPolicy::AbortProcess)) {
             crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
@@ -8863,7 +9076,14 @@ fn run_bounded_teardown_disable(
     } else {
         let outcome = crate::supervisor::PanicDisableOutcome::TimedOut;
         #[cfg(not(target_arch = "wasm32"))]
-        core.record_post_panic_disable_shadow(policy.is_some(), &outcome);
+        core.record_post_panic_disable_shadow_at(
+            policy.is_some(),
+            &outcome,
+            pre_intent,
+            pre_torqued,
+            pre_stopped,
+            pre_ts,
+        );
         outcome
     }
 }
@@ -10661,6 +10881,13 @@ fn control_thread_main_inner(
         // physical disarm cleanly without sending unnecessary torque-off frames (and if any axis
         // replies enabled or silent, fall through to bounded `DisableProtective { ProcessExit }`).
         let core_ref = core_slot.as_deref_mut().expect("core owned");
+        #[cfg(not(target_arch = "wasm32"))]
+        let (pre_intent, pre_torqued, pre_stopped, pre_ts) = (
+            core_ref.shadow_live_intent(),
+            core_ref.is_torqued,
+            core_ref.safety.state().is_stopped(),
+            core_ref.cached_driver_clock_now(),
+        );
         let idle_disarm_proven = if core_ref.eligible_for_readonly_disarm_proof() {
             let now = Instant::now();
             let base_dl = explicit_dl.unwrap_or_else(|| {
@@ -10678,7 +10905,14 @@ fn control_thread_main_inner(
         let outcome = if idle_disarm_proven {
             let outcome = crate::supervisor::PanicDisableOutcome::Confirmed;
             #[cfg(not(target_arch = "wasm32"))]
-            core_ref.record_post_panic_disable_shadow(false, &outcome);
+            core_ref.record_post_panic_disable_shadow_at(
+                false,
+                &outcome,
+                pre_intent,
+                pre_torqued,
+                pre_stopped,
+                pre_ts,
+            );
             teardown_disable.set_outcome(outcome.clone());
             outcome
         } else {
@@ -11644,30 +11878,75 @@ mod tests {
 
     #[test]
     fn owner_env_and_startup_gate_fail_closed() {
-        assert_eq!(RtOwner::from_var(None).unwrap(), RtOwner::Legacy);
+        use crate::model::{ArmConfig, OwnerReason};
+
+        assert_eq!(RtOwner::from_var(None).unwrap(), RtOwner::Executor);
+        assert_eq!(RtOwner::from_var(Some("auto")).unwrap(), RtOwner::Executor);
         assert_eq!(RtOwner::from_var(Some("legacy")).unwrap(), RtOwner::Legacy);
         assert_eq!(RtOwner::from_var(Some("executor")).unwrap(), RtOwner::Executor);
         assert!(RtOwner::from_var(Some("unknown")).is_err());
 
-        // CLI `--owner` wins over `ARMD_RT_OWNER`, default stays `legacy`.
-        assert_eq!(RtOwner::resolve(None, None).unwrap(), RtOwner::Legacy);
-        assert_eq!(RtOwner::resolve(None, Some("executor")).unwrap(), RtOwner::Executor);
-        assert_eq!(RtOwner::resolve(Some("legacy"), Some("executor")).unwrap(), RtOwner::Legacy);
-        assert_eq!(RtOwner::resolve(Some("executor"), Some("legacy")).unwrap(), RtOwner::Executor);
-        assert_eq!(RtOwner::resolve(Some("executor"), None).unwrap(), RtOwner::Executor);
-        let bad_cli = RtOwner::resolve(Some("bogus"), Some("executor")).unwrap_err();
+        // Precedence: CLI `--owner` > `ARMD_RT_OWNER` > `arm.armd_owner` > `Auto`.
+        assert_eq!(
+            RequestedRtOwner::resolve(None, None, None).unwrap(),
+            (RequestedRtOwner::Auto, OwnerSource::Default)
+        );
+        assert_eq!(
+            RequestedRtOwner::resolve(None, None, Some("legacy")).unwrap(),
+            (RequestedRtOwner::Legacy, OwnerSource::Config)
+        );
+        assert_eq!(
+            RequestedRtOwner::resolve(None, Some("executor"), Some("legacy")).unwrap(),
+            (RequestedRtOwner::Executor, OwnerSource::Env)
+        );
+        assert_eq!(
+            RequestedRtOwner::resolve(Some("legacy"), Some("executor"), Some("executor")).unwrap(),
+            (RequestedRtOwner::Legacy, OwnerSource::Cli)
+        );
+        assert_eq!(
+            RequestedRtOwner::resolve(Some("auto"), Some("legacy"), Some("legacy")).unwrap(),
+            (RequestedRtOwner::Auto, OwnerSource::Cli)
+        );
+        let bad_cli = RequestedRtOwner::resolve(Some("bogus"), Some("executor"), None).unwrap_err();
         assert!(bad_cli.contains("--owner"), "{bad_cli}");
+        let bad_env = RequestedRtOwner::resolve(None, Some("bogus"), Some("legacy")).unwrap_err();
+        assert!(bad_env.contains("ARMD_RT_OWNER"), "{bad_env}");
+        let bad_cfg = RequestedRtOwner::resolve(None, None, Some("bogus")).unwrap_err();
+        assert!(bad_cfg.contains("arm.armd_owner"), "{bad_cfg}");
 
-        // Legacy works for any follower; executor is explicitly allowed only for `mock` and `rebot-dm`.
-        assert!(validate_startup_owner(RtOwner::Legacy, "rebot-dm").is_ok());
-        assert!(validate_startup_owner(RtOwner::Legacy, "so-arm101").is_ok());
-        assert!(validate_startup_owner(RtOwner::Executor, "mock").is_ok());
-        assert!(validate_startup_owner(RtOwner::Executor, "rebot-dm").is_ok());
-        for refused in ["sim", "so-arm101", "so-arm100", "rebot-rs", "fashionstar", "star-arm102"] {
-            let err = validate_startup_owner(RtOwner::Executor, refused).unwrap_err();
-            assert!(err.contains(refused), "error must name follower {refused}: {err}");
+        // Auto resolves to Executor for rebot-dm and mock; Legacy (with reason) for all other followers.
+        let dm = ArmConfig::rebot_dm();
+        for qualified in ["rebot-dm", "mock"] {
+            let res = resolve_startup_owner(None, None, None, qualified, &dm).unwrap();
+            assert_eq!(res.effective, RtOwner::Executor, "{qualified}");
+            assert_eq!(res.reason, OwnerReason::AutoQualified, "{qualified}");
+            assert!(res.fallback_detail.is_none());
+        }
+        for fallback in ["sim", "so-arm101", "so-arm100", "rebot-rs", "fashionstar", "star-arm102"] {
+            let res = resolve_startup_owner(None, None, None, fallback, &ArmConfig::default()).unwrap();
+            assert_eq!(res.effective, RtOwner::Legacy, "{fallback}");
+            assert_eq!(res.reason, OwnerReason::AutoFallbackUnqualifiedFollower, "{fallback}");
+            assert!(res.fallback_detail.as_deref().unwrap().contains(fallback));
+
+            let err = validate_startup_owner(RtOwner::Executor, fallback).unwrap_err();
+            assert!(err.contains(fallback), "error must name follower {fallback}: {err}");
             assert!(err.contains("rebot-dm"), "error must state qualified followers: {err}");
         }
+
+        // MIT-configured profile: Auto falls back to Legacy; explicit Executor is refused.
+        let mut mit_cfg = ArmConfig::rebot_dm();
+        if let Some(jt) = mit_cfg.joint_tracking.as_mut() {
+            jt.enabled = true;
+            jt.joints[0].strategy = crate::model::TrackingStrategy::Mit;
+        }
+        let auto_mit = resolve_startup_owner(None, None, None, "rebot-dm", &mit_cfg).unwrap();
+        assert_eq!(auto_mit.effective, RtOwner::Legacy);
+        assert_eq!(auto_mit.reason, OwnerReason::AutoFallbackMitProfile);
+        assert!(auto_mit.fallback_detail.as_deref().unwrap().contains("MIT"));
+
+        let explicit_mit_err =
+            resolve_startup_owner(Some("executor"), None, None, "rebot-dm", &mit_cfg).unwrap_err();
+        assert!(explicit_mit_err.contains("MIT"), "{explicit_mit_err}");
     }
 
     #[test]

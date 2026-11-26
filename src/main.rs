@@ -17,6 +17,8 @@ struct CliArgs {
     owner: Option<String>,
     port: Option<u16>,
     config: Option<String>,
+    cell: Option<String>,
+    cell_host: Option<String>,
     tool: Option<String>,
     tool_info: Option<String>,
     robot: Option<String>,
@@ -44,8 +46,10 @@ where
             println!("armd - Robotic arm daemon\n\nUSAGE: armd [OPTIONS]\n\n\
                 --follower <MODEL>           rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, sim, mock (default)\n\
                 --follower-port <PORT>       CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
-                --owner <OWNER>              control-loop owner: legacy (default) or executor (explicit opt-in for rebot-dm and mock; or ARMD_RT_OWNER)\n\
+                --owner <OWNER>              control-loop owner: auto (default: executor for rebot-dm and mock, legacy otherwise), legacy, or executor (precedence: CLI > ARMD_RT_OWNER > arm.armd_owner > auto)\n\
                 --config <JSON>              ArmConfig profile (must match follower joint count)\n\
+                --cell <JSON>                Multi-arm cell topology file (rebot-cell/v1; or ARMD_CELL; off by default)\n\
+                --cell-host <ID>             Local host ID inside --cell hosts map (or ARMD_CELL_HOST; default auto-identify)\n\
                 --tool <JSON>                Tool pack manifest (tool.json; or ARMD_TOOL)\n\
                 --tool-info <JSON>           Validate tool.json and print single-line summary JSON to stdout\n\
                 --robot <ID>                 Target robot profile for --tool-info (b601dm, so101, so100, b601rs)\n\
@@ -76,6 +80,8 @@ where
                 | "--owner"
                 | "--port"
                 | "--config"
+                | "--cell"
+                | "--cell-host"
                 | "--tool"
                 | "--tool-info"
                 | "--robot"
@@ -101,6 +107,18 @@ where
                 cli.owner = Some(value);
             }
             "--config" => cli.config = Some(value),
+            "--cell" => {
+                if value.trim().is_empty() {
+                    return Err("--cell must not be empty".into());
+                }
+                cli.cell = Some(value);
+            }
+            "--cell-host" => {
+                if value.trim().is_empty() {
+                    return Err("--cell-host must not be empty".into());
+                }
+                cli.cell_host = Some(value);
+            }
             "--tool" => {
                 if value.is_empty() {
                     return Err("--tool must not be empty".into());
@@ -212,6 +230,96 @@ fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &ar
     }
 }
 
+const DEFAULT_APP_CONFIG_PATH: &str = "/userdata/local/apps/rebot-teleop.config.json";
+
+/// Reads `arm.armd_owner` (falling back to top-level `armd_owner`) from the app config JSON
+/// (`ARMD_APP_CONFIG`, or `/userdata/local/apps/rebot-teleop.config.json` when present).
+/// Fails closed on unreadable/malformed files or invalid values so a typo (e.g. `"legcay"`)
+/// never silently falls through to `auto` and switches real hardware to `executor`.
+fn read_app_config_armd_owner_from_path(path: &std::path::Path) -> Result<Option<String>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "Failed to read app config {} for arm.armd_owner: {e}",
+                path.display()
+            ));
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "Failed to parse app config {} for arm.armd_owner: {e}",
+            path.display()
+        )
+    })?;
+    let root = parsed.as_object().ok_or_else(|| {
+        format!(
+            "App config {} must be a JSON object when checking arm.armd_owner",
+            path.display()
+        )
+    })?;
+    let arm_owner_val = match root.get("arm") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(arm) => {
+            let arm_obj = arm.as_object().ok_or_else(|| {
+                format!(
+                    "App config {} field 'arm' must be a JSON object when checking arm.armd_owner",
+                    path.display()
+                )
+            })?;
+            arm_obj.get("armd_owner").filter(|v| !v.is_null())
+        }
+    };
+    let owner_val = arm_owner_val.or_else(|| root.get("armd_owner").filter(|v| !v.is_null()));
+    let Some(val) = owner_val else {
+        return Ok(None);
+    };
+    let Some(s) = val.as_str() else {
+        return Err(format!(
+            "arm.armd_owner in {} must be 'auto', 'legacy', or 'executor' (got non-string JSON value)",
+            path.display()
+        ));
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn read_app_config_armd_owner() -> Result<Option<String>, String> {
+    if let Some(raw) = std::env::var_os("ARMD_APP_CONFIG") {
+        let s = raw.to_string_lossy();
+        let trimmed = s.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("none")
+        {
+            return Ok(None);
+        }
+        return read_app_config_armd_owner_from_path(std::path::Path::new(&raw));
+    }
+    read_app_config_armd_owner_from_path(std::path::Path::new(DEFAULT_APP_CONFIG_PATH))
+}
+
+fn read_env_rt_owner_os(raw: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
+    let Some(os) = raw else {
+        return Ok(None);
+    };
+    let Some(s) = os.to_str() else {
+        return Err(
+            "ARMD_RT_OWNER must be valid UTF-8 ('auto', 'legacy', or 'executor')".into(),
+        );
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
 fn resolve_serial_port(requested: Option<&str>) -> String {
     if let Some(p) = requested {
         return p.to_string();
@@ -225,19 +333,27 @@ fn resolve_serial_port(requested: Option<&str>) -> String {
     "/dev/ttySC0".to_string()
 }
 
+#[cfg(test)]
 fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<ArmConfig, String> {
+    resolve_follower_config_with_path(follower, config_path).map(|(cfg, _)| cfg)
+}
+
+fn resolve_follower_config_with_path(
+    follower: &str,
+    config_path: Option<&str>,
+) -> Result<(ArmConfig, Option<std::path::PathBuf>), String> {
     let expected_dof = match follower {
         "rebot-dm" => Some(7),
         "rebot-rs" | "so-arm101" | "so-arm100" | "fashionstar" | "star-arm102" => Some(6),
         "sim" | "mock" => None,
         other => return Err(format!("Unknown follower model: {other}")),
     };
-    let mut config = if let Some(path) = config_path {
+    let (mut config, loaded_profile_path) = if let Some(path) = config_path {
         let config = ArmConfig::from_profile_file(path)?;
         if config.kinematics.is_none() || config.workspace.is_none() {
             tracing::warn!("Profile {path} has no kinematics/workspace: the Cartesian workspace check and Cartesian actions are off");
         }
-        config
+        (config, Some(std::path::PathBuf::from(path)))
     } else if follower == "rebot-rs" {
         return Err(
             "Follower 'rebot-rs' requires --config <path> (e.g. profiles/rebot_b601_rs.json); refusing to fall back to unconfigured defaults"
@@ -258,11 +374,11 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
         let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
             .unwrap_or(&candidates[1]);
         tracing::info!("Loaded profile for {follower} from {path}");
-        ArmConfig::from_profile_file(path)?
+        (ArmConfig::from_profile_file(path)?, Some(std::path::PathBuf::from(path)))
     } else if follower == "rebot-dm" || follower == "sim" {
-        ArmConfig::rebot_dm()
+        (ArmConfig::rebot_dm(), None)
     } else {
-        ArmConfig::default()
+        (ArmConfig::default(), None)
     };
     config.validate()?;
     if expected_dof.is_some_and(|dof| config.dof != dof) {
@@ -273,7 +389,7 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
         ));
     }
     config.validate_step1_driver_parity(follower)?;
-    Ok(config)
+    Ok((config, loaded_profile_path))
 }
 
 fn apply_cli_tool(config: ArmConfig, cli_tool: Option<&str>) -> Result<ArmConfig, String> {
@@ -310,6 +426,112 @@ fn run_tool_info(path: &str, robot: Option<&str>) -> Result<String, String> {
     let pack = armd::tool::load_tool_file(path)?;
     let summary = armd::tool::resolve_tool_config_summary(&pack, robot)?;
     serde_json::to_string(&summary).map_err(|e| format!("serialize tool info: {e}"))
+}
+
+fn resolve_hardware_follower_device(follower: &str, requested: Option<&str>) -> Option<String> {
+    match follower {
+        "rebot-rs" | "rebot-dm" => Some(requested.unwrap_or("can0").to_string()),
+        "so-arm101" | "so-arm100" => Some(resolve_serial_port(requested)),
+        "fashionstar" | "star-arm102" => Some(requested.unwrap_or("/dev/ttyUSB0").to_string()),
+        "mock" | "sim" => None,
+        _ => None,
+    }
+}
+
+fn resolve_cell_context(
+    cli: &CliArgs,
+    config: &ArmConfig,
+    loaded_profile_path: Option<&std::path::Path>,
+    follower: &str,
+    resolved_hw_device: Option<&str>,
+    port: u16,
+) -> Result<Option<Arc<armd::cell::CellContext>>, String> {
+    let env_cell = std::env::var("ARMD_CELL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let env_cell_host = std::env::var("ARMD_CELL_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    resolve_cell_context_with_env(
+        cli,
+        config,
+        loaded_profile_path,
+        follower,
+        resolved_hw_device,
+        port,
+        env_cell.as_deref(),
+        env_cell_host.as_deref(),
+    )
+}
+
+fn resolve_cell_context_with_env(
+    cli: &CliArgs,
+    config: &ArmConfig,
+    loaded_profile_path: Option<&std::path::Path>,
+    follower: &str,
+    resolved_hw_device: Option<&str>,
+    port: u16,
+    env_cell: Option<&str>,
+    env_cell_host: Option<&str>,
+) -> Result<Option<Arc<armd::cell::CellContext>>, String> {
+    let cell_host = cli
+        .cell_host
+        .as_deref()
+        .or(env_cell_host)
+        .or(config.cell_host.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let cell_path = if let Some(p) = cli.cell.as_deref() {
+        Some(std::path::PathBuf::from(p))
+    } else if let Some(p) = env_cell {
+        Some(std::path::PathBuf::from(p))
+    } else if let Some(p) = config.cell.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let candidate = std::path::Path::new(p);
+        if candidate.is_absolute() {
+            Some(candidate.to_path_buf())
+        } else if let Some(dir) = loaded_profile_path.and_then(std::path::Path::parent).filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir.join(candidate))
+        } else {
+            Some(candidate.to_path_buf())
+        }
+    } else {
+        None
+    };
+
+    let Some(path) = cell_path else {
+        if cell_host.is_some() {
+            return Err(
+                "--cell-host / ARMD_CELL_HOST / profile cell_host requires a cell config (--cell, ARMD_CELL, or profile 'cell')"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
+
+    let cell_cfg = armd::cell::CellConfig::from_json_file(&path)?;
+    let local_port = (port != 0).then_some(port);
+    let ctx = armd::cell::CellContext::resolve_local(
+        cell_cfg,
+        cell_host,
+        local_port,
+        config,
+        Some(follower),
+        resolved_hw_device,
+    )?;
+    info!(
+        "Loaded cell '{}' from {} (host={}, role={}, arm={:?}, coordinator={}, digest={})",
+        ctx.config.cell_id,
+        path.display(),
+        ctx.local_host_id,
+        ctx.local_role(),
+        ctx.local_arm_id,
+        ctx.config.coordinator,
+        ctx.config_digest
+    );
+    Ok(Some(Arc::new(ctx)))
 }
 
 /// The system allocator, timed on the control thread with `ARMD_ALLOC_TIMING=1`
@@ -625,6 +847,9 @@ async fn start_control_owner_with_hooks(
                     error!(
                         "RT executor startup failed on follower '{follower}' while detached writer holds driver in SAFE-HOLD ({e}); keeping daemon alive until deliberate shutdown signal without torque-off"
                     );
+                    supervisor
+                        .set_owner_reason(armd::OwnerReason::StartupFailedDetachedSafeHold)
+                        .await;
                     Ok(StartedControlOwner {
                         executor_handle: None,
                         legacy_control_stop: None,
@@ -641,6 +866,9 @@ async fn start_control_owner_with_hooks(
                     error!(
                         "RT executor startup failed on real follower '{follower}' ({e}); falling back to legacy owner holding (DRV-F1 handback) without torque-off"
                     );
+                    supervisor
+                        .set_owner_reason(armd::OwnerReason::StartupFallbackToLegacy)
+                        .await;
                     let stop = spawn_legacy_control_loop(
                         supervisor,
                         period,
@@ -726,14 +954,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         m => warn!("Process memory not locked ({}); MIT tracking, when configured, is refused", m.describe()),
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
-    let env_rt_owner = std::env::var("ARMD_RT_OWNER").ok();
-    let rt_owner = armd::rt_core::executor::RtOwner::resolve(
+    let env_rt_owner = if cli.owner.is_none() {
+        read_env_rt_owner_os(std::env::var_os("ARMD_RT_OWNER").as_deref())?
+    } else {
+        None
+    };
+    let config_rt_owner = if cli.owner.is_none() && env_rt_owner.is_none() {
+        read_app_config_armd_owner()?
+    } else {
+        None
+    };
+    let (requested_owner, _) = armd::rt_core::executor::RequestedRtOwner::resolve(
         cli.owner.as_deref(),
         env_rt_owner.as_deref(),
+        config_rt_owner.as_deref(),
     )?;
-    armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
-    let config = resolve_follower_config(follower, cli.config.as_deref())?;
+    if requested_owner == armd::rt_core::executor::RequestedRtOwner::Executor {
+        armd::rt_core::executor::validate_startup_owner(
+            armd::rt_core::executor::RtOwner::Executor,
+            follower,
+        )?;
+    }
+    let (config, loaded_profile_path) =
+        resolve_follower_config_with_path(follower, cli.config.as_deref())?;
     let mut config = apply_cli_tool(config, cli.tool.as_deref())?;
+    let resolved_owner = armd::rt_core::executor::resolve_startup_owner(
+        cli.owner.as_deref(),
+        env_rt_owner.as_deref(),
+        config_rt_owner.as_deref(),
+        follower,
+        &config,
+    )?;
+    let rt_owner = resolved_owner.effective;
+    if let Some(detail) = resolved_owner.fallback_detail.as_deref() {
+        info!(
+            "Startup owner auto resolved to legacy (reason={}): {detail}",
+            resolved_owner.reason.as_str()
+        );
+    } else {
+        info!(
+            "Startup owner resolved: effective={} reason={} follower={follower}",
+            resolved_owner.effective.as_str(),
+            resolved_owner.reason.as_str()
+        );
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let shadow_env = std::env::var(armd::torque::shadow::ENV_TORQUE_SHADOW).ok();
@@ -756,6 +1020,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(_) => 8765,
         },
     };
+    // Resolve hardware device path once so cell validation and driver mounting use the exact same device.
+    let resolved_hw_device = resolve_hardware_follower_device(follower, cli.follower_port.as_deref());
+    // Validate optional multi-arm cell config before binding ports or mounting hardware.
+    let cell_context = resolve_cell_context(
+        &cli,
+        &config,
+        loaded_profile_path.as_deref(),
+        follower,
+        resolved_hw_device.as_deref(),
+        port,
+    )?;
     // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
     let bind_ip: std::net::IpAddr = match std::env::var("ARMD_BIND_HOST") {
         Ok(s) if !s.trim().is_empty() => s
@@ -775,6 +1050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_tx_budget = config.damiao_tx_budget();
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    supervisor.set_owner_reason(resolved_owner.reason).await;
     // Install the process-wide lock-free/zero-alloc tiered panic coordinator strictly BEFORE
     // mounting or enabling any hardware (FU-PANIC / DRV-F1).
     armd::panic_coord::install_process_panic_coordinator(Arc::clone(
@@ -783,6 +1059,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before the control loop: frees retired observations, feeds telemetry and recordings
     supervisor.start_dispatcher()?;
     supervisor.set_follower(follower).await;
+    if let Some(cell_ctx) = cell_context {
+        supervisor.set_cell(Some(cell_ctx)).await?;
+    }
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
     let episodes = armd::recording::EpisodeStore::resolve(cli.episodes_dir.as_deref());
     match episodes.dir() {
@@ -835,7 +1114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rebot-rs" | "rebot-dm" => {
             #[cfg(target_os = "linux")]
             {
-                let port = cli.follower_port.as_deref().unwrap_or("can0");
+                let port = resolved_hw_device.as_deref().unwrap_or("can0");
                 let can = armd::transport::SocketCanTransport::open(port)?;
                 if follower == "rebot-dm" {
                     let mut driver = armd::driver::DamiaoArmDriver::new(can, (1..=7).collect())
@@ -864,7 +1143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(cfg) = feetech_config else {
                 return Err(format!("{follower} requires feetech configuration in profile").into());
             };
-            let port = resolve_serial_port(cli.follower_port.as_deref());
+            let port = resolved_hw_device
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| resolve_serial_port(cli.follower_port.as_deref()));
             let baud = 1_000_000;
             let transport = armd::transport::SerialTransport::open_default(&port, baud)?;
             let mut driver = armd::driver::FeetechArmDriver::new(transport, (1..=6).collect())
@@ -876,7 +1158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Mounted {} on {}", follower, port);
         }
         "fashionstar" | "star-arm102" => {
-            let port = cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0");
+            let port = resolved_hw_device.as_deref().unwrap_or("/dev/ttyUSB0");
             let transport = armd::transport::SerialTransport::open_default(port, 115_200)?;
             supervisor
                 .set_driver(Box::new(armd::driver::FashionStarArmDriver::new(
@@ -1603,31 +1885,102 @@ mod shutdown_tests {
 
     #[test]
     fn cli_owner_flag_and_follower_gate() {
+        let dm = ArmConfig::rebot_dm();
         let parsed = parse_cli_args_from(["--follower", "rebot-dm", "--owner", "executor"]).unwrap();
         assert_eq!(parsed.follower.as_deref(), Some("rebot-dm"));
         assert_eq!(parsed.owner.as_deref(), Some("executor"));
-        let owner = armd::rt_core::executor::RtOwner::resolve(parsed.owner.as_deref(), Some("legacy")).unwrap();
-        assert_eq!(owner, armd::rt_core::executor::RtOwner::Executor);
-        assert!(armd::rt_core::executor::validate_startup_owner(owner, "rebot-dm").is_ok());
+        let resolved = armd::rt_core::executor::resolve_startup_owner(
+            parsed.owner.as_deref(),
+            Some("legacy"),
+            Some("legacy"),
+            "rebot-dm",
+            &dm,
+        )
+        .unwrap();
+        assert_eq!(resolved.effective, armd::rt_core::executor::RtOwner::Executor);
+        assert_eq!(resolved.reason, armd::OwnerReason::ExplicitCli);
 
         // Missing or empty --owner value is rejected.
         assert!(parse_cli_args_from(["--owner"]).is_err());
         assert!(parse_cli_args_from(["--owner", ""]).is_err());
 
-        // Default stays legacy when neither CLI nor env is set.
+        // Omitted owner defaults to Auto: executor for rebot-dm and mock, legacy for others.
         let default_cli = parse_cli_args_from(["--follower", "rebot-dm"]).unwrap();
-        assert_eq!(
-            armd::rt_core::executor::RtOwner::resolve(default_cli.owner.as_deref(), None).unwrap(),
-            armd::rt_core::executor::RtOwner::Legacy
-        );
+        let auto_dm = armd::rt_core::executor::resolve_startup_owner(
+            default_cli.owner.as_deref(),
+            None,
+            None,
+            "rebot-dm",
+            &dm,
+        )
+        .unwrap();
+        assert_eq!(auto_dm.effective, armd::rt_core::executor::RtOwner::Executor);
+        assert_eq!(auto_dm.reason, armd::OwnerReason::AutoQualified);
 
-        // Unqualified real followers refuse executor with clear error.
+        let auto_so101 = armd::rt_core::executor::resolve_startup_owner(
+            None,
+            None,
+            None,
+            "so-arm101",
+            &ArmConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(auto_so101.effective, armd::rt_core::executor::RtOwner::Legacy);
+        assert_eq!(auto_so101.reason, armd::OwnerReason::AutoFallbackUnqualifiedFollower);
+        assert!(auto_so101.fallback_detail.as_deref().unwrap().contains("so-arm101"));
+
+        // Explicit --owner auto overrides env/config.
+        let cli_auto = parse_cli_args_from(["--follower", "rebot-dm", "--owner", "auto"]).unwrap();
+        let auto_over_env = armd::rt_core::executor::resolve_startup_owner(
+            cli_auto.owner.as_deref(),
+            Some("legacy"),
+            Some("legacy"),
+            "rebot-dm",
+            &dm,
+        )
+        .unwrap();
+        assert_eq!(auto_over_env.effective, armd::rt_core::executor::RtOwner::Executor);
+        assert_eq!(auto_over_env.reason, armd::OwnerReason::AutoQualified);
+
+        // Unqualified real followers refuse explicit executor with clear error.
         let err = armd::rt_core::executor::validate_startup_owner(
             armd::rt_core::executor::RtOwner::Executor,
             "so-arm101",
         )
         .unwrap_err();
         assert!(err.contains("so-arm101"), "{err}");
+
+        // App config lookup reads arm.armd_owner, falls back to top-level armd_owner, and fails
+        // closed on non-string/malformed values (while unrecognized strings are rejected by resolver).
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("rebot-teleop.config.json");
+        std::fs::write(&cfg_path, r#"{"arm":{"armd_owner":"legacy"}}"#).unwrap();
+        assert_eq!(read_app_config_armd_owner_from_path(&cfg_path).unwrap().as_deref(), Some("legacy"));
+        std::fs::write(&cfg_path, r#"{"armd_owner":"executor","arm":{}}"#).unwrap();
+        assert_eq!(read_app_config_armd_owner_from_path(&cfg_path).unwrap().as_deref(), Some("executor"));
+        std::fs::write(&cfg_path, r#"{"armd_owner":"executor","arm":{"armd_owner":"auto"}}"#).unwrap();
+        assert_eq!(read_app_config_armd_owner_from_path(&cfg_path).unwrap().as_deref(), Some("auto"));
+        std::fs::write(&cfg_path, r#"{"arm":{"armd_owner":"legcay"}}"#).unwrap();
+        let bad_val = read_app_config_armd_owner_from_path(&cfg_path).unwrap();
+        assert_eq!(bad_val.as_deref(), Some("legcay"));
+        assert!(armd::rt_core::executor::RequestedRtOwner::resolve(None, None, bad_val.as_deref()).is_err());
+        std::fs::write(&cfg_path, r#"{"arm":{"armd_owner":123}}"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"{"arm":"legacy"}"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"["legacy"]"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"{malformed"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+
+        // Non-UTF-8 ARMD_RT_OWNER fails closed instead of silently falling through to Auto.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = std::ffi::OsStr::from_bytes(b"leg\xffacy");
+            let err = read_env_rt_owner_os(Some(non_utf8)).unwrap_err();
+            assert!(err.contains("ARMD_RT_OWNER"), "{err}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1758,5 +2111,39 @@ mod shutdown_tests {
         .err()
         .expect("mock executor startup failure must fail fast");
         assert!(mock_err.contains("Failed to start RT executor"), "{mock_err}");
+    }
+
+    #[test]
+    fn cli_cell_args_parse_and_resolve_precedence() {
+        let cli = parse_cli_args_from(["--cell", "cell.json", "--cell-host", "recamera_left"]).unwrap();
+        assert_eq!(cli.cell.as_deref(), Some("cell.json"));
+        assert_eq!(cli.cell_host.as_deref(), Some("recamera_left"));
+
+        assert!(parse_cli_args_from(["--cell"]).is_err());
+        assert!(parse_cli_args_from(["--cell", "   "]).is_err());
+        assert!(parse_cli_args_from(["--cell-host"]).is_err());
+        assert!(parse_cli_args_from(["--cell-host", "  "]).is_err());
+
+        // Without any cell config, returns Ok(None) (zero overhead default).
+        let cfg = ArmConfig::rebot_dm();
+        assert!(resolve_cell_context_with_env(&CliArgs::default(), &cfg, None, "mock", None, 8765, None, None)
+            .unwrap()
+            .is_none());
+
+        // Orphan cell_host without cell path fails closed.
+        assert!(resolve_cell_context_with_env(
+            &CliArgs {
+                cell_host: Some("recamera_left".into()),
+                ..Default::default()
+            },
+            &cfg,
+            None,
+            "mock",
+            None,
+            8765,
+            None,
+            None
+        )
+        .is_err());
     }
 }

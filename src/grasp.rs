@@ -1196,6 +1196,8 @@ pub struct ProviderModels {
     pub swap_error: Option<String>,
     /// Catalogue name -> `ion_mb` (None when not reported).
     pub catalogue: BTreeMap<String, Option<f64>>,
+    /// Catalogue name -> `kind` (`detect`, `segment`, `obb`, `depth`), when reported.
+    pub catalogue_kinds: BTreeMap<String, String>,
     /// `ion` (`base_mb`, `total_mb`, `reserve_mb`), when reported.
     pub ion: Option<[f64; 3]>,
 }
@@ -1206,16 +1208,21 @@ impl ProviderModels {
         let name = |s: Option<&Value>| s.and_then(Value::as_str).map(str::to_string);
         let resident = m.get("resident");
         let swap = m.get("swap");
-        let catalogue = m.get("catalogue").and_then(Value::as_array).map(|a| a.iter().filter_map(|e| {
+        let entries = m.get("catalogue").and_then(Value::as_array);
+        let catalogue = entries.map(|a| a.iter().filter_map(|e| {
             Some((e.get("name")?.as_str()?.to_string(), f(e, &["ion_mb"])))
+        }).collect()).unwrap_or_default();
+        let catalogue_kinds = entries.map(|a| a.iter().filter_map(|e| {
+            Some((e.get("name")?.as_str()?.to_string(), e.get("kind")?.as_str()?.to_string()))
         }).collect()).unwrap_or_default();
         let ion = v.get("ion").and_then(|i| Some([f(i, &["base_mb"])?, f(i, &["total_mb"])?, f(i, &["reserve_mb"])?]));
         Some(Self {
             generation: m.get("generation").and_then(Value::as_u64)?,
             resident: ResidentModels { detector: name(resident.and_then(|r| r.get("detector"))), depth: name(resident.and_then(|r| r.get("depth"))) },
-            swap_state: name(swap.and_then(|s| s.get("state"))).unwrap_or_else(|| "idle".into()),
+            swap_state: name(swap.and_then(|s| s.get("state"))).unwrap_or_else(|| "unknown".into()),
             swap_error: name(swap.and_then(|s| s.get("error"))),
             catalogue,
+            catalogue_kinds,
             ion,
         })
     }
@@ -3371,8 +3378,6 @@ fn task_unsupported(message: String) -> ArmError {
     ArmError::Rejected { status: 422, code: TASK_UNSUPPORTED.to_string(), message }
 }
 
-/// One model-changing preflight at a time (armd talks to one provider; its swap is one at a time).
-pub(crate) static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// How long a preflight waits for the provider's swap (`/api/mode` polled).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3387,8 +3392,9 @@ pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp)
     if has_task_reqs {
         let task = request.task.as_deref().unwrap();
         let _serial = if request.models.is_some() {
-            Some(crate::vision_detector::begin_grasp_model_switch().await)
+            Some(crate::vision_detector::begin_grasp_model_switch(source).await?)
         } else {
+            crate::vision_detector::reconcile_pending_swap(source).await?;
             None
         };
         let mut mode = source.mode_info().await;
@@ -3429,6 +3435,7 @@ pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp)
             }
         })?;
     } else if planned.adaptive.is_some() && planned.mode.is_none() {
+        crate::vision_detector::reconcile_pending_swap(source).await?;
         // Bind vision provider model generation before BeginMacro so a model switch between
         // planning/preflight and live revalidation is rejected, and fail closed if the provider
         // is unreachable before starting motion.
@@ -3445,6 +3452,8 @@ pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp)
             });
         }
         planned.mode = Some(mode);
+    } else {
+        crate::vision_detector::reconcile_pending_swap(source).await?;
     }
     if let Some(pa) = planned.adaptive.as_mut() {
         pa.expected_generation = planned
@@ -3462,6 +3471,7 @@ pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp)
 /// provider or a swap that does not finish in time is the returned `Err` reading.
 async fn switch_models(source: &dyn DetectionSource, body: &Value, task: &str) -> Result<Result<ModeInfo, String>, ArmError> {
     let refused = |why: String| task_unsupported(format!("task {task}: {why}"));
+    let mut attempt = crate::vision_detector::SwapAttemptGuard::begin();
     let (status, reply) = match source.set_models(body).await {
         Ok(r) => r,
         Err(e) => return Ok(Err(format!("model switch failed: {e}"))),
@@ -3469,14 +3479,21 @@ async fn switch_models(source: &dyn DetectionSource, body: &Value, task: &str) -
     let error = reply.get("error").and_then(Value::as_str).unwrap_or("refused");
     match status {
         200..=299 => {}
-        404 => return Err(refused("provider cannot switch models".into())),
+        404 => {
+            attempt.clear_definitive_refusal();
+            return Err(refused("provider cannot switch models".into()));
+        }
         409 if error == "SWAP_BUSY" => return Err(refused("model switch busy".into())),
-        400..=499 => return Err(refused(format!("model switch refused: {}", refusal_message(error, f(&reply, &["need_mb"]), f(&reply, &["limit_mb"]))))),
+        400..=499 => {
+            attempt.clear_definitive_refusal();
+            return Err(refused(format!("model switch refused: {}", refusal_message(error, f(&reply, &["need_mb"]), f(&reply, &["limit_mb"])))));
+        }
         _ => return Ok(Err(format!("model switch failed: detector returned {status}"))),
     }
     let Some(generation) = reply.get("generation").and_then(Value::as_u64) else {
         return Ok(Err("model switch reply has no generation".into()));
     };
+    attempt.set_generation(generation);
     let deadline = Instant::now() + MODEL_SWITCH_TIMEOUT;
     loop {
         let m = match source.mode_info().await {
@@ -3484,6 +3501,7 @@ async fn switch_models(source: &dyn DetectionSource, body: &Value, task: &str) -
             Err(e) => return Ok(Err(e)),
         };
         if let Some(pm) = m.models.as_ref().filter(|pm| pm.generation >= generation && matches!(pm.swap_state.as_str(), "idle" | "failed")) {
+            attempt.confirm_settled();
             if pm.swap_state == "failed" {
                 return Err(refused(format!("model switch failed: {}", pm.swap_error.as_deref().unwrap_or("unknown error"))));
             }
@@ -3801,6 +3819,11 @@ pub fn begin_with_stamp(
         parent_generation: 0,
         deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
     };
+    let vision_guard = if planned.mode.as_ref().is_some_and(Result::is_err) {
+        crate::vision_detector::vision_action_in_flight()
+    } else {
+        crate::vision_detector::try_begin_vision_action()?
+    };
     let owner_ctx = OwnerCheckCtx::for_legacy(inner);
     let id = install_begin_macro(
         inner,
@@ -3817,7 +3840,7 @@ pub fn begin_with_stamp(
         expected_duration(&planned)
             + inner.approach_estimate_s("grasp_final", planned.request.approach)
     };
-    spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
+    spawn_with_deadline_guarded(supervisor.clone(), source, id, planned, stamp, deadline, vision_guard);
     Ok((id, duration))
 }
 
@@ -3826,6 +3849,11 @@ pub fn begin_with_stamp(
 pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
     let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
     let (inner, proof) = admitted.consume()?;
+    let vision_guard = if planned.mode.as_ref().is_some_and(Result::is_err) {
+        crate::vision_detector::vision_action_in_flight()
+    } else {
+        crate::vision_detector::try_begin_vision_action()?
+    };
     if planned.adaptive.is_some() {
         inner.j7_admitted_stamp = None;
     }
@@ -3854,7 +3882,7 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupe
         planned.request.tag.clone(),
         planned.request.task.clone(),
     )?;
-    spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
+    spawn_with_deadline_guarded(supervisor.clone(), source, id, planned, stamp, deadline, vision_guard);
     Ok((id, duration))
 }
 
@@ -3964,6 +3992,11 @@ async fn begin_executor_inner(
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
+    let vision_guard = if planned.mode.as_ref().is_some_and(Result::is_err) {
+        crate::vision_detector::vision_action_in_flight()
+    } else {
+        crate::vision_detector::begin_vision_action(source.as_ref()).await?
+    };
     let (id, _req_id, ack_guard) = crate::macro_action::begin_macro_executor_with_barrier(
         supervisor,
         &action_stamp,
@@ -3988,7 +4021,7 @@ async fn begin_executor_inner(
             });
         expected_duration(&planned) + approach_extra
     };
-    spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
+    spawn_with_deadline_guarded(supervisor.clone(), source, id, planned, stamp, deadline, vision_guard);
     Ok(((id, duration), ack_guard))
 }
 
@@ -4007,7 +4040,23 @@ pub fn spawn_with_deadline(
     stamp: crate::supervisor::AdmissionStamp,
     deadline: Instant,
 ) {
-    tokio::spawn(run(supervisor, source, id, planned, stamp, deadline));
+    let vision_guard = crate::vision_detector::vision_action_in_flight();
+    spawn_with_deadline_guarded(supervisor, source, id, planned, stamp, deadline, vision_guard);
+}
+
+fn spawn_with_deadline_guarded(
+    supervisor: Arc<ArmSupervisor>,
+    source: Arc<dyn DetectionSource>,
+    id: u64,
+    planned: PlannedGrasp,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+    vision_guard: crate::vision_detector::VisionActionGuard,
+) {
+    tokio::spawn(async move {
+        let _vision_guard = vision_guard;
+        run(supervisor, source, id, planned, stamp, deadline).await;
+    });
 }
 
 // ---- orchestrator ----

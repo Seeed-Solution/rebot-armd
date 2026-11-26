@@ -734,6 +734,7 @@ async fn begin_executor_inner(
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
+    let vision_guard = crate::vision_detector::begin_vision_action(source.as_ref()).await?;
     let (id, _req_id, ack_guard) = crate::macro_action::begin_macro_executor_with_barrier(
         sup,
         &action_stamp,
@@ -744,7 +745,7 @@ async fn begin_executor_inner(
         wire_tracker,
     )
     .await?;
-    Ok((spawn_measure_worker(sup, id, plan, source, stamp, deadline_at), ack_guard))
+    Ok((spawn_measure_worker(sup, id, plan, source, stamp, deadline_at, vision_guard), ack_guard))
 }
 
 /// Build the A7 [`BeginMacroSpec`] for a prepared multi-view measurement (shared by Legacy and RT Executor).
@@ -769,12 +770,14 @@ fn spawn_measure_worker(
     source: Arc<dyn DetectionSource>,
     stamp: crate::supervisor::AdmissionStamp,
     deadline_at: Instant,
+    vision_guard: crate::vision_detector::VisionActionGuard,
 ) -> (u64, f64) {
     let deadline_s = plan.deadline_s;
     tracing::info!("measure_multiview {id} started ({} views, baseline {:.3} m, speed_scale {:.2}, bound {deadline_s:.0} s)",
         plan.request.views, plan.request.baseline_m, plan.request.speed_scale);
     let sup = sup.clone();
     tokio::spawn(async move {
+        let _vision_guard = vision_guard;
         let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, source, stamp, deadline_at).await }) };
         if let Err(e) = worker.await {
             tracing::error!("measure_multiview {id} orchestrator failed: {e}");
@@ -817,6 +820,7 @@ pub fn begin_with_stamp(
     use crate::rt_core::requests::actions::{
         install_begin_macro, ActionStamp, OwnerCheckCtx, DEFAULT_ACTION_DEADLINE,
     };
+    let vision_guard = crate::vision_detector::try_begin_vision_action()?;
     let deadline_at = Instant::now() + Duration::from_secs_f64(plan.deadline_s);
     let spec = begin_macro_spec(&plan, inner.boot_id, deadline_at);
     let action_stamp = ActionStamp {
@@ -836,7 +840,7 @@ pub fn begin_with_stamp(
     let owner_ctx = OwnerCheckCtx::for_legacy(inner);
     let id = install_begin_macro(inner, &action_stamp, &owner_ctx, &spec, None, None)
         .map_err(|r| r.into_arm_error(inner))?;
-    Ok(spawn_measure_worker(sup, id, plan, source, stamp, deadline_at))
+    Ok(spawn_measure_worker(sup, id, plan, source, stamp, deadline_at, vision_guard))
 }
 
 /// Begin the action and spawn its orchestrator. Returns (action id, deadline bound s).
@@ -851,6 +855,7 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
         }
         .into());
     }
+    let vision_guard = crate::vision_detector::try_begin_vision_action()?;
     let spec = begin_macro_spec(&plan, inner.boot_id, deadline_at);
     let ws_rev = plan.workspace_revision;
     let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
@@ -861,7 +866,7 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
         None,
         None,
     )?;
-    Ok(spawn_measure_worker(sup, id, plan, source, stamp, deadline_at))
+    Ok(spawn_measure_worker(sup, id, plan, source, stamp, deadline_at, vision_guard))
 }
 
 /// Alive, nothing the run was checked against changed, telemetry fresh, torque on.

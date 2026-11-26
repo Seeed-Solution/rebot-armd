@@ -321,6 +321,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     // Core observation, torque, heartbeat, motion, actions
     rr!(GET    "/api/v1/observation",               rest::get_observation,        ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/observation/schema",        rest::get_observation_schema, ExecutorRequest, None,      None,              Allowed),
+    rr!(GET    "/api/v1/cell/status",               rest::get_cell_status,        OwnerAgnostic,   None,      None,              Allowed),
     rr!(POST   "/api/v1/torque",                    rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/arm",                       rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/heartbeat",                 rest::heartbeat,              ExecutorRequest, None,      None,              Fenced),
@@ -388,6 +389,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/vision/mode",               proxy::get_vision_mode,             OwnerAgnostic,   None,      None,              Allowed),
     rr!(POST   "/api/v1/vision/mode",               proxy::post_vision_mode,            OwnerAgnostic,   Required,  None,              Fenced),
     rr!(POST   crate::vision_detector::PATH,        rest::post_vision_detector,         ExecutorRequest, Required,  None,              Fenced),
+    rr!(POST   crate::vision_detector::MODELS_PATH, rest::post_vision_models,           ExecutorRequest, Required,  None,              Fenced),
     rr!(POST   "/api/v1/vision/subscribe",          proxy::post_vision_subscribe,       OwnerAgnostic,   Required,  None,              Fenced),
     rr!(DELETE "/api/v1/vision/subscribe/{id}",     proxy::delete_vision_subscribe,     OwnerAgnostic,   Required,  None,              Fenced),
     rr!(POST   "/api/v1/vision/subscribe/{id}/keepalive", proxy::post_vision_keepalive, OwnerAgnostic,   Required,  None,              Fenced),
@@ -748,6 +750,14 @@ mod tests {
         );
         assert_eq!(
             lookup(RouteKey::ws_command(crate::depth_measure::PATH)).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Get, "/api/v1/cell/status")).unwrap().ownership,
+            RouteOwnership::OwnerAgnostic
+        );
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Post, crate::vision_detector::MODELS_PATH)).unwrap().ownership,
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(

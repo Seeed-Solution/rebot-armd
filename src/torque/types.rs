@@ -1373,6 +1373,10 @@ pub struct JointRuntime {
     pub grasp_force_limit_raw: Option<u16>,
     /// Timestamp when `ActiveTool(BoundedRetention)` entered stopped retention.
     pub retention_started_us: Option<u64>,
+    /// True once this channel has captured a valid measured position in the current armed/holding
+    /// session (cleared on `EnableStart` from disarmed, `BusLoss`, `JointZeroRecalibrated`, and disarm).
+    #[serde(default)]
+    pub had_valid_capture: bool,
 }
 
 impl Default for JointRuntime {
@@ -1400,6 +1404,7 @@ impl Default for JointRuntime {
             grasp_setpoint_rad: None,
             grasp_force_limit_raw: None,
             retention_started_us: None,
+            had_valid_capture: false,
         }
     }
 }
@@ -1576,6 +1581,9 @@ pub struct PendingDisableDispatch {
     pub rejected_stale_mask: ChannelMask,
     /// False if the owning transaction was cancelled/expired while this wire dispatch was in flight.
     pub tx_still_active: bool,
+    /// Effective monotonic deadline (µs) for this wire dispatch; orphaned dispatches expire once `now_us >= deadline_us`.
+    #[serde(default)]
+    pub deadline_us: u64,
 }
 
 /// Per-group active disable transaction (at most one active per group).
@@ -1615,6 +1623,10 @@ pub struct EnableTransaction {
     pub generation: u64,
     pub target_channels: ChannelMask,
     pub confirmed_channels: ChannelMask,
+    /// True once any enable wire frame was sent or possibly-sent (`Sent` / `Ambiguous`), or when
+    /// the attempt began while the group was already `OperationEnabled`.
+    #[serde(default)]
+    pub any_write_sent: bool,
 }
 
 /// Pending Tier-1 worker-panic park capability bound to one unique `park_id` (B3, M1).
@@ -1898,6 +1910,10 @@ pub enum PanicTier {
 pub enum Event {
     /// Start of a new control release at monotonic timestamp `now_us`.
     Release { now_us: u64 },
+    /// Sub-release transition-wake tick (e.g. Window 2 / headless transition polling between
+    /// periodic releases). Advances in-flight disable repeats and transaction deadlines without
+    /// incrementing `current_release_id` or touching hold contention streaks.
+    TransitionWake { now_us: u64 },
     /// Causal sensor / actuator sample (or whole-device handshake ACK).
     CausalSample(CausalSample),
     /// Per-motor wire result returned by the emitter.
@@ -1913,6 +1929,15 @@ pub enum Event {
     },
     /// Request to enable torque on `group`.
     EnableStart { group: u8, now_us: u64 },
+    /// Pre-TX cancellation or expiry of an active enable attempt before any wire enable write was
+    /// issued. Transitions `ReadyToSwitchOn -> SwitchOnDisabled` ONLY when `!any_write_sent` and
+    /// `confirmed_channels.is_empty()`; otherwise enters `FailedHold` (`ENABLE_FAILED`).
+    EnableCancelledPreTx {
+        group: u8,
+        #[serde(default)]
+        attempt_id: u64,
+        now_us: u64,
+    },
     /// Request to disable torque on `group` (subject to role rest/release gate).
     DisableRequest {
         group: u8,

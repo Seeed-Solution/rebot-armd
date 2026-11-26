@@ -31,6 +31,8 @@ pub async fn get_diagnostics(
     #[cfg(not(target_arch = "wasm32"))]
     {
         axum::Json(serde_json::json!({
+            "effective_owner": supervisor.effective_owner().as_str(),
+            "owner_reason": supervisor.owner_reason().as_str(),
             "torque_shadow": supervisor.torque_shadow_diagnostics(),
         }))
         .into_response()

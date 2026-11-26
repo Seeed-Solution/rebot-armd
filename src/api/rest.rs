@@ -451,6 +451,13 @@ pub async fn get_observation_schema(
     Ok(Json(schema))
 }
 
+/// GET /api/v1/cell/status (read-only; returns `{"enabled": false}` when cell mode is off).
+pub async fn get_cell_status(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+) -> Json<crate::cell::CellStatusResponse> {
+    Json(supervisor.cell_status())
+}
+
 
 // Actuator authority is bound to the WebSocket that acquired the lease. REST
 // cannot prove that identity using a caller-supplied client id or generation.
@@ -918,6 +925,23 @@ pub async fn post_vision_detector(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let body: serde_json::Value = serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("Body is not JSON ({e}): send {{\"kind\": \"detect\" | \"segment\"}}"), "INVALID_COMMAND".into()))?;
     Ok(Json(crate::vision_detector::switch(&supervisor, deps.source.as_ref(), &body).await?))
+}
+
+/// `POST /api/v1/vision/models` (operator): switch the detector variant and/or depth model slot
+/// from the provider's catalogue (`crate::vision_detector::switch_models`).
+pub async fn post_vision_models(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let body: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("Body is not JSON ({e}): send {{\"detector\"?: name|null, \"depth\"?: name|null}}"),
+            "INVALID_COMMAND".into(),
+        )
+    })?;
+    Ok(Json(crate::vision_detector::switch_models(&supervisor, deps.source.as_ref(), &body).await?))
 }
 
 /// `GET /api/v1/calibration`: the camera calibration in effect, the live mount and grasp

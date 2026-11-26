@@ -386,8 +386,9 @@ async fn read_post_capture_service(
 /// the commanded positions or calibration changed meanwhile, then fit and measure. No lease, no motion.
 pub async fn measure(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
     let req = parse_request(body)?;
-    // Mutually exclude detector switches (`POST /api/v1/vision/detector` and grasp preflight) for
-    // the full capture, including any unsettled provider-accepted async model swap.
+    // Mutually exclude detector/model switches (`POST /api/v1/vision/detector`,
+    // `POST /api/v1/vision/models`, and grasp preflight) for the full capture,
+    // including any unsettled provider-accepted async model swap.
     let _in_flight = crate::vision_detector::begin_measure(source).await?;
     let svc0 = supervisor
         .read_services(ReadRequirements {

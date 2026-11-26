@@ -1065,41 +1065,117 @@ fn init_passes_the_operator_pin_to_armd_in_the_environment_only() {
 }
 
 /// The `armd_owner` setting in `/userdata/local/apps/rebot-teleop.config.json` (`arm.armd_owner`
-/// or top-level `armd_owner`) defaults to `legacy`, passes `--owner <legacy|executor>` to armd,
-/// and rejects invalid values back to `legacy` with a warning flag.
+/// or top-level `armd_owner`) omits `--owner` when unset (letting armd resolve `auto`), preserves
+/// caller `ARMD_RT_OWNER` precedence over stored config, forwards explicitly stored
+/// `auto`/`legacy`/`executor` values when `ARMD_RT_OWNER` is unset, and fails closed on invalid
+/// values instead of switching hardware to `auto`. The packaging manifest advertises default `"auto"`.
 #[cfg(unix)]
 #[test]
-fn init_parses_armd_owner_and_defaults_to_legacy() {
+fn init_parses_armd_owner_and_omits_when_unset() {
     let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
-    assert!(source.contains("ARMD_OWNER=\"legacy\""));
-    assert!(source.contains("DAEMON_OPTS=\"$DAEMON_OPTS --owner $ARMD_OWNER\""));
-    assert!(source.contains("unset ARMD_RT_OWNER"));
+    assert!(source.contains("ARMD_OWNER=\"\""));
+    assert!(
+        !source.contains("unset ARMD_RT_OWNER"),
+        "K92 must preserve ARMD_RT_OWNER so env precedence over config holds"
+    );
+    assert!(source.contains("ARMD_RT_OWNER_TRIMMED=$(printf '%s' \"${ARMD_RT_OWNER:-}\" | tr -d ' \\t\\r\\n')"));
+    assert!(source.contains("if [ -z \"$ARMD_RT_OWNER_TRIMMED\" ]; then"));
+    assert!(source.contains("Invalid arm.armd_owner setting"));
     let parse = init_section(source, "config_shell_vars() {", "\n# 读取 supervisor");
+    let launch = init_section(source, "launch_armd() {", "\nstart() {");
     let temp = tempfile::tempdir().unwrap();
     let cases = [
-        (r#"{"arm":{"follower_model":"rebot-dm"}}"#, "legacy", ""),
-        (r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"executor"}}"#, "executor", ""),
-        (r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"legacy"}}"#, "legacy", ""),
-        (r#"{"armd_owner":"executor","arm":{"follower_model":"rebot-dm"}}"#, "executor", ""),
-        (r#"{"armd_owner":"executor","arm":{"follower_model":"rebot-dm","armd_owner":"legacy"}}"#, "legacy", ""),
-        (r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"bogus"}}"#, "legacy", "1"),
+        (r#"{"arm":{"follower_model":"rebot-dm"}}"#, "", "", false, false),
+        (r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"auto"}}"#, "auto", "", true, false),
+        (r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"executor"}}"#, "executor", "", true, false),
+        (r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"legacy"}}"#, "legacy", "", true, false),
+        (r#"{"armd_owner":"executor","arm":{"follower_model":"rebot-dm"}}"#, "executor", "", true, false),
+        (r#"{"armd_owner":"executor","arm":{"follower_model":"rebot-dm","armd_owner":"legacy"}}"#, "legacy", "", true, false),
+        (r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"legcay"}}"#, "", "1", false, true),
     ];
-    for (json_body, want_owner, want_invalid) in cases {
+    for (json_body, want_owner, want_invalid, want_flag, expect_refuse) in cases {
         let cfg = temp.path().join("config.json");
         std::fs::write(&cfg, json_body).unwrap();
         let script = format!(
             "{parse}\n\
-             ARMD_OWNER=legacy; ARMD_OWNER_INVALID=''\n\
+             unset ARMD_RT_OWNER\n\
+             ARMD_OWNER=''; ARMD_OWNER_INVALID=''; DAEMON_OPTS='--follower rebot-dm'\n\
              eval \"$(config_shell_vars '{c}')\"\n\
-             printf '%s|%s' \"$ARMD_OWNER\" \"$ARMD_OWNER_INVALID\"\n",
+             if [ -z \"${{ARMD_RT_OWNER:-}}\" ]; then\n\
+               if [ \"$ARMD_OWNER_INVALID\" = 1 ]; then echo REFUSED; exit 0; fi\n\
+               if [ -n \"$ARMD_OWNER\" ]; then DAEMON_OPTS=\"$DAEMON_OPTS --owner $ARMD_OWNER\"; fi\n\
+             fi\n\
+             printf '%s|%s|%s' \"$ARMD_OWNER\" \"$ARMD_OWNER_INVALID\" \"$DAEMON_OPTS\"\n",
             c = cfg.display()
         );
         let out = Command::new("sh").args(["-c", &script]).output().unwrap();
         assert!(out.status.success(), "{json_body}: {}", String::from_utf8_lossy(&out.stderr));
         let got = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(got, format!("{want_owner}|{want_invalid}"), "{json_body}");
+        if expect_refuse {
+            assert_eq!(got.trim(), "REFUSED", "{json_body}");
+        } else {
+            let want_opts = if want_flag {
+                format!("--follower rebot-dm --owner {want_owner}")
+            } else {
+                "--follower rebot-dm".to_string()
+            };
+            assert_eq!(got, format!("{want_owner}|{want_invalid}|{want_opts}"), "{json_body}");
+        }
     }
-    // Verify the gallery manifest also advertises `armd_owner` with default `legacy`.
+
+    // Verify ARMD_RT_OWNER in environment is preserved through launch_armd and suppresses --owner
+    // from config so env > config precedence holds under K92.
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let (env_log, args_log) = (temp.path().join("owner_env"), temp.path().join("owner_args"));
+    let stub = bin.join("start-stop-daemon");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\necho \"ARMD_RT_OWNER=${{ARMD_RT_OWNER-unset}}\" > '{}'\necho \"$*\" > '{}'\n",
+            env_log.display(),
+            args_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let cfg = temp.path().join("config_exec.json");
+    std::fs::write(&cfg, r#"{"arm":{"follower_model":"rebot-dm","armd_owner":"executor"}}"#).unwrap();
+    let env_script = format!(
+        "{parse}\n{launch}\n\
+         PATH='{b}':$PATH\n\
+         ARMD_RT_OWNER=legacy; export ARMD_RT_OWNER\n\
+         OPERATOR_PIN=''; ARMD_OWNER=''; ARMD_OWNER_INVALID=''; DAEMON_OPTS='--follower rebot-dm'\n\
+         eval \"$(config_shell_vars '{c}')\"\n\
+         if [ -z \"${{ARMD_RT_OWNER:-}}\" ] && [ -n \"$ARMD_OWNER\" ]; then DAEMON_OPTS=\"$DAEMON_OPTS --owner $ARMD_OWNER\"; fi\n\
+         PIDFILE=/tmp/x.pid DAEMON=/usr/local/bin/armd LOGFILE=/dev/null launch_armd || exit 9\n",
+        b = bin.display(),
+        c = cfg.display()
+    );
+    let out = Command::new("sh").args(["-c", &env_script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&env_log).unwrap().trim(), "ARMD_RT_OWNER=legacy");
+    assert!(
+        !std::fs::read_to_string(&args_log).unwrap().contains("--owner"),
+        "K92 must not override ARMD_RT_OWNER with --owner from config"
+    );
+
+    // Whitespace-only ARMD_RT_OWNER is treated as unset (matching Rust trim), so stored config applies.
+    let ws_script = format!(
+        "{parse}\n\
+         ARMD_RT_OWNER='   '; export ARMD_RT_OWNER\n\
+         ARMD_OWNER=''; ARMD_OWNER_INVALID=''; DAEMON_OPTS='--follower rebot-dm'\n\
+         eval \"$(config_shell_vars '{c}')\"\n\
+         ARMD_RT_OWNER_TRIMMED=$(printf '%s' \"${{ARMD_RT_OWNER:-}}\" | tr -d ' \\t\\r\\n')\n\
+         if [ -z \"$ARMD_RT_OWNER_TRIMMED\" ] && [ -n \"$ARMD_OWNER\" ]; then DAEMON_OPTS=\"$DAEMON_OPTS --owner $ARMD_OWNER\"; fi\n\
+         printf '%s' \"$DAEMON_OPTS\"\n",
+        c = cfg.display()
+    );
+    let ws_out = Command::new("sh").args(["-c", &ws_script]).output().unwrap();
+    assert!(ws_out.status.success());
+    assert_eq!(String::from_utf8_lossy(&ws_out.stdout), "--follower rebot-dm --owner executor");
+
+    // Verify the gallery manifest also advertises `armd_owner` with default `auto`.
     let manifest: serde_json::Value = serde_json::from_str(
         include_str!("../kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-teleop.json"),
     )
@@ -1116,6 +1192,6 @@ fn init_parses_armd_owner_and_defaults_to_legacy() {
         .iter()
         .find(|i| i["key"] == "armd_owner")
         .expect("rebot-teleop.json arm group must declare armd_owner");
-    assert_eq!(item["default"], "legacy");
-    assert_eq!(item["options"], serde_json::json!(["legacy", "executor"]));
+    assert_eq!(item["default"], "auto");
+    assert_eq!(item["options"], serde_json::json!(["auto", "legacy", "executor"]));
 }

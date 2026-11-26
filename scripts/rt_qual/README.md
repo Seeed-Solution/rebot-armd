@@ -142,7 +142,7 @@ python3 scripts/rt_qual/analyze.py --load /tmp/mock_load.jsonl
 
 ### Automated §6 Executor Qualification Sequence (`executor_qual.sh`)
 
-Opt into the executor owner on the device by setting `"arm": {"armd_owner": "executor"}` (or top-level `"armd_owner": "executor"`) in `/userdata/local/apps/rebot-teleop.config.json` (default: `"legacy"`), then run:
+On `rebot-dm` (without MIT tracking), the packaging default `arm.armd_owner = "auto"` already resolves to `executor` (`K92rebot-teleop` omits `--owner` unless configured). To require the executor explicitly at admission (refusing ineligible followers or MIT profiles before opening hardware, while preserving DRV-F1 recoverable handback to legacy holding if executor initialization fails after admission), set `"arm": {"armd_owner": "executor"}` (or top-level `"armd_owner": "executor"`) in `/userdata/local/apps/rebot-teleop.config.json`, then run:
 
 ```sh
 # On device (smoke 45 s motion; pass --full for 180 s):

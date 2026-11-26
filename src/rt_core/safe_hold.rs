@@ -643,6 +643,7 @@ impl SafeHoldBuffers {
             }
         }
         let mut sent_hold_mask = 0u64;
+        let mut stale_hold_mask = 0u64;
         let mut unverified_mask = 0u64;
         // A required axis whose hold frame failed (write error or `UnheldTxFailed`).
         let mut hold_tx_failed = false;
@@ -659,9 +660,12 @@ impl SafeHoldBuffers {
                 }
                 for j in 0..dof.min(report.dof) {
                     match report.joint_status[j] {
-                        crate::driver::JointHoldStatus::Held
-                        | crate::driver::JointHoldStatus::HeldStaleTarget => {
+                        crate::driver::JointHoldStatus::Held => {
                             sent_hold_mask |= 1u64 << j;
+                        }
+                        crate::driver::JointHoldStatus::HeldStaleTarget => {
+                            sent_hold_mask |= 1u64 << j;
+                            stale_hold_mask |= 1u64 << j;
                         }
                         crate::driver::JointHoldStatus::UnheldNoVerifiedMode if j < 64 => {
                             unverified_mask |= 1u64 << j;
@@ -688,6 +692,11 @@ impl SafeHoldBuffers {
                     {
                         ctrl.j7_tx_count.fetch_add(1, Ordering::Release);
                         sent_hold_mask |= 1u64 << j7;
+                        if report.joint_status[j7]
+                            == crate::driver::JointHoldStatus::HeldStaleTarget
+                        {
+                            stale_hold_mask |= 1u64 << j7;
+                        }
                     }
                 }
             }
@@ -708,14 +717,20 @@ impl SafeHoldBuffers {
                 .store(unverified_mask != 0 || hold_tx_failed, Ordering::Release);
         }
         if let Some(ref mut sh) = shadow {
-            sh.enqueue(crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
-                hold_mask: crate::torque::ChannelMask(sent_hold_mask as u32),
-                contended: false,
-                escalated: false,
-                live_intent: crate::torque::TorqueIntent::On,
-                live_is_torqued: true,
-                live_stopped: true,
-            });
+            // One checkpoint per tick; with no hold attempted both masks are empty.
+            let checkpoint_now = drv.clock_now();
+            sh.enqueue_at(
+                checkpoint_now,
+                crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
+                    hold_mask: crate::torque::ChannelMask(sent_hold_mask as u32),
+                    stale_held_mask: crate::torque::ChannelMask(stale_hold_mask as u32),
+                    contended: false,
+                    escalated: false,
+                    live_intent: crate::torque::TorqueIntent::On,
+                    live_is_torqued: true,
+                    live_stopped: true,
+                },
+            );
             sh.flush_deferred_steps();
         }
 

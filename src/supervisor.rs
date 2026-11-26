@@ -926,6 +926,8 @@ pub(crate) enum RtRestingCheck {
 
 pub struct SupervisorInner {
     pub config: ArmConfig,
+    /// Optional startup-resolved multi-arm cell context (off by default, never touched on RT).
+    pub(crate) cell: Option<Arc<crate::cell::CellContext>>,
     pub safety: SafetyManager,
     pub held: Option<HeldObject>,
     /// Preallocated reusable `HeldObject::label` buffer on RT (0 alloc / 0 free).
@@ -1457,6 +1459,8 @@ pub struct SupervisorInner {
     /// True once ownership has been transferred to the synchronous RT executor thread
     /// (`armd-control`); internal driver disable paths stay non-blocking and budgeted.
     pub rt_executor_owned: bool,
+    /// Why the daemon is running under its current effective control-loop owner (0 alloc Copy).
+    pub owner_reason: crate::model::OwnerReason,
     /// Irreversibly set by [`Self::commit_shutdown`] under the owner's authority once final
     /// shutdown readiness is confirmed; permanently blocks `clear_fault`, torque enable, and
     /// actuator motion admission while keeping hardware disable paths permitted.
@@ -2511,6 +2515,7 @@ impl SupervisorInner {
             lease_generation_counter: 0,
             boot_id: crate::rt_core::broker::BootId::process(),
             schema_revision: 0,
+            cell: None,
             gripper_stalled: false,
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
@@ -2659,6 +2664,7 @@ impl SupervisorInner {
             detached: false,
             persist_capacity_available: true,
             rt_executor_owned: false,
+            owner_reason: crate::model::OwnerReason::Default,
             shutdown_committed: false,
             shutdown_refused_unknown: false,
             internal_fault_lane: Arc::new(crate::panic_coord::InternalFaultLane::new()),
@@ -4065,6 +4071,7 @@ impl SupervisorInner {
         }
         schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
         if let Some(t) = schema.capabilities.teach.as_mut() { t.episodes = self.episodes.enabled(); }
+        schema.capabilities.cell = self.cell.as_ref().map(|c| c.capabilities());
         schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
         schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(self.zero_convention).ok());
         schema
@@ -4963,6 +4970,12 @@ impl SupervisorInner {
         { out.policy = None; }
         out.watchdog_park_blocked_reason = self.watchdog_park_blocked_reason;
         out.safety_log_dropped = self.safety.log_dropped().saturating_add(self.safety_log_ring_dropped);
+        out.effective_owner = if self.rt_executor_owned {
+            crate::model::EffectiveOwner::Executor
+        } else {
+            crate::model::EffectiveOwner::Legacy
+        };
+        out.owner_reason = self.owner_reason;
     }
 
     pub fn is_at_safe_resting_pose(&self) -> bool {
@@ -5984,11 +5997,28 @@ impl SupervisorInner {
             if let Some(driver_transitions::TorqueTransition::Enable(_)) =
                 self.torque_transition.take()
             {
+                #[cfg(not(target_arch = "wasm32"))]
+                let shadow_rt = &mut self.torque_shadow;
                 if let Some(d) = self.driver.as_mut() {
-                    let _ = d.try_with_mut(|drv| drv.abort_enable());
+                    let _ = d.try_with_mut(|drv| {
+                        drv.abort_enable();
+                        #[cfg(not(target_arch = "wasm32"))]
+                        shadow_rt.drain_from_driver(drv);
+                    });
                 }
                 self.enable_lifecycle = driver_transitions::EnableLifecycle::FailedHold;
                 self.pending_rearm = true;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::HandshakeResult {
+                        live_op_id: self.shadow_enable_op_id,
+                        confirmed_mask: crate::torque::ChannelMask::EMPTY,
+                        outcome: crate::torque::HandshakeOutcome::Failed,
+                        live_intent: self.shadow_live_intent(),
+                        live_is_torqued: self.is_torqued,
+                        live_stopped: self.safety.state().is_stopped(),
+                    },
+                );
             }
             self.stop_motion();
             self.servo_target = None;
@@ -7223,10 +7253,20 @@ impl SupervisorInner {
         #[cfg(not(target_arch = "wasm32"))]
         {
             driver.set_shadow_enabled(self.torque_shadow.is_enabled());
-            self.torque_shadow.reinit_for_driver(
+            let boot_sync = crate::torque::shadow::LiveBootSync {
+                live_is_torqued: self.is_torqued,
+                live_stopped: self.safety.state().is_stopped(),
+                estop_latched: self.e_stop_latched.load(Ordering::SeqCst)
+                    || matches!(self.safety.state(), SafetyState::EStop),
+                has_fault: matches!(self.safety.state(), SafetyState::Fault(_)),
+                failed_hold: self.enable_lifecycle
+                    == driver_transitions::EnableLifecycle::FailedHold,
+            };
+            self.torque_shadow.reinit_for_driver_synced(
                 &self.config,
                 driver.shadow_vendor_kind(),
                 driver.driver_clock(),
+                boot_sync,
             );
             self.torque_shadow.drain_from_driver(&mut *driver);
             self.torque_shadow.flush_deferred_steps();
@@ -7312,6 +7352,52 @@ impl SupervisorInner {
     #[doc(hidden)]
     pub fn torque_shadow_flush_for_test(&mut self) {
         self.flush_torque_shadow();
+    }
+
+    /// Test-only entrypoint invoking `record_post_panic_disable_shadow` directly (for hard-RT
+    /// alloc/lock proofs on `armd-control`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_record_post_panic_disable_shadow(
+        &mut self,
+        is_caught_panic: bool,
+        outcome: &crate::supervisor::PanicDisableOutcome,
+    ) {
+        self.record_post_panic_disable_shadow(is_caught_panic, outcome);
+    }
+
+    /// Test-only conversion of `SupervisorInner`'s mounted `DriverSlot::Legacy` into
+    /// `DriverSlot::Exclusive` (for hard-RT teardown proofs without spawning the executor thread).
+    #[doc(hidden)]
+    pub fn test_into_exclusive_driver(&mut self) -> Result<(), &'static str> {
+        if let Some(slot) = self.driver.take() {
+            match slot.into_exclusive() {
+                Ok(ex) => {
+                    self.driver = Some(ex);
+                    Ok(())
+                }
+                Err((orig, reason)) => {
+                    self.driver = Some(orig);
+                    Err(reason)
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Test-only read of the `DriverSlot` mutex lock-attempt counter on `SupervisorInner`.
+    #[doc(hidden)]
+    pub fn test_driver_lock_attempts(&self) -> u64 {
+        self.driver_lock_attempts.load(Ordering::Acquire)
+    }
+
+    /// Test-only setter for torque shadow owner attribution (mirrors `handoff_to_executor`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_set_torque_shadow_owner(&mut self, owner: crate::torque::shadow::ShadowOwner) {
+        self.flush_torque_shadow();
+        self.torque_shadow.set_owner(owner);
     }
 
     /// Read current torque shadow diagnostics from `SupervisorInner`'s paired hub.
@@ -13555,6 +13641,8 @@ pub struct ArmSupervisor {
     /// Lock order: always `self.inner` before `self.owner`.
     owner: std::sync::Mutex<OwnerSlot>,
     owner_mode: Arc<AtomicU8>,
+    /// Lock-free mirror of why the current effective owner was selected (`OwnerReason as u8`).
+    owner_reason: Arc<AtomicU8>,
     /// `self.inner.generation()` captured at the moment ownership transfers to the RT executor.
     /// In `OWNER_EXECUTOR` mode `fresh()` requires `s.meta.generation >= executor_base_gen + 1`
     /// so rejected legacy lock attempts on the detached shell cannot skew observation freshness.
@@ -13597,6 +13685,9 @@ pub struct ArmSupervisor {
     detached_torque_pending_atomic: Arc<AtomicBool>,
     /// Shared counter of forbidden `DriverLock` attempts on `armd-control`.
     driver_lock_attempts: Arc<AtomicU64>,
+    /// Startup-resolved multi-arm cell context mirrored off the supervisor lock for read-only
+    /// `GET /api/v1/cell/status` without touching RT or control-loop locks (off by default).
+    cell: std::sync::RwLock<Option<Arc<crate::cell::CellContext>>>,
     /// Process-wide / supervisor-wide lock-free internal-fault lane (DRV-F1 / FU-PANIC).
     internal_fault_lane: Arc<crate::panic_coord::InternalFaultLane>,
     /// Shared SAFE-HOLD control block for the legacy control loop.
@@ -14230,6 +14321,7 @@ impl ArmSupervisor {
             sequences_revision: Arc::new(AtomicU64::new(0)),
             owner: std::sync::Mutex::new(OwnerSlot::Legacy),
             owner_mode: Arc::new(AtomicU8::new(OWNER_LEGACY)),
+            owner_reason: Arc::new(AtomicU8::new(crate::model::OwnerReason::Default as u8)),
             executor_base_gen: AtomicU64::new(0),
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
@@ -14248,6 +14340,7 @@ impl ArmSupervisor {
             headless_detached_drain_active: Arc::new(AtomicBool::new(false)),
             detached_torque_pending_atomic,
             driver_lock_attempts,
+            cell: std::sync::RwLock::new(None),
             internal_fault_lane,
             legacy_safe_hold: Arc::clone(&legacy_safe_hold),
             active_writer: std::sync::Mutex::new(WriterEndpoint::Legacy {
@@ -14676,7 +14769,22 @@ impl ArmSupervisor {
                             deadline: now + DRAIN_BUDGET,
                             max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
                         };
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let live_intent = inner.shadow_live_intent();
+                            let live_is_torqued = inner.is_torqued;
+                            let live_stopped = inner.safety.state().is_stopped();
+                            inner.torque_shadow.enqueue_at(
+                                now,
+                                crate::torque::shadow::ShadowInputKind::TransitionWake {
+                                    live_intent,
+                                    live_is_torqued,
+                                    live_stopped,
+                                },
+                            );
+                        }
                         let _ = inner.service_torque_transition(&budget);
+                        inner.flush_torque_shadow();
                         let settled =
                             std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
                         (inner.has_detached_torque_transition(), settled)
@@ -15010,6 +15118,33 @@ impl ArmSupervisor {
         }
     }
 
+    /// Effective control-loop owner (`Legacy`, `Transferring`, `Executor`, or `Failed`, lock-free).
+    pub fn effective_owner(&self) -> crate::model::EffectiveOwner {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => crate::model::EffectiveOwner::Executor,
+            OWNER_TRANSFERRING => crate::model::EffectiveOwner::Transferring,
+            OWNER_FAILED => crate::model::EffectiveOwner::Failed,
+            _ => crate::model::EffectiveOwner::Legacy,
+        }
+    }
+
+    /// Why the daemon is running under its current effective owner (lock-free).
+    pub fn owner_reason(&self) -> crate::model::OwnerReason {
+        crate::model::OwnerReason::from_u8(self.owner_reason.load(Ordering::Acquire))
+    }
+
+    /// Records the startup owner selection reason before ownership transfer or after a recoverable
+    /// DRV-F1 handback to legacy.
+    pub async fn set_owner_reason(&self, reason: crate::model::OwnerReason) {
+        self.owner_reason.store(reason as u8, Ordering::Release);
+        if self.owner_mode() == OWNER_LEGACY {
+            let mut inner = self.inner.write().await;
+            if !inner.detached {
+                inner.owner_reason = reason;
+            }
+        }
+    }
+
     /// Attaches the legacy periodic control loop's [`ExecutorStats`] so `GET /api/v1/diagnostics/tick`
     /// reports `skipped_releases`, monotonic release peaks/thresholds, and single-completion publication
     /// into [`LockFreeTickStats`] in Legacy mode.
@@ -15284,6 +15419,7 @@ impl ArmSupervisor {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
+            real.flush_torque_shadow();
             real.torque_shadow
                 .set_owner(crate::torque::shadow::ShadowOwner::Executor);
             if let Err(e) = self.torque_shadow.start_worker() {
@@ -15597,9 +15733,9 @@ impl ArmSupervisor {
                 core.internal_fault_lane = Arc::clone(&self.internal_fault_lane);
                 #[cfg(not(target_arch = "wasm32"))]
                 {
+                    core.flush_torque_shadow();
                     core.torque_shadow
                         .set_owner(crate::torque::shadow::ShadowOwner::Legacy);
-                    core.flush_torque_shadow();
                     self.torque_shadow.wake();
                 }
                 *guard = *core;
@@ -17175,6 +17311,36 @@ impl ArmSupervisor {
         }
     }
 
+    /// Attaches (or clears) the startup-resolved multi-arm cell context before control-loop
+    /// ownership transfers to the RT executor.
+    pub async fn set_cell(
+        &self,
+        cell: Option<Arc<crate::cell::CellContext>>,
+    ) -> Result<(), ArmError> {
+        let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
+        inner.cell = cell.clone();
+        inner.refresh_schema_cache();
+        *self.cell.write().unwrap_or_else(|e| e.into_inner()) = cell;
+        let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
+        let gen = self.inner.generation();
+        self.published_config.publish(snap, gen);
+        Ok(())
+    }
+
+    /// Returns the active startup-resolved cell context, or `None` in single-arm mode.
+    pub fn cell_context(&self) -> Option<Arc<crate::cell::CellContext>> {
+        self.cell.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Read-only status snapshot for `GET /api/v1/cell/status` (off-RT, zero supervisor lock).
+    pub fn cell_status(&self) -> crate::cell::CellStatusResponse {
+        match self.cell_context() {
+            Some(ctx) => ctx.status_response(),
+            None => crate::cell::CellStatusResponse::disabled(),
+        }
+    }
+
     pub async fn get_config(&self) -> ArmConfig {
         let inner = self.inner.read().await;
         inner.config.clone()
@@ -18687,7 +18853,22 @@ impl ArmSupervisor {
                                         deadline: step_now + FALLBACK_STEP_BUDGET,
                                         max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
                                     };
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    {
+                                        let live_intent = inner.shadow_live_intent();
+                                        let live_is_torqued = inner.is_torqued;
+                                        let live_stopped = inner.safety.state().is_stopped();
+                                        inner.torque_shadow.enqueue_at(
+                                            step_now,
+                                            crate::torque::shadow::ShadowInputKind::TransitionWake {
+                                                live_intent,
+                                                live_is_torqued,
+                                                live_stopped,
+                                            },
+                                        );
+                                    }
                                     let _ = inner.service_torque_transition(&budget);
+                                    inner.flush_torque_shadow();
                                     stepped = true;
                                 }
                                 None
@@ -19255,44 +19436,68 @@ impl ArmSupervisor {
         }
         self.estop_state.request_and_latch();
         let owner_mode = Arc::clone(&self.owner_mode);
+        #[cfg(not(target_arch = "wasm32"))]
+        type PrePanicShadowSnap = Option<(crate::torque::TorqueIntent, bool, bool, Instant)>;
+        #[cfg(target_arch = "wasm32")]
+        type PrePanicShadowSnap = ();
+
         let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>,
                           owner_mode: Arc<AtomicU8>,
                           coop_deadline: Instant,
                           hard_deadline: Instant,
                           coop_budget: Duration|
-         -> LegacyPanicDisableStep {
+         -> (LegacyPanicDisableStep, PrePanicShadowSnap) {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut guard = loop {
                     if owner_mode.load(Ordering::Acquire) == OWNER_TRANSFERRING {
-                        return LegacyPanicDisableStep::Detached;
+                        return (LegacyPanicDisableStep::Detached, Default::default());
                     }
                     if let Ok(g) = inner.try_write() {
                         break g;
                     }
                     let rem = hard_deadline.saturating_duration_since(Instant::now());
                     if rem.is_zero() {
-                        return LegacyPanicDisableStep::Outcome(PanicDisableOutcome::TimedOut);
+                        return (
+                            LegacyPanicDisableStep::Outcome(PanicDisableOutcome::TimedOut),
+                            Default::default(),
+                        );
                     }
                     std::thread::sleep(rem.min(Duration::from_millis(2)));
                 };
                 if guard.detached || owner_mode.load(Ordering::Acquire) == OWNER_TRANSFERRING {
                     // Ownership moved or is actively transferring out of the Legacy shell;
                     // NEVER dispatch Legacy disable or falsely report `NoDriver`.
-                    return LegacyPanicDisableStep::Detached;
+                    return (LegacyPanicDisableStep::Detached, Default::default());
                 }
                 if Instant::now() >= hard_deadline {
-                    return LegacyPanicDisableStep::Outcome(PanicDisableOutcome::TimedOut);
+                    return (
+                        LegacyPanicDisableStep::Outcome(PanicDisableOutcome::TimedOut),
+                        Default::default(),
+                    );
                 }
-                LegacyPanicDisableStep::Outcome(guard.attempt_panic_disable_until(
+                #[cfg(not(target_arch = "wasm32"))]
+                let pre_snap = Some((
+                    guard.shadow_live_intent(),
+                    guard.is_torqued,
+                    guard.safety.state().is_stopped(),
+                    guard.cached_driver_clock_now(),
+                ));
+                #[cfg(target_arch = "wasm32")]
+                let pre_snap = ();
+                let outcome = guard.attempt_panic_disable_until(
                     coop_deadline,
                     hard_deadline,
                     coop_budget,
-                ))
+                );
+                (LegacyPanicDisableStep::Outcome(outcome), pre_snap)
             }))
             .unwrap_or_else(|_| {
-                LegacyPanicDisableStep::Outcome(PanicDisableOutcome::Failed(
-                    "panic during legacy panic-disable".into(),
-                ))
+                (
+                    LegacyPanicDisableStep::Outcome(PanicDisableOutcome::Failed(
+                        "panic during legacy panic-disable".into(),
+                    )),
+                    Default::default(),
+                )
             })
         };
 
@@ -19303,26 +19508,44 @@ impl ArmSupervisor {
         {
             let inner = Arc::clone(&self.inner);
             let owner_mode_thread = Arc::clone(&owner_mode);
+            let shadow_hub = Arc::clone(&self.torque_shadow);
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             match std::thread::Builder::new()
                 .name("armd-panic-disable".into())
                 .spawn(move || {
-                    let (step, done_at) = {
-                        let res = run_inline(
+                    let (step, pre_snap, done_at) = {
+                        let (res, pre_snap) = run_inline(
                             inner.clone(),
                             owner_mode_thread,
                             coop_deadline,
                             hard_deadline,
                             coop_budget,
                         );
-                        (res, Instant::now())
+                        (res, pre_snap, Instant::now())
                     };
                     // Seal and deliver the live outcome FIRST before touching shadow recording.
                     let _ = tx.send((step.clone(), done_at));
                     if let LegacyPanicDisableStep::Outcome(outcome) = step {
-                        if let Ok(mut g) = inner.try_write() {
-                            if !g.detached {
-                                g.record_post_panic_disable_shadow(true, &outcome);
+                        match inner.try_write() {
+                            Ok(mut g) if !g.detached => {
+                                if let Some((pre_intent, pre_torqued, pre_stopped, pre_ts)) = pre_snap {
+                                    g.record_post_panic_disable_shadow_at(
+                                        true,
+                                        &outcome,
+                                        pre_intent,
+                                        pre_torqued,
+                                        pre_stopped,
+                                        pre_ts,
+                                    );
+                                } else {
+                                    g.record_post_panic_disable_shadow(true, &outcome);
+                                }
+                            }
+                            _ => {
+                                // Lock contended or detached after fatal panic-disable: latch
+                                // session staging-loss cutoff lock-free on the hub instead of
+                                // silently dropping post-panic shadow state.
+                                shadow_hub.record_contended_staging_loss(1);
                             }
                         }
                     }
@@ -19372,6 +19595,7 @@ impl ArmSupervisor {
                 hard_deadline,
                 coop_budget,
             )
+            .0
         }
     }
 
@@ -20434,6 +20658,8 @@ impl ArmSupervisor {
         snap.boot_id = ident.boot_id.clone();
         snap.process_start_unix_ns = ident.process_start_unix_ns;
         snap.owner_mode = self.owner_mode_name();
+        snap.effective_owner = self.effective_owner().as_str();
+        snap.owner_reason = self.owner_reason().as_str();
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),

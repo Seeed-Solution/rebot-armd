@@ -1327,12 +1327,13 @@ async fn legacy_ws_contended_stop_drains_cancelling_phase_and_allows_measured_ho
 
     let dl = Instant::now() + Duration::from_secs(2);
     while Instant::now() < dl {
-        if sup.inner().read().await.torque_transition_pending() {
+        if sup.inner().read().await.torque_transition_pending() && bus.enable_tx_count() > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     assert!(sup.inner().read().await.torque_transition_pending());
+    assert!(bus.enable_tx_count() > 0, "expected partial enable TX before contended Stop");
 
     // Trigger Stop WHILE the driver mutex is contended -> must settle STOPPED immediately AND
     // retain `Cancelling` phase instead of dropping the reducer while Damiao still holds torque_hs.

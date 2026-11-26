@@ -1594,6 +1594,12 @@ pub struct ArmConfig {
     /// (`ARMD_TORQUE_SHADOW=0|false|off|no` overrides to off at startup). Default: `true`.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub torque_shadow_enabled: bool,
+    /// Optional multi-arm cell topology file (`rebot-cell/v1` JSON); None = single-arm mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<String>,
+    /// Optional local host ID override within `cell` (`hosts` key); None = auto-identify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_host: Option<String>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -1689,6 +1695,8 @@ impl Default for ArmConfig {
             contact_opening_m: None,
             dynamics_qualified: true,
             torque_shadow_enabled: true,
+            cell: None,
+            cell_host: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -2090,6 +2098,18 @@ impl ArmConfig {
             ));
         }
         if let Some(t) = &self.calibration_tool { t.validate()?; }
+        if let Some(cell_path) = &self.cell {
+            if cell_path.trim().is_empty() {
+                return Err("cell path must not be empty".into());
+            }
+        }
+        if let Some(cell_host) = &self.cell_host {
+            if !crate::cell::is_valid_identifier(cell_host) {
+                return Err(format!(
+                    "cell_host must match [A-Za-z0-9][A-Za-z0-9_-]{{0,63}}, got {cell_host:?}"
+                ));
+            }
+        }
         if self.limits.len() != self.dof {
             return Err(format!("Limits length {} does not match DOF {}", self.limits.len(), self.dof));
         }
@@ -3504,6 +3524,8 @@ impl ArmConfig {
             contact_opening_m: None,
             dynamics_qualified: true,
             torque_shadow_enabled: true,
+            cell: None,
+            cell_host: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -3688,6 +3710,103 @@ impl Clone for WorkspaceViolationSpare {
     fn clone_from(&mut self, _source: &Self) {}
 }
 
+/// Effective control-loop owner reported in observations and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveOwner {
+    /// Legacy supervisor-lock control loop.
+    #[default]
+    Legacy,
+    /// Ownership transfer to the RT executor is in flight.
+    Transferring,
+    /// Synchronous RT executor (`armd-control`) owning `ArmCore` and the actuator bus.
+    Executor,
+    /// Executor ownership failed (e.g. detached SAFE-HOLD writer retains the driver).
+    Failed,
+}
+
+impl EffectiveOwner {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Transferring => "transferring",
+            Self::Executor => "executor",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Why the daemon is running under its current `effective_owner`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum OwnerReason {
+    /// Default / test supervisor constructed directly without startup owner resolution.
+    #[default]
+    Default = 0,
+    /// Selected explicitly via CLI `--owner`.
+    ExplicitCli = 1,
+    /// Selected explicitly via `ARMD_RT_OWNER`.
+    ExplicitEnv = 2,
+    /// Selected explicitly via config (`arm.armd_owner`).
+    ExplicitConfig = 3,
+    /// Automatic selection chose `executor` for a qualified follower and profile (`rebot-dm` or `mock`).
+    AutoQualified = 4,
+    /// Automatic selection fell back to `legacy` because the follower is not qualified for the RT executor.
+    AutoFallbackUnqualifiedFollower = 5,
+    /// Automatic selection fell back to `legacy` because the profile enables MIT joint tracking.
+    AutoFallbackMitProfile = 6,
+    /// Automatic selection fell back to `legacy` because the profile DOF exceeds the RT executor limit.
+    AutoFallbackDofLimit = 7,
+    /// Executor startup failed recoverably on real hardware and handed back to `legacy` holding (DRV-F1).
+    StartupFallbackToLegacy = 8,
+    /// Executor startup failed while a detached SAFE-HOLD writer retained the driver (B4 / `OWNER_FAILED`).
+    StartupFailedDetachedSafeHold = 9,
+}
+
+impl OwnerReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ExplicitCli => "explicit_cli",
+            Self::ExplicitEnv => "explicit_env",
+            Self::ExplicitConfig => "explicit_config",
+            Self::AutoQualified => "auto_qualified",
+            Self::AutoFallbackUnqualifiedFollower => "auto_fallback_unqualified_follower",
+            Self::AutoFallbackMitProfile => "auto_fallback_mit_profile",
+            Self::AutoFallbackDofLimit => "auto_fallback_dof_limit",
+            Self::StartupFallbackToLegacy => "startup_fallback_to_legacy",
+            Self::StartupFailedDetachedSafeHold => "startup_failed_detached_safe_hold",
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ExplicitCli,
+            2 => Self::ExplicitEnv,
+            3 => Self::ExplicitConfig,
+            4 => Self::AutoQualified,
+            5 => Self::AutoFallbackUnqualifiedFollower,
+            6 => Self::AutoFallbackMitProfile,
+            7 => Self::AutoFallbackDofLimit,
+            8 => Self::StartupFallbackToLegacy,
+            9 => Self::StartupFailedDetachedSafeHold,
+            _ => Self::Default,
+        }
+    }
+
+    pub const fn is_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::AutoFallbackUnqualifiedFollower
+                | Self::AutoFallbackMitProfile
+                | Self::AutoFallbackDofLimit
+                | Self::StartupFallbackToLegacy
+                | Self::StartupFailedDetachedSafeHold
+        )
+    }
+}
+
 /// Full arm telemetry / observation
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArmObservation {
@@ -3784,6 +3903,12 @@ pub struct ArmObservation {
     /// Monotonic count of deferred safety log events dropped on overflow (never reset); omitted while zero.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub safety_log_dropped: u64,
+    /// Effective control-loop owner currently driving the arm (`"legacy"` or `"executor"`).
+    #[serde(default)]
+    pub effective_owner: EffectiveOwner,
+    /// Why the daemon is running under `effective_owner` (explicit override, auto-qualified, or fallback).
+    #[serde(default)]
+    pub owner_reason: OwnerReason,
     /// Preallocated string buffer moved into/out of `safety_state` (`FaultReason::Other` /
     /// `JointLimitExceeded`) so RT `fill_observation` transitions perform 0 heap allocations or drops.
     #[serde(skip)]
@@ -3808,6 +3933,8 @@ impl ArmObservation {
             driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
             loads: None, policy: None, watchdog_park_blocked_reason: None, safety_log_dropped: 0,
+            effective_owner: EffectiveOwner::Legacy,
+            owner_reason: OwnerReason::Default,
             safety_text_spare: SafetyTextSpare(String::new()),
             workspace_violation_spare: WorkspaceViolationSpare(None),
         }
@@ -3948,7 +4075,7 @@ impl ArmObservation {
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, safety_text_spare, workspace_violation_spare });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, effective_owner, owner_reason, safety_text_spare, workspace_violation_spare });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -4137,6 +4264,10 @@ pub struct VisionCapabilities {
     /// can switch models shows in `GET /api/v1/vision/mode` `models`.
     #[serde(default)]
     pub detector_switch: bool,
+    /// `POST /api/v1/vision/models` (operator): switch the detector variant and/or depth model
+    /// slot from the provider's catalogue (`GET /api/v1/vision/mode` `models.catalogue`).
+    #[serde(default)]
+    pub model_switch: bool,
     /// armd proxies the provider's mode API at this route (`GET`/`POST`). Present from
     /// capabilities version 2; whether the provider has it shows in `modes`.
     pub mode_endpoint: String,
@@ -4292,6 +4423,9 @@ pub struct Capabilities {
     /// On-device policy runtime capabilities; omitted unless compiled with `policy-runtime`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_runtime: Option<PolicyRuntimeCapabilities>,
+    /// Multi-arm cell capabilities; omitted when no cell config is active (off by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<crate::cell::CellCapabilities>,
 }
 
 /// Policy-runtime features compiled into this armd instance.
@@ -4600,8 +4734,15 @@ impl Capabilities {
             teach: Some(TeachCapabilities { version: TEACH_VERSION, episodes: true, sequences: true }),
             #[cfg(target_arch = "wasm32")]
             teach: None,
-            vision: VisionCapabilities { detection_proxy: true, detector_switch: cfg!(not(target_arch = "wasm32")), mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
+            vision: VisionCapabilities {
+                detection_proxy: true,
+                detector_switch: cfg!(not(target_arch = "wasm32")),
+                model_switch: cfg!(not(target_arch = "wasm32")),
+                mode_endpoint: VISION_MODE_ENDPOINT.to_string(),
+                ..Default::default()
+            },
             policy_runtime,
+            cell: None,
         }
     }
 }
