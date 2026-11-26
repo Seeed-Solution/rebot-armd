@@ -62,7 +62,12 @@ timing = { max-threads = 1 }
 armd-process = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "binary(test_damiao_smoothness) | binary(test_obs_rate) | binary(test_kincal_timing) | binary(test_alloc_timing)"
+filter = """
+binary(test_damiao_smoothness) | binary(test_obs_rate) | binary(test_kincal_timing)
+| binary(test_alloc_timing)
+| (binary(test_rt_m_motion) & (test(=legacy_home_and_jog_write_lock_hold_under_2ms_with_no_in_lock_fallback) | test(=m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_alloc)))
+| (binary(test_rt_s_servo) & test(=b2_m1_executor_large_workspace_32_endpoints_keepout_refusal_and_config_commit_zero_alloc))
+"""
 test-group = "timing"
 
 [[profile.default.overrides]]
@@ -70,7 +75,12 @@ filter = "binary(test_startup_shutdown) | binary(test_arm_profile)"
 test-group = "armd-process"
 
 [[profile.ci.overrides]]
-filter = "binary(test_damiao_smoothness) | binary(test_obs_rate) | binary(test_kincal_timing) | binary(test_alloc_timing)"
+filter = """
+binary(test_damiao_smoothness) | binary(test_obs_rate) | binary(test_kincal_timing)
+| binary(test_alloc_timing)
+| (binary(test_rt_m_motion) & (test(=legacy_home_and_jog_write_lock_hold_under_2ms_with_no_in_lock_fallback) | test(=m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_alloc)))
+| (binary(test_rt_s_servo) & test(=b2_m1_executor_large_workspace_32_endpoints_keepout_refusal_and_config_commit_zero_alloc))
+"""
 test-group = "timing"
 retries = 1
 
