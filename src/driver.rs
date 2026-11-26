@@ -21211,16 +21211,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                let tx_max = self.effective_tx_max_frames();
-                if pass.attempts.saturating_add(batch_frames) > tx_max {
-                    let remaining = tx_max.saturating_sub(pass.attempts);
+                if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
+                    let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
                     let reason = MitFenceTripReason::TxBudgetExceededPreflight {
                         needed: batch_frames.min(u16::MAX as usize) as u16,
                         remaining: remaining.min(u16::MAX as usize) as u16,
-                        max: tx_max.min(u16::MAX as usize) as u16,
+                        max: self.tx_budget.max_frames.min(u16::MAX as usize) as u16,
                     };
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
+                }
+                // Temporary per-release ledger tightening (while the driver's own budget can fit
+                // the batch and `fence_check()` above passed) must defer cleanly without mutating
+                // persistent MIT fence state so the next eligible release resumes.
+                if pass.attempts.saturating_add(batch_frames) > self.effective_tx_max_frames() {
+                    self.last_hold_tx_sent_any = false;
+                    self.last_hold_tx_due_mask = due_mask;
+                    self.last_hold_tx_sent_mask = 0;
+                    return Ok(TxBatchOutcome::Deferred { pending: batch_frames });
                 }
                 if self.now() >= self.effective_tx_pass_deadline(pass) {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
@@ -21990,16 +21998,26 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                let tx_max = self.effective_tx_max_frames();
-                if pass.attempts.saturating_add(batch_frames) > tx_max {
-                    let remaining = tx_max.saturating_sub(pass.attempts);
+                if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
+                    let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
                     let reason = MitFenceTripReason::TxBudgetExceededPreflight {
                         needed: batch_frames.min(u16::MAX as usize) as u16,
                         remaining: remaining.min(u16::MAX as usize) as u16,
-                        max: tx_max.min(u16::MAX as usize) as u16,
+                        max: self.tx_budget.max_frames.min(u16::MAX as usize) as u16,
                     };
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
+                }
+                // Temporary per-release ledger tightening (while the driver's own budget can fit
+                // the batch and `fence_check()` above passed) must defer cleanly without mutating
+                // persistent MIT fence state so the next eligible release resumes.
+                if pass.attempts.saturating_add(batch_frames) > self.effective_tx_max_frames() {
+                    self.last_hold_tx_sent_any = false;
+                    self.last_hold_tx_due_mask = due_mask;
+                    self.last_hold_tx_sent_mask = 0;
+                    report.sent_any = false;
+                    report.outcome = TxBatchOutcome::Deferred { pending: batch_frames };
+                    return Ok(());
                 }
                 if self.now() >= pass.deadline {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
@@ -22715,16 +22733,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                let tx_max = self.effective_tx_max_frames();
-                if pass.attempts.saturating_add(batch_frames) > tx_max {
-                    let remaining = tx_max.saturating_sub(pass.attempts);
+                if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
+                    let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
                     let reason = MitFenceTripReason::TxBudgetExceededPreflight {
                         needed: batch_frames.min(u16::MAX as usize) as u16,
                         remaining: remaining.min(u16::MAX as usize) as u16,
-                        max: tx_max.min(u16::MAX as usize) as u16,
+                        max: self.tx_budget.max_frames.min(u16::MAX as usize) as u16,
                     };
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
+                }
+                // Temporary per-release ledger tightening (while the driver's own budget can fit
+                // the batch and `fence_check()` above passed) must defer cleanly without mutating
+                // persistent MIT fence state so the next eligible release resumes.
+                if pass.attempts.saturating_add(batch_frames) > self.effective_tx_max_frames() {
+                    return Ok(TxBatchOutcome::Deferred { pending: batch_frames });
                 }
                 if self.now() >= self.effective_tx_pass_deadline(pass) {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;

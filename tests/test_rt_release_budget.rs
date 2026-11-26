@@ -455,19 +455,39 @@ fn sub_budget_only_tightens_and_deadline_exhaustion_returns_pending_then_resumes
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dual_owner_parity_under_tight_release_budget() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
     async fn run_owner(use_executor: bool) -> (bool, ModeProgress, usize) {
         let mut cfg = ArmConfig::rebot_dm();
         cfg.control_frequency_hz = 50;
         let (bus, drv, _) = make_bus_and_driver(None, 8, true);
         let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
+
+        // Track every transport TX attempt (including transition wakes and any backpressured
+        // attempts) bucketed by the exact release index (Window 1 + Window 2 of each release).
+        let legacy_release_seq = Arc::new(AtomicU64::new(0));
+        let per_release_attempts: Arc<Mutex<HashMap<u64, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         let exec = if use_executor {
             sup.register_ws_connection(77).await.unwrap();
             let h = sup
                 .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
                 .await
                 .unwrap();
-            // Wait for initial observation publication, then submit TorqueOn via broker.
+            let stats = Arc::clone(h.stats());
+            let map_c = Arc::clone(&per_release_attempts);
+            bus.with(|s| {
+                s.on_tx = Some(Arc::new(move || {
+                    let rel = stats.steps.load(Ordering::Acquire);
+                    if rel > 0 {
+                        *map_c.lock().unwrap().entry(rel).or_insert(0) += 1;
+                    }
+                }));
+            });
             let dl_obs = Instant::now() + Duration::from_secs(2);
             while sup.hub().latest().is_none() {
                 assert!(Instant::now() < dl_obs, "executor never published initial obs");
@@ -502,6 +522,16 @@ async fn dual_owner_parity_under_tight_release_budget() {
             sup.enable_torque(sup.capture_admission_stamp())
                 .await
                 .expect("legacy enable torque");
+            let seq_c = Arc::clone(&legacy_release_seq);
+            let map_c = Arc::clone(&per_release_attempts);
+            bus.with(|s| {
+                s.on_tx = Some(Arc::new(move || {
+                    let rel = seq_c.load(Ordering::Acquire);
+                    if rel > 0 {
+                        *map_c.lock().unwrap().entry(rel).or_insert(0) += 1;
+                    }
+                }));
+            });
             None
         };
 
@@ -519,7 +549,6 @@ async fn dual_owner_parity_under_tight_release_budget() {
             .await
             .unwrap();
 
-        let mut max_tx_per_tick = 0usize;
         let mut final_progress = ModeProgress::Pending { wake: None };
         let dl = Instant::now() + Duration::from_secs(3);
         while Instant::now() < dl {
@@ -527,10 +556,8 @@ async fn dual_owner_parity_under_tight_release_budget() {
                 s.push_all_feedback();
             });
             if !use_executor {
-                bus.with(|s| s.tx_log.clear());
+                legacy_release_seq.fetch_add(1, Ordering::AcqRel);
                 sup.control_tick(0.02).await;
-                let n = bus.with(|s| s.tx_log.len());
-                max_tx_per_tick = max_tx_per_tick.max(n);
             } else {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -548,20 +575,151 @@ async fn dual_owner_parity_under_tight_release_budget() {
                 .await
                 .unwrap();
         }
-        (motors_enabled, final_progress, max_tx_per_tick)
+        let max_attempts = per_release_attempts
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        (motors_enabled, final_progress, max_attempts)
     }
 
     let (leg_en, leg_prog, leg_max_tx) = run_owner(false).await;
-    let (exec_en, exec_prog, _) = run_owner(true).await;
+    let (exec_en, exec_prog, exec_max_tx) = run_owner(true).await;
 
     assert!(leg_en, "legacy owner must reach all motors enabled");
     assert!(exec_en, "executor owner must reach all motors enabled");
     assert_eq!(leg_prog, ModeProgress::Confirmed);
     assert_eq!(exec_prog, ModeProgress::Confirmed);
     assert!(
-        leg_max_tx <= 8,
-        "legacy owner must stay within tight TX budget of 8 frames/tick (saw {leg_max_tx})"
+        leg_max_tx > 0 && leg_max_tx <= 8,
+        "legacy owner must attempt >0 and <=8 TX frames per release (saw {leg_max_tx})"
     );
+    assert!(
+        exec_max_tx > 0 && exec_max_tx <= 8,
+        "executor owner must attempt >0 and <=8 TX frames per release (saw {exec_max_tx})"
+    );
+}
+
+#[test]
+fn armed_mit_fence_temporary_release_tx_exhaustion_defers_and_resumes_without_tripping_fence() {
+    use armd::driver::{JointMode, JointTarget, TxBatchOutcome};
+
+    let clock = MockClock::new();
+    let (bus, mut drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    bus.with(|s| {
+        for m in s.motors.iter_mut().take(6) {
+            m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
+        }
+    });
+    drv.set_torque(true).expect("enable torque");
+
+    let targets = vec![
+        JointTarget {
+            position: 0.0,
+            velocity: Some(0.0),
+            kp: Some(10.0),
+            kd: Some(1.0),
+            torque: Some(0.0),
+        };
+        7
+    ];
+    let modes = [
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Position,
+    ];
+    drv.set_joint_modes(&modes, &targets)
+        .expect("set MIT modes");
+    drv.set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
+
+    // Establish an initial valid MIT batch on release 1 so the fence is actively armed.
+    let t1 = clock.now();
+    drv.begin_control_release(1);
+    drv.set_tx_release_deadline(Some(t1 + Duration::from_millis(10)));
+    assert_eq!(
+        drv.write_joint_targets_bounded(&targets).unwrap(),
+        TxBatchOutcome::Complete
+    );
+    drv.set_tx_release_deadline(None);
+    assert!(drv.mit_fence_trip().is_none());
+
+    // Release 2: temporarily tighten the per-release TX budget below the 6-frame MIT batch size
+    // while driver's own `tx_budget.max_frames` (16) is sufficient -> must defer cleanly on all
+    // three MIT paths without tripping the fence!
+    clock.advance(Duration::from_millis(10));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    let t2 = clock.now();
+    drv.begin_control_release(2);
+    drv.set_tx_release_deadline(Some(t2 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 3);
+
+    // 1) Target path defers without tripping fence.
+    let r_target = drv.write_joint_targets_bounded(&targets).unwrap();
+    assert!(
+        matches!(r_target, TxBatchOutcome::Deferred { pending } if pending >= 6),
+        "{r_target:?}"
+    );
+    assert!(
+        drv.mit_fence_trip().is_none(),
+        "temporary ledger exhaustion must not trip MIT fence"
+    );
+
+    // 2) Stopped-hold path defers without tripping fence.
+    let r_hold = drv.write_estop_hold_bounded(&targets).unwrap();
+    assert!(
+        matches!(r_hold, TxBatchOutcome::Deferred { pending } if pending >= 6),
+        "{r_hold:?}"
+    );
+    assert!(
+        drv.mit_fence_trip().is_none(),
+        "temporary ledger exhaustion on stopped hold must not trip MIT fence"
+    );
+
+    // 3) Measured-hold path defers without tripping fence.
+    let r_mhold = drv.write_measured_hold_masked(0x3F, &targets).unwrap();
+    assert!(
+        matches!(r_mhold.outcome, TxBatchOutcome::Deferred { pending } if pending >= 6),
+        "{:?}",
+        r_mhold.outcome
+    );
+    assert!(!r_mhold.sent_any);
+    assert!(
+        drv.mit_fence_trip().is_none(),
+        "temporary ledger exhaustion on measured hold must not trip MIT fence"
+    );
+    assert!(
+        bus.with(|s| s.tx_log.iter().all(|f| f.id == 0x307) && s.tx_log.len() <= 3),
+        "deferred MIT batches must emit 0 MIT arm frames and stay within tx_limit=3: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+    drv.set_tx_release_deadline(None);
+
+    // Release 3: next eligible release with full TX allowance resumes cleanly!
+    clock.advance(Duration::from_millis(10));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    let t3 = clock.now();
+    drv.begin_control_release(3);
+    drv.set_tx_release_deadline(Some(t3 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 16);
+    assert_eq!(
+        drv.write_joint_targets_bounded(&targets).unwrap(),
+        TxBatchOutcome::Complete,
+        "armed MIT target batch must resume and complete on the next eligible release"
+    );
+    drv.set_tx_release_deadline(None);
+    assert!(drv.mit_fence_trip().is_none());
 }
 
 #[test]
