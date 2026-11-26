@@ -2025,7 +2025,8 @@ async fn two_phase_persistence_success_and_dir_sync_unconfirmed() {
     assert_eq!(a2.code.as_deref(), Some("PERSIST_FAILED"), "{a2:?}");
     assert_eq!(a2.durability_confirmed, Some(false), "{a2:?}");
     assert!(a2.durability_warning.as_deref().unwrap_or("").contains("simulated EIO"), "{a2:?}");
-    assert!(path2.exists(), "rename happened before dir-sync failure");
+    // The candidate is staged at `.pending`; it never reaches the official path unactivated.
+    assert!(!path2.exists(), "dir-sync failure must not publish the official file");
     assert!(
         h2.planning_snapshot().unwrap().config_inhibited,
         "dir-sync failure must enter Reconciling and keep motion inhibited"
@@ -2124,7 +2125,9 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
         h_d2.planning_snapshot().is_ok_and(|s| s.config_inhibited)
     })
     .await;
-    assert!(path_d2.exists(), "rename happened before post-rename revocation");
+    assert!(!path_d2.exists(), "refused candidate must not reach the official path");
+    wait_until_async(Duration::from_secs(2), || !armd::gripper_calib::pending_path_for(&path_d2).exists()).await;
+    assert!(!armd::gripper_calib::pending_path_for(&path_d2).exists(), "refused candidate must be unlinked");
     h_d2.stop_and_join();
 
     // (e) Worker disconnect BEFORE rename -> hold enters Reconciling, action fails PERSIST_FAILED.
@@ -2162,7 +2165,8 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     assert_eq!(a_f.state, "failed", "{a_f:?}");
     assert_eq!(a_f.code.as_deref(), Some("PERSIST_FAILED"));
     assert!(h_f.planning_snapshot().unwrap().config_inhibited);
-    assert!(path_f.exists());
+    assert!(!path_f.exists(), "unactivated candidate must not reach the official path");
+    assert!(armd::gripper_calib::pending_path_for(&path_f).exists(), "worker exit leaves the staged candidate for startup cleanup");
     h_f.stop_and_join();
 }
 
@@ -2214,6 +2218,8 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     let dir_g2 = tempfile::tempdir().unwrap();
     let target_is_dir = dir_g2.path().join("existing_dir");
     std::fs::create_dir(&target_is_dir).unwrap();
+    // The candidate is staged at `<target>.pending`: make that a directory too so staging fails.
+    std::fs::create_dir(armd::gripper_calib::pending_path_for(&target_is_dir)).unwrap();
     let (sup_g2, id_g2) = prepare_zero_check_supervisor(target_is_dir).await;
     let hooks_g2 = PersistTestHooks {
         exit_after_first_job: true,
@@ -3374,7 +3380,9 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
         h_u.planning_snapshot().is_ok_and(|s| s.config_inhibited)
     })
     .await;
-    assert!(path_u.exists(), "rename happened before unapplied urgent E-stop");
+    assert!(!path_u.exists(), "refused candidate must not reach the official path");
+    wait_until_async(Duration::from_secs(2), || !armd::gripper_calib::pending_path_for(&path_u).exists()).await;
+    assert!(!armd::gripper_calib::pending_path_for(&path_u).exists(), "refused candidate must be unlinked");
     assert_eq!(
         sup_u.observation().await.unwrap().safety_state,
         SafetyState::EStop,
