@@ -1770,8 +1770,14 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
     armd::SupervisorInner::enable_torque(adm).unwrap();
-    for _ in 0..3 { inner.tick(DT); }
+    for _ in 0..10 {
+        inner.tick(DT);
+        if inner.mit_active() {
+            break;
+        }
+    }
     assert!(inner.mit_active(), "MIT should be active before injected TX failure");
+    inner.tick(DT);
 
     // Inject partial TX failure -> MIT enters MitOwner::Lost (BusLoss) and J4 command watchdog expires (0x0D).
     bus.with(|s| s.fail_tx_after = Some(3));
@@ -2630,8 +2636,14 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         let stamp = inner.current_admission_stamp();
         let adm = inner.check_admission(stamp).unwrap();
         armd::SupervisorInner::enable_torque(adm).unwrap();
-        for _ in 0..3 { inner.tick(DT); }
+        for _ in 0..10 {
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
         assert!(inner.mit_active());
+        inner.tick(DT);
         // Inject partial TX failure -> MIT enters MitOwner::Lost (BusLoss) and J4 command watchdog expires (0x0D).
         bus.with(|s| s.fail_tx_after = Some(3));
         inner.tick(DT);
@@ -2797,8 +2809,14 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
             let adm = inner.check_admission(stamp).unwrap();
             armd::SupervisorInner::enable_torque(adm).unwrap();
         }
-        for _ in 0..3 { inner.tick(DT); }
+        for _ in 0..10 {
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
         assert!(inner.mit_active());
+        inner.tick(DT);
         bus.with(|s| s.fail_tx_after = Some(3));
         inner.tick(DT);
         assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
@@ -3564,8 +3582,14 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         let stamp = inner.current_admission_stamp();
         let adm = inner.check_admission(stamp).unwrap();
         armd::SupervisorInner::enable_torque(adm).unwrap();
-        for _ in 0..3 { inner.tick(DT); }
+        for _ in 0..10 {
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
         assert!(inner.mit_active());
+        inner.tick(DT);
         bus.with(|s| s.fail_tx_after = Some(3));
         inner.tick(DT);
         assert_eq!(inner.mit.owner, mit::MitOwner::Lost);

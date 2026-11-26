@@ -1081,6 +1081,8 @@ pub enum MaintenanceOp {
         supplied_epoch: Option<u64>,
         request_id_valid: bool,
         body_error: Option<&'static str>,
+        mit_recovery: bool,
+        mit_recovery_started_at: Option<Instant>,
         auth_policy: super::requests::lease::OwnerAuthPolicy,
         operator: crate::auth::OperatorGrant,
     },
@@ -2027,6 +2029,7 @@ enum OffloadReclaim {
     ZeroCheckCtx(Box<crate::supervisor::ZeroCheckPersistContext>),
     DiscardZeroCheckCtx(u64),
     GravityCompRun(crate::gravity_comp::GravityCompRun),
+    GravityCompPolicy(crate::model::GravityCompPolicy),
     Probe(Box<dyn Any + Send>),
     SafetyState(Arc<SafetyState>),
     RetiredStop(RetiredStopPayloads),
@@ -5942,6 +5945,8 @@ impl RtExecutorHandle {
         supplied_epoch: Option<u64>,
         request_id_valid: bool,
         body_error: Option<&'static str>,
+        mit_recovery: bool,
+        mit_recovery_started_at: Option<Instant>,
         auth_policy: super::requests::lease::OwnerAuthPolicy,
         operator: crate::auth::OperatorGrant,
     ) -> Result<super::requests::lease::LeaseClearFaultOutcome, OwnerError> {
@@ -5952,6 +5957,8 @@ impl RtExecutorHandle {
                 supplied_epoch,
                 request_id_valid,
                 body_error,
+                mit_recovery,
+                mit_recovery_started_at,
                 auth_policy,
                 operator,
             })
@@ -7246,8 +7253,11 @@ impl ControlState {
         if std::mem::replace(&mut core.zero_check_stream_pushed, false) {
             self.persist_wake.unpark();
         }
-        if let Some(run) = core.retired_gravity_comp.take() {
-            let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
+        while let Some(run) = core.pop_retired_gravity_comp() {
+            push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::GravityCompRun(run));
+        }
+        while let Some(pol) = core.pop_retired_gravity_comp_policy() {
+            push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::GravityCompPolicy(pol));
         }
     }
 
@@ -7325,11 +7335,19 @@ impl ControlState {
         if std::mem::replace(&mut core.zero_check_stream_pushed, false) {
             self.persist_wake.unpark();
         }
-        if !self.offload_reclaim_tx.is_full() {
-            if let Some(run) = core.retired_gravity_comp.take() {
-                let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
-                drained = true;
-            }
+        while !self.offload_reclaim_tx.is_full() {
+            let Some(run) = core.pop_retired_gravity_comp() else {
+                break;
+            };
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
+            drained = true;
+        }
+        while !self.offload_reclaim_tx.is_full() {
+            let Some(pol) = core.pop_retired_gravity_comp_policy() else {
+                break;
+            };
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompPolicy(pol));
+            drained = true;
         }
         let lost_inline = core.safety.advance_log_dropped_forwarded();
         if lost_inline > 0 {
@@ -7519,6 +7537,8 @@ impl ControlState {
                 supplied_epoch,
                 request_id_valid,
                 body_error,
+                mit_recovery,
+                mit_recovery_started_at,
                 auth_policy,
                 operator,
             } => {
@@ -7531,6 +7551,8 @@ impl ControlState {
                     supplied_epoch,
                     request_id_valid,
                     body_error,
+                    mit_recovery,
+                    mit_recovery_started_at,
                     auth_policy,
                     operator,
                     ctx.now,
@@ -11917,23 +11939,27 @@ fn control_thread_main_inner(
         } else {
             "SHUTDOWN"
         });
-        let _ = core.flush_published_session_terminals();
         state.drain_maintenance_stopped();
         state.drain_persistence_stopped(core);
         if !panicked {
             if !core.pending_estop_acks.is_empty()
                 || engine.has_applied_urgent_stop_pending()
                 || engine.has_pending_lifecycle_replies()
+                || core.sessions.has_pending_terminals()
             {
                 publish_gen += 1;
                 let ts = core.now_timestamp();
                 core.publish(ts, publish_gen);
             }
+            // Flush session terminals strictly AFTER publishing the revoked service snapshot so
+            // router consumers never observe a terminal ahead of `read_services`.
+            let _ = core.flush_published_session_terminals();
             engine.drain_urgent_stops_stopped(true);
             engine.drain_conn_lifecycle_stopped(true);
             let _ = engine.flush_servo_closes(&mut *core);
             state.emit_estop_ack_if_advanced(core);
         } else {
+            let _ = core.flush_published_session_terminals();
             engine.drain_urgent_stops_stopped(false);
             engine.drain_conn_lifecycle_stopped(false);
             state.retire_unpublished_estop_acks(core);

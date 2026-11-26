@@ -994,6 +994,8 @@ pub struct EnableAuthority {
     pub lease_generation: u64,
     pub owner_conn_id: u64,
     pub admitted_epoch: u64,
+    pub admission_request_id: u64,
+    pub stop_gen: u64,
 }
 
 /// Phase of the single budgeted enable transition reducer (`Enable -> Validate -> Armed | FailedHold`,
@@ -1020,6 +1022,10 @@ pub struct EnableReducer {
     pub prev_gripper_cmd: Option<f32>,
     pub authority: Option<EnableAuthority>,
     pub budgeted: bool,
+    /// True iff this exact enable admission passed MIT qualification (sync `mit_gate` on legacy
+    /// or admission-bound `MitGateProof` consumed on RT executor). Only this reducer's successful
+    /// arming may set `mit.armed_ok`.
+    pub mit_qualified: bool,
 }
 
 /// Result of one step of the unified enable reducer (stack-only, 0 heap allocs on RT).
@@ -3428,12 +3434,14 @@ impl SupervisorInner {
         // Torque changes and re-arming are refused in gravity compensation: exit first.
         self.gravity_comp_servo_busy()?;
         let (was_torqued, prev_gripper_cmd) = self.enable_prepare()?;
+        let mit_qualified = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
         let mut outcome = self.start_enable_reducer(
             EnableOrigin::BrokerTransition,
             was_torqued,
             prev_gripper_cmd,
             None,
             false,
+            mit_qualified,
         );
         let mut first = true;
         let res = loop {
@@ -3839,7 +3847,7 @@ impl SupervisorInner {
     }
 
     /// Zero-allocation RT preflight for torque enable (all refusal paths return static codes).
-    fn enable_prepare_rt_precheck(&self) -> Result<(), &'static str> {
+    fn enable_prepare_rt_precheck(&mut self, authority: Option<EnableAuthority>) -> Result<(), &'static str> {
         #[cfg(not(target_arch = "wasm32"))]
         if (self.calibration_busy && self.motor_zero_busy)
             || self.commissioning.is_active()
@@ -3885,19 +3893,55 @@ impl SupervisorInner {
                 "ESTOP_ACTIVE"
             });
         }
-        if self.mit_active()
-            || self.mit.revoke_pending
-            || crate::mit::mit_joint_mask(&self.config) != 0
-        {
-            return Err("UNSUPPORTED");
+        if self.mit_active() || self.mit.revoke_pending {
+            return Err("MOTION_BUSY");
+        }
+        if crate::mit::mit_joint_mask(&self.config) != 0 {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if crate::rt_core::sched::mit_refusal().is_some() {
+                    return Err("MIT_UNQUALIFIED");
+                }
+                let Some(auth) = authority else {
+                    return Err("MIT_UNQUALIFIED");
+                };
+                let Some(proof) = self.mit_gate_proof.take() else {
+                    return Err("MIT_UNQUALIFIED");
+                };
+                let now = Instant::now();
+                let matches_admission = proof.admission_request_id == auth.admission_request_id
+                    && proof.connection_id == auth.owner_conn_id
+                    && proof.lease_generation == auth.lease_generation
+                    && proof.estop_epoch == auth.admitted_epoch
+                    && proof.estop_epoch == self.safety.epoch_id()
+                    && proof.stop_gen == auth.stop_gen
+                    && proof.stop_gen == self.current_stop_gen()
+                    && proof.calibration_revision == self.calibration_revision
+                    && proof.motion_config_revision == self.motion_config_revision
+                    && proof.zero_offsets_hash
+                        == crate::mit::zero_offsets_hash(&self.joint_zero_offsets)
+                    && now.saturating_duration_since(proof.verified_at) <= Duration::from_secs(5);
+                if !matches_admission {
+                    return Err("MIT_UNQUALIFIED");
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                return Err("UNSUPPORTED");
+            }
         }
         Ok(())
     }
 
     /// Zero-allocation RT enable prepare (runs after [`Self::enable_prepare_rt_precheck`]).
     /// Never infers `was_torqued` from feedback-reported enable state (R10 decision-owned torque).
-    fn enable_prepare_rt(&mut self) -> Result<(bool, Option<f32>), &'static str> {
-        self.enable_prepare_rt_precheck()?;
+    /// Returns `(was_torqued, prev_gripper_cmd, mit_qualified)`.
+    fn enable_prepare_rt(
+        &mut self,
+        authority: Option<EnableAuthority>,
+    ) -> Result<(bool, Option<f32>, bool), &'static str> {
+        self.enable_prepare_rt_precheck(authority)?;
+        let mit_qualified = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
         let was_torqued = self.is_torqued;
         let prev_gripper_cmd = if was_torqued {
             self.config
@@ -3925,7 +3969,7 @@ impl SupervisorInner {
             drop(driver);
             self.driver = Some(d);
         }
-        Ok((was_torqued, prev_gripper_cmd))
+        Ok((was_torqued, prev_gripper_cmd, mit_qualified))
     }
 
     /// Starts the single budgeted enable reducer (`Enable -> Validate -> Armed | FailedHold`).
@@ -3936,8 +3980,17 @@ impl SupervisorInner {
         prev_gripper_cmd: Option<f32>,
         authority: Option<EnableAuthority>,
         budgeted: bool,
+        mit_qualified: bool,
     ) -> EnableStepOutcome {
-        self.start_enable_reducer_inner(origin, was_torqued, prev_gripper_cmd, authority, budgeted, false)
+        self.start_enable_reducer_inner(
+            origin,
+            was_torqued,
+            prev_gripper_cmd,
+            authority,
+            budgeted,
+            false,
+            mit_qualified,
+        )
     }
 
     /// Computes the owner-clock authority ceiling (`min(lease_expiry, request_deadline)`) so
@@ -3976,6 +4029,7 @@ impl SupervisorInner {
         authority: Option<EnableAuthority>,
         budgeted: bool,
         retry_unverified_ranges: bool,
+        mit_qualified: bool,
     ) -> EnableStepOutcome {
         use crate::driver::{TorqueOutcome, TorqueProgress as Drv};
         let reducer = EnableReducer {
@@ -3985,6 +4039,7 @@ impl SupervisorInner {
             prev_gripper_cmd,
             authority,
             budgeted,
+            mit_qualified,
         };
         self.torque_intent = TorqueIntent::On;
         self.enable_lifecycle = EnableLifecycle::Enabling;
@@ -4252,6 +4307,7 @@ impl SupervisorInner {
                 prev_gripper_cmd: None,
                 authority: None,
                 budgeted: true,
+                mit_qualified: false,
             }));
         }
         self.sync_detached_torque_flag();
@@ -5190,8 +5246,12 @@ impl SupervisorInner {
                     self.pending_rearm = false;
                     self.disable_pending = false;
                     self.background_disable_retry = None;
-                    self.mit.armed_ok = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
-                    self.mit.handover_error = None;
+                    self.mit.armed_ok = reducer.mit_qualified;
+                    self.mit.handback_suppress_until = None;
+                    self.mit.handover_error_rt = None;
+                    if !self.rt_executor_owned {
+                        self.mit.handover_error = None;
+                    }
                     self.last_heartbeat = armed_now;
                     self.last_motion_frame = armed_now;
                     #[cfg(not(target_arch = "wasm32"))]
@@ -5231,8 +5291,12 @@ impl SupervisorInner {
                     self.pending_rearm = false;
                     self.disable_pending = false;
                     self.background_disable_retry = None;
-                    self.mit.armed_ok = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
-                    self.mit.handover_error = None;
+                    self.mit.armed_ok = reducer.mit_qualified;
+                    self.mit.handback_suppress_until = None;
+                    self.mit.handover_error_rt = None;
+                    if !self.rt_executor_owned {
+                        self.mit.handover_error = None;
+                    }
                     self.last_heartbeat = armed_now;
                     self.last_motion_frame = armed_now;
                     #[cfg(not(target_arch = "wasm32"))]
@@ -5718,6 +5782,14 @@ impl SupervisorInner {
     pub(crate) fn begin_enable_torque_transition(
         admitted: Admitted<'_>,
     ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
+        let req_id = admitted.stamp().request_id;
+        Self::begin_enable_torque_transition_with_seq(admitted, req_id)
+    }
+
+    pub(crate) fn begin_enable_torque_transition_with_seq(
+        admitted: Admitted<'_>,
+        client_seq: u64,
+    ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
         let (this, proof) = admitted
             .consume()
             .map_err(|e| torque_admission_error_code(&e))?;
@@ -5726,6 +5798,8 @@ impl SupervisorInner {
             lease_generation: s.lease_gen,
             owner_conn_id: s.connection_id,
             admitted_epoch: s.estop_epoch,
+            admission_request_id: client_seq,
+            stop_gen: s.stop_gen,
         };
         this.begin_enable_torque_transition_inner(
             EnableOrigin::BrokerTransition,
@@ -5751,8 +5825,10 @@ impl SupervisorInner {
             lease_generation: s.lease_gen,
             owner_conn_id: s.connection_id,
             admitted_epoch: s.estop_epoch,
+            admission_request_id: s.request_id,
+            stop_gen: s.stop_gen,
         };
-        let (was_torqued, prev_gripper_cmd) = this.enable_prepare_rt()?;
+        let (was_torqued, prev_gripper_cmd, mit_qualified) = this.enable_prepare_rt(Some(authority))?;
         let _ = now;
         match this.start_enable_reducer(
             EnableOrigin::BrokerTransition,
@@ -5760,6 +5836,7 @@ impl SupervisorInner {
             prev_gripper_cmd,
             Some(authority),
             true,
+            mit_qualified,
         ) {
             EnableStepOutcome::Armed(_) => Ok(()),
             EnableStepOutcome::Failed { rt_code, .. } => Err(rt_code),
@@ -5802,19 +5879,21 @@ impl SupervisorInner {
     ) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
         use crate::rt_core::ops::TorqueProgress as Rt;
         let use_rt_path = self.rt_executor_owned || matches!(origin, EnableOrigin::BrokerTransition);
-        let prep_res: Result<(bool, Option<f32>), &'static str> = if use_rt_path {
-            self.enable_prepare_rt()
+        let prep_res: Result<(bool, Option<f32>, bool), &'static str> = if use_rt_path {
+            self.enable_prepare_rt(Some(authority))
         } else {
             (|| {
                 if self.torque_transition.is_some() {
                     return Err("TRANSITION_BUSY");
                 }
                 self.gravity_comp_servo_busy().map_err(|_| "MOTION_BUSY")?;
-                self.enable_prepare_inner(false, allow_sync_mit, false)
-                    .map_err(|e| torque_error_code(&e))
+                let (w, g) = self.enable_prepare_inner(false, allow_sync_mit, false)
+                    .map_err(|e| torque_error_code(&e))?;
+                let mit_q = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
+                Ok((w, g, mit_q))
             })()
         };
-        let (was_torqued, prev_gripper_cmd) = match prep_res {
+        let (was_torqued, prev_gripper_cmd, mit_qualified) = match prep_res {
             Ok(v) => v,
             Err(code) => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -5853,6 +5932,7 @@ impl SupervisorInner {
                 prev_gripper_cmd,
                 Some(authority),
                 budgeted,
+                mit_qualified,
             ) {
                 EnableStepOutcome::Armed(_) => Ok(Rt::Done),
                 EnableStepOutcome::Pending { wake } => Ok(Rt::Pending { wake }),
@@ -5879,6 +5959,8 @@ impl SupervisorInner {
             lease_generation: s.lease_gen,
             owner_conn_id: s.connection_id,
             admitted_epoch: s.estop_epoch,
+            admission_request_id: s.request_id,
+            stop_gen: s.stop_gen,
         };
         let map_code = |c: &'static str| match c {
             "ESTOP_ACTIVE" => MotionInstallError::EStopActive,
@@ -6388,6 +6470,7 @@ impl SupervisorInner {
         }
         this.gravity_comp_servo_busy()?;
         let (was_torqued, prev_gripper_cmd) = this.enable_prepare_inner(false, true, true)?;
+        let mit_qualified = this.config.joint_tracking.as_ref().is_some_and(|jt| jt.mit_requested());
         let Some((token, slot_idx, slot)) = this.reserve_legacy_torque_slot() else {
             return Err(SafetyError::ClearFaultRejected(
                 "A torque transition is pending".into(),
@@ -6398,6 +6481,8 @@ impl SupervisorInner {
             lease_generation: s.lease_gen,
             owner_conn_id: s.connection_id,
             admitted_epoch: s.estop_epoch,
+            admission_request_id: s.request_id,
+            stop_gen: s.stop_gen,
         };
         let prev_torque_intent = this.torque_intent;
         let budgeted = this.driver.is_none() || this.driver_supports_rt_executor_nonblocking();
@@ -6415,6 +6500,7 @@ impl SupervisorInner {
             Some(authority),
             budgeted,
             budgeted,
+            mit_qualified,
         ) {
             EnableStepOutcome::Armed(state) => {
                 slot.release_unstarted(token);
@@ -9253,7 +9339,8 @@ impl SupervisorInner {
                     mit_ctx,
                     mit_commit,
                     driver_err_override,
-                ).map_err(ClearFaultLegacyInnerError::Safety);
+                    authority,
+                );
             }
         }
 
@@ -10118,7 +10205,7 @@ impl SupervisorInner {
         expected_epoch: Option<u64>,
     ) -> Result<SafetyState, crate::safety::ClearFaultError> {
         let mut wall_now = Instant::now;
-        match self.clear_fault_executor_inner(&mut wall_now, deadline, expected_epoch, None) {
+        match self.clear_fault_executor_inner(&mut wall_now, deadline, expected_epoch, None, None) {
             Ok(state) => Ok(state),
             Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
             Err(ClearFaultWithAuthError::Authority(_)) => {
@@ -10159,7 +10246,7 @@ impl SupervisorInner {
         let tx_deadline = release_deadline
             .checked_sub(self.tx_release_publish_margin())
             .unwrap_or(now);
-        match self.clear_fault_executor_inner(now_fn, tx_deadline, expected_epoch, None) {
+        match self.clear_fault_executor_inner(now_fn, tx_deadline, expected_epoch, None, None) {
             Ok(state) => Ok(state),
             Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
             Err(ClearFaultWithAuthError::Authority(_)) => {
@@ -10176,6 +10263,7 @@ impl SupervisorInner {
         now: Instant,
         release_deadline: Instant,
         authority: crate::rt_core::requests::lease::ClearFaultAuthority,
+        mit_recovery_started_at: Option<Instant>,
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> Result<SafetyState, ClearFaultWithAuthError> {
         let tx_deadline = release_deadline
@@ -10186,6 +10274,7 @@ impl SupervisorInner {
             tx_deadline,
             Some(authority.expected_epoch),
             Some(authority),
+            mit_recovery_started_at,
         )
     }
 
@@ -10196,6 +10285,7 @@ impl SupervisorInner {
         deadline: Instant,
         expected_epoch: Option<u64>,
         authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+        mit_recovery_started_at: Option<Instant>,
     ) -> Result<SafetyState, ClearFaultWithAuthError> {
         use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearFaultError as E, ClearRefusal as R};
@@ -10221,6 +10311,409 @@ impl SupervisorInner {
             (None, None)
         };
         let is_stopped_or_latched = self.safety.state().is_stopped() || self.safety.has_latched_fault();
+
+        // Zero-allocation, release-bounded MIT expiry recovery on RT executor when `mit.owner == Lost`.
+        // Enforces explicit confirmation (`mit_recovery == true`), Rule A′ rest-pose gate at send
+        // time (`TxKind::DisableRequested { started_at }`), live authority + new-estop-since baseline
+        // checks, physical disable sync on Done, and causal all-axis disabled feedback before
+        // clearing `MitOwner::Lost` and the fault latch.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.mit.owner == crate::mit::MitOwner::Lost && is_stopped_or_latched {
+            let mut pre_ctx = self.build_mit_recovery_clear_context();
+            pre_ctx.driver_config_error = if candidate_limits.is_some() {
+                None
+            } else {
+                driver_err_override.or(pre_ctx.driver_config_error)
+            };
+            pre_ctx.expected_epoch = expected_epoch;
+            pre_ctx.pending_estop = self.estop_request_unapplied();
+            let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+            let mut scratch_rx = std::mem::take(&mut self.scratch.rx);
+            if let Some(drv) = self.driver.as_ref().and_then(|d| d.read()) {
+                drv.feedback_ages_into(&mut scratch_ages);
+                let ages_valid = scratch_ages.len() == self.config.dof
+                    && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
+                let caps = drv.capabilities();
+                pre_ctx.feedback_fresh = ages_valid && drv.is_feedback_valid();
+                pre_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                pre_ctx.thermal_sensor_available = caps.temperature_feedback;
+                let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                let thermal_below = pre_ctx.feedback_fresh
+                    && caps.temperature_feedback
+                    && !self.temperatures.is_empty()
+                    && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+                let next_cd = Self::evaluate_thermal_cooldown_fields(
+                    self.config.dof,
+                    self.thermal_cooldown,
+                    drv.as_ref(),
+                    &scratch_ages,
+                    thermal_below,
+                    &mut scratch_rx,
+                );
+                pre_ctx.thermal_below_threshold = thermal_below;
+                pre_ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
+                pre_ctx.enable_state_known = true;
+                pre_ctx.joint_limit_violation =
+                    self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
+            } else {
+                pre_ctx.feedback_fresh = false;
+                pre_ctx.j7_feedback_fresh = false;
+                pre_ctx.enable_state_known = false;
+            }
+            self.scratch.ages = scratch_ages;
+            self.scratch.rx = scratch_rx;
+
+            if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+                self.mit.recovery_baseline = None;
+                if refusal == R::EStopActive {
+                    return Err(apply_estop_refusal(self));
+                }
+                return Err(ClearFaultWithAuthError::Clear(E::from(refusal)));
+            }
+            // Rule A′ rest-pose check BEFORE checking confirmation or issuing any CAN TX.
+            let rest_check = {
+                let drv_check = self
+                    .driver
+                    .as_ref()
+                    .and_then(|d| d.read())
+                    .map(|drv| Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref()));
+                match drv_check {
+                    Some(res) => res,
+                    None => self.eval_stopped_torque_off(),
+                }
+            };
+            if let Err(refusal) = rest_check {
+                self.mit.recovery_baseline = None;
+                self.last_stopped_torque_off_refusal = Some(refusal);
+                return Err(ClearFaultWithAuthError::Clear(refusal.into_clear_fault_error()));
+            }
+            if !self.mit.recovery_confirmed {
+                self.mit.recovery_baseline = None;
+                return Err(ClearFaultWithAuthError::Clear(E::Rejected(
+                    R::MitRecoveryConfirmRequired,
+                )));
+            }
+            if now_fn() >= deadline {
+                self.mit.recovery_baseline = None;
+                return Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)));
+            }
+            // Run bounded, zero-alloc clear-error + Rule A′ DisableRequested + causal confirmation.
+            #[allow(clippy::large_enum_variant)] // stack-only RT enum avoids heap allocation
+            enum MitRecStep {
+                Done,
+                Pending,
+                TorqueOffWouldDrop(crate::supervisor::StoppedTorqueOffRefusal),
+                Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+                Refusal(R),
+            }
+            let attempt_started_at = mit_recovery_started_at.unwrap_or_else(&mut *now_fn);
+            let is_new_attempt = self.mit.recovery_attempt_started_at != Some(attempt_started_at);
+            self.mit.recovery_attempt_started_at = Some(attempt_started_at);
+            let recovery_baseline = match self.mit.recovery_baseline {
+                Some(b) if !is_new_attempt => b,
+                _ => {
+                    let b = self.capture_baseline();
+                    self.mit.recovery_baseline = Some(b);
+                    b
+                }
+            };
+            let Some(rec_step) = self.with_driver_and_owner_ref(|owner, drv| {
+                if is_new_attempt {
+                    drv.mit_expiry_recover_reset();
+                }
+                if let Some(auth) = authority {
+                    if let Err(auth_err) =
+                        recheck_clear_fault_authority_readonly(owner, auth, now_fn())
+                    {
+                        drv.mit_expiry_recover_reset();
+                        return MitRecStep::Authority(auth_err);
+                    }
+                }
+                if let Err(refusal) =
+                    Self::check_stopped_torque_off_with_driver(&owner.config, &*drv)
+                {
+                    drv.mit_expiry_recover_reset();
+                    return MitRecStep::TorqueOffWouldDrop(refusal);
+                }
+                let Ok((drv_now, owner_now, drv_deadline)) =
+                    crate::supervisor::translate_driver_cutoff_conservative(
+                        drv, deadline, now_fn,
+                    )
+                else {
+                    return MitRecStep::Refusal(R::BudgetExpired);
+                };
+                let elapsed_since_start =
+                    owner_now.saturating_duration_since(attempt_started_at);
+                let drv_started_at = drv_now
+                    .checked_sub(elapsed_since_start)
+                    .unwrap_or(drv_now);
+                let mut auth_abort: Option<crate::rt_core::requests::lease::ClearFaultAuthorityError> = None;
+                let mut estop_abort = false;
+                let mut pre_tx_gate = || -> Result<(), &'static str> {
+                    if owner.new_estop_since(recovery_baseline) {
+                        estop_abort = true;
+                        return Err("ESTOP_ACTIVE");
+                    }
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) =
+                            recheck_clear_fault_authority_readonly(owner, auth, now_fn())
+                        {
+                            auth_abort = Some(auth_err);
+                            return Err("AUTH_REVOKED");
+                        }
+                    }
+                    Ok(())
+                };
+                drv.set_tx_release_deadline(Some(drv_deadline));
+                let r = drv.mit_expiry_recover_budgeted(
+                    drv_deadline,
+                    drv_started_at,
+                    &mut pre_tx_gate,
+                );
+                drv.set_tx_release_deadline(None);
+                if let Some(auth_err) = auth_abort {
+                    drv.mit_expiry_recover_reset();
+                    return MitRecStep::Authority(auth_err);
+                }
+                if estop_abort {
+                    drv.mit_expiry_recover_reset();
+                    return MitRecStep::Refusal(R::EStopActive);
+                }
+                match r {
+                    Ok(true) => {
+                        drv.mit_expiry_recover_reset();
+                        MitRecStep::Done
+                    }
+                    Ok(false) => MitRecStep::Pending,
+                    Err(crate::driver::ArmDriverError::DisableRequestExpired) => {
+                        drv.mit_expiry_recover_reset();
+                        MitRecStep::Refusal(R::BudgetExpired)
+                    }
+                    Err(crate::driver::ArmDriverError::TorqueOffWouldDrop) => {
+                        drv.mit_expiry_recover_reset();
+                        let ref_err = Self::check_stopped_torque_off_with_driver(
+                            &owner.config,
+                            &*drv,
+                        )
+                        .err()
+                        .unwrap_or(
+                            crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback,
+                        );
+                        MitRecStep::TorqueOffWouldDrop(ref_err)
+                    }
+                    Err(e) if crate::driver::is_estop_inhibited(&e) => {
+                        drv.mit_expiry_recover_reset();
+                        MitRecStep::Refusal(R::EStopActive)
+                    }
+                    Err(_) => MitRecStep::Pending,
+                }
+            }) else {
+                self.mit.recovery_baseline = None;
+                return Err(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable));
+            };
+            match rec_step {
+                MitRecStep::Done => {
+                    self.mit.recovery_attempt_started_at = None;
+                    self.mit.recovery_baseline = None;
+                    // Synchronize confirmed physical disable immediately after bus disable confirmation;
+                    // logical fault clear and MIT-off state clear wait for final authority/clear_check below.
+                    self.stop_motion();
+                    self.servo_stream_active = false;
+                    self.tracking.invalidate();
+                    self.tracking.clear_recovery_suspension();
+                    self.disable_accepted();
+                    let _ = self.safety.set_torque_rt(false);
+                    self.is_torqued = false;
+                }
+                MitRecStep::Pending => {
+                    return Err(ClearFaultWithAuthError::Clear(E::Rejected(
+                        R::MitRecoveryIncomplete,
+                    )));
+                }
+                MitRecStep::TorqueOffWouldDrop(r) => {
+                    self.mit.recovery_attempt_started_at = None;
+                    self.mit.recovery_baseline = None;
+                    self.last_stopped_torque_off_refusal = Some(r);
+                    return Err(ClearFaultWithAuthError::Clear(r.into_clear_fault_error()));
+                }
+                MitRecStep::Authority(e) => {
+                    self.mit.recovery_attempt_started_at = None;
+                    self.mit.recovery_baseline = None;
+                    return Err(ClearFaultWithAuthError::Authority(e));
+                }
+                MitRecStep::Refusal(R::EStopActive) => {
+                    self.mit.recovery_attempt_started_at = None;
+                    self.mit.recovery_baseline = None;
+                    return Err(apply_estop_refusal(self));
+                }
+                MitRecStep::Refusal(r) => {
+                    self.mit.recovery_attempt_started_at = None;
+                    self.mit.recovery_baseline = None;
+                    return Err(ClearFaultWithAuthError::Clear(E::from(r)));
+                }
+            }
+            // All motors causally confirmed disabled after req_boundary: rebuild the final clear
+            // context directly from the fresh post-disable driver snapshot (0 RT allocs) so any
+            // out-of-limit position, overtemperature sample, or carried hardware fault observed on
+            // the disable confirmation gates the clear identically to legacy.
+            let mut post_ctx = self.build_mit_recovery_clear_context();
+            post_ctx.driver_config_error = if candidate_limits.is_some() {
+                None
+            } else {
+                driver_err_override.or(post_ctx.driver_config_error)
+            };
+            post_ctx.expected_epoch = expected_epoch;
+            post_ctx.pending_estop = self.estop_request_unapplied();
+            post_ctx.hardware_reset_required = false;
+            let mut post_cd = self.thermal_cooldown;
+            let mut post_thermal_trip: Option<(usize, f32)> = None;
+            let mut post_positions = [0.0f32; crate::model::MAX_MOTION_DOF];
+            let mut post_pos_len = 0usize;
+            let mut scratch_states = std::mem::take(&mut self.scratch.states);
+            let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+            let mut scratch_rx = std::mem::take(&mut self.scratch.rx);
+            if let Some(drv) = self.driver.as_ref().and_then(|d| d.read()) {
+                drv.feedback_ages_into(&mut scratch_ages);
+                let ages_valid = scratch_ages.len() == self.config.dof
+                    && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
+                let caps = drv.capabilities();
+                let cached_ok = drv.read_cached_joint_states_into(&mut scratch_states).is_some()
+                    && scratch_states.len() >= self.config.dof;
+                let states_finite = cached_ok
+                    && scratch_states[..self.config.dof]
+                        .iter()
+                        .all(|s| s.position.is_finite() && (!caps.temperature_feedback || s.temperature.is_finite()));
+                let fb_fresh = ages_valid && drv.is_feedback_valid() && (!cached_ok || states_finite);
+                post_ctx.feedback_fresh = fb_fresh;
+                post_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                post_ctx.thermal_sensor_available = caps.temperature_feedback;
+                post_ctx.enable_state_known = true;
+                post_ctx.hardware_reset_required = drv.has_hardware_fault();
+                post_ctx.hardware_error = None;
+                let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                let thermal_below = if cached_ok {
+                    if fb_fresh && caps.temperature_feedback {
+                        post_thermal_trip = scratch_states[..self.config.dof]
+                            .iter()
+                            .map(|s| s.temperature)
+                            .enumerate()
+                            .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
+                            .max_by(|a, b| a.1.total_cmp(&b.1));
+                    }
+                    fb_fresh
+                        && caps.temperature_feedback
+                        && self.config.dof > 0
+                        && scratch_states[..self.config.dof]
+                            .iter()
+                            .all(|s| s.temperature.is_finite() && s.temperature <= threshold)
+                } else {
+                    fb_fresh
+                        && caps.temperature_feedback
+                        && !self.temperatures.is_empty()
+                        && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
+                };
+                post_cd = Self::evaluate_thermal_cooldown_fields(
+                    self.config.dof,
+                    self.thermal_cooldown,
+                    drv.as_ref(),
+                    &scratch_ages,
+                    thermal_below,
+                    &mut scratch_rx,
+                );
+                post_ctx.thermal_below_threshold = thermal_below;
+                post_ctx.thermal_cooldown_elapsed_ms = if thermal_below { post_cd.elapsed_ms() } else { 0 };
+                if cached_ok && fb_fresh && self.config.dof <= crate::model::MAX_MOTION_DOF {
+                    for (dst, s) in post_positions[..self.config.dof]
+                        .iter_mut()
+                        .zip(&scratch_states[..self.config.dof])
+                    {
+                        *dst = s.position;
+                    }
+                    post_pos_len = self.config.dof;
+                }
+            } else {
+                post_ctx.feedback_fresh = false;
+                post_ctx.j7_feedback_fresh = false;
+                post_ctx.enable_state_known = false;
+            }
+            self.scratch.states = scratch_states;
+            self.scratch.ages = scratch_ages;
+            self.scratch.rx = scratch_rx;
+            if let Some((joint_idx, temperature)) = post_thermal_trip {
+                self.safety.latch(
+                    crate::safety::FaultKind::ThermalTrip,
+                    crate::safety::FaultDetail::ThermalTrip {
+                        joint_idx,
+                        temperature,
+                        limit: self.config.max_temperature,
+                    },
+                );
+            }
+            post_ctx.joint_limit_violation = if post_pos_len == self.config.dof {
+                self.joint_limit_clear_violation_for_positions(
+                    &post_positions[..post_pos_len],
+                    candidate_limits.as_ref(),
+                )
+            } else {
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref())
+            };
+            if self.estop_request_unapplied() {
+                self.consume_pending_estop();
+            }
+            if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(auth) = authority {
+                    recheck_clear_fault_authority_readonly(self, auth, now_fn())
+                        .map_err(ClearFaultWithAuthError::Authority)?;
+                }
+                if let Some(received) = expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(ClearFaultWithAuthError::Clear(E::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        }));
+                    }
+                }
+                self.mit.owner = crate::mit::MitOwner::Off;
+                self.mit.joints.clear();
+                self.mit.last_ff.clear();
+                self.mit.last_output = None;
+                self.mit.armed_ok = false;
+                self.mit.revoke_pending = false;
+                self.mit.recovery_confirmed = false;
+                if let Some(d) = self.driver.as_mut() {
+                    let _ = d.try_with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                }
+                let _ = self.safety.clear_with_check(&post_ctx);
+                self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
+                return Err(ClearFaultWithAuthError::Clear(E::EStopActive));
+            }
+            let commit = ClearFaultCommit {
+                candidate_limits,
+                reapply_legacy_limits: false,
+                is_torqued: Some(false),
+                reset_disarmed_hold: true,
+                thermal_cooldown: Some(post_cd),
+            };
+            let state = self.clear_fault_finish_bounded_with_authority(
+                &post_ctx,
+                commit,
+                authority,
+                Some(now_fn()),
+                |this| {
+                    this.mit.owner = crate::mit::MitOwner::Off;
+                    this.mit.joints.clear();
+                    this.mit.last_ff.clear();
+                    this.mit.last_output = None;
+                    this.mit.armed_ok = false;
+                    this.mit.revoke_pending = false;
+                    this.mit.recovery_confirmed = false;
+                    if let Some(d) = this.driver.as_mut() {
+                        let _ = d.try_with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                    }
+                },
+            )?;
+            return Ok(state);
+        }
 
         if !is_stopped_or_latched {
             let mut ctx = self.build_clear_context_base(driver_err_override);

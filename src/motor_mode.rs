@@ -2376,11 +2376,24 @@ pub mod switch {
                 return 0;
             }
             let slot = &self.slots[self.active_idx];
-            if matches!(slot.phase, AxisPhase::NeedWrite) {
-                let j = usize::from(slot.target.joint);
-                if drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
-                    return 1u32 << j;
+            match slot.phase {
+                AxisPhase::NeedWrite => {
+                    let j = usize::from(slot.target.joint);
+                    if drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
+                        return 1u32 << j;
+                    }
                 }
+                AxisPhase::AwaitingFeedback {
+                    confirmed_mode,
+                    fenced_pending_feedback: false,
+                    ..
+                } if confirmed_mode != ControlMode::PositionForce => {
+                    let j = usize::from(slot.target.joint);
+                    if drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
+                        return 1u32 << j;
+                    }
+                }
+                _ => {}
             }
             0
         }

@@ -652,6 +652,15 @@ pub fn install_torque_on_transition(
     SupervisorInner::begin_enable_torque_transition(admitted)
 }
 
+/// Broker-aware `TransitionOp::TorqueOn` install binding `client_seq` into `EnableAuthority`
+/// for one-shot admission-bound MIT qualification proof verification.
+pub fn install_torque_on_transition_with_seq(
+    admitted: crate::supervisor::Admitted<'_>,
+    client_seq: u64,
+) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
+    SupervisorInner::begin_enable_torque_transition_with_seq(admitted, client_seq)
+}
+
 /// Single owner-side RT install function for `TransitionOp::TorqueOff` (exempt from `Admitted`
 /// and `stop_generation`; zero heap allocations).
 pub fn install_torque_off_transition(
@@ -778,6 +787,10 @@ pub fn map_torque_code_to_api_error(
             "a configuration change is being activated or reconciled; torque enable is refused until it ends".to_string(),
             "CONFIG_BUSY".to_string(),
         ),
+        "MIT_UNQUALIFIED" => ArmError::Safety(SafetyError::ClearFaultRejected(
+            "MIT_UNQUALIFIED: MIT tracking refused: qualification proof missing or stale".into(),
+        ))
+        .into(),
         "STOPPED" => ArmError::Safety(SafetyError::Stopped).into(),
         "LEASE_LOST" | "NO_LEASE" | "DISCONNECTED" => ArmError::Safety(SafetyError::LeaseLost).into(),
         "EPOCH_MISMATCH" => ApiError(
@@ -1146,6 +1159,8 @@ pub fn install_lease_clear_fault_rt(
         supplied_epoch,
         request_id_valid,
         body_error,
+        false,
+        None,
         auth_policy,
         operator,
         now,
@@ -1165,6 +1180,8 @@ pub(crate) fn install_lease_clear_fault_rt_with_clock(
     supplied_epoch: Option<u64>,
     request_id_valid: bool,
     body_error: Option<&'static str>,
+    mit_recovery: bool,
+    mit_recovery_started_at: Option<Instant>,
     auth_policy: OwnerAuthPolicy,
     operator: OperatorGrant,
     now: Instant,
@@ -1185,12 +1202,16 @@ pub(crate) fn install_lease_clear_fault_rt_with_clock(
         Ok(a) => a,
         Err(out) => return out,
     };
-    match inner.clear_fault_executor_bounded_for_release_with_authority_clock(
+    inner.mit.recovery_confirmed = mit_recovery;
+    let res = inner.clear_fault_executor_bounded_for_release_with_authority_clock(
         now,
         release_deadline,
         auth,
+        mit_recovery_started_at,
         now_fn,
-    ) {
+    );
+    inner.mit.recovery_confirmed = false;
+    match res {
         Ok(safety_state) => LeaseClearFaultOutcome::Cleared {
             safety_state,
             epoch_id: inner.safety.epoch_id(),

@@ -1728,7 +1728,10 @@ impl CoreOps for SupervisorInner {
                 let admitted = self
                     .check_admission(stamp)
                     .map_err(|e| static_code(ArmError::Safety(e)))?;
-                super::requests::lease::install_torque_on_transition(admitted)?
+                super::requests::lease::install_torque_on_transition_with_seq(
+                    admitted,
+                    d.stamp.client_seq,
+                )?
             }
             // Stop-direction action: exempt from stop-generation checks and Admitted.
             TransitionOp::TorqueOff => super::requests::lease::install_torque_off_transition(self)?,

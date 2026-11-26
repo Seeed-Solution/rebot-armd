@@ -1105,6 +1105,10 @@ impl SupervisorInner {
         prepared: PreparedSession,
         allow_gravity_comp_exit: bool,
         allow_mit_handback: bool,
+        terminal: Option<(
+            super::reply_router::SessionTerminalTicket,
+            Option<&super::reply_router::SessionTerminalHandoff>,
+        )>,
         now: Instant,
     ) -> Result<SessionId, SessionAdmitError> {
         let SessionAuthorityMode::PosVelHandback { expected_epoch, allow_in_fault } = prepared.authority_mode else {
@@ -1146,6 +1150,23 @@ impl SupervisorInner {
         if !allow_mit_handback && self.mit_active() {
             return Err(SessionAdmitError::OutputBusy("MOTION_BUSY"));
         }
+        let (binding, handoff) = match terminal {
+            Some((ticket, h)) => {
+                if ticket.client().0 != 0 && self.is_connection_closed(ticket.client().0) {
+                    return Err(SessionAdmitError::AuthorityRejected("CONNECTION_CLOSED"));
+                }
+                (
+                    SessionTerminalBinding::Routed {
+                        request: ticket.request(),
+                        route_gen: ticket.route_gen(),
+                        client: ticket.client(),
+                        action_id: ticket.action_id(),
+                    },
+                    h,
+                )
+            }
+            None => (SessionTerminalBinding::Internal, None),
+        };
         let authority = SessionAuthority {
             baseline: self.capture_baseline(),
             connection_id: 0,
@@ -1161,8 +1182,8 @@ impl SupervisorInner {
         self.sessions.admit_with_authority_handoff(
             prepared,
             authority,
-            SessionTerminalBinding::Internal,
-            None,
+            binding,
+            handoff,
             now,
             false,
         )
@@ -1379,6 +1400,9 @@ impl SupervisorInner {
     pub(crate) fn on_safe_hold_enter(&mut self, reason: &'static str) {
         self.cancel_active_commissioning_on_stop(reason);
         self.reconcile_mode_switch_on_revocation(reason);
+        if let Some(pending) = self.pending_gravity_enter.take() {
+            self.retire_gravity_comp_policy(pending.policy);
+        }
         self.cancel_active_gripper_zero_check_on_stop(reason);
         let outcomes = self.sessions.revoke_live_sessions_by_scope(
             SessionTerminalReason::Revoked(reason),
