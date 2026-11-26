@@ -63,7 +63,10 @@ use armd::rt_core::requests::config::{
     ConfigAuthContext, ConfigCandidate, ConfigError, ConfigReply, ConfigRequest,
     ModeSwitchStartRequest, PersistedConfig, ReserveConfig, ReservePrecheck, VerifyDomainChecks,
 };
-use armd::rt_core::session::{admit_internal, admit_routed, PreparedSession, SessionKind, SessionSlot};
+use armd::rt_core::session::{
+    admit_internal, admit_routed, admit_routed_retiring, PreparedSession, SessionAdmitError,
+    SessionKind, SessionSlot,
+};
 use armd::rt_core::urgent::{StopRequests, UrgentStop, UrgentStopOutcome};
 use armd::safety::{FaultDetail, FaultKind, StopPolicy};
 use armd::supervisor::{AdmissionStamp, ArmError, ArmSupervisor, SupervisorInner};
@@ -1505,6 +1508,71 @@ async fn terminal_reservation_cancellation_before_and_after_owner_admission() {
     assert_eq!(delivered.lock().unwrap().len(), 1);
     assert_eq!(exec.router_global_reserved(), 0);
     assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(0));
+
+    // Case C (R2 Major 1 regression): Dispatcher drops its guard (so `staged_consume` holds the
+    // LAST `Arc` to `SessionTerminalHandoff`), AND an asynchronous E-stop invalidates the `Admitted`
+    // token BEFORE `admit_routed_retiring` calls `Admitted::consume()`.
+    // `admit_routed_retiring` MUST park the handoff unconditionally before `consume()`, returning
+    // `AuthorityRejected("ESTOP_ACTIVE")` with 0 RT allocs AND 0 RT deallocs, no live session,
+    // and exact credit recovery (`0`).
+    let mut guard_consume = exec
+        .reserve_session_terminal(
+            ClientId(910),
+            ActionId(303),
+            ExternalDestinationPolicy::ConnectionOnly,
+        )
+        .unwrap();
+    let staged_consume = guard_consume.stage_for_admission().unwrap();
+    assert_eq!(exec.router_global_reserved(), 1);
+    drop(guard_consume);
+    assert_eq!(exec.router_global_reserved(), 0);
+    assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(0));
+
+    let mut rt_core = SupervisorInner::new(ArmConfig::rebot_dm());
+    rt_core.lease_enabled = false;
+    let estop_mirror = Arc::clone(&rt_core.estop_state);
+    let mut retired_handoff = None;
+    let admitted = rt_core
+        .check_admission(make_stamp(
+            910,
+            0,
+            rt_core.safety.epoch_id(),
+            rt_core.current_stop_gen(),
+            303,
+        ))
+        .unwrap();
+    // Asynchronously latch E-stop AFTER check_admission and BEFORE Admitted::consume()!
+    let _ = estop_mirror.request_and_latch();
+    let prep_consume = PreparedSession::exclusive(SessionKind::ModeSwitch, ClientId(910));
+    time_this_thread();
+    let before = snapshot_counts();
+    let consume_res = admit_routed_retiring(
+        admitted,
+        prep_consume,
+        staged_consume,
+        &mut retired_handoff,
+        Instant::now(),
+    );
+    let delta = snapshot_counts().delta_since(before);
+    assert_eq!(
+        consume_res,
+        Err(SessionAdmitError::AuthorityRejected("ESTOP_ACTIVE")),
+        "invalidated Admitted token must fail with ESTOP_ACTIVE"
+    );
+    assert_eq!(
+        delta,
+        AllocCounts::ZERO,
+        "admit_routed_retiring must perform 0 allocs and 0 deallocs when consume() fails: {delta:?}"
+    );
+    assert!(
+        retired_handoff.is_some(),
+        "handoff handle must be unconditionally parked for off-RT drop"
+    );
+    assert!(!rt_core.sessions().is_slot_occupied(SessionSlot::ExclusiveOutput));
+    drop(retired_handoff);
+    assert_eq!(exec.router_global_reserved(), 0);
+    assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(0));
+
     assert_eq!(exec.stats().total_allocs(), AllocCounts::ZERO);
     assert_eq!(h.sup.inner().control_thread_attempts(), 0);
     h.shutdown(false).await;

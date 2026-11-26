@@ -886,28 +886,34 @@ impl SessionDriver {
 ///
 /// Validates authority, deadlines, slot occupancy, and exclusive output conflicts BEFORE atomically
 /// claiming the reservation handoff (`PENDING -> ADMITTED`) and making the slot live.
+///
+/// Off-RT / test entry point: drops the reservation's atomic handoff handle locally on return.
+/// Real-time (`armd-control`) callers MUST use [`admit_routed_retiring`] so the handoff `Arc` is
+/// unconditionally parked for off-RT retirement with 0 RT heap frees.
 pub fn admit_routed(
     admitted: Admitted<'_>,
     prepared: PreparedSession,
     reservation: super::reply_router::SessionTerminalReservation,
     now: Instant,
 ) -> Result<SessionId, SessionAdmitError> {
-    let (inner, proof) = admitted.consume().map_err(SessionAdmitError::from_safety)?;
-    inner.admit_routed_with_proof(prepared, reservation, &proof, None, now)
+    let mut local_handoff = None;
+    admit_routed_retiring(admitted, prepared, reservation, &mut local_handoff, now)
 }
 
-/// RT-safe variant of [`admit_routed`] that parks the reservation's atomic handoff token in
-/// `retired_handoff` so `armd-control` executes 0 heap frees even if the dispatcher dropped its
-/// guard concurrently.
-pub(crate) fn admit_routed_retiring(
+/// RT-safe routed session admission that unconditionally parks the reservation's atomic handoff
+/// handle in `retired_handoff` BEFORE any fallible step (including [`Admitted::consume`]), so
+/// `armd-control` executes 0 heap allocations and 0 heap frees on every success and failure path.
+pub fn admit_routed_retiring(
     admitted: Admitted<'_>,
     prepared: PreparedSession,
     reservation: super::reply_router::SessionTerminalReservation,
     retired_handoff: &mut Option<super::reply_router::SessionTerminalHandoff>,
     now: Instant,
 ) -> Result<SessionId, SessionAdmitError> {
+    let (ticket, handoff) = reservation.into_parts();
+    *retired_handoff = Some(handoff);
     let (inner, proof) = admitted.consume().map_err(SessionAdmitError::from_safety)?;
-    inner.admit_routed_with_proof(prepared, reservation, &proof, Some(retired_handoff), now)
+    inner.admit_routed_ticket_with_proof(prepared, ticket, retired_handoff.as_ref(), &proof, now)
 }
 
 /// Admits an explicit internal session (autonomous cleanup, recorder, Legacy polling-only session,
@@ -928,26 +934,21 @@ impl SupervisorInner {
     #[inline]
     pub fn sessions_mut(&mut self) -> &mut SessionDriver { &mut self.sessions }
 
-    pub(crate) fn admit_routed_with_proof(
+    pub(crate) fn admit_routed_ticket_with_proof(
         &mut self,
         prepared: PreparedSession,
-        reservation: super::reply_router::SessionTerminalReservation,
+        ticket: super::reply_router::SessionTerminalTicket,
+        handoff: Option<&super::reply_router::SessionTerminalHandoff>,
         proof: &AdmittedProof,
-        retired_handoff: Option<&mut Option<super::reply_router::SessionTerminalHandoff>>,
         now: Instant,
     ) -> Result<SessionId, SessionAdmitError> {
-        let (ticket, handoff) = reservation.into_parts();
         let terminal = SessionTerminalBinding::Routed {
             request: ticket.request(),
             route_gen: ticket.route_gen(),
             client: ticket.client(),
             action_id: ticket.action_id(),
         };
-        let res = self.admit_session_inner(prepared, terminal, Some(&handoff), proof, now);
-        if let Some(slot) = retired_handoff {
-            *slot = Some(handoff);
-        }
-        res
+        self.admit_session_inner(prepared, terminal, handoff, proof, now)
     }
 
     pub(crate) fn admit_internal_with_proof(
