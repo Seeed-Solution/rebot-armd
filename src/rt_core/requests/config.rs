@@ -5956,6 +5956,15 @@ pub(crate) fn check_zero_check_authority(
             "Safety stop intervened before gripper calibration persisted",
         ));
     }
+    if let Some((gid, grant)) = core.zero_check_persisting_grant {
+        if gid == action_id && !grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+            return Err((
+                "failed",
+                "OPERATOR_REQUIRED",
+                "Operator session expired or locked before gripper calibration persisted",
+            ));
+        }
+    }
     if let Err(err) = check_config_authority(core, ctx, proposal, auth, false) {
         return Err(match err {
             ConfigError::LeaseLost | ConfigError::ConnectionClosed => (
@@ -6075,6 +6084,9 @@ pub(crate) fn zero_check_owner_reserve(
     ) {
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = if core
             .last_action
@@ -6092,6 +6104,9 @@ pub(crate) fn zero_check_owner_reserve(
         Reserved::Refused { code, .. } => {
             if core.zero_check_persisting == Some(action_id) {
                 core.zero_check_persisting = None;
+                if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                    core.zero_check_persisting_grant = None;
+                }
             }
             let ret = core.finish_zero_check_action_in_place(
                 action_id,
@@ -6129,6 +6144,9 @@ pub(crate) fn zero_check_owner_verify_authority(
         let _ = ConfigAuthority::release(core, reservation);
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = core.finish_zero_check_action_in_place(
             action_id,
@@ -6146,6 +6164,9 @@ pub(crate) fn zero_check_owner_verify_authority(
         let _ = ConfigAuthority::release(core, reservation);
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = if core
             .last_action
@@ -6185,6 +6206,9 @@ pub(crate) fn zero_check_owner_persisted(
             .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = core.finish_zero_check_action_in_place(
             action_id,
@@ -6270,6 +6294,9 @@ pub(crate) fn zero_check_owner_activate(
             }
             if core.zero_check_persisting == Some(action_id) {
                 core.zero_check_persisting = None;
+                if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                    core.zero_check_persisting_grant = None;
+                }
             }
             let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
             Ok((old_policy, old_jaw, code_buf, msg_buf))
@@ -6286,6 +6313,9 @@ pub(crate) fn zero_check_owner_activate(
             }
             if core.zero_check_persisting == Some(action_id) {
                 core.zero_check_persisting = None;
+                if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                    core.zero_check_persisting_grant = None;
+                }
             }
             let (old_code, old_msg) = if core
                 .last_action

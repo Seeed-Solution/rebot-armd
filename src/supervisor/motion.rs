@@ -219,6 +219,7 @@ impl SupervisorInner {
         self.pending_deferred_done = None;
         self.pending_normal_unload = false;
         self.zero_check_persisting = None;
+        self.zero_check_persisting_grant = None;
         self.end_gripper_stream();
         self.j7_admitted_stamp = None;
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);

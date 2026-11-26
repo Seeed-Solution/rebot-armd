@@ -1632,6 +1632,9 @@ pub struct PersistTestHooks {
     /// extracted from the Legacy shell and before `StartupGate::try_settle_ready`.
     /// Tuple is `(entered, gate_open_mutex, gate_cv)`.
     pub pause_in_startup_init: Option<Arc<(AtomicBool, Mutex<bool>, Condvar)>>,
+    /// Fault-injection hook: simulates `zero_check_stream_tx.try_push(...)` saturation once on
+    /// `armd-control` release tail so tests verify `PERSIST_FAILED` + zero-alloc context discard.
+    pub fail_zero_check_stream_push_once: Option<Arc<AtomicBool>>,
 }
 
 enum PersistCmd {
@@ -1768,6 +1771,7 @@ enum OffloadReclaim {
     PersistReply(PersistReply),
     PersistJob(PendingZeroCheckPersist, Option<Box<dyn Any + Send>>),
     ZeroCheckCtx(Box<crate::supervisor::ZeroCheckPersistContext>),
+    DiscardZeroCheckCtx(u64),
     GravityCompRun(crate::gravity_comp::GravityCompRun),
     Probe(Box<dyn Any + Send>),
     SafetyState(Arc<SafetyState>),
@@ -1779,6 +1783,59 @@ enum OffloadReclaim {
     Buf(String),
     LogLegacyJ6(crate::joint_zero::ZeroConvention),
     Observation(ArmObservation),
+}
+
+/// Bounded off-RT staging table for executor `gripper_zero_check(store_offset=true)` persistence
+/// contexts. `armd-control` only carries a `Copy` `u64` ID (strictly monotonic, never reused);
+/// heap contexts live exclusively off-RT and are reclaimed on persist, discard, refusal, or exit.
+const ZERO_CHECK_CTX_CAPACITY: usize = 16;
+
+struct ZeroCheckContextStore {
+    next_id: u64,
+    entries: HashMap<u64, Box<crate::supervisor::ZeroCheckPersistContext>>,
+}
+
+impl ZeroCheckContextStore {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            entries: HashMap::with_capacity(ZERO_CHECK_CTX_CAPACITY),
+        }
+    }
+
+    fn stage(
+        &mut self,
+        ctx: Box<crate::supervisor::ZeroCheckPersistContext>,
+    ) -> Result<u64, Box<crate::supervisor::ZeroCheckPersistContext>> {
+        if self.entries.len() >= ZERO_CHECK_CTX_CAPACITY {
+            return Err(ctx);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.entries.insert(id, ctx);
+        Ok(id)
+    }
+
+    fn take(&mut self, id: u64) -> Option<Box<crate::supervisor::ZeroCheckPersistContext>> {
+        if id == 0 {
+            return None;
+        }
+        self.entries.remove(&id)
+    }
+
+    fn remove(&mut self, id: u64) {
+        if id != 0 {
+            self.entries.remove(&id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Off-thread broker dispatcher coordinating `Broker<PlanSlot>` submissions, connection-liveness
@@ -2840,6 +2897,7 @@ pub(crate) struct OffThreadSinks {
     servo_dispatcher: Arc<ServoTargetDispatcher>,
     hub: Arc<StateHub>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
+    zero_check_contexts: Arc<Mutex<ZeroCheckContextStore>>,
 }
 
 impl OffThreadSinks {
@@ -3023,6 +3081,12 @@ impl OffThreadSinks {
                         if let Some(msg) = zc.message() {
                             tracing::warn!("Joint zero check: {msg}");
                         }
+                    }
+                    OffloadReclaim::DiscardZeroCheckCtx(ctx_id) => {
+                        self.zero_check_contexts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(ctx_id);
                     }
                     other => drop(other),
                 }
@@ -4413,6 +4477,7 @@ struct RtExecutorShared {
     persist_park_thread: Thread,
     clock: Option<Arc<dyn ExecutorClock>>,
     baseline_identity: BaselineIdentity,
+    zero_check_contexts: Arc<Mutex<ZeroCheckContextStore>>,
 }
 
 /// Wakes a worker thread if possible, waits up to `deadline` for `jh.is_finished()` to become
@@ -4588,6 +4653,10 @@ impl RtExecutorShared {
             }
             let _ = self.hub.latest();
         }
+        self.zero_check_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn default_teardown_deadline(&self) -> Instant {
@@ -4627,6 +4696,42 @@ impl RtExecutorHandle {
     /// `submit_internal_action`, or the typed `submit_*_async` methods instead.
     #[doc(hidden)]
     pub fn broker(&self) -> &Arc<Mutex<Broker<PlanSlot>>> { &self.shared.broker }
+
+    /// Stages a heap `ZeroCheckPersistContext` off-RT for executor `gripper_zero_check(store_offset=true)`
+    /// and returns its strictly monotonic non-zero handle (`Copy`, passed onto `armd-control`).
+    pub fn stage_zero_check_context(
+        &self,
+        ctx: Box<crate::supervisor::ZeroCheckPersistContext>,
+    ) -> Result<u64, ArmError> {
+        self.shared
+            .zero_check_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stage(ctx)
+            .map_err(|_| ArmError::Rejected {
+                status: 503,
+                code: "MOTION_BUSY".into(),
+                message: "Gripper zero-check persistence staging table is full".into(),
+            })
+    }
+
+    /// Removes an uncommitted or discarded `ZeroCheckPersistContext` off-RT.
+    pub fn remove_zero_check_context(&self, ctx_id: u64) {
+        self.shared
+            .zero_check_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(ctx_id);
+    }
+
+    /// Number of currently staged off-RT `ZeroCheckPersistContext` entries (test/diagnostic check).
+    pub fn zero_check_context_count(&self) -> usize {
+        self.shared
+            .zero_check_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
 
     /// Atomically verifies connection liveness, reserves bounded per-connection + global reply
     /// capacity, submits an external action (`BeginMacro` or `InstallPrepared`), and binds its
@@ -5925,6 +6030,10 @@ pub(crate) fn spawn_executor(
     let broker = Arc::new(Mutex::new(broker));
     let reply_router = Arc::new(Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)));
     let session_terminal_rx = core.sessions.attach_terminal_channel();
+    let (zero_check_stream_tx, zero_check_stream_rx) =
+        super::stream::channel::<crate::supervisor::ZeroCheckStreamEvent>(16);
+    core.zero_check_stream_tx = Some(zero_check_stream_tx);
+    let zero_check_contexts = Arc::new(Mutex::new(ZeroCheckContextStore::new()));
     let broker_dispatcher = Arc::new(BrokerDispatcher::new(
         Arc::clone(&broker),
         Arc::clone(&conn_lifecycle_client),
@@ -5975,6 +6084,7 @@ pub(crate) fn spawn_executor(
         servo_dispatcher: Arc::clone(&servo_dispatcher),
         hub: Arc::clone(&hub),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
+        zero_check_contexts: Arc::clone(&zero_check_contexts),
     });
 
     let startup_bound = hooks
@@ -5986,6 +6096,8 @@ pub(crate) fn spawn_executor(
     let persist_terminal_capture = core.terminal_capture_channel();
     let persist_thread = match spawn_persist_worker(
         persist_job_rx,
+        zero_check_stream_rx,
+        Arc::clone(&zero_check_contexts),
         persist_cmd_tx,
         persist_rep_rx.clone(),
         watchdog_plan_tx,
@@ -6001,6 +6113,7 @@ pub(crate) fn spawn_executor(
     ) {
         Ok(jh) => jh,
         Err(e) => {
+            core.zero_check_stream_tx = None;
             return Err(SpawnExecutorError::Recoverable {
                 core,
                 unsupported_reason: None,
@@ -6092,6 +6205,7 @@ pub(crate) fn spawn_executor(
                     persist_thread,
                     startup_deadline,
                 );
+                core.zero_check_stream_tx = None;
                 return Err(SpawnExecutorError::Recoverable {
                     core,
                     unsupported_reason: None,
@@ -6100,7 +6214,7 @@ pub(crate) fn spawn_executor(
             }
         }
     };
-    if let Err(mpsc::SendError(core)) = core_tx.send(core) {
+    if let Err(mpsc::SendError(mut core)) = core_tx.send(core) {
         stop_and_join_persist_bounded(
             &persist_stop,
             &persist_park_thread,
@@ -6109,6 +6223,7 @@ pub(crate) fn spawn_executor(
             startup_deadline,
         );
         let _ = join_or_detach_until(control_thread, startup_deadline, "armd-control");
+        core.zero_check_stream_tx = None;
         return Err(SpawnExecutorError::Recoverable {
             core,
             unsupported_reason: None,
@@ -6211,6 +6326,7 @@ pub(crate) fn spawn_executor(
         persist_park_thread,
         clock: hooks.clock.clone(),
         baseline_identity,
+        zero_check_contexts,
     });
     Ok((RtExecutorHandle { shared }, sinks, ready_payload, startup_gate))
 }
@@ -6422,6 +6538,14 @@ impl ControlState {
         while let Some(ctx) = core.pop_retired_zero_check_ctx() {
             let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
         }
+        while let Some(ctx_id) = core.pop_retired_zero_check_ctx_id() {
+            let _ = self
+                .offload_reclaim_tx
+                .push(OffloadReclaim::DiscardZeroCheckCtx(ctx_id));
+        }
+        if std::mem::replace(&mut core.zero_check_stream_pushed, false) {
+            self.persist_wake.unpark();
+        }
         if let Some(run) = core.retired_gravity_comp.take() {
             let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
         }
@@ -6488,6 +6612,18 @@ impl ControlState {
             };
             let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
             drained = true;
+        }
+        while !self.offload_reclaim_tx.is_full() {
+            let Some(ctx_id) = core.pop_retired_zero_check_ctx_id() else {
+                break;
+            };
+            let _ = self
+                .offload_reclaim_tx
+                .push(OffloadReclaim::DiscardZeroCheckCtx(ctx_id));
+            drained = true;
+        }
+        if std::mem::replace(&mut core.zero_check_stream_pushed, false) {
+            self.persist_wake.unpark();
         }
         if !self.offload_reclaim_tx.is_full() {
             if let Some(run) = core.retired_gravity_comp.take() {
@@ -7136,6 +7272,43 @@ impl ControlState {
                     self.disconnect_code_buf.take(),
                     self.disconnect_msg_buf.take(),
                 );
+                Self::settle_zero_check_session_on_persist_end(
+                    core,
+                    action_id,
+                    false,
+                    "PERSIST_FAILED",
+                    ctx.now,
+                );
+                if old_code.is_some() || old_msg.is_some() {
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Done {
+                            _returned_policy: None,
+                            _returned_jaw: None,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_warning: None,
+                            _returned_probe: None,
+                        },
+                        core,
+                    );
+                }
+            } else if let Some(action_id) = core.zero_check_persisting.take() {
+                // Worker exited after stream handoff before sending `Reserve` or `Fail`.
+                let (old_code, old_msg) = core.finish_zero_check_action_in_place(
+                    action_id,
+                    "failed",
+                    "PERSIST_FAILED",
+                    "Persistence worker disconnected before reservation",
+                    self.disconnect_code_buf.take(),
+                    self.disconnect_msg_buf.take(),
+                );
+                Self::settle_zero_check_session_on_persist_end(
+                    core,
+                    action_id,
+                    false,
+                    "PERSIST_FAILED",
+                    ctx.now,
+                );
                 if old_code.is_some() || old_msg.is_some() {
                     self.push_persist_reply_or_retain(
                         PersistReply::Done {
@@ -7151,6 +7324,66 @@ impl ControlState {
                 }
             }
         }
+    }
+
+    fn zero_check_static_code(code: Option<&str>) -> &'static str {
+        match code {
+            Some("OPERATOR_REQUIRED") => "OPERATOR_REQUIRED",
+            Some("INVALID_CALIBRATION") => "INVALID_CALIBRATION",
+            Some("LEASE_LOST") => "LEASE_LOST",
+            Some("EPOCH_MISMATCH") => "EPOCH_MISMATCH",
+            Some("STOPPED") => "STOPPED",
+            Some("DEADLINE_EXPIRED") => "DEADLINE_EXPIRED",
+            Some("POLICY_REVISION_MISMATCH") => "POLICY_REVISION_MISMATCH",
+            _ => "PERSIST_FAILED",
+        }
+    }
+
+    fn settle_zero_check_session_on_persist_end(
+        core: &mut SupervisorInner,
+        action_id: u64,
+        ok: bool,
+        code: &'static str,
+        now: Instant,
+    ) {
+        if core
+            .zero_check_persisting_grant
+            .is_some_and(|(gid, _)| gid == action_id)
+        {
+            core.zero_check_persisting_grant = None;
+        }
+        let worker_reply = core
+            .sessions
+            .slot(super::session::SessionSlot::ExclusiveOutput)
+            .filter(|s| {
+                s.kind == super::session::SessionKind::GripperZeroCheck
+                    && s.action_id == Some(super::broker::ActionId(action_id))
+            })
+            .and_then(|s| match s.state {
+                super::session::SessionState::AwaitingWorker(ticket) => {
+                    Some(super::session::WorkerReply {
+                        slot: super::session::SessionSlot::ExclusiveOutput,
+                        ticket,
+                        ok,
+                        code,
+                        value: 0,
+                    })
+                }
+                _ => None,
+            });
+        let reason = if ok {
+            super::session::SessionTerminalReason::Completed
+        } else {
+            super::session::SessionTerminalReason::Failed(code)
+        };
+        core.teardown_gripper_zero_check_session_rt(
+            action_id,
+            None,
+            false,
+            worker_reply,
+            reason,
+            now,
+        );
     }
 
     /// Release-tail handler when `persist_job_tx.push(job)` fails: marks the action failed without
@@ -7276,7 +7509,15 @@ impl ControlState {
                 if core.zero_check_persisting == Some(action_id) {
                     core.zero_check_persisting = None;
                 }
+                let static_code = Self::zero_check_static_code(Some(code.as_str()));
                 let (old_code, old_msg) = core.fail_zero_check_action_owned(action_id, code, message);
+                Self::settle_zero_check_session_on_persist_end(
+                    core,
+                    action_id,
+                    false,
+                    static_code,
+                    ctx.now,
+                );
                 let probe = self.take_reply_probe();
                 self.push_persist_reply_or_retain(
                     PersistReply::Done {
@@ -7334,6 +7575,19 @@ impl ControlState {
                         );
                     }
                     Err((old_code, old_msg)) => {
+                        let static_code = Self::zero_check_static_code(
+                            core.last_action
+                                .as_ref()
+                                .filter(|a| a.id == action_id)
+                                .and_then(|a| a.code.as_deref()),
+                        );
+                        Self::settle_zero_check_session_on_persist_end(
+                            core,
+                            action_id,
+                            false,
+                            static_code,
+                            ctx.now,
+                        );
                         self.push_persist_reply_or_retain(
                             PersistReply::Reserved {
                                 reservation: None,
@@ -7382,6 +7636,19 @@ impl ControlState {
                     }
                     Err((old_code, old_msg)) => {
                         self.persist_granted = None;
+                        let static_code = Self::zero_check_static_code(
+                            core.last_action
+                                .as_ref()
+                                .filter(|a| a.id == action_id)
+                                .and_then(|a| a.code.as_deref()),
+                        );
+                        Self::settle_zero_check_session_on_persist_end(
+                            core,
+                            action_id,
+                            false,
+                            static_code,
+                            ctx.now,
+                        );
                         self.push_persist_reply_or_retain(
                             PersistReply::Verified {
                                 reservation: None,
@@ -7400,7 +7667,15 @@ impl ControlState {
                 if core.zero_check_persisting == Some(action_id) {
                     core.zero_check_persisting = None;
                 }
+                let static_code = Self::zero_check_static_code(Some(code.as_str()));
                 let (old_code, old_msg) = core.fail_zero_check_action_owned(action_id, code, message);
+                Self::settle_zero_check_session_on_persist_end(
+                    core,
+                    action_id,
+                    false,
+                    static_code,
+                    ctx.now,
+                );
                 let probe = self.take_reply_probe();
                 self.push_persist_reply_or_retain(
                     PersistReply::Done {
@@ -7447,6 +7722,13 @@ impl ControlState {
                     }
                     Err((old_code, old_msg)) => {
                         self.persist_granted = None;
+                        Self::settle_zero_check_session_on_persist_end(
+                            core,
+                            action_id,
+                            false,
+                            "PERSIST_FAILED",
+                            ctx.now,
+                        );
                         self.push_persist_reply_or_retain(
                             PersistReply::Persisted {
                                 reservation: None,
@@ -7476,6 +7758,13 @@ impl ControlState {
                         warning,
                         Some(msg_buf),
                     );
+                Self::settle_zero_check_session_on_persist_end(
+                    core,
+                    action_id,
+                    false,
+                    "PERSIST_FAILED",
+                    ctx.now,
+                );
                 let probe = self.take_reply_probe();
                 self.push_persist_reply_or_retain(
                     PersistReply::Done {
@@ -7521,6 +7810,13 @@ impl ControlState {
                 ) {
                     Ok((old_policy, old_jaw, ret_code, ret_msg)) => {
                         let activated_revision = core.gripper_calib_revision;
+                        Self::settle_zero_check_session_on_persist_end(
+                            core,
+                            action_id,
+                            true,
+                            "",
+                            ctx.now,
+                        );
                         self.push_persist_reply_or_retain(
                             PersistReply::Activated {
                                 activated_revision,
@@ -7535,6 +7831,19 @@ impl ControlState {
                         );
                     }
                     Err((ret_policy, ret_jaw, old_code, old_msg)) => {
+                        let static_code = Self::zero_check_static_code(
+                            core.last_action
+                                .as_ref()
+                                .filter(|a| a.id == action_id)
+                                .and_then(|a| a.code.as_deref()),
+                        );
+                        Self::settle_zero_check_session_on_persist_end(
+                            core,
+                            action_id,
+                            false,
+                            static_code,
+                            ctx.now,
+                        );
                         self.push_persist_reply_or_retain(
                             PersistReply::Done {
                                 _returned_policy: ret_policy,
@@ -7626,6 +7935,8 @@ impl ControlState {
 #[allow(clippy::too_many_arguments)]
 fn spawn_persist_worker(
     mut job_rx: Consumer<PendingZeroCheckPersist>,
+    mut zero_check_stream_rx: super::stream::StreamConsumer<crate::supervisor::ZeroCheckStreamEvent>,
+    zero_check_contexts: Arc<Mutex<ZeroCheckContextStore>>,
     mut cmd_tx: Producer<PersistCmd>,
     rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     mut watchdog_plan_tx: Producer<WatchdogParkPlan>,
@@ -7660,9 +7971,15 @@ fn spawn_persist_worker(
         }
     }
 
-    struct ExitFlag(Arc<AtomicBool>, Arc<(Mutex<bool>, Condvar)>, Arc<StateHub>);
+    struct ExitFlag(
+        Arc<AtomicBool>,
+        Arc<(Mutex<bool>, Condvar)>,
+        Arc<StateHub>,
+        Arc<Mutex<ZeroCheckContextStore>>,
+    );
     impl Drop for ExitFlag {
         fn drop(&mut self) {
+            self.3.lock().unwrap_or_else(|e| e.into_inner()).clear();
             self.0.store(true, Ordering::Release);
             *self.1 .0.lock().unwrap_or_else(|e| e.into_inner()) = true;
             self.1 .1.notify_all();
@@ -7673,7 +7990,13 @@ fn spawn_persist_worker(
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
         let hub_watch = Arc::clone(&hub);
         let hub_for_refresh = Arc::clone(&hub);
-        let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
+        let zero_check_contexts_worker = Arc::clone(&zero_check_contexts);
+        let _exit_guard = ExitFlag(
+            persist_worker_exited,
+            persist_exited_cv,
+            hub,
+            zero_check_contexts,
+        );
         let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             mirror_persist_cmd_text(terminal_capture.as_deref(), &cmd);
@@ -7736,9 +8059,71 @@ fn spawn_persist_worker(
                 thread::park_timeout(Duration::from_millis(2));
                 continue;
             }
-            let Ok(job) = job_rx.pop() else {
-                thread::park_timeout(Duration::from_millis(2));
-                continue;
+            let mut next_job: Option<PendingZeroCheckPersist> = None;
+            while let Some(sample) = zero_check_stream_rx.try_pop() {
+                match sample.payload {
+                    crate::supervisor::ZeroCheckStreamEvent::Discard { persist_ctx_id } => {
+                        zero_check_contexts_worker
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(persist_ctx_id);
+                    }
+                    crate::supervisor::ZeroCheckStreamEvent::Persist {
+                        action_id,
+                        offset_rad,
+                        base_revision,
+                        lease_owner,
+                        estop_epoch,
+                        stop_gen,
+                        deadline,
+                        persist_ctx_id,
+                        worker_ticket: _,
+                    } => {
+                        let ctx = zero_check_contexts_worker
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take(persist_ctx_id);
+                        if let Some(ctx) = ctx {
+                            next_job = Some(PendingZeroCheckPersist {
+                                action_id,
+                                offset_rad,
+                                base_revision,
+                                lease_owner,
+                                estop_epoch,
+                                stop_gen,
+                                deadline,
+                                ctx,
+                            });
+                            break;
+                        }
+                        let _ = push_cmd(
+                            &mut cmd_tx,
+                            PersistCmd::Fail {
+                                action_id,
+                                code: "PERSIST_FAILED".into(),
+                                message: "Gripper zero-check persistence context unavailable".into(),
+                                unused_policy: None,
+                                unused_jaw: None,
+                            },
+                            &persist_stop,
+                            &control_exited,
+                        );
+                        let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                        if hooks.exit_after_first_job {
+                            break;
+                        }
+                    }
+                }
+            }
+            let job = match next_job {
+                Some(j) => j,
+                None => match job_rx.pop() {
+                    Ok(j) => j,
+                    Err(_) => {
+                        thread::park_timeout(Duration::from_millis(2));
+                        continue;
+                    }
+                },
             };
             // Stop-aware config write lock acquisition: teardown unparks this thread and sets
             // `persist_stop`, preventing deadlock even if the caller holds `config_write_mutex`.
@@ -9397,7 +9782,8 @@ fn control_thread_main_inner(
             unsupported_reason,
             msg,
         }) => {
-            let taken = core_slot.take().expect("core owned for recoverable return");
+            let mut taken = core_slot.take().expect("core owned for recoverable return");
+            taken.zero_check_stream_tx = None;
             if let Some(rejected_core) = startup_gate.try_settle_failed(
                 SpawnExecutorError::Recoverable {
                     core: taken,
@@ -9762,6 +10148,35 @@ fn control_thread_main_inner(
                     );
                     let session_safe_hold = core.sessions.is_safe_hold_requested();
                     if control_stop.load(Ordering::Acquire) || session_safe_hold {
+                        if let Some(crate::supervisor::ZeroCheckStreamEvent::Persist {
+                            action_id,
+                            persist_ctx_id,
+                            ..
+                        }) = core.pending_zero_check_stream_persist.take()
+                        {
+                            if core.zero_check_persisting == Some(action_id) {
+                                core.zero_check_persisting = None;
+                            }
+                            if core
+                                .zero_check_persisting_grant
+                                .is_some_and(|(gid, _)| gid == action_id)
+                            {
+                                core.zero_check_persisting_grant = None;
+                            }
+                            ControlState::fail_zero_check_inline_only(
+                                core,
+                                action_id,
+                                "Persistence aborted on stop",
+                            );
+                            core.discard_zero_check_ctx_id_rt(persist_ctx_id);
+                            ControlState::settle_zero_check_session_on_persist_end(
+                                core,
+                                action_id,
+                                false,
+                                "PERSIST_FAILED",
+                                now_inst(),
+                            );
+                        }
                         let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
                         let session_terms = core.flush_published_session_terminals();
                         if let Some(p) = injected_job_probe.take() {
@@ -9810,6 +10225,93 @@ fn control_thread_main_inner(
                                 let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
                                 if captured_any {
                                     hub.wake();
+                                }
+                            }
+                        }
+                    }
+                    if let Some(mut ev) = core.pending_zero_check_stream_persist.take() {
+                        if let crate::supervisor::ZeroCheckStreamEvent::Persist {
+                            action_id,
+                            ref mut stop_gen,
+                            persist_ctx_id,
+                            ..
+                        } = ev
+                        {
+                            *stop_gen = state.stop_requests.current();
+                            let inject_fail = state
+                                .hooks
+                                .fail_zero_check_stream_push_once
+                                .as_ref()
+                                .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+                            let pushed = if inject_fail {
+                                Err(super::stream::StreamPushError::Full)
+                            } else if let Some(tx) = core.zero_check_stream_tx.as_mut() {
+                                tx.try_push(ev)
+                            } else {
+                                Err(super::stream::StreamPushError::Closed)
+                            };
+                            match pushed {
+                                Ok(_) => {
+                                    state.persist_wake.unpark();
+                                }
+                                Err(_) => {
+                                    if core.zero_check_persisting == Some(action_id) {
+                                        core.zero_check_persisting = None;
+                                    }
+                                    if core
+                                        .zero_check_persisting_grant
+                                        .is_some_and(|(gid, _)| gid == action_id)
+                                    {
+                                        core.zero_check_persisting_grant = None;
+                                    }
+                                    const SAT_MSG: &str = "Persistence queue saturated";
+                                    if state.offload_reclaim_tx.slots() >= 2 {
+                                        if let Some(buf) = state.sat_msg_buf.take() {
+                                            let (_, old_msg) = core.finish_zero_check_action_in_place(
+                                                action_id,
+                                                "failed",
+                                                "PERSIST_FAILED",
+                                                SAT_MSG,
+                                                None,
+                                                Some(buf),
+                                            );
+                                            if let Some(m) = old_msg {
+                                                if m.capacity() >= SAT_MSG.len() {
+                                                    state.sat_msg_buf = Some(m);
+                                                } else {
+                                                    let _ = state
+                                                        .offload_reclaim_tx
+                                                        .push(OffloadReclaim::Buf(m));
+                                                }
+                                            }
+                                        } else {
+                                            ControlState::fail_zero_check_inline_only(
+                                                core,
+                                                action_id,
+                                                SAT_MSG,
+                                            );
+                                        }
+                                    } else {
+                                        ControlState::fail_zero_check_inline_only(
+                                            core,
+                                            action_id,
+                                            SAT_MSG,
+                                        );
+                                    }
+                                    core.discard_zero_check_ctx_id_rt(persist_ctx_id);
+                                    ControlState::settle_zero_check_session_on_persist_end(
+                                        core,
+                                        action_id,
+                                        false,
+                                        "PERSIST_FAILED",
+                                        now_inst(),
+                                    );
+                                    let (_, captured_any) =
+                                        core.capture_edge_terminals(core.now_s(), None);
+                                    let session_terms = core.flush_published_session_terminals();
+                                    if captured_any || session_terms > 0 {
+                                        hub.wake();
+                                    }
                                 }
                             }
                         }

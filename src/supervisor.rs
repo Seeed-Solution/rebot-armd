@@ -1416,8 +1416,24 @@ pub struct SupervisorInner {
     tick_phases_us: [u32; 5],
     /// Action id whose zero_check(store_offset=true) disk persist is currently in flight.
     pub zero_check_persisting: Option<u64>,
+    /// Live lock-free operator grant captured for an in-flight executor `zero_check(store_offset=true)`
+    /// persistence transaction so PR C owner gates verify operator revocation on `armd-control` with 0 alloc.
+    pub(crate) zero_check_persisting_grant: Option<(u64, crate::auth::OperatorGrant)>,
     /// Pending disk persist + commit payload produced by finish_action during ArmSupervisor::tick.
     pub pending_zero_check_persist: Option<PendingZeroCheckPersist>,
+    /// Preallocated lock-free RT->off-RT stream producer for executor `gripper_zero_check`
+    /// persistence handoff and context discard (uses `rt_core/stream`, 0 RT heap allocs/frees).
+    pub(crate) zero_check_stream_tx: Option<crate::rt_core::stream::StreamProducer<ZeroCheckStreamEvent>>,
+    /// Pending `Copy` persistence handoff queued by `finish_action` and flushed at release tail
+    /// (stamped with live `stop_gen`) onto `zero_check_stream_tx`.
+    pub(crate) pending_zero_check_stream_persist: Option<ZeroCheckStreamEvent>,
+    /// True when `discard_zero_check_ctx_id_rt` pushed a `Discard` onto `zero_check_stream_tx`
+    /// so `armd-control` wakes `armd-persist` immediately.
+    pub(crate) zero_check_stream_pushed: bool,
+    /// Inline fixed-capacity fallback queue of staged `persist_ctx_id`s to discard off-thread via
+    /// `OffloadReclaim::DiscardZeroCheckCtx` whenever `zero_check_stream_tx` is full or closed.
+    pub(crate) retired_zero_check_ctx_ids: [u64; 16],
+    pub(crate) retired_zero_check_ctx_id_len: usize,
     /// Retired `ZeroCheckPersistContext` payloads waiting for off-thread drop (never dropped on RT).
     pub(crate) retired_zero_check_ctx: std::collections::VecDeque<Box<ZeroCheckPersistContext>>,
     /// Whether operator auth is enforced (exposed in GET /api/v1/safety/describe).
@@ -1923,6 +1939,33 @@ pub struct ZeroCheckParams {
     pub threshold_rad: f32,
     pub base_closed_rad: f32,
     pub persist_ctx: Option<Box<ZeroCheckPersistContext>>,
+    /// Off-RT staged `ZeroCheckPersistContext` handle for executor-admitted sessions (`0` on legacy
+    /// or when `store_offset == false`), avoiding any heap allocation or free on `armd-control`.
+    pub persist_ctx_id: u64,
+    /// Bound PR0B `SessionId` when driven by `SessionDriver` (`SessionKind::GripperZeroCheck`).
+    pub session_id: Option<crate::rt_core::session::SessionId>,
+    /// Live lock-free operator grant bound at executor admission (when `store_offset == true`).
+    pub operator_grant: Option<crate::auth::OperatorGrant>,
+}
+
+/// `Copy` off-RT handoff event emitted over `rt_core::stream` from `armd-control` to `armd-persist`
+/// for executor-admitted `gripper_zero_check` sessions (0 RT heap allocs/frees).
+#[derive(Debug, Clone, Copy)]
+pub enum ZeroCheckStreamEvent {
+    Persist {
+        action_id: u64,
+        offset_rad: f32,
+        base_revision: u64,
+        lease_owner: Option<(crate::model::HolderLabel, u64)>,
+        estop_epoch: u64,
+        stop_gen: u64,
+        deadline: Instant,
+        persist_ctx_id: u64,
+        worker_ticket: Option<crate::rt_core::session::WorkerTicket>,
+    },
+    Discard {
+        persist_ctx_id: u64,
+    },
 }
 
 /// Deferred atomic persist-before-commit job for `gripper_zero_check(store_offset=true)`.
@@ -2625,7 +2668,13 @@ impl SupervisorInner {
             tick_phase_mark: None,
             tick_phases_us: [0; 5],
             zero_check_persisting: None,
+            zero_check_persisting_grant: None,
             pending_zero_check_persist: None,
+            zero_check_stream_tx: None,
+            pending_zero_check_stream_persist: None,
+            zero_check_stream_pushed: false,
+            retired_zero_check_ctx_ids: [0; 16],
+            retired_zero_check_ctx_id_len: 0,
             retired_zero_check_ctx: std::collections::VecDeque::with_capacity(4),
             operator_auth_enforced: false,
             tool_commissioning_path: None,
