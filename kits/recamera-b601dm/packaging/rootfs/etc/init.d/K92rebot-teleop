@@ -840,7 +840,8 @@ start() {
     # armd runs as root; it falls back to stdout only when these cannot be written
     mkdir -p "$PERSIST_LOG_DIR" "$BLACKBOX_DIR" "$EPISODES_DIR" 2>/dev/null || true
     DAEMON_OPTS="$DAEMON_OPTS --log-dir $PERSIST_LOG_DIR --blackbox-dir $BLACKBOX_DIR --episodes-dir $EPISODES_DIR"
-    if [ -z "${ARMD_RT_OWNER:-}" ]; then
+    ARMD_RT_OWNER_TRIMMED=$(printf '%s' "${ARMD_RT_OWNER:-}" | tr -d ' \t\r\n')
+    if [ -z "$ARMD_RT_OWNER_TRIMMED" ]; then
         if [ "$ARMD_OWNER_INVALID" = 1 ]; then
             echo "[rebot-teleop] Invalid arm.armd_owner setting (use 'auto', 'legacy' or 'executor'); refusing to start"
             return 1

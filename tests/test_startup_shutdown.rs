@@ -1078,7 +1078,8 @@ fn init_parses_armd_owner_and_omits_when_unset() {
         !source.contains("unset ARMD_RT_OWNER"),
         "K92 must preserve ARMD_RT_OWNER so env precedence over config holds"
     );
-    assert!(source.contains("if [ -z \"${ARMD_RT_OWNER:-}\" ]; then"));
+    assert!(source.contains("ARMD_RT_OWNER_TRIMMED=$(printf '%s' \"${ARMD_RT_OWNER:-}\" | tr -d ' \\t\\r\\n')"));
+    assert!(source.contains("if [ -z \"$ARMD_RT_OWNER_TRIMMED\" ]; then"));
     assert!(source.contains("Invalid arm.armd_owner setting"));
     let parse = init_section(source, "config_shell_vars() {", "\n# 读取 supervisor");
     let launch = init_section(source, "launch_armd() {", "\nstart() {");
@@ -1158,6 +1159,21 @@ fn init_parses_armd_owner_and_omits_when_unset() {
         !std::fs::read_to_string(&args_log).unwrap().contains("--owner"),
         "K92 must not override ARMD_RT_OWNER with --owner from config"
     );
+
+    // Whitespace-only ARMD_RT_OWNER is treated as unset (matching Rust trim), so stored config applies.
+    let ws_script = format!(
+        "{parse}\n\
+         ARMD_RT_OWNER='   '; export ARMD_RT_OWNER\n\
+         ARMD_OWNER=''; ARMD_OWNER_INVALID=''; DAEMON_OPTS='--follower rebot-dm'\n\
+         eval \"$(config_shell_vars '{c}')\"\n\
+         ARMD_RT_OWNER_TRIMMED=$(printf '%s' \"${{ARMD_RT_OWNER:-}}\" | tr -d ' \\t\\r\\n')\n\
+         if [ -z \"$ARMD_RT_OWNER_TRIMMED\" ] && [ -n \"$ARMD_OWNER\" ]; then DAEMON_OPTS=\"$DAEMON_OPTS --owner $ARMD_OWNER\"; fi\n\
+         printf '%s' \"$DAEMON_OPTS\"\n",
+        c = cfg.display()
+    );
+    let ws_out = Command::new("sh").args(["-c", &ws_script]).output().unwrap();
+    assert!(ws_out.status.success());
+    assert_eq!(String::from_utf8_lossy(&ws_out.stdout), "--follower rebot-dm --owner executor");
 
     // Verify the gallery manifest also advertises `armd_owner` with default `auto`.
     let manifest: serde_json::Value = serde_json::from_str(

@@ -235,11 +235,25 @@ fn read_app_config_armd_owner_from_path(path: &std::path::Path) -> Result<Option
             path.display()
         )
     })?;
-    let owner_val = parsed
-        .get("arm")
-        .and_then(|arm| arm.get("armd_owner"))
-        .filter(|v| !v.is_null())
-        .or_else(|| parsed.get("armd_owner").filter(|v| !v.is_null()));
+    let root = parsed.as_object().ok_or_else(|| {
+        format!(
+            "App config {} must be a JSON object when checking arm.armd_owner",
+            path.display()
+        )
+    })?;
+    let arm_owner_val = match root.get("arm") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(arm) => {
+            let arm_obj = arm.as_object().ok_or_else(|| {
+                format!(
+                    "App config {} field 'arm' must be a JSON object when checking arm.armd_owner",
+                    path.display()
+                )
+            })?;
+            arm_obj.get("armd_owner").filter(|v| !v.is_null())
+        }
+    };
+    let owner_val = arm_owner_val.or_else(|| root.get("armd_owner").filter(|v| !v.is_null()));
     let Some(val) = owner_val else {
         return Ok(None);
     };
@@ -808,7 +822,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         m => warn!("Process memory not locked ({}); MIT tracking, when configured, is refused", m.describe()),
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
-    let env_rt_owner = read_env_rt_owner_os(std::env::var_os("ARMD_RT_OWNER").as_deref())?;
+    let env_rt_owner = if cli.owner.is_none() {
+        read_env_rt_owner_os(std::env::var_os("ARMD_RT_OWNER").as_deref())?
+    } else {
+        None
+    };
     let config_rt_owner = if cli.owner.is_none() && env_rt_owner.is_none() {
         read_app_config_armd_owner()?
     } else {
@@ -1797,6 +1815,10 @@ mod shutdown_tests {
         assert_eq!(bad_val.as_deref(), Some("legcay"));
         assert!(armd::rt_core::executor::RequestedRtOwner::resolve(None, None, bad_val.as_deref()).is_err());
         std::fs::write(&cfg_path, r#"{"arm":{"armd_owner":123}}"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"{"arm":"legacy"}"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"["legacy"]"#).unwrap();
         assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
         std::fs::write(&cfg_path, r#"{malformed"#).unwrap();
         assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());

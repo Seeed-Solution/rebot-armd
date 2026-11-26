@@ -8579,6 +8579,9 @@ function applyJointMap(map) {
   camMountNow();
   V3.key = ''; PCARD.key = '';
 }
+function isValidEffectiveOwner(v) {
+  return v === 'executor' || v === 'legacy' || v === 'failed' || v === 'transferring';
+}
 function isOwnerFallbackReason(reason) {
   return typeof reason === 'string' && (reason.startsWith('auto_fallback_') || reason === 'startup_fallback_to_legacy' || reason === 'startup_failed_detached_safe_hold');
 }
@@ -8588,16 +8591,34 @@ function ownerReasonLabel(reason) {
   const translated = t(k);
   return translated === k ? String(reason) : translated;
 }
+async function loadOwnerDiagnostics() {
+  try {
+    const d = await api('/api/v1/diagnostics', undefined, { quiet: true, method: 'GET' });
+    if (d && isValidEffectiveOwner(d.effective_owner)) {
+      S.ownerDiag = {
+        effective_owner: d.effective_owner,
+        owner_reason: typeof d.owner_reason === 'string' ? d.owner_reason : '',
+      };
+      renderOwnerStatus();
+    }
+  } catch (_) {}
+}
 function renderOwnerStatus() {
   const badge = $('owner-badge');
   if (!badge) return;
   const obs = S.obs;
-  const owner = obs && (obs.effective_owner === 'executor' || obs.effective_owner === 'legacy' || obs.effective_owner === 'failed' || obs.effective_owner === 'transferring') ? obs.effective_owner : null;
+  const diag = S.ownerDiag;
+  const obsOwner = obs && isValidEffectiveOwner(obs.effective_owner) ? obs.effective_owner : null;
+  const diagOwner = diag && isValidEffectiveOwner(diag.effective_owner) ? diag.effective_owner : null;
+  const useDiag = diagOwner === 'failed' || !obsOwner;
+  const owner = useDiag ? diagOwner : obsOwner;
   if (!owner) {
     badge.hidden = true;
     return;
   }
-  const reason = typeof obs.owner_reason === 'string' ? obs.owner_reason : '';
+  const reason = useDiag
+    ? (diag && typeof diag.owner_reason === 'string' ? diag.owner_reason : '')
+    : (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : '');
   const failed = owner === 'failed';
   const fallback = failed || (owner === 'legacy' && isOwnerFallbackReason(reason));
   badge.hidden = false;
@@ -16775,6 +16796,7 @@ i18nHooks.push(() => { if (opIsOpen()) renderOperatorModal(); });
   $('c-rmax').textContent = Math.round(CFG.cart.reachMax * 1000);
 }
 schemaReady = loadSchema();
+loadOwnerDiagnostics();
 loadAuthStatus();
 setInterval(() => { if (S.auth.role === 'operator') { renderOpBadge(); opCheckExpiry(); } }, 10000); // minutes left on the badge, renewal before the end of a flow
 initSandbox();

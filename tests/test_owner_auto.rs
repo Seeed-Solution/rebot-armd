@@ -585,8 +585,8 @@ fn cockpit_owner_badge_shows_in_expert_and_only_on_fallback_in_simple() {
     // Execute the exact JS helper extracted from index.html when Node is available.
     if Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success()) {
         let start = html
-            .find("function isOwnerFallbackReason(")
-            .expect("isOwnerFallbackReason present");
+            .find("function isValidEffectiveOwner(")
+            .expect("isValidEffectiveOwner present");
         let end = html[start..]
             .find("i18nHooks.push(renderOwnerStatus);")
             .expect("i18nHooks registration present")
@@ -601,11 +601,12 @@ const badge = {{
   addEventListener(ev, fn) {{ this['on_' + ev] = fn; }},
   classList: {{ contains(c) {{ return badge.className.split(/\s+/).includes(c); }} }},
 }};
-const S = {{ obs: null }};
+const S = {{ obs: null, ownerDiag: null }};
 const $ = (id) => id === 'owner-badge' ? badge : null;
 const setText = (el, v) => {{ el.textContent = v; }};
 const setCls = (el, v) => {{ el.className = v; }};
 const toast = (msg, kind) => {{ lastToast = {{ msg, kind }}; }};
+const api = async () => ({{ effective_owner: 'failed', owner_reason: 'startup_failed_detached_safe_hold' }});
 const dict = {{
   'owner.badge.executor': 'RT',
   'owner.badge.legacy': 'Legacy',
@@ -629,41 +630,47 @@ const t = (k, p) => {{
 {snippet}
 function assert(cond, msg) {{ if (!cond) {{ console.error(msg); process.exit(1); }} }}
 
-// 1. Executor auto_qualified: shown in expert, NOT marked is-fallback (hidden in simple).
-S.obs = {{ effective_owner: 'executor', owner_reason: 'auto_qualified' }};
-renderOwnerStatus();
-assert(badge.hidden === false, 'executor badge must be unhidden');
-assert(badge.textContent === 'RT', 'executor text: ' + badge.textContent);
-assert(!badge.className.includes('is-fallback'), 'executor must not be is-fallback');
-assert(badge.attrs['aria-label'] === badge.title, 'aria-label must match title');
+(async () => {{
+  // 1. Executor auto_qualified: shown in expert, NOT marked is-fallback (hidden in simple).
+  S.obs = {{ effective_owner: 'executor', owner_reason: 'auto_qualified' }};
+  renderOwnerStatus();
+  assert(badge.hidden === false, 'executor badge must be unhidden');
+  assert(badge.textContent === 'RT', 'executor text: ' + badge.textContent);
+  assert(!badge.className.includes('is-fallback'), 'executor must not be is-fallback');
+  assert(badge.attrs['aria-label'] === badge.title, 'aria-label must match title');
 
-// 2. Explicit legacy: shown in expert, NOT marked is-fallback (hidden in simple).
-S.obs = {{ effective_owner: 'legacy', owner_reason: 'explicit_cli' }};
-renderOwnerStatus();
-assert(badge.hidden === false, 'explicit legacy badge must be unhidden');
-assert(badge.textContent === 'Legacy', 'explicit legacy text: ' + badge.textContent);
-assert(!badge.className.includes('is-fallback'), 'explicit legacy must not be is-fallback');
+  // 2. Explicit legacy: shown in expert, NOT marked is-fallback (hidden in simple).
+  S.obs = {{ effective_owner: 'legacy', owner_reason: 'explicit_cli' }};
+  renderOwnerStatus();
+  assert(badge.hidden === false, 'explicit legacy badge must be unhidden');
+  assert(badge.textContent === 'Legacy', 'explicit legacy text: ' + badge.textContent);
+  assert(!badge.className.includes('is-fallback'), 'explicit legacy must not be is-fallback');
 
-// 3. Auto fallback to legacy (MIT): shown in expert AND marked is-fallback + is-warn (visible in simple).
-S.obs = {{ effective_owner: 'legacy', owner_reason: 'auto_fallback_mit_profile' }};
-renderOwnerStatus();
-assert(badge.hidden === false, 'fallback badge must be unhidden');
-assert(badge.textContent === 'Legacy · fallback', 'fallback text: ' + badge.textContent);
-assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'fallback classes: ' + badge.className);
-assert(badge.title.includes('mit fallback'), 'fallback title: ' + badge.title);
-badge.on_click();
-assert(lastToast && lastToast.kind === 'warn' && lastToast.msg.includes('mit fallback'), 'click must surface reason via toast');
+  // 3. Auto fallback to legacy (MIT): shown in expert AND marked is-fallback + is-warn (visible in simple).
+  S.obs = {{ effective_owner: 'legacy', owner_reason: 'auto_fallback_mit_profile' }};
+  renderOwnerStatus();
+  assert(badge.hidden === false, 'fallback badge must be unhidden');
+  assert(badge.textContent === 'Legacy · fallback', 'fallback text: ' + badge.textContent);
+  assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'fallback classes: ' + badge.className);
+  assert(badge.title.includes('mit fallback'), 'fallback title: ' + badge.title);
+  badge.on_click();
+  assert(lastToast && lastToast.kind === 'warn' && lastToast.msg.includes('mit fallback'), 'click must surface reason via toast');
 
-// 4. Startup DRV-F1 fallback to legacy: also marked is-fallback + is-warn.
-S.obs = {{ effective_owner: 'legacy', owner_reason: 'startup_fallback_to_legacy' }};
-renderOwnerStatus();
-assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'startup fallback classes: ' + badge.className);
+  // 4. Startup DRV-F1 fallback to legacy: also marked is-fallback + is-warn.
+  S.obs = {{ effective_owner: 'legacy', owner_reason: 'startup_fallback_to_legacy' }};
+  renderOwnerStatus();
+  assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'startup fallback classes: ' + badge.className);
 
-// 5. Detached SAFE-HOLD failed owner: shown as failed warning in both expert & simple.
-S.obs = {{ effective_owner: 'failed', owner_reason: 'startup_failed_detached_safe_hold' }};
-renderOwnerStatus();
-assert(badge.textContent === 'Owner · failed', 'failed text: ' + badge.textContent);
-assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'failed classes: ' + badge.className);
+  // 5. Detached SAFE-HOLD failed owner with NO observation (OWNER_FAILED rejects /observation):
+  //    loadOwnerDiagnostics() fetches /api/v1/diagnostics and renders failed warning in expert & simple.
+  S.obs = null;
+  S.ownerDiag = null;
+  await loadOwnerDiagnostics();
+  assert(badge.hidden === false, 'failed owner via diagnostics must be unhidden');
+  assert(badge.textContent === 'Owner · failed', 'failed text: ' + badge.textContent);
+  assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'failed classes: ' + badge.className);
+  assert(badge.title.includes('detached safe hold'), 'failed title: ' + badge.title);
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
 "#
         );
         let out = Command::new("node").args(["-e", &script]).output().unwrap();

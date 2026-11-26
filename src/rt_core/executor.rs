@@ -178,7 +178,15 @@ impl RequestedRtOwner {
 
 impl RtOwner {
     pub fn from_env() -> Result<Self, String> {
-        Self::from_var(std::env::var("ARMD_RT_OWNER").ok().as_deref())
+        match std::env::var_os("ARMD_RT_OWNER") {
+            None => Self::from_var(None),
+            Some(os) => match os.to_str() {
+                Some(s) => Self::from_var(Some(s)),
+                None => Err(
+                    "ARMD_RT_OWNER must be valid UTF-8 ('auto', 'legacy', or 'executor')".into(),
+                ),
+            },
+        }
     }
 
     /// Parses `ARMD_RT_OWNER` into an effective owner for mock/default tests (`auto` resolves to `Executor`).
