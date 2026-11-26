@@ -753,7 +753,19 @@ mod tests {
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Get, "/api/v1/cell/status")).unwrap().ownership,
+            RouteOwnership::OwnerAgnostic
+        );
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Post, crate::vision_detector::MODELS_PATH)).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
             lookup(RouteKey::rest(RestMethod::Post, "/api/v1/dataset/record/start")).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Post, "/api/v1/action/gripper_zero_check")).unwrap().ownership,
             RouteOwnership::LegacyOnly
         );
         assert_eq!(
@@ -765,7 +777,7 @@ mod tests {
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(
-            lookup(RouteKey::ws_command("/api/v1/grasp/measure")).unwrap().ownership,
+            lookup(RouteKey::ws_command("/api/v1/action/gripper_zero_check")).unwrap().ownership,
             RouteOwnership::LegacyOnly
         );
         assert_eq!(
@@ -890,13 +902,13 @@ mod tests {
             .unwrap();
         assert_eq!(post_mode.status(), StatusCode::FORBIDDEN);
 
-        // Unmigrated LegacyOnly route (POST /api/v1/dataset/record/start) still returns 503 EXECUTOR_ROUTING_PENDING.
+        // Unmigrated LegacyOnly route (POST /api/v1/action/gripper_zero_check) still returns 503 EXECUTOR_ROUTING_PENDING.
         let legacy_rec = router
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/dataset/record/start")
+                    .uri("/api/v1/action/gripper_zero_check")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -907,7 +919,7 @@ mod tests {
         let legacy_body = axum::body::to_bytes(legacy_rec.into_body(), 4096).await.unwrap();
         assert!(
             String::from_utf8_lossy(&legacy_body).contains("EXECUTOR_ROUTING_PENDING"),
-            "POST /api/v1/dataset/record/start must remain LegacyOnly: {legacy_body:?}"
+            "POST /api/v1/action/gripper_zero_check must remain LegacyOnly: {legacy_body:?}"
         );
 
         // Executor: OPTIONS /api/v1/observation fails closed with 503 EXECUTOR_ROUTING_PENDING.

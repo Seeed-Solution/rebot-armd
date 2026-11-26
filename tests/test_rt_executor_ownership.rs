@@ -1940,7 +1940,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/dataset/record/start")
+                .uri("/api/v1/action/gripper_zero_check")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{}"#))
                 .unwrap(),
@@ -2465,7 +2465,7 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
     assert_eq!(jog_resp.status(), reqwest::StatusCode::CONFLICT);
     assert!(jog_resp.text().await.unwrap().contains("LEASE_REQUIRED"));
 
-    let legacy_rec_url = format!("http://127.0.0.1:{port}/api/v1/dataset/record/start");
+    let legacy_rec_url = format!("http://127.0.0.1:{port}/api/v1/action/gripper_zero_check");
     let legacy_resp = client
         .post(&legacy_rec_url)
         .json(&json!({}))

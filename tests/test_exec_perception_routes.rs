@@ -1461,7 +1461,6 @@ async fn dual_owner_multiview_and_motion_action_rest_stubs_lease_contract() {
         if owner == OwnerKind::Executor {
             for (method, path) in [
                 ("POST", "/api/v1/action/gripper_zero_check"),
-                ("POST", "/api/v1/dataset/record/start"),
                 ("GET", "/api/v1/diagnostics/power"),
             ] {
                 let r = if method == "POST" {
