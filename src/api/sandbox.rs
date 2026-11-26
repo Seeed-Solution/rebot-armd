@@ -3391,35 +3391,47 @@ pub async fn delete_policy(
     if !validate_pack_id(&id) {
         return Err(policy_delete_error(StatusCode::BAD_REQUEST, "INVALID_ID", format!("Invalid policy pack id '{id}'")));
     }
-    // Global lock order: activate_lock -> supervisor -> state.active.
-    // Holding activate_lock across the check + rename ensures concurrent activate() calls
-    // (including mode="sim" upstream round-trips) cannot select a policy being deleted.
+    // Global lock order: activate_lock -> policy_use_gate -> supervisor -> state.active.
+    // Acquiring `try_begin_policy_delete` unconditionally BEFORE checking owner mode or awaiting
+    // the legacy read lock ensures that an executor handoff during the lock wait cannot allow a
+    // concurrent WS `policy/start` to load `id` while DELETE proceeds.
     let _act_guard = state.activate_lock.lock().await;
-    let (legacy_guard, _delete_use_guard) = if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+    let _delete_use_guard = state.try_begin_policy_delete(&id)?;
+    let legacy_guard = if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
         let inner = supervisor.inner().read().await;
-        #[cfg(feature = "policy-runtime")]
-        {
-            if let Some(run) = inner.policy_run.as_ref().filter(|r| r.policy_id == id) {
-                return Err(policy_delete_error(
-                    StatusCode::CONFLICT,
-                    "POLICY_IN_USE",
-                    format!("Policy pack '{id}' is used by the running policy action {}", run.action_id),
-                ));
+        if inner.detached {
+            drop(inner);
+            None
+        } else {
+            #[cfg(feature = "policy-runtime")]
+            {
+                if let Some(run) = inner.policy_run.as_ref().filter(|r| r.policy_id == id) {
+                    return Err(policy_delete_error(
+                        StatusCode::CONFLICT,
+                        "POLICY_IN_USE",
+                        format!("Policy pack '{id}' is used by the running policy action {}", run.action_id),
+                    ));
+                }
+                if inner.policy_loading {
+                    return Err(policy_delete_error(
+                        StatusCode::CONFLICT,
+                        "POLICY_IN_USE",
+                        "A policy pack is being loaded for a run; delete it after the start finishes".into(),
+                    ));
+                }
             }
-            if inner.policy_loading {
-                return Err(policy_delete_error(
-                    StatusCode::CONFLICT,
-                    "POLICY_IN_USE",
-                    "A policy pack is being loaded for a run; delete it after the start finishes".into(),
-                ));
-            }
+            Some(inner)
         }
-        (Some(inner), None)
     } else {
-        // Atomically verify no executor policy load/run pins `id` and block new executor loads
-        // of `id` while deletion runs (gate mutex is never held across I/O or awaits).
-        let del_guard = state.try_begin_policy_delete(&id)?;
-        // Fail closed if the RT executor cannot supply a live coherent service snapshot.
+        None
+    };
+    if legacy_guard.is_none() {
+        // Non-legacy owner (or handoff landed while awaiting the legacy read lock): fail closed if
+        // the RT executor cannot supply a live coherent service snapshot. `_delete_use_guard`
+        // already enforces `loading_count == 0` (any policy load blocks delete, matching legacy
+        // `policy_loading`) and `!active_runs.contains_key(id)` (blocking only the running pack,
+        // permitting deletion of unrelated inactive packs just like legacy). Checking `obs.policy`
+        // preserves the full error message including `action_id` for same-pack rejections.
         let svc = supervisor
             .read_services(crate::rt_core::publish::ReadRequirements::default())
             .await
@@ -3433,18 +3445,10 @@ pub async fn delete_policy(
                     format!("Policy pack '{id}' is used by the running policy action {}", p.action_id),
                 ));
             }
-            if svc.snapshot.rt.owner.policy_busy {
-                return Err(policy_delete_error(
-                    StatusCode::CONFLICT,
-                    "POLICY_IN_USE",
-                    "A policy pack is being loaded or running; delete it after the run finishes".into(),
-                ));
-            }
         }
         #[cfg(not(feature = "policy-runtime"))]
         let _ = svc;
-        (None, Some(del_guard))
-    };
+    }
     let active = state.active.read().await;
     if active.active_policy.as_deref() == Some(id.as_str()) {
         return Err(policy_delete_error(

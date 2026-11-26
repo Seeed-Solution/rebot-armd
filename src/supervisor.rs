@@ -3689,6 +3689,10 @@ impl SupervisorInner {
                 let action_id = a.id;
                 let seq = self.alloc_terminal_seq();
                 let _ = self.terminal_edge_tracker.record_edge(action_id, seq);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.core
+                    .hub()
+                    .record_action_terminal_cutoff_rt(action_id, self.start_time.elapsed());
                 let ts = self.now_s();
                 if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
                     terminal_capture::StagedTerminal::Deferred {
@@ -13350,6 +13354,7 @@ impl ArmSupervisor {
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
+        hub.set_boot_instant(inner.start_time);
         #[cfg(feature = "policy-runtime")]
         hub.attach_policy_diag_seal(atomic_diag_sealed_policy_action_id.clone());
         hub.update_prep_env(Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner)));
@@ -14692,6 +14697,11 @@ impl ArmSupervisor {
                     self.torque_shadow.wake();
                 }
                 *guard = *core;
+                guard.hover_jobs = self
+                    .executor_hover_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
                 guard.purge_closed_live_connections();
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = None;

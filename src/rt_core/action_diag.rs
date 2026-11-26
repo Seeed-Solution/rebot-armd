@@ -13,7 +13,8 @@
 //!   the exact same frozen overlay and late patches for that `action_id` are ignored.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Instant;
+use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::kinematics::WorkspaceViolationDetail;
 use crate::model::ArmObservation;
@@ -22,6 +23,86 @@ use crate::rt_core::stream::{self, StreamConsumer, StreamProducer, StreamStats};
 
 /// Default capacity of the SPSC diagnostic patch ring.
 pub const ACTION_DIAG_STREAM_CAP: usize = 512;
+
+const TERMINAL_CUTOFF_SLOTS: usize = 64;
+
+struct TerminalCutoffSlot {
+    version: AtomicU64,
+    action_id: AtomicU64,
+    cutoff_stream_seq: AtomicU64,
+    terminal_offset_ns: AtomicU64,
+}
+
+impl TerminalCutoffSlot {
+    const fn new() -> Self {
+        Self {
+            version: AtomicU64::new(0),
+            action_id: AtomicU64::new(0),
+            cutoff_stream_seq: AtomicU64::new(0),
+            terminal_offset_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Lock-free, zero-allocation RT terminal cutoff table written once per terminal action edge on
+/// `armd-control` and read off-RT by [`ActionDiagStore`] so late patches queued after RT
+/// termination (even before the first reader arrives) are ignored and final phase durations are
+/// anchored to the RT terminal instant rather than reader delay.
+pub(crate) struct ActionDiagTerminalCutoff {
+    slots: [TerminalCutoffSlot; TERMINAL_CUTOFF_SLOTS],
+}
+
+impl ActionDiagTerminalCutoff {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [const { TerminalCutoffSlot::new() }; TERMINAL_CUTOFF_SLOTS],
+        }
+    }
+
+    /// Records the exact RT terminal edge `(cutoff_stream_seq, elapsed_since_boot)` for
+    /// `action_id`. Single-writer (`armd-control`), zero locks, zero heap allocations.
+    pub(crate) fn record(&self, action_id: u64, cutoff_stream_seq: u64, elapsed: Duration) {
+        if action_id == 0 {
+            return;
+        }
+        let slot = &self.slots[(action_id as usize) & (TERMINAL_CUTOFF_SLOTS - 1)];
+        let v = slot.version.load(Ordering::Relaxed);
+        slot.version.store(v.wrapping_add(1), Ordering::Release);
+        slot.action_id.store(action_id, Ordering::Relaxed);
+        slot.cutoff_stream_seq
+            .store(cutoff_stream_seq, Ordering::Relaxed);
+        slot.terminal_offset_ns.store(
+            elapsed.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        slot.version.store(v.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Tear-free seqlock lookup returning `(cutoff_stream_seq, terminal_offset_ns)` if `action_id`
+    /// has committed terminal state on RT.
+    pub(crate) fn get(&self, action_id: u64) -> Option<(u64, u64)> {
+        if action_id == 0 {
+            return None;
+        }
+        let slot = &self.slots[(action_id as usize) & (TERMINAL_CUTOFF_SLOTS - 1)];
+        for _ in 0..8 {
+            let v1 = slot.version.load(Ordering::Acquire);
+            if v1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let id = slot.action_id.load(Ordering::Relaxed);
+            let seq = slot.cutoff_stream_seq.load(Ordering::Relaxed);
+            let ns = slot.terminal_offset_ns.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            let v2 = slot.version.load(Ordering::Acquire);
+            if v1 == v2 {
+                return (id == action_id).then_some((seq, ns));
+            }
+        }
+        None
+    }
+}
 
 /// Compact inline UTF-8 label (`Copy`, zero heap allocation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,13 +511,16 @@ impl ActionDiagEntry {
         }
     }
 
-    fn seal(&mut self, now: Instant) {
+    fn seal(&mut self, terminal_at: Instant, mark_done_phase: bool) {
         if self.sealed {
             return;
         }
         if let Some((prev_phase, start)) = self.current_phase.take() {
-            let ms = now.saturating_duration_since(start).as_millis() as u32;
+            let ms = terminal_at.saturating_duration_since(start).as_millis() as u32;
             *self.phase_ms.entry(prev_phase).or_insert(0) += ms;
+        }
+        if mark_done_phase {
+            self.phase_ms.entry("done".to_owned()).or_insert(0);
         }
         self.sealed = true;
     }
@@ -901,14 +985,21 @@ impl ActionDiagStore {
         slot
     }
 
-    /// Drains all pending patches from the SPSC stream into the bounded off-RT overlay table.
-    pub(crate) fn drain(&mut self) -> usize {
+    /// Drains all pending patches from the SPSC stream into the bounded off-RT overlay table,
+    /// dropping any patch whose stream sequence exceeds the RT-recorded terminal cutoff for its
+    /// `action_id` (even if no reader has observed the terminal state yet).
+    pub(crate) fn drain(&mut self, cutoff: &ActionDiagTerminalCutoff) -> usize {
         let mut count = 0usize;
         while let Some(sample) = self.rx.try_pop() {
             let patch = sample.payload;
             if patch.action_id != 0 {
-                let entry = self.entry_mut(patch.action_id);
-                entry.apply_patch(patch.kind);
+                let past_cutoff = cutoff
+                    .get(patch.action_id)
+                    .is_some_and(|(cutoff_seq, _)| sample.seq > cutoff_seq);
+                if !past_cutoff {
+                    let entry = self.entry_mut(patch.action_id);
+                    entry.apply_patch(patch.kind);
+                }
             }
             count += 1;
         }
@@ -919,33 +1010,63 @@ impl ActionDiagStore {
         self.rx.stats()
     }
 
-    /// Drains pending patches, freezes the overlay for `action.id` if non-running (single terminal
-    /// cutoff), and applies the overlay onto `action`.
-    pub(crate) fn attach_to_action(&mut self, action: &mut ActionStatus, force_seal: bool) {
-        self.drain();
+    fn resolve_terminal_instant(
+        action: &ActionStatus,
+        cutoff: &ActionDiagTerminalCutoff,
+        boot_instant: Instant,
+    ) -> Instant {
+        if let Some((_, ns)) = cutoff.get(action.id) {
+            return boot_instant + Duration::from_nanos(ns);
+        }
+        if let Some(t_s) = action
+            .finished_at
+            .filter(|t| t.is_finite() && *t >= 0.0)
+        {
+            return boot_instant + Duration::from_secs_f64(t_s);
+        }
+        Instant::now()
+    }
+
+    /// Drains pending patches, freezes the overlay for `action.id` if non-running (anchored to the
+    /// RT terminal edge), and applies the overlay onto `action`.
+    pub(crate) fn attach_to_action(
+        &mut self,
+        action: &mut ActionStatus,
+        force_seal: bool,
+        cutoff: &ActionDiagTerminalCutoff,
+        boot_instant: Instant,
+    ) {
+        self.drain(cutoff);
         if action.id == 0 {
             return;
         }
         if force_seal || !action.is_running() {
-            let now = Instant::now();
+            let terminal_at = Self::resolve_terminal_instant(action, cutoff, boot_instant);
+            let mark_done = action.state.as_str() == "done";
             let entry = self.entry_mut(action.id);
-            entry.seal(now);
+            entry.seal(terminal_at, mark_done);
             entry.apply_to_action(action);
         } else if let Some(entry) = self.entry(action.id) {
             entry.apply_to_action(action);
         }
     }
 
-    /// Drains pending patches, seals any terminal `obs.action` / `obs.previous_action`, and
-    /// overlays accumulated diagnostics in place.
-    pub(crate) fn attach_to_observation(&mut self, obs: &mut ArmObservation) {
-        self.drain();
-        let now = Instant::now();
+    /// Drains pending patches, seals any terminal `obs.action` / `obs.previous_action` using the
+    /// RT terminal instant, and overlays accumulated diagnostics in place.
+    pub(crate) fn attach_to_observation(
+        &mut self,
+        obs: &mut ArmObservation,
+        cutoff: &ActionDiagTerminalCutoff,
+        boot_instant: Instant,
+    ) {
+        self.drain(cutoff);
         if let Some(a) = obs.action.as_mut() {
             if a.id != 0 {
                 if !a.is_running() {
+                    let terminal_at = Self::resolve_terminal_instant(a, cutoff, boot_instant);
+                    let mark_done = a.state.as_str() == "done";
                     let entry = self.entry_mut(a.id);
-                    entry.seal(now);
+                    entry.seal(terminal_at, mark_done);
                     entry.apply_to_action(a);
                 } else if let Some(entry) = self.entry(a.id) {
                     entry.apply_to_action(a);
@@ -954,8 +1075,10 @@ impl ActionDiagStore {
         }
         if let Some(a) = obs.previous_action.as_mut() {
             if a.id != 0 {
+                let terminal_at = Self::resolve_terminal_instant(a, cutoff, boot_instant);
+                let mark_done = a.state.as_str() == "done";
                 let entry = self.entry_mut(a.id);
-                entry.seal(now);
+                entry.seal(terminal_at, mark_done);
                 entry.apply_to_action(a);
             }
         }

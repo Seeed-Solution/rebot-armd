@@ -469,27 +469,38 @@ impl DetectorDefaults {
     }
 }
 
-/// Single-view depth measurements (`POST /api/v1/grasp/measure`) and detector kind switches
-/// (`POST /api/v1/vision/detector`) share the vision provider and mutually exclude each other
-/// through a single non-blocking state gate (never held across `.await`).
+/// Single-view depth measurements (`POST /api/v1/grasp/measure`), REST detector switches
+/// (`POST /api/v1/vision/detector`), and grasp preflight model switches share the vision provider
+/// and mutually exclude each other through one non-blocking state gate (never held across `.await`).
 #[derive(Default)]
 struct VisionUseState {
     measures: usize,
     switching: bool,
+    /// Set when the provider accepts an asynchronous model switch (`POST /api/models` 2xx with
+    /// `generation`) and cleared only once `GET /api/mode` confirms `generation >= gen` with
+    /// `swap_state` in `idle | failed`. Survives polling errors/timeouts so a subsequent
+    /// `depth_measure` cannot overlap an unsettled provider swap.
+    pending_swap_generation: Option<u64>,
 }
 
 static VISION_USE: Mutex<VisionUseState> = Mutex::new(VisionUseState {
     measures: 0,
     switching: false,
+    pending_swap_generation: None,
 });
 
-/// Held by a running depth measurement ([`measure_in_flight`] / [`try_begin_measure`]).
+static VISION_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Held by a running depth measurement ([`begin_measure`] / [`try_begin_measure`]).
 pub struct MeasureGuard(());
 
 impl Drop for MeasureGuard {
     fn drop(&mut self) {
-        let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
-        st.measures = st.measures.saturating_sub(1);
+        {
+            let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+            st.measures = st.measures.saturating_sub(1);
+        }
+        VISION_NOTIFY.notify_waiters();
     }
 }
 
@@ -497,30 +508,88 @@ struct SwitchGuard(());
 
 impl Drop for SwitchGuard {
     fn drop(&mut self) {
-        let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
-        st.switching = false;
+        {
+            let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+            st.switching = false;
+        }
+        VISION_NOTIFY.notify_waiters();
+    }
+}
+
+/// Held by a grasp preflight model switch ([`begin_grasp_model_switch`]): serializes against
+/// REST detector switches and waits for / fences against concurrent depth measurements.
+pub(crate) struct GraspModelSwitchGuard {
+    _serial: tokio::sync::MutexGuard<'static, ()>,
+    _switch: SwitchGuard,
+}
+
+/// Serializes a grasp preflight model switch behind any active model switch and any in-flight
+/// depth measurements, then fences new depth measurements until preflight drops the guard.
+pub(crate) async fn begin_grasp_model_switch() -> GraspModelSwitchGuard {
+    let serial = crate::grasp::MODEL_SWITCH.lock().await;
+    loop {
+        let notified = VISION_NOTIFY.notified();
+        {
+            let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+            if st.measures == 0 && !st.switching {
+                st.switching = true;
+                return GraspModelSwitchGuard {
+                    _serial: serial,
+                    _switch: SwitchGuard(()),
+                };
+            }
+        }
+        notified.await;
     }
 }
 
 /// Marks a depth measurement as running until the guard is dropped.
+/// Kept for compatibility with tests; production callers use [`begin_measure`].
 pub fn measure_in_flight() -> MeasureGuard {
     let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
     st.measures = st.measures.saturating_add(1);
     MeasureGuard(())
 }
 
-/// Atomically registers an in-flight depth measurement if no detector model switch is active,
-/// refusing with `409 VISION_BUSY` if a switch holds the provider.
+/// Atomically registers an in-flight depth measurement if no model switch (active or unsettled on
+/// the provider) holds the vision provider, refusing with `409 VISION_BUSY` otherwise.
 pub fn try_begin_measure() -> Result<MeasureGuard, ArmError> {
     let _probe = crate::grasp::MODEL_SWITCH
         .try_lock()
         .map_err(|_| busy("a model switch is in progress"))?;
     let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
-    if st.switching {
+    if st.switching || st.pending_swap_generation.is_some() {
         return Err(busy("a model switch is in progress"));
     }
     st.measures = st.measures.saturating_add(1);
     Ok(MeasureGuard(()))
+}
+
+/// Production admission gate for single-view depth measurements: if a prior REST model switch left
+/// an unsettled provider-accepted `pending_swap_generation` (e.g. poll timed out or failed), probes
+/// `source.mode_info()` once to confirm the swap settled before admitting the measurement.
+pub async fn begin_measure(source: &dyn DetectionSource) -> Result<MeasureGuard, ArmError> {
+    let pending = VISION_USE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_swap_generation;
+    if let Some(gen) = pending {
+        let mode = source
+            .mode_info()
+            .await
+            .map_err(|_| busy("the vision service is switching models"))?;
+        let settled = mode.models.as_ref().is_some_and(|pm| {
+            pm.generation >= gen && matches!(pm.swap_state.as_str(), "idle" | "failed")
+        });
+        if !settled {
+            return Err(busy("the vision service is switching models"));
+        }
+        let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+        if st.pending_swap_generation == Some(gen) {
+            st.pending_swap_generation = None;
+        }
+    }
+    try_begin_measure()
 }
 
 /// Why an action of `kind` in `state` blocks a switch (None: it does not).
@@ -636,10 +705,20 @@ pub async fn switch(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSourc
     let Some(generation) = v.get("generation").and_then(Value::as_u64) else {
         return Err(rejected(502, "DETECTION_UNAVAILABLE", "The vision service's model switch reply has no generation. Update rebot-teleop on the device."));
     };
+    {
+        let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending_swap_generation = Some(generation);
+    }
     let deadline = Instant::now() + SWITCH_TIMEOUT;
     loop {
         let m = source.mode_info().await.map_err(unreachable)?;
         if let Some(pm) = m.models.as_ref().filter(|pm| pm.generation >= generation && matches!(pm.swap_state.as_str(), "idle" | "failed")) {
+            {
+                let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+                if st.pending_swap_generation == Some(generation) {
+                    st.pending_swap_generation = None;
+                }
+            }
             if pm.swap_state == "failed" {
                 let why = pm.swap_error.as_deref().unwrap_or("unknown error");
                 let code = if why.starts_with("ION_BUDGET") { "ION_BUDGET" } else { "MODEL_SWITCH_FAILED" };

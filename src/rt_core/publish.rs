@@ -455,6 +455,8 @@ pub struct ReadRequirements {
     pub require_within_valid_until: bool,
     /// Maximum allowed age `now - snap.meta.sampled_at`.
     pub max_snapshot_age: Option<Duration>,
+    /// Minimum required `snap.meta.sampled_at` (used for causal post-capture reads).
+    pub min_captured_at: Option<Instant>,
     /// Require `PublishedOwnerMeta::feedback_valid == true`.
     pub require_feedback_valid: bool,
     /// Require every arm joint (`0..arm_dof`) to carry a receive instant with
@@ -479,6 +481,7 @@ impl Default for ReadRequirements {
             min_release_seq: None,
             require_within_valid_until: true,
             max_snapshot_age: None,
+            min_captured_at: None,
             require_feedback_valid: false,
             max_feedback_age: None,
             require_motion_idle: false,
@@ -498,6 +501,7 @@ impl ReadRequirements {
             min_release_seq: None,
             require_within_valid_until: false,
             max_snapshot_age: None,
+            min_captured_at: None,
             require_feedback_valid: false,
             max_feedback_age: None,
             require_motion_idle: false,
@@ -514,6 +518,7 @@ impl ReadRequirements {
             min_release_seq: None,
             require_within_valid_until: true,
             max_snapshot_age: Some(max_age),
+            min_captured_at: None,
             require_feedback_valid: true,
             max_feedback_age: Some(max_age),
             require_motion_idle: false,
@@ -530,6 +535,7 @@ impl ReadRequirements {
             min_release_seq: None,
             require_within_valid_until: true,
             max_snapshot_age: Some(max_feedback_age),
+            min_captured_at: None,
             require_feedback_valid: true,
             max_feedback_age: Some(max_feedback_age),
             require_motion_idle: true,
@@ -1180,6 +1186,16 @@ pub struct StateHub {
     action_diag: Mutex<super::action_diag::ActionDiagStore>,
     /// Monotonic revision bumped on every pushed [`ActionDiagPatch`].
     action_diag_seq: AtomicU64,
+    /// Latest stream sequence number returned by `action_diag_tx.try_push` (read lock-free on
+    /// `armd-control` at action terminal edges to freeze the exact stream cutoff).
+    action_diag_pushed_seq: AtomicU64,
+    /// Lock-free, zero-allocation RT terminal cutoff table written on `armd-control` at terminal
+    /// action commit and read off-RT by `ActionDiagStore`.
+    action_diag_cutoff: super::action_diag::ActionDiagTerminalCutoff,
+    /// Supervisor boot instant (`start_time`), bound once in `ArmSupervisor::new` so RT terminal
+    /// timestamps (`Duration` since boot) map back to monotonic `Instant` without reader drift.
+    boot_instant: OnceLock<Instant>,
+    fallback_boot_instant: Instant,
     /// Test hook: when true, pauses automatic consumer drain to exercise drop-newest overflow.
     action_diag_consumer_paused: AtomicBool,
     /// Number of off-RT readers currently waiting to acquire `self.state` inside `latest()`.
@@ -1226,6 +1242,10 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         action_diag_tx: Mutex::new(action_diag_tx),
         action_diag: Mutex::new(action_diag_store),
         action_diag_seq: AtomicU64::new(0),
+        action_diag_pushed_seq: AtomicU64::new(0),
+        action_diag_cutoff: super::action_diag::ActionDiagTerminalCutoff::new(),
+        boot_instant: OnceLock::new(),
+        fallback_boot_instant: Instant::now(),
         action_diag_consumer_paused: AtomicBool::new(false),
         latest_waiters: AtomicUsize::new(0),
     });
@@ -1347,6 +1367,28 @@ impl StateHub {
         }
     }
 
+    /// Binds the supervisor's `start_time` boot instant (called once in `ArmSupervisor::new`).
+    pub fn set_boot_instant(&self, start_time: Instant) {
+        let _ = self.boot_instant.set(start_time);
+    }
+
+    fn boot_instant(&self) -> Instant {
+        self.boot_instant
+            .get()
+            .copied()
+            .unwrap_or(self.fallback_boot_instant)
+    }
+
+    /// Records the exact RT terminal edge for `action_id` (single-writer `armd-control`, zero
+    /// locks, zero allocations). Any `ActionDiagPatch` pushed after this edge (even before the
+    /// first off-RT reader drains the stream) is discarded, and final phase timing closes at
+    /// `boot_instant + elapsed` instead of reader observation time.
+    pub fn record_action_terminal_cutoff_rt(&self, action_id: u64, elapsed: Duration) {
+        let cutoff_seq = self.action_diag_pushed_seq.load(Ordering::Acquire);
+        self.action_diag_cutoff
+            .record(action_id, cutoff_seq, elapsed);
+    }
+
     /// Monotonic sequence of off-RT action diagnostic stream patches (`0` before first patch).
     pub fn action_diag_seq(&self) -> u64 {
         self.action_diag_seq.load(Ordering::Acquire)
@@ -1370,7 +1412,11 @@ impl StateHub {
                 .action_diag_tx
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            tx.try_push(patch)
+            let r = tx.try_push(patch);
+            if let Ok(seq) = r {
+                self.action_diag_pushed_seq.fetch_max(seq, Ordering::Release);
+            }
+            r
         };
         let res = match first {
             Ok(seq) => Ok(seq),
@@ -1382,7 +1428,11 @@ impl StateHub {
                     .action_diag_tx
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                tx.try_push(patch)
+                let r = tx.try_push(patch);
+                if let Ok(seq) = r {
+                    self.action_diag_pushed_seq.fetch_max(seq, Ordering::Release);
+                }
+                r
             }
             Err(e) => Err(e),
         };
@@ -1533,7 +1583,7 @@ impl StateHub {
         self.action_diag
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .drain()
+            .drain(&self.action_diag_cutoff)
     }
 
     /// Applies accumulated (and seals terminal) action diagnostics onto `obs.action` and
@@ -1542,10 +1592,11 @@ impl StateHub {
         if self.action_diag_consumer_paused.load(Ordering::Acquire) {
             return;
         }
+        let boot = self.boot_instant();
         self.action_diag
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .attach_to_observation(obs);
+            .attach_to_observation(obs, &self.action_diag_cutoff, boot);
     }
 
     /// Single terminal freeze cutoff: drains pending patches, seals `action.id`, and overlays the
@@ -1554,10 +1605,11 @@ impl StateHub {
         if self.action_diag_consumer_paused.load(Ordering::Acquire) {
             return;
         }
+        let boot = self.boot_instant();
         self.action_diag
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .attach_to_action(action, true);
+            .attach_to_action(action, true, &self.action_diag_cutoff, boot);
     }
 
     /// Returns lock-free [`StreamStats`](super::stream::StreamStats) for the action diagnostics stream.
@@ -1891,6 +1943,15 @@ impl StateHub {
                 return Err(ServiceReadError::SnapshotStale {
                     age_ms: age.as_millis() as u64,
                     max_ms: max_age.as_millis() as u64,
+                });
+            }
+        }
+        if let Some(min_at) = req.min_captured_at {
+            if snap.meta.sampled_at < min_at {
+                let behind_ms = min_at.saturating_duration_since(snap.meta.sampled_at).as_millis() as u64;
+                return Err(ServiceReadError::SnapshotStale {
+                    age_ms: behind_ms,
+                    max_ms: 0,
                 });
             }
         }

@@ -168,7 +168,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         reply: ReplyPolicy::CommandDeferred,
         ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::LeaseFree,
+        executor_route: ExecutorWsRoute::Unified,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/record/start"),

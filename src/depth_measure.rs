@@ -344,11 +344,13 @@ async fn read_post_capture_service(
     let base_req = ReadRequirements {
         require_within_valid_until: true,
         require_prep_env: true,
+        min_captured_at: Some(capture_done_at),
         ..ReadRequirements::default()
     };
-    if svc0.publish_seq == 0 && supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
-        // No-ticker legacy owner: read_services synthesizes a fresh snapshot directly under the
-        // supervisor read lock at `Instant::now() >= capture_done_at`.
+    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+        // Legacy owner: returns a post-capture StateHub snapshot if a periodic ticker published
+        // one, or synthesizes a fresh coherent snapshot directly under the supervisor read lock
+        // (working even after a single manual tick with no periodic ticker).
         return supervisor.read_services(base_req).await;
     }
     let deadline = Instant::now() + POST_CAPTURE_WAIT;
@@ -359,14 +361,15 @@ async fn read_post_capture_service(
             ..base_req
         };
         match supervisor.read_services(req).await {
-            Ok(svc1) => {
-                if svc1.captured_at >= capture_done_at {
-                    return Ok(svc1);
-                }
-                want_seq = svc1.publish_seq.saturating_add(1);
-            }
+            Ok(svc1) => return Ok(svc1),
             Err(ArmError::Rejected { status: 503, ref code, .. })
-                if code == "OBSERVATION_UNAVAILABLE" && Instant::now() < deadline => {}
+                if code == "OBSERVATION_UNAVAILABLE" && Instant::now() < deadline =>
+            {
+                let cur_seq = supervisor.hub().published_seq();
+                if cur_seq >= want_seq {
+                    want_seq = cur_seq.saturating_add(1);
+                }
+            }
             Err(e) => return Err(e),
         }
         if Instant::now() >= deadline {
@@ -383,8 +386,9 @@ async fn read_post_capture_service(
 /// the commanded positions or calibration changed meanwhile, then fit and measure. No lease, no motion.
 pub async fn measure(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
     let req = parse_request(body)?;
-    // Mutually exclude detector switches (`POST /api/v1/vision/detector`) for the full capture.
-    let _in_flight = crate::vision_detector::try_begin_measure()?;
+    // Mutually exclude detector switches (`POST /api/v1/vision/detector` and grasp preflight) for
+    // the full capture, including any unsettled provider-accepted async model swap.
+    let _in_flight = crate::vision_detector::begin_measure(source).await?;
     let svc0 = supervisor
         .read_services(ReadRequirements {
             require_within_valid_until: true,

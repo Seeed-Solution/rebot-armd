@@ -3386,7 +3386,11 @@ pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp)
     let has_task_reqs = request.task.as_deref().is_some_and(|_| !request.requires.is_empty() || request.models.is_some());
     if has_task_reqs {
         let task = request.task.as_deref().unwrap();
-        let _serial = if request.models.is_some() { Some(MODEL_SWITCH.lock().await) } else { None };
+        let _serial = if request.models.is_some() {
+            Some(crate::vision_detector::begin_grasp_model_switch().await)
+        } else {
+            None
+        };
         let mut mode = source.mode_info().await;
         if let (Some(models), Ok(m)) = (&request.models, &mode) {
             if let Some(body) = models.switch_body(m) {
