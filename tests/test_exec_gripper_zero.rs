@@ -346,6 +346,13 @@ struct ZeroCheckDriverState {
     /// History of written J7 targets after recording is enabled.
     recorded_j7_targets: Vec<f32>,
     record_targets: bool,
+    /// When `Some((age, cached_q))`, holds J7 feedback stale by `age` and reports `cached_q`
+    /// without advancing `rx_at[6]`, testing E-stop freshness preservation.
+    stale_j7: Option<(Duration, f32)>,
+    /// Joint temperature reported for J7 (°C).
+    j7_temperature_c: f32,
+    /// When `true`, ages all joint feedback timestamps by 2s to trigger `BusLossFallback`.
+    bus_loss_stale: bool,
 }
 
 impl ZeroCheckDriver {
@@ -366,6 +373,9 @@ impl ZeroCheckDriver {
                 last_written_j7: None,
                 recorded_j7_targets: Vec::with_capacity(512),
                 record_targets: false,
+                stale_j7: None,
+                j7_temperature_c: 30.0,
+                bus_loss_stale: false,
             })),
         }
     }
@@ -466,15 +476,22 @@ impl ArmDriver for ZeroCheckDriver {
     fn fresh_joint_positions_into(
         &self,
         indices: &[usize],
-        _max_age: Duration,
+        max_age: Duration,
         out: &mut [f32],
     ) -> bool {
         if out.len() < indices.len() {
             return false;
         }
         let s = self.state.lock().unwrap();
+        let now = Instant::now();
         for (slot, &i) in out.iter_mut().zip(indices.iter()) {
             let Some(&p) = s.q.get(i) else { return false };
+            let Some(ts) = s.rx_at.get(i).and_then(|t| *t) else {
+                return false;
+            };
+            if now.saturating_duration_since(ts) > max_age {
+                return false;
+            }
             *slot = p;
         }
         true
@@ -500,13 +517,25 @@ impl ArmDriver for ZeroCheckDriver {
         };
         out.clear();
         for i in 0..7 {
-            s.rx_at[i] = Some(now);
-            s.seqs[i] += 1;
+            if s.bus_loss_stale {
+                s.rx_at[i] = Some(now - Duration::from_secs(2));
+            } else if i == 6 {
+                if let Some((age, cached_q)) = s.stale_j7 {
+                    s.rx_at[6] = Some(now - age);
+                    s.q[6] = cached_q;
+                } else {
+                    s.rx_at[6] = Some(now);
+                    s.seqs[6] += 1;
+                }
+            } else {
+                s.rx_at[i] = Some(now);
+                s.seqs[i] += 1;
+            }
             out.push(JointState {
                 position: s.q[i],
                 velocity: 0.0,
                 torque: if i == 6 { j7_torque } else { 0.0 },
-                temperature: 30.0,
+                temperature: if i == 6 { s.j7_temperature_c } else { 30.0 },
             });
         }
         Ok(())
@@ -561,10 +590,12 @@ impl ArmDriver for ZeroCheckDriver {
             if s.record_targets && s.recorded_j7_targets.len() < s.recorded_j7_targets.capacity() {
                 s.recorded_j7_targets.push(t7.position);
             }
-            if s.never_stall_creep {
+            if let Some((_, cached_q)) = s.stale_j7 {
+                s.q[6] = cached_q;
+            } else if s.never_stall_creep {
                 // Oscillate above the stillness-stall threshold without reaching target or
                 // making net closing progress -> triggers `GRIPPER_TIMEOUT` right at `timeout_s`.
-                s.q[6] = if s.seqs[6] % 2 == 0 { -0.08 } else { -0.02 };
+                s.q[6] = if s.seqs[6].is_multiple_of(2) { -0.08 } else { -0.02 };
             } else if let Some(stop_q) = s.stall_stop_q {
                 s.q[6] = t7.position.min(stop_q);
             } else {
@@ -1699,23 +1730,64 @@ async fn executor_zero_check_stream_saturation_repeated_failures_zero_leak_and_p
     assert!(!rig.calib_path.exists());
     rig.wait_zero_check_ctx_empty("stream_saturation").await;
 
-    // 2. 20x consecutive store_offset=true refusals (exceeding ZERO_CHECK_CTX_CAPACITY=16!)
-    //    using wrong epoch / wrong lease -> must NEVER exhaust staging table or leak!
+    // 2. 20x consecutive post-staging store_offset=true refusals (exceeding ZERO_CHECK_CTX_CAPACITY=16!)
+    //    Hold `config_write_lock` while one store_offset=true check is in PR C persistence so
+    //    `ExclusiveOutput` is occupied: every subsequent valid command passes off-RT preparation,
+    //    calls `stage_zero_check_context`, submits to the broker, and is refused on RT
+    //    (`MOTION_BUSY` / `SESSION_BUSY`), proving `BrokerDispatcher` reclaims every staged context.
+    let cw_guard = rig.sup.config_write_lock().lock_owned().await;
+    let first_req = next_req_id();
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": first_req,
+            "generation": gen,
+            "epoch_id": ep,
+            "path": "/api/v1/action/gripper_zero_check",
+            "body": {"store_offset": true},
+        }),
+    )
+    .await;
+    let first_ack = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("request_id").and_then(Value::as_u64) == Some(first_req) {
+                return v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first_ack["type"], "command_ack", "{first_ack}");
+    let first_action_id = first_ack["action_id"].as_u64().unwrap();
+
     for i in 0..20u64 {
+        let cur_ep = rig.sup.get_observation().await.epoch_id;
         let rej = send_cmd(
             &mut ws,
-            gen + 1 + i,
-            ep,
+            gen,
+            cur_ep,
             "/api/v1/action/gripper_zero_check",
             json!({"store_offset": true}),
         )
         .await;
         assert_eq!(rej["type"], "command_reject", "iter {i}: {rej}");
-        assert_eq!(rej["code"], "LEASE_LOST", "iter {i}: {rej}");
+        let code = rej["code"].as_str().unwrap_or("");
+        assert!(
+            code == "MOTION_BUSY" || code == "SESSION_BUSY" || code == "BUSY",
+            "iter {i}: expected RT busy refusal after staging, got {rej}"
+        );
     }
-    rig.wait_zero_check_ctx_empty("repeated_refusals").await;
+    drop(cw_guard);
+    let term_first = wait_terminal_for_id(&mut ws, first_action_id, Duration::from_secs(8)).await;
+    assert_eq!(term_first["state"], "done", "{term_first}");
+    assert_eq!(term_first["durability_confirmed"], json!(true), "{term_first}");
+    assert!(rig.calib_path.exists());
+    rig.wait_zero_check_ctx_empty("post_staging_20x_refusals").await;
 
-    // 3. Subsequent valid store_offset=true succeeds cleanly after saturation + 20 failures!
+    // 3. Subsequent valid store_offset=true succeeds cleanly after saturation + 20 post-staging refusals!
     let ep2 = rig.sup.get_observation().await.epoch_id;
     let (_, term_ok, _) = run_cmd_to_terminal(
         &mut ws,
@@ -1733,4 +1805,866 @@ async fn executor_zero_check_stream_saturation_repeated_failures_zero_leak_and_p
     rig.wait_zero_check_ctx_empty("after_recovery").await;
     rig.assert_zero_rt_allocs("stream_sat_and_20x_refusals");
     rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 11. Blocker 1 regression: E-stop with stale J7 feedback preserves commanded hold
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_estop_preserves_commanded_when_j7_feedback_stale() {
+    let driver = ZeroCheckDriver::new(-0.50);
+    let driver_for_inner = driver.clone();
+    let rig = DualRig::start(
+        RtOwner::Executor,
+        OperatorAuth::disabled(),
+        |cfg| {
+            // Disable close torque-cap watchdog so RT ingests the 350ms stale J7 sample
+            // before E-stop arrives instead of aborting early on FEEDBACK_UNAVAILABLE.
+            if let Some(gp) = cfg.gripper_policy.as_mut() {
+                gp.max_close_torque_nm = None;
+            }
+        },
+        move |inner| {
+            let mut q = INSPECT;
+            q[6] = -0.50;
+            inner.measured_positions = q.to_vec();
+            inner.commanded_positions = q.to_vec();
+            inner.target_positions = q.to_vec();
+            inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(driver_for_inner)));
+        },
+        PersistTestHooks::default(),
+    )
+    .await;
+
+    let mut ws = connect_ws(rig.addr, None).await;
+    let gen = acquire_lease(&mut ws, "c-estop-stale", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+
+    let req_id = next_req_id();
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": req_id,
+            "generation": gen,
+            "epoch_id": ep,
+            "path": "/api/v1/action/gripper_zero_check",
+            "body": {"store_offset": false},
+        }),
+    )
+    .await;
+    let ack = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("request_id").and_then(Value::as_u64) == Some(req_id) {
+                return v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let action_id = ack["action_id"].as_u64().unwrap();
+
+    // Wait until seek advances J7 commanded target above -0.44 rad.
+    let dl = Instant::now() + Duration::from_secs(2);
+    loop {
+        let last_j7 = driver.state.lock().unwrap().last_written_j7;
+        if last_j7.is_some_and(|v| v > -0.44) {
+            break;
+        }
+        assert!(Instant::now() < dl, "J7 seek did not advance: {last_j7:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Freeze J7 feedback at age 350 ms (> E-stop's 250 ms freshness gate, < 500 ms BUS_LOSS_TIMEOUT)
+    // with cached measured_positions[6] = -0.80 rad (far behind commanded ~ -0.42 rad).
+    {
+        let mut s = driver.state.lock().unwrap();
+        s.stale_j7 = Some((Duration::from_millis(350), -0.80));
+        s.recorded_j7_targets.clear();
+        s.record_targets = true;
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let _ = ws_reply(&mut ws, json!({"type": "e_stop"}), &["epoch_sync"]).await;
+    let term = wait_terminal_for_id(&mut ws, action_id, Duration::from_secs(4)).await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "ESTOP_ACTIVE", "{term}");
+
+    // Let several post-E-stop ticks execute and verify no target ever snapped to stale -0.80 rad.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let recorded = driver.state.lock().unwrap().recorded_j7_targets.clone();
+    assert!(!recorded.is_empty(), "expected J7 targets recorded across E-stop");
+    for &t in &recorded {
+        assert!(
+            t > -0.60,
+            "E-stop overwrote J7 hold target with stale cached feedback (-0.80): recorded={recorded:?}"
+        );
+    }
+
+    rig.assert_zero_rt_allocs("estop_stale_j7");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 12. Major 1 regression: oversized durability_warning -> 0 RT alloc + full mirror
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_oversized_durability_warning_zero_rt_alloc_and_full_mirror() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_hook = Arc::clone(&calls);
+    let long_tail = "Z".repeat(420);
+    let long_tail_hook = long_tail.clone();
+    let hooks = PersistTestHooks {
+        dir_sync_override: Some(Arc::new(move |_| {
+            let n = calls_hook.fetch_add(1, Ordering::AcqRel);
+            if n == 0 {
+                Err(std::io::Error::other(format!("dir_sync_eio: {long_tail_hook}")))
+            } else {
+                Ok(())
+            }
+        })),
+        ..Default::default()
+    };
+    let rig = DualRig::start(
+        RtOwner::Executor,
+        OperatorAuth::disabled(),
+        |_| {},
+        |inner| {
+            inner.set_mock_gripper_stall_offset(Some(0.05));
+        },
+        hooks,
+    )
+    .await;
+
+    let mut ws = connect_ws(rig.addr, None).await;
+    let gen = acquire_lease(&mut ws, "c-big-warn", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+
+    let (_, term, _) = run_cmd_to_terminal(
+        &mut ws,
+        gen,
+        ep,
+        "/api/v1/action/gripper_zero_check",
+        json!({"store_offset": true}),
+        Duration::from_secs(8),
+    )
+    .await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "PERSIST_FAILED", "{term}");
+    assert_eq!(term["durability_confirmed"], json!(false), "{term}");
+    let msg = term["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("Parent directory fsync failed"),
+        "expected non-empty dir-sync failure message alongside warning, got: {term}"
+    );
+    let warn = term["durability_warning"].as_str().unwrap_or("");
+    assert!(
+        warn.contains(&long_tail),
+        "expected full untruncated >420-byte durability_warning in WS mirror, got len={}: {warn}",
+        warn.len()
+    );
+
+    // Wait for background reconciliation to clear HoldState::Reconciling.
+    let dl = Instant::now() + Duration::from_secs(6);
+    loop {
+        let reply = rig
+            .sup
+            .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+            .await
+            .unwrap();
+        if let ConfigReply::HoldInspected { state: None, .. } = reply {
+            break;
+        }
+        assert!(Instant::now() < dl, "GripperCalibration did not reconcile");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Run two follow-up actions to force full rollover of `action` and `prev_action` in ObservationSpares.
+    for _ in 0..2 {
+        let ep_next = rig.sup.get_observation().await.epoch_id;
+        let (_, t2, _) = run_cmd_to_terminal(
+            &mut ws,
+            gen,
+            ep_next,
+            "/api/v1/action/gripper_zero_check",
+            json!({"store_offset": false}),
+            Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(t2["state"], "done", "{t2}");
+    }
+
+    rig.wait_zero_check_ctx_empty("oversized_warning_rollover").await;
+    rig.assert_zero_rt_allocs("oversized_warning_rollover");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 13. Major 2 regression: drop waiter after broker admit + fail-closed after worker exit
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_drop_waiter_preserves_admitted_ctx_and_worker_exit_fails_closed() {
+    // Part A: dropping the broker submission oneshot receiver immediately after admission must
+    // NOT delete the staged ZeroCheckPersistContext; the admitted action finishes & persists.
+    {
+        let rig = DualRig::start(
+            RtOwner::Executor,
+            OperatorAuth::disabled(),
+            |_| {},
+            |inner| {
+                inner.lease_enabled = false;
+                let adm = armd::supervisor::AdmissionStamp {
+                    stop_gen: 0,
+                    estop_epoch: inner.safety.epoch_id(),
+                    lease_gen: 0,
+                    connection_id: 0,
+                    request_id: 1,
+                };
+                let admitted = inner.check_admission(adm).unwrap();
+                armd::SupervisorInner::enable_torque(admitted).unwrap();
+                inner.set_mock_gripper_stall_offset(Some(0.05));
+            },
+            PersistTestHooks::default(),
+        )
+        .await;
+
+        let handle = rig.sup.executor_handle().unwrap();
+        handle.attach_external_reply_sink(Arc::new(|_, _| {
+            armd::rt_core::broker::DeliveryDecision::Delivered
+        }));
+
+        let svc = rig
+            .sup
+            .read_services(armd::rt_core::publish::ReadRequirements {
+                require_within_valid_until: false,
+                require_prep_env: true,
+                ..armd::rt_core::publish::ReadRequirements::identity()
+            })
+            .await
+            .unwrap();
+        let pub_cfg = rig.sup.published_config().await.unwrap();
+        let admission = armd::supervisor::AdmissionStamp {
+            stop_gen: svc.applied_stop_generation,
+            estop_epoch: svc.snapshot.owner.epoch,
+            lease_gen: 0,
+            connection_id: 0,
+            request_id: 7777,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (prepared, persist_ctx) = armd::rt_core::requests::actions::prepare_gripper_zero_check(
+            &svc,
+            &pub_cfg,
+            admission,
+            deadline,
+            &json!({"store_offset": true}),
+            armd::auth::OperatorGrant::unenforced(),
+            None,
+        )
+        .unwrap();
+        let ctx_id = handle.stage_zero_check_context(persist_ctx.unwrap()).unwrap();
+        let slot = prepared.to_plan_slot(ctx_id).unwrap();
+        let write = |dst: &mut PlanSlot| *dst = slot.clone();
+        let (_req_id, rx, ack_guard) = handle
+            .submit_external_action_with_zero_check_ctx(
+                armd::rt_core::broker::ClientId(0),
+                0,
+                prepared.stamp.broker_authority(),
+                deadline,
+                armd::rt_core::requests::actions::ActionSubmit::InstallPrepared {
+                    write: &write,
+                    kind: armd::rt_core::requests::actions::PreparedActionKind::GripperZeroCheck,
+                    prepared_boot: prepared.stamp.boot,
+                    admission_request_id: prepared.stamp.admission.request_id,
+                    check_workspace_revision: false,
+                    poses_revision: None,
+                    calibration_revision: prepared.stamp.calibration_revision,
+                    gripper_calib_revision: prepared.stamp.gripper_calib_revision,
+                    power_budget_revision: prepared.stamp.power_budget_revision,
+                },
+                armd::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOrGlobal,
+                false,
+                None,
+                ctx_id,
+            )
+            .unwrap();
+        // Simulate caller future dropped right after broker admission: drop `rx` and `ack_guard`!
+        drop(rx);
+        drop(ack_guard);
+
+        // Wait until the admitted action completes and persists cleanly.
+        let dl = Instant::now() + Duration::from_secs(8);
+        loop {
+            handle.pump_broker_replies();
+            let obs = rig.sup.get_observation().await;
+            if let Some(a) = obs.action.as_ref() {
+                if a.kind == "gripper_zero_check" && a.state != "running" {
+                    assert_eq!(a.state, "done", "{a:?}");
+                    assert_eq!(a.durability_confirmed, Some(true), "{a:?}");
+                    break;
+                }
+            }
+            assert!(Instant::now() < dl, "admitted zero_check did not complete after caller drop");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(rig.calib_path.exists());
+        rig.wait_zero_check_ctx_empty("drop_waiter_admitted").await;
+        rig.assert_zero_rt_allocs("drop_waiter_admitted");
+        rig.shutdown().await;
+    }
+
+    // Part B: once `armd-persist` exits cleanly after a job (`exit_after_first_job`),
+    // subsequent `store_offset=true` staging fails closed immediately with `PERSIST_FAILED`.
+    {
+        let hooks = PersistTestHooks {
+            exit_after_first_job: true,
+            ..Default::default()
+        };
+        let rig = DualRig::start(
+            RtOwner::Executor,
+            OperatorAuth::disabled(),
+            |_| {},
+            |inner| {
+                inner.set_mock_gripper_stall_offset(Some(0.05));
+            },
+            hooks,
+        )
+        .await;
+
+        let mut ws = connect_ws(rig.addr, None).await;
+        let gen = acquire_lease(&mut ws, "c-exit-closed", false).await;
+        let ep = rig.sup.get_observation().await.epoch_id;
+        let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+        let ep = rig.sup.get_observation().await.epoch_id;
+
+        let (_, term, _) = run_cmd_to_terminal(
+            &mut ws,
+            gen,
+            ep,
+            "/api/v1/action/gripper_zero_check",
+            json!({"store_offset": true}),
+            Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(term["state"], "done", "{term}");
+        assert_eq!(term["durability_confirmed"], json!(true), "{term}");
+        rig.wait_zero_check_ctx_empty("after_worker_exit").await;
+
+        // Wait briefly for `ExitFlag::drop` on `armd-persist` to mark `ZeroCheckContextStore` closed.
+        let handle = rig.sup.executor_handle().unwrap();
+        let exit_dl = Instant::now() + Duration::from_secs(2);
+        while !handle.persist_worker_exited() {
+            assert!(Instant::now() < exit_dl, "armd-persist did not exit after first job");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let ep2 = rig.sup.get_observation().await.epoch_id;
+        let rej = send_cmd(
+            &mut ws,
+            gen,
+            ep2,
+            "/api/v1/action/gripper_zero_check",
+            json!({"store_offset": true}),
+        )
+        .await;
+        assert_eq!(rej["type"], "command_reject", "{rej}");
+        assert_eq!(rej["code"], "PERSIST_FAILED", "{rej}");
+        rig.wait_zero_check_ctx_empty("fail_closed_after_worker_exit").await;
+        rig.assert_zero_rt_allocs("fail_closed_after_worker_exit");
+        rig.shutdown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. Major 3 regression: no-lease disconnect refuses persist via connection_id
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_no_lease_disconnect_refuses_persist_by_connection_id() {
+    let rig = DualRig::start(
+        RtOwner::Executor,
+        OperatorAuth::disabled(),
+        |_| {},
+        |inner| {
+            inner.lease_enabled = false;
+            let adm = armd::supervisor::AdmissionStamp {
+                stop_gen: 0,
+                estop_epoch: inner.safety.epoch_id(),
+                lease_gen: 0,
+                connection_id: 0,
+                request_id: 1,
+            };
+            let admitted = inner.check_admission(adm).unwrap();
+            armd::SupervisorInner::enable_torque(admitted).unwrap();
+            inner.set_mock_gripper_stall_offset(Some(0.05));
+        },
+        PersistTestHooks::default(),
+    )
+    .await;
+
+    let handle = rig.sup.executor_handle().unwrap();
+    handle.attach_external_reply_sink(Arc::new(|_, _| {
+        armd::rt_core::broker::DeliveryDecision::Delivered
+    }));
+
+    // Open connection 42 with NO lease held (`lease_gen = 0`), submit zero_check(store_offset=true)
+    // while holding `config_write_lock` so PR C pauses before Reserve, then disconnect conn 42.
+    let conn_id = 42u64;
+    handle.open_connection_async(conn_id).await.unwrap().unwrap();
+    let svc = rig
+        .sup
+        .read_services(armd::rt_core::publish::ReadRequirements {
+            require_within_valid_until: false,
+            require_prep_env: true,
+            ..armd::rt_core::publish::ReadRequirements::identity()
+        })
+        .await
+        .unwrap();
+    let pub_cfg = rig.sup.published_config().await.unwrap();
+    let admission = armd::supervisor::AdmissionStamp {
+        stop_gen: svc.applied_stop_generation,
+        estop_epoch: svc.snapshot.owner.epoch,
+        lease_gen: 0,
+        connection_id: conn_id,
+        request_id: 8888,
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (prepared, persist_ctx) = armd::rt_core::requests::actions::prepare_gripper_zero_check(
+        &svc,
+        &pub_cfg,
+        admission,
+        deadline,
+        &json!({"store_offset": true}),
+        armd::auth::OperatorGrant::unenforced(),
+        None,
+    )
+    .unwrap();
+    let ctx_id = handle.stage_zero_check_context(persist_ctx.unwrap()).unwrap();
+    let slot = prepared.to_plan_slot(ctx_id).unwrap();
+    let write = |dst: &mut PlanSlot| *dst = slot.clone();
+
+    let cw_guard = rig.sup.config_write_lock().lock_owned().await;
+    let (_req_id, mut rx, _ack_guard) = handle
+        .submit_external_action_with_zero_check_ctx(
+            armd::rt_core::broker::ClientId(conn_id),
+            0,
+            prepared.stamp.broker_authority(),
+            deadline,
+            armd::rt_core::requests::actions::ActionSubmit::InstallPrepared {
+                write: &write,
+                kind: armd::rt_core::requests::actions::PreparedActionKind::GripperZeroCheck,
+                prepared_boot: prepared.stamp.boot,
+                admission_request_id: prepared.stamp.admission.request_id,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: prepared.stamp.calibration_revision,
+                gripper_calib_revision: prepared.stamp.gripper_calib_revision,
+                power_budget_revision: prepared.stamp.power_budget_revision,
+            },
+            armd::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOrGlobal,
+            false,
+            None,
+            ctx_id,
+        )
+        .unwrap();
+    let ack_dl = Instant::now() + Duration::from_secs(5);
+    let action_id = loop {
+        handle.pump_broker_replies();
+        match rx.try_recv() {
+            Ok(Ok(armd::rt_core::broker::Reply::Ack { action: Some(aid), .. })) => break aid.0,
+            Ok(other) => panic!("expected Ack for no-lease zero_check, got {other:?}"),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                panic!("broker ack channel closed unexpectedly");
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                assert!(Instant::now() < ack_dl, "timed out waiting for broker ACK");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+
+    // Wait deterministically until seek finishes and enters PR C persistence (`stop_rad` set
+    // while `state == "running"`, blocked on `cw_guard`).
+    let seek_dl = Instant::now() + Duration::from_secs(5);
+    loop {
+        let obs = rig.sup.get_observation().await;
+        if obs
+            .action
+            .as_ref()
+            .is_some_and(|a| a.id == action_id && a.stop_rad.is_some() && a.state == "running")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < seek_dl,
+            "seek did not enter PR C persistence phase: {:?}",
+            obs.action
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    // Disconnect conn 42 (no lease exists -> ONLY `connection_id` in PersistCmd::Reserve catches it!).
+    let conn_handle = armd::rt_core::requests::lease::ConnectionHandle::from_ws_id(conn_id).unwrap();
+    let _ = handle.disconnect_connection_async(conn_handle).await.unwrap();
+    drop(cw_guard);
+
+    let dl = Instant::now() + Duration::from_secs(5);
+    loop {
+        handle.pump_broker_replies();
+        let obs = rig.sup.get_observation().await;
+        if let Some(a) = obs.action.as_ref() {
+            if a.id == action_id && a.state != "running" {
+                assert_eq!(a.state, "cancelled", "{a:?}");
+                assert_eq!(a.code.as_deref(), Some("LEASE_LOST"), "{a:?}");
+                break;
+            }
+        }
+        assert!(Instant::now() < dl, "disconnected no-lease zero_check did not terminate");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !rig.calib_path.exists(),
+        "disconnected connection must not persist calibration when no lease is held"
+    );
+    rig.wait_zero_check_ctx_empty("no_lease_disconnect").await;
+    rig.assert_zero_rt_allocs("no_lease_disconnect");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 15. Major 4 regression: config_write_mutex contention past deadline -> DEADLINE_EXPIRED
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_config_write_mutex_deadline_expired() {
+    let rig = DualRig::start(
+        RtOwner::Executor,
+        OperatorAuth::disabled(),
+        |_| {},
+        |inner| {
+            inner.set_mock_gripper_stall_offset(Some(0.05));
+        },
+        PersistTestHooks::default(),
+    )
+    .await;
+
+    let mut ws = connect_ws(rig.addr, None).await;
+    let gen = acquire_lease(&mut ws, "c-dl", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+
+    // Hold `config_write_lock` past `CONFIG_PROPOSAL_BUDGET` (5s): worker must fail promptly with
+    // `DEADLINE_EXPIRED` instead of hanging indefinitely, and release `ExclusiveOutput`.
+    let cw_guard = rig.sup.config_write_lock().lock_owned().await;
+    let (_, term, _) = run_cmd_to_terminal(
+        &mut ws,
+        gen,
+        ep,
+        "/api/v1/action/gripper_zero_check",
+        json!({"store_offset": true}),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "DEADLINE_EXPIRED", "{term}");
+    assert!(!rig.calib_path.exists());
+    rig.wait_zero_check_ctx_empty("deadline_expired").await;
+
+    // Release mutex and verify SessionSlot::ExclusiveOutput was cleanly cleared.
+    drop(cw_guard);
+    let ep2 = rig.sup.get_observation().await.epoch_id;
+    let (_, term_ok, _) = run_cmd_to_terminal(
+        &mut ws,
+        gen,
+        ep2,
+        "/api/v1/action/gripper_zero_check",
+        json!({"store_offset": true}),
+        Duration::from_secs(8),
+    )
+    .await;
+    assert_eq!(term_ok["state"], "done", "{term_ok}");
+    assert_eq!(term_ok["durability_confirmed"], json!(true), "{term_ok}");
+    assert!(rig.calib_path.exists());
+    rig.wait_zero_check_ctx_empty("deadline_expired_recovery").await;
+    rig.assert_zero_rt_allocs("deadline_expired");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 16. Major 5 regression: stop during PR C persistence -> single terminal, no slot leak
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_stop_during_persist_settles_without_double_terminal_or_slot_leak() {
+    let rig = DualRig::start(
+        RtOwner::Executor,
+        OperatorAuth::disabled(),
+        |_| {},
+        |inner| {
+            inner.set_mock_gripper_stall_offset(Some(0.05));
+        },
+        PersistTestHooks::default(),
+    )
+    .await;
+
+    let mut ws = connect_ws(rig.addr, None).await;
+    let gen = acquire_lease(&mut ws, "c-stop-prc", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+
+    let cw_guard = rig.sup.config_write_lock().lock_owned().await;
+    let req_id = next_req_id();
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": req_id,
+            "generation": gen,
+            "epoch_id": ep,
+            "path": "/api/v1/action/gripper_zero_check",
+            "body": {"store_offset": true},
+        }),
+    )
+    .await;
+    let ack = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("request_id").and_then(Value::as_u64) == Some(req_id) {
+                return v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let action_id = ack["action_id"].as_u64().unwrap();
+
+    // Wait deterministically until seek finishes and enters PR C persistence (`stop_rad` set
+    // while `state == "running"`, blocked on `cw_guard`).
+    let seek_dl = Instant::now() + Duration::from_secs(5);
+    loop {
+        let obs = rig.sup.get_observation().await;
+        if obs
+            .action
+            .as_ref()
+            .is_some_and(|a| a.id == action_id && a.stop_rad.is_some() && a.state == "running")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < seek_dl,
+            "seek did not enter PR C persistence phase before stop: {:?}",
+            obs.action
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    // Issue authorized stop while PR C holds the action in `zero_check_persisting`.
+    let stop_ack = send_cmd(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await;
+    assert_eq!(stop_ack["type"], "command_ack", "{stop_ack}");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    drop(cw_guard);
+
+    // Collect distinct terminal transitions `(state, code, finished_at)` for `action_id` and
+    // assert exactly one transition to cancelled/STOPPED (no double-terminal).
+    let mut terminal_keys: Vec<(Value, Value, Value)> = Vec::new();
+    let mut first_term: Option<Value> = None;
+    let collect_until = Instant::now() + Duration::from_secs(3);
+    let mut saw_terminal_at: Option<Instant> = None;
+    while Instant::now() < collect_until {
+        if let Some(t) = saw_terminal_at {
+            if t.elapsed() >= Duration::from_millis(350) {
+                break;
+            }
+        }
+        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
+            let text = msg.into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("type").is_none() {
+                if let Some(a) = v.get("action").filter(|a| !a.is_null()) {
+                    if a["id"].as_u64() == Some(action_id) && a["state"] != "running" {
+                        let key = (a["state"].clone(), a["code"].clone(), a["finished_at"].clone());
+                        if !terminal_keys.contains(&key) {
+                            terminal_keys.push(key);
+                        }
+                        if first_term.is_none() {
+                            first_term = Some(a.clone());
+                        }
+                        saw_terminal_at.get_or_insert_with(Instant::now);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        terminal_keys.len(),
+        1,
+        "expected exactly one terminal transition for stop during PR C, got: {terminal_keys:?}"
+    );
+    let term = first_term.expect("missing terminal payload");
+    assert_eq!(term["state"], "cancelled", "{term}");
+    assert_eq!(term["code"], "STOPPED", "{term}");
+    assert!(!rig.calib_path.exists());
+    rig.wait_zero_check_ctx_empty("stop_during_prc").await;
+
+    // SessionSlot::ExclusiveOutput must be cleanly released for subsequent actions.
+    let ep2 = rig.sup.get_observation().await.epoch_id;
+    let (_, term_ok, _) = run_cmd_to_terminal(
+        &mut ws,
+        gen,
+        ep2,
+        "/api/v1/action/gripper_zero_check",
+        json!({"store_offset": false}),
+        Duration::from_secs(8),
+    )
+    .await;
+    assert_eq!(term_ok["state"], "done", "{term_ok}");
+    rig.assert_zero_rt_allocs("stop_during_prc");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 17. Major 6 regression: ThermalTrip and BusLossFallback emit failed + exact code
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_thermal_trip_and_bus_loss_report_failed_codes() {
+    // (a) ThermalTrip -> state="failed", code="THERMAL_TRIP"
+    {
+        let driver = ZeroCheckDriver::new(-0.50);
+        driver.state.lock().unwrap().never_stall_creep = true;
+        let driver_for_inner = driver.clone();
+        let rig = DualRig::start(
+            RtOwner::Executor,
+            OperatorAuth::disabled(),
+            |_| {},
+            move |inner| {
+                let mut q = INSPECT;
+                q[6] = -0.50;
+                inner.measured_positions = q.to_vec();
+                inner.commanded_positions = q.to_vec();
+                inner.target_positions = q.to_vec();
+                inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(driver_for_inner)));
+            },
+            PersistTestHooks::default(),
+        )
+        .await;
+
+        let mut ws = connect_ws(rig.addr, None).await;
+        let gen = acquire_lease(&mut ws, "c-thermal", false).await;
+        let ep = rig.sup.get_observation().await.epoch_id;
+        let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+        let ep = rig.sup.get_observation().await.epoch_id;
+
+        let req_id = next_req_id();
+        send(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": req_id,
+                "generation": gen,
+                "epoch_id": ep,
+                "path": "/api/v1/action/gripper_zero_check",
+                "body": {"store_offset": false},
+            }),
+        )
+        .await;
+        let ack = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let v: Value = serde_json::from_str(&text).unwrap();
+                if v.get("request_id").and_then(Value::as_u64) == Some(req_id) {
+                    return v;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        let action_id = ack["action_id"].as_u64().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        driver.state.lock().unwrap().j7_temperature_c = 85.0;
+
+        let term = wait_terminal_for_id(&mut ws, action_id, Duration::from_secs(4)).await;
+        assert_eq!(term["state"], "failed", "{term}");
+        assert_eq!(term["code"], "THERMAL_TRIP", "{term}");
+        rig.assert_zero_rt_allocs("thermal_trip");
+        rig.shutdown().await;
+    }
+
+    // (b) BusLossFallback -> state="failed", code="BUS_LOSS"
+    {
+        let driver = ZeroCheckDriver::new(-0.50);
+        driver.state.lock().unwrap().never_stall_creep = true;
+        let driver_for_inner = driver.clone();
+        let rig = DualRig::start(
+            RtOwner::Executor,
+            OperatorAuth::disabled(),
+            |_| {},
+            move |inner| {
+                let mut q = INSPECT;
+                q[6] = -0.50;
+                inner.measured_positions = q.to_vec();
+                inner.commanded_positions = q.to_vec();
+                inner.target_positions = q.to_vec();
+                inner.driver = Some(armd::supervisor_lock::DriverSlot::legacy(Box::new(driver_for_inner)));
+            },
+            PersistTestHooks::default(),
+        )
+        .await;
+
+        let mut ws = connect_ws(rig.addr, None).await;
+        let gen = acquire_lease(&mut ws, "c-busloss", false).await;
+        let ep = rig.sup.get_observation().await.epoch_id;
+        let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+        let ep = rig.sup.get_observation().await.epoch_id;
+
+        let req_id = next_req_id();
+        send(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": req_id,
+                "generation": gen,
+                "epoch_id": ep,
+                "path": "/api/v1/action/gripper_zero_check",
+                "body": {"store_offset": false},
+            }),
+        )
+        .await;
+        let ack = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let v: Value = serde_json::from_str(&text).unwrap();
+                if v.get("request_id").and_then(Value::as_u64) == Some(req_id) {
+                    return v;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        let action_id = ack["action_id"].as_u64().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        driver.state.lock().unwrap().bus_loss_stale = true;
+
+        let term = wait_terminal_for_id(&mut ws, action_id, Duration::from_secs(4)).await;
+        assert_eq!(term["state"], "failed", "{term}");
+        assert_eq!(term["code"], "BUS_LOSS", "{term}");
+        rig.assert_zero_rt_allocs("bus_loss");
+        rig.shutdown().await;
+    }
 }
