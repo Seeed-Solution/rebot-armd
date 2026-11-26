@@ -8916,6 +8916,72 @@ impl SupervisorInner {
         obs
     }
 
+    /// Effective per-release budgeted TX attempt cap used to initialize [`crate::rt_core::budget::ReleaseBudget`].
+    pub(crate) fn release_tx_budget_limit(&self) -> u16 {
+        let cfg_max = self
+            .config
+            .damiao_tx_budget()
+            .max_frames
+            .min(u16::MAX as usize) as u16;
+        self.driver
+            .as_ref()
+            .and_then(|d| {
+                d.try_with_ref_recover(|drv| drv.tx_budget_max_frames())
+                    .flatten()
+            })
+            .unwrap_or(cfg_max)
+    }
+
+    /// Snapshots the driver's current `(rx_frames, tx_attempts)` consumed in this control release
+    /// and monotonically tightens the driver's remaining RX/TX caps from `budget`.
+    #[inline]
+    pub(crate) fn sync_driver_budget_before(
+        &mut self,
+        budget: &crate::rt_core::budget::ReleaseBudget,
+    ) -> (u16, u16) {
+        let Some(d) = self.driver.as_mut() else {
+            return (0, 0);
+        };
+        let rx_rem = budget.rx_remaining();
+        let tx_rem = budget.tx_remaining();
+        let apply = |drv: &mut dyn ArmDriver| {
+            let before = drv.release_budget_consumed();
+            drv.sync_release_budget_limits(rx_rem, tx_rem);
+            before
+        };
+        let use_try = self.rt_executor_owned || self.nonblocking_driver_release;
+        if use_try {
+            d.try_with_mut(apply).unwrap_or((0, 0))
+        } else {
+            d.with_mut(apply).unwrap_or((0, 0))
+        }
+    }
+
+    /// Charges the driver's newly consumed `(rx_frames, tx_attempts)` since `before` into `budget`.
+    #[inline]
+    pub(crate) fn charge_driver_budget_after(
+        &self,
+        budget: &mut crate::rt_core::budget::ReleaseBudget,
+        before: (u16, u16),
+        reported_rx: u16,
+        rx_exhausted: bool,
+        reported_tx: u16,
+    ) {
+        let after = self
+            .driver
+            .as_ref()
+            .and_then(|d| d.try_with_ref_recover(|drv| drv.release_budget_consumed()))
+            .unwrap_or(before);
+        let rx_delta = after.0.saturating_sub(before.0).max(reported_rx);
+        let tx_delta = after.1.saturating_sub(before.1).max(reported_tx);
+        if rx_delta > 0 || rx_exhausted {
+            budget.charge_rx(rx_delta, rx_exhausted);
+        }
+        if tx_delta > 0 {
+            budget.charge_tx(tx_delta);
+        }
+    }
+
     /// Shared Step-2 hardware poll implementation for [`crate::rt_core::ops::CoreOps::poll_hardware`]
     /// and [`crate::rt_core::ops::CoreOps::poll_hardware_for_release`].
     pub(crate) fn poll_hardware_with_release_deadline(
@@ -8932,6 +8998,32 @@ impl SupervisorInner {
         &mut self,
         budget: &crate::rt_core::ops::ServiceBudget,
         release_deadline: Option<Instant>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> crate::rt_core::ops::HardwarePoll {
+        let mut ledger = crate::rt_core::budget::ReleaseBudget::new(
+            self.control_release_seq.wrapping_add(1).max(1),
+            budget.now,
+            release_deadline.unwrap_or(budget.deadline),
+            budget.max_rx_frames,
+            self.release_tx_budget_limit(),
+        );
+        self.poll_hardware_with_budget_inner(&mut ledger, Some(budget.deadline), release_deadline.is_some(), now_fn)
+    }
+
+    /// Ledger-threaded Step-2 hardware poll owned by [`crate::rt_core::ops::ReleaseEngine`].
+    pub(crate) fn poll_hardware_with_budget_and_clock(
+        &mut self,
+        budget: &mut crate::rt_core::budget::ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> crate::rt_core::ops::HardwarePoll {
+        self.poll_hardware_with_budget_inner(budget, None, true, now_fn)
+    }
+
+    fn poll_hardware_with_budget_inner(
+        &mut self,
+        budget: &mut crate::rt_core::budget::ReleaseBudget,
+        rx_deadline_override: Option<Instant>,
+        install_tx_cap: bool,
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> crate::rt_core::ops::HardwarePoll {
         self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
@@ -8960,42 +9052,82 @@ impl SupervisorInner {
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
         // If the release cutoff has already expired, stage ZERO driver deadline and skip budgeted
         // Step-2 TX/poll work cleanly (`budget_exhausted = true`).
-        let cap_outcome = match release_deadline {
-            Some(rd) => self.install_driver_tx_release_cap_with_clock(rd, now_fn),
-            None => DriverTxCapOutcome::NotInstalled,
+        let cap_outcome = if install_tx_cap {
+            self.install_driver_tx_release_cap_with_clock(budget.deadline(), now_fn)
+        } else {
+            DriverTxCapOutcome::NotInstalled
         };
         let applied_step2_tx_cap = cap_outcome == DriverTxCapOutcome::Installed;
         let release_cap_expired = cap_outcome == DriverTxCapOutcome::Expired;
         let mut park_wake = None;
         let mut park_state_changed = false;
+        let make_sb = |b: &crate::rt_core::budget::ReleaseBudget, now: Instant| {
+            let mut sb = b.poll_service_budget(now);
+            if let Some(dl) = rx_deadline_override {
+                sb.deadline = sb.deadline.min(dl);
+            }
+            sb
+        };
+        let step_now = now_fn();
         let (rx_frames, rx_exhausted) = if release_cap_expired {
             // Release TX cutoff already expired: skip budgeted Step-2 TX transitions without
             // staging an expired driver deadline, and still read RX feedback so `bus_feedback_fresh`
             // remains accurate.
-            let mut rx = self.poll_hardware_rx_with_clock(Some(budget), None, None, now_fn);
+            let before_rx = self.sync_driver_budget_before(budget);
+            let sb = make_sb(budget, step_now);
+            let mut rx = self.poll_hardware_rx_with_clock(Some(&sb), None, None, now_fn);
             rx.budget_exhausted = true;
+            self.charge_driver_budget_after(budget, before_rx, rx.rx_frames, true, 0);
+            rx.rx_frames = budget.rx_used();
             let rx_frames = rx.rx_frames;
             self.pending_rx_poll = rx;
             (rx_frames, true)
         } else {
-            let trans = self.service_torque_transition_with_clock(budget, now_fn);
-            let transition_rx = if let Some(tp) = trans {
-                if tp.broker_owned {
-                    self.core.begin_transition(tp.progress);
-                } else {
-                    match tp.progress {
-                        Ok(crate::rt_core::ops::TorqueProgress::Pending { wake }) => park_wake = Some(wake),
-                        Ok(crate::rt_core::ops::TorqueProgress::Done) | Err(_) => park_state_changed = true,
-                    }
+            let sb_t = make_sb(budget, step_now);
+            let transition_rx = if sb_t.max_rx_frames == 0 || sb_t.now > sb_t.deadline {
+                if sb_t.max_rx_frames == 0 {
+                    budget.mark_rx_exhausted();
                 }
-                tp.rx
+                if self.torque_transition.is_some() || self.disable_pending {
+                    Some((0, true))
+                } else {
+                    None
+                }
             } else {
-                self.service_background_disable_with_clock(budget, now_fn)
+                let before_t = self.sync_driver_budget_before(budget);
+                let trans = self.service_torque_transition_with_clock(&sb_t, now_fn);
+                let t_rx = if let Some(tp) = trans {
+                    if tp.broker_owned {
+                        self.core.begin_transition(tp.progress);
+                    } else {
+                        match tp.progress {
+                            Ok(crate::rt_core::ops::TorqueProgress::Pending { wake }) => park_wake = Some(wake),
+                            Ok(crate::rt_core::ops::TorqueProgress::Done) | Err(_) => park_state_changed = true,
+                        }
+                    }
+                    tp.rx
+                } else {
+                    self.service_background_disable_with_clock(&sb_t, now_fn)
+                };
+                if let Some((tf, tex)) = t_rx {
+                    self.charge_driver_budget_after(budget, before_t, tf, tex, 0);
+                } else {
+                    self.charge_driver_budget_after(budget, before_t, 0, false, 0);
+                }
+                t_rx
             };
-            let rx = self.poll_hardware_rx_with_clock(Some(budget), transition_rx, None, now_fn);
+            let before_rx = self.sync_driver_budget_before(budget);
+            let sb_rx = make_sb(budget, now_fn());
+            // `sb_rx.max_rx_frames` already reflects `budget.rx_remaining()` after Phase 2a,
+            // so pass `(0, exhausted)` to avoid double-subtracting transition RX frames.
+            let rx_marker = transition_rx.map(|(_, ex)| (0u16, ex));
+            let mut rx = self.poll_hardware_rx_with_clock(Some(&sb_rx), rx_marker, None, now_fn);
             if applied_step2_tx_cap {
                 self.clear_driver_tx_release_cap();
             }
+            self.charge_driver_budget_after(budget, before_rx, rx.rx_frames, rx.budget_exhausted, 0);
+            rx.rx_frames = budget.rx_used();
+            rx.budget_exhausted |= budget.rx_exhausted();
             let rx_frames = rx.rx_frames;
             let rx_exhausted = rx.budget_exhausted;
             self.pending_rx_poll = rx;
@@ -9007,7 +9139,8 @@ impl SupervisorInner {
         // cannot suppress `ThermalTrip`.
         self.check_thermal_protection_inner(was_thermal_active, true);
         let _ = self.confirm_background_disable_if_ready();
-        let budget_exhausted = release_cap_expired || budget.now > budget.deadline || rx_exhausted;
+        let budget_exhausted =
+            release_cap_expired || budget.deadline_exceeded(step_now) || rx_exhausted || budget.rx_exhausted();
         let Some(driver) = self.driver.as_ref() else {
             self.rt_j7_pf_gate = None;
             return crate::rt_core::ops::HardwarePoll {
@@ -9200,13 +9333,18 @@ impl SupervisorInner {
                         }
                     }
                     (Some(b), None) => {
-                        match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
-                            Ok((_, _, drv_deadline)) => {
-                                driver.read_joint_states_budgeted(&mut sc.states, drv_deadline, b.max_rx_frames)
-                            }
-                            Err(_) => {
-                                let _ = driver.read_cached_joint_states_into(&mut sc.states);
-                                Ok((0, true))
+                        if b.max_rx_frames == 0 {
+                            let _ = driver.read_cached_joint_states_into(&mut sc.states);
+                            Ok((0, true))
+                        } else {
+                            match translate_driver_cutoff_conservative(driver, b.deadline, now_fn) {
+                                Ok((_, _, drv_deadline)) => {
+                                    driver.read_joint_states_budgeted(&mut sc.states, drv_deadline, b.max_rx_frames)
+                                }
+                                Err(_) => {
+                                    let _ = driver.read_cached_joint_states_into(&mut sc.states);
+                                    Ok((0, true))
+                                }
                             }
                         }
                     }
@@ -9798,8 +9936,11 @@ impl SupervisorInner {
         }
 
         // Reuse Step 2's single budgeted hardware poll when present; legacy callers without
-        // a preceding `poll_hardware` advance the control-release counter and perform RX here.
+        // a preceding `poll_hardware` advance the control-release counter and run a single
+        // `ReleaseBudget` ledger for parity across transition poll, RX/recovery, and ModeSwitch.
         let was_step2_poll = self.pending_rx_poll.active;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut legacy_ledger: Option<crate::rt_core::budget::ReleaseBudget> = None;
         let rx = if was_step2_poll {
             std::mem::take(&mut self.pending_rx_poll)
         } else {
@@ -9810,6 +9951,15 @@ impl SupervisorInner {
             if let Some(mut drv) = self.write_driver_for_tick() {
                 drv.begin_control_release(rel_seq);
             }
+            let leg_now = legacy_step_start.unwrap_or_else(&mut *now_fn);
+            let leg_rd = release_deadline.unwrap_or(leg_now + period_tick);
+            let mut leg_budget = crate::rt_core::budget::ReleaseBudget::new(
+                rel_seq,
+                leg_now,
+                leg_rd,
+                crate::rt_core::ops::RX_FRAME_BUDGET,
+                self.release_tx_budget_limit(),
+            );
             #[cfg(not(target_arch = "wasm32"))]
             self.torque_shadow
                 .enqueue_at(
@@ -9821,15 +9971,12 @@ impl SupervisorInner {
                         live_stopped: self.safety.state().is_stopped(),
                     },
                 );
-            if rx_tx_cap_expired {
+            let rx_out = if rx_tx_cap_expired {
                 // Cutoff already expired: read cached feedback ONLY so unbudgeted RX can never
                 // emit Damiao recovery TX past the release cutoff (DRV-F1 B9).
+                leg_budget.tighten_rx_remaining(0);
                 let expired_now = now_fn();
-                let expired_budget = crate::rt_core::ops::ServiceBudget {
-                    now: expired_now,
-                    deadline: expired_now,
-                    max_rx_frames: 0,
-                };
+                let expired_budget = leg_budget.service_budget(expired_now, Duration::ZERO, 0);
                 self.poll_hardware_rx_with_clock(
                     Some(&expired_budget),
                     None,
@@ -9841,30 +9988,52 @@ impl SupervisorInner {
                 let deadline = legacy_rx_deadline.unwrap_or_else(|| now + LEGACY_TORQUE_STEP_BUDGET);
                 let budget = crate::rt_core::ops::ServiceBudget {
                     now,
-                    deadline,
-                    max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
+                    deadline: deadline.min(leg_budget.deadline()),
+                    max_rx_frames: leg_budget.rx_remaining(),
                 };
+                let before_t = self.sync_driver_budget_before(&leg_budget);
                 let trans = self.service_torque_transition_with_clock(&budget, now_fn);
                 let transition_rx = trans.and_then(|tp| tp.rx);
+                if let Some((tf, tex)) = transition_rx {
+                    self.charge_driver_budget_after(&mut leg_budget, before_t, tf, tex, 0);
+                } else {
+                    self.charge_driver_budget_after(&mut leg_budget, before_t, 0, false, 0);
+                }
                 if self.driver_supports_rt_executor_nonblocking() {
                     let after = now_fn();
+                    let before_rx = self.sync_driver_budget_before(&leg_budget);
                     let rem_budget = crate::rt_core::ops::ServiceBudget {
                         now: after,
-                        deadline,
-                        max_rx_frames: budget.max_rx_frames,
+                        deadline: deadline.min(leg_budget.deadline()),
+                        max_rx_frames: leg_budget.rx_remaining(),
                     };
-                    self.poll_hardware_rx_with_clock(
+                    let rx_marker = transition_rx.map(|(_, ex)| (0u16, ex));
+                    let mut r = self.poll_hardware_rx_with_clock(
                         Some(&rem_budget),
-                        transition_rx,
+                        rx_marker,
                         release_deadline,
                         now_fn,
-                    )
+                    );
+                    self.charge_driver_budget_after(&mut leg_budget, before_rx, r.rx_frames, r.budget_exhausted, 0);
+                    r.rx_frames = leg_budget.rx_used();
+                    r
                 } else {
-                    self.poll_hardware_rx_with_clock(None, None, None, now_fn)
+                    let before_rx = self.sync_driver_budget_before(&leg_budget);
+                    let r = self.poll_hardware_rx_with_clock(None, None, None, now_fn);
+                    self.charge_driver_budget_after(&mut leg_budget, before_rx, r.rx_frames, r.budget_exhausted, 0);
+                    r
                 }
             } else {
-                self.poll_hardware_rx_with_clock(None, None, None, now_fn)
+                let before_rx = self.sync_driver_budget_before(&leg_budget);
+                let r = self.poll_hardware_rx_with_clock(None, None, None, now_fn);
+                self.charge_driver_budget_after(&mut leg_budget, before_rx, r.rx_frames, r.budget_exhausted, 0);
+                r
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                legacy_ledger = Some(leg_budget);
             }
+            rx_out
         };
         #[cfg(not(target_arch = "wasm32"))]
         if !was_step2_poll
@@ -9887,7 +10056,11 @@ impl SupervisorInner {
                 now: ms_now,
                 stop_generation: self.current_stop_gen(),
             };
-            self.service_mode_switch_release_with_clock(&ms_ctx, ms_rd, now_fn);
+            if let Some(ref mut leg_budget) = legacy_ledger {
+                self.service_mode_switch_release_with_budget(&ms_ctx, leg_budget, now_fn);
+            } else {
+                self.service_mode_switch_release_with_clock(&ms_ctx, ms_rd, now_fn);
+            }
         }
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
@@ -12979,20 +13152,26 @@ impl SupervisorInner {
         true
     }
 
-    pub(crate) fn service_mode_switch_release(
-        &mut self,
-        ctx: &crate::rt_core::ops::CommitCtx,
-        release_deadline: Instant,
-        owner_now_fn: &dyn Fn() -> Instant,
-    ) {
-        let mut f = || owner_now_fn();
-        self.service_mode_switch_release_with_clock(ctx, release_deadline, &mut f);
-    }
-
     pub(crate) fn service_mode_switch_release_with_clock(
         &mut self,
         ctx: &crate::rt_core::ops::CommitCtx,
         release_deadline: Instant,
+        owner_now_fn: &mut dyn FnMut() -> Instant,
+    ) {
+        let mut ledger = crate::rt_core::budget::ReleaseBudget::new(
+            self.control_release_seq,
+            ctx.now,
+            release_deadline,
+            crate::rt_core::ops::RX_FRAME_BUDGET,
+            self.release_tx_budget_limit(),
+        );
+        self.service_mode_switch_release_with_budget(ctx, &mut ledger, owner_now_fn);
+    }
+
+    pub(crate) fn service_mode_switch_release_with_budget(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
         owner_now_fn: &mut dyn FnMut() -> Instant,
     ) {
         use crate::motor_mode::{ModeProgress, ModeSwitchFailure, ReleaseBudget};
@@ -13007,6 +13186,7 @@ impl SupervisorInner {
         }
         let sid = active.id;
         let now = owner_now_fn();
+        let release_deadline = release_budget.deadline();
         let total_span = release_deadline.saturating_duration_since(now);
         let margin = self.tx_release_publish_margin().min(total_span / 2);
         let base_cutoff = release_deadline.checked_sub(margin).unwrap_or(now);
@@ -13047,7 +13227,8 @@ impl SupervisorInner {
 
         let effective_cutoff = self
             .sessions
-            .effective_tx_cutoff(SessionSlot::ExclusiveOutput, base_cutoff);
+            .effective_tx_cutoff(SessionSlot::ExclusiveOutput, base_cutoff)
+            .min(release_budget.deadline());
         let Some(mut machine) = self.mode_switch.machine.take() else {
             if let Some(outcome) = self.sessions.finish_slot(
                 SessionSlot::ExclusiveOutput,
@@ -13066,12 +13247,19 @@ impl SupervisorInner {
             .damiao_tx_budget()
             .max_frames
             .min(u8::MAX as usize) as u8;
+        let before_drv = self.sync_driver_budget_before(release_budget);
+        let ledger_rx_rem = release_budget.rx_remaining();
+        let ledger_tx_rem = release_budget.tx_remaining();
+        let ledger_seq = release_budget.release_seq();
 
         // Temporarily take driver out (restored unconditionally even on unwind) so the live
         // pre-TX gate closure can borrow `&*self` right before `can.transmit` (0 alloc).
         let mut taken_drv = self.driver.take();
         self.mode_switch_ran_release_seq = self.control_release_seq;
         let mut drv_uncertain = 0u32;
+        let mut ms_rx_used: u16 = 0;
+        let mut ms_rx_exhausted = false;
+        let mut ms_tx_used: u16 = 0;
         let step_progress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let Some(slot) = taken_drv.as_mut() else {
                 return ModeProgress::FailedClean {
@@ -13088,8 +13276,20 @@ impl SupervisorInner {
                     drv_uncertain = drv.mode_write_uncertain_mask();
                     return;
                 };
-                let mut budget = ReleaseBudget::new(drv_now, drv_cutoff, period, max_tx_frames);
-                budget.max_rx_frames = crate::rt_core::ops::RX_FRAME_BUDGET;
+                let mut drv_ledger = crate::rt_core::budget::ReleaseBudget::new(
+                    ledger_seq,
+                    drv_now,
+                    drv_cutoff,
+                    ledger_rx_rem,
+                    ledger_tx_rem,
+                );
+                let budget = ReleaseBudget::from_ledger(
+                    &drv_ledger,
+                    drv_now,
+                    drv_cutoff,
+                    period,
+                    max_tx_frames,
+                );
                 let mut gate = || -> Result<(), &'static str> {
                     let gate_now = owner_now_fn();
                     self.check_session_pre_tx(
@@ -13101,7 +13301,16 @@ impl SupervisorInner {
                     .map(|_| ())
                 };
                 let stop_proof = || self.mode_switch_stop_applied();
-                out = machine.step_with_gate_and_stop_proof(drv, &mut gate, &stop_proof, budget);
+                out = machine.step_with_gate_and_stop_proof_ledger(
+                    drv,
+                    &mut gate,
+                    &stop_proof,
+                    budget,
+                    &mut drv_ledger,
+                );
+                ms_rx_used = drv_ledger.rx_used();
+                ms_rx_exhausted = drv_ledger.rx_exhausted();
+                ms_tx_used = drv_ledger.tx_used();
                 drv_uncertain = drv.mode_write_uncertain_mask();
             });
             if locked.is_err() {
@@ -13111,6 +13320,13 @@ impl SupervisorInner {
             }
         }));
         self.driver = taken_drv;
+        self.charge_driver_budget_after(
+            release_budget,
+            before_drv,
+            ms_rx_used,
+            ms_rx_exhausted,
+            ms_tx_used,
+        );
 
         let progress = match step_progress {
             Ok(p) => p,

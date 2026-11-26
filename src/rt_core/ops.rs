@@ -26,6 +26,7 @@ use super::broker::{
     ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, PlanSlotRef, RequestId, RtIntake,
     TransitionOp,
 };
+use super::budget::{ReleaseBudget, DEFAULT_TX_ATTEMPT_BUDGET};
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
 use super::mailbox::{target_mailbox, Refusal, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
@@ -451,6 +452,16 @@ impl ServiceBudget {
     pub fn for_release(now: Instant, release_deadline: Instant) -> Self {
         Self { now, deadline: (now + RX_TIME_BUDGET).min(release_deadline), max_rx_frames: RX_FRAME_BUDGET }
     }
+
+    /// Derives a tightened [`ServiceBudget`] from a shared [`ReleaseBudget`] ledger.
+    pub fn from_release_budget(
+        ledger: &ReleaseBudget,
+        now: Instant,
+        max_duration: Duration,
+        max_rx: u16,
+    ) -> Self {
+        ledger.service_budget(now, max_duration, max_rx)
+    }
 }
 
 /// Progress of the driver transition in flight (`HardwarePoll::torque`).
@@ -850,6 +861,24 @@ pub trait CoreOps {
     ) -> Result<Committed, &'static str> {
         self.commit_transition_for_release(d, op, ctx, release_deadline)
     }
+    /// Per-release budgeted TX attempt cap used to initialize [`ReleaseEngine`]'s [`ReleaseBudget`].
+    fn release_tx_budget_limit(&self) -> u16 {
+        DEFAULT_TX_ATTEMPT_BUDGET
+    }
+    /// Ledger-threaded [`Self::commit_transition`]: draws deadline and TX attempts from `budget`.
+    fn commit_transition_with_budget(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> Result<Committed, &'static str> {
+        if budget.deadline_exceeded(now_fn()) {
+            return Err("BUDGET_EXPIRED");
+        }
+        self.commit_transition_for_release_with_clock(d, op, ctx, budget.deadline(), now_fn)
+    }
     /// Applies one target after rechecking it ([`TargetFrame::check`] against the core's
     /// [`super::mailbox::TargetAuthority`], then the configuration hold).
     ///
@@ -932,6 +961,20 @@ pub trait CoreOps {
     ) -> HardwarePoll {
         self.poll_hardware_for_release(budget, release_deadline)
     }
+    /// Ledger-threaded [`Self::poll_hardware`]: draws RX frames, TX attempts, and deadline from
+    /// `budget` and charges consumption back into `budget`.
+    fn poll_hardware_with_budget(
+        &mut self,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        let now = now_fn();
+        let sb = budget.poll_service_budget(now);
+        let mut poll = self.poll_hardware_for_release_with_clock(&sb, budget.deadline(), now_fn);
+        budget.charge_rx(poll.rx_frames, poll.budget_exhausted);
+        poll.budget_exhausted |= budget.rx_exhausted();
+        poll
+    }
     /// Sub-release wake for a pending driver transition only (without running a full release
     /// feedback pass). Default delegates to [`Self::poll_hardware`].
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
@@ -962,6 +1005,27 @@ pub trait CoreOps {
         _now_fn: &mut dyn FnMut() -> Instant,
     ) -> HardwarePoll {
         self.poll_transition_wake_for_release(budget, release_deadline)
+    }
+    /// Ledger-threaded [`Self::poll_transition_wake`]: draws remaining RX frames, TX attempts, and
+    /// tightened deadline from `budget`; returns pending immediately on exhaustion without polling.
+    fn poll_transition_wake_with_budget(
+        &mut self,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        let now = now_fn();
+        if !budget.can_rx(now) {
+            budget.mark_rx_exhausted();
+            return HardwarePoll {
+                budget_exhausted: true,
+                ..HardwarePoll::default()
+            };
+        }
+        let sb = budget.poll_service_budget(now);
+        let mut poll = self.poll_transition_wake_for_release_with_clock(&sb, budget.deadline(), now_fn);
+        budget.charge_rx(poll.rx_frames, poll.budget_exhausted);
+        poll.budget_exhausted |= budget.rx_exhausted();
+        poll
     }
     /// One release of the control tick (`generation`: the publication's lock generation).
     fn advance(&mut self, dt: f64, generation: u64);
@@ -994,6 +1058,16 @@ pub trait CoreOps {
     ) -> f64 {
         let now = now_fn();
         self.advance_output_with_deadline(dt, generation, now, release_deadline)
+    }
+    /// Ledger-threaded [`Self::advance_output`]: draws TX attempts and deadline from `budget`.
+    fn advance_output_with_budget(
+        &mut self,
+        dt: f64,
+        generation: u64,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> f64 {
+        self.advance_output_with_clock(dt, generation, now_fn, budget.deadline())
     }
     /// Refreshes `HardwarePoll::urgent_wake` strictly AFTER Step 5 output so control/hold frames
     /// transmitted in Step 5 supersede any stale Step-2 watchdog wake before Window 2 admission.
@@ -1723,6 +1797,24 @@ impl CoreOps for SupervisorInner {
         self.commit_transition_for_release_with_clock(d, op, ctx, release_deadline, &mut live_now)
     }
 
+    fn release_tx_budget_limit(&self) -> u16 {
+        SupervisorInner::release_tx_budget_limit(self)
+    }
+
+    fn commit_transition_with_budget(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> Result<Committed, &'static str> {
+        let before = self.sync_driver_budget_before(budget);
+        let res = self.commit_transition_for_release_with_clock(d, op, ctx, budget.deadline(), now_fn);
+        self.charge_driver_budget_after(budget, before, 0, false, 0);
+        res
+    }
+
     fn commit_transition_for_release_with_clock(
         &mut self,
         d: &Descriptor,
@@ -1885,6 +1977,61 @@ impl CoreOps for SupervisorInner {
         self.poll_hardware_with_release_deadline_with_clock(budget, Some(release_deadline), now_fn)
     }
 
+    fn poll_hardware_with_budget(
+        &mut self,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        self.poll_hardware_with_budget_and_clock(budget, now_fn)
+    }
+
+    fn poll_transition_wake_with_budget(
+        &mut self,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> HardwarePoll {
+        let now = now_fn();
+        if budget.deadline_exceeded(now) || budget.rx_remaining() == 0 {
+            if budget.rx_remaining() == 0 {
+                budget.mark_rx_exhausted();
+            }
+            return HardwarePoll {
+                driverless: self.driver.is_none(),
+                budget_exhausted: true,
+                torque: self.core.poll_transition(),
+                ..HardwarePoll::default()
+            };
+        }
+        match self.install_driver_tx_release_cap_with_clock(budget.deadline(), now_fn) {
+            crate::supervisor::DriverTxCapOutcome::Expired => HardwarePoll {
+                driverless: self.driver.is_none(),
+                budget_exhausted: true,
+                torque: self.core.poll_transition(),
+                ..HardwarePoll::default()
+            },
+            outcome => {
+                if let Some(d) = self.driver.as_mut() {
+                    let _ = d.try_with_mut(|drv| drv.begin_wake_tx_pass());
+                }
+                let before = self.sync_driver_budget_before(budget);
+                let sb = budget.poll_service_budget(now);
+                let mut poll = self.poll_transition_wake_with_clock(&sb, now_fn);
+                self.charge_driver_budget_after(
+                    budget,
+                    before,
+                    poll.rx_frames,
+                    poll.budget_exhausted,
+                    0,
+                );
+                poll.budget_exhausted |= budget.rx_exhausted();
+                if outcome == crate::supervisor::DriverTxCapOutcome::Installed {
+                    self.clear_driver_tx_release_cap();
+                }
+                poll
+            }
+        }
+    }
+
     fn poll_transition_wake_for_release(
         &mut self,
         budget: &ServiceBudget,
@@ -2039,6 +2186,19 @@ impl CoreOps for SupervisorInner {
         release_deadline: Instant,
     ) -> f64 {
         self.tick_control_with_clock(dt, now_fn, release_deadline)
+    }
+
+    fn advance_output_with_budget(
+        &mut self,
+        dt: f64,
+        _generation: u64,
+        budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> f64 {
+        let before = self.sync_driver_budget_before(budget);
+        let ts = self.tick_control_with_clock(dt, now_fn, budget.deadline());
+        self.charge_driver_budget_after(budget, before, 0, false, 0);
+        ts
     }
 
     fn post_output_urgent_wake(
@@ -2322,6 +2482,13 @@ pub struct ReleaseEngine {
     /// The driver transition in flight.
     transition: Option<Installed>,
     releases: u64,
+    /// Single per-release mutable resource ledger shared across Step 2 poll, Step 2b sessions,
+    /// Step 3 transition commit, Step 5 output, and Window 2 sub-release wakes.
+    release_budget: Option<ReleaseBudget>,
+    /// Per-release RX frame allowance cap (`RX_FRAME_BUDGET` by default; tests may tighten).
+    rx_budget_limit: u16,
+    /// Optional per-release TX attempt allowance cap override (`None` queries `core.release_tx_budget_limit()`).
+    tx_budget_limit: Option<u16>,
     hook: Option<Box<dyn FnMut(Checkpoint) + Send>>,
 }
 
@@ -2346,12 +2513,26 @@ impl ReleaseEngine {
                 active: None,
                 transition: None,
                 releases: 0,
+                release_budget: None,
+                rx_budget_limit: RX_FRAME_BUDGET,
+                tx_budget_limit: None,
                 hook: None,
             },
             broker,
             tw,
             stop,
         )
+    }
+
+    /// Configures per-release RX frame and optional TX attempt ledger caps.
+    pub fn set_release_budget_limits(&mut self, rx_limit: u16, tx_limit: Option<u16>) {
+        self.rx_budget_limit = rx_limit;
+        self.tx_budget_limit = tx_limit;
+    }
+
+    /// Snapshot of the current / most recent release's [`ReleaseBudget`] ledger.
+    pub fn last_release_budget(&self) -> Option<ReleaseBudget> {
+        self.release_budget
     }
 
     /// Attaches the dedicated bounded urgent-stop intake drained at Step 1, every
@@ -2599,28 +2780,60 @@ impl ReleaseEngine {
     pub fn step_with_pre_commit<O: CoreOps>(
         &mut self,
         core: &mut O,
-        mut now_fn: impl FnMut() -> Instant,
+        now_fn: impl FnMut() -> Instant,
         dt: f64,
         release_deadline: Instant,
         publish_generation: u64,
         mut pre_commit: impl FnMut(&mut O, &CommitCtx) -> bool,
     ) -> ReleaseReport {
+        self.step_with_pre_commit_budget(
+            core,
+            now_fn,
+            dt,
+            release_deadline,
+            publish_generation,
+            |core, ctx, _budget| pre_commit(core, ctx),
+        )
+    }
+
+    /// Runs one full release on `core`, owning ONE mutable [`ReleaseBudget`] ledger threaded
+    /// through Step 2 hardware poll, Step 2b `pre_commit` (maintenance + sessions), Step 3
+    /// transition commit, Step 5 control output, and retained for Window 2 sub-release wakes.
+    pub fn step_with_pre_commit_budget<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        mut now_fn: impl FnMut() -> Instant,
+        dt: f64,
+        release_deadline: Instant,
+        publish_generation: u64,
+        mut pre_commit: impl FnMut(&mut O, &CommitCtx, &mut ReleaseBudget) -> bool,
+    ) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
+        let release_started = now_fn();
+        let core_tx_limit = core.release_tx_budget_limit();
+        let tx_limit = self
+            .tx_budget_limit
+            .map_or(core_tx_limit, |lim| lim.min(core_tx_limit));
+        let mut ledger = ReleaseBudget::new(
+            self.releases,
+            release_started,
+            release_deadline,
+            self.rx_budget_limit,
+            tx_limit,
+        );
         // 1. Urgent requests (E-stop + urgent Stop handoff + authorized stop), independent of command ring capacity
         if self.apply_pending_urgent_at(core, now_fn()) { report.stopped = true; }
-        // 2. Single budgeted hardware poll (frees `self.transition`, defers terminal delivery until after Step 6 publish).
-        // NOTE: `DamiaoArmDriver::receive_feedback` still has a legacy stale-joint RX-poll
-        // recovery TX path (`src/driver.rs:4701`) outside Step 5's `BeforeOutput` checkpoint;
-        // that path is addressed on branch `feat/rt-tx-budget`, which merges after stage 3 step 1.
-        let budget = ServiceBudget::for_release(now_fn(), release_deadline);
-        report.poll = core.poll_hardware_for_release_with_clock(&budget, release_deadline, &mut now_fn);
+        // 2. Single budgeted hardware poll drawing from `ledger` (frees `self.transition`, defers
+        //    terminal delivery until after Step 6 publish).
+        report.poll = core.poll_hardware_with_budget(&mut ledger, &mut now_fn);
         let finished_transition = self.take_finished_transition(&mut report);
-        // 2b. Owner persistence and bounded maintenance run strictly after Step 2 feedback intake
-        // and strictly before Step 3–6 commit, output, and publication.
+        // 2b. Owner persistence and bounded maintenance/sessions run strictly after Step 2 feedback
+        // intake and strictly before Step 3–6 commit, output, and publication, sharing `ledger`.
         let pre_ctx = self.ctx(now_fn());
-        let stopping = pre_commit(core, &pre_ctx);
+        let stopping = pre_commit(core, &pre_ctx, &mut ledger);
         if stopping {
+            self.release_budget = Some(ledger);
             let ended_transition = finished_transition
                 .or_else(|| self.take_aborted_transition(core, &mut report));
             // Single publication boundary: publish any Step 1-2b state changes (such as an E-stop
@@ -2752,11 +2965,11 @@ impl ReleaseEngine {
                         },
                         CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx).map_err(CommitRefusal::code),
                         CommandKind::Transition(op) => {
-                            core.commit_transition_for_release_with_clock(
+                            core.commit_transition_with_budget(
                                 &d,
                                 op,
                                 &ctx,
-                                release_deadline,
+                                &mut ledger,
                                 &mut now_fn,
                             )
                             .map_err(CommitRefusal::code)
@@ -2895,7 +3108,8 @@ impl ReleaseEngine {
         // 5. Urgent recheck + advance control output (passes live `now_fn` so pre-step and
         //    transmit-point macro deadline checks always take fresh clock reads).
         let _out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
-        let timestamp = core.advance_output_with_clock(dt, publish_generation, &mut now_fn, release_deadline);
+        let timestamp = core.advance_output_with_budget(dt, publish_generation, &mut ledger, &mut now_fn);
+        self.release_budget = Some(ledger);
         // Consume any transition aborted during Steps 2b-5 (including one installed in Step 3 and
         // fenced by Disconnect/expiry in Steps 4-5) at the single pre-publish boundary so Step 6
         // publishes `torque_transition_pending == false`, while Step 7 delivers replies strictly
@@ -3025,8 +3239,16 @@ impl ReleaseEngine {
         let lifecycle_pending = self.has_pending_lifecycle_replies();
         if urgent_stopped { report.stopped = true; }
         if allow_transition_poll && !urgent_consumed && !lifecycle_pending {
-            let budget = ServiceBudget::for_release(now, release_deadline);
-            report.poll = core.poll_transition_wake_for_release_with_clock(&budget, release_deadline, &mut now_fn);
+            let core_tx_limit = core.release_tx_budget_limit();
+            let tx_limit = self
+                .tx_budget_limit
+                .map_or(core_tx_limit, |lim| lim.min(core_tx_limit));
+            let ledger = self.release_budget.get_or_insert_with(|| {
+                ReleaseBudget::new(self.releases, now, release_deadline, self.rx_budget_limit, tx_limit)
+            });
+            // Sub-budgets in Window 2 may only tighten the release deadline, never widen it.
+            ledger.tighten_deadline(release_deadline);
+            report.poll = core.poll_transition_wake_with_budget(ledger, &mut now_fn);
         }
         let finished = self
             .take_finished_transition(report)
@@ -3129,6 +3351,18 @@ impl<O: CoreOps> ReleaseFixture<O> {
     pub fn with_sub_release_margin(mut self, margin: Duration) -> Self {
         self.sub_release_margin = Some(margin);
         self
+    }
+
+    /// Configures per-release RX frame and optional TX attempt ledger caps on the underlying
+    /// [`ReleaseEngine`].
+    pub fn with_release_budget_limits(mut self, rx_limit: u16, tx_limit: Option<u16>) -> Self {
+        self.engine.set_release_budget_limits(rx_limit, tx_limit);
+        self
+    }
+
+    /// Snapshot of the most recent release's [`ReleaseBudget`] ledger.
+    pub fn last_release_budget(&self) -> Option<ReleaseBudget> {
+        self.engine.last_release_budget()
     }
 
     /// [`Self::new`] with a freshly generated non-zero executor [`BootId`].

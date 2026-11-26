@@ -11115,13 +11115,13 @@ fn control_thread_main_inner(
                     core.begin_tick_phases(body_start);
                     core.service_internal_fault_lane();
 
-                    let report = engine.step_with_pre_commit(
+                    let report = engine.step_with_pre_commit_budget(
                         &mut *core,
                         now_inst,
                         dt,
                         release_deadline,
                         publish_gen,
-                        |core, ctx| {
+                        |core, ctx, release_budget| {
                             // Run persistence reconciliation and at most one bounded maintenance op
                             // strictly AFTER Step 2 fresh feedback intake and strictly BEFORE Step 3
                             // commit, Step 5 output, and Step 6 publication. Hold E-stop acknowledgements
@@ -11132,13 +11132,13 @@ fn control_thread_main_inner(
                             state.service_one_maintenance(
                                 core,
                                 ctx,
-                                release_deadline,
+                                release_budget.deadline(),
                                 step_num,
                                 &mut release_flags,
                                 &mut maint_req_id,
                             );
                             if !control_stop.load(Ordering::Acquire) && !core.internal_fault_lane.is_fenced() {
-                                core.service_sessions_release(ctx, release_deadline, &now_inst);
+                                core.service_sessions_release_with_budget(ctx, release_budget, &now_inst);
                             }
                             control_stop.load(Ordering::Acquire)
                                 || core.sessions.is_safe_hold_requested()

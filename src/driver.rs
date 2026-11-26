@@ -1247,6 +1247,17 @@ pub trait ArmDriver: Send {
     /// and mark that Step 5 normal output will NOT run again in this release.
     fn begin_wake_tx_pass(&mut self) {}
 
+    /// Configured per-release budgeted TX attempt cap, if this driver enforces one.
+    fn tx_budget_max_frames(&self) -> Option<u16> { None }
+
+    /// Cumulative `(rx_frames_consumed, budgeted_tx_attempts_started)` accounted by this driver
+    /// during the current control release (including discarded RX frames).
+    fn release_budget_consumed(&self) -> (u16, u16) { (0, 0) }
+
+    /// Monotonically tightens this driver's remaining RX frame and budgeted TX attempt caps for
+    /// the current control release from the owner's [`crate::rt_core::budget::ReleaseBudget`].
+    fn sync_release_budget_limits(&mut self, _rx_remaining: u16, _tx_remaining: u16) {}
+
     /// Earliest next wake instant needed to keep already-enabled arm joints refreshed within the
     /// hardware watchdog window while a transition is pending (`None` if no motor is energized).
     fn next_watchdog_hold_wake(&self) -> Option<Instant> { None }
@@ -7917,8 +7928,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Bitmask of joints currently owned by an active `ModeSwitch` transaction (suppresses
     /// legacy `mode_readback_boundary` auto-verification in `process_rx_frame`).
     mode_switch_active_mask: u32,
-    /// Per-release RX frame counter shared between Step 2 RX and ModeSwitch RX drain (one ledger).
+    /// Per-release RX frame counter shared across Step 2 RX, transition polls, ModeSwitch, and commissioning (one ledger).
     release_rx_frames: u16,
+    /// Per-release RX frame cap tightened by the owner's [`crate::rt_core::budget::ReleaseBudget`] (default 64).
+    release_rx_limit: u16,
+    /// Optional per-release budgeted TX cap tightened by the owner's [`crate::rt_core::budget::ReleaseBudget`].
+    release_tx_limit: Option<u16>,
     /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
     last_feedback_decode_offset_ns: Vec<Option<i128>>,
     /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary
@@ -9264,6 +9279,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mode_write_uncertain_mask: 0,
             mode_switch_active_mask: 0,
             release_rx_frames: 0,
+            release_rx_limit: crate::rt_core::ops::RX_FRAME_BUDGET,
+            release_tx_limit: None,
             last_feedback_decode_offset_ns: vec![None; dof],
             uncertain_readback_probe: [None; MAX_MODE_JOINTS],
             mit_limits_verified: vec![false; dof],
@@ -9398,6 +9415,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.tx_budget = budget;
         self.tick_tx = None;
         self.tx_release_deadline = None;
+        self.release_tx_limit = None;
     }
 
     /// Open a fresh per-tick TX budget window. Called automatically at the start of
@@ -9695,28 +9713,60 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             })))
     }
 
+    /// Effective budgeted TX attempt cap for the current control release (tightened monotonically
+    /// by the owner's [`crate::rt_core::budget::ReleaseBudget`]).
+    #[inline]
+    fn effective_tx_max_frames(&self) -> usize {
+        match self.release_tx_limit {
+            Some(lim) => self.tx_budget.max_frames.min(usize::from(lim)),
+            None => self.tx_budget.max_frames,
+        }
+    }
+
+    /// Remaining per-release RX frames allowed on this driver under the active control release.
+    #[inline]
+    fn driver_remaining_release_rx(&self) -> u16 {
+        if self.control_release_managed {
+            self.release_rx_limit.saturating_sub(self.release_rx_frames)
+        } else {
+            crate::rt_core::ops::RX_FRAME_BUDGET
+        }
+    }
+
+    /// Tightens a caller-supplied RX frame limit against the active control release ledger.
+    #[inline]
+    fn clamp_release_rx_limit(&self, max_rx_frames: u16) -> u16 {
+        if self.control_release_managed {
+            max_rx_frames.min(self.driver_remaining_release_rx())
+        } else {
+            max_rx_frames.min(crate::rt_core::ops::RX_FRAME_BUDGET)
+        }
+    }
+
     #[inline]
     fn can_start_tick_tx_n(&self, needed: usize) -> bool {
+        let max_frames = self.effective_tx_max_frames();
         let Some(pass) = self.tick_tx else {
-            return needed <= self.tx_budget.max_frames
+            return needed <= max_frames
                 && self.tx_release_deadline.is_none_or(|cap| self.now() < cap);
         };
         let effective_deadline = self
             .tx_release_deadline
             .map_or(pass.deadline, |cap| pass.deadline.min(cap));
         !pass.backpressured
-            && pass.attempts.saturating_add(needed) <= self.tx_budget.max_frames
+            && pass.attempts.saturating_add(needed) <= max_frames
             && self.now() < effective_deadline
     }
 
     /// Remaining TX frame slots in the active tick pass (`0` if backpressured or past deadline).
     #[inline]
     fn remaining_tick_tx_slots(&self) -> usize {
+        let max_frames = self.effective_tx_max_frames();
         let Some(pass) = self.tick_tx else {
             if self.tx_release_deadline.is_some_and(|cap| self.now() >= cap) {
                 return 0;
             }
-            return self.tx_budget.max_frames;
+            return max_frames;
         };
         let effective_deadline = self
             .tx_release_deadline
@@ -9724,7 +9774,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if pass.backpressured || self.now() >= effective_deadline {
             return 0;
         }
-        self.tx_budget.max_frames.saturating_sub(pass.attempts)
+        max_frames.saturating_sub(pass.attempts)
     }
 
     /// Priority `(class, slot_last_tx_seq)` of the active `PosForce` J7 joint's `0x307` frame
@@ -12330,10 +12380,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Pure RX-only drain (no autonomous recovery/refresh TX, no `begin_tx_tick`, zero heap
     /// allocation). Returns `true` when the transport explicitly reported an empty RX queue.
     fn drain_rx_frames_only(&mut self, deadline: Option<Deadline>, max_frames: usize) -> bool {
+        let limit = if self.control_release_managed {
+            max_frames.min(usize::from(self.driver_remaining_release_rx()))
+        } else {
+            max_frames
+        };
         let mut frames = 0usize;
-        while frames < max_frames {
+        let mut drained = false;
+        while frames < limit {
             if deadline.is_some_and(|d| d.passed(self.now())) {
-                return false;
+                break;
             }
             let attempt = self.now();
             match self.receive_with_rx_time_timed() {
@@ -12343,12 +12399,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     self.mark_rx_empty(attempt);
-                    return true;
+                    drained = true;
+                    break;
                 }
-                Err(_) => return false,
+                Err(_) => break,
             }
         }
-        false
+        if frames > 0 {
+            let f_u16 = u16::try_from(frames).unwrap_or(u16::MAX);
+            if self.control_release_managed {
+                self.release_rx_frames = self.release_rx_frames.saturating_add(f_u16);
+            }
+            if let Some(rem) = self.rx_frame_limit.as_mut() {
+                *rem = rem.saturating_sub(f_u16);
+            }
+        }
+        drained
     }
 
     /// Transmit a read-only `0xCC` status refresh probe on an empty software queue through the
@@ -13579,7 +13645,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let budget_armed = match max_rx_frames {
             Some(limit) => {
                 self.last_poll_rx = None;
-                self.rx_frame_limit = Some(limit.min(64));
+                self.rx_frame_limit = Some(self.clamp_release_rx_limit(limit));
                 true
             }
             None => false,
@@ -14235,15 +14301,28 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake })
     }
 
-    /// Remaining frames allowed in the current budgeted RX pass (defaults to 64 when unbudgeted).
+    /// Remaining frames allowed in the current budgeted RX pass (defaults to 64 when unbudgeted,
+    /// tightened by the active control release ledger when `control_release_managed`).
     fn remaining_rx_frame_limit(&self) -> usize {
-        usize::from(self.rx_frame_limit.unwrap_or(64).min(64))
+        let base = self
+            .rx_frame_limit
+            .unwrap_or(crate::rt_core::ops::RX_FRAME_BUDGET)
+            .min(crate::rt_core::ops::RX_FRAME_BUDGET);
+        usize::from(if self.control_release_managed {
+            base.min(self.driver_remaining_release_rx())
+        } else {
+            base
+        })
     }
 
-    /// Account frames consumed by an RX pass into `last_poll_rx` and deduct them from the active
-    /// `rx_frame_limit` so multiple drains within one release share a single frame budget.
+    /// Account frames consumed by an RX pass (including discarded frames) into the per-release
+    /// counter, `last_poll_rx`, and active `rx_frame_limit` so all drains in one release share a
+    /// single frame ledger.
     fn account_rx_pass(&mut self, frames_processed: usize, exhausted: bool) {
         let frames = u16::try_from(frames_processed).unwrap_or(u16::MAX);
+        if self.control_release_managed {
+            self.release_rx_frames = self.release_rx_frames.saturating_add(frames);
+        }
         if let Some(rem) = self.rx_frame_limit.as_mut() {
             *rem = rem.saturating_sub(frames);
         }
@@ -15837,7 +15916,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(0) => self.awaiting_rx_boundary || !self.last_read_drained,
             Some(limit) => {
                 self.last_poll_rx = None;
-                self.rx_frame_limit = Some(limit.min(64));
+                self.rx_frame_limit = Some(self.clamp_release_rx_limit(limit));
                 let drained = self.drain_rx_before_command_limit(usize::from(limit));
                 self.rx_frame_limit = None;
                 !drained
@@ -17309,7 +17388,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn drain_rx_before_command_limit(&mut self, max_frames: usize) -> bool {
-        let limit = self.rx_frame_limit.map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
+        let base = self
+            .rx_frame_limit
+            .map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
+        let limit = if self.control_release_managed {
+            base.min(usize::from(self.driver_remaining_release_rx()))
+        } else {
+            base
+        };
         self.last_read_drained = false;
         let start = self.now();
         let mut frames_processed = 0usize;
@@ -17335,6 +17421,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if self.rx_frame_limit.is_some() {
             self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
+        } else if frames_processed > 0 && self.control_release_managed {
+            let f_u16 = u16::try_from(frames_processed).unwrap_or(u16::MAX);
+            self.release_rx_frames = self.release_rx_frames.saturating_add(f_u16);
         }
         rx_drained
     }
@@ -17588,7 +17677,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.in_poll_torque = true;
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
-        self.rx_frame_limit = Some(max_rx_frames.min(64));
+        self.rx_frame_limit = Some(self.clamp_release_rx_limit(max_rx_frames));
         let is_enable_hs = matches!(
             self.torque_hs,
             Some(
@@ -18247,6 +18336,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.control_release_id != release_seq {
             self.control_release_id = release_seq;
             self.release_rx_frames = 0;
+            self.release_rx_limit = crate::rt_core::ops::RX_FRAME_BUDGET;
+            self.release_tx_limit = None;
             self.begin_tx_tick();
             self.output_step_pending_in_release = true;
         }
@@ -18261,6 +18352,30 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.discard_staged_ctrl_tx();
         self.output_step_pending_in_release = false;
+    }
+
+    fn tx_budget_max_frames(&self) -> Option<u16> {
+        Some(self.tx_budget.max_frames.min(u16::MAX as usize) as u16)
+    }
+
+    fn release_budget_consumed(&self) -> (u16, u16) {
+        let tx = self
+            .tick_tx
+            .map_or(0, |p| p.attempts.min(u16::MAX as usize) as u16);
+        (self.release_rx_frames, tx)
+    }
+
+    fn sync_release_budget_limits(&mut self, rx_remaining: u16, tx_remaining: u16) {
+        let new_rx_lim = self.release_rx_frames.saturating_add(rx_remaining);
+        self.release_rx_limit = self.release_rx_limit.min(new_rx_lim);
+        let cur_tx = self
+            .tick_tx
+            .map_or(0, |p| p.attempts.min(u16::MAX as usize) as u16);
+        let new_tx_lim = cur_tx.saturating_add(tx_remaining);
+        self.release_tx_limit = Some(
+            self.release_tx_limit
+                .map_or(new_tx_lim, |prev| prev.min(new_tx_lim)),
+        );
     }
 
     fn next_watchdog_hold_wake(&self) -> Option<Instant> {
@@ -18837,7 +18952,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if !self.can.supports_nonblocking_rt() {
             return Err(ArmDriverError::Protocol("non-blocking CAN RX unsupported".into()));
         }
-        let limit = usize::from(max_frames.min(64));
+        let limit = usize::from(self.clamp_release_rx_limit(max_frames));
         let mut frames = 0u16;
         let mut drained = false;
         self.last_read_drained = false;
@@ -18846,7 +18961,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             match self.can.receive_with_rx_time() {
                 Ok((frame, rx_time)) => {
                     frames = frames.saturating_add(1);
-                    self.release_rx_frames = self.release_rx_frames.saturating_add(1);
+                    if self.control_release_managed {
+                        self.release_rx_frames = self.release_rx_frames.saturating_add(1);
+                    }
                     self.process_rx_frame(&frame, true, rx_time);
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
@@ -19405,11 +19522,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn mode_switch_remaining_rx_budget(&self, default_max: u16) -> u16 {
-        if self.in_active_control_release() {
-            default_max.saturating_sub(self.release_rx_frames)
-        } else {
-            default_max
-        }
+        default_max.min(self.driver_remaining_release_rx())
     }
 
     fn axis_confirmed_mode(&self, joint: usize) -> Option<crate::motor_mode::ControlMode> {
@@ -20534,7 +20647,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
         let prev_managed = self.control_release_managed;
+        let prev_rx_frames = self.release_rx_frames;
+        let prev_rx_limit = self.release_rx_limit;
+        let prev_tx_limit = self.release_tx_limit;
         self.control_release_managed = true;
+        self.release_rx_frames = 0;
+        self.release_rx_limit = crate::rt_core::ops::RX_FRAME_BUDGET;
+        self.release_tx_limit = None;
         let mut last_release_at = self.now();
         let res = (|| {
             let mut progress = self.begin_disable_torque(kind)?;
@@ -20548,11 +20667,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     last_release_at = now;
                     self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
                 }
+                self.release_rx_frames = 0;
                 let deadline = self.now() + DAMIAO_RX_PASS;
                 progress = self.poll_torque(deadline)?;
             }
         })();
         self.control_release_managed = prev_managed;
+        self.release_rx_frames = prev_rx_frames;
+        self.release_rx_limit = prev_rx_limit;
+        self.release_tx_limit = prev_tx_limit;
         res
     }
 
@@ -21084,12 +21207,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
-                    let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
+                let tx_max = self.effective_tx_max_frames();
+                if pass.attempts.saturating_add(batch_frames) > tx_max {
+                    let remaining = tx_max.saturating_sub(pass.attempts);
                     let reason = MitFenceTripReason::TxBudgetExceededPreflight {
                         needed: batch_frames.min(u16::MAX as usize) as u16,
                         remaining: remaining.min(u16::MAX as usize) as u16,
-                        max: self.tx_budget.max_frames.min(u16::MAX as usize) as u16,
+                        max: tx_max.min(u16::MAX as usize) as u16,
                     };
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
@@ -21862,12 +21986,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
-                    let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
+                let tx_max = self.effective_tx_max_frames();
+                if pass.attempts.saturating_add(batch_frames) > tx_max {
+                    let remaining = tx_max.saturating_sub(pass.attempts);
                     let reason = MitFenceTripReason::TxBudgetExceededPreflight {
                         needed: batch_frames.min(u16::MAX as usize) as u16,
                         remaining: remaining.min(u16::MAX as usize) as u16,
-                        max: self.tx_budget.max_frames.min(u16::MAX as usize) as u16,
+                        max: tx_max.min(u16::MAX as usize) as u16,
                     };
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
@@ -22586,12 +22711,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
-                    let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
+                let tx_max = self.effective_tx_max_frames();
+                if pass.attempts.saturating_add(batch_frames) > tx_max {
+                    let remaining = tx_max.saturating_sub(pass.attempts);
                     let reason = MitFenceTripReason::TxBudgetExceededPreflight {
                         needed: batch_frames.min(u16::MAX as usize) as u16,
                         remaining: remaining.min(u16::MAX as usize) as u16,
-                        max: self.tx_budget.max_frames.min(u16::MAX as usize) as u16,
+                        max: tx_max.min(u16::MAX as usize) as u16,
                     };
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
@@ -23030,7 +23156,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
-        self.rx_frame_limit = Some(max_rx_frames.min(64));
+        self.rx_frame_limit = Some(self.clamp_release_rx_limit(max_rx_frames));
         let r = self.receive_feedback();
         self.rx_deadline = None;
         self.rx_frame_limit = None;
@@ -23663,9 +23789,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
-        self.release_rx_frames = self
-            .release_rx_frames
-            .saturating_add(frames_processed.min(u16::MAX as usize) as u16);
 
         // R2 Blocker 1: Resolve SAFE-HOLD / stopped recovery `REG_READ(RID_CTRL_MODE)` probes for
         // mode-uncertain joints strictly AFTER observed empty RX queue closure using the timed

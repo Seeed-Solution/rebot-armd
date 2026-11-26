@@ -3483,29 +3483,43 @@ impl crate::supervisor::SupervisorInner {
     /// Advances the single preallocated commissioning state machine by one bounded non-blocking
     /// step inside Step 2b of a control release (strictly under `release_deadline - publish_margin`,
     /// sharing Step 2's RX/TX pass budgets; 0 heap allocs and 0 heap frees on `armd-control`).
-    pub(crate) fn service_commissioning_release(
+    pub(crate) fn service_commissioning_release_with_budget(
         &mut self,
         ctx: &crate::rt_core::ops::CommitCtx,
-        release_deadline: std::time::Instant,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
         owner_now_fn: &dyn Fn() -> std::time::Instant,
     ) {
         if self.commissioning.state != CommissioningOpState::Running {
             return;
         }
         let owner_now = owner_now_fn();
+        let release_deadline = release_budget.deadline();
         let total_span = release_deadline.saturating_duration_since(owner_now);
         let publish_margin = self.tx_release_publish_margin().min(total_span / 2);
         let owner_cutoff = release_deadline
             .checked_sub(publish_margin)
             .unwrap_or(owner_now);
         let mut now_mut = || owner_now_fn();
-        let _ = self.service_commissioning_step_with_cutoff(
+        let rx_cap = release_budget.rx_remaining().min(16);
+        let tx_cap = u16::from(COMM_MAX_TX_PER_RELEASE)
+            .min(release_budget.tx_remaining())
+            .min(u16::from(u8::MAX)) as u8;
+        let before = self.sync_driver_budget_before(release_budget);
+        let progress = self.service_commissioning_step_with_cutoff_and_rx(
             ctx,
             owner_cutoff,
-            COMM_MAX_TX_PER_RELEASE,
+            tx_cap,
             None,
+            rx_cap,
             true,
             &mut now_mut,
+        );
+        self.charge_driver_budget_after(
+            release_budget,
+            before,
+            0,
+            rx_cap == 0,
+            u16::from(progress.reg_tx_attempted.saturating_add(progress.probe_tx_attempted)),
         );
     }
 
@@ -3517,9 +3531,33 @@ impl crate::supervisor::SupervisorInner {
     pub(crate) fn service_commissioning_step_with_cutoff(
         &mut self,
         ctx: &crate::rt_core::ops::CommitCtx,
+        owner_cutoff: std::time::Instant,
+        max_tx: u8,
+        probe_tx_cap: Option<u8>,
+        is_new_release: bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
+    ) -> CommissioningStepProgress {
+        let rx_cap = crate::rt_core::ops::RX_FRAME_BUDGET
+            .saturating_sub(self.pending_rx_poll.rx_frames)
+            .min(16);
+        self.service_commissioning_step_with_cutoff_and_rx(
+            ctx,
+            owner_cutoff,
+            max_tx,
+            probe_tx_cap,
+            rx_cap,
+            is_new_release,
+            owner_now_fn,
+        )
+    }
+
+    fn service_commissioning_step_with_cutoff_and_rx(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
         mut owner_cutoff: std::time::Instant,
         max_tx: u8,
         probe_tx_cap: Option<u8>,
+        remaining_rx: u16,
         is_new_release: bool,
         owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> CommissioningStepProgress {
@@ -3569,9 +3607,6 @@ impl crate::supervisor::SupervisorInner {
                 ..CommissioningStepProgress::default()
             };
         }
-        let remaining_rx = crate::rt_core::ops::RX_FRAME_BUDGET
-            .saturating_sub(self.pending_rx_poll.rx_frames)
-            .min(16);
 
         let kind = self.commissioning.kind;
         let joint_len = self.commissioning.joint_len;
