@@ -321,6 +321,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     // Core observation, torque, heartbeat, motion, actions
     rr!(GET    "/api/v1/observation",               rest::get_observation,        ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/observation/schema",        rest::get_observation_schema, ExecutorRequest, None,      None,              Allowed),
+    rr!(GET    "/api/v1/cell/status",               rest::get_cell_status,        OwnerAgnostic,   None,      None,              Allowed),
     rr!(POST   "/api/v1/torque",                    rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/arm",                       rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/heartbeat",                 rest::heartbeat,              ExecutorRequest, None,      None,              Fenced),

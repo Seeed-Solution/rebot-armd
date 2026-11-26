@@ -1594,6 +1594,12 @@ pub struct ArmConfig {
     /// (`ARMD_TORQUE_SHADOW=0|false|off|no` overrides to off at startup). Default: `true`.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub torque_shadow_enabled: bool,
+    /// Optional multi-arm cell topology file (`rebot-cell/v1` JSON); None = single-arm mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<String>,
+    /// Optional local host ID override within `cell` (`hosts` key); None = auto-identify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_host: Option<String>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -1689,6 +1695,8 @@ impl Default for ArmConfig {
             contact_opening_m: None,
             dynamics_qualified: true,
             torque_shadow_enabled: true,
+            cell: None,
+            cell_host: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -2090,6 +2098,18 @@ impl ArmConfig {
             ));
         }
         if let Some(t) = &self.calibration_tool { t.validate()?; }
+        if let Some(cell_path) = &self.cell {
+            if cell_path.trim().is_empty() {
+                return Err("cell path must not be empty".into());
+            }
+        }
+        if let Some(cell_host) = &self.cell_host {
+            if !crate::cell::is_valid_identifier(cell_host) {
+                return Err(format!(
+                    "cell_host must match [A-Za-z0-9][A-Za-z0-9_-]{{0,63}}, got {cell_host:?}"
+                ));
+            }
+        }
         if self.limits.len() != self.dof {
             return Err(format!("Limits length {} does not match DOF {}", self.limits.len(), self.dof));
         }
@@ -3504,6 +3524,8 @@ impl ArmConfig {
             contact_opening_m: None,
             dynamics_qualified: true,
             torque_shadow_enabled: true,
+            cell: None,
+            cell_host: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -4292,6 +4314,9 @@ pub struct Capabilities {
     /// On-device policy runtime capabilities; omitted unless compiled with `policy-runtime`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_runtime: Option<PolicyRuntimeCapabilities>,
+    /// Multi-arm cell capabilities; omitted when no cell config is active (off by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<crate::cell::CellCapabilities>,
 }
 
 /// Policy-runtime features compiled into this armd instance.
@@ -4602,6 +4627,7 @@ impl Capabilities {
             teach: None,
             vision: VisionCapabilities { detection_proxy: true, detector_switch: cfg!(not(target_arch = "wasm32")), mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
             policy_runtime,
+            cell: None,
         }
     }
 }

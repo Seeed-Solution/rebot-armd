@@ -451,6 +451,13 @@ pub async fn get_observation_schema(
     Ok(Json(schema))
 }
 
+/// GET /api/v1/cell/status (read-only; returns `{"enabled": false}` when cell mode is off).
+pub async fn get_cell_status(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+) -> Json<crate::cell::CellStatusResponse> {
+    Json(supervisor.cell_status())
+}
+
 
 // Actuator authority is bound to the WebSocket that acquired the lease. REST
 // cannot prove that identity using a caller-supplied client id or generation.
