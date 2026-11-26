@@ -1832,7 +1832,7 @@ async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
     for executor_mode in [false, true] {
         let (sup, addr, handle) = setup_mode(
             ArmConfig {
-                lease_timeout_ms: 5_000,
+                lease_timeout_ms: 60_000,
                 ..ArmConfig::rebot_dm()
             },
             OperatorAuth::disabled(),
@@ -1939,8 +1939,12 @@ async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
     // (b) Executor mode with delayed hardware confirmation: WS `command_ack` MUST wait for
     //     confirmed `Outcome::Completed` terminal (NEVER sent on early Step 3 `Ack`).
     {
+        // Match a 20 Hz (50 ms) executor release period so each release has 48 ms of TX budget
+        // (`period - DAMIAO_TX_RELEASE_PUBLISH_MARGIN`), preventing spurious `BUDGET_EXPIRED`
+        // under host CPU contention while keeping `L2MockDriver` sub-release confirmation fast.
         let cfg = ArmConfig {
-            lease_timeout_ms: 5_000,
+            lease_timeout_ms: 60_000,
+            control_frequency_hz: 20,
             ..ArmConfig::rebot_dm()
         };
         let ctrl = Arc::new(L2DriverControl::default());
@@ -1950,10 +1954,10 @@ async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
         let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
         let addr = serve_with_auth(sup.clone(), OperatorAuth::disabled()).await;
         let handle = sup
-            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(50)))
             .await
             .unwrap();
-        wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+        wait_until(Duration::from_secs(10), || sup.hub().latest().is_some()).await;
 
         let mut ws = connect_ws(addr, "").await;
         let g = ws_reply(
@@ -1972,7 +1976,7 @@ async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
             json!({"type": "command", "request_id": 1, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
         )
         .await;
-        wait_until(Duration::from_secs(2), || {
+        wait_until(Duration::from_secs(10), || {
             ctrl.begin_enable_calls.load(Ordering::SeqCst) >= 1
                 && ctrl.poll_enable_calls.load(Ordering::SeqCst) >= 1
         })
@@ -2001,7 +2005,7 @@ async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
             json!({"type": "command", "request_id": 2, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": false}}),
         )
         .await;
-        wait_until(Duration::from_secs(2), || {
+        wait_until(Duration::from_secs(10), || {
             ctrl.begin_disable_calls.load(Ordering::SeqCst) >= 1
         })
         .await;

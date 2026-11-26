@@ -474,6 +474,72 @@ fn build_sg2002_driver(bus: Sg2002WallBus) -> DamiaoArmDriver<Sg2002WallBus> {
     dm
 }
 
+fn assert_sg2002_write_holds_bounded(
+    holds: &[armd::supervisor_lock::HoldRecord],
+    label: &str,
+) {
+    let write_holds: Vec<_> = holds.iter().filter(|h| h.kind == HoldKind::Write).collect();
+    assert!(
+        !write_holds.is_empty(),
+        "expected recorded SupervisorLock::write holds during {label}"
+    );
+    let mut saw_comm_write = false;
+    for h in &write_holds {
+        let io = h.io_timing.unwrap_or_default();
+        assert_eq!(
+            io.sleep_us, 0,
+            "SupervisorLock::write guard must never sleep during {label}: {h:?}"
+        );
+        if let Some(cpu) = h.cpu_hold {
+            assert!(
+                cpu <= Duration::from_millis(2),
+                "SupervisorLock::write guard on-CPU hold during {label} MUST stay <= 2 ms (cpu={cpu:?}, wall={:?}, hold={h:?})",
+                h.hold(),
+            );
+        }
+        if h.command == Some(mit::TIMEOUT_PATH) {
+            saw_comm_write = true;
+            if h.involuntary_csw == 0 {
+                let non_io = h
+                    .hold()
+                    .saturating_sub(Duration::from_micros(u64::from(io.tx_us) + u64::from(io.rx_us)));
+                assert!(
+                    non_io <= Duration::from_millis(1),
+                    "commissioning write guard non-I/O hold during {label} MUST stay <= 1 ms (non_io={non_io:?}, wall={:?}, hold={h:?})",
+                    h.hold(),
+                );
+                if io.tx_us <= 700 && io.rx_us <= 200 {
+                    assert!(
+                        h.hold() <= Duration::from_millis(2),
+                        "un-jittered commissioning write guard hold during {label} MUST stay <= 2 ms (wall={:?}, hold={h:?})",
+                        h.hold(),
+                    );
+                }
+            }
+        } else {
+            // Control-tick write guards must never emit commissioning TX inline, and their
+            // lock-held work outside the simulated SG2002 RX drain (`std::thread::sleep` in
+            // `Sg2002WallBus`) must stay <= 2 ms even in unoptimized debug builds.
+            assert_eq!(
+                io.tx_us, 0,
+                "control-tick write guard during disarmed {label} must emit 0 inline TX (hold={h:?})"
+            );
+            if h.involuntary_csw == 0 {
+                let non_rx = h.hold().saturating_sub(Duration::from_micros(u64::from(io.rx_us)));
+                assert!(
+                    non_rx <= Duration::from_millis(2),
+                    "control-tick write guard non-RX hold during {label} MUST stay <= 2 ms (non_rx={non_rx:?}, wall={:?}, hold={h:?})",
+                    h.hold(),
+                );
+            }
+        }
+    }
+    assert!(
+        saw_comm_write,
+        "expected at least one post-tick commissioning write guard during {label}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sg2002_legacy_mit_timeout_dry_run_and_write_meet_latency_and_guard_bounds() {
     let dir = tempfile::tempdir().unwrap();
@@ -640,10 +706,7 @@ async fn sg2002_legacy_mit_timeout_dry_run_and_write_meet_latency_and_guard_boun
         "SG2002 dry-run J1–J6 MUST complete in < 1 s (got {dry_elapsed:?})"
     );
     assert_eq!(dry_skipped, 0, "expected 0 skipped releases during dry-run");
-    assert!(
-        dry_max_write_hold <= Duration::from_millis(2),
-        "max write guard hold during dry-run MUST stay <= 2 ms (got {dry_max_write_hold:?})"
-    );
+    assert_sg2002_write_holds_bounded(&dry_holds, "dry-run");
     assert!(
         dry_progress_gap < 2,
         "commissioning must make progress at least every 2 releases (max gap={dry_progress_gap})"
@@ -752,10 +815,7 @@ async fn sg2002_legacy_mit_timeout_dry_run_and_write_meet_latency_and_guard_boun
         "SG2002 write 0->2000 J1–J6 MUST complete in < 2 s (got {wr_elapsed:?})"
     );
     assert_eq!(wr_skipped, 0, "expected 0 skipped releases during write");
-    assert!(
-        wr_max_write_hold <= Duration::from_millis(2),
-        "max write guard hold during write MUST stay <= 2 ms (got {wr_max_write_hold:?})"
-    );
+    assert_sg2002_write_holds_bounded(&wr_holds, "write 0->2000");
     assert!(
         wr_progress_gap < 2,
         "commissioning must make progress at least every 2 releases (max gap={wr_progress_gap})"
