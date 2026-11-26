@@ -460,6 +460,16 @@ impl ArmDriver for ZeroOffsetDriver {
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> { self.inner.clear_fault() }
     fn clear_fault_budgeted(&mut self, deadline: Instant) -> Result<(), ArmDriverError> { self.inner.clear_fault_budgeted(deadline) }
+    fn drain_rx_only_bounded(&mut self, deadline: Option<Instant>) -> Result<(), ArmDriverError> {
+        self.inner.drain_rx_only_bounded(deadline)
+    }
+    fn clear_carried_over_motor_errors(
+        &mut self,
+        deadline: Option<Instant>,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<crate::driver::CarryoverMotorClearOutcome, ArmDriverError> {
+        self.inner.clear_carried_over_motor_errors(deadline, pre_tx_gate)
+    }
     fn clear_fault_disables_joints(&self) -> Vec<usize> { self.inner.clear_fault_disables_joints() }
     fn has_known_partial_enable(&self) -> bool { self.inner.has_known_partial_enable() }
     fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
@@ -538,6 +548,25 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
     fn begin_control_release(&mut self, release_seq: u64) { self.inner.begin_control_release(release_seq) }
+    fn begin_wake_tx_pass(&mut self) { self.inner.begin_wake_tx_pass() }
+    fn next_watchdog_hold_wake(&self) -> Option<std::time::Instant> { self.inner.next_watchdog_hold_wake() }
+    fn service_release_watchdog_fallback(
+        &mut self,
+        authorized_mask: u64,
+        hold_targets: Option<&[Option<f32>]>,
+    ) {
+        if let Some(targets) = hold_targets {
+            let mut motor_targets = [None; crate::rt_core::mailbox::MAX_DOF];
+            let n = targets.len().min(motor_targets.len());
+            for i in 0..n {
+                motor_targets[i] = targets[i].map(|p| p + self.offsets.get(i).copied().unwrap_or(0.0));
+            }
+            self.inner
+                .service_release_watchdog_fallback(authorized_mask, Some(&motor_targets[..n]));
+        } else {
+            self.inner.service_release_watchdog_fallback(authorized_mask, None);
+        }
+    }
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
         self.inner.driver_clock()
     }

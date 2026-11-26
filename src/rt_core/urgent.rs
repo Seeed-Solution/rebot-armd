@@ -530,6 +530,8 @@ impl UrgentStopIntake {
         applied_any
     }
 
+    pub fn has_pending_requests(&self) -> bool { !self.req_rx.is_empty() }
+
     pub fn has_pending_replies(&self) -> bool { !self.pending.is_empty() }
 
     pub fn has_applied_pending(&self) -> bool {

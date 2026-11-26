@@ -2956,7 +2956,7 @@ const I18N = {
     'gc.x.WATCHDOG': '心跳超时：已退出拖动示教并锁定位置', 'gc.x.LEASE_LOST': '控制权丢失：已退出拖动示教并锁定位置', 'gc.x.TORQUE_LOST': '电机已失能：拖动示教结束',
     'gc.x.GRAVITY_COMP_OVERSPEED': '关节速度过快（可能在下坠）：已锁定位置', 'gc.x.GRAVITY_COMP_SAG': '补偿不足，机械臂在下沉：已锁定位置',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
-    'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障',
+    'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障', 'en.clear_motor_err_s': '⚠️ 清除电机错误', 'en.sub_clear_motor_err': '仅收纳位 · 保持未使能',
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.armed_readonly': '力矩已开 · 未控制', 'en.sub_readonly': '按住 0.6 秒：先确认控制权，再停靠卸力',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
@@ -2970,7 +2970,7 @@ const I18N = {
     'stop': '停止', 'stop.sub': '保持位置', 'stop.aria': '停止运动并保持位置',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who} 正在控制机械臂',
     'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.cockpit_id': '另一个驾驶舱页面（{id}）', 'who.unnamed': '未命名客户端', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
-    'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制', 'lock.col_hold': '碰撞保护中：自动恢复前运动控制已锁定（急停可用）',
+    'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.motor_err': '⚠️ 电机残留错误（{d}）：机械臂在收纳位且未使能时由操作员点击「清除电机错误」；若仍存在请给电机断电重启', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制', 'lock.col_hold': '碰撞保护中：自动恢复前运动控制已锁定（急停可用）',
     'preempt.btn': '接管控制权', 'preempt.title': '接管控制权确认',
     'preempt.body': '当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。',
     'preempt.body.who': '当前由 {who} 持有控制权。确认强制接管机械臂控制权？接管后对方将失去控制，正在进行的运动将被平稳悬停保持；开启操作员认证时需先解锁。',
@@ -3038,6 +3038,8 @@ const I18N = {
     'fault.limit': '关节超限 {name}: {val}°', 'fault.thermal': '过温 J{j}: {temp}°C / {limit}°C',
     // observation.fault.code -> short explanation + what to do (fc.<CODE> / fc.<CODE>.do)
     'fm.coded': '⚠️ {title}。{todo}。点此清除故障后长按「使能」。', 'lock.fault_coded': '⚠️ {title}：{todo}，然后点「清除故障」并长按「使能」',
+    'fm.motor_err': '⚠️ 电机报告硬件错误：{d}（锁存在电机内存中）。确认机械臂未使能且处于收纳位后点此清除（仅操作员，不会使能）；若仍存在请给电机断电重启。',
+    'fm.motor_err_op': '🔒 电机报告硬件错误：{d}（锁存在电机内存中）。需要操作员权限：确认机械臂未使能且处于收纳位后点此解锁并清除（不会使能）；若仍存在请给电机断电重启。',
     'fc.ESTOP': '急停已按下', 'fc.ESTOP.do': '确认周围安全后复位急停',
     'fc.BUS_LOSS': '电机总线断开', 'fc.BUS_LOSS.do': '检查电机线缆和电源是否接好',
     'fc.THERMAL_TRIP': '电机过热', 'fc.THERMAL_TRIP.do': '让机械臂停下冷却几分钟',
@@ -3081,7 +3083,7 @@ const I18N = {
     'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；需要控制时请长按「使能」或在提示中确认获取后再次操作', 'toast.lease_busy': '{who} 正在持有控制权，本页面为观察模式：请等对方释放，或点击「接管控制权」', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
     'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_rejected_fix': '接管请求被拒绝：{why}。请检查当前控制状态后重试', 'toast.take_owner_transferred': '接管失败：控制方已发生变更，请确认当前控制方后重新点击「接管控制权」', 'toast.take_ambiguous': '控制权确认异常（缺少有效租约编号），已重置为只读连接，请检查状态后重试', 'toast.take_timeout': '获取/接管控制权超时：未收到设备确认，已重置为只读连接，请检查状态后重试', 'toast.release_timeout': '释放控制权确认超时：已重置为只读连接，请检查控制状态', 'toast.release_inactive': '当前连接已不持有控制权，已刷新只读状态', 'toast.refresh_timeout': '释放后确认控制方超时：已重置为只读连接，请检查状态后重试', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
     'toast.homing': '回零中', 'toast.stop_no_control': '当前页面未持有控制权，未能向机械臂发送停止；如需立即停机请按急停', 'toast.stop_unconfirmed': '停止未确认，请使用急停', 'toast.stopped': '已停止，位置保持', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
-    'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
+    'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.motor_err_cleared': '电机错误已清除，电机保持未使能', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
     'toast.stow_failed': '收起失败: ', 'toast.stow_unconfirmed': '设备未确认收纳，请检查机械臂状态', 'toast.parked_off': '已收纳并关闭力矩',
     'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
     'toast.torque_off_unconfirmed': '关闭力矩请求未确认，请检查连接和机械臂状态', 'toast.stowing': '正在平稳回零收起...', 'toast.enabled': '控制已开启，请确认机械臂反馈状态',
@@ -3090,8 +3092,8 @@ const I18N = {
     'op.hint': 'PIN 在 reCamera 控制台本应用的设置里（「操作员权限」分组）设置。未设置时，armd 每次启动生成新的随机 PIN，存放在设备的 /userdata/rebot-teleop/operator.pin（root 登录后查看）。',
     'op.pin': '操作员 PIN', 'op.unlock': '解锁', 'op.lock': '锁定会话', 'op.unlocked_msg': '操作员权限已解锁', 'op.locked_msg': '操作员权限已锁定', 'op.lock_fail': '锁定未确认，请重试', 'op.bad_pin': 'PIN 错误', 'op.need_pin': '请输入操作员 PIN', 'err.operator_required': '需要操作员权限：点「解锁」输入 PIN 后再试',
     'op.rate': '尝试次数过多，请 {s} 秒后再试', 'op.state_on': '已解锁，{m} 分钟后自动锁定', 'op.state_on0': '已解锁', 'op.expired': '操作员会话已过期，已自动锁定', 'op.close': '关闭',
-    'op.inline': '🔒 复位需要操作员权限 · 解锁并复位', 'op.inline_fault': '🔒 清除故障需要操作员权限 · 解锁并清除',
-    'op.why.gc': '重力补偿需要操作员权限', 'op.why.det': '识别需要操作员权限', 'op.why.estop': '复位急停需要操作员权限', 'op.why.fault': '清除这个故障需要操作员权限',
+    'op.inline': '🔒 复位需要操作员权限 · 解锁并复位', 'op.inline_fault': '🔒 清除故障需要操作员权限 · 解锁并清除', 'op.inline_motor_err': '🔒 清除电机错误需要操作员权限 · 解锁并清除',
+    'op.why.gc': '重力补偿需要操作员权限', 'op.why.det': '识别需要操作员权限', 'op.why.estop': '复位急停需要操作员权限', 'op.why.fault': '清除这个故障需要操作员权限', 'op.why.motor_err': '清除电机硬件错误需要操作员权限',
     'op.why.calib': '标定需要操作员权限', 'op.why.poses': '保存或修改点位、动作需要操作员权限', 'op.why.rec': '录制和管理录制片段需要操作员权限', 'op.why.safety': '修改安全设置（禁入区、碰撞保护）需要操作员权限',
     'op.why.sandbox': '仿真沙盒需要操作员权限', 'op.why.vision': '切换视觉模式（YOLO / ArUco / 深度）需要操作员权限',
     'op.why.calib_open': '标定向导会把视觉切到 ArUco、保存标定数据并写入标定结果，这些步骤需要操作员权限。不解锁也能打开向导，但这些步骤会被拒绝。',
@@ -3225,7 +3227,7 @@ const I18N = {
     'gc.x.WATCHDOG': 'Heartbeat timeout: hand-guiding ended, pose held', 'gc.x.LEASE_LOST': 'Control lost: hand-guiding ended, pose held', 'gc.x.TORQUE_LOST': 'Motors disabled: hand-guiding ended',
     'gc.x.GRAVITY_COMP_OVERSPEED': 'Joint too fast (falling?): pose held', 'gc.x.GRAVITY_COMP_SAG': 'Compensation too weak, the arm sagged: pose held',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
-    'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault',
+    'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.clear_motor_err_s': '⚠️ Clear motor error', 'en.sub_clear_motor_err': 'Rest pose only · stays disabled',
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.armed_readonly': 'Torque on · not in control', 'en.sub_readonly': 'Hold 0.6 s: confirm control, then park & torque off',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
@@ -3239,7 +3241,7 @@ const I18N = {
     'stop': 'Stop', 'stop.sub': 'HOLD', 'stop.aria': 'Stop motion and hold position',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
     'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.cockpit_id': 'another cockpit page ({id})', 'who.unnamed': 'an unnamed client', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
-    'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control', 'lock.col_hold': 'Collision hold: motion controls locked until it resumes (E-stop available)',
+    'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.motor_err': '⚠️ Carried-over motor error ({d}): with the arm disarmed at rest pose, tap "Clear motor error" (operator-only); power-cycle the motor if it persists', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control', 'lock.col_hold': 'Collision hold: motion controls locked until it resumes (E-stop available)',
     'preempt.btn': 'Take control', 'preempt.title': 'Confirm take over',
     'preempt.body': 'Another device or window holds control. Take over control of the arm? The previous window will switch to observer mode and any motion in progress will be held steady.',
     'preempt.body.who': '{who} currently holds control. Force take control of the arm? The current holder will lose control and any motion in progress will be held steady. Operator unlock is required when auth is enforced.',
@@ -3306,6 +3308,8 @@ const I18N = {
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
     'fault.limit': 'Joint limit exceeded {name}: {val}°', 'fault.thermal': 'Over-temperature J{j}: {temp}°C / {limit}°C',
     'fm.coded': '⚠️ {title}. {todo}. Tap here to clear the fault, then hold "Enable".', 'lock.fault_coded': '⚠️ {title}: {todo}, then tap "Clear fault" and hold "Enable"',
+    'fm.motor_err': '⚠️ Motor hardware error reported: {d} (latched in motor RAM). Confirm the arm is disarmed at the rest pose and tap here to clear (operator-only; stays disabled); power-cycle the motor if it persists.',
+    'fm.motor_err_op': '🔒 Motor hardware error reported: {d} (latched in motor RAM). Operator access required: confirm the arm is disarmed at the rest pose and tap here to unlock and clear (stays disabled); power-cycle the motor if it persists.',
     'fc.ESTOP': 'E-stop pressed', 'fc.ESTOP.do': 'Make sure the area is safe, then reset the E-stop',
     'fc.BUS_LOSS': 'Motor bus lost', 'fc.BUS_LOSS.do': 'Check the motor cable and power',
     'fc.THERMAL_TRIP': 'Motor overheated', 'fc.THERMAL_TRIP.do': 'Let the arm rest and cool for a few minutes',
@@ -3349,7 +3353,7 @@ const I18N = {
     'toast.lease_released': 'This page released control', 'toast.lease_idle': 'Idle for {s} s, control released. Hold Enable or confirm "Take control?" and repeat when you need control', 'toast.lease_busy': '{who} holds control (observer mode): wait for it to release, or click "Take control"', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
     'toast.take_rejected': 'Take over rejected: ', 'toast.take_rejected_fix': 'Take over rejected: {why}. Check control status and try again', 'toast.take_owner_transferred': 'Take over failed: control moved to another holder; review the current holder and click "Take control" again', 'toast.take_ambiguous': 'Control grant was malformed (missing valid lease generation); reconnecting read-only — check status and retry', 'toast.take_timeout': 'Control request timed out: no reply from armd. Reconnecting read-only; check status and try again', 'toast.release_timeout': 'Release confirmation timed out: reconnecting read-only; check control status', 'toast.release_inactive': 'This connection no longer held control; refreshed read-only status', 'toast.refresh_timeout': 'Checking holder after release timed out: reconnecting read-only; check status and try again', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
     'toast.homing': 'Homing', 'toast.stop_no_control': 'This page does not hold control, so Stop was not sent; press E-Stop to halt immediately', 'toast.stop_unconfirmed': 'Stop not confirmed, use the E-stop', 'toast.stopped': 'Stopped, holding position', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
-    'toast.reset_ok': 'Reset done, hold Enable to take control', 'toast.parked': 'Parked and powered off safely', 'toast.unload_unconfirmed': 'Safe unload not confirmed, torque may still be held, check the state',
+    'toast.reset_ok': 'Reset done, hold Enable to take control', 'toast.motor_err_cleared': 'Motor error cleared; motors stay disabled', 'toast.parked': 'Parked and powered off safely', 'toast.unload_unconfirmed': 'Safe unload not confirmed, torque may still be held, check the state',
     'toast.stow_failed': 'Stow failed: ', 'toast.stow_unconfirmed': 'Device did not confirm park, check the arm', 'toast.parked_off': 'Parked and torque off',
     'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
     'toast.torque_off_unconfirmed': 'Torque-off request not confirmed, check the connection and the arm', 'toast.stowing': 'Smoothly homing and stowing...', 'toast.enabled': 'Control enabled, verify arm feedback',
@@ -3358,8 +3362,8 @@ const I18N = {
     'op.hint': 'The PIN is set in the reCamera console, this app\'s settings, group "Operator Access". When it is not set, armd makes a new random PIN at every start and keeps it on the device in /userdata/rebot-teleop/operator.pin (log in as root to read it).',
     'op.pin': 'Operator PIN', 'op.unlock': 'Unlock', 'op.lock': 'Lock session', 'op.unlocked_msg': 'Operator access unlocked', 'op.locked_msg': 'Operator access locked', 'op.lock_fail': 'Lock not confirmed; please retry', 'op.bad_pin': 'Wrong PIN', 'op.need_pin': 'Enter the operator PIN', 'err.operator_required': 'Needs operator access: tap Unlock, enter the PIN, then try again',
     'op.rate': 'Too many attempts; try again in {s} s', 'op.state_on': 'Unlocked; locks again in {m} min', 'op.state_on0': 'Unlocked', 'op.expired': 'Operator session expired; locked again', 'op.close': 'Close',
-    'op.inline': '🔒 Reset needs operator access · Unlock and reset', 'op.inline_fault': '🔒 Clearing this fault needs operator access · Unlock and clear',
-    'op.why.gc': 'Gravity mode needs operator access', 'op.why.det': 'Detection needs operator access', 'op.why.estop': 'Resetting the E-stop needs operator access', 'op.why.fault': 'Clearing this fault needs operator access',
+    'op.inline': '🔒 Reset needs operator access · Unlock and reset', 'op.inline_fault': '🔒 Clearing this fault needs operator access · Unlock and clear', 'op.inline_motor_err': '🔒 Clearing motor error needs operator access · Unlock and clear',
+    'op.why.gc': 'Gravity mode needs operator access', 'op.why.det': 'Detection needs operator access', 'op.why.estop': 'Resetting the E-stop needs operator access', 'op.why.fault': 'Clearing this fault needs operator access', 'op.why.motor_err': 'Clearing motor hardware errors needs operator access',
     'op.why.calib': 'Calibration needs operator access', 'op.why.poses': 'Saving or changing poses and motions needs operator access', 'op.why.rec': 'Recording and managing episodes needs operator access', 'op.why.safety': 'Changing safety settings (keep-out boxes, collision guard) needs operator access',
     'op.why.sandbox': 'The simulation sandbox needs operator access', 'op.why.vision': 'Switching the vision mode (YOLO / ArUco / depth) needs operator access',
     'op.why.calib_open': 'The calibration wizard switches the vision to ArUco, stores calibration data and writes the calibration; these steps need operator access. Without an unlock the wizard opens, but those steps are refused.',
@@ -8662,6 +8666,32 @@ function faultText() {
   if ((c === 'JOINT_LIMIT' || c === 'THERMAL_TRIP' || c === 'ENABLE_FAILED') && S.fault && !/^[A-Z][A-Za-z]+$/.test(S.fault)) title += (LANG === 'zh' ? '（' + S.fault + '）' : ' (' + S.fault + ')');
   return { title, todo: t('fc.' + c + '.do') };
 }
+function reportedMotorErrors() {
+  const errs = S.obs && Array.isArray(S.obs.motor_errors) ? S.obs.motor_errors : [];
+  const list = [];
+  for (let i = 0; i < errs.length; i++) {
+    const e = errs[i];
+    if (e && typeof e === 'object' && e.code != null) {
+      list.push({ joint: i + 1, code: Number(e.code), name: String(e.name || '') });
+    }
+  }
+  return list;
+}
+function hasCarriedOverMotorErrors() {
+  return !isStopped() && reportedMotorErrors().length > 0;
+}
+function motorErrorSummary(list = reportedMotorErrors()) {
+  return list.map((e) => {
+    const hex = '0x' + e.code.toString(16).toUpperCase();
+    return e.name ? `J${e.joint} ${hex} (${e.name})` : `J${e.joint} ${hex}`;
+  }).join(', ');
+}
+function mitFaultKey() {
+  const f = S.obs && S.obs.fault;
+  if (f && (f.code || f.message)) return String(f.code || '') + ':' + String(f.message || '');
+  const errs = reportedMotorErrors();
+  return errs.length ? 'motor:' + errs.map((e) => `${e.joint}:${e.code}`).join(',') : '';
+}
 function lockReason() {
   if (!isLive()) return t('lock.offline');
   if (!obsFresh()) return t('lease.checking');
@@ -8670,6 +8700,7 @@ function lockReason() {
   if (S.state === 'EStop') return t('lock.estop');
   if (S.state === 'Fault') { const ft = faultText(); return ft ? t('lock.fault_coded', ft) : t('lock.fault'); }
   if (isOperational() && colHold()) return t('lock.col_hold');
+  if (hasCarriedOverMotorErrors()) return t('lock.motor_err', { d: motorErrorSummary() });
   return t('lock.disabled');
 }
 function flashLock() {
@@ -10091,7 +10122,7 @@ function estopPinSync() {
   document.addEventListener('webkitfullscreenchange', sync);
   sync();
 })();
-$('fault-msg').addEventListener('click', () => { if (isStopped()) clearFault(); });
+$('fault-msg').addEventListener('click', () => { if (isStopped() || (!S.obs?.is_torqued && hasCarriedOverMotorErrors())) clearFault({ directLease: true }); });
 
 /* speed */
 (() => {
@@ -10163,11 +10194,12 @@ $('input-seg').addEventListener('click', (e) => { const b = e.target.closest('bu
    which is shown inline with the same text as stopped torque-off. */
 function clearFault(opts) {
   const mitLost = !!(S.obs && S.obs.fault && /MIT_LOST/.test(S.obs.fault.message || ''));
+  const carriedMotorErr = !!(S.obs && !S.obs.fault && Array.isArray(S.obs.motor_errors) && S.obs.motor_errors.some(Boolean));
   const apiOpts = opts && opts.directLease ? { quiet: true, directLease: true } : { quiet: true };
   return api('/api/v1/safety/clear_fault', mitLost ? { mit_recovery: 'torque_off_all' } : undefined, apiOpts)
     .then((d) => {
       showTorqueOffInline('');
-      toast(t(d && d.is_torqued ? 'toast.reset_holding' : (mitLost ? 'mit.recovery.done' : 'toast.reset_ok')), 'ok');
+      toast(t(d && d.is_torqued ? 'toast.reset_holding' : (mitLost ? 'mit.recovery.done' : (carriedMotorErr ? 'toast.motor_err_cleared' : 'toast.reset_ok'))), 'ok');
     })
     .catch((e) => {
       if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return;
@@ -10278,8 +10310,8 @@ async function disableTorque({ fallback = true } = {}) {
     if (inflight || leaseModalOrPending()) return;
     if (!obsFresh()) return toast(lockReason(), 'err');
     if (leaseOther() != null) return toast(lockReason(), 'err');
-    if (isStopped()) {
-      // Single tap in stopped state: ONLY clears fault / resets to Standby/Idle
+    if (isStopped() || (!S.obs?.is_torqued && hasCarriedOverMotorErrors())) {
+      // Single tap in stopped state or disarmed carried-over motor error: ONLY clears fault / motor error; never enables
       inflight = true;
       clearFault({ directLease: true }).finally(() => { setTimeout(() => { inflight = false; }, 300); });
       return;
@@ -15123,9 +15155,10 @@ function frame(ts) {
 
   const eb = $('btn-enable');
   const stopped = isStopped();
+  const carriedErrs = live && !stopped && !torqued && hasCarriedOverMotorErrors();
   const armedReadonly = live && !stopped && isOperational() && S.leaseGeneration == null;
   eb.classList.toggle('on', en && S.leaseGeneration != null);
-  eb.classList.toggle('clear', stopped);
+  eb.classList.toggle('clear', stopped || carriedErrs);
   eb.setAttribute('aria-checked', String(en && S.leaseGeneration != null));
   // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
   const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
@@ -15136,11 +15169,11 @@ function frame(ts) {
   tob.hidden = !stoppedTorqueOff;
   tob.disabled = !stoppedTorqueOff || !fresh || !!leaseOp || torqueOffInflight;
   if (!stopped || !torqued) showTorqueOffInline('');
-  const opClear = live && stopped && opLocked() && clearNeedsOperator();
+  const opClear = live && (stopped || carriedErrs) && opLocked() && clearNeedsOperator();
   $('op-inline').hidden = !opClear;
-  if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : 'op.inline_fault'));
-  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop_s') : t('en.clear_fault_s')) : armedReadonly ? t('en.armed_readonly') : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
-  setText($('enable-sub'), stopped ? t('en.sub_reset') : armedReadonly ? (holder != null ? t('lease.other', { who: leaseHolderDetail(holder) }) : t('en.sub_readonly')) : en ? t('en.sub_off') : t('en.hold'));
+  if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : carriedErrs ? 'op.inline_motor_err' : 'op.inline_fault'));
+  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop_s') : t('en.clear_fault_s')) : carriedErrs ? t('en.clear_motor_err_s') : armedReadonly ? t('en.armed_readonly') : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
+  setText($('enable-sub'), stopped ? t('en.sub_reset') : carriedErrs ? t('en.sub_clear_motor_err') : armedReadonly ? (holder != null ? t('lease.other', { who: leaseHolderDetail(holder) }) : t('en.sub_readonly')) : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !fresh || !!leaseOp || holder != null;
   $('btn-stop').disabled = false;
   $('btn-preempt').hidden = !fresh || !!leaseOp || holder == null;
@@ -15266,9 +15299,16 @@ function frame(ts) {
   setText($('epoch-txt'), 'epoch ' + (S.epoch ?? '--'));
   for (const sp of $('fsm').querySelectorAll('span[data-s]')) sp.classList.toggle('on', live && sp.dataset.s === S.state);
   const fm = $('fault-msg');
-  const showFault = live && isStopped();
+  const showFault = live && (isStopped() || carriedErrs);
   fm.classList.toggle('show', showFault);
-  if (showFault) { const ft = S.state === 'Fault' && faultText(); setText(fm, S.state === 'EStop' ? t('fm.estop') : ft ? t('fm.coded', ft) : t('fm.fault', { d: S.fault || t('unknown') })); }
+  if (showFault) {
+    if (isStopped()) {
+      const ft = S.state === 'Fault' && faultText();
+      setText(fm, S.state === 'EStop' ? t('fm.estop') : ft ? t('fm.coded', ft) : t('fm.fault', { d: S.fault || t('unknown') }));
+    } else {
+      setText(fm, t(opLocked() ? 'fm.motor_err_op' : 'fm.motor_err', { d: motorErrorSummary() }));
+    }
+  }
 
   if (S.rec.active) {
     const el = Date.now() - S.rec.startedAt;
@@ -15304,7 +15344,7 @@ function renderSimple(live, op, ctrl) {
 
   const rd = $('s-ready');
   const readonlyOp = live && op && !ctrl;
-  setCls(rd, 'ready' + (op && !readonlyOp ? ' ok' : live && (isStopped() || colHold()) ? ' bad' : ''));
+  setCls(rd, 'ready' + (op && !readonlyOp ? ' ok' : live && (isStopped() || colHold() || hasCarriedOverMotorErrors()) ? ' bad' : ''));
   setText($('s-ready-txt'), !live ? t('wait_arm') : readonlyOp ? t(S.leaseReleased ? 'ready.released' : 'ready.readonly') : op ? t('ready') : lockReason());
   if (S.preset && Date.now() > S.preset.until) { S.preset = null; S.presetRunning = false; }
   for (const b of document.querySelectorAll('.preset')) b.classList.toggle('busy', !!S.preset && S.preset.name === b.dataset.preset);
@@ -16340,11 +16380,12 @@ function reconnectWS() {
 const OP = { waiters: [], why: null, retry: false, skip: false, renew: false, ack: null, seq: 0, lastFocus: null, pass: null, warned: false, queue: new Map(), warnedFor: null };
 const opLocked = () => S.auth.enforced && S.auth.role !== 'operator';
 const opIsOpen = () => !!$('op-modal') && !$('op-modal').hidden;
-// Resetting needs the operator: a latched E-stop, a non-recoverable fault, an escalated collision (armd ws.rs)
+// Resetting needs the operator: a latched E-stop, a non-recoverable fault, an escalated collision, or a carried-over motor error (armd lease.rs)
 function clearNeedsOperator() {
   if (S.state === 'EStop') return true;
   const f = S.obs && S.obs.fault;
-  return S.state === 'Fault' && (!f || f.recoverable === false || S.faultCode === 'COLLISION');
+  if (S.state === 'Fault' && (!f || f.recoverable === false || S.faultCode === 'COLLISION')) return true;
+  return hasCarriedOverMotorErrors();
 }
 function opReasonKey(path, body) {
   const p = String(path || '');
@@ -16353,7 +16394,7 @@ function opReasonKey(path, body) {
   if (p === 'op.renew') return 'op.why.renew';
   if (p === '/api/v1/vision/mode' || p === '/api/v1/vision/subscribe') return 'op.why.vision';
   if (p === '/api/v1/mode/gravity_comp') return 'op.why.gc';
-  if (p === '/api/v1/safety/clear_fault') return S.state === 'EStop' ? 'op.why.estop' : 'op.why.fault';
+  if (p === '/api/v1/safety/clear_fault') return S.state === 'EStop' ? 'op.why.estop' : hasCarriedOverMotorErrors() ? 'op.why.motor_err' : 'op.why.fault';
   if (/^\/api\/v1\/(detection|vision)\//.test(p) || p === '/api/v1/grasp/measure') return 'op.why.det';
   if (/^\/api\/v1\/(calibration|gripper\/calibration|grasp\/setup)/.test(p) || p === '/api/v1/action/gripper_zero_check' || p === '/api/v1/action/calib_hover') return 'op.why.calib';
   if (p === '/api/v1/action/gripper_calibrate') return 'op.why.calib';
@@ -16650,7 +16691,7 @@ bindEstopButton($('op-estop'));
 $('op-inline')?.addEventListener('click', () => {
   const snap = { controlEpoch: S.controlEpoch, faultKey: mitFaultKey() };
   opRequire('/api/v1/safety/clear_fault').then((ok) => {
-    if (ok && isStopped() && S.controlEpoch === snap.controlEpoch && mitFaultKey() === snap.faultKey) {
+    if (ok && (isStopped() || (!S.obs?.is_torqued && hasCarriedOverMotorErrors())) && S.controlEpoch === snap.controlEpoch && mitFaultKey() === snap.faultKey) {
       clearFault({ directLease: true });
     }
   });

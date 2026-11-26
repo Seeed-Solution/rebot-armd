@@ -1498,6 +1498,19 @@ impl ShadowRuntime {
         self.drain_driver_staging_into_fifo(|buf| drv.drain_shadow_observations(buf));
     }
 
+    /// True when the deferred shadow FIFO has reached half capacity and must flush immediately
+    /// to avoid staging overflow on subsequent releases.
+    #[inline]
+    pub fn should_flush_urgently(&self) -> bool {
+        self.enabled && self.pending_len >= OWNER_PENDING_INPUTS_CAP / 2
+    }
+
+    /// True when any deferred shadow inputs are waiting to be flushed.
+    #[inline]
+    pub fn has_pending_steps(&self) -> bool {
+        self.enabled && self.pending_len > 0
+    }
+
     /// Outer post-write boundary flush: drains `pending_inputs` in exact causal FIFO order,
     /// steps the single inline `TorqueState` (zero `prev_state` copy, zero `check_invariants` on RT),
     /// and pushes compact `ShadowRecord`s into the preallocated SPSC ring (`rtrb`).

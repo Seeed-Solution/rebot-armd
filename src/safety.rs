@@ -1205,6 +1205,11 @@ pub enum ClearRefusal {
     MitModesUncertain,
     FreshFeedbackRequiredForRestingSupport,
     RestingPoseSupport(RestingSupportViolation),
+    MotorErrorClearRequiresDisarmed,
+    MotorErrorNotAtRestPose(RestingSupportViolation),
+    MotorErrorPersists { joint: u8, code: u8, name: Option<&'static str> },
+    MotorErrorClearUnconfirmed { joint: u8 },
+    MotorErrorClearMotorEnabled { joint: u8 },
     BudgetExpired,
     HardwareResetRequired,
     HardwareResetSent,
@@ -1257,6 +1262,19 @@ impl std::fmt::Display for ClearRefusal {
             Self::FreshFeedbackRequiredForRestingSupport => f.write_str("Fresh feedback is required before checking resting pose support"),
             Self::RestingPoseSupport(violation) =>
                 write!(f, "Cannot disable faulted supporting arm joint away from resting pose ({violation}); support the arm at rest first"),
+            Self::MotorErrorClearRequiresDisarmed =>
+                f.write_str("Cannot clear motor hardware error while the arm is armed or torque is enabled; disarm/park the arm first"),
+            Self::MotorErrorNotAtRestPose(violation) =>
+                write!(f, "Cannot clear motor hardware error away from resting pose ({violation}); move the arm to its resting pose first"),
+            Self::MotorErrorPersists { joint, code, name } => {
+                let j = usize::from(*joint) + 1;
+                let label = name.unwrap_or("Motor Hardware Fault");
+                write!(f, "Motor J{j} hardware error 0x{code:X} ({label}) persisted after clear; power-cycle the motor")
+            }
+            Self::MotorErrorClearUnconfirmed { joint } =>
+                write!(f, "Motor J{} did not confirm fault clear with a fresh status reply; check CAN wiring or power-cycle the motor", usize::from(*joint) + 1),
+            Self::MotorErrorClearMotorEnabled { joint } =>
+                write!(f, "Motor J{} reported torque enabled after fault clear; power-cycle the motor", usize::from(*joint) + 1),
             Self::BudgetExpired => f.write_str("Clear fault budget expired"),
             Self::HardwareResetRequired => f.write_str("Hardware fault bit active; motor reset is required before re-evaluating clear conditions"),
             Self::HardwareResetSent => f.write_str("Hardware reset sent; wait for fresh fault-free feedback before retrying"),

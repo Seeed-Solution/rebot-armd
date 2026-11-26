@@ -1596,6 +1596,9 @@ pub struct SupervisorInner {
     pub(crate) watchdog_park_seq: u64,
     /// Set by `ArmSupervisor::tick_shared` so legacy watchdog expiry never plans under `SupervisorLock`.
     pub(crate) defer_watchdog_park_plan: bool,
+    /// Set by `ArmSupervisor::tick_shared` so legacy commissioning runs in separate `<= 2 ms`
+    /// write guards strictly AFTER tick output & publish, never inflating the control-tick hold.
+    pub(crate) defer_legacy_commissioning: bool,
     /// Current control tick's J7 `PosForce` intent set by arm/motion/hold paths and consumed
     /// strictly once by the tick epilogue's single J7 emitter (`emit_j7_tick_epilogue`).
     pub(crate) j7_intent: Option<crate::driver::PosForceIntent>,
@@ -2695,6 +2698,7 @@ impl SupervisorInner {
             watchdog_park_pending: None,
             watchdog_park_seq: 0,
             defer_watchdog_park_plan: false,
+            defer_legacy_commissioning: false,
             j7_intent: None,
             j7_admitted_stamp: None,
             rt_j7_pf_gate: None,
@@ -7077,6 +7081,23 @@ impl SupervisorInner {
         cache.copy_ages_from(&ages, self.config.dof, poll_before);
         self.capture_driver_cache = cache;
         self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
+        let dof = self.config.dof;
+        if self.motor_errors.capacity() < dof {
+            self.motor_errors.reserve(dof - self.motor_errors.len());
+        }
+        if driver.has_hardware_fault() {
+            let mut status = Vec::with_capacity(dof);
+            if driver.motor_status_into(&mut status) {
+                self.motor_errors.resize_with(status.len(), || None);
+                for (slot, &code) in self.motor_errors.iter_mut().zip(status.iter()) {
+                    *slot = driver
+                        .decode_motor_error_static(code)
+                        .map(std::borrow::Cow::Borrowed)
+                        .or_else(|| driver.decode_motor_error(code).map(std::borrow::Cow::Owned))
+                        .map(|name| crate::model::MotorError { code, name });
+                }
+            }
+        }
         self.torque_intent = crate::supervisor::TorqueIntent::On;
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -7095,11 +7116,51 @@ impl SupervisorInner {
         ));
     }
 
+    /// True when any joint currently reports a decoded motor hardware error in `self.motor_errors`.
+    /// Lock-free and zero-allocation; safe to call on RT authority checks and under driver locks.
+    #[inline]
+    pub(crate) fn has_reported_motor_errors(&self) -> bool {
+        self.motor_errors.iter().any(Option::is_some)
+    }
+
     /// Flush all pending shadow reducer steps and emit compact SPSC records (outer post-write boundary only).
     #[inline]
     pub(crate) fn flush_torque_shadow(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         self.torque_shadow.flush_deferred_steps();
+    }
+
+    /// Flush deferred torque shadow steps immediately when `urgent`, when the staging FIFO is
+    /// nearing half capacity, or when at least `margin` remains before `release_deadline`.
+    /// Otherwise defers the non-urgent flush to the next release so it cannot push this release
+    /// past its deadline. Returns `true` if a flush ran.
+    #[inline]
+    pub(crate) fn flush_torque_shadow_if_budget(
+        &mut self,
+        urgent: bool,
+        now: Instant,
+        release_deadline: Instant,
+        margin: Duration,
+    ) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.torque_shadow.has_pending_steps() {
+                return false;
+            }
+            if urgent
+                || self.torque_shadow.should_flush_urgently()
+                || release_deadline.saturating_duration_since(now) >= margin
+            {
+                self.torque_shadow.flush_deferred_steps();
+                return true;
+            }
+            false
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (urgent, now, release_deadline, margin);
+            false
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -8532,6 +8593,13 @@ impl SupervisorInner {
         self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
         self.control_release_seq_atomic
             .store(self.control_release_seq, Ordering::Release);
+        // Notify the driver of the new control release BEFORE transition polling so Step 2
+        // transition polls, Step 2 RX recovery/refresh, Step 3 commits, and Step 5 output all
+        // share a single per-release TX budget and per-motor control-frame coalescing mask.
+        if let Some(d) = self.driver.as_mut() {
+            let seq = self.control_release_seq;
+            let _ = d.try_with_mut(|drv| drv.begin_control_release(seq));
+        }
         #[cfg(not(target_arch = "wasm32"))]
         self.torque_shadow
             .enqueue_at(
@@ -8640,6 +8708,12 @@ impl SupervisorInner {
                 } else {
                     J7PosForceGate::default()
                 };
+                let torque_poll = self.core.poll_transition();
+                let urgent_wake = if torque_poll.is_some() || park_wake.is_some() {
+                    d.next_watchdog_hold_wake()
+                } else {
+                    None
+                };
                 let poll = crate::rt_core::ops::HardwarePoll {
                     driverless: false,
                     feedback_valid: d.is_feedback_valid(),
@@ -8647,9 +8721,10 @@ impl SupervisorInner {
                     oldest_feedback_age: oldest,
                     rx_frames,
                     budget_exhausted,
-                    torque: self.core.poll_transition(),
+                    torque: torque_poll,
                     park_wake,
                     park_state_changed,
+                    urgent_wake,
                 };
                 (poll, gate)
             })
@@ -8683,6 +8758,7 @@ impl SupervisorInner {
                     torque: self.core.poll_transition(),
                     park_wake,
                     park_state_changed,
+                    urgent_wake: None,
                 };
                 (poll, gate)
             });
@@ -9256,6 +9332,22 @@ impl SupervisorInner {
         }
     }
 
+    /// True when legacy ticked hardware commissioning may run on this release (disarmed,
+    /// no active torque transition or pending disable, not detached/shutting down, legacy driver).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn legacy_commissioning_eligible(&self) -> bool {
+        !self.detached
+            && !self.shutdown_committed
+            && !self.is_torqued
+            && !self.disable_pending
+            && self.torque_transition.is_none()
+            && self.commissioning.is_running()
+            && self
+                .driver
+                .as_ref()
+                .is_some_and(|d| d.as_legacy_lock().is_some())
+    }
+
     #[inline(never)]
     fn tick_control_inner(
         &mut self,
@@ -9263,7 +9355,6 @@ impl SupervisorInner {
         release_deadline: Option<Instant>,
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> f64 {
-        let tick_wall_start = Instant::now();
         if release_deadline.is_some() {
             self.last_clock_now = Some(now_fn());
         }
@@ -9368,6 +9459,10 @@ impl SupervisorInner {
             self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
             self.control_release_seq_atomic
                 .store(self.control_release_seq, Ordering::Release);
+            let rel_seq = self.control_release_seq;
+            if let Some(mut drv) = self.write_driver_for_tick() {
+                drv.begin_control_release(rel_seq);
+            }
             #[cfg(not(target_arch = "wasm32"))]
             self.torque_shadow
                 .enqueue_at(
@@ -9425,42 +9520,6 @@ impl SupervisorInner {
             }
         };
         let invalid_feedback = rx.invalid_feedback;
-        // Legacy ticked hardware commissioning (Step 2b equivalent): advance at most ONE
-        // <= 1 ms bounded step while disarmed so `/api/v1/calibration/mit_timeout` register I/O
-        // runs strictly off the WS handler lock with max write-guard hold <= 2 ms and 0 skipped releases.
-        #[cfg(not(target_arch = "wasm32"))]
-        if !self.pending_rx_poll.active
-            && !self.shutdown_committed
-            && !self.is_torqued
-            && !self.disable_pending
-            && self.torque_transition.is_none()
-            && self.commissioning.is_running()
-            && self
-                .driver
-                .as_ref()
-                .is_some_and(|d| d.as_legacy_lock().is_some())
-        {
-            // Clamp commissioning strictly to BOTH `tick_wall_start + 1 ms` (keeping total legacy
-            // write-guard hold <= 2 ms) AND `release_deadline - publish_margin` (never overrunning
-            // the scheduled release cutoff).
-            const LEGACY_COMMISSIONING_STEP_BUDGET: Duration = Duration::from_millis(1);
-            let comm_now = Instant::now();
-            let mut comm_deadline = tick_wall_start + LEGACY_COMMISSIONING_STEP_BUDGET;
-            if let Some(rd) = release_deadline {
-                if let Some(rel_cap) = rd.checked_sub(margin_tick) {
-                    comm_deadline = comm_deadline.min(rel_cap);
-                }
-            }
-            if comm_now < comm_deadline {
-                let comm_ctx = crate::rt_core::ops::CommitCtx {
-                    arm: self.core.id(),
-                    boot: crate::rt_core::broker::BootId::process(),
-                    now: comm_now,
-                    stop_generation: self.current_stop_gen(),
-                };
-                self.service_commissioning_release(&comm_ctx, comm_deadline, &Instant::now);
-            }
-        }
         let driver_torque_lost = rx.driver_torque_lost;
         let driver_enable_confirmed_ok = rx.driver_enable_confirmed_ok;
         let driver_torque_loss_sample_seq = rx.driver_torque_loss_sample_seq;
@@ -11520,7 +11579,9 @@ impl SupervisorInner {
         // An E-stop or authorized stop requested during this tick: its output did not reach
         // the bus (or the batch stopped at the next frame, `ArmDriver::set_estop_gate`); apply
         // it now instead of one period later. A batch the gate stopped is not a driver failure.
+        let mut stop_inhibited_this_tick = matches!(tick_output, TickOutput::EstopInhibited { .. });
         if self.urgent_stop_unapplied() {
+            stop_inhibited_this_tick = true;
             allow_output_accepted = false;
             driverless_accepted = false;
             if self.estop_request_unapplied() {
@@ -11613,6 +11674,67 @@ impl SupervisorInner {
             );
         }
         self.j7_intent = None;
+        // Coalesced end-of-release watchdog fallback: normal control/hold output has now run;
+        // emit an urgent stationary hold ONLY for owner-authorized already-enabled arm joints whose
+        // normal output in this release was absent, deferred, or failed and whose watchdog deadline
+        // needs it. Stopped / E-stop / FailedHold / pending-disable states strictly consume the
+        // owner's `measured_hold` joint mask & captured targets (never overriding
+        // `UnheldNoFreshFeedback` or `DisableProtective`).
+        // Restores `drv_release_cap` so an expired action deadline never suppresses watchdog safety.
+        let is_stopped_or_failed_hold_fb = self.safety.state().is_stopped()
+            || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
+        let pending_disable_hold_fb =
+            (self.disable_pending || transition_owns_bus) && self.torque_intent == TorqueIntent::On;
+        if !self.shutdown_committed
+            && !enable_transition_owns_bus
+            && !stop_inhibited_this_tick
+            && !disconnect_fenced_mid_tick
+            && !self.urgent_stop_unapplied()
+            && !output_tx_cap_expired
+            && !matches!(tick_output, TickOutput::ActionDeadlineRefused { .. })
+            && self.stopped_hold_eligible()
+            && (self.is_torqued || is_stopped_or_failed_hold_fb || pending_disable_hold_fb)
+        {
+            let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+            let use_owner_hold_targets = is_stopped_or_failed_hold_fb || pending_disable_hold_fb;
+            let mut owner_hold_targets = [None; crate::rt_core::mailbox::MAX_DOF];
+            let authorized_mask = if use_owner_hold_targets {
+                let mask = self.measured_hold.owner_hold_mask;
+                for j in 0..dof {
+                    if (mask & (1u64 << j)) != 0 {
+                        let pos = self.measured_hold.owner_hold_targets[j];
+                        if pos.is_finite() {
+                            owner_hold_targets[j] = Some(pos);
+                        }
+                    }
+                }
+                mask
+            } else if dof >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << dof) - 1
+            };
+            let release_cap = self.active_tx_cutoff.map(|c| c.drv_release_cap);
+            let use_try = self.rt_executor_owned || self.nonblocking_driver_release;
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
+            if let Some(d) = self.driver.as_mut() {
+                let target_slice = use_owner_hold_targets.then_some(&owner_hold_targets[..dof]);
+                let run_fb = |drv: &mut dyn ArmDriver| {
+                    if let Some(cap) = release_cap {
+                        drv.set_tx_release_deadline(Some(cap));
+                    }
+                    drv.service_release_watchdog_fallback(authorized_mask, target_slice);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    shadow_rt.drain_from_driver(drv);
+                };
+                if use_try {
+                    let _ = d.try_with_mut(run_fb);
+                } else {
+                    let _ = d.with_mut(run_fb);
+                }
+            }
+        }
         let action_deadline_refused_at = match tick_output {
             TickOutput::ActionDeadlineRefused { drv_now, .. } => Some(drv_now),
             _ => None,
@@ -11896,6 +12018,38 @@ impl SupervisorInner {
                     action: self.commanded_positions.clone(),
                 });
             }
+        }
+
+        // Legacy ticked hardware commissioning for direct `tick_control*` callers
+        // (`ArmSupervisor::tick_shared` sets `defer_legacy_commissioning = true` and services
+        // commissioning in separate <= 2 ms write guards strictly AFTER tick output & publish).
+        // Runs strictly AFTER the tick's own output using the remaining release budget derived
+        // from `release_deadline - margin_tick` (matching TQ-LOCK TX deadline separation),
+        // bounded to `COMM_MAX_TX_PER_RELEASE` frames per release.
+        #[cfg(not(target_arch = "wasm32"))]
+        if !was_step2_poll
+            && !self.defer_legacy_commissioning
+            && self.legacy_commissioning_eligible()
+        {
+            let comm_now = now_fn();
+            let comm_cutoff = match release_deadline {
+                Some(rd) => rd.checked_sub(margin_tick).unwrap_or(comm_now),
+                None => comm_now + period_tick.saturating_sub(margin_tick),
+            };
+            let comm_ctx = crate::rt_core::ops::CommitCtx {
+                arm: self.core.id(),
+                boot: crate::rt_core::broker::BootId::process(),
+                now: comm_now,
+                stop_generation: self.current_stop_gen(),
+            };
+            let _ = self.service_commissioning_step_with_cutoff(
+                &comm_ctx,
+                comm_cutoff,
+                crate::mit::COMM_MAX_TX_PER_RELEASE,
+                None,
+                true,
+                now_fn,
+            );
         }
 
         self.active_tx_cutoff = None;
@@ -14653,16 +14807,17 @@ impl ArmSupervisor {
 
     /// Headless fallback stepper for legacy ticked commissioning when no background 50 Hz control
     /// loop is running (mirrors TQ-LOCK headless fallback). Re-verifies under `SupervisorLock::write`
-    /// that `control_release_seq == expected_seq`, then runs at most ONE `<= 1 ms` bounded step.
+    /// that `control_release_seq == expected_seq`, then runs at most ONE bounded step (`<= 1 ms`,
+    /// max 1 TX frame) without double-subtracting publish margin so write-guard holds stay `<= 2 ms`.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn step_legacy_commissioning_headless(
         &self,
         op_id: u64,
         expected_seq: u64,
     ) -> (u64, bool) {
-        // Matches TQ-LOCK `FALLBACK_STEP_BUDGET` (500 us) so headless write-guard holds stay well
-        // below the <= 2 ms bound and carry full HoldIoScope attribution.
-        const LEGACY_HEADLESS_COMM_BUDGET: Duration = Duration::from_micros(500);
+        // 1 ms cutoff with max 1 TX frame (no second margin subtraction) keeps SG2002 headless
+        // progress non-starving while bounding every SupervisorLock::write hold <= 2 ms.
+        const LEGACY_HEADLESS_COMM_BUDGET: Duration = Duration::from_millis(1);
         let mut inner = self.inner.write().await;
         let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
         inner.set_command(crate::mit::TIMEOUT_PATH);
@@ -14689,13 +14844,170 @@ impl ArmSupervisor {
             now: step_now,
             stop_generation: inner.current_stop_gen(),
         };
-        inner.service_commissioning_release(
+        let mut sys_now = Instant::now;
+        let _ = inner.service_commissioning_step_with_cutoff(
             &ctx,
             step_now + LEGACY_HEADLESS_COMM_BUDGET,
-            &Instant::now,
+            1,
+            Some(1),
+            true,
+            &mut sys_now,
         );
+        inner.flush_torque_shadow();
         inner.set_io_timing(io_scope.finish());
         (seq, true)
+    }
+
+    /// Post-tick legacy commissioning scheduler invoked by [`Self::tick_shared`] strictly AFTER
+    /// the control tick's own RX/output/publish write guard has dropped.
+    ///
+    /// - Derives the release cutoff strictly from `release_deadline - comm_margin` (matching
+    ///   TQ-LOCK TX deadline separation, never `tick_wall_start + 1 ms`).
+    /// - Splits commissioning I/O across short bounded `SupervisorLock::write` guards (`<= 1.2 ms`
+    ///   and max 1 TX frame per guard) so even on SG2002 (1.0–1.5 ms RX drain, 0.4–0.6 ms/frame TX)
+    ///   EVERY write-guard hold stays strictly `<= 2 ms` and commissioning makes progress every
+    ///   release without delaying control releases.
+    /// - Bounds total commissioning register I/O to `COMM_MAX_TX_PER_RELEASE` frames per release
+    ///   (and at most one `GatherRestEvidence` `0xCC` burst per release), sleeping only OFF-LOCK
+    ///   when awaiting an in-flight reply within the remaining release budget.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn service_legacy_commissioning_post_tick(
+        &self,
+        tick_started: Instant,
+        release_deadline: Instant,
+        comm_margin: Duration,
+        tx_budget_dur: Duration,
+    ) {
+        const OFF_LOCK_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
+        const MAX_OFF_LOCK_POLLS_PER_REQ: u8 = 3;
+        const MAX_GUARD_STEPS_PER_RELEASE: u8 = 16;
+
+        let Some(comm_release_cap) = release_deadline.checked_sub(comm_margin) else {
+            return;
+        };
+        // Keep off-lock reply polling strictly inside BOTH `release_deadline - comm_margin` AND
+        // the driver's per-release TX pass duration so subsequent same-release sends never hit
+        // spurious TX-duration backpressure.
+        let comm_wait_cap = comm_release_cap.min(
+            tick_started + tx_budget_dur.saturating_sub(Duration::from_millis(1)),
+        );
+
+        let mut reg_tx_left: u8 = crate::mit::COMM_MAX_TX_PER_RELEASE;
+        let mut probe_tx_left: u8 = crate::rt_core::mailbox::MAX_DOF as u8;
+        let mut first_step = true;
+        let mut wait_polls_for_req: u8 = 0;
+        let mut guard_steps: u8 = 0;
+        let mut lock_yields: u8 = 0;
+
+        while guard_steps < MAX_GUARD_STEPS_PER_RELEASE {
+            if self.owner_mode() != OWNER_LEGACY
+                || self.estop_state.is_latched()
+                || self.process_exit_requested.load(Ordering::Acquire)
+                || self.internal_fault_lane.is_fenced()
+            {
+                break;
+            }
+            // Never acquire `SupervisorLock` for optional commissioning once the release cutoff
+            // (`release_deadline - comm_margin`) has elapsed.
+            if Instant::now() >= comm_release_cap {
+                break;
+            }
+            // Non-blocking acquisition: optional post-tick commissioning must NEVER queue behind
+            // another `SupervisorLock` holder and delay the next 50 Hz control release.
+            let Ok(mut inner) = self.inner.try_write() else {
+                if lock_yields >= 1 || Instant::now() >= comm_release_cap {
+                    break;
+                }
+                lock_yields = lock_yields.saturating_add(1);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            lock_yields = 0;
+            let progress = {
+                let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                inner.set_command(crate::mit::TIMEOUT_PATH);
+                let guard_start = Instant::now();
+                if self.owner_mode() != OWNER_LEGACY
+                    || guard_start >= comm_release_cap
+                    || !inner.legacy_commissioning_eligible()
+                {
+                    inner.set_io_timing(io_scope.finish());
+                    break;
+                }
+                let ctx = crate::rt_core::ops::CommitCtx {
+                    arm: inner.core.id(),
+                    boot: crate::rt_core::broker::BootId::process(),
+                    now: guard_start,
+                    stop_generation: inner.current_stop_gen(),
+                };
+                // Each guard executes at most 1 commissioning TX frame (keeping guard hold <= 2 ms
+                // on SG2002 0.4–0.6 ms/frame TX) while passing the true `comm_release_cap`
+                // (`release_deadline - comm_margin`) as the hardware TX/flush cutoff so transient
+                // OS jitter never causes false `SentFlushFailed` on non-noop flush transports.
+                let step_reg_tx = reg_tx_left.min(1);
+                let step_probe_tx = probe_tx_left.min(1);
+                let mut sys_now = Instant::now;
+                let p = inner.service_commissioning_step_with_cutoff(
+                    &ctx,
+                    comm_release_cap,
+                    step_reg_tx,
+                    Some(step_probe_tx),
+                    first_step,
+                    &mut sys_now,
+                );
+                inner.flush_torque_shadow();
+                inner.set_io_timing(io_scope.finish());
+                p
+            };
+            drop(inner);
+            first_step = false;
+            guard_steps = guard_steps.saturating_add(1);
+            if progress.probe_tx_attempted > 0 {
+                probe_tx_left = probe_tx_left.saturating_sub(progress.probe_tx_attempted);
+            }
+            if progress.reg_tx_attempted > 0 {
+                reg_tx_left = reg_tx_left.saturating_sub(progress.reg_tx_attempted);
+                wait_polls_for_req = 0;
+            }
+            if !progress.still_running
+                || progress.contended
+                || progress.backpressured
+                || self.estop_state.is_latched()
+                || self.owner_mode() != OWNER_LEGACY
+            {
+                break;
+            }
+            let now = Instant::now();
+            if now >= comm_release_cap {
+                break;
+            }
+            if progress.rest_probe_pending {
+                if probe_tx_left == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if progress.more_immediate_work {
+                if reg_tx_left == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if progress.awaiting_reply {
+                if reg_tx_left == 0 || wait_polls_for_req >= MAX_OFF_LOCK_POLLS_PER_REQ {
+                    break;
+                }
+                if now + OFF_LOCK_REPLY_POLL_INTERVAL + Duration::from_millis(1) >= comm_wait_cap {
+                    break;
+                }
+                wait_polls_for_req = wait_polls_for_req.saturating_add(1);
+                tokio::time::sleep(OFF_LOCK_REPLY_POLL_INTERVAL).await;
+                continue;
+            }
+            break;
+        }
     }
 
     /// Routes one [`ConfigRequest`] through the active single owner (`Legacy` write lock or
@@ -18278,6 +18590,7 @@ impl ArmSupervisor {
             tick_tq_dir,
             tick_io,
             settled_legacy,
+            legacy_comm_plan,
         ) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
@@ -18291,6 +18604,7 @@ impl ArmSupervisor {
             inner.defer_terminal_capture = true;
             inner.defer_zero_check_persist = true;
             inner.defer_watchdog_park_plan = true;
+            inner.defer_legacy_commissioning = true;
             if self.pending_disconnect_hold.load(Ordering::Acquire) > 0 {
                 let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
             }
@@ -18326,6 +18640,19 @@ impl ArmSupervisor {
             inner.defer_terminal_capture = false;
             inner.defer_zero_check_persist = false;
             inner.defer_watchdog_park_plan = false;
+            inner.defer_legacy_commissioning = false;
+            #[cfg(not(target_arch = "wasm32"))]
+            let legacy_comm_plan = if inner.legacy_commissioning_eligible() {
+                Some((
+                    release_deadline,
+                    inner.tx_release_publish_margin(),
+                    inner.config.damiao_tx_budget().max_duration,
+                ))
+            } else {
+                None
+            };
+            #[cfg(target_arch = "wasm32")]
+            let legacy_comm_plan: Option<(Instant, Duration, Duration)> = None;
             let pending_zc = inner.pending_zero_check_persist.take();
             let pending_wd = inner.watchdog_park_pending.filter(|p| !p.waiting_mit_handback);
             let control_hz = inner.config.control_frequency_hz;
@@ -18356,6 +18683,7 @@ impl ArmSupervisor {
                 tick_tq_dir,
                 tick_io,
                 settled_legacy,
+                legacy_comm_plan,
             )
         };
         let released = Instant::now();
@@ -18431,6 +18759,13 @@ impl ArmSupervisor {
                 .await;
             });
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((comm_rd, comm_margin, tx_budget_dur)) = legacy_comm_plan {
+            self.service_legacy_commissioning_post_tick(started, comm_rd, comm_margin, tx_budget_dur)
+                .await;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = legacy_comm_plan;
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
         let done = Instant::now();
         let post_us = us(done.saturating_duration_since(released));

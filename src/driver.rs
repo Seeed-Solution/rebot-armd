@@ -1137,6 +1137,25 @@ pub enum PosForceEmitOutcome {
 /// Bounded maximum window for an active read-only shutdown disarm proof probe (`0xCC` polls).
 pub const SHUTDOWN_DISARM_PROOF_WINDOW: Duration = Duration::from_millis(300);
 
+/// Bounded zero-allocation outcome of clearing carried-over motor hardware errors on a disarmed arm
+/// (`CMD_CLEAR_FAULTS` sent to affected motors only, then verified on a fresh post-clear status reply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarryoverMotorClearOutcome {
+    /// No motor reported an active hardware fault bit.
+    NoErrors,
+    /// Every affected motor accepted `CMD_CLEAR_FAULTS`, replied with a fresh post-clear status,
+    /// cleared its error bit, and remained disabled (`status == 0`).
+    Cleared,
+    /// At least one motor still reported a hardware fault code in a fresh post-clear reply.
+    ErrorPersists { joint: usize, code: u8 },
+    /// At least one motor reported torque enabled (`status == 1`) after the clear attempt.
+    MotorEnabled { joint: usize },
+    /// At least one affected motor did not return a fresh post-clear status reply within the bound.
+    Unconfirmed { joint: usize },
+    /// Pre-transmit live authority/stop gate revoked immediately before `can.transmit`.
+    Revoked(&'static str),
+}
+
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
@@ -1222,6 +1241,26 @@ pub trait ArmDriver: Send {
     /// Once invoked by the owner, rest-pose K=3 ticks count distinct `release_seq` values
     /// rather than individual receive/drain passes.
     fn begin_control_release(&mut self, _release_seq: u64) {}
+
+    /// Open a fresh TX pass for a Window 2 sub-release wake while preserving the active release's
+    /// coalescing ledger (`release_ctrl_tx_mask`, `refresh_scheduler`, `release_recovery_tx_count`),
+    /// and mark that Step 5 normal output will NOT run again in this release.
+    fn begin_wake_tx_pass(&mut self) {}
+
+    /// Earliest next wake instant needed to keep already-enabled arm joints refreshed within the
+    /// hardware watchdog window while a transition is pending (`None` if no motor is energized).
+    fn next_watchdog_hold_wake(&self) -> Option<Instant> { None }
+
+    /// End-of-release watchdog continuity fallback: after normal control/hold output has run,
+    /// emit an urgent stationary hold ONLY for owner-authorized (`authorized_mask`) already-enabled
+    /// arm joints that did NOT receive a confirmed control frame in this release and whose
+    /// watchdog deadline needs service. When `hold_targets` is `Some`, ONLY finite owner-captured
+    /// targets from that slice are permitted (no fallback to driver-cached positions).
+    fn service_release_watchdog_fallback(
+        &mut self,
+        _authorized_mask: u64,
+        _hold_targets: Option<&[Option<f32>]>,
+    ) {}
 
     /// True when `joint` has a verified hold mode capable of receiving stationary hold frames
     /// without enable or mode-switch side effects.
@@ -1855,6 +1894,29 @@ pub trait ArmDriver: Send {
     /// `UNSUPPORTED` until a driver implements bounded transmission and flush checks.
     fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
         Err(ArmDriverError::Protocol("UNSUPPORTED: driver has no bounded clear_fault".into()))
+    }
+
+    /// Pure RX-only bounded drain with zero TX and zero heap allocations; establishes a clean
+    /// empty-queue boundary before evaluating rest-pose / disarm gates for carried-over clears.
+    fn drain_rx_only_bounded(&mut self, _deadline: Option<Instant>) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+
+    /// Clear carried-over motor hardware errors on affected motors ONLY while disarmed, then
+    /// verify on a fresh post-clear status reply that every affected motor's error bit is gone
+    /// and the motor stays disabled (never sends an enable command).
+    ///
+    /// Runs `pre_tx_gate` immediately before every CAN frame submission (re-verifying live
+    /// operator authority and pending E-stop at the hardware write boundary). When `deadline` is
+    /// `Some`, operates within the caller's RT release budget with zero heap allocations.
+    fn clear_carried_over_motor_errors(
+        &mut self,
+        _deadline: Option<Instant>,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<CarryoverMotorClearOutcome, ArmDriverError> {
+        Err(ArmDriverError::ProtocolStatic(
+            "UNSUPPORTED: driver does not support targeted motor error clear",
+        ))
     }
 
     /// Return indices of joints disabled during clear_fault
@@ -7897,6 +7959,31 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Last finite measured position observed for joint `idx` (never cleared by transient
     /// staleness) so energized non-`PosForce` arm joints always have a stationary hold target.
     motor_keepalive_hold_pos: [Option<f32>; MAX_MODE_JOINTS],
+    /// Bitmask of joints (`1u32 << idx`) that already received a confirmed watchdog-refreshing
+    /// control frame (`POS_VEL`, `MIT`, `POS_FORCE`, or initial `CMD_ENABLE`) during the current
+    /// control release (`control_release_id`). Prevents duplicate control/hold frames per release.
+    release_ctrl_tx_mask: u32,
+    /// Staged watchdog-refreshing control TX timestamps awaiting confirmed `can.flush()` on
+    /// real-flush (`!flush_is_noop()`) transports. Committed atomically on flush success and
+    /// discarded on any pre-flush error, cutoff, stop, or flush failure.
+    staged_ctrl_tx: [Option<Instant>; MAX_MODE_JOINTS],
+    /// Bitmask of joints (`1u32 << idx`) present in `staged_ctrl_tx`.
+    staged_ctrl_tx_mask: u32,
+    /// True from `begin_control_release` through Window 1 Step 5 while a subsequent normal/hold
+    /// output step in THIS release still owns watchdog servicing. Cleared on Window 2 wakes,
+    /// end-of-release fallback, and release-cap teardown so off-tick and Window 2 confirmations
+    /// never skip inline watchdog holds.
+    output_step_pending_in_release: bool,
+    /// `control_release_id` for which the current per-release TX pass (`tick_tx`,
+    /// `refresh_scheduler`, `release_ctrl_tx_mask`, `release_recovery_tx_count`) was opened.
+    release_tx_pass_release_id: u64,
+    /// Autonomous stale-feedback recovery TX frames emitted during the current control release.
+    release_recovery_tx_count: u8,
+    /// Round-robin cursor across joints for bounded per-release autonomous recovery TX.
+    recovery_cursor: usize,
+    /// Diagnostic tag distinguishing urgent watchdog continuity holds (`TxFrameKind::UrgentHold`)
+    /// from normal stopped / SAFE-HOLD / FailedHold holds (`TxFrameKind::Hold`).
+    in_urgent_watchdog_hold: bool,
 }
 
 /// Transmit priority classes (lower value = higher priority):
@@ -8861,6 +8948,23 @@ const WATCHDOG_HOLD_PROACTIVE_INTERVAL: Duration = Duration::from_millis(15);
 /// during a multi-tick enable refreshes already-enabled arm joints FIRST before handshake TX,
 /// guaranteeing <= 40 ms between control frames even with jitter or a 1-tick TX budget squeeze.
 const WATCHDOG_HOLD_URGENT_INTERVAL: Duration = Duration::from_millis(18);
+/// Sub-release wake threshold for watchdog continuity: strictly above one 50 Hz release (20 ms)
+/// so healthy 50 Hz releases service energized motors once per release without scheduling a
+/// redundant Window 2 sleep at t + 16 ms, while still waking before 40 ms if a release misses TX
+/// or runs at a slower period.
+const WATCHDOG_HOLD_WAKE_INTERVAL: Duration = Duration::from_millis(22);
+/// Remaining release budget margin required to start optional (deferrable) CAN work such as
+/// background `0xCC` status polls or autonomous recovery frames without pushing a release past
+/// its deadline.
+pub(crate) const OPTIONAL_WORK_RELEASE_MARGIN: Duration = Duration::from_millis(6);
+/// Remaining release budget margin required to admit an optional Window 2 sub-release transition
+/// poll (capped at `period / 2` for shorter periods). A Window 2 poll on SG2002 costs ~3–4 ms, so
+/// deferring optional wakes past `period - 9 ms` keeps worst-case 50 Hz releases under 15 ms while
+/// urgent watchdog/stop wakes remain eligible up to `release_deadline - DAMIAO_TX_RELEASE_PUBLISH_MARGIN`.
+pub(crate) const OPTIONAL_WAKE_RELEASE_MARGIN: Duration = Duration::from_millis(9);
+/// Maximum autonomous stale-feedback recovery TX frames transmitted inside `receive_feedback`
+/// during a single managed/release-bounded control release (round-robin across joints).
+const DAMIAO_MAX_RECOVERY_PER_RELEASE: u8 = 2;
 /// Fallback watchdog hold threshold during `AwaitRestGate` / `Disable` Phase A (`repeats_sent == 0`):
 /// strictly above one 50 Hz control tick (20 ms) so normal ticked control (whose Step 3 already
 /// runs `service_stopped_measured_hold` every 20 ms) never emits duplicate holds, while blocking
@@ -9011,6 +9115,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             motor_energized_mask: 0,
             motor_last_ctrl_tx: [None; MAX_MODE_JOINTS],
             motor_keepalive_hold_pos: [None; MAX_MODE_JOINTS],
+            release_ctrl_tx_mask: 0,
+            staged_ctrl_tx: [None; MAX_MODE_JOINTS],
+            staged_ctrl_tx_mask: 0,
+            output_step_pending_in_release: false,
+            release_tx_pass_release_id: 0,
+            release_recovery_tx_count: 0,
+            recovery_cursor: 0,
+            in_urgent_watchdog_hold: false,
         }
     }
 
@@ -9036,6 +9148,106 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn begin_tx_tick(&mut self) {
         self.tick_tx = None;
         self.refresh_scheduler.begin_tick();
+        self.release_ctrl_tx_mask = 0;
+        self.discard_staged_ctrl_tx();
+        self.release_recovery_tx_count = 0;
+        self.release_tx_pass_release_id = self.control_release_id;
+    }
+
+    /// True when executing inside an active owner-managed control release (both
+    /// `control_release_managed` and an installed `tx_release_deadline`).
+    #[inline]
+    fn in_active_control_release(&self) -> bool {
+        self.control_release_managed && self.tx_release_deadline.is_some()
+    }
+
+    /// Record a watchdog-refreshing control TX at the confirmed delivery boundary: immediately on
+    /// no-op-flush transports, or staged until `flush_can_and_commit()` succeeds on real-flush
+    /// transports.
+    #[inline]
+    fn record_ctrl_tx_delivered(&mut self, idx: usize, at: Instant) {
+        if idx < MAX_MODE_JOINTS {
+            if self.can.flush_is_noop() {
+                self.motor_last_ctrl_tx[idx] = Some(at);
+                self.release_ctrl_tx_mask |= 1u32 << idx;
+            } else {
+                self.staged_ctrl_tx[idx] = Some(at);
+                self.staged_ctrl_tx_mask |= 1u32 << idx;
+            }
+        }
+    }
+
+    /// Commit all staged real-flush control TX timestamps after a confirmed `can.flush()`.
+    #[inline]
+    fn commit_staged_ctrl_tx(&mut self) {
+        let mut mask = self.staged_ctrl_tx_mask;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if idx < MAX_MODE_JOINTS {
+                if let Some(at) = self.staged_ctrl_tx[idx].take() {
+                    self.motor_last_ctrl_tx[idx] = Some(at);
+                    self.release_ctrl_tx_mask |= 1u32 << idx;
+                }
+            }
+        }
+        self.staged_ctrl_tx_mask = 0;
+    }
+
+    /// Discard staged control TX timestamps without crediting watchdog refreshes.
+    #[inline]
+    fn discard_staged_ctrl_tx(&mut self) {
+        let mut mask = self.staged_ctrl_tx_mask;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if idx < MAX_MODE_JOINTS {
+                self.staged_ctrl_tx[idx] = None;
+            }
+        }
+        self.staged_ctrl_tx_mask = 0;
+    }
+
+    /// Single confirmed-delivery flush boundary: commits staged watchdog timestamps iff `flush()`
+    /// succeeds, and discards them on error.
+    #[inline]
+    fn flush_can_and_commit(&mut self) -> Result<(), TransportError> {
+        match self.can.flush() {
+            Ok(()) => {
+                self.commit_staged_ctrl_tx();
+                Ok(())
+            }
+            Err(e) => {
+                self.discard_staged_ctrl_tx();
+                Err(e)
+            }
+        }
+    }
+
+    /// Open a fresh per-release TX pass only if one has not already been opened for the active
+    /// managed control release (`in_active_control_release()`).
+    /// Prevents multiple Step 2 / RX entry points inside Window 1 from resetting the release TX
+    /// budget or refresh slot, while off-tick blocking loops (`tx_release_deadline == None`)
+    /// still open a fresh TX pass on every iteration.
+    #[inline]
+    fn ensure_release_tx_tick(&mut self) {
+        if !self.in_active_control_release() || self.release_tx_pass_release_id != self.control_release_id {
+            self.begin_tx_tick();
+        }
+    }
+
+    /// True when enough release budget remains to start optional (deferrable) CAN work such as
+    /// background `0xCC` status polls or autonomous recovery frames without risking a deadline
+    /// overrun. Always returns `true` when no release deadline cap is installed.
+    #[inline]
+    fn has_optional_release_budget(&self) -> bool {
+        let Some(cap) = self.tx_release_deadline else {
+            return true;
+        };
+        let extra_margin = OPTIONAL_WORK_RELEASE_MARGIN
+            .saturating_sub(DAMIAO_TX_RELEASE_PUBLISH_MARGIN)
+            .min(self.tx_budget.max_duration / 2);
+        cap.saturating_duration_since(self.now()) >= extra_margin
     }
 
     #[inline]
@@ -10047,7 +10259,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         let bit = 1u32 << idx;
                         if (self.motor_energized_mask & bit) == 0 {
                             self.motor_energized_mask |= bit;
-                            self.motor_last_ctrl_tx[idx] = Some(tx_started_mark);
+                            self.record_ctrl_tx_delivered(idx, tx_started_mark);
                         }
                         if self.cached_states.get(idx).is_some_and(|s| s.position.is_finite()) {
                             self.motor_keepalive_hold_pos[idx] = Some(self.cached_states[idx].position);
@@ -10056,10 +10268,38 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 } else if let Some(idx) = disable_motor_idx {
                     self.motor_post_enable_feedback[idx] = false;
                 } else if let Some(idx) = self.damiao_command_motor_index(&frame) {
-                    if idx < MAX_MODE_JOINTS {
-                        self.motor_last_ctrl_tx[idx] = Some(tx_started_mark);
-                    }
+                    self.record_ctrl_tx_delivered(idx, tx_started_mark);
                 }
+                let frame_kind = if is_cmd_enable || is_cmd_disable {
+                    crate::diagnostics::tick::TxFrameKind::EnableDisable
+                } else if (frame.id == 0x7FF && frame.dlc >= 3 && frame.data[2] == 0xCC)
+                    || matches!(kind, TxKind::Refresh | TxKind::DisableProbe)
+                {
+                    crate::diagnostics::tick::TxFrameKind::Refresh0xCc
+                } else {
+                    match kind {
+                        TxKind::Target => crate::diagnostics::tick::TxFrameKind::Normal,
+                        TxKind::Recovery => crate::diagnostics::tick::TxFrameKind::Recovery,
+                        TxKind::MeasuredHold(_) if self.in_urgent_watchdog_hold => {
+                            crate::diagnostics::tick::TxFrameKind::UrgentHold
+                        }
+                        TxKind::Hold | TxKind::RollbackHold(_) | TxKind::MeasuredHold(_) => {
+                            crate::diagnostics::tick::TxFrameKind::Hold
+                        }
+                        TxKind::Handshake
+                        | TxKind::ModeWrite
+                        | TxKind::ClearFault
+                        | TxKind::DisableRequested { .. }
+                        | TxKind::ClientParkDisable { .. }
+                        | TxKind::DisableProtective { .. } => {
+                            crate::diagnostics::tick::TxFrameKind::EnableDisable
+                        }
+                        TxKind::Refresh | TxKind::DisableProbe => {
+                            crate::diagnostics::tick::TxFrameKind::Refresh0xCc
+                        }
+                    }
+                };
+                crate::diagnostics::tick::record_tx_frame_kind(frame_kind);
             } else if let Err(ref e) = res {
                 // Non-backpressure transport error on CMD_ENABLE has ambiguous wire delivery:
                 // invalidate any cached disarm proof on that axis fail-closed.
@@ -10072,10 +10312,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.panic_disable_confirmed[idx] = false;
                         if idx < MAX_MODE_JOINTS {
                             let bit = 1u32 << idx;
-                            if (self.motor_energized_mask & bit) == 0 {
-                                self.motor_energized_mask |= bit;
-                                self.motor_last_ctrl_tx[idx] = Some(tx_started_mark);
-                            }
+                            // Fail-closed: record possible energization, but do NOT advance
+                            // `motor_last_ctrl_tx` on ambiguous hard-error delivery so a due
+                            // watchdog hold is never postponed.
+                            self.motor_energized_mask |= bit;
                         }
                     }
                 }
@@ -10390,7 +10630,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 })
                 .is_ok()
             });
-            let _ = self.can.flush();
+            let _ = self.flush_can_and_commit();
             let expected: Vec<(usize, bool, u8)> = RIDS.iter().map(|&rid| (i, false, rid)).collect();
             let replies = if sent { self.await_register_replies_for(&expected, RANGE_CHECK_REPLY_TIMEOUT) } else { vec![None; RIDS.len()] };
             let l = self.limits[i];
@@ -10793,6 +11033,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if deadline.is_some_and(|d| d.passed(now)) {
             return Ok(false);
         }
+        // Optional background 0xCC refresh: defer to the next release when remaining release
+        // budget is below the optional-work margin so it never pushes a release past deadline.
+        if !self.has_optional_release_budget() {
+            self.refresh_scheduler.record_deferred();
+            return Ok(false);
+        }
         let stale_mask = self.compute_stale_refresh_mask(now, defer_active_pf_freeze) & allowed_mask;
         let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
         let Some(joint) =
@@ -10817,7 +11063,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.refresh_scheduler.record_deferred();
                     return Err(TransportError::Timeout.into());
                 }
-                if let Err(e) = self.can.flush() {
+                if let Err(e) = self.flush_can_and_commit() {
                     self.mark_tx_pass_backpressured();
                     self.discard_all_pending_tx();
                     self.refresh_scheduler.record_deferred();
@@ -11242,7 +11488,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 .map_err(Self::refusal_to_driver_err)?;
             }
             self.strict_stop_check(Some(expected_stamp))?;
-            self.can.flush()?;
+            self.flush_can_and_commit()?;
             let expected: Vec<(usize, bool, u8)> = RIDS.map(|rid| (i, false, rid)).to_vec();
             let replies = self.await_register_replies(&expected);
             let want = [self.limits[i].p_max, self.limits[i].v_max, self.limits[i].t_max];
@@ -11334,7 +11580,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                 }
                 if sent_changing {
-                    let _ = self.can.flush();
+                    let _ = self.flush_can_and_commit();
                 }
             }
             if self.mode_write_replied(&w) || w.deadline.passed(self.now()) {
@@ -11556,7 +11802,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.policy_check(policy)?;
         let flush_ok = if any_tx_sent {
-            self.can.flush().is_ok() || !strict
+            self.flush_can_and_commit().is_ok() || !strict
         } else {
             true
         };
@@ -11690,7 +11936,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if sent_any {
             self.enable_estop_inhibited()?;
-            w.flush_ok &= self.can.flush().is_ok() || !strict;
+            w.flush_ok &= self.flush_can_and_commit().is_ok() || !strict;
         }
         Ok(())
     }
@@ -11853,7 +12099,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if deadline.is_some_and(|d| d.passed(self.now())) || self.flush_cutoff_exceeded() {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
-        if let Err(e) = self.can.flush() {
+        if let Err(e) = self.flush_can_and_commit() {
             self.mark_tx_pass_backpressured();
             return Err(ArmDriverError::Transport(e));
         }
@@ -12021,7 +12267,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         pre_oldest_expired: Option<Duration>,
         stop_on_expiry: bool,
     ) -> Result<TxBatchOutcome, ArmDriverError> {
+        let res = self.drain_pending_pass_inner(
+            pass_stop_stamp,
+            pass_lease_gen,
+            pre_dropped_stale,
+            pre_oldest_expired,
+            stop_on_expiry,
+        );
+        if res.is_err() {
+            self.discard_staged_ctrl_tx();
+        }
+        res
+    }
+
+    fn drain_pending_pass_inner(
+        &mut self,
+        pass_stop_stamp: StopStamp,
+        pass_lease_gen: u64,
+        pre_dropped_stale: usize,
+        pre_oldest_expired: Option<Duration>,
+        stop_on_expiry: bool,
+    ) -> Result<TxBatchOutcome, ArmDriverError> {
         let _ = self.ensure_tx_pass();
+        self.discard_staged_ctrl_tx();
         self.last_target_tx_sent_mask = 0;
         let mut sent_any = false;
         let mut sent_mask: u64 = 0;
@@ -12154,10 +12422,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if self.tick_tx.is_some_and(|p| self.now() >= p.deadline) {
                     self.mark_tx_pass_backpressured();
                 }
+                self.discard_staged_ctrl_tx();
                 self.discard_pending_tx_stopped();
                 return Err(TransportError::Timeout.into());
             }
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.flush_can_and_commit() {
                 self.mark_tx_pass_backpressured();
                 self.discard_pending_tx_stopped();
                 return Err(e.into());
@@ -12326,7 +12595,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         } else {
             self.strict_stop_check(Some(expected_stamp))?;
         }
-        self.can.flush()?;
+        self.flush_can_and_commit()?;
         let expected: Vec<(usize, bool, u8)> = rids.iter().map(|&rid| (i, false, rid)).collect();
         self.await_replies_after(&expected, sent);
         rids.iter().map(|&rid| {
@@ -12539,7 +12808,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(e);
         }
         let mut why = "mode write, hold or flush";
-        if any_tx_sent && self.can.flush().is_err() { failed = joints.to_vec(); }
+        if any_tx_sent && self.flush_can_and_commit().is_err() { failed = joints.to_vec(); }
         if let Err(e) = self.policy_check(policy) {
             if fenced {
                 self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
@@ -12644,7 +12913,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         for &j in joints { self.joint_modes[j] = None; }
                         return Err(e);
                     }
-                    let _ = self.can.flush();
+                    let _ = self.flush_can_and_commit();
                 }
                 polled = true;
             }
@@ -12775,7 +13044,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             .map_err(Self::refusal_to_driver_err)?;
             *written = true;
             self.strict_stop_check(Some(start_stamp))?;
-            self.can.flush()?;
+            self.flush_can_and_commit()?;
             self.await_replies_after(&[(i, true, damiao::RID_TIMEOUT)], sent);
             let ack = self.register_reply_log.iter().rev()
                 .find(|(r, _, _, seq, _)| r.motor_id == id && r.write && r.rid == damiao::RID_TIMEOUT && *seq > sent).copied();
@@ -12869,17 +13138,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_stop_stamp = None;
         self.enable_frames_sent_any = false;
         self.enable_estop_inhibited()?;
-        if self.motor_energized_mask != 0 {
-            let _ = self.service_energized_watchdog_holds(
-                WATCHDOG_HOLD_URGENT_INTERVAL,
-                None,
-                0,
-                false,
-            );
-        }
         // Fast-path: only if !pending_rearm && is_enabled && feedback_valid && all state == 1
         // (never after an MIT deadline trip: the rearm restores the modes and re-enables;
         // a position-force gripper also requires verified mode 4 and fresh <= 100 ms feedback).
+        // Checked BEFORE urgent watchdog holds so a fast-path enable lets Step 5 emit the single
+        // normal control batch for this release without duplicate holds.
         if self.mit_fence_trip.is_none()
             && !self.pending_rearm
             && self.is_enabled
@@ -12896,9 +13159,30 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.enable_state() == EnableState::Enabled
             && self.motor_status.iter().all(|&st| st == 1)
         {
+            // When no subsequent Step 5 output owns this release (off-tick blocking `set_torque(true)`
+            // or Window 2 wake), service any already-due energized watchdog holds inline before
+            // returning `Confirmed`.
+            if !(self.output_step_pending_in_release && self.in_active_control_release())
+                && self.motor_energized_mask != 0
+            {
+                let _ = self.service_energized_watchdog_holds(
+                    WATCHDOG_HOLD_URGENT_INTERVAL,
+                    None,
+                    0,
+                    false,
+                );
+            }
             self.enable_tx_deadline = None;
             self.enable_lease_gen = None;
             return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+        }
+        if self.motor_energized_mask != 0 {
+            let _ = self.service_energized_watchdog_holds(
+                WATCHDOG_HOLD_URGENT_INTERVAL,
+                None,
+                0,
+                false,
+            );
         }
 
         // A motor that did not answer the startup range read gets another (read-only)
@@ -13189,7 +13473,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if sent_any {
             self.enable_estop_inhibited()?;
             self.check_enable_tx_authority()?;
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.flush_can_and_commit() {
                 self.enable_failed();
                 return Err(e.into());
             }
@@ -13498,7 +13782,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             if sent_any {
                 self.enable_estop_inhibited()?;
-                if let Err(e) = self.can.flush() {
+                if let Err(e) = self.flush_can_and_commit() {
                     self.enable_failed();
                     return Err(ArmDriverError::Transport(e));
                 }
@@ -13722,7 +14006,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
-        self.can.flush()?;
+        self.flush_can_and_commit()?;
         self.refresh_scheduler.mark_slot_used();
         self.refresh_capture = Some(RefreshCapture {
             joint,
@@ -14145,7 +14429,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             if sent_any {
                 self.enable_estop_inhibited()?;
-                if let Err(e) = self.can.flush() {
+                if let Err(e) = self.flush_can_and_commit() {
                     let j = first_sent_joint.unwrap_or(0);
                     return self.readback_failed_err(
                         j,
@@ -14319,7 +14603,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         };
         self.enable_estop_inhibited()?;
-        if let Err(e) = self.can.flush() {
+        if let Err(e) = self.flush_can_and_commit() {
             return self.readback_failed_err(
                 joint,
                 ArmDriverError::PosForcePreEnableHoldTxFailed {
@@ -14434,6 +14718,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// `0xCC` refresh slot instead of failing closed before trying a refresh.
     fn send_enable_masked(
         &mut self,
+        mask: u32,
+        fail_on_error: bool,
+        deadline: Option<Deadline>,
+        tx_cursor: &mut u8,
+        prioritize_joint: Option<usize>,
+        defer_stale_pf: bool,
+    ) -> Result<u32, ArmDriverError> {
+        let res = self.send_enable_masked_inner(
+            mask,
+            fail_on_error,
+            deadline,
+            tx_cursor,
+            prioritize_joint,
+            defer_stale_pf,
+        );
+        if res.is_err() {
+            self.discard_staged_ctrl_tx();
+        }
+        res
+    }
+
+    fn send_enable_masked_inner(
+        &mut self,
         mut mask: u32,
         fail_on_error: bool,
         deadline: Option<Deadline>,
@@ -14441,6 +14748,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         prioritize_joint: Option<usize>,
         defer_stale_pf: bool,
     ) -> Result<u32, ArmDriverError> {
+        let orig_mask = mask;
+        self.discard_staged_ctrl_tx();
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
         let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
@@ -14566,14 +14875,30 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         if sent_any {
-            self.enable_estop_inhibited()?;
-            self.check_enable_tx_authority()?;
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.enable_estop_inhibited() {
+                self.discard_staged_ctrl_tx();
+                return Err(e);
+            }
+            if let Err(e) = self.check_enable_tx_authority() {
+                self.discard_staged_ctrl_tx();
+                return Err(e);
+            }
+            if self.flush_cutoff_exceeded() {
+                self.mark_tx_pass_backpressured();
+                self.discard_staged_ctrl_tx();
+                if fail_on_error {
+                    self.enable_failed();
+                    return Err(TransportError::Timeout.into());
+                }
+                tracing::warn!("Retry flush cutoff exceeded");
+                return Ok(orig_mask);
+            } else if let Err(e) = self.flush_can_and_commit() {
                 if fail_on_error {
                     self.enable_failed();
                     return Err(e.into());
                 }
                 tracing::warn!("Retry flush failed: {:?}", e);
+                return Ok(orig_mask);
             }
         }
         Ok(mask)
@@ -14919,10 +15244,39 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.check_pf_enable_hardware_fault(pf_joint)?;
         }
 
+        // Plan BEFORE urgent watchdog holds: if every motor is already confirmed enabled right
+        // after RX (`unsent_mask == 0` and `pf_refresh.is_none()`), confirm immediately without
+        // emitting redundant urgent holds so Step 5 sends the release's single normal control
+        // batch (with end-of-release watchdog fallback if any motor's normal output is deferred
+        // or absent). Do not consume retry windows here so retries preserve `fail_on_error = false`.
+        if unsent_mask == 0 && pf_refresh.is_none() {
+            let all_mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+            let (confirmed_mask, all_post_fb, fault) = self.enable_confirm_snapshot(0);
+            if fault.is_some() || (all_post_fb && (confirmed_mask & all_mask) == all_mask) {
+                let now = self.now();
+                match window.service(now, confirmed_mask, all_post_fb, fault) {
+                    Service::Confirmed => return Ok(self.finish_enable_confirmed(window.started)),
+                    Service::Fault { .. } => {
+                        let e = self
+                            .check_hardware_status()
+                            .err()
+                            .unwrap_or(ArmDriverError::MotorHardwareFault {
+                                joint: 0,
+                                motor_id: 0,
+                                status: 0xFF,
+                            });
+                        self.enable_failed();
+                        return Err(e);
+                    }
+                    Service::Retry { .. } | Service::Wait { .. } => {}
+                }
+            }
+        }
+
         // Urgent watchdog refresh AFTER the RX pass (so `rx_deadline` is never consumed before
         // `receive_feedback`) and BEFORE enable/0xCC/retry TX so already-enabled arm joints
-        // (>= 18 ms since last control frame) preempt new enables / retries / 0xCC polls and
-        // never exceed 40 ms between control frames.
+        // (>= 18 ms since last control frame, not yet serviced in this release) preempt new
+        // enables / retries / 0xCC polls and never exceed 40 ms between control frames.
         if self.motor_energized_mask != 0 {
             let reserve_for_phase = unsent_mask != 0 || pf_refresh.is_some();
             self.service_urgent_enable_watchdog_holds(0, reserve_for_phase)?;
@@ -15534,7 +15888,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let mut flush_failed = false;
         if sent_any || (!client_park && !skip_dispatched) {
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.flush_can_and_commit() {
                 flush_failed = true;
                 other_err = Some(e.into());
             }
@@ -15738,7 +16092,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if probed_any {
             *next_probe_at = self.now() + EVIDENCE_PROBE_INTERVAL;
-            let _ = self.can.flush();
+            let _ = self.flush_can_and_commit();
             let _ = self.receive_feedback();
         }
         probed_any
@@ -16112,7 +16466,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             let mut flush_failed = false;
             if sent_any {
-                if let Err(e) = self.can.flush() {
+                if let Err(e) = self.flush_can_and_commit() {
                     flush_failed = true;
                     other_err = Some(e.into());
                 }
@@ -16312,7 +16666,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let mut flush_ok = true;
         if sent_any {
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.flush_can_and_commit() {
                 tracing::warn!("Repeat disable CAN flush failed: {:?}", e);
                 flush_ok = false;
                 if other_err.is_none() {
@@ -16559,6 +16913,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         exclude_mask: u32,
         abort_on_starve: bool,
     ) -> Result<bool, ArmDriverError> {
+        self.service_energized_watchdog_holds_with_targets(
+            min_age,
+            deadline,
+            exclude_mask,
+            None,
+            abort_on_starve,
+        )
+    }
+
+    fn service_energized_watchdog_holds_with_targets(
+        &mut self,
+        min_age: Duration,
+        deadline: Option<Deadline>,
+        exclude_mask: u32,
+        hold_targets: Option<&[Option<f32>]>,
+        abort_on_starve: bool,
+    ) -> Result<bool, ArmDriverError> {
         if self.motor_energized_mask == 0 {
             return Ok(false);
         }
@@ -16572,13 +16943,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let pf_joint = self.active_pos_force_joint();
         let now = self.now();
 
-        // Collect eligible energized joints whose control-frame age >= min_age, ordered
-        // oldest-unfed first (largest elapsed age first). Zero heap allocation.
+        // Collect eligible energized joints whose control-frame age >= min_age and that have NOT
+        // already received a confirmed control frame in this release, ordered oldest-unfed first
+        // (largest elapsed age first). Zero heap allocation.
+        let effective_exclude = exclude_mask | self.release_ctrl_tx_mask;
         let mut due = [(0usize, Duration::ZERO); MAX_MODE_JOINTS];
         let mut due_len = 0usize;
         for i in 0..n {
             if (self.motor_energized_mask & (1u32 << i)) == 0
-                || (exclude_mask & (1u32 << i)) != 0
+                || (effective_exclude & (1u32 << i)) != 0
             {
                 continue;
             }
@@ -16610,19 +16983,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             due[j] = key;
         }
 
-        let prev_ctrl_tx = self.motor_last_ctrl_tx;
+        let start_stamp = self.current_stop_stamp();
+        self.discard_staged_ctrl_tx();
         let mut sent_mask = 0u32;
+        let mut aborted_flush = false;
+        self.in_urgent_watchdog_hold = true;
         for &(i, _) in &due[..due_len] {
-            let Some(pos) = self.motor_keepalive_hold_pos[i].or_else(|| {
-                self.cached_states
-                    .get(i)
-                    .map(|s| s.position)
-                    .filter(|p| p.is_finite())
+            let Some(pos) = (match hold_targets {
+                Some(targets) => targets.get(i).and_then(|&p| p).filter(|p| p.is_finite()),
+                None => self.motor_keepalive_hold_pos[i].or_else(|| {
+                    self.cached_states
+                        .get(i)
+                        .map(|s| s.position)
+                        .filter(|p| p.is_finite())
+                }),
             }) else {
                 continue;
             };
             let target = JointTarget::position(pos);
-            match self.send_plain(TxKind::MeasuredHold(i), None, deadline, false, |d| {
+            match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), deadline, false, |d| {
                 d.build_verified_hold_frame(i, &target)
             }) {
                 Ok(_) => {
@@ -16630,20 +17009,32 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
                 Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
-                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => break,
+                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                    aborted_flush = true;
+                    break;
+                }
+                Err(TxRefusal::Transport(_)) => {
+                    self.mark_tx_pass_backpressured();
+                    aborted_flush = true;
+                    break;
+                }
                 Err(_) => {}
             }
         }
+        self.in_urgent_watchdog_hold = false;
         let mut sent_any = sent_mask != 0;
-        if sent_any && (self.flush_cutoff_exceeded() || self.can.flush().is_err()) {
-            // On a real-flush transport where flush failed or overran cutoff, do not credit
-            // those unconfirmed transmits as watchdog refreshes.
-            for i in 0..n {
-                if (sent_mask & (1u32 << i)) != 0 {
-                    self.motor_last_ctrl_tx[i] = prev_ctrl_tx[i];
-                }
+        if sent_any {
+            if aborted_flush
+                || self.pending_stop_check(Some(start_stamp)).is_err()
+                || self.flush_cutoff_exceeded()
+            {
+                self.discard_staged_ctrl_tx();
+                sent_any = false;
+            } else if self.flush_can_and_commit().is_err() {
+                sent_any = false;
             }
-            sent_any = false;
+        } else {
+            self.discard_staged_ctrl_tx();
         }
 
         if abort_on_starve && self.tx_budget.max_frames >= n {
@@ -16678,11 +17069,28 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Earliest next wake instant needed to keep already-enabled arm joints refreshed within
-    /// `WATCHDOG_HOLD_PROACTIVE_INTERVAL`.
+    /// the active handshake phase's watchdog hold threshold (`WATCHDOG_DISABLE_FALLBACK_INTERVAL`
+    /// during pre-dispatch disable when RX is drained, `WATCHDOG_HOLD_WAKE_INTERVAL` during enable).
     fn next_watchdog_hold_wake(&self) -> Option<Instant> {
         if self.motor_energized_mask == 0 || (self.mit_fence.is_some() && !self.is_enabling) {
             return None;
         }
+        let is_disable_pre_all = matches!(
+            self.torque_hs,
+            Some(DamiaoTorque::AwaitRestGate { .. } | DamiaoTorque::Disable { repeats_sent: 0, .. })
+        );
+        if is_disable_pre_all
+            && (self.mit_fence_trip.is_some()
+                || !self.last_read_drained
+                || self.awaiting_rx_boundary)
+        {
+            return None;
+        }
+        let wake_interval = if is_disable_pre_all {
+            WATCHDOG_DISABLE_FALLBACK_INTERVAL
+        } else {
+            WATCHDOG_HOLD_WAKE_INTERVAL
+        };
         let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
         let pf_joint = self.active_pos_force_joint();
         let mut earliest: Option<Instant> = None;
@@ -16700,7 +17108,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 continue;
             }
             if let Some(last_tx) = self.motor_last_ctrl_tx[i] {
-                let due = last_tx + WATCHDOG_HOLD_PROACTIVE_INTERVAL;
+                let due = last_tx + wake_interval;
                 earliest = Some(earliest.map_or(due, |e| e.min(due)));
             }
         }
@@ -16711,7 +17119,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if !self.control_release_managed {
             self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
         }
-        self.begin_tx_tick();
+        self.ensure_release_tx_tick();
         self.in_poll_torque = true;
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
@@ -16822,7 +17230,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             }
                         }
                     }
-                    Ok(TorqueProgress::Done(TorqueOutcome::Confirmed)) => {
+                    // Skip duplicate pre-Step-5 holds ONLY when a subsequent Window 1 Step 5
+                    // output step in THIS release still owns watchdog servicing; Window 2
+                    // confirmations and off-tick callers have no Step 5 and must service inline.
+                    Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+                        if !(self.output_step_pending_in_release && self.in_active_control_release()) =>
+                    {
                         let _ = self.service_energized_watchdog_holds(
                             WATCHDOG_HOLD_PROACTIVE_INTERVAL,
                             None,
@@ -17354,10 +17767,48 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn begin_control_release(&mut self, release_seq: u64) {
         if self.control_release_id != release_seq {
-            self.tick_tx = None;
+            self.control_release_id = release_seq;
+            self.begin_tx_tick();
+            self.output_step_pending_in_release = true;
         }
         self.control_release_managed = true;
-        self.control_release_id = release_seq;
+    }
+
+    fn begin_wake_tx_pass(&mut self) {
+        let now = self.now();
+        if let Some(pass) = self.tick_tx.as_mut() {
+            pass.deadline = now + self.tx_budget.max_duration;
+            pass.backpressured = false;
+        }
+        self.discard_staged_ctrl_tx();
+        self.output_step_pending_in_release = false;
+    }
+
+    fn next_watchdog_hold_wake(&self) -> Option<Instant> {
+        DamiaoArmDriver::next_watchdog_hold_wake(self)
+    }
+
+    fn service_release_watchdog_fallback(
+        &mut self,
+        authorized_mask: u64,
+        hold_targets: Option<&[Option<f32>]>,
+    ) {
+        self.output_step_pending_in_release = false;
+        if authorized_mask == 0
+            || self.motor_energized_mask == 0
+            || self.is_enabling
+            || self.mit_fence.is_some()
+        {
+            return;
+        }
+        let exclude_mask = !(authorized_mask as u32);
+        let _ = self.service_energized_watchdog_holds_with_targets(
+            WATCHDOG_DISABLE_FALLBACK_INTERVAL,
+            None,
+            exclude_mask,
+            hold_targets,
+            false,
+        );
     }
 
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
@@ -17393,7 +17844,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         if sent_any {
-            let _ = self.can.flush();
+            let _ = self.flush_can_and_commit();
         }
         sent_any
     }
@@ -17626,7 +18077,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         self.pending_stop_check(Some(start_stamp)).map_err(|e| format!("status poll not sent: {e}"))?;
-        self.can.flush().map_err(|e| format!("flush: {e}"))?;
+        self.flush_can_and_commit().map_err(|e| format!("flush: {e}"))?;
         let start = self.now();
         loop {
             let _ = self.read_joint_states();
@@ -17669,7 +18120,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         if !faulted.is_empty() {
             self.pending_stop_check(Some(start_stamp)).map_err(|e| format!("clear-error flush inhibited: {e}"))?;
-            self.can.flush().map_err(|e| format!("flush: {e}"))?;
+            self.flush_can_and_commit().map_err(|e| format!("flush: {e}"))?;
         }
         // 2. no cached frame may ever be replayed; then the disable of every motor.
         // Callers (`SupervisorInner::clear_fault_for_epoch` / `mit_expiry_recovery_for_epoch`)
@@ -17792,7 +18243,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         })
         .map_err(Self::refusal_to_driver_err)?;
         self.strict_stop_check(Some(start_stamp))?;
-        self.can.flush()?;
+        self.flush_can_and_commit()?;
         tracing::warn!("Damiao joint {} (CAN ID 0x{id:X}): set-zero sent at reading {:.4} rad", joint + 1, self.cached_states[joint].position);
         Ok(())
     }
@@ -17871,7 +18322,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             tx_offset_ns,
                         };
                     }
-                    if self.can.flush().is_err() {
+                    if self.flush_can_and_commit().is_err() {
                         return crate::mit::CommissioningTxStatus::SentFlushFailed {
                             tx_seq,
                             tx_started,
@@ -17930,7 +18381,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             tx_offset_ns,
                         };
                     }
-                    if self.can.flush().is_err() {
+                    if self.flush_can_and_commit().is_err() {
                         return crate::mit::CommissioningTxStatus::SentFlushFailed {
                             tx_seq,
                             tx_started,
@@ -17999,7 +18450,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             tx_offset_ns,
                         };
                     }
-                    if self.can.flush().is_err() {
+                    if self.flush_can_and_commit().is_err() {
                         return crate::mit::CommissioningTxStatus::SentFlushFailed {
                             tx_seq,
                             tx_started,
@@ -18144,7 +18595,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             crate::torque::MotorWriteOutcome::RejectedStale;
                     }
                     if sent_any && !self.can.flush_is_noop() && !self.flush_cutoff_exceeded() {
-                        let _ = self.can.flush();
+                        let _ = self.flush_can_and_commit();
                     }
                     early_ret = Some(crate::mit::CommissioningDisableStep::Revoked(code));
                     break;
@@ -18235,7 +18686,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     dispatched_mask: self.disable_dispatched_mask,
                 };
             }
-            if self.can.flush().is_err() {
+            if self.flush_can_and_commit().is_err() {
                 return crate::mit::CommissioningDisableStep::Refused("disable flush failed");
             }
         }
@@ -18289,7 +18740,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             tx_offset_ns,
                         };
                     }
-                    if self.can.flush().is_err() {
+                    if self.flush_can_and_commit().is_err() {
                         return crate::mit::CommissioningTxStatus::SentFlushFailed {
                             tx_seq,
                             tx_started,
@@ -18412,7 +18863,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.pending_stop_check(Some(start_stamp))?;
         if sent_any {
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.flush_can_and_commit() {
                 if err.is_none() {
                     err = Some(ArmDriverError::HardwareFault(e.to_string()));
                 }
@@ -18466,7 +18917,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.pending_stop_check(Some(start_stamp))?;
         if sent_any {
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.flush_can_and_commit() {
                 if err.is_none() {
                     err = Some(ArmDriverError::Transport(e));
                 }
@@ -18478,6 +18929,252 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         match err {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    fn drain_rx_only_bounded(&mut self, deadline: Option<Instant>) -> Result<(), ArmDriverError> {
+        let blocking = deadline.is_none();
+        if !blocking && (!self.can.supports_nonblocking_rt() || !self.can.supports_bounded_flush()) {
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: transport does not support non-blocking RT I/O and bounded flush",
+            ));
+        }
+        let dl = deadline.map(|at| Deadline { at });
+        let release_cap_passed = |d: &Self| d.tx_release_deadline.is_some_and(|cap| d.now() >= cap);
+        if dl.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        let mut drained = self.drain_rx_frames_only(dl, 64);
+        if !drained && blocking {
+            for _ in 0..7 {
+                drained = self.drain_rx_frames_only(dl, 64);
+                if drained {
+                    break;
+                }
+            }
+        }
+        if !drained {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        Ok(())
+    }
+
+    fn clear_carried_over_motor_errors(
+        &mut self,
+        deadline: Option<Instant>,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<CarryoverMotorClearOutcome, ArmDriverError> {
+        let blocking = deadline.is_none();
+        if !blocking && (!self.can.supports_nonblocking_rt() || !self.can.supports_bounded_flush()) {
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: transport does not support non-blocking RT I/O and bounded flush",
+            ));
+        }
+        let n = self.motor_ids.len().min(64);
+        if n == 0 {
+            return Ok(CarryoverMotorClearOutcome::NoErrors);
+        }
+        // Fail closed unless EVERY motor (including J7) has fresh feedback and none is enabled.
+        if self.is_enabled
+            || self.is_enabling
+            || self.torque_transition_pending()
+            || !self.is_feedback_valid()
+            || self.has_any_joint_enabled()
+            || self.motor_status.iter().take(n).any(|&st| st == 1)
+        {
+            return Err(ArmDriverError::ProtocolStatic(
+                "cannot clear carried-over motor errors while torque is enabled or motor state is stale",
+            ));
+        }
+        if let Some((_, at)) = self.mit_fence_trip {
+            if self.since(at) < self.mit_fence_holdoff {
+                return Err(ArmDriverError::Transport(TransportError::WouldBlock));
+            }
+        }
+        let dl = deadline.map(|at| Deadline { at });
+        let release_cap_passed = |d: &Self| d.tx_release_deadline.is_some_and(|cap| d.now() >= cap);
+        if dl.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        let start_stamp = self.current_stop_stamp();
+        self.pending_stop_check(Some(start_stamp))?;
+
+        let mut affected_mask: u64 = 0;
+        for i in 0..n {
+            if damiao_fault_name(self.motor_status[i]).is_some() {
+                affected_mask |= 1u64 << i;
+            }
+        }
+        if affected_mask == 0 {
+            self.pending_stop_check(Some(start_stamp))?;
+            if dl.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
+                return Err(ArmDriverError::Transport(TransportError::Timeout));
+            }
+            if let Err(code) = pre_tx_gate() {
+                return Ok(CarryoverMotorClearOutcome::Revoked(code));
+            }
+            return Ok(CarryoverMotorClearOutcome::NoErrors);
+        }
+
+        let mut tx_boundary_seq = [0u64; 64];
+        let mut sent_mask: u64 = 0;
+        self.discard_all_pending_tx();
+        self.begin_tx_tick();
+        let mut tx_err: Option<ArmDriverError> = None;
+        for idx in 0..n {
+            if (affected_mask & (1u64 << idx)) == 0 {
+                continue;
+            }
+            // Establish a per-motor pre-write RX watermark immediately before submitting this
+            // motor's `CMD_CLEAR_FAULTS`, and re-verify live authority + E-stop inside
+            // `send_with_commissioning_gate` right at the `can.transmit` boundary.
+            tx_boundary_seq[idx] = self.rx_seq;
+            match self.send_with_commissioning_gate(
+                TxKind::ClearFault,
+                Some(start_stamp),
+                dl,
+                pre_tx_gate,
+                |d| Some(damiao::build_clear_faults_frame(d.motor_ids[idx])),
+            ) {
+                Ok(_) => sent_mask |= 1u64 << idx,
+                Err(Ok(code)) => return Ok(CarryoverMotorClearOutcome::Revoked(code)),
+                Err(Err(TxRefusal::DeadlinePassed)) => {
+                    return Err(ArmDriverError::Transport(TransportError::Timeout));
+                }
+                Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                Err(Err(TxRefusal::Deferred)) => {
+                    let pending = (affected_mask >> idx).count_ones() as usize;
+                    tx_err = Some(ArmDriverError::TxDeferred { pending });
+                    break;
+                }
+                Err(Err(TxRefusal::Transport(e))) => {
+                    tx_err = Some(ArmDriverError::Transport(e));
+                    break;
+                }
+                Err(Err(r)) => {
+                    tx_err = Some(Self::refusal_to_driver_err(r));
+                    break;
+                }
+            }
+        }
+        self.pending_stop_check(Some(start_stamp))?;
+        if sent_mask != 0 {
+            if dl.is_some_and(|d| d.passed(self.now())) || self.flush_cutoff_exceeded() {
+                return Err(ArmDriverError::Transport(TransportError::Timeout));
+            }
+            if let Err(e) = self.can.flush() {
+                self.mark_tx_pass_backpressured();
+                if tx_err.is_none() {
+                    tx_err = Some(ArmDriverError::Transport(e));
+                }
+            }
+        }
+        if let Some(e) = tx_err {
+            return Err(e);
+        }
+
+        // Verify on a fresh post-clear status reply (`last_feedback_seq[i] > tx_boundary_seq[i]`)
+        // that every affected motor's error bit is gone and every motor stays disabled (`status == 0`).
+        // Never sends `CMD_ENABLE`. If a motor did not automatically reply to `CMD_CLEAR_FAULTS`,
+        // sends a single read-only `0xCC` status poll to the unanswered affected motor(s).
+        let verify_start = self.now();
+        let verify_deadline = deadline.unwrap_or_else(|| verify_start + REGISTER_REPLY_TIMEOUT);
+        let verify_dl = Some(Deadline { at: verify_deadline });
+        let refresh_after = verify_start + Duration::from_millis(5);
+        let mut polled_refresh = false;
+        loop {
+            let drained_empty = self.drain_rx_frames_only(verify_dl, 64);
+            self.pending_stop_check(Some(start_stamp))?;
+            if self.now() >= verify_deadline || release_cap_passed(self) {
+                return Err(ArmDriverError::Transport(TransportError::Timeout));
+            }
+            let mut first_unconfirmed: Option<usize> = None;
+            for i in 0..n {
+                if (affected_mask & (1u64 << i)) != 0
+                    && self.last_feedback_seq[i] <= tx_boundary_seq[i]
+                {
+                    first_unconfirmed = Some(i);
+                    break;
+                }
+            }
+            if first_unconfirmed.is_none() {
+                for i in 0..n {
+                    if (affected_mask & (1u64 << i)) == 0 {
+                        continue;
+                    }
+                    let st = self.motor_status[i];
+                    if damiao_fault_name(st).is_some() {
+                        return Ok(CarryoverMotorClearOutcome::ErrorPersists { joint: i, code: st });
+                    }
+                    if st == 1 {
+                        return Ok(CarryoverMotorClearOutcome::MotorEnabled { joint: i });
+                    }
+                    if st != 0 {
+                        return Ok(CarryoverMotorClearOutcome::ErrorPersists { joint: i, code: st });
+                    }
+                }
+                for i in 0..n {
+                    let st = self.motor_status[i];
+                    if damiao_fault_name(st).is_some() {
+                        return Ok(CarryoverMotorClearOutcome::ErrorPersists { joint: i, code: st });
+                    }
+                    if st == 1 {
+                        return Ok(CarryoverMotorClearOutcome::MotorEnabled { joint: i });
+                    }
+                }
+                self.pending_stop_check(Some(start_stamp))?;
+                if self.now() >= verify_deadline || release_cap_passed(self) {
+                    return Err(ArmDriverError::Transport(TransportError::Timeout));
+                }
+                return Ok(CarryoverMotorClearOutcome::Cleared);
+            }
+            if !polled_refresh && (!blocking || self.now() >= refresh_after) {
+                let mut sent_poll = false;
+                for idx in 0..n {
+                    if (affected_mask & (1u64 << idx)) == 0
+                        || self.last_feedback_seq[idx] > tx_boundary_seq[idx]
+                    {
+                        continue;
+                    }
+                    tx_boundary_seq[idx] = self.rx_seq;
+                    match self.send_with_commissioning_gate(
+                        TxKind::Refresh,
+                        Some(start_stamp),
+                        verify_dl,
+                        pre_tx_gate,
+                        |d| Some(damiao::build_refresh_frame(d.motor_ids[idx])),
+                    ) {
+                        Ok(_) => sent_poll = true,
+                        Err(Ok(code)) => return Ok(CarryoverMotorClearOutcome::Revoked(code)),
+                        Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                            return Err(ArmDriverError::EstopInhibited);
+                        }
+                        Err(Err(_)) => break,
+                    }
+                }
+                polled_refresh = true;
+                if sent_poll {
+                    self.pending_stop_check(Some(start_stamp))?;
+                    if !self.flush_cutoff_exceeded() && self.now() < verify_deadline {
+                        let _ = self.can.flush();
+                    }
+                    continue;
+                }
+            }
+            if blocking {
+                self.pause(Duration::from_micros(500));
+            } else if drained_empty && polled_refresh {
+                // Under a mock clock on the non-blocking RT path no background hardware thread
+                // will inject replies while spinning; exit bounded instead of busy-looping.
+                if self.clock.is_some() {
+                    return Ok(CarryoverMotorClearOutcome::Unconfirmed {
+                        joint: first_unconfirmed.unwrap_or(0),
+                    });
+                }
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -18774,7 +19471,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.defer_disable_shadow = false;
         }
         if sent_any {
-            if let Err(e) = self.can.flush() {
+            if let Err(e) = self.flush_can_and_commit() {
                 tracing::warn!("Panic disable CAN flush failed: {e}");
                 for i in newly_armed {
                     self.panic_disable_tx_boundary[i] = None;
@@ -19183,6 +19880,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if sent_any {
                     if self.flush_cutoff_exceeded() {
                         self.mark_tx_pass_backpressured();
+                        self.discard_staged_ctrl_tx();
                         self.last_hold_tx_sent_any = false;
                         self.last_hold_tx_due_mask = due_mask;
                         self.last_hold_tx_sent_mask = 0;
@@ -19191,7 +19889,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         });
                         return Err(TransportError::Timeout.into());
                     }
-                    if let Err(e) = self.can.flush() {
+                    if let Err(e) = self.flush_can_and_commit() {
                         self.mark_tx_pass_backpressured();
                         self.last_hold_tx_sent_any = false;
                         if self.pending_stop_check(Some(start_stamp)).is_err() {
@@ -19310,6 +20008,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
 
             let _ = self.ensure_tx_pass();
+            self.discard_staged_ctrl_tx();
             let mut sent_any = false;
             let mut sent_slot_mask: u64 = 0;
             let mut sent_order = [(0usize, 0usize); MAX_MODE_JOINTS * 2];
@@ -19467,13 +20166,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if sent_any {
                     if self.flush_cutoff_exceeded() {
                         self.mark_tx_pass_backpressured();
+                        self.discard_staged_ctrl_tx();
                         self.discard_pending_hold_tx();
                         self.last_hold_tx_sent_any = false;
                         self.last_hold_tx_due_mask = due_mask;
                         self.last_hold_tx_sent_mask = 0;
                         return Err(TransportError::Timeout.into());
                     }
-                    if let Err(e) = self.can.flush() {
+                    if let Err(e) = self.flush_can_and_commit() {
                         self.mark_tx_pass_backpressured();
                         self.discard_pending_hold_tx();
                         self.last_hold_tx_sent_any = false;
@@ -19547,6 +20247,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             })()
         };
+        if arm_res.is_err() {
+            self.discard_staged_ctrl_tx();
+        }
 
         // When attached to `SupervisorInner` (`external_pos_force_emitter == true`), the tick
         // epilogue invokes `emit_pos_force_j7` once per tick after every arm path. Direct driver
@@ -19926,13 +20629,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if sent_any {
                     if self.flush_cutoff_exceeded() {
                         self.mark_tx_pass_backpressured();
+                        self.discard_staged_ctrl_tx();
                         self.last_hold_tx_sent_any = false;
                         self.last_hold_tx_due_mask = due_mask;
                         self.last_hold_tx_sent_mask = 0;
                         self.trip_fence(MitFenceTripReason::FlushFailed { kind: TxFailKind::Timeout });
                         return Err(TransportError::Timeout.into());
                     }
-                    if let Err(e) = self.can.flush() {
+                    if let Err(e) = self.flush_can_and_commit() {
                         self.mark_tx_pass_backpressured();
                         self.last_hold_tx_sent_any = false;
                         if self.pending_stop_check(Some(start_stamp)).is_err() {
@@ -20045,6 +20749,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
 
                 let _ = self.ensure_tx_pass();
+                self.discard_staged_ctrl_tx();
                 let mut sent_any = false;
                 let mut sent_mask = 0u64;
                 let mut sent_slot_mask = 0u64;
@@ -20198,13 +20903,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if sent_any {
                     if self.flush_cutoff_exceeded() {
                         self.mark_tx_pass_backpressured();
+                        self.discard_staged_ctrl_tx();
                         self.discard_pending_hold_tx();
                         self.last_hold_tx_sent_any = false;
                         self.last_hold_tx_due_mask = due_mask;
                         self.last_hold_tx_sent_mask = 0;
                         return Err(TransportError::Timeout.into());
                     }
-                    if let Err(e) = self.can.flush() {
+                    if let Err(e) = self.flush_can_and_commit() {
                         self.mark_tx_pass_backpressured();
                         self.discard_pending_hold_tx();
                         self.last_hold_tx_sent_any = false;
@@ -20290,6 +20996,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 Ok(())
             })()
         };
+        if arm_res.is_err() {
+            self.discard_staged_ctrl_tx();
+        }
 
         // When attached to `SupervisorInner` (`external_pos_force_emitter == true`), the tick
         // epilogue invokes `emit_pos_force_j7` once per tick after every arm path. Standalone
@@ -20637,20 +21346,23 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                 }
                 if self.strict_stop_check(Some(start_stamp)).is_err() {
+                    self.discard_staged_ctrl_tx();
                     self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
                     return Err(ArmDriverError::EstopInhibited);
                 }
                 if self.is_lease_fenced(batch_lease_gen) {
+                    self.discard_staged_ctrl_tx();
                     return Err(ArmDriverError::LeaseFenced);
                 }
                 if self.flush_cutoff_exceeded() {
                     self.mark_tx_pass_backpressured();
+                    self.discard_staged_ctrl_tx();
                     self.trip_fence(MitFenceTripReason::FlushFailed {
                         kind: TxFailKind::Timeout,
                     });
                     return Err(TransportError::Timeout.into());
                 }
-                if let Err(e) = self.can.flush() {
+                if let Err(e) = self.flush_can_and_commit() {
                     self.mark_tx_pass_backpressured();
                     if self.strict_stop_check(Some(start_stamp)).is_err() {
                         self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
@@ -20898,6 +21610,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
         self.tx_release_deadline = deadline;
+        if deadline.is_none() {
+            self.output_step_pending_in_release = false;
+        }
     }
 
     fn tx_frame_max_age(&self) -> Duration {
@@ -21534,10 +22249,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     fn receive_feedback(&mut self) -> Result<(), ArmDriverError> {
         // Every hardware receive pass opens a fresh per-tick TX budget window unless we are inside
-        // `poll_torque_inner`, which already opened the single TX pass for this release so urgent
-        // holds and handshake TX share one release TX budget.
+        // `poll_torque_inner` or already opened the single TX pass for the current managed control
+        // release, so transition polls, RX recovery/refresh, and Step 5 output share one budget.
         if !self.in_poll_torque {
-            self.begin_tx_tick();
+            self.ensure_release_tx_tick();
         }
         let max_frames = self.remaining_rx_frame_limit();
         let t0 = self.now();
@@ -21620,6 +22335,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Err(e) => return Err(e),
             }
         }
+        let managed_recovery_cap = self.in_active_control_release();
+        // When a managed release already runs Step 5 normal output every tick without joint
+        // tracking (`!self.strict_mode_handover`), or is actively running Step 5 stopped/measured
+        // holds (`self.last_output_was_hold`), Step 5 will immediately emit a fresh control/hold
+        // frame to every eligible joint in this release (and end-of-release watchdog fallback
+        // covers any deferred/absent motor). Skip redundant Step-2 recovery holds here so no motor
+        // receives duplicate control frames in the same release.
+        let skip_redundant_step2_recovery = managed_recovery_cap
+            && self.output_ran_since_rx
+            && (!self.strict_mode_handover || self.last_output_was_hold);
         if rx_drained
             && self.is_enabled
             && !self.is_enabling
@@ -21631,9 +22356,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.recovery_tx_allowed()
             && self.is_feedback_valid()
             && !(self.output_ran_since_rx && self.has_class1_transition_pending())
+            && !skip_redundant_step2_recovery
+            && (!managed_recovery_cap || self.has_optional_release_budget())
         {
+            self.discard_staged_ctrl_tx();
+            let mut any_recovery_sent = false;
+            let mut recovery_flush_aborted = false;
             let n = self.motor_ids.len();
-            for i in 0..n {
+            let start = if managed_recovery_cap && n > 0 {
+                self.recovery_cursor % n
+            } else {
+                0
+            };
+            for offset in 0..n {
+                if managed_recovery_cap
+                    && (self.release_recovery_tx_count >= DAMIAO_MAX_RECOVERY_PER_RELEASE
+                        || !self.has_optional_release_budget())
+                {
+                    break;
+                }
+                let i = (start + offset) % n;
+                if managed_recovery_cap && i < MAX_MODE_JOINTS && (self.release_ctrl_tx_mask & (1u32 << i)) != 0 {
+                    continue;
+                }
                 if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
                     continue;
                 }
@@ -21732,18 +22477,30 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     Err(TxRefusal::Deferred) => break,
                     Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
                         self.discard_pending_tx_stopped();
+                        recovery_flush_aborted = true;
                         break;
                     }
                     Err(TxRefusal::BuildRefused | TxRefusal::PosForceFeedbackExpired(_)) => continue,
                     Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
                         if self.strict_stop_check(Some(rx_stop_stamp)).is_err() {
                             self.discard_pending_tx_stopped();
+                            recovery_flush_aborted = true;
                         }
+                        break;
+                    }
+                    Err(TxRefusal::Transport(_)) => {
+                        self.mark_tx_pass_backpressured();
+                        recovery_flush_aborted = true;
                         break;
                     }
                     Err(_) => false,
                 };
                 if recovery_sent {
+                    any_recovery_sent = true;
+                    self.release_recovery_tx_count = self.release_recovery_tx_count.saturating_add(1);
+                    if n > 0 {
+                        self.recovery_cursor = (i + 1) % n;
+                    }
                     self.discard_pending_tx_stopped();
                     if !self.recovery_written_joints.contains(&i) {
                         self.recovery_written_joints.push(i);
@@ -21751,8 +22508,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 if self.strict_stop_check(Some(rx_stop_stamp)).is_err() {
                     self.discard_pending_tx_stopped();
+                    recovery_flush_aborted = true;
                     break;
                 }
+            }
+            if any_recovery_sent && !self.can.flush_is_noop() {
+                if recovery_flush_aborted
+                    || self.flush_cutoff_exceeded()
+                    || self.strict_stop_check(Some(rx_stop_stamp)).is_err()
+                {
+                    self.discard_staged_ctrl_tx();
+                } else {
+                    let _ = self.flush_can_and_commit();
+                }
+            } else if recovery_flush_aborted {
+                self.discard_staged_ctrl_tx();
             }
         }
         self.output_ran_since_rx = false;
@@ -22232,7 +23002,10 @@ mod pos_force_emitter {
             && driver.poll_tx_allowed()
             && driver.can_start_tick_tx()
         {
-            let _ = driver.try_send_pf_refresh(start_stamp)?;
+            if let Err(e) = driver.try_send_pf_refresh(start_stamp) {
+                driver.discard_staged_ctrl_tx();
+                return Err(e);
+            }
         }
 
         let stop_check = |d: &DamiaoArmDriver<C>| {
@@ -22243,13 +23016,15 @@ mod pos_force_emitter {
             }
         };
         if stop_check(driver).is_err() {
+            driver.discard_staged_ctrl_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
         if driver.flush_cutoff_exceeded() {
             driver.mark_tx_pass_backpressured();
+            driver.discard_staged_ctrl_tx();
             return Err(TransportError::Timeout.into());
         }
-        if let Err(e) = driver.can.flush() {
+        if let Err(e) = driver.flush_can_and_commit() {
             driver.mark_tx_pass_backpressured();
             if stop_check(driver).is_err() {
                 return Err(ArmDriverError::EstopInhibited);
@@ -22257,6 +23032,7 @@ mod pos_force_emitter {
             return Err(e.into());
         }
         if stop_check(driver).is_err() {
+            driver.discard_staged_ctrl_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
 
@@ -23280,6 +24056,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
             };
             crate::diagnostics::tick::record_tx_attempt(kind, wall_ns, cpu_ns);
+            if res.is_ok() {
+                crate::diagnostics::tick::record_tx_frame_kind(
+                    crate::diagnostics::tick::TxFrameKind::Hold,
+                );
+            }
             res?;
             if is_stale {
                 stale_mask |= 1u64 << i;
@@ -23368,6 +24149,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
             };
             crate::diagnostics::tick::record_tx_attempt(kind, wall_ns, cpu_ns);
+            if res.is_ok() {
+                crate::diagnostics::tick::record_tx_frame_kind(
+                    crate::diagnostics::tick::TxFrameKind::Normal,
+                );
+            }
             res?;
             let (write_done_rx_clock, write_done_offset_ns) =
                 self.capture_rx_clock_sample(write_done);
