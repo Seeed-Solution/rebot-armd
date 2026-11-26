@@ -5,34 +5,47 @@
 #[allow(unused_imports)]
 use super::*;
 use super::dispatch::{
-    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
-    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, ExecutorWsRoute,
+    FrameKind, LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
+use crate::api::routes::{FaultAvailability, RouteOwnership};
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::Servo),
         handler: DispatchHandler::Owner(dispatch_servo_frame),
+        handler_name: "ws::servo::dispatch_servo_frame",
         admission: AdmissionClass::OrdinaryServo,
         lease: LeaseRequirement::RequiredExplicitGeneration,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::ServoRejectOnly,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Servo,
     },
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::ImplicitServo),
         handler: DispatchHandler::Owner(dispatch_servo_frame),
+        handler_name: "ws::servo::dispatch_servo_frame",
         admission: AdmissionClass::OrdinaryServo,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::ServoRejectOnly,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Servo,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/motion/servo"),
         handler: DispatchHandler::Owner(dispatch_servo_command),
+        handler_name: "ws::servo::dispatch_servo_command",
         admission: AdmissionClass::OrdinaryServo,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::CommandImmediate,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Servo,
     },
 ];
 

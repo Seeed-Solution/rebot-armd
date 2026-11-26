@@ -7,9 +7,10 @@ use std::time::Instant;
 #[allow(unused_imports)]
 use super::*;
 use super::dispatch::{
-    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
-    LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, ExecutorWsRoute,
+    FrameKind, LeaseRequirement, OwnerDispatchCtx, OwnerReply, ReplyPolicy,
 };
+use crate::api::routes::{FaultAvailability, RouteOwnership};
 use crate::rt_core::requests::motion as req;
 
 const MAX_START_DRIFT_RETRIES: usize = 5;
@@ -18,42 +19,62 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::Preset),
         handler: DispatchHandler::Owner(dispatch_preset),
+        handler_name: "ws::motion::dispatch_preset",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::PresetReply,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Motion,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/motion/jog"),
         handler: DispatchHandler::Owner(dispatch_motion_command),
+        handler_name: "ws::motion::dispatch_motion_command",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::CommandDeferred,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Motion,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/motion/home"),
         handler: DispatchHandler::Owner(dispatch_motion_command),
+        handler_name: "ws::motion::dispatch_motion_command",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::CommandDeferred,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Motion,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/motion/unload"),
         handler: DispatchHandler::Owner(dispatch_motion_command),
+        handler_name: "ws::motion::dispatch_motion_command",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
         reply: ReplyPolicy::CommandDeferred,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::Motion,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/mode/gravity_comp"),
         handler: DispatchHandler::Owner(dispatch_motion_command),
+        handler_name: "ws::motion::dispatch_motion_command",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandImmediate,
+        ownership: RouteOwnership::ExecutorRequest,
+        fault: FaultAvailability::Fenced,
+        executor_route: ExecutorWsRoute::ConfigOrCalib,
     },
 ];
 
