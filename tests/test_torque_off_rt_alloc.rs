@@ -2035,7 +2035,8 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
 
     // 4. Hard-RT teardown proof: dropping BOTH `ShadowDriverStaging` and `ShadowRuntime` on
     //    `armd-control` (`ControlThreadGuard`) AND running `record_post_panic_disable_shadow`
-    //    on `armd-control` MUST perform strictly (0, 0) heap ops and NEVER touch the driver mutex!
+    //    on `armd-control` with BOTH `DriverSlot::Exclusive` and `DriverSlot::Legacy` MUST
+    //    perform strictly (0, 0) heap ops and NEVER touch the driver mutex!
     let (td_rt, td_hub) = armd::torque::shadow::ShadowRuntime::new_with_hub(
         &ArmConfig::rebot_dm(),
         true,
@@ -2056,6 +2057,110 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
         "armd-control teardown dropping ShadowDriverStaging and ShadowRuntime must perform (0, 0) heap ops"
     );
     td_hub.stop_and_flush_bounded(Duration::from_secs(1));
+
+    // 4a. Direct `record_post_panic_disable_shadow` on `armd-control` with `DriverSlot::Exclusive`:
+    //     must drain driver staging lock-free with (0, 0) allocs/frees and 0 driver lock attempts.
+    {
+        let td_clock = Arc::new(MockClock::new());
+        let td_bus = ZeroAllocBus::new(td_clock.clone());
+        let mut td_cfg = ArmConfig::rebot_dm();
+        td_cfg.torque_shadow_enabled = true;
+        let td_limits: Vec<DamiaoLimits> = td_cfg
+            .damiao_ranges
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect();
+        let mut td_drv = DamiaoArmDriver::new(td_bus.clone(), (1..=7).collect())
+            .with_joint_limits(td_limits)
+            .unwrap();
+        td_drv.set_rt_mode(true);
+        let mut ex_inner = SupervisorInner::new(td_cfg).with_driver(Box::new(td_drv));
+        ex_inner.test_into_exclusive_driver().unwrap();
+        td_bus.with(|s| s.push_all_feedback());
+        let _ = ex_inner.tick_control(0.02);
+        let locks_before = ex_inner.test_driver_lock_attempts();
+        let (_, a_ex, f_ex) = counted(|| {
+            let _rt_guard = armd::rt_core::executor::ControlThreadGuard::enter();
+            ex_inner.test_record_post_panic_disable_shadow(
+                true,
+                &armd::supervisor::PanicDisableOutcome::Confirmed,
+            );
+        });
+        assert_eq!(
+            (a_ex, f_ex),
+            (0, 0),
+            "record_post_panic_disable_shadow(Exclusive) on armd-control must perform (0, 0) heap ops"
+        );
+        assert_eq!(
+            ex_inner.test_driver_lock_attempts(),
+            locks_before,
+            "record_post_panic_disable_shadow(Exclusive) must perform 0 driver mutex lock attempts"
+        );
+        ex_inner.test_flush_and_drain_torque_shadow();
+        let ex_diag = ex_inner.torque_shadow_diagnostics();
+        assert!(ex_diag.events_processed > 0);
+        assert!(
+            !ex_diag.ring.interval_unverifiable,
+            "exclusive drain on armd-control should not latch staging loss: {ex_diag:?}"
+        );
+    }
+
+    // 4b. Direct `record_post_panic_disable_shadow` on `armd-control` with `DriverSlot::Legacy`
+    //     (both normal and under SPSC ring saturation): MUST perform (0, 0) heap ops, 0 driver
+    //     mutex lock attempts, and latch `interval_unverifiable` via external staging loss!
+    for saturate_ring in [false, true] {
+        let td_clock = Arc::new(MockClock::new());
+        let td_bus = ZeroAllocBus::new(td_clock.clone());
+        let mut td_cfg = ArmConfig::rebot_dm();
+        td_cfg.torque_shadow_enabled = true;
+        let td_limits: Vec<DamiaoLimits> = td_cfg
+            .damiao_ranges
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect();
+        let td_drv = DamiaoArmDriver::new(td_bus.clone(), (1..=7).collect())
+            .with_joint_limits(td_limits)
+            .unwrap();
+        let mut leg_inner = SupervisorInner::new(td_cfg).with_driver(Box::new(td_drv));
+        if saturate_ring {
+            for _ in 0..(armd::torque::shadow::SHADOW_RING_CAPACITY + 16) {
+                td_clock.advance(Duration::from_millis(2));
+                leg_inner.tick_control(0.002);
+            }
+        }
+        let locks_before = leg_inner.test_driver_lock_attempts();
+        let (_, a_leg, f_leg) = counted(|| {
+            let _rt_guard = armd::rt_core::executor::ControlThreadGuard::enter();
+            leg_inner.test_record_post_panic_disable_shadow(
+                true,
+                &armd::supervisor::PanicDisableOutcome::Confirmed,
+            );
+        });
+        assert_eq!(
+            (a_leg, f_leg),
+            (0, 0),
+            "record_post_panic_disable_shadow(Legacy, sat={saturate_ring}) on armd-control must perform (0, 0) heap ops"
+        );
+        assert_eq!(
+            leg_inner.test_driver_lock_attempts(),
+            locks_before,
+            "record_post_panic_disable_shadow(Legacy, sat={saturate_ring}) must perform 0 driver lock attempts on armd-control"
+        );
+        leg_inner.test_flush_and_drain_torque_shadow();
+        let leg_diag = leg_inner.torque_shadow_diagnostics();
+        assert!(
+            leg_diag.ring.interval_unverifiable,
+            "legacy RT teardown must latch interval_unverifiable (sat={saturate_ring}): {leg_diag:?}"
+        );
+        assert!(
+            leg_diag.ring.staging_dropped_records >= 1,
+            "legacy RT teardown must record staging loss (sat={saturate_ring}): {leg_diag:?}"
+        );
+    }
 }
 
 #[test]

@@ -7159,6 +7159,52 @@ impl SupervisorInner {
         self.flush_torque_shadow();
     }
 
+    /// Test-only entrypoint invoking `record_post_panic_disable_shadow` directly (for hard-RT
+    /// alloc/lock proofs on `armd-control`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_record_post_panic_disable_shadow(
+        &mut self,
+        is_caught_panic: bool,
+        outcome: &crate::supervisor::PanicDisableOutcome,
+    ) {
+        self.record_post_panic_disable_shadow(is_caught_panic, outcome);
+    }
+
+    /// Test-only conversion of `SupervisorInner`'s mounted `DriverSlot::Legacy` into
+    /// `DriverSlot::Exclusive` (for hard-RT teardown proofs without spawning the executor thread).
+    #[doc(hidden)]
+    pub fn test_into_exclusive_driver(&mut self) -> Result<(), &'static str> {
+        if let Some(slot) = self.driver.take() {
+            match slot.into_exclusive() {
+                Ok(ex) => {
+                    self.driver = Some(ex);
+                    Ok(())
+                }
+                Err((orig, reason)) => {
+                    self.driver = Some(orig);
+                    Err(reason)
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Test-only read of the `DriverSlot` mutex lock-attempt counter on `SupervisorInner`.
+    #[doc(hidden)]
+    pub fn test_driver_lock_attempts(&self) -> u64 {
+        self.driver_lock_attempts.load(Ordering::Acquire)
+    }
+
+    /// Test-only setter for torque shadow owner attribution (mirrors `handoff_to_executor`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn test_set_torque_shadow_owner(&mut self, owner: crate::torque::shadow::ShadowOwner) {
+        self.flush_torque_shadow();
+        self.torque_shadow.set_owner(owner);
+    }
+
     /// Read current torque shadow diagnostics from `SupervisorInner`'s paired hub.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {

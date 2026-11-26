@@ -2805,6 +2805,20 @@ impl<O: CoreOps> ReleaseFixture<O> {
         self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
         report
     }
+
+    /// Test helper: explicitly run one Window-2 sub-release transition wake at an arbitrary
+    /// deterministic clock instant (used to reproduce sub-release repeat-disable wake timing).
+    #[doc(hidden)]
+    pub fn service_wake_at_clock(
+        &mut self,
+        now_fn: impl FnMut() -> Instant,
+        release_deadline: Instant,
+        report: &mut ReleaseReport,
+    ) -> bool {
+        let next_gen = self.engine.releases();
+        self.engine
+            .service_wake_with_clock(&mut self.core, now_fn, release_deadline, next_gen, report)
+    }
 }
 
 impl<O: CoreOps + ConfigAuthority> ReleaseFixture<O> {
