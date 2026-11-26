@@ -12894,6 +12894,30 @@ impl SupervisorInner {
     }
 }
 
+/// RAII owner of one reserved P-F1 session terminal credit: released on drop unless ownership
+/// was transferred to an admitted session (which then emits or abandons it through the router).
+#[cfg(not(target_arch = "wasm32"))]
+struct TerminalCreditGuard {
+    handle: crate::rt_core::executor::RtExecutorHandle,
+    ticket: Option<crate::rt_core::reply_router::SessionTerminalTicket>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TerminalCreditGuard {
+    fn transfer_to_session(&mut self) {
+        self.ticket = None;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for TerminalCreditGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticket.take() {
+            let _ = self.handle.release_session_terminal(&t);
+        }
+    }
+}
+
 /// Allocates a collision-free `ActionId` for a router-bound `ModeSwitch` session terminal
 /// (session-request namespace bit set, never equal to a broker `ActionId`).
 #[cfg(not(target_arch = "wasm32"))]
@@ -16677,7 +16701,7 @@ impl ArmSupervisor {
                     next_mode_switch_terminal_action_id(),
                     ExternalDestinationPolicy::ConnectionOnly,
                 ) {
-                    Ok(t) => Some(t),
+                    Ok(t) => Some(TerminalCreditGuard { handle: h.clone(), ticket: Some(t) }),
                     Err(ExternalSubmitError::Admit(crate::rt_core::broker::AdmitError::RepliesFull)) => {
                         return Err(ConfigError::Busy("REPLIES_FULL"));
                     }
@@ -16687,17 +16711,22 @@ impl ArmSupervisor {
             }
             _ => None,
         };
+        // Major M2 (R6): the guard releases the credit on rejection AND when this future is
+        // dropped (e.g. cancelled during the queue-full backoff); only an admitted session takes
+        // ownership of it.
+        let mut terminal = terminal;
+        let ticket = terminal.as_ref().and_then(|g| g.ticket);
         let res = match self
-            .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(req, terminal))
+            .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(req, ticket))
             .await
         {
             Ok(ConfigReply::ModeSwitchStarted(res)) => res,
             Ok(_) => Err(ConfigError::OwnerStopped),
             Err(e) => Err(e),
         };
-        if res.is_err() {
-            if let (Some(h), Some(t)) = (handle.as_ref(), terminal.as_ref()) {
-                let _ = h.release_session_terminal(t);
+        if res.is_ok() {
+            if let Some(g) = terminal.as_mut() {
+                g.transfer_to_session();
             }
         }
         res

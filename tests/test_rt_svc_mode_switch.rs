@@ -2382,3 +2382,99 @@ async fn infeasible_watchdog_gap_is_rejected_at_admission() {
         "{err:?}"
     );
 }
+
+/// Round 6 M2: the reserved terminal credit is released when the start is cancelled after the
+/// reservation, when the owner rejects the start, when the caller's connection closes, and on
+/// executor handback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mode_switch_terminal_credit_released_on_cancel_reject_close_and_handback() {
+    use armd::rt_core::broker::{DeliveryDecision, Reply};
+    use std::future::Future;
+    let mut h = OwnerHarness::start(OwnerKind::Executor, true, 0, false, false).await;
+    let exec = h.exec.take().unwrap();
+    let open_sink = |id: u64| {
+        exec.open_connection_sync(id).unwrap().unwrap();
+        let sink = Arc::new(|_c: ClientId, _r: Reply| DeliveryDecision::Delivered);
+        exec.register_connection_reply_sink(ClientId(id), sink, Some(4)).unwrap()
+    };
+    let _tok1 = open_sink(708);
+    // J7 never answers: the first session stays pending and holds its credit.
+    h.bus.with(|s| s.motors[6].silent = true);
+    let mut plan = ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap();
+    plan.per_axis_timeout = Duration::from_secs(3);
+    let req = |client: u64| ModeSwitchStartRequest {
+        plan,
+        admission: h.sup.capture_admission_stamp(),
+        operator_required: false,
+        operator_grant: OperatorGrant::unenforced(),
+        deadline: Instant::now() + Duration::from_secs(4),
+        client: ClientId(client),
+    };
+    let sid1 = h.sup.start_mode_switch_session(req(708)).await.unwrap();
+    assert_eq!(exec.router_global_reserved(), 1);
+
+    // Rejection: the owner refuses a second session (Busy); its credit is released.
+    let rej = h.sup.start_mode_switch_session(req(708)).await;
+    assert!(matches!(rej, Err(ConfigError::Busy(_))), "{rej:?}");
+    assert_eq!(exec.router_global_reserved(), 1, "rejected start must release its credit");
+
+    // Cancellation: drop the start future after it reserved its credit, before the owner reply.
+    {
+        let fut = h.sup.start_mode_switch_session(req(708));
+        let mut fut = std::pin::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut reserved = false;
+        for _ in 0..10_000 {
+            if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+                panic!("start completed before cancellation: {r:?}");
+            }
+            if exec.router_global_reserved() == 2 {
+                reserved = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(reserved, "start must reserve before awaiting the owner");
+    }
+    let dl = Instant::now() + Duration::from_secs(1);
+    while exec.router_global_reserved() != 1 {
+        assert!(Instant::now() < dl, "cancelled start leaked its credit: {}", exec.router_global_reserved());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Connection close: the bound session's credit is recovered when its client disconnects.
+    exec.disconnect_client(ClientId(708));
+    let dl = Instant::now() + Duration::from_secs(1);
+    while exec.router_global_reserved() != 0 {
+        assert!(Instant::now() < dl, "closed connection leaked its credit");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = h.sup.cancel_mode_switch_session(sid1, "CANCELLED").await;
+    let dl = Instant::now() + Duration::from_secs(1);
+    while !h.sup.clear_mode_switch_session(sid1).await.unwrap_or(false) {
+        if h.sup.poll_mode_switch_session(sid1).await.ok().flatten().is_none() {
+            break;
+        }
+        assert!(Instant::now() < dl);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Handback: a pending bound session's credit is recovered when the executor stops.
+    let _tok2 = open_sink(709);
+    let dl = Instant::now() + Duration::from_secs(2);
+    let _sid2 = loop {
+        match h.sup.start_mode_switch_session(req(709)).await {
+            Ok(s) => break s,
+            Err(ConfigError::Busy(_)) => {
+                assert!(Instant::now() < dl);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    assert_eq!(exec.router_global_reserved(), 1);
+    exec.stop_and_join();
+    assert_eq!(exec.router_global_reserved(), 0, "handback must recover the credit");
+    h.shutdown(false).await;
+}
