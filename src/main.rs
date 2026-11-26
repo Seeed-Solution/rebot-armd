@@ -239,9 +239,7 @@ fn read_app_config_armd_owner_from_path(path: &std::path::Path) -> Option<String
         .and_then(|arm| arm.get("armd_owner"))
         .filter(|v| !v.is_null())
         .or_else(|| parsed.get("armd_owner").filter(|v| !v.is_null()));
-    let Some(val) = owner_val else {
-        return None;
-    };
+    let val = owner_val?;
     let Some(s) = val.as_str() else {
         warn!(
             "Ignoring non-string arm.armd_owner in {} (use 'auto', 'legacy', or 'executor'); defaulting to auto",
