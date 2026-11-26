@@ -1576,7 +1576,7 @@ body::before {
 
   /* top: floating status island instead of a header bar */
   body.ui-simple .topbar {
-    position: fixed; z-index: 200; top: 8px; left: 50%; transform: translateX(-50%); width: auto; height: 34px;
+    position: fixed; z-index: 200; top: 8px; left: 50%; transform: translateX(-50%); width: auto; max-width: calc(100vw - 16px); height: 34px;
     padding-left: 6px; padding-right: 6px;
     padding: 0 6px; gap: 8px; border-radius: 17px;
     background: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.45); box-shadow: 0 4px 16px rgba(0,0,0,0.15);
@@ -1880,6 +1880,40 @@ body.controls-unavailable .grip-slider input[type=range]::-moz-range-thumb { bor
 .ui-mode-btn svg { width: 16px; height: 16px; flex: none; }
 .ui-mode-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 body.ui-simple .ui-mode-btn { margin: 0; }
+@media (max-width: 639px) {
+  .ui-mode-btn { margin: 0; }
+}
+/* phones (360-479 px): compact the mode button, icon controls and operator pill so the header fits inside the viewport
+   in en/zh and simple/expert without pushing #btn-lang off-screen; wrap only as a safety net for extra badges */
+@media (max-width: 479px) {
+  body:not(.is-fs):not(.is-hud) .topbar {
+    gap: 4px; row-gap: 4px; padding: 6px 8px;
+    padding-left: max(8px, env(safe-area-inset-left));
+    padding-right: max(8px, env(safe-area-inset-right));
+    height: auto; min-height: var(--head-h); flex-wrap: wrap;
+  }
+  .ui-mode-btn { height: 32px; padding: 0 9px; gap: 4px; font-size: 12px; }
+  .ui-mode-btn svg { width: 15px; height: 15px; }
+  .speed-pill { width: 46px; height: 26px; font-size: 11px; }
+  .fs-btn, .hd-btn { width: 30px; height: 32px; }
+  .fs-btn svg, .hd-btn svg { width: 16px; height: 16px; }
+  .op-btn { height: 30px; min-width: 30px; padding: 0; gap: 0; justify-content: center; }
+  .op-btn .op-lbl { display: none; }
+  .lang-btn { height: 32px; min-width: 30px; padding: 0 6px; font-size: 11px; }
+}
+@media (max-width: 379px) {
+  body:not(.is-fs):not(.is-hud) .topbar {
+    gap: 3px; row-gap: 4px; padding: 6px;
+    padding-left: max(6px, env(safe-area-inset-left));
+    padding-right: max(6px, env(safe-area-inset-right));
+  }
+  .ui-mode-btn { height: 30px; padding: 0 8px; font-size: 11px; }
+  .ui-mode-btn svg { width: 14px; height: 14px; }
+  .speed-pill { width: 44px; height: 26px; font-size: 11px; }
+  .fs-btn, .hd-btn { width: 28px; height: 30px; }
+  .op-btn { height: 28px; min-width: 28px; }
+  .lang-btn { height: 30px; min-width: 28px; padding: 0 5px; font-size: 11px; }
+}
 body.ui-simple #det-ctl, body.ui-simple.vis-open #det-ctl:not([hidden]) { display: none !important; }
 body.ui-simple #det-chip { display: none !important; }
 body.ui-simple #cam-chip.is-ok { display: none; }
