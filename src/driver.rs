@@ -19431,7 +19431,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(ArmDriverError::Protocol("non-blocking CAN RX unsupported".into()));
         }
         // PR2-LEDGER: cap by remaining release RX budget and route through single convergence point.
-        let limit = usize::from(self.remaining_release_rx_budget(max_frames.min(64)));
+        let limit = usize::from(
+            max_frames.min(self.remaining_release_rx_budget(crate::rt_core::ops::RX_FRAME_BUDGET)),
+        );
         let mut frames = 0u16;
         let mut drained = false;
         self.last_read_drained = false;

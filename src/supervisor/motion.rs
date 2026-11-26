@@ -1950,7 +1950,11 @@ impl SupervisorInner {
             return false;
         }
         if self.gravity_comp.is_some() {
-            self.exit_gravity_comp("STOPPED", "Stop command");
+            if self.rt_executor_owned {
+                self.exit_gravity_comp_rt("STOPPED", "Stop command");
+            } else {
+                self.exit_gravity_comp("STOPPED", "Stop command");
+            }
         }
         let disable_in_flight = self.park_disable_in_flight();
         let running_park_id = self

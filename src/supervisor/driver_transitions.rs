@@ -9932,6 +9932,25 @@ impl SupervisorInner {
         if let Some(hook) = self.before_estop_unlatch_hook.take() {
             hook();
         }
+        if was_mit_lost {
+            // Only after full clear_with_check passed: release MIT lost ownership and acknowledge
+            // the driver MIT fence BEFORE any E-stop-latch early return so a cleared MIT fault
+            // never re-latches `MIT_LOST` over `SafetyState::EStop` on the next control tick.
+            self.mit.owner = crate::mit::MitOwner::Off;
+            self.mit.joints.clear();
+            self.mit.last_ff.clear();
+            self.mit.last_output = None;
+            self.mit.armed_ok = false;
+            self.mit.revoke_pending = false;
+            self.mit.recovery_confirmed = false;
+            if let Some(ref mut d) = self.driver {
+                if self.rt_executor_owned {
+                    let _ = d.try_with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                } else {
+                    let _ = d.with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                }
+            }
+        }
         if !was_estop {
             // Clearing a non-E-stop fault must never overwrite a prior or concurrent E-stop latch.
             if self.consume_pending_estop() || self.estop_state.is_latched() {
@@ -9969,15 +9988,6 @@ impl SupervisorInner {
                     self.last_motion_frame = Instant::now();
                     return Ok(self.safety.state().clone());
                 }
-            }
-        }
-        if was_mit_lost {
-            // Only after full clear passed: release MIT lost ownership and allow read-only polls.
-            self.mit.owner = crate::mit::MitOwner::Off;
-            self.mit.joints.clear();
-            self.mit.armed_ok = false;
-            if let Some(ref mut d) = self.driver {
-                let _ = d.with_mut(|drv| drv.acknowledge_mit_fence_trip());
             }
         }
         // If a valid lease was acquired while E-stop was latched, its servo stream could not be
