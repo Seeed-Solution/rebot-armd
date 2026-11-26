@@ -3279,6 +3279,8 @@ pub mod targets {
             }
             if self.lease_enabled && frame.authority.lease_generation == 0 { return Err(Refusal::code("NO_LEASE")); }
             if self.core.motion_inhibited_by_config() { return Err(Refusal::code("CONFIG_BUSY")); }
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.sessions.blocks_ordinary_output(None) { return Err(Refusal::code("MOTION_BUSY")); }
             if policy { return self.consume_policy_target(frame, ctx.now); }
             if self.calibration_busy { return Err(Refusal::code("CALIBRATION_BUSY")); }
             self.sync_stop_generation(ctx.stop_generation);

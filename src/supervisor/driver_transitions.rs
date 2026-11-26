@@ -3792,6 +3792,14 @@ impl SupervisorInner {
 
     /// Zero-allocation RT preflight for torque enable (all refusal paths return static codes).
     fn enable_prepare_rt_precheck(&self) -> Result<(), &'static str> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if (self.calibration_busy && self.motor_zero_busy)
+            || self.commissioning.is_active()
+            || self.sessions.blocks_ordinary_output(None)
+        {
+            return Err("MOTION_BUSY");
+        }
+        #[cfg(target_arch = "wasm32")]
         if (self.calibration_busy && self.motor_zero_busy) || self.commissioning.is_active() {
             return Err("MOTION_BUSY");
         }

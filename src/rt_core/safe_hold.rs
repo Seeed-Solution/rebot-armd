@@ -36,6 +36,7 @@ pub enum SafeHoldReason {
     TeardownWhileEnergized = 2,
     StartupTimeoutLoser = 3,
     HandbackStalled = 4,
+    SessionUncertainState = 5,
 }
 
 impl SafeHoldReason {
@@ -45,6 +46,7 @@ impl SafeHoldReason {
             2 => Self::TeardownWhileEnergized,
             3 => Self::StartupTimeoutLoser,
             4 => Self::HandbackStalled,
+            5 => Self::SessionUncertainState,
             _ => Self::None,
         }
     }

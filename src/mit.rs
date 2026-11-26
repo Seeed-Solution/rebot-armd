@@ -2531,6 +2531,7 @@ enum MotorZeroPhase {
 pub struct CommissioningMachine {
     active_op_id: u64,
     next_op_id: u64,
+    session_id: Option<crate::rt_core::session::SessionId>,
     txn_id: u64,
     kind: CommissioningOpKind,
     state: CommissioningOpState,
@@ -2594,6 +2595,7 @@ impl Default for CommissioningMachine {
         Self {
             active_op_id: 0,
             next_op_id: 1,
+            session_id: None,
             txn_id: 0,
             kind: CommissioningOpKind::ReadIdentity,
             state: CommissioningOpState::Idle,
@@ -2666,6 +2668,18 @@ impl CommissioningMachine {
 
     pub fn active_op_id(&self) -> Option<u64> {
         (self.state != CommissioningOpState::Idle).then_some(self.active_op_id)
+    }
+
+    pub fn session_id(&self) -> Option<crate::rt_core::session::SessionId> {
+        (self.state != CommissioningOpState::Idle)
+            .then_some(self.session_id)
+            .flatten()
+    }
+
+    pub(crate) fn has_uncertain_outcome(&self) -> bool {
+        self.outcomes[..self.joint_len]
+            .iter()
+            .any(|o| o.disposition == JointCommissioningDisposition::Uncertain)
     }
 
     pub fn hw_mutated(&self) -> bool {
@@ -3216,7 +3230,12 @@ impl crate::supervisor::SupervisorInner {
         owner_now: std::time::Instant,
     ) -> Result<u64, crate::rt_core::requests::config::ConfigError> {
         use crate::rt_core::requests::config::ConfigError;
-        if self.commissioning.is_occupied() {
+        use crate::rt_core::session::{
+            PreparedSession, SessionAuthority, SessionKind, SessionSlot,
+        };
+        if self.commissioning.is_occupied()
+            || self.sessions.is_slot_occupied(SessionSlot::ExclusiveOutput)
+        {
             return Err(ConfigError::Busy("a hardware commissioning operation is already running"));
         }
         if req.joint_len == 0 || req.joint_len > crate::rt_core::mailbox::MAX_DOF {
@@ -3283,9 +3302,36 @@ impl crate::supervisor::SupervisorInner {
                 false
             }
         };
+        let mut prepared = PreparedSession::exclusive(
+            SessionKind::Commissioning,
+            crate::rt_core::broker::ClientId(req.authority.conn_id),
+        );
+        prepared.deadline = Some(req.txn_deadline);
+        prepared.timeout_code = Self::commissioning_deadline_error_code(req.kind);
+        prepared.operator_required = self.operator_auth_enforced;
+        prepared.operator_grant = Some(req.authority.operator_grant);
+        prepared.revoke_on_stop = true;
+        prepared.escalate_safe_hold_on_uncertain = true;
+        let session_auth = SessionAuthority {
+            connection_id: req.authority.conn_id,
+            lease_generation: req.authority.lease_holder.map_or(0, |(_, gen)| gen),
+            epoch: req.authority.expected_epoch,
+            stop_generation: req.authority.expected_stop_gen,
+            require_lease: self.lease_enabled,
+            operator_required: self.operator_auth_enforced,
+            operator_grant: Some(req.authority.operator_grant),
+            revoke_on_stop: true,
+        };
+        let session_id = self
+            .sessions
+            .admit_with_authority(prepared, session_auth, owner_now, false)
+            .map_err(|_| {
+                ConfigError::Busy("a hardware commissioning operation is already running")
+            })?;
         let op_id = self.commissioning.next_op_id;
         self.commissioning.next_op_id = op_id.wrapping_add(1).max(1);
         self.commissioning.active_op_id = op_id;
+        self.commissioning.session_id = Some(session_id);
         self.commissioning.txn_id = req.authority.txn_id;
         self.commissioning.kind = req.kind;
         self.commissioning.state = CommissioningOpState::Running;
@@ -3365,6 +3411,7 @@ impl crate::supervisor::SupervisorInner {
                     .config_mut()
                     .force_reconcile(crate::rt_core::config_iface::ConfigDomain::Calibration, active_rev);
             }
+            self.sync_commissioning_session_terminal();
         }
         self.commissioning.snapshot(op_id)
     }
@@ -3384,6 +3431,17 @@ impl crate::supervisor::SupervisorInner {
         if self.commissioning.state == CommissioningOpState::Running {
             let drv_now = self.driver_clock_now_or(std::time::Instant::now());
             self.commissioning.mark_quiet_if_in_flight(drv_now);
+            if let Some(sid) = self.commissioning.session_id {
+                let uncertain = self.commissioning.has_uncertain_outcome()
+                    || self.commissioning.hw_mutated
+                    || self.commissioning.disk_mutated;
+                let _ = self.sessions.cancel_slot(
+                    crate::rt_core::session::SessionSlot::ExclusiveOutput,
+                    sid,
+                    crate::rt_core::session::SessionTerminalReason::Cancelled("CANCELLED"),
+                    uncertain,
+                );
+            }
         }
         let must_reconcile = force_reconcile
             || (!clean_complete && (self.commissioning.hw_mutated || self.commissioning.disk_mutated));
@@ -3395,6 +3453,11 @@ impl crate::supervisor::SupervisorInner {
             self.core
                 .config_mut()
                 .force_reconcile(crate::rt_core::config_iface::ConfigDomain::Calibration, active_rev);
+        }
+        if let Some(sid) = self.commissioning.session_id.take() {
+            let _ = self
+                .sessions
+                .clear_terminal_slot(crate::rt_core::session::SessionSlot::ExclusiveOutput, sid);
         }
         self.commissioning.state = CommissioningOpState::Idle;
         self.commissioning.authority = None;
@@ -3485,7 +3548,11 @@ impl crate::supervisor::SupervisorInner {
             return CommissioningStepProgress::default();
         }
 
-        // Clamp caller-derived cutoff to the commissioning transaction deadline.
+        // Clamp caller-derived cutoff through the session lifecycle driver (session + child
+        // deadlines) as well as the commissioning transaction deadline (no second margin subtraction).
+        owner_cutoff = self
+            .sessions
+            .effective_tx_cutoff(crate::rt_core::session::SessionSlot::ExclusiveOutput, owner_cutoff);
         if let Some(txn_dl) = self.commissioning.txn_deadline {
             owner_cutoff = owner_cutoff.min(txn_dl);
         }
@@ -3512,6 +3579,7 @@ impl crate::supervisor::SupervisorInner {
         if self.driver.is_none() {
             if kind == CommissioningOpKind::MotorZeroDisable {
                 self.commissioning.state = CommissioningOpState::Done;
+                self.sync_commissioning_session_terminal();
                 return CommissioningStepProgress::default();
             }
             if kind == CommissioningOpKind::MotorZeroWriteVerify {
@@ -3558,6 +3626,7 @@ impl crate::supervisor::SupervisorInner {
                 }
                 if self.commissioning.joint_idx >= joint_len {
                     self.commissioning.state = CommissioningOpState::Done;
+                    self.sync_commissioning_session_terminal();
                 }
                 return CommissioningStepProgress {
                     still_running: self.commissioning.state == CommissioningOpState::Running,
@@ -3682,6 +3751,9 @@ impl crate::supervisor::SupervisorInner {
             }
         }
         let still_running = self.commissioning.state == CommissioningOpState::Running;
+        if !still_running {
+            self.sync_commissioning_session_terminal();
+        }
         let rest_probe_pending = still_running
             && kind == CommissioningOpKind::WriteTimeout
             && self.commissioning.write_phase == WriteTimeoutPhase::GatherRestEvidence
@@ -3803,6 +3875,55 @@ impl crate::supervisor::SupervisorInner {
             self.core
                 .config_mut()
                 .force_reconcile(crate::rt_core::config_iface::ConfigDomain::Calibration, active_rev);
+        }
+        self.sync_commissioning_session_terminal();
+    }
+
+    fn sync_commissioning_session_terminal(&mut self) {
+        use crate::rt_core::session::{SessionSlot, SessionTerminalReason};
+        let Some(sid) = self.commissioning.session_id else {
+            return;
+        };
+        if self
+            .sessions
+            .slot(SessionSlot::ExclusiveOutput)
+            .is_some_and(|s| s.id == sid && !s.is_live())
+        {
+            return;
+        }
+        let reason = match self.commissioning.state {
+            CommissioningOpState::Done => SessionTerminalReason::Completed,
+            CommissioningOpState::Cancelled => {
+                SessionTerminalReason::Cancelled(if self.commissioning.error_code.is_empty() {
+                    "CANCELLED"
+                } else {
+                    self.commissioning.error_code
+                })
+            }
+            CommissioningOpState::Failed => {
+                let code = if self.commissioning.error_code.is_empty() {
+                    "FAILED"
+                } else {
+                    self.commissioning.error_code
+                };
+                if code == Self::commissioning_deadline_error_code(self.commissioning.kind)
+                    && self.commissioning.error_status == 502
+                {
+                    SessionTerminalReason::DeadlineExpired(code)
+                } else {
+                    SessionTerminalReason::Failed(code)
+                }
+            }
+            CommissioningOpState::Idle | CommissioningOpState::Running => return,
+        };
+        let uncertain = self.commissioning.has_uncertain_outcome()
+            || (self.commissioning.state != CommissioningOpState::Done
+                && (self.commissioning.hw_mutated || self.commissioning.disk_mutated));
+        if let Some(outcome) = self
+            .sessions
+            .finish_slot(SessionSlot::ExclusiveOutput, sid, reason, uncertain)
+        {
+            self.maybe_escalate_session_safe_hold(outcome, true);
         }
     }
 

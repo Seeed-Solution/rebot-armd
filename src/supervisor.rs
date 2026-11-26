@@ -1242,6 +1242,9 @@ pub struct SupervisorInner {
     /// Single preallocated tick-driven hardware commissioning state machine (C-F1 part 2).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) commissioning: crate::mit::CommissioningMachine,
+    /// Release-side session lifecycle driver (`ExclusiveOutput` + singleton `Recorder`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) sessions: crate::rt_core::session::SessionDriver,
     /// True when startup found an incomplete or unreadable pending calibration commit marker.
     pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
@@ -2533,6 +2536,8 @@ impl SupervisorInner {
             calibration_txn_id: None,
             #[cfg(not(target_arch = "wasm32"))]
             commissioning: crate::mit::CommissioningMachine::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            sessions: crate::rt_core::session::SessionDriver::new(),
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
@@ -5835,7 +5840,7 @@ impl SupervisorInner {
     /// right now (never accepting stale retained `captured_positions` or unverified modes).
     pub(crate) fn quiesce_motion_and_refresh_hold_for_handback(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
-        self.cancel_active_commissioning_on_stop("HANDBACK");
+        self.revoke_sessions_on_stop("HANDBACK");
         self.active_trajectory = None;
         self.release_servo_target();
         self.servo_stream_active = false;
@@ -5943,7 +5948,7 @@ impl SupervisorInner {
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        self.cancel_active_commissioning_on_stop("INTERNAL_FAULT");
+        self.revoke_sessions_on_stop("INTERNAL_FAULT");
         if self.internal_fault_lane.take_park_request() {
             // Revoke all prior client motion, servo targets, macro/policy runs, and any in-flight
             // enable transition without setting E-stop (so `NormalUnload` remains eligible).
@@ -6159,7 +6164,7 @@ impl SupervisorInner {
             return false;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        self.cancel_active_commissioning_on_stop("shutdown");
+        self.revoke_sessions_on_stop("shutdown");
         self.shutdown_committed = true;
         self.estop_state.latch();
         self.stop_motion();
@@ -13085,7 +13090,7 @@ impl Drop for ArmSupervisor {
                         guard.stop_requests.clone(),
                     );
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        guard.cancel_active_commissioning_on_stop("SAFE_HOLD");
+                        guard.on_safe_hold_enter("SAFE_HOLD");
                         safe_hold_bufs.seed_on_entry(&guard);
                     }));
                     let extracted = guard
@@ -13608,7 +13613,7 @@ impl ArmSupervisor {
                     if !guard.detached && !guard.shutdown_committed {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             #[cfg(not(target_arch = "wasm32"))]
-                            guard.cancel_active_commissioning_on_stop(if panicked {
+                            guard.on_safe_hold_enter(if panicked {
                                 "CONTROL_PANIC"
                             } else {
                                 "SAFE_HOLD"

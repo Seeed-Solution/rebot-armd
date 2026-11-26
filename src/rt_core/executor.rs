@@ -1800,6 +1800,7 @@ pub(crate) struct BrokerDispatcher {
         Arc<crate::supervisor::TerminalBroadcaster>,
         Arc<crate::model::ArmObservation>,
     )>,
+    session_terminal_rx: Mutex<super::stream::StreamConsumer<super::session::SessionTerminalRecord>>,
     broker_discarded: AtomicBool,
     state: Mutex<BrokerDispatcherState>,
 }
@@ -1844,6 +1845,7 @@ impl BrokerDispatcher {
             Arc<crate::supervisor::TerminalBroadcaster>,
             Arc<crate::model::ArmObservation>,
         )>,
+        session_terminal_rx: super::stream::StreamConsumer<super::session::SessionTerminalRecord>,
         exited: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -1853,6 +1855,7 @@ impl BrokerDispatcher {
             reply_router,
             hub,
             terminal_capture_drain,
+            session_terminal_rx: Mutex::new(session_terminal_rx),
             broker_discarded: AtomicBool::new(false),
             state: Mutex::new(BrokerDispatcherState {
                 managed: HashMap::with_capacity(super::broker::REPLY_CAPACITY),
@@ -2510,7 +2513,14 @@ impl BrokerDispatcher {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, force_poll)
             };
-            total += polled;
+            let session_polled = {
+                let mut srx = self.session_terminal_rx.lock().unwrap_or_else(|e| e.into_inner());
+                let mut router = self.reply_router.lock().unwrap_or_else(|e| e.into_inner());
+                srx.drain_up_to(super::session::SESSION_TERMINAL_RING_CAPACITY, |sample| {
+                    let _ = router.route_session_terminal_record(sample.payload);
+                })
+            };
+            total += polled + session_polled;
 
             let mut delivered_any = false;
             loop {
@@ -4834,6 +4844,60 @@ impl RtExecutorHandle {
             .pending_external_count()
     }
 
+    /// Reserves 1 bounded P-F1 terminal credit for a direct/no-wire-ACK session.
+    pub fn reserve_session_terminal_direct(
+        &self,
+        client: ClientId,
+        action_id: super::broker::ActionId,
+        policy: ExternalDestinationPolicy,
+    ) -> Result<super::reply_router::SessionTerminalTicket, ExternalSubmitError> {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reserve_session_terminal_direct(client, action_id, policy)
+    }
+
+    /// Releases an unused P-F1 session terminal reservation on admission rollback.
+    pub fn release_session_terminal(
+        &self,
+        ticket: &super::reply_router::SessionTerminalTicket,
+    ) -> bool {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_session_terminal(ticket)
+    }
+
+    /// Emits a session terminal through P-F1 router (at-most-once; duplicates suppressed).
+    pub fn emit_session_terminal(
+        &self,
+        ticket: &super::reply_router::SessionTerminalTicket,
+        outcome: super::broker::Outcome,
+        children: u32,
+    ) -> super::reply_router::SessionTerminalEmit {
+        let res = self
+            .shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .emit_session_terminal(ticket, outcome, children);
+        if res == super::reply_router::SessionTerminalEmit::Enqueued {
+            self.pump_broker_replies();
+        }
+        res
+    }
+
+    /// Current total reserved credits held in the P-F1 router (tests / diagnostics).
+    pub fn router_global_reserved(&self) -> usize {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .global_reserved()
+    }
+
     pub fn disconnect_client(&self, client: ClientId) {
         self.shared
             .broker_dispatcher
@@ -5794,7 +5858,7 @@ pub(crate) fn spawn_executor(
     let closed_bitset = broker.closed_bitset();
     // Box `core` once off-control so energized SPSC handback performs zero heap allocations
     // on `armd-control`.
-    let core = Box::new(core);
+    let mut core = Box::new(core);
     // Defer mutating `core`'s boot ID, `StopRequests`, driver E-stop gate, closed-connection
     // bitset, and `ActionPrepEnv` until inside `armd-control`'s `catch_unwind` startup transaction
     // so: (a) recoverable spawn/init failure returns `core` cleanly with Legacy routing intact,
@@ -5860,12 +5924,14 @@ pub(crate) fn spawn_executor(
     let conn_lifecycle_client = Arc::new(conn_lifecycle_client);
     let broker = Arc::new(Mutex::new(broker));
     let reply_router = Arc::new(Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)));
+    let session_terminal_rx = core.sessions.attach_terminal_channel();
     let broker_dispatcher = Arc::new(BrokerDispatcher::new(
         Arc::clone(&broker),
         Arc::clone(&conn_lifecycle_client),
         Arc::clone(&reply_router),
         Arc::clone(&hub),
         core.terminal_capture_drain_handles(),
+        session_terminal_rx,
         exited.clone(),
     ));
     let control_exited_cv = Arc::new((Mutex::new(ControlExitState), Condvar::new()));
@@ -6581,7 +6647,7 @@ impl ControlState {
                     self.shutdown_committed && core.commit_shutdown_until(probe_deadline)
                 });
                 if valid {
-                    core.cancel_active_commissioning_on_stop("shutdown");
+                    core.revoke_sessions_on_stop("shutdown");
                     self.control_stop.store(true, Ordering::Release);
                 } else if !self.lifecycle.commit_accepted() {
                     self.shutdown_committed = false;
@@ -8775,7 +8841,7 @@ fn run_executor_safe_hold(
     internal_fault_lane.latch_control_safe_hold_fence();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(core) = core_slot.as_deref_mut() {
-            core.cancel_active_commissioning_on_stop("SAFE_HOLD");
+            core.on_safe_hold_enter("SAFE_HOLD");
             safe_hold_bufs.seed_on_entry(core);
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -9292,7 +9358,7 @@ fn control_thread_main_inner(
          safe_hold_bufs_slot: &mut Option<super::safe_hold::SafeHoldBuffers>,
          reason: super::safe_hold::SafeHoldReason| {
             let core_ref = core_slot.as_deref_mut().expect("core owned by timeout loser");
-            core_ref.cancel_active_commissioning_on_stop("STARTUP_TIMEOUT");
+            core_ref.revoke_sessions_on_stop("STARTUP_TIMEOUT");
             if core_is_confirmed_disarmed(core_ref) {
                 core_ref.flush_torque_shadow();
                 lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
@@ -9538,6 +9604,7 @@ fn control_thread_main_inner(
     let mut last_release_start = now_inst();
     let mut publish_gen = initial_generation;
     let mut panicked = false;
+    let mut session_uncertain_safe_hold = false;
     {
         let core = core_slot.as_deref_mut().expect("core owned during control loop");
         let safe_hold_bufs = safe_hold_bufs_slot
@@ -9687,13 +9754,16 @@ fn control_thread_main_inner(
                                 &mut maint_req_id,
                             );
                             if !control_stop.load(Ordering::Acquire) && !core.internal_fault_lane.is_fenced() {
-                                core.service_commissioning_release(ctx, release_deadline, &now_inst);
+                                core.service_sessions_release(ctx, release_deadline, &now_inst);
                             }
                             control_stop.load(Ordering::Acquire)
+                                || core.sessions.is_safe_hold_requested()
                         },
                     );
-                    if control_stop.load(Ordering::Acquire) {
+                    let session_safe_hold = core.sessions.is_safe_hold_requested();
+                    if control_stop.load(Ordering::Acquire) || session_safe_hold {
                         let (_, captured_any) = core.capture_edge_terminals(core.now_s(), None);
+                        let session_terms = core.flush_published_session_terminals();
                         if let Some(p) = injected_job_probe.take() {
                             if state.offload_reclaim_tx.push(OffloadReclaim::Probe(p)).is_ok() {
                                 core.core.hub().wake();
@@ -9704,6 +9774,7 @@ fn control_thread_main_inner(
                         state.drain_retired_states(core, now_inst());
                         core.flush_torque_shadow();
                         if captured_any
+                            || session_terms > 0
                             || engine.take_urgent_replies_flushed()
                             || engine.take_lifecycle_replies_flushed()
                             || engine.take_servo_closes_flushed()
@@ -9855,6 +9926,7 @@ fn control_thread_main_inner(
                     let post_cpu_start_ns = usage_done.cpu_ns();
                     // Wake dispatcher immediately after Window 1 publication/drain work (preserving
                     // pre-Window-2 service latency for observations, acks, and safety logs).
+                    let _ = core.flush_published_session_terminals();
                     hub.wake();
                     let release_period_ns = next_release_ns.saturating_sub(scheduled_ns).max(1);
                     let optional_margin = crate::driver::OPTIONAL_WORK_RELEASE_MARGIN
@@ -10304,6 +10376,12 @@ fn control_thread_main_inner(
             break;
         } else {
             safe_hold_bufs.mirror_from_core(core);
+            if core.sessions.take_safe_hold_requested() {
+                session_uncertain_safe_hold = true;
+                estop_state.request_and_latch();
+                internal_fault_lane.latch_control_safe_hold_fence();
+                break;
+            }
         }
     }
 
@@ -10320,11 +10398,14 @@ fn control_thread_main_inner(
     // Wrap post-loop drain in `catch_unwind` so even a panic in teardown cleanup transitions an
     // energized driver cleanly into preallocated SAFE-HOLD (B5).
     let drain_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        core.cancel_active_commissioning_on_stop(if panicked {
+        core.revoke_sessions_on_stop(if panicked {
             "CONTROL_PANIC"
+        } else if session_uncertain_safe_hold {
+            "SAFE_HOLD"
         } else {
             "STOPPED"
         });
+        let _ = core.flush_published_session_terminals();
         state.drain_maintenance_stopped();
         state.drain_persistence_stopped(core);
         if !panicked {
@@ -10371,6 +10452,33 @@ fn control_thread_main_inner(
     // 5. Ordinary stop / `Drop` while energized or unknown -> retain exclusive driver in SAFE-HOLD
     //    (NEVER disable torque away from rest and NEVER destroy an energized driver!).
     let req_kind = lifecycle.current_request();
+    if session_uncertain_safe_hold {
+        if !core_is_confirmed_disarmed(core_slot.as_deref().expect("core owned")) {
+            run_executor_safe_hold(
+                core_slot,
+                safe_hold_bufs,
+                &lifecycle,
+                &teardown_disable,
+                &state.hooks,
+                &estop_state,
+                &internal_fault_lane,
+                &exited,
+                &control_exited_cv,
+                &hub,
+                &clock_hook,
+                &control_stop,
+                super::safe_hold::SafeHoldReason::SessionUncertainState,
+            );
+            return;
+        }
+        lifecycle.set_owner_state(LC_OWNER_DISARMED_EXITED);
+        if let Some(mut c) = core_slot.take() {
+            c.shutdown_committed = true;
+            drop(c);
+        }
+        mark_control_exited(&exited, &control_exited_cv, &hub);
+        return;
+    }
     if panicked {
         if !core_is_confirmed_disarmed(core_slot.as_deref().expect("core owned")) {
             run_executor_safe_hold(

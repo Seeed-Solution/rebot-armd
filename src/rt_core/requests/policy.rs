@@ -593,6 +593,7 @@ fn check_policy_start_preconditions_rt(
     if inner.calibration_busy
         || inner.zero_check_persisting.is_some()
         || inner.gravity_comp.is_some()
+        || inner.sessions.blocks_ordinary_output(None)
         || inner.pending_normal_unload
         || inner.active_trajectory.is_some()
         || inner.macro_run.is_some()

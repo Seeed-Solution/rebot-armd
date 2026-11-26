@@ -642,6 +642,8 @@ pub fn verify_slot_authority(
 
 fn check_common_blockers(inner: &SupervisorInner) -> Result<(), MotionInstallError> {
     if inner.calibration_busy || !inner.can_replace_active_trajectory() || inner.gravity_comp.is_some() { return Err(MotionInstallError::MotionBusy); }
+    #[cfg(not(target_arch = "wasm32"))]
+    if inner.sessions.blocks_ordinary_output(None) { return Err(MotionInstallError::MotionBusy); }
     if inner.core.motion_inhibited_by_config() { return Err(MotionInstallError::ConfigBusy); }
     if inner.collision.hold.is_some() { return Err(MotionInstallError::CollisionHold); }
     if inner.handover_settling_since.is_some() { return Err(MotionInstallError::HandoverSettling); }
@@ -1003,6 +1005,14 @@ pub fn install_watchdog_park(
         return Err(MotionInstallError::UnsupportedUnload);
     }
     let _ = verify_motion_freshness(inner, slot)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if inner.sessions.blocks_ordinary_output(None) {
+        // Safety watchdog park preempts any ordinary non-safety session cleanly.
+        inner.revoke_sessions_on_stop("LEASE_LOST");
+        if inner.sessions.is_safe_hold_requested() {
+            return Err(MotionInstallError::EStopActive);
+        }
+    }
     inner.watchdog_park_pending = None;
     let installed = install_park_trajectory(inner, ParkActionMode::Watchdog, slot, heap_traj)?;
     let budget = inner.watchdog_park_timeout();
