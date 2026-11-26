@@ -6779,6 +6779,8 @@ impl SupervisorInner {
             torque_or_power_hold: self.torque_guard.hold.is_some() || self.power.gov.hold.is_some(),
             held,
             macro_state,
+            #[cfg(not(target_arch = "wasm32"))]
+            mode_switch: self.current_mode_switch_snapshot(),
         }
     }
 
@@ -12212,6 +12214,13 @@ impl ModeSwitchRunner {
             .is_some_and(crate::motor_mode::ModeSwitch::is_running)
     }
 
+    pub(crate) fn retire_if_session(&mut self, sid: crate::rt_core::session::SessionId) {
+        if self.active_session == Some(sid) {
+            self.active_session = None;
+            self.machine = None;
+        }
+    }
+
     fn stage_events_from_machine(&mut self, sid: crate::rt_core::session::SessionId) {
         let Some(m) = self.machine.as_mut() else { return };
         let retained = &mut self.retained_events;
@@ -12261,6 +12270,23 @@ impl SupervisorInner {
     }
 
     #[inline]
+    pub(crate) fn current_mode_switch_snapshot(
+        &self,
+    ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
+        let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
+            let mut m = 0u32;
+            let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+            m
+        });
+        if let (Some(sid), Some(machine)) =
+            (self.mode_switch.active_session, self.mode_switch.machine.as_ref())
+        {
+            return Some(machine.snapshot(sid.0, drv_uncertain));
+        }
+        self.mode_switch.last_terminal_snapshot
+    }
+
+    #[inline]
     pub(crate) fn mode_switch_owns_bus(&self) -> bool {
         !self.safety.state().is_stopped()
             && self.mode_switch.is_running()
@@ -12285,11 +12311,11 @@ impl SupervisorInner {
         if self.mode_switch.active_session.is_some() {
             return Err(ConfigError::Busy("a mode-switch session is already active"));
         }
-        if req.plan.len == 0 || usize::from(req.plan.len) > crate::motor_mode::MAX_MODE_SWITCH_AXES {
+        if req.plan.validate().is_err() {
             return Err(ConfigError::CalibPrecondition {
                 status: 400,
                 code: "INVALID_COMMAND",
-                message: "invalid mode-switch plan axis count",
+                message: "invalid mode-switch plan",
             });
         }
         let cur_epoch = self.safety.epoch_id();
@@ -12318,11 +12344,6 @@ impl SupervisorInner {
         prepared.operator_grant = Some(req.operator_grant);
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
-        if let Some((request_id, action_id, route_gen)) = req.terminal_ticket {
-            prepared.request_id = Some(request_id);
-            prepared.action_id = Some(action_id);
-            prepared.route_gen = route_gen;
-        }
         let sid = admit_session(admitted, prepared, owner_now).map_err(|err| match err {
             SessionAdmitError::SlotBusy | SessionAdmitError::OutputBusy(_) => {
                 ConfigError::Busy(err.code())
@@ -12365,18 +12386,7 @@ impl SupervisorInner {
         &self,
         session_id: u64,
     ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
-        let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
-            let mut m = 0u32;
-            let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
-            m
-        });
-        if self.mode_switch.active_session.map(|s| s.0) == Some(session_id) {
-            if let Some(ref machine) = self.mode_switch.machine {
-                return Some(machine.snapshot(session_id, drv_uncertain));
-            }
-        }
-        self.mode_switch
-            .last_terminal_snapshot
+        self.current_mode_switch_snapshot()
             .filter(|s| s.session_id == session_id)
     }
 
@@ -12444,7 +12454,10 @@ impl SupervisorInner {
     pub(crate) fn clear_mode_switch_rt(&mut self, session_id: u64) -> bool {
         use crate::rt_core::session::SessionSlot;
         let Some(sid) = self.mode_switch.active_session else {
-            return false;
+            return self
+                .mode_switch
+                .last_terminal_snapshot
+                .is_some_and(|s| s.session_id == session_id);
         };
         if sid.0 != session_id {
             return false;
@@ -14062,7 +14075,10 @@ impl ArmSupervisor {
         let safe_hold_ctrl = Arc::clone(&self.legacy_safe_hold);
         let mut step_counter: u64 = 0;
         let mut panicked = false;
-        let mut session_uncertain_safe_hold = false;
+        let mut handoff_driver: Option<Box<dyn ArmDriver>> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut handoff_shadow: Option<crate::torque::shadow::ShadowRuntime> = None;
+        let mut handoff_reason: Option<crate::rt_core::safe_hold::SafeHoldReason> = None;
 
         crate::rt_core::executor::run_periodic_with_deadline(
             period,
@@ -14070,6 +14086,11 @@ impl ArmSupervisor {
             &loop_stats,
             |dt, release_deadline| {
                 step_counter = step_counter.saturating_add(1);
+                let mut extracted: Option<(
+                    Box<dyn ArmDriver>,
+                    Option<crate::torque::shadow::ShadowRuntime>,
+                    crate::rt_core::safe_hold::SafeHoldReason,
+                )> = None;
                 let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if panic_hook_step
                         .as_ref()
@@ -14077,19 +14098,25 @@ impl ArmSupervisor {
                     {
                         panic!("simulated legacy control thread panic at tick {step_counter}");
                     }
-                    runtime.block_on(self.control_tick_with_deadline(dt, release_deadline));
+                    runtime.block_on(self.tick_shared_with_handoff(
+                        dt,
+                        false,
+                        Some(release_deadline),
+                        Some((&mut safe_hold_bufs, &control_stop, &mut extracted)),
+                    ));
                 }));
                 match tick_res {
                     Ok(()) => {
-                        if let Ok(guard) = self.inner.try_read() {
-                            if !guard.detached {
-                                safe_hold_bufs.mirror_from_core(&guard);
-                                #[cfg(not(target_arch = "wasm32"))]
-                                if guard.sessions.is_safe_hold_requested() {
-                                    session_uncertain_safe_hold = true;
-                                    control_stop.store(true, Ordering::Release);
-                                }
+                        if let Some((drv, sh, reason)) = extracted {
+                            handoff_driver = Some(drv);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                handoff_shadow = sh;
                             }
+                            #[cfg(target_arch = "wasm32")]
+                            let _ = sh;
+                            handoff_reason = Some(reason);
+                            control_stop.store(true, Ordering::Release);
                         }
                     }
                     Err(_) => {
@@ -14108,18 +14135,36 @@ impl ArmSupervisor {
             },
         );
 
-        // Unified Legacy loop exit disposition (DRV-F1 B1/B2/B5):
-        // - Confirmed disarm, completed ownership transfer (`guard.detached`), or committed shutdown
-        //   exits cleanly without abandoning an energized arm.
-        // - Control panic, ordinary stop, OR unconfirmed/timed-out Legacy `ProcessExit` while
-        //   energized/unconfirmed atomically detaches the shell (`guard.detached = true`),
-        //   publishes `OwnerSlot::Failed` + `DetachedSafeHold`, and retains exclusive ownership in
-        //   SAFE-HOLD until thermal trip or confirmed `ProcessExit` disarm.
+        // Unified Legacy loop exit disposition (DRV-F1 B1/B2/B5 + PR0C Blocker 7):
+        // - If `tick_shared_with_handoff` already extracted the driver directly under its own
+        //   single write guard (e.g. `SessionUncertainState`), enter SAFE-HOLD immediately with
+        //   zero extra lock attempts and zero contention delay.
+        // - Otherwise handle panic / teardown-while-energized via bounded extraction.
+        if let Some(mut drv) = handoff_driver {
+            let reason = handoff_reason
+                .unwrap_or(crate::rt_core::safe_hold::SafeHoldReason::SessionUncertainState);
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = safe_hold_bufs.run_loop_with_shadow(
+                drv.as_mut(),
+                &safe_hold_ctrl,
+                reason,
+                Instant::now,
+                std::thread::sleep,
+                handoff_shadow.as_mut(),
+            );
+            #[cfg(target_arch = "wasm32")]
+            let _ = safe_hold_bufs.run_loop(
+                drv.as_mut(),
+                &safe_hold_ctrl,
+                reason,
+                Instant::now,
+                std::thread::sleep,
+            );
+            return;
+        }
         {
             let reason = if panicked {
                 crate::rt_core::safe_hold::SafeHoldReason::ControlPanic
-            } else if session_uncertain_safe_hold {
-                crate::rt_core::safe_hold::SafeHoldReason::SessionUncertainState
             } else {
                 crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized
             };
@@ -16382,21 +16427,36 @@ impl ArmSupervisor {
     }
 
     /// Polls the authoritative [`crate::motor_mode::ModeSwitchSnapshot`] for `session_id`
-    /// (unaffected by off-RT event stream saturation).
+    /// directly via [`Self::read_services`] (no config exchange, no write lock, no command label
+    /// mutation, and unaffected by off-RT event stream saturation). Falls back to the latest
+    /// published `StateHub` snapshot if the owner just transitioned to SAFE-HOLD.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn poll_mode_switch_session(
         &self,
         session_id: u64,
     ) -> Result<Option<crate::motor_mode::ModeSwitchSnapshot>, crate::rt_core::requests::config::ConfigError>
     {
-        use crate::rt_core::requests::config::{ConfigError, ConfigReply, ConfigRequest};
-        match self
-            .dispatch_config_request_owned_reliable(ConfigRequest::PollModeSwitch { session_id })
-            .await?
+        if let Ok(svc) = self
+            .read_services(crate::rt_core::publish::ReadRequirements::identity())
+            .await
         {
-            ConfigReply::ModeSwitchPolled(snap) => Ok(snap),
-            _ => Err(ConfigError::OwnerStopped),
+            return Ok(svc
+                .snapshot
+                .rt
+                .owner
+                .mode_switch
+                .filter(|s| s.session_id == session_id));
         }
+        if let Some(snap) = self.hub.latest().and_then(|latest| {
+            latest
+                .rt
+                .owner
+                .mode_switch
+                .filter(|s| s.session_id == session_id)
+        }) {
+            return Ok(Some(snap));
+        }
+        Err(crate::rt_core::requests::config::ConfigError::OwnerStopped)
     }
 
     /// Cancels an active `ModeSwitch` session matching `session_id` (stale IDs return `Ok(None)`).
@@ -16438,8 +16498,8 @@ impl ArmSupervisor {
     }
 
     /// Runs a `ModeSwitch` session to completion on the active owner (`OWNER_LEGACY` or
-    /// `OWNER_EXECUTOR`), polling until terminal and clearing the slot before returning the final
-    /// authoritative snapshot.
+    /// `OWNER_EXECUTOR`), polling via [`Self::read_services`] until terminal and clearing the slot
+    /// before returning the final authoritative snapshot.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn run_mode_switch_session(
         &self,
@@ -16456,8 +16516,7 @@ impl ArmSupervisor {
                     let _ = self.clear_mode_switch_session(session_id).await;
                     return Ok(snap);
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => return Err(ConfigError::OwnerStopped),
+                Ok(Some(_)) | Ok(None) => {}
                 Err(e) => return Err(e),
             }
             if Instant::now() >= wait_deadline {
@@ -16484,7 +16543,13 @@ impl ArmSupervisor {
         timeout: Duration,
     ) -> Result<crate::motor_mode::ModeSwitchSnapshot, crate::rt_core::requests::config::ConfigError>
     {
-        let plan = crate::motor_mode::ModeSwitchPlan::confirm_gripper(joint, mode);
+        let plan = crate::motor_mode::ModeSwitchPlan::confirm_gripper(joint, mode).map_err(|_| {
+            crate::rt_core::requests::config::ConfigError::CalibPrecondition {
+                status: 400,
+                code: "INVALID_COMMAND",
+                message: "invalid gripper joint index",
+            }
+        })?;
         let req = crate::rt_core::requests::config::ModeSwitchStartRequest {
             plan,
             admission,
@@ -16492,7 +16557,6 @@ impl ArmSupervisor {
             operator_grant,
             deadline: Instant::now() + timeout,
             client: crate::rt_core::broker::ClientId(admission.connection_id),
-            terminal_ticket: None,
         };
         self.run_mode_switch_session(req, timeout + Duration::from_millis(250))
             .await
@@ -19363,6 +19427,26 @@ impl ArmSupervisor {
         keep: bool,
         scheduled_deadline: Option<Instant>,
     ) -> Option<ArmObservation> {
+        self.tick_shared_with_handoff(dt, keep, scheduled_deadline, None)
+            .await
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn tick_shared_with_handoff(
+        &self,
+        dt: f64,
+        keep: bool,
+        scheduled_deadline: Option<Instant>,
+        mut legacy_safe_hold_handoff: Option<(
+            &mut crate::rt_core::safe_hold::SafeHoldBuffers,
+            &Arc<AtomicBool>,
+            &mut Option<(
+                Box<dyn ArmDriver>,
+                Option<crate::torque::shadow::ShadowRuntime>,
+                crate::rt_core::safe_hold::SafeHoldReason,
+            )>,
+        )>,
+    ) -> Option<ArmObservation> {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick_shared");
         let wake_lateness_ns = crate::diagnostics::tick::take_current_wake_lateness_ns();
         let wake_lateness_us = (wake_lateness_ns / 1_000).min(u64::from(u32::MAX)) as u32;
@@ -19443,6 +19527,65 @@ impl ArmSupervisor {
             inner.defer_zero_check_persist = false;
             inner.defer_watchdog_park_plan = false;
             inner.defer_legacy_commissioning = false;
+            // Blocker 7: Mirror SAFE-HOLD buffers AND perform atomic zero-contention driver
+            // extraction directly inside the single tick write guard when a session requests
+            // SAFE-HOLD — eliminating post-tick `try_read()` and `try_write()` contention.
+            if let Some((bufs, control_stop, out)) = legacy_safe_hold_handoff.as_mut() {
+                if !inner.detached {
+                    bufs.mirror_from_core(&inner);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if inner.sessions.is_safe_hold_requested()
+                        && !inner.shutdown_committed
+                        && !crate::rt_core::executor::core_is_confirmed_disarmed(&inner)
+                    {
+                        let reason =
+                            crate::rt_core::safe_hold::SafeHoldReason::SessionUncertainState;
+                        inner.on_safe_hold_enter("SAFE_HOLD");
+                        bufs.seed_on_entry(&inner);
+                        self.estop_state.latch();
+                        self.internal_fault_lane.latch_control_safe_hold_fence();
+                        self.legacy_safe_hold.mark_active(reason);
+                        let live_intent = inner.shadow_live_intent();
+                        let live_is_torqued = inner.is_torqued;
+                        inner.torque_shadow.enqueue(
+                            crate::torque::shadow::ShadowInputKind::Stop {
+                                kind: crate::torque::StopKind::EStop,
+                                live_intent,
+                                live_is_torqued,
+                                live_stopped: true,
+                            },
+                        );
+                        inner.flush_torque_shadow();
+                        if let Some(drv) = inner
+                            .driver
+                            .take()
+                            .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold)
+                        {
+                            inner.detached = true;
+                            let disabled =
+                                crate::torque::shadow::ShadowRuntime::disabled(&inner.config);
+                            let sh = std::mem::replace(&mut inner.torque_shadow, disabled);
+                            {
+                                let mut slot =
+                                    self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                                *slot = OwnerSlot::Failed;
+                                self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                            }
+                            {
+                                let mut w = self
+                                    .active_writer
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                *w = WriterEndpoint::DetachedSafeHold {
+                                    safe_hold: Arc::clone(&self.legacy_safe_hold),
+                                    control_stop: Arc::clone(control_stop),
+                                };
+                            }
+                            **out = Some((drv, Some(sh), reason));
+                        }
+                    }
+                }
+            }
             #[cfg(not(target_arch = "wasm32"))]
             let legacy_comm_plan = if inner.legacy_commissioning_eligible() {
                 Some((

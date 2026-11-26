@@ -2282,6 +2282,12 @@ pub trait ArmDriver: Send {
     /// True when `joint` carries a hardware control-frame watchdog (e.g. Damiao J1–J6; false for J7 `TIMEOUT=0`).
     fn axis_has_watchdog(&self, _joint: usize) -> bool { false }
 
+    /// True when `joint` is configured to support `ControlMode::PositionForce` (e.g. J7 gripper).
+    fn axis_supports_pos_force(&self, _joint: usize) -> bool { false }
+
+    /// Remaining per-release RX frame allowance (charges Step 2 RX and ModeSwitch RX to one ledger).
+    fn mode_switch_remaining_rx_budget(&self, default_max: u16) -> u16 { default_max }
+
     /// Last causally confirmed control mode for `joint` (`None` if unverified or uncertain).
     fn axis_confirmed_mode(&self, _joint: usize) -> Option<crate::motor_mode::ControlMode> { None }
 
@@ -2406,12 +2412,15 @@ pub trait ArmDriver: Send {
     }
 
     /// Checks whether causal post-confirmation feedback has arrived for `joint`.
+    #[allow(clippy::too_many_arguments)]
     fn mode_switch_post_confirm_feedback(
         &self,
         _joint: usize,
         _mode: crate::motor_mode::ControlMode,
         _after_seq: u64,
         _after_at: Instant,
+        _max_rx_at: Instant,
+        _confirm_offset_ns: Option<i128>,
         _now: Instant,
         _require_disarmed_stationary: bool,
     ) -> crate::motor_mode::ModeFeedbackMatch {
@@ -7864,6 +7873,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Bitmask of joints currently owned by an active `ModeSwitch` transaction (suppresses
     /// legacy `mode_readback_boundary` auto-verification in `process_rx_frame`).
     mode_switch_active_mask: u32,
+    /// Per-release RX frame counter shared between Step 2 RX and ModeSwitch RX drain (one ledger).
+    release_rx_frames: u16,
+    /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
+    last_feedback_decode_offset_ns: Vec<Option<i128>>,
     /// PMAX / VMAX / TMAX read back from the motor and equal to `limits[i]`.
     mit_limits_verified: Vec<bool>,
     /// Register replies seen by `read_joint_states` since the last clear.
@@ -8516,6 +8529,26 @@ impl PendingTxQueue {
             *slot = None;
         }
         self.len = 0;
+        dropped
+    }
+
+    fn discard_joint(&mut self, joint: usize) -> usize {
+        let mut write = 0usize;
+        let mut dropped = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                if entry.joint == joint {
+                    dropped += 1;
+                } else {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
         dropped
     }
 
@@ -9185,6 +9218,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mode_readback_boundary: vec![None; dof],
             mode_write_uncertain_mask: 0,
             mode_switch_active_mask: 0,
+            release_rx_frames: 0,
+            last_feedback_decode_offset_ns: vec![None; dof],
             mit_limits_verified: vec![false; dof],
             register_replies: Vec::with_capacity(64),
             range_check: None,
@@ -9782,10 +9817,37 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_failed();
     }
 
+    #[inline]
+    fn is_axis_mode_uncertain(&self, i: usize) -> bool {
+        i < 32 && (self.mode_write_uncertain_mask & (1u32 << i)) != 0
+    }
+
+    #[inline]
+    fn is_mit_hold_eligible(&self, i: usize) -> bool {
+        !self.mit_ownership_lost
+            && self.mit_fence_trip.is_none()
+            && self.mit_limits_verified.get(i).copied().unwrap_or(false)
+    }
+
     fn build_pending_target_frame(&self, entry: &PendingTxFrame) -> Option<CanFrame> {
+        if self.is_axis_mode_uncertain(entry.joint) {
+            return None;
+        }
+        let active = self.joint_modes.get(entry.joint).copied().flatten();
         match entry.cmd {
-            PendingTargetCmd::PosVel { position } => Some(self.pos_vel_frame(entry.joint, position)),
+            PendingTargetCmd::PosVel { position } => {
+                if matches!(active, Some(DamiaoControlMode::Mit | DamiaoControlMode::PosForce)) {
+                    return None;
+                }
+                Some(self.pos_vel_frame(entry.joint, position))
+            }
             PendingTargetCmd::Mit { position, velocity, kp, kd, torque } => {
+                if matches!(active, Some(DamiaoControlMode::PosVel | DamiaoControlMode::PosForce)) {
+                    return None;
+                }
+                if self.control_mode != DamiaoControlMode::Mit && !self.is_mit_hold_eligible(entry.joint) {
+                    return None;
+                }
                 let target = JointTarget { position, velocity, kp, kd, torque };
                 Some(self.mit_frame(entry.joint, &target))
             }
@@ -11478,12 +11540,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         i: usize,
         target: &JointTarget,
     ) -> Result<([Option<CanFrame>; 2], Option<usize>), ArmDriverError> {
+        if self.is_axis_mode_uncertain(i) {
+            return Ok(([None, None], None));
+        }
         if self.control_mode == DamiaoControlMode::Mit && self.base_mode(i) != DamiaoControlMode::PosForce {
             return Ok(([Some(self.mit_frame(i, target)), None], None));
         }
         match self.joint_modes[i] {
             Some(DamiaoControlMode::PosVel) => Ok(([Some(self.pos_vel_frame(i, target.position)), None], None)),
-            Some(DamiaoControlMode::Mit) => Ok(([Some(self.mit_frame(i, target)), None], None)),
+            Some(DamiaoControlMode::Mit) => {
+                if !self.is_mit_hold_eligible(i) {
+                    return Ok(([None, None], None));
+                }
+                Ok(([Some(self.mit_frame(i, target)), None], None))
+            }
             Some(DamiaoControlMode::PosForce) => Ok(([None, None], Some(i))),
             None if self.base_mode(i) == DamiaoControlMode::PosForce => {
                 Err(ArmDriverError::PosForceModeUnconfirmed { joint: i })
@@ -11522,6 +11592,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         i: usize,
         target: &JointTarget,
     ) -> Result<[Option<(u32, PendingTargetCmd)>; 2], ArmDriverError> {
+        if self.is_axis_mode_uncertain(i) {
+            return Ok([None, None]);
+        }
         let id = self.motor_ids[i];
         if self.control_mode == DamiaoControlMode::Mit && self.base_mode(i) != DamiaoControlMode::PosForce {
             return Ok([
@@ -11543,19 +11616,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Some((0x100 + u32::from(id), PendingTargetCmd::PosVel { position: target.position })),
                 None,
             ]),
-            Some(DamiaoControlMode::Mit) => Ok([
-                Some((
-                    u32::from(id),
-                    PendingTargetCmd::Mit {
-                        position: target.position,
-                        velocity: target.velocity,
-                        kp: target.kp,
-                        kd: target.kd,
-                        torque: target.torque,
-                    },
-                )),
-                None,
-            ]),
+            Some(DamiaoControlMode::Mit) => {
+                if !self.is_mit_hold_eligible(i) {
+                    return Ok([None, None]);
+                }
+                Ok([
+                    Some((
+                        u32::from(id),
+                        PendingTargetCmd::Mit {
+                            position: target.position,
+                            velocity: target.velocity,
+                            kp: target.kp,
+                            kd: target.kd,
+                            torque: target.torque,
+                        },
+                    )),
+                    None,
+                ])
+            }
             Some(DamiaoControlMode::PosForce) => Ok([None, None]),
             None if self.base_mode(i) == DamiaoControlMode::PosForce => {
                 Err(ArmDriverError::PosForceModeUnconfirmed { joint: i })
@@ -15223,7 +15301,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if i >= self.motor_ids.len() {
             return None;
         }
-        if i < 32 && (self.mode_write_uncertain_mask & (1u32 << i)) != 0 {
+        if self.is_axis_mode_uncertain(i) {
             return None;
         }
         let verified = self.verified_modes.get(i).copied().flatten()?;
@@ -15231,9 +15309,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if verified != active {
             return None;
         }
-        if verified == DamiaoControlMode::Mit
-            && (self.mit_ownership_lost || self.mit_fence_trip.is_some())
-        {
+        if verified == DamiaoControlMode::Mit && !self.is_mit_hold_eligible(i) {
             return None;
         }
         Some(verified)
@@ -17957,6 +18033,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn begin_control_release(&mut self, release_seq: u64) {
         if self.control_release_id != release_seq {
             self.control_release_id = release_seq;
+            self.release_rx_frames = 0;
             self.begin_tx_tick();
             self.output_step_pending_in_release = true;
         }
@@ -18466,6 +18543,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             match self.can.receive_with_rx_time() {
                 Ok((frame, rx_time)) => {
                     frames = frames.saturating_add(1);
+                    self.release_rx_frames = self.release_rx_frames.saturating_add(1);
                     self.process_rx_frame(&frame, true, rx_time);
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
@@ -19010,6 +19088,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             && self.pos_force.as_ref().is_none_or(|pf| pf.joint != joint)
     }
 
+    fn axis_supports_pos_force(&self, joint: usize) -> bool {
+        self.pos_force.as_ref().is_some_and(|pf| pf.joint == joint)
+    }
+
+    fn mode_switch_remaining_rx_budget(&self, default_max: u16) -> u16 {
+        if self.in_active_control_release() {
+            default_max.saturating_sub(self.release_rx_frames)
+        } else {
+            default_max
+        }
+    }
+
     fn axis_confirmed_mode(&self, joint: usize) -> Option<crate::motor_mode::ControlMode> {
         self.verified_hold_mode(joint)
             .map(damiao_mode_to_shadow_control_mode)
@@ -19023,8 +19113,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if joint >= self.motor_ids.len() {
             return;
         }
+        let prev = self.joint_modes[joint];
         match mode.and_then(control_mode_to_damiao) {
             Some(dm) => {
+                if prev != Some(dm) {
+                    self.pending_tx.discard_joint(joint);
+                    self.pending_hold_tx.discard_joint(joint);
+                }
                 self.verified_modes[joint] = Some(dm);
                 self.joint_modes[joint] = Some(dm);
                 self.mode_readback_boundary[joint] = None;
@@ -19040,6 +19135,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.stage_damiao_mode_verified(joint, dm);
             }
             None => {
+                self.pending_tx.discard_joint(joint);
+                self.pending_hold_tx.discard_joint(joint);
                 self.verified_modes[joint] = None;
                 self.joint_modes[joint] = None;
                 self.mode_readback_boundary[joint] = None;
@@ -19092,14 +19189,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         max_frames: u8,
     ) -> Result<crate::motor_mode::WatchdogHoldResult, crate::motor_mode::ModeSwitchFailure> {
         let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
-        let pf_joint = self.pos_force.as_ref().map(|p| p.joint);
         let effective_exclude = exclude_mask | self.mode_write_uncertain_mask;
+        let effective_max_frames = if self.in_active_control_release() {
+            self.remaining_tick_tx_slots()
+                .min(usize::from(max_frames)) as u8
+        } else {
+            max_frames
+        };
         let now = self.now();
 
         // Collect due energized watchdog-bearing verified axes (oldest-unfed first), plus any
         // `force_mask` axis (refreshed in its last confirmed mode right before `REG_WRITE`).
+        // Verified non-watchdog axes (e.g. a configured J7 gripper verified in PosVel — Major 2)
+        // are collected separately and serviced AFTER arm watchdog axes so arm watchdogs keep
+        // strict priority without starving J7 PosVel hold continuity.
         let mut due = [(0usize, Duration::ZERO, false); MAX_MODE_JOINTS];
         let mut due_len = 0usize;
+        let mut non_wd_posvel = [0usize; MAX_MODE_JOINTS];
+        let mut non_wd_len = 0usize;
         for i in 0..n {
             if !self.axis_is_energized(i) || (effective_exclude & (1u32 << i)) != 0 {
                 continue;
@@ -19107,22 +19214,30 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
                 continue;
             }
-            if pf_joint == Some(i) || self.base_mode(i) == DamiaoControlMode::PosForce {
+            let Some(vmode) = self.verified_hold_mode(i) else {
+                continue;
+            };
+            if vmode == DamiaoControlMode::PosForce {
                 continue;
             }
-            if self.verified_hold_mode(i).is_none() {
+            let already_this_release = (self.release_ctrl_tx_mask & (1u32 << i)) != 0;
+            if already_this_release {
+                continue;
+            }
+            if !self.axis_has_watchdog(i) {
+                non_wd_posvel[non_wd_len] = i;
+                non_wd_len += 1;
                 continue;
             }
             let age = self.motor_last_ctrl_tx[i]
                 .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
             let forced = (force_mask & (1u32 << i)) != 0;
-            let already_this_release = (self.release_ctrl_tx_mask & (1u32 << i)) != 0;
-            if (age >= min_age && !already_this_release) || (forced && !already_this_release) {
+            if age >= min_age || forced {
                 due[due_len] = (i, age, forced);
                 due_len += 1;
             }
         }
-        // Insertion sort: oldest-unfed first (largest age first; ties prefer non-forced urgent).
+        // Insertion sort: oldest-unfed first (largest age first).
         for idx in 1..due_len {
             let key = due[idx];
             let mut j = idx;
@@ -19140,8 +19255,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut aborted_flush = false;
         let mut hit_stop = false;
         self.in_urgent_watchdog_hold = true;
+        // First pass: watchdog-bearing arm axes; second pass: verified PosVel non-watchdog axes (J7).
         for &(i, _, _) in &due[..due_len] {
-            if frames_sent >= max_frames || self.now() >= deadline {
+            if frames_sent >= effective_max_frames || self.now() >= deadline {
                 break;
             }
             let Some(pos) = self.motor_keepalive_hold_pos[i].or_else(|| {
@@ -19179,6 +19295,47 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 Err(_) => {}
             }
         }
+        if !aborted_flush {
+            for &i in &non_wd_posvel[..non_wd_len] {
+                if frames_sent >= effective_max_frames || self.now() >= deadline {
+                    break;
+                }
+                let Some(pos) = self.motor_keepalive_hold_pos[i].or_else(|| {
+                    self.cached_states
+                        .get(i)
+                        .map(|s| s.position)
+                        .filter(|p| p.is_finite())
+                }) else {
+                    continue;
+                };
+                let target = JointTarget::position(pos);
+                match self.send_plain(
+                    TxKind::MeasuredHold(i),
+                    Some(start_stamp),
+                    Some(Deadline { at: deadline }),
+                    false,
+                    |d| d.build_verified_hold_frame(i, &target),
+                ) {
+                    Ok(_) => {
+                        sent_mask |= 1u32 << i;
+                        frames_sent = frames_sent.saturating_add(1);
+                    }
+                    Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
+                    Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
+                    Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                        aborted_flush = true;
+                        hit_stop = true;
+                        break;
+                    }
+                    Err(TxRefusal::Transport(_)) => {
+                        self.mark_tx_pass_backpressured();
+                        aborted_flush = true;
+                        break;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
         self.in_urgent_watchdog_hold = false;
         let mut refreshed_mask: u32 = 0;
         if sent_mask != 0 {
@@ -19202,7 +19359,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
         // Also service an enabled, verified PosForce J7 joint via the single J7 emitter when
         // budget remains and J7 is not excluded/uncertain.
-        if frames_sent < max_frames && self.now() < deadline {
+        if frames_sent < effective_max_frames && self.now() < deadline {
             if let Some(pf_j) = self.active_pos_force_joint() {
                 if self.axis_is_energized(pf_j)
                     && (effective_exclude & (1u32 << pf_j)) == 0
@@ -19332,9 +19489,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             |_| Some(damiao::build_set_control_mode_frame(id, mode_val)),
         ) {
             Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
-                // Blocker 2: Frame was accepted by transport — IMMEDIATELY invalidate cached
-                // verified mode and mark `mode_write_uncertain_mask` BEFORE flush so even a
-                // failed flush or immediate revocation can NEVER emit holds in a stale mode.
+                // Blocker 1 & 2: Frame was accepted by transport — IMMEDIATELY drop queued
+                // targets for this joint, invalidate cached verified mode, and mark
+                // `mode_write_uncertain_mask` BEFORE flush so even a failed flush or immediate
+                // revocation can NEVER emit targets or holds in a stale mode.
+                self.pending_tx.discard_joint(joint);
+                self.pending_hold_tx.discard_joint(joint);
                 self.verified_modes[joint] = None;
                 self.joint_modes[joint] = None;
                 self.mode_readback_boundary[joint] = None;
@@ -19519,6 +19679,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     raw_value: raw,
                     rx_seq: rep.rx_seq,
                     rx_at: rep.rx_at,
+                    decode_offset_ns: rep.decode_offset_ns,
                 }
             }
         }
@@ -19563,12 +19724,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mode_switch_post_confirm_feedback(
         &self,
         joint: usize,
         mode: crate::motor_mode::ControlMode,
         after_seq: u64,
         after_at: Instant,
+        max_rx_at: Instant,
+        confirm_offset_ns: Option<i128>,
         now: Instant,
         require_disarmed_stationary: bool,
     ) -> crate::motor_mode::ModeFeedbackMatch {
@@ -19582,8 +19746,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let Some(rx_at) = self.last_feedback_instant.get(joint).copied().flatten() else {
             return crate::motor_mode::ModeFeedbackMatch::Pending;
         };
-        if rx_at < after_at {
+        if rx_at < after_at || rx_at >= max_rx_at {
             return crate::motor_mode::ModeFeedbackMatch::Pending;
+        }
+        // Major 3: reject feedback whose realtime-to-monotonic clock mapping drifted (> 5 ms)
+        // relative to the causal mode confirmation reply.
+        if let (Some(c_off), Some(fb_off)) = (
+            confirm_offset_ns,
+            self.last_feedback_decode_offset_ns
+                .get(joint)
+                .copied()
+                .flatten(),
+        ) {
+            if (fb_off - c_off).abs() > 5_000_000 {
+                return crate::motor_mode::ModeFeedbackMatch::Pending;
+            }
         }
         let max_age = if mode == crate::motor_mode::ControlMode::PositionForce {
             POS_FORCE_FEEDBACK_MAX_AGE
@@ -20178,6 +20355,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.disable_rest_established = false;
         self.disable_tx_deadline = None;
         self.disable_lease_gen = None;
+        self.mode_switch_active_mask = 0;
         self.set_external_pos_force_emitter(false);
     }
 
@@ -22682,9 +22860,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             .is_some_and(|b| self.rx_seq > b)
                     {
                         if let Some(mode) = Self::mode_from_u32(reply.as_u32()) {
+                            let prev = self.joint_modes[idx];
+                            if prev != Some(mode) {
+                                self.pending_tx.discard_joint(idx);
+                                self.pending_hold_tx.discard_joint(idx);
+                            }
                             self.verified_modes[idx] = Some(mode);
                             self.joint_modes[idx] = Some(mode);
                             self.mode_readback_boundary[idx] = None;
+                            if idx < 32 {
+                                self.mode_write_uncertain_mask &= !(1u32 << idx);
+                            }
+                            if self
+                                .pos_force
+                                .as_ref()
+                                .is_some_and(|pf| pf.joint == idx)
+                                && mode != DamiaoControlMode::PosForce
+                            {
+                                self.pos_force_verified = false;
+                            }
                             #[cfg(not(target_arch = "wasm32"))]
                             if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS
                             {
@@ -22874,6 +23068,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.motor_keepalive_hold_pos[idx] = Some(feedback.position);
                 }
                 self.last_feedback_instant[idx] = Some(rx_at);
+                if let Some(slot) = self.last_feedback_decode_offset_ns.get_mut(idx) {
+                    *slot = decode_offset_ns;
+                }
                 self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                 self.feedback_queue_bound[idx] = queue_bound;
                 self.last_feedback_seq[idx] = seq;
@@ -23114,6 +23311,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
+        self.release_rx_frames = self
+            .release_rx_frames
+            .saturating_add(frames_processed.min(u16::MAX as usize) as u16);
 
         // Evaluate feedback age only after receive() explicitly reports an empty
         // queue. If the bounded budget expires first, defer recovery to the next
@@ -23160,7 +23360,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
-        if !self.is_enabling {
+        // Blocker 1 & Major 1: while a `ModeSwitch` transaction owns the bus (`mode_switch_active_mask != 0`),
+        // Step 2 RX MUST NOT consume release TX slots on optional refresh/recovery frames or emit
+        // control frames before `ModeSwitch::step` runs watchdog-first holds.
+        if !self.is_enabling && self.mode_switch_active_mask == 0 {
             match self.service_refresh_scheduler(rx_stop_stamp, None, true, u64::MAX) {
                 Ok(_) | Err(ArmDriverError::EstopInhibited) => {}
                 Err(e) => return Err(e),
@@ -23179,6 +23382,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if rx_drained
             && self.is_enabled
             && !self.is_enabling
+            && self.mode_switch_active_mask == 0
             && !self.is_stopped_for_disable()
             && !matches!(
                 self.torque_hs,
@@ -23213,6 +23417,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
                     continue;
                 }
+                // Blocker 1: NEVER transmit a recovery control frame for a joint whose mode is uncertain!
+                if self.is_axis_mode_uncertain(i) {
+                    continue;
+                }
                 if self.strict_stop_check(Some(rx_stop_stamp)).is_err() {
                     self.discard_pending_tx_stopped();
                     break;
@@ -23235,6 +23443,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     None if self.base_mode(i) == DamiaoControlMode::PosForce => continue,
                     None => self.control_mode,
                 };
+                if resolved_mode == DamiaoControlMode::Mit && !self.is_mit_hold_eligible(i) {
+                    continue;
+                }
                 let send_res = if resolved_mode == DamiaoControlMode::PosForce {
                     if self.external_pos_force_emitter {
                         continue;

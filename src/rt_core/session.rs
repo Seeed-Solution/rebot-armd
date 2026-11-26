@@ -1067,6 +1067,15 @@ impl SupervisorInner {
 
     pub(crate) fn flush_published_session_terminals(&mut self) -> usize {
         self.mode_switch.flush_events();
-        self.sessions.flush_published_terminals()
+        let flushed = self.sessions.flush_published_terminals();
+        if let Some(slot) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() {
+            if slot.kind == SessionKind::ModeSwitch
+                && matches!(slot.state, SessionState::Terminal(_))
+                && self.sessions.clear_terminal_slot(SessionSlot::ExclusiveOutput, slot.id)
+            {
+                self.mode_switch.retire_if_session(slot.id);
+            }
+        }
+        flushed
     }
 }

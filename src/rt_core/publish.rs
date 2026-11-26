@@ -287,6 +287,9 @@ pub struct PublishedOwnerMeta {
     pub torque_or_power_hold: bool,
     pub held: Option<PublishedHeld>,
     pub macro_state: PublishedMacroState,
+    /// Coherent snapshot of the active or latest terminal PR0C `ModeSwitch` session (`Copy`, 0 alloc).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub mode_switch: Option<crate::motor_mode::ModeSwitchSnapshot>,
 }
 
 impl Default for PublishedOwnerMeta {
@@ -321,6 +324,8 @@ impl Default for PublishedOwnerMeta {
             torque_or_power_hold: false,
             held: None,
             macro_state: PublishedMacroState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            mode_switch: None,
         }
     }
 }

@@ -710,6 +710,12 @@ impl ArmDriver for ZeroOffsetDriver {
     fn axis_has_watchdog(&self, joint: usize) -> bool {
         self.inner.axis_has_watchdog(joint)
     }
+    fn axis_supports_pos_force(&self, joint: usize) -> bool {
+        self.inner.axis_supports_pos_force(joint)
+    }
+    fn mode_switch_remaining_rx_budget(&self, default_max: u16) -> u16 {
+        self.inner.mode_switch_remaining_rx_budget(default_max)
+    }
     fn axis_confirmed_mode(&self, joint: usize) -> Option<crate::motor_mode::ControlMode> {
         self.inner.axis_confirmed_mode(joint)
     }
@@ -825,12 +831,15 @@ impl ArmDriver for ZeroOffsetDriver {
             tx_offset_ns,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn mode_switch_post_confirm_feedback(
         &self,
         joint: usize,
         mode: crate::motor_mode::ControlMode,
         after_seq: u64,
         after_at: Instant,
+        max_rx_at: Instant,
+        confirm_offset_ns: Option<i128>,
         now: Instant,
         require_disarmed_stationary: bool,
     ) -> crate::motor_mode::ModeFeedbackMatch {
@@ -839,6 +848,8 @@ impl ArmDriver for ZeroOffsetDriver {
             mode,
             after_seq,
             after_at,
+            max_rx_at,
+            confirm_offset_ns,
             now,
             require_disarmed_stationary,
         )

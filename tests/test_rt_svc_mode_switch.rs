@@ -220,7 +220,9 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
 
     let mut ex_drv = ExclusiveDriver::new(Box::new(raw_drv));
 
-    // Seed confirmed control frames at t0 across J1..J6.
+    // Seed confirmed control frames at t0 across J1..J6 and keep 100% wire logging continuously
+    // across BOTH forward (PosVel -> Impedance) AND reverse (Impedance -> PosVel) switches AND
+    // the first post-terminal normal control release (Major 8: no synthetic baseline!).
     let mut seq = 1u64;
     let start_at = clock.now();
     bus.clear_log();
@@ -236,42 +238,21 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
             (5, ControlMode::Impedance),
         ],
         ModeSwitchRecovery::RollbackToPrevious,
-    );
+    )
+    .unwrap();
     let mut ms = ModeSwitch::new(to_mit);
 
-    // Zero-alloc proof across active RT stepping (turn off tx_log growth only for the alloc probe
-    // tick, then re-enable for full wire-gap audit).
     let mut final_prog = ModeProgress::Pending { wake: None };
-    for tick in 0..40 {
-        let t_tick = start_at + PERIOD_50HZ * tick;
+    let mut tick_idx = 0u32;
+    for _ in 0..40 {
+        let t_tick = start_at + PERIOD_50HZ * tick_idx;
         if t_tick > clock.now() {
             clock.advance(t_tick - clock.now());
         }
         bus.with(|s| s.run_watchdogs());
         seq += 1;
-        if tick == 4 {
-            let mut rx_buf = Vec::with_capacity(16);
-            bus.with(|s| s.record_tx_log = false);
-            let before = snapshot_counts();
-            let tick_start = clock.now();
-            let d = ex_drv.get_mut().as_mut();
-            d.begin_control_release(seq);
-            let cutoff = tick_start + PERIOD_50HZ.saturating_sub(Duration::from_millis(3));
-            d.set_tx_release_deadline(Some(cutoff));
-            let _ = d.read_joint_states_into(&mut rx_buf);
-            let budget = ReleaseBudget::new(clock.now(), cutoff, PERIOD_50HZ, 8);
-            final_prog = ms.step(&mut ex_drv, budget);
-            ex_drv.get_mut().as_mut().set_tx_release_deadline(None);
-            let delta = snapshot_counts().delta_since(before);
-            bus.with(|s| s.record_tx_log = true);
-            assert_eq!(
-                (delta.alloc, delta.alloc_zeroed, delta.realloc, delta.dealloc),
-                (0, 0, 0, 0),
-                "ModeSwitch::step + RX intake must perform 0 heap allocs/frees on RT: {delta:?}"
-            );
-        } else {
-            final_prog = step_release_on_exclusive(&mut ex_drv, &mut ms, &clock, PERIOD_50HZ, 8, seq);
-        }
+        final_prog = step_release_on_exclusive(&mut ex_drv, &mut ms, &clock, PERIOD_50HZ, 8, seq);
+        tick_idx += 1;
         if final_prog.is_terminal() {
             break;
         }
@@ -282,9 +263,7 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
     }
     assert_eq!(ex_drv.get_ref().mode_write_uncertain_mask(), 0);
 
-    // Return switch: Impedance -> PositionVelocity with 100% wire logging for exact gap audit.
-    let return_start = clock.now();
-    bus.clear_log();
+    // Return switch: Impedance -> PositionVelocity (continuous log, no clear_log, no synthetic t0!).
     let to_pv = ModeSwitchPlan::switch_axes(
         &[
             (0, ControlMode::PositionVelocity),
@@ -295,26 +274,46 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
             (5, ControlMode::PositionVelocity),
         ],
         ModeSwitchRecovery::RollbackToPrevious,
-    );
+    )
+    .unwrap();
     let mut ms_back = ModeSwitch::new(to_pv);
     let mut back_prog = ModeProgress::Pending { wake: None };
-    for tick in 0..40 {
-        let t_tick = return_start + PERIOD_50HZ * tick;
+    for _ in 0..40 {
+        let t_tick = start_at + PERIOD_50HZ * tick_idx;
         if t_tick > clock.now() {
             clock.advance(t_tick - clock.now());
         }
         bus.with(|s| s.run_watchdogs());
         seq += 1;
         back_prog = step_release_on_exclusive(&mut ex_drv, &mut ms_back, &clock, PERIOD_50HZ, 8, seq);
+        tick_idx += 1;
         if back_prog.is_terminal() {
             break;
         }
     }
-    let return_end = clock.now();
     assert_eq!(back_prog, ModeProgress::Confirmed, "6-axis Impedance->PosVel must confirm");
     for j in 0..6 {
         assert_eq!(ex_drv.get_ref().axis_confirmed_mode(j), Some(ControlMode::PositionVelocity));
     }
+
+    // One post-terminal normal control release (verifies gap through handback to normal holds).
+    {
+        let t_tick = start_at + PERIOD_50HZ * tick_idx;
+        if t_tick > clock.now() {
+            clock.advance(t_tick - clock.now());
+        }
+        bus.with(|s| s.run_watchdogs());
+        seq += 1;
+        let d = ex_drv.get_mut().as_mut();
+        d.begin_control_release(seq);
+        let cutoff = clock.now() + PERIOD_50HZ.saturating_sub(Duration::from_millis(3));
+        d.set_tx_release_deadline(Some(cutoff));
+        let _ = d.read_joint_states();
+        let holds = vec![armd::driver::JointTarget::position(0.0); 7];
+        let _ = d.write_measured_hold_masked(0x3F, &holds);
+        d.set_tx_release_deadline(None);
+    }
+    let full_end = clock.now();
 
     let (tx_log, tx_times, expiries, all_enabled) = bus.with(|s| {
         s.run_watchdogs();
@@ -325,46 +324,12 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
     assert_eq!(expiries, 0, "Damiao TIMEOUT=2000 must suffer 0 watchdog expiries");
     assert!(all_enabled, "all motors must remain enabled across round-trip switch");
 
-    // Audit exact wire gaps across the Impedance -> PosVel round-trip (initial mode = MIT).
-    // Verify using the bus's actual mode history by starting audit from Impedance.
-    let mut active_mode = [damiao::CTRL_MODE_MIT; 6];
-    let mut last_ctrl = [Some(return_start); 6];
-    let mut max_gap = [Duration::ZERO; 6];
-    let mut wrong_mode = 0usize;
-    let mut disables = 0usize;
-    for (frame, ts) in tx_log.iter().zip(tx_times.iter()) {
-        let Some(t) = *ts else { continue };
-        if frame.data == damiao::CMD_DISABLE {
-            disables += 1;
-            continue;
-        }
-        if frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE && frame.data[3] == damiao::RID_CTRL_MODE {
-            let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
-            if (1..=6).contains(&id) {
-                active_mode[(id - 1) as usize] =
-                    u32::from_le_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
-            }
-            continue;
-        }
-        if (0x101..=0x106).contains(&frame.id) {
-            let j = (frame.id - 0x101) as usize;
-            if active_mode[j] != damiao::CTRL_MODE_POS_VEL { wrong_mode += 1; }
-            if let Some(prev) = last_ctrl[j] { max_gap[j] = max_gap[j].max(t.saturating_duration_since(prev)); }
-            last_ctrl[j] = Some(t);
-        } else if (1..=6).contains(&frame.id) && frame.data != damiao::CMD_ENABLE {
-            let j = (frame.id - 1) as usize;
-            if active_mode[j] != damiao::CTRL_MODE_MIT { wrong_mode += 1; }
-            if let Some(prev) = last_ctrl[j] { max_gap[j] = max_gap[j].max(t.saturating_duration_since(prev)); }
-            last_ctrl[j] = Some(t);
-        }
-    }
+    let (max_gap, wrong_mode, disables) =
+        audit_wire_control_gaps(&tx_log, &tx_times, start_at, full_end);
     for j in 0..6 {
-        if let Some(prev) = last_ctrl[j] {
-            max_gap[j] = max_gap[j].max(return_end.saturating_duration_since(prev));
-        }
         assert!(
             max_gap[j] <= MAX_ALLOWED_GAP,
-            "J{} watchdog gap {:?} exceeded 40 ms bound (all gaps: {:?})",
+            "J{} continuous round-trip watchdog gap {:?} exceeded 40 ms bound (all gaps: {:?})",
             j + 1,
             max_gap[j],
             max_gap
@@ -372,6 +337,71 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
     }
     assert_eq!(wrong_mode, 0, "0 control frames may be sent in an unverified/wrong mode");
     assert_eq!(disables, 0, "0 CMD_DISABLE frames may be sent during mode switch");
+
+    // Separate 4-counter zero-alloc proof (`alloc == alloc_zeroed == realloc == dealloc == 0`)
+    // across an active RT step (with tx_log recording disabled so test FakeBus Vec doesn't grow).
+    {
+        let mut ms_alloc = ModeSwitch::new(
+            ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+                .unwrap(),
+        );
+        let mut rx_buf = Vec::with_capacity(16);
+        bus.with(|s| s.record_tx_log = false);
+        for _ in 0..4 {
+            clock.advance(PERIOD_50HZ);
+            seq += 1;
+            let before = snapshot_counts();
+            let tick_start = clock.now();
+            let d = ex_drv.get_mut().as_mut();
+            d.begin_control_release(seq);
+            let cutoff = tick_start + PERIOD_50HZ.saturating_sub(Duration::from_millis(3));
+            d.set_tx_release_deadline(Some(cutoff));
+            let _ = d.read_joint_states_into(&mut rx_buf);
+            let budget = ReleaseBudget::new(clock.now(), cutoff, PERIOD_50HZ, 8);
+            let p = ms_alloc.step(&mut ex_drv, budget);
+            ex_drv.get_mut().as_mut().set_tx_release_deadline(None);
+            let delta = snapshot_counts().delta_since(before);
+            assert_eq!(
+                (delta.alloc, delta.alloc_zeroed, delta.realloc, delta.dealloc),
+                (0, 0, 0, 0),
+                "ModeSwitch::step + RX intake must perform 0 heap allocs/frees on RT: {delta:?}"
+            );
+            if p.is_terminal() {
+                break;
+            }
+        }
+        bus.with(|s| s.record_tx_log = true);
+    }
+
+    // Major 2 proof: a configured J7 gripper verified in PosVel STILL receives PosVel hold
+    // frames during an energized arm switch (not dropped by the PosForce-only branch).
+    {
+        bus.with(|s| {
+            s.motors[6].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL);
+        });
+        ex_drv
+            .get_mut()
+            .as_mut()
+            .set_axis_confirmed_mode(6, Some(ControlMode::PositionVelocity));
+        bus.clear_log();
+        let mut ms_j7_hold = ModeSwitch::new(
+            ModeSwitchPlan::switch_axes(&[(1, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+                .unwrap(),
+        );
+        for _ in 0..6 {
+            clock.advance(PERIOD_50HZ);
+            seq += 1;
+            let p = step_release_on_exclusive(&mut ex_drv, &mut ms_j7_hold, &clock, PERIOD_50HZ, 8, seq);
+            if p.is_terminal() {
+                break;
+            }
+        }
+        let j7_posvel_holds = bus.with(|s| s.tx_log.iter().filter(|f| f.id == 0x107).count());
+        assert!(
+            j7_posvel_holds >= 1,
+            "verified PosVel J7 must keep receiving PosVel hold frames during arm mode switch"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +425,8 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
     let plan = ModeSwitchPlan::switch_axes(
         &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
         ModeSwitchRecovery::RollbackToPrevious,
-    );
+    )
+    .unwrap();
     let mut ms = ModeSwitch::new(plan);
     let mut seq = 10u64;
     for tick in 0..4 {
@@ -438,10 +469,13 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
     bus.with(|s| {
         s.motors[0].no_write_ack = true;
     });
-    let mut ms_late = ModeSwitch::new(ModeSwitchPlan::switch_axes(
-        &[(0, ControlMode::PositionVelocity)],
-        ModeSwitchRecovery::FailClosed,
-    ));
+    let mut ms_late = ModeSwitch::new(
+        ModeSwitchPlan::switch_axes(
+            &[(0, ControlMode::PositionVelocity)],
+            ModeSwitchRecovery::FailClosed,
+        )
+        .unwrap(),
+    );
     let t_b = clock.now() + PERIOD_50HZ;
     clock.advance(t_b - clock.now());
     seq += 1;
@@ -458,8 +492,27 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
         "driver must clear verified_hold_mode immediately at REG_WRITE TX boundary"
     );
 
-    // Advance exactly 1 period (release N+1): ACK still absent -> MUST abort immediately on N+1!
-    clock.advance(PERIOD_50HZ);
+    // Blocker 1 proof: even if J1 feedback becomes stale (> 45 ms), ordinary RX recovery MUST NOT
+    // transmit any guessed-mode control frame for uncertain J1!
+    bus.clear_log();
+    clock.advance(Duration::from_millis(50));
+    {
+        let d = ex_drv.get_mut().as_mut();
+        d.begin_control_release(seq + 100);
+        let _ = d.read_joint_states();
+    }
+    let j1_recovery_frames = bus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.id == 0x101 || (f.id == 1 && f.data != damiao::CMD_ENABLE))
+            .count()
+    });
+    assert_eq!(
+        j1_recovery_frames, 0,
+        "ordinary RX recovery must transmit 0 control frames for mode-uncertain J1"
+    );
+
+    // Advance & step ms_late -> MUST abort immediately as Ambiguous { WriteAckTimeout }!
     seq += 1;
     let p_n1 = step_release_on_exclusive(&mut ex_drv, &mut ms_late, &clock, PERIOD_50HZ, 8, seq);
     assert_eq!(
@@ -468,7 +521,7 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
             failed_joint: 0,
             reason: ModeSwitchFailure::WriteAckTimeout,
         },
-        "must abort on release N+1 before waiting to N+2 (>= 40 ms)"
+        "must abort fail-closed as Ambiguous when ACK misses predictive watchdog deadline"
     );
     assert_ne!(ex_drv.get_ref().mode_write_uncertain_mask() & 1, 0);
 
@@ -476,6 +529,8 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
     bus.with(|s| {
         s.motors[0].no_write_ack = false;
         s.motors[0].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL);
+        s.motors[0].enabled = true;
+        s.push_all_feedback();
     });
     ex_drv.get_mut().as_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
 
@@ -484,7 +539,8 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
     let mut plan_rb = ModeSwitchPlan::switch_axes(
         &[(0, ControlMode::Impedance)],
         ModeSwitchRecovery::FailClosed,
-    );
+    )
+    .unwrap();
     plan_rb.axes[0].require_post_write_readback = true;
     bus.clear_log();
     let mut ms_rb_50 = ModeSwitch::new(plan_rb);
@@ -522,7 +578,39 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
             .any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE)
     });
     assert!(saw_ctrl_read, "post-write readback must have transmitted REG_READ(RID_CTRL_MODE)");
-    assert_eq!(bus.with(|s| s.motors.iter().map(|m| m.watchdog_expiry_count).sum::<usize>()), 0);
+
+    // (d) Blocker 6 proof: 100 Hz post-write readback enters `NeedReadback`, then TX backpressure
+    // (`max_tx = 0`) prevents transmitting `REG_READ` -> single absolute `post_write_deadline`
+    // MUST abort fail-closed as `Ambiguous { ReadbackTimeout }` (never stranded!).
+    let mut plan_rb_back = ModeSwitchPlan::switch_axes(
+        &[(0, ControlMode::PositionVelocity)],
+        ModeSwitchRecovery::FailClosed,
+    )
+    .unwrap();
+    plan_rb_back.axes[0].require_post_write_readback = true;
+    let mut ms_strand = ModeSwitch::new(plan_rb_back);
+    clock.advance(period_100hz);
+    seq += 1;
+    let p_w = step_release_on_exclusive(&mut ex_drv, &mut ms_strand, &clock, period_100hz, 8, seq);
+    assert!(matches!(p_w, ModeProgress::Pending { .. }));
+    let mut p_strand = ModeProgress::Pending { wake: None };
+    for _ in 0..5 {
+        clock.advance(period_100hz);
+        seq += 1;
+        // Starve TX budget (max_tx = 0) so `NeedReadback` cannot transmit `REG_READ`!
+        p_strand = step_release_on_exclusive(&mut ex_drv, &mut ms_strand, &clock, period_100hz, 0, seq);
+        if p_strand.is_terminal() {
+            break;
+        }
+    }
+    assert_eq!(
+        p_strand,
+        ModeProgress::Ambiguous {
+            failed_joint: 0,
+            reason: ModeSwitchFailure::ReadbackTimeout,
+        },
+        "NeedReadback under TX starvation must abort at post_write_deadline, never strand"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +627,49 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     let mut ex_drv = ExclusiveDriver::new(Box::new(raw_drv));
     let mut seq = 100u64;
 
+    // Minor 1 & Major 7: typed plan construction errors & overflowing timeout rejected fail-closed!
+    assert_eq!(
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance), (99, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed),
+        Err(ModeSwitchFailure::InvalidPlan)
+    );
+    assert_eq!(
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance), (0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed),
+        Err(ModeSwitchFailure::InvalidPlan)
+    );
+    assert_eq!(
+        ModeSwitchPlan::confirm_gripper(99, ControlMode::PositionForce),
+        Err(ModeSwitchFailure::InvalidPlan)
+    );
+    let mut bad_timeout_plan =
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+            .unwrap();
+    bad_timeout_plan.per_axis_timeout = Duration::MAX;
+    assert_eq!(bad_timeout_plan.validate(), Err(ModeSwitchFailure::InvalidPlan));
+    let mut ms_bad_to = ModeSwitch::new(bad_timeout_plan);
+    clock.advance(PERIOD_50HZ);
+    seq += 1;
+    assert_eq!(
+        step_release_on_exclusive(&mut ex_drv, &mut ms_bad_to, &clock, PERIOD_50HZ, 8, seq),
+        ModeProgress::FailedClean {
+            failed_joint: 0,
+            reason: ModeSwitchFailure::InvalidPlan,
+        }
+    );
+
+    // Blocker 2: PositionForce on a non-PosForce joint (J1) refused fail-closed!
+    let mut ms_pf_j1 = ModeSwitch::new(
+        ModeSwitchPlan::confirm_gripper(0, ControlMode::PositionForce).unwrap(),
+    );
+    clock.advance(PERIOD_50HZ);
+    seq += 1;
+    assert_eq!(
+        step_release_on_exclusive(&mut ex_drv, &mut ms_pf_j1, &clock, PERIOD_50HZ, 8, seq),
+        ModeProgress::FailedClean {
+            failed_joint: 0,
+            reason: ModeSwitchFailure::UnsupportedMode,
+        }
+    );
+
     // (a) Mandatory wire-range check + partial switch causal rollback:
     // J1 ranges verified; J2 ranges unverified and hardware reports mismatched TMAX (99.0 vs configured 28.0).
     // J1 switches to Impedance -> J2 fails mandatory range check BEFORE writing J2 -> J1 rolls back to PosVel!
@@ -547,10 +678,13 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
         s.motors[1].regs.insert(damiao::RID_TMAX, 99.0f32.to_le_bytes());
     });
     bus.clear_log();
-    let mut ms_rb = ModeSwitch::new(ModeSwitchPlan::switch_axes(
-        &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
-        ModeSwitchRecovery::RollbackToPrevious,
-    ));
+    let mut ms_rb = ModeSwitch::new(
+        ModeSwitchPlan::switch_axes(
+            &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
+            ModeSwitchRecovery::RollbackToPrevious,
+        )
+        .unwrap(),
+    );
     let mut prog = ModeProgress::Pending { wake: None };
     for _ in 0..30 {
         clock.advance(PERIOD_50HZ);
@@ -578,16 +712,39 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     });
     assert_eq!(j2_writes, 0, "range mismatch must forbid REG_WRITE on J2");
 
+    // Blocker 3 proof: ConfirmOnly(Impedance) with unverified mismatched TMAX on J2 MUST fail
+    // with RangeMismatch and NEVER publish Impedance as eligible for MIT holds!
+    let mut co_mit_plan = ModeSwitchPlan::empty(ModeSwitchIntent::ConfirmOnly);
+    co_mit_plan.axes[0] = AxisTarget::new(1, ControlMode::Impedance);
+    co_mit_plan.len = 1;
+    let mut ms_co_mit = ModeSwitch::new(co_mit_plan);
+    let mut p_co_mit = ModeProgress::Pending { wake: None };
+    for _ in 0..12 {
+        clock.advance(PERIOD_50HZ);
+        bus.with(|s| s.run_watchdogs());
+        seq += 1;
+        p_co_mit = step_release_on_exclusive(&mut ex_drv, &mut ms_co_mit, &clock, PERIOD_50HZ, 8, seq);
+        if p_co_mit.is_terminal() { break; }
+    }
+    assert_eq!(
+        p_co_mit,
+        ModeProgress::FailedClean {
+            failed_joint: 1,
+            reason: ModeSwitchFailure::RangeMismatch,
+        },
+        "ConfirmOnly(Impedance) must refuse unverified mismatched wire ranges"
+    );
+
     // (b) Failed flush after REG_WRITE (`real_flush = true`, `fail_next_reg_write_flush = true`):
     // Must immediately set uncertain mask & return Ambiguous!
     bus.with(|s| {
         s.real_flush = true;
         s.fail_next_reg_write_flush = true;
     });
-    let mut ms_fl = ModeSwitch::new(ModeSwitchPlan::switch_axes(
-        &[(0, ControlMode::Impedance)],
-        ModeSwitchRecovery::FailClosed,
-    ));
+    let mut ms_fl = ModeSwitch::new(
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+            .unwrap(),
+    );
     clock.advance(PERIOD_50HZ);
     seq += 1;
     let p_fl = step_release_on_exclusive(&mut ex_drv, &mut ms_fl, &clock, PERIOD_50HZ, 8, seq);
@@ -616,10 +773,10 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     bus.with(|s| {
         s.inject_on_reg_write.push(dup_ack);
     });
-    let mut ms_dup = ModeSwitch::new(ModeSwitchPlan::switch_axes(
-        &[(0, ControlMode::Impedance)],
-        ModeSwitchRecovery::FailClosed,
-    ));
+    let mut ms_dup = ModeSwitch::new(
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+            .unwrap(),
+    );
     let mut p_dup = ModeProgress::Pending { wake: None };
     for _ in 0..5 {
         clock.advance(PERIOD_50HZ);
@@ -639,14 +796,15 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     bus.with(|s| s.motors[0].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL));
     ex_drv.get_mut().as_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
 
-    // (d) Blocker 3: Energized ConfirmOnly contradiction on J7!
+    // (d) Blocker 3/4: Energized ConfirmOnly contradiction on J7!
     // Driver cache believes J7 is verified PosForce, but motor causally answers POS_VEL.
     // Must invalidate cached PosForce mode & return Ambiguous!
     assert_eq!(ex_drv.get_ref().axis_confirmed_mode(6), Some(ControlMode::PositionForce));
     bus.with(|s| {
         s.motors[6].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL);
     });
-    let mut ms_j7_contra = ModeSwitch::new(ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce));
+    let mut ms_j7_contra =
+        ModeSwitch::new(ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap());
     let mut p_contra = ModeProgress::Pending { wake: None };
     for _ in 0..6 {
         clock.advance(PERIOD_50HZ);
@@ -672,12 +830,14 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
         "pos_force_verified must be cleared on contradiction"
     );
 
-    // (e) J7 ConfirmOnly wrong reply CAN ID (`reply_id != 0x17`) -> rejected as AmbiguousReply!
+    // (e) Blocker 4: Energized J7 ConfirmOnly wrong reply CAN ID (`reply_id != 0x17`) ->
+    // invalidates mode and escalates as Ambiguous { AmbiguousReply } while energized!
     bus.with(|s| {
         s.motors[6].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
         s.motors[6].reply_id = 0x18; // wrong master reply CAN ID
     });
-    let mut ms_j7_id = ModeSwitch::new(ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce));
+    let mut ms_j7_id =
+        ModeSwitch::new(ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap());
     let mut p_id = ModeProgress::Pending { wake: None };
     for _ in 0..6 {
         clock.advance(PERIOD_50HZ);
@@ -688,7 +848,7 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     }
     assert_eq!(
         p_id,
-        ModeProgress::FailedClean {
+        ModeProgress::Ambiguous {
             failed_joint: 6,
             reason: ModeSwitchFailure::AmbiguousReply,
         }
@@ -713,10 +873,9 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         let mut g = sup.inner().write().await;
         g.attach_mode_switch_event_stream(1)
     };
-    let exec = sup
-        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(8)))
-        .await
-        .unwrap();
+    let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(8));
+    ecfg.alloc_timing = true;
+    let exec = sup.start_executor(ecfg).await.unwrap();
     let dl = Instant::now() + Duration::from_secs(2);
     while sup.hub().latest().is_none() {
         assert!(Instant::now() < dl);
@@ -731,6 +890,7 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
     plan.axes[1].require_post_confirm_feedback = false;
     plan.len = 2;
 
+    let before_allocs = exec.stats().release_allocs.snapshot();
     let sid1 = sup
         .start_mode_switch_session(ModeSwitchStartRequest {
             plan,
@@ -739,12 +899,11 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
             operator_grant: OperatorGrant::unenforced(),
             deadline: Instant::now() + Duration::from_secs(2),
             client: ClientId(7),
-            terminal_ticket: None,
         })
         .await
         .unwrap();
 
-    // Poll until terminal despite saturated capacity-1 event stream.
+    // Poll via StateHub::read_services until terminal despite saturated capacity-1 event stream.
     let wait_dl = Instant::now() + Duration::from_secs(2);
     let snap1 = loop {
         if let Some(s) = sup.poll_mode_switch_session(sid1).await.unwrap() {
@@ -756,8 +915,11 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     assert_eq!(snap1.progress, ModeProgress::Confirmed);
-    assert!(sup.clear_mode_switch_session(sid1).await.unwrap());
-    // Stream dropped excess events cleanly without blocking authoritative poll/clear.
+    // Major 5 proof: owner-side retirement frees `ExclusiveOutput` automatically after terminal
+    // publication, so a dropped caller who NEVER calls `clear_mode_switch_session` cannot wedge
+    // the slot! (Wait one tick for post-publish flush, then start sid2 WITHOUT calling clear.)
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Stream dropped excess events cleanly without blocking authoritative poll/retirement.
     let mut popped = 0usize;
     while ev_rx.try_pop().is_some() {
         popped += 1;
@@ -765,8 +927,8 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
     assert_eq!(popped, 1);
     assert!(ev_rx.stats().dropped_full >= 1, "capacity-1 stream must record drop-newest loss");
 
-    // Start a second session (silent J1 so it stays live) and verify stale cancel/clear for sid1
-    // are ignored and do NOT disturb sid2!
+    // Start a second session (silent J1 so it stays live) WITHOUT having called clear on sid1,
+    // and verify stale cancel/clear for sid1 are ignored and do NOT disturb sid2!
     bus.with(|s| s.motors[0].silent = true);
     let sid2 = sup
         .start_mode_switch_session(ModeSwitchStartRequest {
@@ -776,7 +938,6 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
             operator_grant: OperatorGrant::unenforced(),
             deadline: Instant::now() + Duration::from_secs(2),
             client: ClientId(7),
-            terminal_ticket: None,
         })
         .await
         .unwrap();
@@ -789,7 +950,15 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         !sup.clear_mode_switch_session(sid1).await.unwrap(),
         "stale clear for old session must return false"
     );
-    let live2 = sup.poll_mode_switch_session(sid2).await.unwrap().unwrap();
+    // Wait until StateHub publishes sid2 running snapshot.
+    let wait_live = Instant::now() + Duration::from_secs(1);
+    let live2 = loop {
+        if let Some(s) = sup.poll_mode_switch_session(sid2).await.unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < wait_live);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     assert!(live2.running, "stale cancel/clear must never disturb active sid2");
 
     // Clean cancel & clear of sid2.
@@ -801,6 +970,17 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         }
     );
     assert!(sup.clear_mode_switch_session(sid2).await.unwrap());
+    let after_allocs = exec.stats().release_allocs.snapshot();
+    assert_eq!(
+        (
+            after_allocs.alloc.saturating_sub(before_allocs.alloc),
+            after_allocs.alloc_zeroed.saturating_sub(before_allocs.alloc_zeroed),
+            after_allocs.realloc.saturating_sub(before_allocs.realloc),
+            after_allocs.dealloc.saturating_sub(before_allocs.dealloc),
+        ),
+        (0, 0, 0, 0),
+        "Executor armd-control releases across admission, stepping, cancel, and terminal publish must do 0 allocs/frees"
+    );
     assert_eq!(sup.inner().control_thread_attempts(), 0, "0 SupervisorLock attempts on armd-control");
 
     exec.stop_and_join();
@@ -826,7 +1006,13 @@ struct OwnerHarness {
 }
 
 impl OwnerHarness {
-    async fn start(kind: OwnerKind, j7_pos_force: bool, arm_timeout_counts: u32, arm_enabled: bool) -> Self {
+    async fn start(
+        kind: OwnerKind,
+        j7_pos_force: bool,
+        arm_timeout_counts: u32,
+        arm_enabled: bool,
+        lease_enabled: bool,
+    ) -> Self {
         let mut cfg = ArmConfig::rebot_dm();
         cfg.control_frequency_hz = 50;
         let bus = configure_damiao_bus(None, Duration::ZERO, j7_pos_force, arm_timeout_counts);
@@ -840,7 +1026,10 @@ impl OwnerHarness {
             let _ = drv.read_joint_states();
         }
         let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
-        sup.set_lease_enabled(false).await;
+        sup.set_lease_enabled(lease_enabled).await;
+        if lease_enabled {
+            let _ = sup.acquire_lease("mode-switch-test-client").await.unwrap();
+        }
         if arm_enabled {
             sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
             bus.with(|s| {
@@ -936,7 +1125,7 @@ impl OwnerHarness {
 async fn dual_owner_j7_gripper_mode_confirmation_pos_vel_and_pos_force() {
     let mut results = Vec::new();
     for owner in [OwnerKind::Legacy, OwnerKind::Executor] {
-        let h = OwnerHarness::start(owner, true, 0, false).await;
+        let h = OwnerHarness::start(owner, true, 0, false, true).await;
 
         // 1. Confirm J7 in PositionForce (disarmed stationary + expected master reply ID 0x17).
         let snap_pf = h
@@ -1000,12 +1189,13 @@ async fn dual_owner_j7_gripper_mode_confirmation_pos_vel_and_pos_force() {
 }
 
 /// Dual-owner test 2: Energized 3-axis `PositionVelocity -> Impedance -> PositionVelocity` switch
-/// AND partial-switch range-mismatch rollback produce identical outcomes on Legacy & Executor.
+/// AND partial-switch range-mismatch rollback produce identical outcomes on Legacy & Executor
+/// with live leases enabled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dual_owner_energized_mode_switch_and_rollback_parity() {
     let mut results = Vec::new();
     for owner in [OwnerKind::Legacy, OwnerKind::Executor] {
-        let h = OwnerHarness::start(owner, true, TIMEOUT_2000_COUNTS, true).await;
+        let h = OwnerHarness::start(owner, true, TIMEOUT_2000_COUNTS, true, true).await;
         h.bus.clear_log();
 
         // 1. Switch J1..J3 PosVel -> Impedance.
@@ -1016,7 +1206,8 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                 (2, ControlMode::Impedance),
             ],
             ModeSwitchRecovery::RollbackToPrevious,
-        );
+        )
+        .unwrap();
         let snap_mit = h
             .sup
             .run_mode_switch_session(
@@ -1027,7 +1218,6 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                     operator_grant: OperatorGrant::unenforced(),
                     deadline: Instant::now() + Duration::from_secs(2),
                     client: ClientId(10),
-                    terminal_ticket: None,
                 },
                 Duration::from_secs(2),
             )
@@ -1043,7 +1233,8 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                 (2, ControlMode::PositionVelocity),
             ],
             ModeSwitchRecovery::RollbackToPrevious,
-        );
+        )
+        .unwrap();
         let snap_pv = h
             .sup
             .run_mode_switch_session(
@@ -1054,7 +1245,6 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                     operator_grant: OperatorGrant::unenforced(),
                     deadline: Instant::now() + Duration::from_secs(2),
                     client: ClientId(10),
-                    terminal_ticket: None,
                 },
                 Duration::from_secs(2),
             )
@@ -1062,13 +1252,15 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
             .unwrap();
         assert_eq!(snap_pv.progress, ModeProgress::Confirmed, "{owner:?}: Impedance->PosVel");
 
-        let (disables, all_enabled, modes_after) = h.bus.with(|s| {
+        let (disables, all_enabled, modes_after, expiries) = h.bus.with(|s| {
             let dis = s.tx_log.iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
             let en = s.motors.iter().all(|m| m.enabled);
             let modes = [s.motors[0].ctrl_mode(), s.motors[1].ctrl_mode(), s.motors[2].ctrl_mode()];
-            (dis, en, modes)
+            let exp: usize = s.motors.iter().map(|m| m.watchdog_expiry_count).sum();
+            (dis, en, modes, exp)
         });
         assert_eq!(disables, 0, "{owner:?}: 0 CMD_DISABLE frames");
+        assert_eq!(expiries, 0, "{owner:?}: 0 watchdog expiries");
         assert!(all_enabled, "{owner:?}: all motors remain enabled");
         assert_eq!(modes_after, [damiao::CTRL_MODE_POS_VEL; 3]);
 
@@ -1092,7 +1284,8 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                 s.motors[1].regs.insert(damiao::RID_TMAX, 99.0f32.to_le_bytes());
             });
             let sup_rb = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv_rb)));
-            sup_rb.set_lease_enabled(false).await;
+            sup_rb.set_lease_enabled(true).await;
+            let _ = sup_rb.acquire_lease("rb-client").await.unwrap();
             sup_rb.enable_torque(sup_rb.capture_admission_stamp()).await.unwrap();
             bus_rb.with(|s| {
                 s.immediate_replies = false;
@@ -1142,13 +1335,13 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
                         plan: ModeSwitchPlan::switch_axes(
                             &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
                             ModeSwitchRecovery::RollbackToPrevious,
-                        ),
+                        )
+                        .unwrap(),
                         admission: sup_rb.capture_admission_stamp(),
                         operator_required: false,
                         operator_grant: OperatorGrant::unenforced(),
                         deadline: Instant::now() + Duration::from_secs(2),
                         client: ClientId(11),
-                        terminal_ticket: None,
                     },
                     Duration::from_secs(2),
                 )
@@ -1187,22 +1380,46 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
     assert_eq!(results[0], results[1], "Legacy and Executor energized switch parity");
 }
 
-/// Dual-owner test 3: Authority refusal (epoch mismatch / operator required) AND energized
-/// mid-write ambiguity -> same-release SAFE-HOLD (`SafeHoldReason::SessionUncertainState`) with
-/// 0 `CMD_DISABLE` frames produce identical outcomes on Legacy & Executor.
+/// Dual-owner test 3: Live lease enforcement (stale lease / epoch / operator required),
+/// energized mid-write ambiguity -> same-release SAFE-HOLD (`SafeHoldReason::SessionUncertainState`),
+/// SAFE-HOLD causal readback recovery of the uncertain axis (0 watchdog expiries, per-axis holds
+/// across J1–J6, 0 `CMD_DISABLE` frames), terminal poll coherence after SAFE-HOLD transition,
+/// and Legacy off-thread read-lock contention parity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
     let mut results = Vec::new();
     for owner in [OwnerKind::Legacy, OwnerKind::Executor] {
-        let h = OwnerHarness::start(owner, true, TIMEOUT_2000_COUNTS, true).await;
+        let h = OwnerHarness::start(owner, true, TIMEOUT_2000_COUNTS, true, true).await;
 
-        // 1. Authority check: stale epoch refused identically on both owners.
-        let mut stale_stamp = h.sup.capture_admission_stamp();
-        stale_stamp.estop_epoch = stale_stamp.estop_epoch.wrapping_add(99);
         let plan = ModeSwitchPlan::switch_axes(
             &[(0, ControlMode::Impedance)],
             ModeSwitchRecovery::FailClosed,
+        )
+        .unwrap();
+
+        // 1. Authority check: stale lease generation refused identically on both owners.
+        let mut stale_lease = h.sup.capture_admission_stamp();
+        stale_lease.lease_gen = stale_lease.lease_gen.wrapping_add(77);
+        let err_lease = h
+            .sup
+            .start_mode_switch_session(ModeSwitchStartRequest {
+                plan,
+                admission: stale_lease,
+                operator_required: false,
+                operator_grant: OperatorGrant::unenforced(),
+                deadline: Instant::now() + Duration::from_secs(2),
+                client: ClientId(20),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err_lease, ConfigError::LeaseLost),
+            "{owner:?}: expected LeaseLost, got {err_lease:?}"
         );
+
+        // 2. Authority check: stale epoch refused identically on both owners.
+        let mut stale_stamp = h.sup.capture_admission_stamp();
+        stale_stamp.estop_epoch = stale_stamp.estop_epoch.wrapping_add(99);
         let err_epoch = h
             .sup
             .start_mode_switch_session(ModeSwitchStartRequest {
@@ -1212,7 +1429,6 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
                 operator_grant: OperatorGrant::unenforced(),
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
-                terminal_ticket: None,
             })
             .await
             .unwrap_err();
@@ -1221,7 +1437,7 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             "{owner:?}: expected EpochMismatch, got {err_epoch:?}"
         );
 
-        // 2. Authority check: operator required with unenforced grant when operator_required=true.
+        // 3. Authority check: operator required with denied grant.
         let err_op = h
             .sup
             .start_mode_switch_session(ModeSwitchStartRequest {
@@ -1231,7 +1447,6 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
                 operator_grant: OperatorGrant::DENIED,
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
-                terminal_ticket: None,
             })
             .await
             .unwrap_err();
@@ -1244,11 +1459,40 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
         );
         assert!(op_is_rejected, "{owner:?}: expected OPERATOR_REQUIRED, got {err_op:?}");
 
-        // 3. Energized mid-write ambiguity (J1 drops write ACK) -> same-release SAFE-HOLD
-        //    (`SafeHoldReason::SessionUncertainState`), 0 CMD_DISABLE frames, motors stay enabled!
+        // 4. Plan validation check: Duration::MAX timeout refused at admission (Major 7).
+        let mut bad_plan = plan;
+        bad_plan.per_axis_timeout = Duration::MAX;
+        let err_bad = h
+            .sup
+            .start_mode_switch_session(ModeSwitchStartRequest {
+                plan: bad_plan,
+                admission: h.sup.capture_admission_stamp(),
+                operator_required: false,
+                operator_grant: OperatorGrant::unenforced(),
+                deadline: Instant::now() + Duration::from_secs(2),
+                client: ClientId(20),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err_bad,
+                ConfigError::CalibPrecondition {
+                    code: "INVALID_COMMAND",
+                    ..
+                }
+            ),
+            "{owner:?}: expected INVALID_COMMAND for overflowing timeout, got {err_bad:?}"
+        );
+
+        // 5. Energized mid-write ambiguity (J1 drops write ACK) -> same-release SAFE-HOLD
+        //    (`SafeHoldReason::SessionUncertainState`), SAFE-HOLD causally probes J1 CTRL_MODE
+        //    and resumes holding ALL 6 axes (0 watchdog expiries, 0 CMD_DISABLE frames).
+        //    On Legacy, also hold an off-thread read guard right after admission to prove Blocker 7
+        //    single-guard handoff completes without stalling on supervisor contention!
         h.bus.clear_log();
         h.bus.with(|s| s.motors[0].no_write_ack = true);
-        let _sid = h
+        let sid = h
             .sup
             .start_mode_switch_session(ModeSwitchStartRequest {
                 plan,
@@ -1257,7 +1501,6 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
                 operator_grant: OperatorGrant::unenforced(),
                 deadline: Instant::now() + Duration::from_secs(2),
                 client: ClientId(20),
-                terminal_ticket: None,
             })
             .await
             .unwrap();
@@ -1267,7 +1510,7 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             OwnerKind::Legacy => h.sup.legacy_safe_hold_control(),
         };
         let dl = Instant::now() + Duration::from_secs(3);
-        while (!sh.is_active() || sh.ticks() < 2) && Instant::now() < dl {
+        while (!sh.is_active() || sh.ticks() < 4) && Instant::now() < dl {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(sh.is_active(), "{owner:?}: energized ambiguity must enter SAFE-HOLD");
@@ -1276,20 +1519,51 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             SafeHoldReason::SessionUncertainState,
             "{owner:?}: SAFE-HOLD reason must be SessionUncertainState"
         );
-        assert!(sh.hold_tx_count() >= 1, "{owner:?}: SAFE-HOLD must emit hold frames");
+        assert!(sh.hold_tx_count() >= 2, "{owner:?}: SAFE-HOLD must emit hold frames");
         assert!(h.sup.internal_fault_fenced(), "{owner:?}: internal fault fence must be latched");
 
-        let (all_enabled, disables) = h.bus.with(|s| {
+        // Major 6 proof: polling the session AFTER SAFE-HOLD transition still returns the final
+        // Ambiguous terminal snapshot from StateHub!
+        let term_snap = h
+            .sup
+            .poll_mode_switch_session(sid)
+            .await
+            .unwrap()
+            .expect("terminal snapshot must remain readable from StateHub after SAFE-HOLD");
+        assert!(!term_snap.running);
+        assert!(term_snap.progress.is_ambiguous(), "{owner:?}: expected Ambiguous, got {:?}", term_snap.progress);
+
+        // Blocker 5 + Major 8 proof: per-axis hold frames observed on ALL 6 arm axes (including
+        // J1 recovered causally via SAFE-HOLD REG_READ(RID_CTRL_MODE)!), 0 CMD_DISABLE frames,
+        // 0 watchdog expiries, all motors enabled.
+        let (all_enabled, disables, expiries, per_axis_holds, saw_readback) = h.bus.with(|s| {
             let dis = s.tx_log.iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
-            (s.motors.iter().all(|m| m.enabled), dis)
+            let exp: usize = s.motors.iter().map(|m| m.watchdog_expiry_count).sum();
+            let mut per_axis = [0usize; 6];
+            for f in &s.tx_log {
+                if (0x101..=0x106).contains(&f.id) {
+                    per_axis[(f.id - 0x101) as usize] += 1;
+                } else if (1..=6).contains(&f.id) && f.data != damiao::CMD_ENABLE {
+                    per_axis[(f.id - 1) as usize] += 1;
+                }
+            }
+            let rb = s.tx_log.iter().any(|f| {
+                f.id == 0x7FF && f.data[0] == 1 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE
+            });
+            (s.motors.iter().all(|m| m.enabled), dis, exp, per_axis, rb)
         });
         assert!(all_enabled, "{owner:?}: all motors must remain enabled in SAFE-HOLD away from rest");
         assert_eq!(disables, 0, "{owner:?}: 0 CMD_DISABLE frames on SAFE-HOLD escalation");
+        assert_eq!(expiries, 0, "{owner:?}: 0 watchdog expiries (SAFE-HOLD causally recovered J1)");
+        assert!(saw_readback, "{owner:?}: SAFE-HOLD must causally probe REG_READ(RID_CTRL_MODE) for uncertain J1");
+        for (j, count) in per_axis_holds.iter().enumerate() {
+            assert!(*count >= 2, "{owner:?}: J{} must receive hold frames (got {count})", j + 1);
+        }
         if owner == OwnerKind::Executor {
             assert_eq!(h.sup.inner().control_thread_attempts(), 0, "0 SupervisorLock attempts on armd-control");
         }
 
-        results.push((true, op_is_rejected, sh.reason(), disables));
+        results.push((true, op_is_rejected, sh.reason(), disables, term_snap.progress.is_ambiguous()));
         h.shutdown(true).await;
     }
     assert_eq!(results[0], results[1], "Legacy and Executor authority & SAFE-HOLD parity");

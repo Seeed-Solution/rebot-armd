@@ -458,8 +458,9 @@ impl SafeHoldBuffers {
             ctrl.ticks.fetch_add(1, Ordering::Release);
             return;
         };
-        drv.set_tx_release_deadline(Some(drv_cap));
         let release_seq = ctrl.ticks.load(Ordering::Acquire).saturating_add(1);
+        drv.begin_control_release(0x8000_0000_0000_0000u64 | release_seq);
+        drv.set_tx_release_deadline(Some(drv_cap));
         let thermal_confirmed = ctrl.thermal_disable_confirmed.load(Ordering::Acquire);
         if let Some(ref mut sh) = shadow {
             sh.enqueue(crate::torque::shadow::ShadowInputKind::Release {
@@ -644,6 +645,7 @@ impl SafeHoldBuffers {
             }
         }
         let mut sent_hold_mask = 0u64;
+        let mut unverified_mask = 0u64;
         if hold_mask != 0 || self.gripper_is_pos_force {
             // Acknowledge any pending external E-stop/stop generations while keeping LATCH_BIT set
             // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
@@ -655,12 +657,15 @@ impl SafeHoldBuffers {
                     ctrl.hold_tx_count.fetch_add(1, Ordering::Release);
                 }
                 for j in 0..dof.min(report.dof) {
-                    if matches!(
-                        report.joint_status[j],
+                    match report.joint_status[j] {
                         crate::driver::JointHoldStatus::Held
-                            | crate::driver::JointHoldStatus::HeldStaleTarget
-                    ) {
-                        sent_hold_mask |= 1u64 << j;
+                        | crate::driver::JointHoldStatus::HeldStaleTarget => {
+                            sent_hold_mask |= 1u64 << j;
+                        }
+                        crate::driver::JointHoldStatus::UnheldNoVerifiedMode if j < 64 => {
+                            unverified_mask |= 1u64 << j;
+                        }
+                        _ => {}
                     }
                 }
                 if sent_hold_mask == 0 && report.sent_any {
@@ -679,6 +684,12 @@ impl SafeHoldBuffers {
                         sent_hold_mask |= 1u64 << j7;
                     }
                 }
+            }
+            if unverified_mask != 0 {
+                // Causally probe CTRL_MODE for any mode-uncertain joint (e.g. lost REG_WRITE ACK)
+                // so SAFE-HOLD can resume holding it in its verified mode without ever sending a
+                // guessed-mode frame or letting the 100 ms motor watchdog expire.
+                let _ = drv.request_mode_readback_budgeted(unverified_mask);
             }
             if let Some(ref mut sh) = shadow {
                 sh.drain_from_driver(drv);
