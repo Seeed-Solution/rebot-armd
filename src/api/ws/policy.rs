@@ -826,6 +826,22 @@ pub(super) async fn handle_executor_ws_policy(
         )));
     }
 
+    let load_use_guard = match recv_sandbox.try_begin_policy_load(&request.policy_id) {
+        Ok(g) => g,
+        Err(_) => {
+            return Some(Some(config::off_lock_command_reject(
+                &request_id_val,
+                epoch,
+                ArmError::Rejected {
+                    status: 404,
+                    code: "POLICY_NOT_FOUND".into(),
+                    message: format!("Policy pack '{}' not found", request.policy_id),
+                }
+                .into(),
+            )));
+        }
+    };
+
     let token_guard = match recv_supervisor.policy_cancel_slots().claim_slot() {
         Ok(g) => g,
         Err(code) => {
@@ -981,6 +997,9 @@ pub(super) async fn handle_executor_ws_policy(
         };
         let prepared = tokio::task::spawn_blocking(move || {
             let _backend_permit = backend_permit;
+            // Pin the policy pack for the entire blocking preparation so WS abort cannot release
+            // the pin while `prepare_policy` is still reading files from disk.
+            let load_use_guard = load_use_guard;
             let is_cancelled = || {
                 cancel_policy.load(Ordering::Acquire)
                     || cancel_slots_load.is_cancelled(cancel_slot_idx, cancel_token_val)
@@ -1097,6 +1116,7 @@ pub(super) async fn handle_executor_ws_policy(
                 verified_release_gate,
                 production_qualified_verified,
                 speed,
+                load_use_guard,
             ))
         })
         .await;
@@ -1121,6 +1141,7 @@ pub(super) async fn handle_executor_ws_policy(
                 verified_release_gate,
                 production_qualified_verified,
                 speed,
+                load_use_guard,
             ))) => {
                 let deadline_res =
                     crate::policy_runtime::compute_policy_deadline(max_seconds)
@@ -1339,8 +1360,11 @@ pub(super) async fn handle_executor_ws_policy(
                                         } else {
                                             None
                                         };
-                                        // Hand ownership of `token_guard` and `pending_qual_guard`
-                                        // directly into the runner BEFORE sending the WS ACK.
+                                        // Atomically transition load pin -> active-run pin and hand
+                                        // ownership alongside `token_guard` into the runner BEFORE
+                                        // sending the WS ACK.
+                                        let policy_run_use_guard =
+                                            Some(load_use_guard.into_active_run());
                                         crate::policy_runtime::spawn_executor_policy_runner(
                                             crate::policy_runtime::ExecutorPolicyRunParams {
                                                 supervisor: sup.clone(),
@@ -1360,6 +1384,7 @@ pub(super) async fn handle_executor_ws_policy(
                                                 has_driver,
                                                 token_guard,
                                                 pending_qual_guard,
+                                                policy_run_use_guard,
                                             },
                                         );
                                         let mut ack = off_lock_policy_ack(

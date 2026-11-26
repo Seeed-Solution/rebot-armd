@@ -291,7 +291,20 @@ impl MacroCtx {
     /// Report `phase` in `action.phase` (after a [`check`](Self::check)).
     pub async fn phase(&self, phase: &str, progress: f32) -> Result<(), Stop> {
         self.check().await?;
-        if !self.is_executor() {
+        if self.is_executor() {
+            let _ = self.sup.hub().push_action_diag(
+                crate::rt_core::action_diag::ActionDiagPatch {
+                    action_id: self.id,
+                    kind: crate::rt_core::action_diag::ActionDiagKind::Phase {
+                        phase: crate::rt_core::action_diag::ShortLabel::new_truncated(phase),
+                        progress,
+                        iteration: None,
+                        error_px: None,
+                        at: Instant::now(),
+                    },
+                },
+            );
+        } else {
             self.sup.inner().write().await.set_action_phase(self.id, phase, progress, None, None);
         }
         Ok(())
@@ -891,8 +904,10 @@ impl MacroCtx {
         let resolved = match resolved {
             Ok(p) => p,
             Err(e) => {
-                if !self.is_executor() {
-                    if let Some(detail) = e.workspace_detail() {
+                if let Some(detail) = e.workspace_detail() {
+                    if self.is_executor() {
+                        self.sup.hub().push_action_workspace_violation(self.id, detail);
+                    } else {
                         self.sup.inner().write().await.set_action_workspace_violation(self.id, detail);
                     }
                 }
@@ -937,6 +952,9 @@ impl MacroCtx {
             self.submit_child_slot_executor(&child_stamp, slot, true, None)
                 .await
                 .map_err(before)?;
+            if let Some(outcome) = resolved.outcome.as_ref() {
+                self.sup.hub().push_action_approach(self.id, outcome);
+            }
             child_spec.ticket
         } else {
             let mut inner = self.sup.inner().write().await;
@@ -987,7 +1005,32 @@ impl MacroCtx {
         let sub_res = self.wait_child(ticket).await;
         let ms = t0.elapsed().as_millis() as u32;
         let watch = self.child_watch(ticket).await;
-        if !self.is_executor() {
+        if self.is_executor() {
+            if let (Some(env), Some(snap)) = (self.sup.hub().prep_env(), self.sup.hub().latest()) {
+                let meas_opt = env.config.arm_model.fk_f32(&snap.rt.positions).map(|p| motion::end_to_frame(&p, &input));
+                let cmd_opt = env.config.arm_model.fk_f32(&snap.rt.commanded_positions).map(|p| motion::end_to_frame(&p, &input));
+                if let (Some(meas), Some(cmd)) = (meas_opt, cmd_opt) {
+                    let track_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &cmd.p)) * 1000.0) as f32;
+                    let track_deg = crate::kinematics::angle_between(&meas.r, &cmd.r).to_degrees() as f32;
+                    let goal_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &goal.p)) * 1000.0) as f32;
+                    let goal_deg = crate::kinematics::angle_between(&meas.r, &goal.r).to_degrees() as f32;
+                    let _ = self.sup.hub().push_action_diag(
+                        crate::rt_core::action_diag::ActionDiagPatch {
+                            action_id: self.id,
+                            kind: crate::rt_core::action_diag::ActionDiagKind::MotionDiag {
+                                phase: crate::rt_core::action_diag::ShortLabel::new_truncated(phase),
+                                ms,
+                                track_mm,
+                                track_deg,
+                                goal_mm,
+                                goal_deg,
+                                contact: None,
+                            },
+                        },
+                    );
+                }
+            }
+        } else {
             let mut inner = self.sup.inner().write().await;
             let meas_opt = inner.config.arm_model.fk_f32(&inner.measured_positions).map(|p| motion::end_to_frame(&p, &input));
             let cmd_opt = inner.config.arm_model.fk_f32(&inner.commanded_positions).map(|p| motion::end_to_frame(&p, &input));
@@ -1133,7 +1176,32 @@ impl MacroCtx {
         let sub_res = self.wait_child(ticket).await;
         let ms = t0.elapsed().as_millis() as u32;
         let watch = self.child_watch(ticket).await;
-        if !self.is_executor() {
+        if self.is_executor() {
+            if let (Some(env), Some(snap)) = (self.sup.hub().prep_env(), self.sup.hub().latest()) {
+                let meas_opt = env.config.arm_model.fk_f32(&snap.rt.positions).map(|p| motion::end_to_frame(&p, input));
+                let cmd_opt = env.config.arm_model.fk_f32(&snap.rt.commanded_positions).map(|p| motion::end_to_frame(&p, input));
+                if let (Some(meas), Some(cmd)) = (meas_opt, cmd_opt) {
+                    let track_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &cmd.p)) * 1000.0) as f32;
+                    let track_deg = crate::kinematics::angle_between(&meas.r, &cmd.r).to_degrees() as f32;
+                    let goal_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &goal.p)) * 1000.0) as f32;
+                    let goal_deg = crate::kinematics::angle_between(&meas.r, &goal.r).to_degrees() as f32;
+                    let _ = self.sup.hub().push_action_diag(
+                        crate::rt_core::action_diag::ActionDiagPatch {
+                            action_id: self.id,
+                            kind: crate::rt_core::action_diag::ActionDiagKind::MotionDiag {
+                                phase: crate::rt_core::action_diag::ShortLabel::new_truncated(phase),
+                                ms,
+                                track_mm,
+                                track_deg,
+                                goal_mm,
+                                goal_deg,
+                                contact: None,
+                            },
+                        },
+                    );
+                }
+            }
+        } else {
             let mut inner = self.sup.inner().write().await;
             let meas_opt = inner.config.arm_model.fk_f32(&inner.measured_positions).map(|p| motion::end_to_frame(&p, input));
             let cmd_opt = inner.config.arm_model.fk_f32(&inner.commanded_positions).map(|p| motion::end_to_frame(&p, input));

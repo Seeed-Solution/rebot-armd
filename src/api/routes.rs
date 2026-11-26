@@ -284,13 +284,13 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(POST   "/api/v1/auth/lock",   rest::auth_lock,   OwnerAgnostic, None, None, Allowed),
     // Calibration
     rr!(GET    "/api/v1/calibration",               rest::get_calibration,                 ExecutorRequest, None,     None, Allowed),
-    rr!(GET    "/api/v1/calibration/hover",         crate::calib_hover::get_jobs,          LegacyOnly,      None,     None, Allowed),
-    rr!(GET    "/api/v1/calibration/hover/{id}",    crate::calib_hover::get_job,           LegacyOnly,      None,     None, Allowed),
-    rr!(GET    "/api/v1/calibration/sessions",      crate::calibration_sessions::get_sessions, LegacyOnly,  None,     None, Allowed),
+    rr!(GET    "/api/v1/calibration/hover",         crate::calib_hover::get_jobs,          ExecutorRequest, None,     None, Allowed),
+    rr!(GET    "/api/v1/calibration/hover/{id}",    crate::calib_hover::get_job,           ExecutorRequest, None,     None, Allowed),
+    rr!(GET    "/api/v1/calibration/sessions",      crate::calibration_sessions::get_sessions, OwnerAgnostic, None,   None, Allowed),
     rr!(POST_LIMIT crate::calibration_sessions::MAX_BODY_BYTES,
-               "/api/v1/calibration/sessions",      crate::calibration_sessions::post_session, LegacyOnly,  Required, None, Fenced),
-    rr!(GET    "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::get_session,  LegacyOnly,  None,     None, Allowed),
-    rr!(DELETE "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::delete_session, LegacyOnly, Required, None, Fenced),
+               "/api/v1/calibration/sessions",      crate::calibration_sessions::post_session, OwnerAgnostic, Required, None, Fenced),
+    rr!(GET    "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::get_session,  OwnerAgnostic, None,   None, Allowed),
+    rr!(DELETE "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::delete_session, OwnerAgnostic, Required, None, Fenced),
     // Cockpit / static assets
     rr!(GET    "/",                       super::serve_index,        OwnerAgnostic, None, None, Allowed),
     rr!(GET    "/assets/jmuxer.min.js",   super::serve_jmuxer,       OwnerAgnostic, None, None, Allowed),
@@ -299,45 +299,45 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/assets/model/{*path}",   super::assets::serve_model, OwnerAgnostic, None, None, Allowed),
     rr!(GET    "/assets/wasm/{*path}",    super::assets::serve_wasm,  OwnerAgnostic, None, None, Allowed),
     // Sandbox
-    rr!(GET    "/api/v1/sandbox/catalog",                   sandbox::get_catalog,       LegacyOnly, None,     None, Allowed),
-    rr!(POST_UPLOAD "/api/v1/sandbox/scenes",               sandbox::upload_scene,      LegacyOnly, Required, None, Fenced),
-    rr!(GET    "/api/v1/sandbox/scenes/{id}",               sandbox::get_scene,         LegacyOnly, None,     None, Allowed),
-    rr!(GET    "/api/v1/sandbox/scenes/{id}/files/{*path}", sandbox::serve_scene_file,  LegacyOnly, None,     None, Allowed),
-    rr!(POST_UPLOAD "/api/v1/sandbox/tools",                sandbox::upload_tool,       LegacyOnly, Required, None, Fenced),
-    rr!(GET    "/api/v1/sandbox/tools/{id}",                sandbox::get_tool,          LegacyOnly, None,     None, Allowed),
-    rr!(GET    "/api/v1/sandbox/tools/{id}/files/{*path}",  sandbox::serve_tool_file,   LegacyOnly, None,     None, Allowed),
-    rr!(POST_UPLOAD "/api/v1/sandbox/policies",             sandbox::upload_policy,     LegacyOnly, Required, None, Fenced),
-    rr!(GET    "/api/v1/sandbox/policies/{id}",             sandbox::get_policy,        LegacyOnly, None,     None, Allowed),
-    rr!(DELETE "/api/v1/sandbox/policies/{id}",             sandbox::delete_policy,     LegacyOnly, Required, None, Fenced),
-    rr!(GET    "/api/v1/sandbox/policies/{id}/files/{*path}", sandbox::serve_policy_file, LegacyOnly, None,   None, Allowed),
-    rr!(GET    "/api/v1/sandbox/base-assets/{*path}",       sandbox::serve_base_asset,  LegacyOnly, None,     None, Allowed),
-    rr!(POST   "/api/v1/sandbox/activate",                  sandbox::activate,          LegacyOnly, Required, None, Fenced),
-    rr!(POST   "/api/v1/sandbox/recover-split",             sandbox::recover_split,     LegacyOnly, Required, None, Fenced),
-    rr!(GET    "/api/v1/sandbox/bundle",                    sandbox::get_bundle,        LegacyOnly, None,     None, Allowed),
-    rr!(GET    "/api/v1/sandbox/state",                     sandbox::get_state,         LegacyOnly, None,     None, Allowed),
-    rr!(POST   "/api/v1/sandbox/reset",                     sandbox::reset,             LegacyOnly, Required, None, Fenced),
-    rr!(POST   "/api/v1/sandbox/io",                        sandbox::set_io,            LegacyOnly, Required, None, Fenced),
-    rr!(POST   "/api/v1/sandbox/telemetry",                 sandbox::post_telemetry,    LegacyOnly, Required, None, Fenced),
+    rr!(GET    "/api/v1/sandbox/catalog",                   sandbox::get_catalog,       ExecutorRequest, None,     None, Allowed),
+    rr!(POST_UPLOAD "/api/v1/sandbox/scenes",               sandbox::upload_scene,      OwnerAgnostic,   Required, None, Fenced),
+    rr!(GET    "/api/v1/sandbox/scenes/{id}",               sandbox::get_scene,         OwnerAgnostic,   None,     None, Allowed),
+    rr!(GET    "/api/v1/sandbox/scenes/{id}/files/{*path}", sandbox::serve_scene_file,  OwnerAgnostic,   None,     None, Allowed),
+    rr!(POST_UPLOAD "/api/v1/sandbox/tools",                sandbox::upload_tool,       OwnerAgnostic,   Required, None, Fenced),
+    rr!(GET    "/api/v1/sandbox/tools/{id}",                sandbox::get_tool,          OwnerAgnostic,   None,     None, Allowed),
+    rr!(GET    "/api/v1/sandbox/tools/{id}/files/{*path}",  sandbox::serve_tool_file,   OwnerAgnostic,   None,     None, Allowed),
+    rr!(POST_UPLOAD "/api/v1/sandbox/policies",             sandbox::upload_policy,     OwnerAgnostic,   Required, None, Fenced),
+    rr!(GET    "/api/v1/sandbox/policies/{id}",             sandbox::get_policy,        OwnerAgnostic,   None,     None, Allowed),
+    rr!(DELETE "/api/v1/sandbox/policies/{id}",             sandbox::delete_policy,     ExecutorRequest, Required, None, Fenced),
+    rr!(GET    "/api/v1/sandbox/policies/{id}/files/{*path}", sandbox::serve_policy_file, OwnerAgnostic, None,     None, Allowed),
+    rr!(GET    "/api/v1/sandbox/base-assets/{*path}",       sandbox::serve_base_asset,  OwnerAgnostic,   None,     None, Allowed),
+    rr!(POST   "/api/v1/sandbox/activate",                  sandbox::activate,          ExecutorRequest, Required, None, Fenced),
+    rr!(POST   "/api/v1/sandbox/recover-split",             sandbox::recover_split,     ExecutorRequest, Required, None, Fenced),
+    rr!(GET    "/api/v1/sandbox/bundle",                    sandbox::get_bundle,        ExecutorRequest, None,     None, Allowed),
+    rr!(GET    "/api/v1/sandbox/state",                     sandbox::get_state,         OwnerAgnostic,   None,     None, Allowed),
+    rr!(POST   "/api/v1/sandbox/reset",                     sandbox::reset,             OwnerAgnostic,   Required, None, Fenced),
+    rr!(POST   "/api/v1/sandbox/io",                        sandbox::set_io,            OwnerAgnostic,   Required, None, Fenced),
+    rr!(POST   "/api/v1/sandbox/telemetry",                 sandbox::post_telemetry,    OwnerAgnostic,   Required, None, Fenced),
     // Core observation, torque, heartbeat, motion, actions
     rr!(GET    "/api/v1/observation",               rest::get_observation,        ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/observation/schema",        rest::get_observation_schema, ExecutorRequest, None,      None,              Allowed),
     rr!(POST   "/api/v1/torque",                    rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/arm",                       rest::set_torque,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/heartbeat",                 rest::heartbeat,              ExecutorRequest, None,      None,              Fenced),
-    rr!(POST   "/api/v1/motion/jog",                rest::motion_jog,             LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/motion/home",               rest::motion_home,            LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/motion/unload",             rest::motion_unload,          LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/motion/jog",                rest::motion_jog,             ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/motion/home",               rest::motion_home,            ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/motion/unload",             rest::motion_unload,          ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/motion/servo",              rest::motion_servo,           ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/action/move_to",            rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/action/move_relative",      rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/action/gripper",            rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/move_to",            rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/move_relative",      rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/gripper",            rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/action/gripper_zero_check", rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/action/grasp",              rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/action/move_to_pose",       rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/action/place",              rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/action/replay",             rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   crate::measure_multiview::PATH,      rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/mode/gravity_comp",         rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/move_to_pose",       rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/place",              rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/replay",             rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   crate::measure_multiview::PATH,      rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/mode/gravity_comp",         rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     #[cfg(feature = "policy-runtime")]
     rr!(POST   "/api/v1/action/policy/start",       rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     #[cfg(feature = "policy-runtime")]
@@ -347,7 +347,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/tool/commissioning",        rest::get_tool_commissioning,       ExecutorRequest, None,      None,              Allowed),
     rr!(POST   "/api/v1/tool/commissioning/confirm", rest::post_tool_commissioning_confirm, ExecutorRequest, Required, None,           Fenced),
     rr!(GET    "/api/v1/grasp/setup",               rest::get_grasp_setup,              ExecutorRequest, None,      None,              Allowed),
-    rr!(POST   crate::depth_measure::PATH,          rest::post_grasp_measure,           LegacyOnly,      Required,  None,              Fenced),
+    rr!(POST   crate::depth_measure::PATH,          rest::post_grasp_measure,           ExecutorRequest, Required,  None,              Fenced),
     rr!(GET    "/api/v1/workspace/keepout",         rest::get_keepout,                  ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/safety/collision",          rest::get_collision,                ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/safety/describe",           rest::get_safety_describe,          ExecutorRequest, None,      None,              Allowed),
@@ -367,7 +367,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/datasets",                  rest::get_datasets,                 LegacyOnly,      None,      None,              Allowed),
     rr!(GET    "/api/v1/sequences",                 rest::get_sequences,                ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/sequences/{id}",            rest::get_sequence,                 ExecutorRequest, None,      None,              Allowed),
-    rr!(POST   "/api/v1/action/run_sequence",       rest::action_requires_lease,        LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/run_sequence",       rest::action_requires_lease,        ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(GET    "/api/v1/diagnostics",               diagnostics::get_diagnostics,       ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/diagnostics/boots",         diagnostics::get_boots,             OwnerAgnostic,   None,      None,              Allowed),
     rr!(GET    "/api/v1/diagnostics/blackbox",      diagnostics::get_blackbox,          OwnerAgnostic,   None,      None,              Allowed),
@@ -376,24 +376,23 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/diagnostics/power",         diagnostics::get_power,             LegacyOnly,      None,      None,              Allowed),
     rr!(GET    "/api/v1/ws",                        super::ws::ws_handler,              ExecutorRequest, None,      None,              Allowed),
     // Reverse proxy & vision routes
-    rr!(GET    "/api/v1/detection/ws",              proxy::proxy_detection_ws,          LegacyOnly,      None,      None,              Allowed),
-    rr!(GET    "/results",                          proxy::proxy_detection_ws,          LegacyOnly,      None,      None,              Allowed),
-    rr!(GET    "/api/v1/detection/inference",       proxy::get_detection_inference,     LegacyOnly,      None,      None,              Allowed),
-    rr!(POST   "/api/v1/detection/inference",       proxy::post_detection_inference,    LegacyOnly,      Required,  None,              Fenced),
-    rr!(GET    "/api/v1/detection/latest",          proxy::get_detection_latest,        LegacyOnly,      None,      None,              Allowed),
-    rr!(GET    "/api/v1/camera/snapshot",           proxy::get_camera_snapshot,         LegacyOnly,      None,      None,              Allowed),
-    rr!(POST   "/api/v1/detection/trigger",         proxy::post_detection_trigger,      LegacyOnly,      Required,  None,              Fenced),
-    rr!(GET    "/api/v1/detection/mask_focus",      proxy::get_detection_mask_focus,    LegacyOnly,      None,      None,              Allowed),
-    rr!(POST   "/api/v1/detection/mask_focus",      proxy::post_detection_mask_focus,   LegacyOnly,      Required,  None,              Fenced),
-    // Reference adapter (PR0A): stateless vision mode proxy read classified OwnerAgnostic.
+    rr!(GET    "/api/v1/detection/ws",              proxy::proxy_detection_ws,          OwnerAgnostic,   None,      None,              Allowed),
+    rr!(GET    "/results",                          proxy::proxy_detection_ws,          OwnerAgnostic,   None,      None,              Allowed),
+    rr!(GET    "/api/v1/detection/inference",       proxy::get_detection_inference,     OwnerAgnostic,   None,      None,              Allowed),
+    rr!(POST   "/api/v1/detection/inference",       proxy::post_detection_inference,    OwnerAgnostic,   Required,  None,              Fenced),
+    rr!(GET    "/api/v1/detection/latest",          proxy::get_detection_latest,        OwnerAgnostic,   None,      None,              Allowed),
+    rr!(GET    "/api/v1/camera/snapshot",           proxy::get_camera_snapshot,         OwnerAgnostic,   None,      None,              Allowed),
+    rr!(POST   "/api/v1/detection/trigger",         proxy::post_detection_trigger,      OwnerAgnostic,   Required,  None,              Fenced),
+    rr!(GET    "/api/v1/detection/mask_focus",      proxy::get_detection_mask_focus,    OwnerAgnostic,   None,      None,              Allowed),
+    rr!(POST   "/api/v1/detection/mask_focus",      proxy::post_detection_mask_focus,   OwnerAgnostic,   Required,  None,              Fenced),
     rr!(GET    "/api/v1/vision/mode",               proxy::get_vision_mode,             OwnerAgnostic,   None,      None,              Allowed),
-    rr!(POST   "/api/v1/vision/mode",               proxy::post_vision_mode,            LegacyOnly,      Required,  None,              Fenced),
-    rr!(POST   crate::vision_detector::PATH,        rest::post_vision_detector,         LegacyOnly,      Required,  None,              Fenced),
-    rr!(POST   "/api/v1/vision/subscribe",          proxy::post_vision_subscribe,       LegacyOnly,      Required,  None,              Fenced),
-    rr!(DELETE "/api/v1/vision/subscribe/{id}",     proxy::delete_vision_subscribe,     LegacyOnly,      Required,  None,              Fenced),
-    rr!(POST   "/api/v1/vision/subscribe/{id}/keepalive", proxy::post_vision_keepalive, LegacyOnly,      Required,  None,              Fenced),
-    rr!(GET    "/api/v1/vision/subscriptions",      proxy::get_vision_subscriptions,    LegacyOnly,      None,      None,              Allowed),
-    rr!(GET    "/api/v1/vision/depth",              proxy::get_vision_depth,            LegacyOnly,      Required,  None,              Allowed),
+    rr!(POST   "/api/v1/vision/mode",               proxy::post_vision_mode,            OwnerAgnostic,   Required,  None,              Fenced),
+    rr!(POST   crate::vision_detector::PATH,        rest::post_vision_detector,         ExecutorRequest, Required,  None,              Fenced),
+    rr!(POST   "/api/v1/vision/subscribe",          proxy::post_vision_subscribe,       OwnerAgnostic,   Required,  None,              Fenced),
+    rr!(DELETE "/api/v1/vision/subscribe/{id}",     proxy::delete_vision_subscribe,     OwnerAgnostic,   Required,  None,              Fenced),
+    rr!(POST   "/api/v1/vision/subscribe/{id}/keepalive", proxy::post_vision_keepalive, OwnerAgnostic,   Required,  None,              Fenced),
+    rr!(GET    "/api/v1/vision/subscriptions",      proxy::get_vision_subscriptions,    OwnerAgnostic,   None,      None,              Allowed),
+    rr!(GET    "/api/v1/vision/depth",              proxy::get_vision_depth,            OwnerAgnostic,   Required,  None,              Allowed),
     #[cfg(feature = "policy-runtime")]
     rr!(POST   "/api/v1/vision/clock-handshake",    super::post_vision_clock_handshake, ExecutorRequest, Required,  None,              Fenced),
     #[cfg(feature = "policy-runtime")]
@@ -737,10 +736,22 @@ mod tests {
         );
         assert_eq!(
             lookup(RouteKey::rest(RestMethod::Post, "/api/v1/vision/mode")).unwrap().ownership,
-            RouteOwnership::LegacyOnly
+            RouteOwnership::OwnerAgnostic
         );
         assert_eq!(
             lookup(RouteKey::rest(RestMethod::Post, "/api/v1/motion/jog")).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Post, crate::depth_measure::PATH)).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::ws_command(crate::depth_measure::PATH)).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Post, "/api/v1/dataset/record/start")).unwrap().ownership,
             RouteOwnership::LegacyOnly
         );
         assert_eq!(
@@ -858,6 +869,7 @@ mod tests {
             );
         }
 
+        // POST /api/v1/vision/mode is OwnerAgnostic (requires operator auth when enforced).
         let post_mode = router
             .clone()
             .oneshot(
@@ -870,11 +882,26 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(post_mode.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let post_body = axum::body::to_bytes(post_mode.into_body(), 4096).await.unwrap();
+        assert_eq!(post_mode.status(), StatusCode::FORBIDDEN);
+
+        // Unmigrated LegacyOnly route (POST /api/v1/dataset/record/start) still returns 503 EXECUTOR_ROUTING_PENDING.
+        let legacy_rec = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/dataset/record/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_rec.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let legacy_body = axum::body::to_bytes(legacy_rec.into_body(), 4096).await.unwrap();
         assert!(
-            String::from_utf8_lossy(&post_body).contains("EXECUTOR_ROUTING_PENDING"),
-            "POST /api/v1/vision/mode must remain LegacyOnly: {post_body:?}"
+            String::from_utf8_lossy(&legacy_body).contains("EXECUTOR_ROUTING_PENDING"),
+            "POST /api/v1/dataset/record/start must remain LegacyOnly: {legacy_body:?}"
         );
 
         // Executor: OPTIONS /api/v1/observation fails closed with 503 EXECUTOR_ROUTING_PENDING.

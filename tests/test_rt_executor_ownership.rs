@@ -1931,8 +1931,24 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         )
         .await
         .unwrap();
-    assert_eq!(jog_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = axum::body::to_bytes(jog_resp.into_body(), 4096).await.unwrap();
+    assert_eq!(jog_resp.status(), StatusCode::CONFLICT);
+    let jog_body = axum::body::to_bytes(jog_resp.into_body(), 4096).await.unwrap();
+    assert!(String::from_utf8_lossy(&jog_body).contains("LEASE_REQUIRED"), "{jog_body:?}");
+
+    let legacy_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dataset/record/start")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(legacy_resp.into_body(), 4096).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("EXECUTOR_ROUTING_PENDING"), "{body:?}");
 
     // Stage 3 §2 A1: `/api/v1/ws` is allowed through the executor gate (for WS E-stop and
@@ -2446,8 +2462,18 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
         .send()
         .await
         .unwrap();
-    assert_eq!(jog_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert!(jog_resp.text().await.unwrap().contains("EXECUTOR_ROUTING_PENDING"));
+    assert_eq!(jog_resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(jog_resp.text().await.unwrap().contains("LEASE_REQUIRED"));
+
+    let legacy_rec_url = format!("http://127.0.0.1:{port}/api/v1/dataset/record/start");
+    let legacy_resp = client
+        .post(&legacy_rec_url)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(legacy_resp.text().await.unwrap().contains("EXECUTOR_ROUTING_PENDING"));
 
     // Send SIGTERM and verify clean shutdown exit (0).
     // SAFETY: valid PID of child process spawned above.

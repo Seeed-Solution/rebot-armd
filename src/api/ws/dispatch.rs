@@ -746,7 +746,14 @@ fn validate_entry(entry: &DispatchEntry) {
             assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);
             assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::CommandDeferred, "{:?}", entry.key);
-            assert_eq!(entry.executor_route, ExecutorWsRoute::None, "{:?}", entry.key);
+            assert!(
+                matches!(
+                    entry.executor_route,
+                    ExecutorWsRoute::None | ExecutorWsRoute::Unified
+                ),
+                "LeaseFree handler must use None (LegacyOnly) or Unified executor route: {:?}",
+                entry.key
+            );
         }
         DispatchHandler::Owner(_) => {
             assert!(

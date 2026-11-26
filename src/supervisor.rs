@@ -3689,6 +3689,10 @@ impl SupervisorInner {
                 let action_id = a.id;
                 let seq = self.alloc_terminal_seq();
                 let _ = self.terminal_edge_tracker.record_edge(action_id, seq);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.core
+                    .hub()
+                    .record_action_terminal_cutoff_rt(action_id, self.start_time.elapsed());
                 let ts = self.now_s();
                 if let Some(oldest) = self.staged_terminals.push_evicting_oldest(
                     terminal_capture::StagedTerminal::Deferred {
@@ -4586,6 +4590,7 @@ impl SupervisorInner {
             owner,
             rt,
             policy_diag_seq: 0,
+            action_diag_seq: 0,
         }
     }
 
@@ -6768,6 +6773,8 @@ impl SupervisorInner {
             policy_busy,
             zero_check_persisting: self.zero_check_persisting.is_some(),
             torque_or_power_hold: self.torque_guard.hold.is_some() || self.power.gov.hold.is_some(),
+            watchdog_park_active: self.watchdog_park.is_some(),
+            active_lease_present: self.active_lease.is_some(),
             held,
             macro_state,
         }
@@ -13347,6 +13354,7 @@ impl ArmSupervisor {
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
+        hub.set_boot_instant(inner.start_time);
         #[cfg(feature = "policy-runtime")]
         hub.attach_policy_diag_seal(atomic_diag_sealed_policy_action_id.clone());
         hub.update_prep_env(Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner)));
@@ -13865,41 +13873,66 @@ impl ArmSupervisor {
     }
 
     /// Owner-aware storage of a `calib_hover` job record (never touches `SupervisorLock` in
-    /// `OWNER_EXECUTOR` mode).
+    /// `OWNER_EXECUTOR` mode, and re-checks detachment if a handoff lands while waiting on the
+    /// legacy write lock).
     pub async fn put_hover_job(&self, job: crate::calib_hover::HoverJob) {
         if self.owner_mode() == OWNER_EXECUTOR {
-            let mut jobs = self
-                .executor_hover_jobs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            jobs.retain(|j| j.id != job.id);
-            jobs.push(job);
-            let n = jobs.len();
-            if n > crate::calib_hover::KEEP_JOBS {
-                jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+            self.put_executor_hover_job(job);
+            return;
+        }
+        let mut inner = self.inner().write().await;
+        if inner.detached {
+            drop(inner);
+            if self.owner_mode() == OWNER_EXECUTOR {
+                self.put_executor_hover_job(job);
             }
-        } else {
-            let mut inner = self.inner().write().await;
-            inner.hover_jobs.retain(|j| j.id != job.id);
-            inner.hover_jobs.push(job);
-            let n = inner.hover_jobs.len();
-            if n > crate::calib_hover::KEEP_JOBS {
-                inner.hover_jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
-            }
+            return;
+        }
+        inner.hover_jobs.retain(|j| j.id != job.id);
+        inner.hover_jobs.push(job);
+        let n = inner.hover_jobs.len();
+        if n > crate::calib_hover::KEEP_JOBS {
+            inner.hover_jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+        }
+    }
+
+    fn put_executor_hover_job(&self, job: crate::calib_hover::HoverJob) {
+        let mut jobs = self
+            .executor_hover_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|j| j.id != job.id);
+        jobs.push(job);
+        let n = jobs.len();
+        if n > crate::calib_hover::KEEP_JOBS {
+            jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
         }
     }
 
     /// Owner-aware snapshot of stored `calib_hover` jobs (never touches `SupervisorLock` in
-    /// `OWNER_EXECUTOR` mode).
+    /// `OWNER_EXECUTOR` mode, and re-checks detachment if a handoff lands while waiting on the
+    /// legacy read lock).
     pub async fn hover_jobs_snapshot(&self) -> Vec<crate::calib_hover::HoverJob> {
         if self.owner_mode() == OWNER_EXECUTOR {
-            self.executor_hover_jobs
+            return self
+                .executor_hover_jobs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        } else {
-            self.inner().read().await.hover_jobs.clone()
+                .clone();
         }
+        let inner = self.inner().read().await;
+        if inner.detached {
+            drop(inner);
+            if self.owner_mode() == OWNER_EXECUTOR {
+                return self
+                    .executor_hover_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+            }
+            return Vec::new();
+        }
+        inner.hover_jobs.clone()
     }
 
     /// Current live `SequenceStore::revision` mirror used to linearize episode deletes against
@@ -14267,6 +14300,7 @@ impl ArmSupervisor {
 
         let initial_gen = self.inner.generation();
         let candidate_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&guard);
+        let staged_hover_jobs = guard.hover_jobs.clone();
         let staged_service_identity = Arc::new(
             crate::rt_core::publish::ServiceIdentity::from_published_config(
                 guard.core.id(),
@@ -14417,6 +14451,10 @@ impl ArmSupervisor {
                     crate::rt_core::sched::set_readiness(readiness);
                 }
                 self.published_config.publish(candidate_pub_cfg, initial_gen);
+                *self
+                    .executor_hover_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = staged_hover_jobs;
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
                 self.executor_base_gen.store(initial_gen, Ordering::Release);
                 {
@@ -14659,6 +14697,11 @@ impl ArmSupervisor {
                     self.torque_shadow.wake();
                 }
                 *guard = *core;
+                guard.hover_jobs = self
+                    .executor_hover_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
                 guard.purge_closed_live_connections();
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -15627,6 +15670,7 @@ impl ArmSupervisor {
                     if let Some(h) = self.executor_handle() {
                         if let Ok(mut obs) = h.observation_async().await {
                             self.hub.attach_action_measurement(&mut obs);
+                            self.hub.attach_action_diag(&mut obs);
                             return obs;
                         }
                     }
@@ -15643,6 +15687,7 @@ impl ArmSupervisor {
                 if let Some(h) = self.executor_handle() {
                     if let Ok(mut obs) = h.observation_async().await {
                         self.hub.attach_action_measurement(&mut obs);
+                        self.hub.attach_action_diag(&mut obs);
                         return obs;
                     }
                 }
@@ -19220,6 +19265,7 @@ fn dispatch_loop(
     }
     let mut last = 0u64;
     let mut last_diag = 0u64;
+    let mut last_action_diag = 0u64;
     let mut latest_snap: Option<Arc<crate::rt_core::publish::Snapshot>> = None;
     let mut pending_telemetry: Option<ArmObservation> = None;
     while !hub.is_closed() {
@@ -19232,20 +19278,23 @@ fn dispatch_loop(
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
                 last_diag = last_diag.max(s.policy_diag_seq);
+                last_action_diag = last_action_diag.max(s.action_diag_seq);
                 pending_telemetry = Some(s.obs.clone());
                 latest_snap = Some(s);
             }
-        } else if hub.policy_diag_seq() != last_diag {
+        } else if hub.policy_diag_seq() != last_diag || hub.action_diag_seq() != last_action_diag {
             if let Some(s) = hub.latest() {
                 if s.meta.seq > last {
                     last = s.meta.seq;
                     last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
-                } else if s.policy_diag_seq > last_diag {
-                    last_diag = s.policy_diag_seq;
-                    // Diagnostic-only overlay update (Shadow steps / timing stats): forward
-                    // telemetry without re-enqueuing action terminals.
+                } else if s.policy_diag_seq > last_diag || s.action_diag_seq > last_action_diag {
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
+                    // Diagnostic-only overlay update (Shadow steps / timing stats / grasp diag
+                    // stream patch): forward telemetry without re-enqueuing action terminals.
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
                 }
@@ -19268,6 +19317,7 @@ fn dispatch_loop(
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
                 last_diag = last_diag.max(s.policy_diag_seq);
+                last_action_diag = last_action_diag.max(s.action_diag_seq);
                 pending_telemetry = Some(s.obs.clone());
                 latest_snap = Some(s);
                 let _ = terminal_capture.drain_into(
@@ -19301,6 +19351,7 @@ fn dispatch_loop(
                 if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                     last = s.meta.seq;
                     last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
                     let _ = terminal_capture.drain_into(

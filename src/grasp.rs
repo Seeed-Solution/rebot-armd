@@ -3386,7 +3386,11 @@ pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp)
     let has_task_reqs = request.task.as_deref().is_some_and(|_| !request.requires.is_empty() || request.models.is_some());
     if has_task_reqs {
         let task = request.task.as_deref().unwrap();
-        let _serial = if request.models.is_some() { Some(MODEL_SWITCH.lock().await) } else { None };
+        let _serial = if request.models.is_some() {
+            Some(crate::vision_detector::begin_grasp_model_switch().await)
+        } else {
+            None
+        };
         let mut mode = source.mode_info().await;
         if let (Some(models), Ok(m)) = (&request.models, &mode) {
             if let Some(body) = models.switch_body(m) {
@@ -4046,10 +4050,34 @@ impl std::ops::Deref for Orchestrator {
 }
 
 impl Orchestrator {
-    /// Applies a diagnostic `ActionStatus` update on Legacy owner only (0 lock on `OWNER_EXECUTOR`).
+    /// Applies a diagnostic `ActionStatus` update on Legacy owner, or emits a stream patch via
+    /// `rt_core::stream` on `OWNER_EXECUTOR` (0 `SupervisorLock`, 0 RT allocation).
     async fn update_action_if_legacy(&self, f: impl FnOnce(&mut crate::motion::ActionStatus)) {
         if !self.is_executor() {
             self.sup.inner().write().await.update_action(self.id, f);
+        }
+    }
+
+    fn emit_diag(&self, kind: crate::rt_core::action_diag::ActionDiagKind) {
+        if self.is_executor() {
+            let _ = self.sup.hub().push_action_diag(
+                crate::rt_core::action_diag::ActionDiagPatch {
+                    action_id: self.id,
+                    kind,
+                },
+            );
+        }
+    }
+
+    fn emit_estimates(
+        &self,
+        list: crate::rt_core::action_diag::EstimateListKind,
+        entries: &[crate::motion::EstimateEntry],
+    ) {
+        if self.is_executor() {
+            self.sup
+                .hub()
+                .push_action_estimates(self.id, list, entries);
         }
     }
 
@@ -4145,8 +4173,12 @@ impl Orchestrator {
         let (goal, _yaw_free) = motion::resolve_goal_ex(&input, &spec);
         let goal_end = motion::goal_to_end(&goal, &input);
         if let Some(e) = table_violation(&input.arm.fk(&input.q0), &goal_end, &self.envelope, self.setup.table_z_m) {
-            if !self.is_executor() {
-                if let MotionError::WorkspaceViolation { ref detail, .. } = e {
+            if let MotionError::WorkspaceViolation { ref detail, .. } = e {
+                if self.is_executor() {
+                    self.sup
+                        .hub()
+                        .push_action_workspace_violation(self.id, (**detail).clone());
+                } else {
                     self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
                 }
             }
@@ -5130,10 +5162,16 @@ impl Orchestrator {
             Ok(pair) => pair,
             Err((stop, _)) => return Err(stop),
         };
-        if !self.is_executor() {
-            let contact_h = watch
-                .contact_joint
-                .map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m);
+        let contact_h = watch
+            .contact_joint
+            .map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m);
+        if self.is_executor() {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::DescendContact {
+                peak_residual_nm: watch.peak_residual_nm,
+                peak_tracking_rad: watch.peak_tracking_rad,
+                contact_height_m: contact_h.map(|h| h as f32),
+            });
+        } else {
             self.update_action_if_legacy(|a| {
                 a.descend_peak_residual_nm = watch.peak_residual_nm;
                 a.descend_peak_tracking_rad = watch.peak_tracking_rad;
@@ -5195,6 +5233,7 @@ impl Orchestrator {
             .run_gripper_fenced("close", 0.70, GripperCommand::Close, None, true, rev)
             .await?;
         if let Some(w) = self.held_width_m().await {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::HeldWidth { held_width_m: w });
             self.update_action_if_legacy(|a| a.held_width_m = Some(w)).await;
         }
         if closed.holding != Some(true) {
@@ -5359,9 +5398,17 @@ impl Orchestrator {
         self.phase("lift_confirm", 0.95).await?;
         let (held, gap) = self.holding_now_fenced(Some(rev)).await?;
         if held {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PostLift {
+                kind: crate::rt_core::action_diag::PostLiftKind::Held,
+                gripper_gap_rad: None,
+            });
             self.update_action_if_legacy(|a| a.post_lift = Some("held".into())).await;
             return Ok((true, closed.gripper_gap_rad.or(Some(gap))));
         }
+        self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PostLift {
+            kind: crate::rt_core::action_diag::PostLiftKind::Dropped,
+            gripper_gap_rad: Some(gap),
+        });
         self.update_action_if_legacy(|a| {
             a.post_lift = Some("dropped".into());
             a.gripper_gap_rad = Some(gap);
@@ -5401,7 +5448,11 @@ impl Orchestrator {
             let height = goal.p[2] - s.table_z_m;
             if height > s.approach_height_m + 1e-6 {
                 tracing::info!("Grasp {}: camera-down acquisition at {height:.3} m (approach_height_m {:.3}) for table clearance", self.id, s.approach_height_m);
-                if !self.is_executor() {
+                if self.is_executor() {
+                    self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::AcquireHeight {
+                        height_m: height as f32,
+                    });
+                } else {
                     self.sup.inner().write().await.set_action_acquire_height(self.id, height as f32);
                 }
             }
@@ -5435,9 +5486,18 @@ impl Orchestrator {
         let shifted = centred_at != aim_px;
         let cut = c.frames.iter().any(|d| touches_border(&d.box_norm, self.cam.size));
         if shifted || cut {
+            let shift_px = shifted.then(|| [(centred_at[0] - aim_px[0]) as f32, (centred_at[1] - aim_px[1]) as f32]);
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Border {
+                kind: if cut {
+                    crate::rt_core::action_diag::BorderKind::Cut
+                } else {
+                    crate::rt_core::action_diag::BorderKind::Shifted
+                },
+                shift_px,
+            });
             self.update_action_if_legacy(|a| {
                 a.border = Some(if cut { "cut" } else { "shifted" }.into());
-                a.border_shift_px = shifted.then(|| [(centred_at[0] - aim_px[0]) as f32, (centred_at[1] - aim_px[1]) as f32]);
+                a.border_shift_px = shift_px;
             }).await;
         }
         let last = c.last.clone();
@@ -5496,18 +5556,47 @@ impl Orchestrator {
                 plane = s.table_z_m + s.grasp_height_m.max(h);
                 close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
                 tracing::info!("Grasp {}: object top {h:.3} m above the table ({source}), closing at {close_h:.3} m", self.id);
-                self.update_action_if_legacy(|a| {
-                    a.height_source = Some(if depth_chosen { "depth".into() } else { source });
-                    a.object_height_m = Some(h as f32);
-                }).await;
+                let src_label = if depth_chosen { "depth".to_string() } else { source };
+                if self.is_executor() {
+                    self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::HeightDecision {
+                        source: crate::rt_core::action_diag::ShortLabel::new_truncated(&src_label),
+                        object_height_m: Some(h as f32),
+                        reason: None,
+                    });
+                } else {
+                    self.update_action_if_legacy(|a| {
+                        a.height_source = Some(src_label);
+                        a.object_height_m = Some(h as f32);
+                    }).await;
+                }
             }
-            None => self.update_action_if_legacy(|a| {
-                a.height_source = Some("setup".into());
-                a.height_reason = (!reasons.is_empty()).then(|| reasons.join(","));
-            }).await,
+            None => {
+                let joined = (!reasons.is_empty()).then(|| reasons.join(","));
+                if self.is_executor() {
+                    let reason = joined
+                        .as_deref()
+                        .map(|r| self.sup.hub().intern_action_diag_str(self.id, r));
+                    self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::HeightDecision {
+                        source: crate::rt_core::action_diag::ShortLabel::new_truncated("setup"),
+                        object_height_m: None,
+                        reason,
+                    });
+                } else {
+                    self.update_action_if_legacy(|a| {
+                        a.height_source = Some("setup".into());
+                        a.height_reason = joined;
+                    }).await;
+                }
+            }
         }
         // depth measurement fields: when depth decided or is record-only (diagnostic)
         if let Some(meas) = depth_meas.as_ref().filter(|_| depth_chosen || record.contains(&HeightSource::Depth)) {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::DepthMeasurement {
+                anchor: crate::rt_core::action_diag::ShortLabel::new_truncated(meas.source),
+                object_depth_m: meas.depth_m as f32,
+                object_length_m: meas.length_m.map(|l| l as f32),
+                jaw_clear: meas.jaw_clear,
+            });
             self.update_action_if_legacy(|a| {
                 a.depth_anchor = Some(meas.source.into());
                 a.object_depth_m = Some(meas.depth_m as f32);
@@ -5515,6 +5604,9 @@ impl Orchestrator {
                 a.jaw_clear = meas.jaw_clear;
             }).await;
         }
+        self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::CloseHeight {
+            close_height_m: close_h as f32,
+        });
         self.update_action_if_legacy(|a| a.close_height_m = Some(close_h as f32)).await;
 
         // look-down, centred at a border-free aim: one base move that puts the TCP over the box
@@ -5555,6 +5647,10 @@ impl Orchestrator {
         // J6 alignment: close the jaws across the object's short side
         self.phase("align", 0.55).await?;
         let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
+        self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Align {
+            align: crate::rt_core::action_diag::ShortLabel::new_truncated(&align),
+            turn_rad: turn.map(|t| t as f32),
+        });
         self.update_action_if_legacy(|a| { a.align = Some(align.clone()); a.align_turn_rad = turn.map(|t| t as f32); }).await;
 
         // grasp width: `width_record` sources first (reported only), then `width_sources` in
@@ -5582,6 +5678,15 @@ impl Orchestrator {
         }
         let (chosen_width, width_entries) = match wchain.finish() { Ok(r) => r, Err((_, e)) => (None, e) };
         let measured_width_m = chosen_width.map(|(w, _)| w);
+        self.emit_estimates(
+            crate::rt_core::action_diag::EstimateListKind::Width,
+            &width_entries,
+        );
+        if let Some(w) = measured_width_m {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::GraspWidth {
+                width_m: w as f32,
+            });
+        }
         self.update_action_if_legacy(|a| {
             a.width_estimates = width_entries;
             if let Some(w) = measured_width_m { a.grasp_width_m = Some(w as f32); }
@@ -5648,26 +5753,49 @@ impl Orchestrator {
         if let Some((fraction, target_w)) = pre_open_target {
             self.phase("preopen", 0.6).await?;
             self.gripper_move("preopen", fraction).await?;
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PreOpen {
+                decision: crate::rt_core::action_diag::DiagStr::Inline(
+                    crate::rt_core::action_diag::ShortLabel::new_truncated("done"),
+                ),
+                pre_open_m: Some(target_w),
+            });
             self.update_action_if_legacy(|a| {
                 a.pre_open = Some("done".into());
                 a.pre_open_m = Some(target_w);
             }).await;
         } else if let Some(reason) = pre_open_decision {
-            self.update_action_if_legacy(|a| {
-                a.pre_open = Some(reason);
-            }).await;
+            if self.is_executor() {
+                let d = self.sup.hub().intern_action_diag_str(self.id, &reason);
+                self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PreOpen {
+                    decision: d,
+                    pre_open_m: None,
+                });
+            } else {
+                self.update_action_if_legacy(|a| {
+                    a.pre_open = Some(reason);
+                }).await;
+            }
         }
 
         // descend (look-down: re-centre at mid height on the way), close, check
         self.phase("descend", 0.65).await?;
         if !camera_down {
             let (recentre, iterations) = self.recentre(&c, plane, close_h, &planned.request.label, &mut after).await?;
-            self.update_action_if_legacy(|a| { a.recentre = Some(recentre); a.recentre_iterations = iterations; }).await;
+            if self.is_executor() {
+                let status = self.sup.hub().intern_action_diag_str(self.id, &recentre);
+                self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Recentre {
+                    status,
+                    iterations,
+                });
+            } else {
+                self.update_action_if_legacy(|a| { a.recentre = Some(recentre); a.recentre_iterations = iterations; }).await;
+            }
             self.phase("descend", 0.75).await?;
         }
         self.descend(close_h, planned.request.approach).await?;
         let closed = self.gripper_phase("close", 0.8, GripperCommand::Close).await?;
         if let Some(w) = self.held_width_m().await {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::HeldWidth { held_width_m: w });
             self.update_action_if_legacy(|a| a.held_width_m = Some(w)).await;
         }
         let holding = closed.holding == Some(true);
@@ -5692,6 +5820,10 @@ impl Orchestrator {
         // stops on the object (holding) or runs to closed (dropped)
         let (held, gap) = self.holding_now().await?;
         if held {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PostLift {
+                kind: crate::rt_core::action_diag::PostLiftKind::Held,
+                gripper_gap_rad: None,
+            });
             self.update_action_if_legacy(|a| a.post_lift = Some("held".into())).await;
             return Ok((true, closed.gripper_gap_rad));
         }
@@ -5700,11 +5832,20 @@ impl Orchestrator {
         let gap = regrip.gripper_gap_rad.unwrap_or(gap);
         if regrip.holding == Some(true) {
             if let Some(w) = self.held_width_m().await {
+                self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::HeldWidth { held_width_m: w });
                 self.update_action_if_legacy(|a| a.held_width_m = Some(w)).await;
             }
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PostLift {
+                kind: crate::rt_core::action_diag::PostLiftKind::Regripped,
+                gripper_gap_rad: None,
+            });
             self.update_action_if_legacy(|a| a.post_lift = Some("regripped".into())).await;
             return Ok((true, Some(gap)));
         }
+        self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PostLift {
+            kind: crate::rt_core::action_diag::PostLiftKind::Dropped,
+            gripper_gap_rad: Some(gap),
+        });
         self.update_action_if_legacy(|a| { a.post_lift = Some("dropped".into()); a.gripper_gap_rad = Some(gap); }).await;
         Err(fail("DROPPED", format!("Object no longer held after the lift: the re-grip closed to {gap:.2} rad from closed")))
     }
@@ -5908,8 +6049,11 @@ impl Orchestrator {
         tracker.predict_at(self.cam.to_norm(p));
         let d = self.fresh_match(&tracker, since, after).await?;
         let c = self.cam.to_px(box_centre(&d.box_norm));
-        if !self.is_executor() {
-            self.sup.inner().write().await.set_action_final_offset(self.id, [(c[0] - grip_px[0]) as f32, (c[1] - grip_px[1]) as f32]);
+        let off = [(c[0] - grip_px[0]) as f32, (c[1] - grip_px[1]) as f32];
+        if self.is_executor() {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::FinalOffset { offset_px: off });
+        } else {
+            self.sup.inner().write().await.set_action_final_offset(self.id, off);
         }
         let moved = (c[0] - p[0]).hypot(c[1] - p[1]);
         if moved > self.setup.recheck_tol_px {
@@ -5950,7 +6094,15 @@ impl Orchestrator {
                 let err = (c[0] - aim_px[0]).hypot(c[1] - aim_px[1]);
                 if err <= s.centre_tol_px { consecutive += 1; } else { consecutive = 0; }
                 let (it, e) = if report { (Some(iteration), Some(err as f32)) } else { (None, None) };
-                if !self.is_executor() {
+                if self.is_executor() {
+                    self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Phase {
+                        phase: crate::rt_core::action_diag::ShortLabel::new_truncated(phase),
+                        progress,
+                        iteration: it,
+                        error_px: e,
+                        at: Instant::now(),
+                    });
+                } else {
                     self.sup.inner().write().await.set_action_phase(self.id, phase, progress, it, e);
                 }
                 if consecutive >= s.stable_frames { break None; }
@@ -6127,6 +6279,10 @@ impl Orchestrator {
 
     async fn write_estimates(&self, chain: &EstimateChain) {
         let entries = chain.entries().to_vec();
+        self.emit_estimates(
+            crate::rt_core::action_diag::EstimateListKind::Height,
+            &entries,
+        );
         self.update_action_if_legacy(|a| a.height_estimates = entries).await;
     }
 
@@ -6160,7 +6316,12 @@ impl Orchestrator {
         let up = match self.probe_up(c, &est, label, after).await? { Ok(h) => self.accept_height(h)?, Err(e) => Err(e) };
         Ok(match (up, fallback) {
             (Ok(h), Some(f)) => {
-                self.update_action_if_legacy(|a| a.height_reason = Some(f)).await;
+                if self.is_executor() {
+                    let reason = self.sup.hub().intern_action_diag_str(self.id, &f);
+                    self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::HeightReason { reason });
+                } else {
+                    self.update_action_if_legacy(|a| a.height_reason = Some(f)).await;
+                }
                 Ok((h, "scale"))
             }
             (Ok(h), None) => Ok((h, "scale")),
@@ -6209,6 +6370,7 @@ impl Orchestrator {
             }
         }
         let Some((done, dz)) = moved else { return Ok(Err("probe_unreachable".into())); };
+        self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::ProbeUp { dz_m: dz as f32 });
         self.update_action_if_legacy(|a| { a.probe_dz_m = Some(dz as f32); a.probe_mode = Some("up".into()); }).await;
         let now = self.pose().await;
         let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
@@ -6306,6 +6468,7 @@ impl Orchestrator {
             };
             if !moved {
                 moved = true;
+                self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::ProbeLateralStart);
                 self.update_action_if_legacy(|a| a.probe_mode = Some("lateral".into())).await;
             }
             let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
@@ -6345,6 +6508,10 @@ impl Orchestrator {
         let b_meas = kinematics::dot(&kinematics::sub(&l_pos, &l_neg), &x_meas);
         // commanded: the image-x component of the commanded lens displacement (B · n)
         let b_cmd = kinematics::dot(&kinematics::sub(&self.cam.origin(&pos), &self.cam.origin(&neg)), &x_cam);
+        self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::ProbeLateralBaseline {
+            baseline_m: b_meas as f32,
+            err_mm: ((b_meas - b_cmd) * 1000.0) as f32,
+        });
         self.update_action_if_legacy(|a| {
             a.lateral_baseline_m = Some(b_meas as f32);
             a.lateral_baseline_err_mm = Some(((b_meas - b_cmd) * 1000.0) as f32);
@@ -6455,9 +6622,29 @@ impl Orchestrator {
                 // a contact stop ends the descent before the short segment
                 inner.approach_interrupted(self.id, "contact");
             }
-        } else if let Ok((_, watch)) = &result {
-            if let Some(h) = watch.contact_joint.map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m) {
+        } else {
+            let watch = match &result {
+                Ok((_, w)) => *w,
+                Err(_) => self
+                    .sup
+                    .hub()
+                    .latest()
+                    .map(|s| s.rt.owner.macro_state)
+                    .filter(|m| m.active_id == self.id)
+                    .map(|m| m.child_watch)
+                    .unwrap_or_default(),
+            };
+            let contact_h = watch.contact_joint.map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m);
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::DescendContact {
+                peak_residual_nm: watch.peak_residual_nm,
+                peak_tracking_rad: watch.peak_tracking_rad,
+                contact_height_m: contact_h.map(|h| h as f32),
+            });
+            if let Some(h) = contact_h {
                 tracing::info!("Grasp {}: contact during the descent at {h:.3} m above the table", self.id);
+                self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::ApproachInterrupted {
+                    reason: crate::rt_core::action_diag::ShortLabel::new_truncated("contact"),
+                });
             }
         }
         result.map(|_| ())
@@ -6516,6 +6703,15 @@ impl Orchestrator {
             Some([half, -half].into_iter().find(|t| room(*t)).unwrap_or(half))
         };
         let out = yaw_chain(&self.setup, &c.last, &c.frames, self.cam.size, &angle_turn, &box_turn);
+        if let Some(spread) = out.angle_spread_deg {
+            self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::AngleSpread {
+                spread_deg: spread as f32,
+            });
+        }
+        self.emit_estimates(
+            crate::rt_core::action_diag::EstimateListKind::Yaw,
+            &out.entries,
+        );
         self.update_action_if_legacy(|a| {
             if let Some(spread) = out.angle_spread_deg { a.angle_spread_deg = Some(spread as f32); }
             a.yaw_estimates = out.entries.clone();
@@ -6911,6 +7107,15 @@ async fn run(
     let envelope = envelope_with_contact(planned.input.ws.as_ref(), &planned.input.cam, &cam.rec, contact_end_m);
     let lens_known = planned.input.cam.offset_m.is_some();
     let orch = Orchestrator { ctx, source: source.clone(), setup, cam, envelope, tcp_offset: planned.input.tcp_offset, triggered, lens_known, depth_available, generation };
+    if orch.is_executor() {
+        orch.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Phase {
+            phase: crate::rt_core::action_diag::ShortLabel::new_truncated("start"),
+            progress: 0.0,
+            iteration: None,
+            error_px: None,
+            at: Instant::now(),
+        });
+    }
     let result = if let Err(e) = per_request {
         Err(fail("DETECTION_UNAVAILABLE", format!("Cannot reach the vision provider: {e}")))
     } else if triggered {
