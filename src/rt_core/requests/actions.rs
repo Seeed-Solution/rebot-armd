@@ -44,7 +44,8 @@ use crate::supervisor::{
     JointGoalSnapshot, PreparedQuintic, SupervisorInner, OWNER_EXECUTOR,
 };
 pub use crate::rt_core::session::{
-    admit_session, ActiveSession, PhaseStepOutcome, PreparedSession, ReleaseCtx, SessionAdmitError,
+    admit_internal, ActiveSession, PhaseStepOutcome, PreparedSession, ReleaseCtx,
+    SessionAdmitError,
     SessionAuthority, SessionDriver, SessionDriverStats, SessionId, SessionKind, SessionOutcome,
     SessionSlot, SessionState, SessionStep, SessionTerminalReason, SessionTerminalRecord,
     WorkerReply, WorkerReplyError, WorkerTicket,
@@ -4315,12 +4316,8 @@ fn install_gripper_zero_check_rt(
     if inner.held.is_some() {
         return Err("OBJECT_HELD");
     }
-    if store_offset
-        && inner.operator_auth_enforced
-        && !operator_grant.is_valid_at(ctx.now, true)
-    {
-        return Err("OPERATOR_REQUIRED");
-    }
+    let operator = crate::auth::OperatorRequirement::when(store_offset, operator_grant);
+    inner.check_operator_requirement(operator, ctx.now)?;
     let request = GripperRequest {
         command: GripperCommand::Seek,
         fraction: None,
@@ -4383,7 +4380,6 @@ fn install_gripper_zero_check_rt(
         ClientId(proof.stamp().connection_id),
     );
     prepared_session.action_id = Some(ActionId(predicted_id));
-    prepared_session.request_id = None; // Single P-F1 terminal owned by ReleaseEngine::active.
     prepared_session.child_deadline =
         Some(ctx.now + Duration::from_secs_f64(motion_timeout_s + 2.0));
     prepared_session.deadline = Some(
@@ -4392,13 +4388,13 @@ fn install_gripper_zero_check_rt(
     );
     prepared_session.timeout_code = "GRIPPER_TIMEOUT";
     prepared_session.child_timeout_code = "GRIPPER_TIMEOUT";
-    prepared_session.operator_required = store_offset;
-    prepared_session.operator_grant = Some(operator_grant);
+    prepared_session.operator = operator;
     prepared_session.revoke_on_stop = true;
     prepared_session.escalate_safe_hold_on_uncertain = true;
 
+    // Single P-F1 terminal owned by ReleaseEngine::active -> explicit internal session admission.
     let sid = this
-        .admit_session_with_proof(prepared_session, &proof, ctx.now)
+        .admit_internal_with_proof(prepared_session, &proof, ctx.now)
         .map_err(SessionAdmitError::code)?;
     if let Err(e) = this.safety.mark_motion_started() {
         let _ = this.sessions.cancel_slot(

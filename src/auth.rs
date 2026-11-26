@@ -138,6 +138,47 @@ impl OperatorGrant {
     }
 }
 
+/// Explicit operator authorization requirement carried on prepared commands and sessions.
+///
+/// Protected operations specify [`Self::Required`]; unprivileged operations specify
+/// [`Self::NotRequired`]. Checked lock-free and zero-alloc on the owner against `now` and
+/// `owner_auth_enforced` via [`Self::is_satisfied_at`], reusing [`OperatorGrant::is_valid_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorRequirement {
+    Required(OperatorGrant),
+    NotRequired,
+}
+
+impl OperatorRequirement {
+    #[inline]
+    pub const fn required(grant: OperatorGrant) -> Self {
+        Self::Required(grant)
+    }
+
+    #[inline]
+    pub const fn when(required: bool, grant: OperatorGrant) -> Self {
+        if required {
+            Self::Required(grant)
+        } else {
+            Self::NotRequired
+        }
+    }
+
+    #[inline]
+    pub const fn is_required(self) -> bool {
+        matches!(self, Self::Required(_))
+    }
+
+    /// Lock-free, zero-allocation live check against `now` and `owner_auth_enforced`.
+    #[inline]
+    pub fn is_satisfied_at(self, now: Instant, owner_auth_enforced: bool) -> bool {
+        match self {
+            Self::NotRequired => true,
+            Self::Required(grant) => grant.is_valid_at(now, owner_auth_enforced),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SessionEntry {
     expires_at: Instant,

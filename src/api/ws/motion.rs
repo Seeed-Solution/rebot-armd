@@ -257,6 +257,17 @@ fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply>
                 .ok_or_else(|| invalid_command("enable must be boolean"))?;
             if enable {
                 let g = gravity_comp_request(&ctx.value["body"])?;
+                let grant = ctx.ws_auth.operator_grant();
+                if ctx
+                    .inner
+                    .check_protected_operator_requirement(
+                        crate::auth::OperatorRequirement::Required(grant),
+                        std::time::Instant::now(),
+                    )
+                    .is_err()
+                {
+                    return Err(ApiError::operator_required("/api/v1/mode/gravity_comp"));
+                }
                 let admitted = ctx.inner.check_admission(ctx.stamp).map_err(ArmError::from)?;
                 SupervisorInner::enter_gravity_comp(admitted, g)?;
             } else {

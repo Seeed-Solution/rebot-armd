@@ -29,7 +29,7 @@
 //!    completion records cross to `armd-dispatch` strictly through `TerminalCaptureChannel`.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -405,6 +405,177 @@ impl SessionTerminalTicket {
     pub fn action_id(&self) -> ActionId { self.action_id }
     #[inline]
     pub fn route_gen(&self) -> u64 { self.route_gen }
+}
+
+const HANDOFF_PENDING: u8 = 0;
+const HANDOFF_ADMITTED: u8 = 1;
+const HANDOFF_CANCELLED: u8 = 2;
+
+/// Lock-free, single-transition ownership-handoff coordinate between a dispatcher-side
+/// [`SessionTerminalReservationGuard`] and the RT owner's [`super::session::admit_routed`].
+///
+/// Exactly one side wins the atomic CAS out of `PENDING`:
+/// - Owner wins (`PENDING -> ADMITTED`): ownership transfers to the live session; dispatcher
+///   cancellation or guard drop MUST NOT release the router credit.
+/// - Dispatcher wins (`PENDING -> CANCELLED`): dispatcher releases the router credit immediately;
+///   the owner refuses admission if the already-queued request arrives later.
+#[derive(Debug)]
+pub struct SessionTerminalHandoff(Arc<AtomicU8>);
+
+impl SessionTerminalHandoff {
+    fn new_pending() -> Self {
+        Self(Arc::new(AtomicU8::new(HANDOFF_PENDING)))
+    }
+
+    fn clone_ref(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+
+    #[inline]
+    pub(crate) fn try_claim_admitted(&self) -> bool {
+        self.0
+            .compare_exchange(
+                HANDOFF_PENDING,
+                HANDOFF_ADMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    fn try_claim_cancelled(&self) -> bool {
+        self.0
+            .compare_exchange(
+                HANDOFF_PENDING,
+                HANDOFF_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// Move-only typed terminal reservation proving 1 bounded P-F1 terminal credit was reserved on
+/// [`ActionReplyRouter`] before enqueueing a routed session request.
+///
+/// Consumed by value in [`super::session::admit_routed`] so a reservation can be bound to at most
+/// one live session and cannot be fabricated outside `reply_router`.
+#[derive(Debug)]
+pub struct SessionTerminalReservation {
+    ticket: SessionTerminalTicket,
+    handoff: SessionTerminalHandoff,
+}
+
+impl SessionTerminalReservation {
+    #[inline]
+    fn from_parts(ticket: SessionTerminalTicket, handoff: SessionTerminalHandoff) -> Self {
+        Self { ticket, handoff }
+    }
+
+    #[inline]
+    pub fn ticket(&self) -> SessionTerminalTicket { self.ticket }
+    #[inline]
+    pub fn request(&self) -> RequestId { self.ticket.request }
+    #[inline]
+    pub fn client(&self) -> ClientId { self.ticket.client }
+    #[inline]
+    pub fn action_id(&self) -> ActionId { self.ticket.action_id }
+    #[inline]
+    pub fn route_gen(&self) -> u64 { self.ticket.route_gen }
+
+    #[inline]
+    pub(crate) fn into_parts(self) -> (SessionTerminalTicket, SessionTerminalHandoff) {
+        (self.ticket, self.handoff)
+    }
+}
+
+/// Dispatcher-side RAII owner of 1 reserved P-F1 session terminal credit.
+///
+/// Coordinated atomically with owner admission via [`SessionTerminalHandoff`]:
+/// - If dropped or released before the owner commits admission (`PENDING -> CANCELLED`), the
+///   guard immediately releases the credit on [`ActionReplyRouter`] and prevents any in-flight
+///   queued request from admitting a session.
+/// - If the owner has already committed admission (`PENDING -> ADMITTED`), dropping the guard
+///   (even on caller future cancellation before [`Self::commit_transferred`]) leaves the credit
+///   owned by the live session until terminal handling.
+pub struct SessionTerminalReservationGuard {
+    router: Arc<Mutex<ActionReplyRouter>>,
+    ticket: Option<SessionTerminalTicket>,
+    handoff: SessionTerminalHandoff,
+    staged: bool,
+}
+
+impl std::fmt::Debug for SessionTerminalReservationGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionTerminalReservationGuard")
+            .field("ticket", &self.ticket)
+            .field("handoff", &self.handoff)
+            .field("staged", &self.staged)
+            .finish()
+    }
+}
+
+impl SessionTerminalReservationGuard {
+    pub(crate) fn new(
+        router: Arc<Mutex<ActionReplyRouter>>,
+        ticket: SessionTerminalTicket,
+    ) -> Self {
+        Self {
+            router,
+            ticket: Some(ticket),
+            handoff: SessionTerminalHandoff::new_pending(),
+            staged: false,
+        }
+    }
+
+    #[inline]
+    pub fn ticket(&self) -> Option<SessionTerminalTicket> {
+        self.ticket
+    }
+
+    /// Extracts the single move-only [`SessionTerminalReservation`] for enqueue into
+    /// [`super::session::admit_routed`]. May be called at most once; RAII rollback remains armed
+    /// until the owner atomically claims admission or [`Self::commit_transferred`] is invoked.
+    pub fn stage_for_admission(&mut self) -> Option<SessionTerminalReservation> {
+        if self.staged {
+            return None;
+        }
+        let ticket = self.ticket?;
+        self.staged = true;
+        Some(SessionTerminalReservation::from_parts(
+            ticket,
+            self.handoff.clone_ref(),
+        ))
+    }
+
+    /// Disarms local guard state once the owner has confirmed admission.
+    #[inline]
+    pub fn commit_transferred(&mut self) {
+        self.ticket = None;
+    }
+
+    /// Explicitly attempts to cancel and release the reserved credit now (idempotent; also invoked
+    /// on [`Drop`]). Returns `false` if already released or if the owner already atomically
+    /// claimed admission (`PENDING -> ADMITTED`).
+    pub fn release_now(&mut self) -> bool {
+        let Some(ticket) = self.ticket.take() else {
+            return false;
+        };
+        if !self.handoff.try_claim_cancelled() {
+            return false;
+        }
+        self.router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_session_terminal(&ticket)
+    }
+}
+
+impl Drop for SessionTerminalReservationGuard {
+    fn drop(&mut self) {
+        let _ = self.release_now();
+    }
 }
 
 /// Result of attempting to emit a session terminal through [`ActionReplyRouter`].
@@ -904,6 +1075,14 @@ impl ActionReplyRouter {
 
     pub(crate) fn global_reserved(&self) -> usize {
         self.global_reserved
+    }
+
+    pub(crate) fn connection_reserved(&self, client: ClientId) -> Option<usize> {
+        self.client_to_slot
+            .get(&client)
+            .and_then(|&idx| self.slots[idx].as_ref())
+            .filter(|s| s.client == client && !s.closed.load(Ordering::Acquire))
+            .map(|s| s.reserved)
     }
 
     /// Registers a per-connection reply sink in a free fixed slot with a strictly monotonic

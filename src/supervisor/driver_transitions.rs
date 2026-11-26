@@ -3766,6 +3766,7 @@ impl SupervisorInner {
                 buf.push_str(msg_copy.as_str());
             }),
         );
+        self.record_applied_qualifying_fault_stop();
         msg
     }
 

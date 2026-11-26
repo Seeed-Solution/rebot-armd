@@ -417,6 +417,7 @@ impl SupervisorInner {
             crate::supervisor::TickOutput::None
         };
         self.safety.latch(crate::safety::FaultKind::Estop, crate::safety::FaultDetail::Estop);
+        self.record_applied_estop();
         // If an urgent E-stop request is still pending (requested != applied), `pending_stop_check`
         // intentionally returns `EstopInhibited` and defers the hold to the first eligible stopped
         // release; do not log or classify that as a hold write failure.
@@ -441,14 +442,8 @@ impl SupervisorInner {
     pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
         self.bump_motion_generation();
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            let reason = match policy {
-                StopPolicy::EStopLatch => "ESTOP_ACTIVE",
-                StopPolicy::ThermalTrip => "THERMAL_TRIP",
-                StopPolicy::BusLossFallback => "BUS_LOSS",
-                StopPolicy::NormalUnload => "STOPPED",
-            };
-            self.revoke_sessions_on_stop(reason);
+        if policy == StopPolicy::NormalUnload {
+            self.revoke_sessions_on_stop("STOPPED");
         }
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         if self.policy_load_reservation.take().is_some() {
@@ -667,6 +662,8 @@ impl SupervisorInner {
             }
             StopPolicy::EStopLatch => {
                 self.apply_estop_latch_impl(None);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.revoke_sessions_on_stop("ESTOP_ACTIVE");
             }
             StopPolicy::ThermalTrip => {
                 // Protective-cut exception (decision b, 2026-11-24): thermal trip is NOT a user
@@ -686,6 +683,9 @@ impl SupervisorInner {
                         limit: self.config.max_temperature,
                     },
                 );
+                self.record_applied_qualifying_fault_stop();
+                #[cfg(not(target_arch = "wasm32"))]
+                self.revoke_sessions_on_stop("THERMAL_TRIP");
                 #[cfg(not(target_arch = "wasm32"))]
                 self.torque_shadow
                     .enqueue(crate::torque::shadow::ShadowInputKind::Thermal {
@@ -727,6 +727,9 @@ impl SupervisorInner {
                 };
                 self.safety.latch(crate::safety::FaultKind::BusLoss, fault_detail);
                 self.notify_driver_bus_loss();
+                self.record_applied_qualifying_fault_stop();
+                #[cfg(not(target_arch = "wasm32"))]
+                self.revoke_sessions_on_stop("BUS_LOSS");
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let multi_device_gap = self
@@ -1956,7 +1959,7 @@ impl SupervisorInner {
             .filter(|a| a.is_running() && a.kind == "park")
             .map(|a| a.id);
         self.stop_motion();
-        self.applied_general_stop_seq = self.applied_general_stop_seq.saturating_add(1);
+        self.record_applied_general_stop();
         if !disable_in_flight {
             if let Some(id) = running_park_id {
                 if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {

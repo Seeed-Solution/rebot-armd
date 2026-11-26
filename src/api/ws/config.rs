@@ -1722,7 +1722,22 @@ pub(super) async fn handle_executor_ws_command(
     gc_stamp.lease_gen = local_generation;
     gc_stamp.estop_epoch = epoch;
     let lease_holder = Some((HolderLabel::new(recv_connection), local_generation));
-    match gravity_comp_command(recv_supervisor, gc_stamp, lease_holder, enable, scale, damping_kd).await {
+    let operator = if enable {
+        crate::auth::OperatorRequirement::Required(ws_auth.operator_grant())
+    } else {
+        crate::auth::OperatorRequirement::NotRequired
+    };
+    match gravity_comp_command(
+        recv_supervisor,
+        gc_stamp,
+        lease_holder,
+        operator,
+        enable,
+        scale,
+        damping_kd,
+    )
+    .await
+    {
         Ok(rep) => {
             let control_mode = if rep.active { "gravity_comp" } else { "position" };
             Some(Some(json!({
@@ -1734,6 +1749,14 @@ pub(super) async fn handle_executor_ws_command(
                 "is_torqued": rep.is_torqued,
                 "control_mode": control_mode,
             })))
+        }
+        Err(ArmError::Rejected { status: 403, code, .. }) if code == "OPERATOR_REQUIRED" => {
+            let cur_epoch = current_epoch_off_lock(recv_supervisor, epoch);
+            Some(Some(off_lock_command_reject(
+                &request_id_val,
+                cur_epoch,
+                ApiError::operator_required("/api/v1/mode/gravity_comp"),
+            )))
         }
         Err(err) => {
             let cur_epoch = current_epoch_off_lock(recv_supervisor, epoch);

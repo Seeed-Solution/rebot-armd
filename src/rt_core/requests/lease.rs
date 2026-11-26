@@ -958,9 +958,12 @@ pub(crate) fn recheck_clear_fault_authority_readonly_with_op(
             OwnerAuthPolicy::ClearFault | OwnerAuthPolicy::Operator(_)
         );
         if !explicit_operator_clear
-            || !auth
-                .operator
-                .is_valid_at(check_now, inner.operator_auth_enforced)
+            || inner
+                .check_operator_requirement(
+                    crate::auth::OperatorRequirement::Required(auth.operator),
+                    check_now,
+                )
+                .is_err()
         {
             return Err(ClearFaultAuthorityError::OperatorRequired {
                 operation: if inner.e_stop_latched.load(Ordering::SeqCst) {
@@ -975,9 +978,12 @@ pub(crate) fn recheck_clear_fault_authority_readonly_with_op(
             });
         }
     } else if let OwnerAuthPolicy::Operator(label) = auth.auth_policy {
-        if !auth
-            .operator
-            .is_valid_at(check_now, inner.operator_auth_enforced)
+        if inner
+            .check_operator_requirement(
+                crate::auth::OperatorRequirement::Required(auth.operator),
+                check_now,
+            )
+            .is_err()
         {
             return Err(ClearFaultAuthorityError::OperatorRequired {
                 operation: label.unwrap_or("/api/v1/safety/clear_fault"),

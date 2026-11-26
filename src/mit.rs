@@ -3330,26 +3330,32 @@ impl crate::supervisor::SupervisorInner {
             SessionKind::Commissioning,
             crate::rt_core::broker::ClientId(req.authority.conn_id),
         );
+        let op_req = crate::auth::OperatorRequirement::Required(req.authority.operator_grant);
         prepared.deadline = Some(req.txn_deadline);
         prepared.timeout_code = Self::commissioning_deadline_error_code(req.kind);
-        prepared.operator_required = self.operator_auth_enforced;
-        prepared.operator_grant = Some(req.authority.operator_grant);
+        prepared.operator = op_req;
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
         let session_auth = SessionAuthority {
+            baseline: self.capture_baseline(),
             connection_id: req.authority.conn_id,
             lease_generation: req.authority.lease_holder.map_or(0, |(_, gen)| gen),
             epoch: req.authority.expected_epoch,
             stop_generation: req.authority.expected_stop_gen,
             require_lease: self.lease_enabled,
-            operator_required: self.operator_auth_enforced,
-            operator_grant: Some(req.authority.operator_grant),
+            operator: op_req,
             revoke_on_stop: true,
             revoke_on_epoch_change: true,
         };
         let session_id = self
             .sessions
-            .admit_with_authority(prepared, session_auth, owner_now, false)
+            .admit_with_authority(
+                prepared,
+                session_auth,
+                crate::rt_core::session::SessionTerminalBinding::Internal,
+                owner_now,
+                false,
+            )
             .map_err(|_| {
                 ConfigError::Busy("a hardware commissioning operation is already running")
             })?;
