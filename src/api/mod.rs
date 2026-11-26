@@ -28,6 +28,13 @@ async fn serve_index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+async fn serve_favicon() -> impl axum::response::IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [(axum::http::header::CACHE_CONTROL, "public, max-age=86400")],
+    )
+}
+
 // JMuxer 2.1.0 (MIT), vendored; plays the camera's H.264-over-WebSocket stream.
 static JMUXER_JS: &str = include_str!("vendor/jmuxer.min.js");
 
@@ -184,6 +191,7 @@ pub fn create_router_full_with_sandbox(
                 .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route("/", get(serve_index))
+        .route("/favicon.ico", get(serve_favicon))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
         .route("/assets/calib_wizard.js", get(serve_calib_wizard))
         .route("/assets/three-urdf.min.js", get(assets::serve_three))
@@ -383,6 +391,7 @@ async fn gate_executor_owner(
             let allowed = match *method {
                 axum::http::Method::GET | axum::http::Method::HEAD => {
                     path == "/"
+                        || path == "/favicon.ico"
                         || path.starts_with("/assets/")
                         || path.starts_with("/api/v1/sequences/")
                         || matches!(
@@ -655,5 +664,35 @@ mod tests {
         let remote = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 50000));
         assert!(!infer_same_host(remote, &empty));
         assert!(!infer_same_host(remote, &localhost_host_hdr));
+    }
+}
+
+#[cfg(test)]
+mod static_tests {
+    use super::{serve_favicon, serve_index};
+    use axum::{body::Body, http::{Request, StatusCode}, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn index_and_favicon_do_not_404() {
+        let app = Router::new()
+            .route("/", get(serve_index))
+            .route("/favicon.ico", get(serve_favicon));
+
+        let idx = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(idx.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(idx.into_body(), usize::MAX).await.unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains(r#"<link rel="icon""#), "index.html must declare an inline favicon");
+
+        let fav = app
+            .oneshot(Request::get("/favicon.ico").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fav.status(), StatusCode::NO_CONTENT);
     }
 }
