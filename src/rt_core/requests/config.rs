@@ -3554,7 +3554,10 @@ fn install_gravity_comp(
             scale,
             damping_kd,
         } => {
-            if core.rt_executor_owned && core.driver.is_some() {
+            if crate::gravity_comp::executor_blocks_hardware_gravity_comp(
+                core.rt_executor_owned,
+                core.driver.is_some(),
+            ) {
                 retired.gravity_comp_policy = policy;
                 return Err(ConfigError::ExecutorCapabilityUnsupported(
                     "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
@@ -3613,7 +3616,10 @@ fn install_gravity_comp(
             code,
             message,
         } => {
-            if core.rt_executor_owned && core.driver.is_some() {
+            if crate::gravity_comp::executor_blocks_hardware_gravity_comp(
+                core.rt_executor_owned,
+                core.driver.is_some(),
+            ) {
                 return Err(ConfigError::ExecutorCapabilityUnsupported(
                     "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
                 ));
@@ -7320,7 +7326,10 @@ pub async fn gravity_comp_command(
 ) -> Result<GravityCompReply, ArmError> {
     let op = if enable {
         let pub_cfg = sup.published_config().await?;
-        if sup.owner_mode() == OWNER_EXECUTOR && pub_cfg.has_driver {
+        if crate::gravity_comp::executor_blocks_hardware_gravity_comp(
+            sup.owner_mode() == OWNER_EXECUTOR,
+            pub_cfg.has_driver,
+        ) {
             return Err(executor_capability_unsupported(
                 "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
             ));
@@ -7356,7 +7365,7 @@ pub async fn gravity_comp_command(
     } else {
         if sup.owner_mode() == OWNER_EXECUTOR {
             let pub_cfg = sup.published_config().await?;
-            if pub_cfg.has_driver {
+            if crate::gravity_comp::executor_blocks_hardware_gravity_comp(true, pub_cfg.has_driver) {
                 return Err(executor_capability_unsupported(
                     "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
                 ));

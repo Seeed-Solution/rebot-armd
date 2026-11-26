@@ -2070,8 +2070,20 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
     }
     let _detached_hw = sup_hw.inner().write().await;
 
-    // On RT executor with hardware driver, observation & schema capabilities must match the WS gate
-    // up front (never advertise gravity_comp while WS would refuse with EXECUTOR_CAPABILITY_UNSUPPORTED).
+    // On RT executor with hardware driver, observation & schema capabilities must match the single
+    // converged capability predicate (`executor_blocks_hardware_gravity_comp`) and WS gate.
+    assert!(
+        armd::gravity_comp::executor_blocks_hardware_gravity_comp(true, true),
+        "single predicate must refuse hardware gravity_comp on executor"
+    );
+    assert!(
+        !armd::gravity_comp::executor_blocks_hardware_gravity_comp(true, false),
+        "single predicate must allow driverless mock gravity_comp on executor"
+    );
+    assert!(
+        !armd::gravity_comp::executor_blocks_hardware_gravity_comp(false, true),
+        "single predicate must allow hardware gravity_comp on legacy"
+    );
     let exec_obs = sup_hw.observation().await.unwrap();
     let exec_schema = sup_hw.schema().await.unwrap();
     assert!(

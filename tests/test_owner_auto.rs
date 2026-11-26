@@ -684,6 +684,8 @@ const banner = mkEl();
 const bannerTitle = mkEl();
 const bannerSub = mkEl();
 const S = {{ obs: null, ownerDiag: null }};
+let liveFlag = true;
+const isLive = () => liveFlag;
 const $ = (id) => ({{ 'owner-badge': badge, 'owner-banner': banner, 'owner-banner-title': bannerTitle, 'owner-banner-sub': bannerSub }}[id] || null);
 const setText = (el, v) => {{ if (el) el.textContent = v; }};
 const setCls = (el, v) => {{ if (el) el.className = v; }};
@@ -801,6 +803,28 @@ function assert(cond, msg) {{ if (!cond) {{ console.error(msg); process.exit(1);
   S.obs = {{ effective_owner: 'executor', owner_reason: 'auto_qualified' }};
   S.ownerDiag = {{ effective_owner: 'executor', owner_reason: 'auto_qualified', legacy_only_routes: {{ rest: [], ws: [] }} }};
   assert(legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null, 'gate must lift when route leaves legacy_only_routes');
+
+  // 7. Same-page recovery: cached failed S.ownerDiag must NOT override fresh live observations after restart into legacy or executor.
+  liveFlag = true;
+  S.ownerDiag = {{
+    effective_owner: 'failed',
+    owner_reason: 'startup_failed_detached_safe_hold',
+    detached_safe_hold: true,
+    legacy_only_routes: {{ rest: ['/api/v1/diagnostics/power'], ws: ['/api/v1/action/gripper_calibrate'] }},
+  }};
+  S.obs = {{ effective_owner: 'legacy', owner_reason: 'explicit_cli' }};
+  renderOwnerStatus();
+  assert(banner.hidden === true, 'recovery to live legacy must clear stale failed banner');
+  assert(badge.textContent === 'Legacy', 'recovery to live legacy badge: ' + badge.textContent);
+  assert(legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null, 'recovery to live legacy must unblock stroke calibration');
+
+  // 8. Same-page healthy -> OWNER_FAILED: once telemetry goes offline (liveFlag=false), refreshed failed ownerDiag wins over stale S.obs.
+  liveFlag = false;
+  S.obs = {{ effective_owner: 'executor', owner_reason: 'auto_qualified' }};
+  renderOwnerStatus();
+  assert(banner.hidden === false && banner.className.includes('is-danger'), 'offline stale obs must yield to failed ownerDiag');
+  assert(badge.textContent === 'Owner · failed', 'offline failed badge: ' + badge.textContent);
+  if (ownerDiagRetryTimer) clearTimeout(ownerDiagRetryTimer);
 }})().catch((e) => {{ console.error(e); process.exit(1); }});
 "#
         );

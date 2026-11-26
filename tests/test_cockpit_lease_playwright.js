@@ -783,11 +783,24 @@ async function runScenario9OwnerHonesty(browserInst) {
         for (const vp of viewports) {
           const tag = `failed_${lang.code}_${vp.tag}`;
           const { ctx, page, guards } = await newCockpit(browserInst, port, { width: vp.width, height: vp.height, locale: lang.locale });
+          const badAssets = [];
+          const okAssets = [];
+          page.on('response', (resp) => {
+            try {
+              const u = new URL(resp.url());
+              if (u.pathname === '/' || u.pathname === '/favicon.ico' || u.pathname.startsWith('/assets/')) {
+                if (resp.status() >= 400) badAssets.push(`${u.pathname}:${resp.status()}`);
+                else okAssets.push(`${u.pathname}:${resp.status()}`);
+              }
+            } catch (_) {}
+          });
           try {
             await ctx.addInitScript((l) => { try { localStorage.setItem('lang', l); } catch (_) {} }, lang.code);
-            await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
+            await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
             await waitShown(page, '#owner-banner', 5000);
             await waitShown(page, '#owner-badge', 5000);
+            assert.equal(badAssets.length, 0, `${tag}: cockpit shell/assets failed under OWNER_FAILED: ${JSON.stringify(badAssets)}`);
+            assert(okAssets.some((x) => x.startsWith('/assets/jmuxer.min.js:200')), `${tag}: /assets/jmuxer.min.js must load 200 under OWNER_FAILED, saw ${JSON.stringify(okAssets)}`);
 
             const info = await page.evaluate(() => {
               const badge = document.getElementById('owner-badge');
@@ -961,6 +974,53 @@ async function runScenario9OwnerHonesty(browserInst) {
         }
       }
     } finally {
+      await killArmd(proc);
+    }
+  }
+
+  // --- 9E. Same-page lifecycle: healthy executor -> restart into OWNER_FAILED -> restart into legacy (no reload) ---
+  {
+    const port = await allocFreePort();
+    let proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth']);
+    const { ctx, page, guards } = await newCockpit(browserInst, port, { width: 1024, height: 768, locale: 'en-US' });
+    try {
+      await ctx.addInitScript(() => { try { localStorage.setItem('lang', 'en'); } catch (_) {} });
+      await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
+      await waitForCockpitLive(page);
+      await waitFn(page, () => S.ownerDiag?.effective_owner === 'executor' && document.getElementById('owner-banner').hidden === true, null, 5000);
+
+      // Restart daemon into OWNER_FAILED on the same port without reloading the page.
+      await killArmd(proc);
+      proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth'], {
+        extraEnv: { ARMD_MOCK_TEST_OWNER_MODE: 'failed' },
+        waitOwnerStatus: true,
+      });
+      await waitFn(
+        page,
+        () => S.ownerDiag?.effective_owner === 'failed'
+          && document.getElementById('owner-banner').hidden === false
+          && document.getElementById('owner-banner').className.includes('is-danger'),
+        null,
+        10000,
+      );
+
+      // Restart daemon into legacy on the same port without reloading the page:
+      // failed banner must clear automatically and stroke calibration must become available.
+      await killArmd(proc);
+      proc = await spawnArmd(port, ['--config', B601_CONFIG, '--owner', 'legacy', '--no-operator-auth']);
+      await waitForCockpitLive(page, 15000);
+      await waitFn(
+        page,
+        () => S.ownerDiag?.effective_owner === 'legacy'
+          && document.getElementById('owner-banner').hidden === true
+          && legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null,
+        null,
+        10000,
+      );
+      guards.assertClean('9E same-page lifecycle');
+      log('PASS Scenario 9E: same-page healthy executor -> OWNER_FAILED -> recovered legacy updated banner and gating without reload.');
+    } finally {
+      await ctx.close();
       await killArmd(proc);
     }
   }

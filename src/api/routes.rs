@@ -350,14 +350,15 @@ static REST_ROUTES: &[RestRouteEntry] = &[
                "/api/v1/calibration/sessions",      crate::calibration_sessions::post_session, OwnerAgnostic, Required, None, Fenced),
     rr!(GET    "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::get_session,  OwnerAgnostic, None,   None, Allowed),
     rr!(DELETE "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::delete_session, OwnerAgnostic, Required, None, Fenced),
-    // Cockpit / static assets
-    rr!(GET_ALWAYS "/",                       super::serve_index,        OwnerAgnostic, None, None, Allowed),
-    rr!(GET_ALWAYS "/favicon.ico",            super::serve_favicon,      OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/jmuxer.min.js",   super::serve_jmuxer,       OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/calib_wizard.js", super::serve_calib_wizard, OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/three-urdf.min.js", super::assets::serve_three, OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/model/{*path}",   super::assets::serve_model, OwnerAgnostic, None, None, Allowed),
-    rr!(GET    "/assets/wasm/{*path}",    super::assets::serve_wasm,  OwnerAgnostic, None, None, Allowed),
+    // Cockpit / static assets (read-only UI shell + static bundles; always readable so a fresh
+    // browser load under OWNER_FAILED / OWNER_TRANSFERRING has zero 503 asset errors).
+    rr!(GET_ALWAYS "/",                         super::serve_index,         OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/favicon.ico",              super::serve_favicon,       OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/jmuxer.min.js",     super::serve_jmuxer,        OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/calib_wizard.js",   super::serve_calib_wizard,  OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/three-urdf.min.js", super::assets::serve_three, OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/model/{*path}",     super::assets::serve_model, OwnerAgnostic, None, None, Allowed),
+    rr!(GET_ALWAYS "/assets/wasm/{*path}",      super::assets::serve_wasm,  OwnerAgnostic, None, None, Allowed),
     // Sandbox
     rr!(GET    "/api/v1/sandbox/catalog",                   sandbox::get_catalog,       ExecutorRequest, None,     None, Allowed),
     rr!(POST_UPLOAD "/api/v1/sandbox/scenes",               sandbox::upload_scene,      OwnerAgnostic,   Required, None, Fenced),
@@ -1272,18 +1273,24 @@ mod tests {
         assert_eq!(st_fail["owner_reason"], "startup_failed_detached_safe_hold");
         assert_eq!(st_fail["is_fallback"], true);
 
-        let idx_resp = fail_router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(idx_resp.status(), StatusCode::OK);
+        for asset in ["/", "/favicon.ico", "/assets/jmuxer.min.js", "/assets/calib_wizard.js"] {
+            let asset_resp = fail_router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(asset)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                asset_resp.status().is_success(),
+                "{asset} must remain readable under OWNER_FAILED, got {}",
+                asset_resp.status()
+            );
+        }
 
         for gated in ["/api/v1/observation", "/api/v1/diagnostics", "/api/v1/vision/mode"] {
             let resp = fail_router

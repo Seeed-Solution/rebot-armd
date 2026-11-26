@@ -98,6 +98,22 @@ fn reason_fmt(code: &str, f: impl FnOnce(&mut crate::safety::BoundedText<256>)) 
     }
 }
 
+/// Single authority for whether hardware MIT gravity compensation is currently supported under the
+/// synchronous RT executor. Lifting this predicate when the RT gravity adapter lands updates
+/// observation, schema capabilities, published config, and WS/config admission in lockstep.
+pub const fn executor_hardware_gravity_comp_supported() -> bool {
+    false
+}
+
+/// True when `(rt_executor_owned, has_driver)` is refused by the RT executor hardware
+/// gravity-compensation capability gate.
+pub const fn executor_blocks_hardware_gravity_comp(
+    rt_executor_owned: bool,
+    has_driver: bool,
+) -> bool {
+    rt_executor_owned && has_driver && !executor_hardware_gravity_comp_supported()
+}
+
 fn arm6(v: &[f32]) -> [f32; ARM] {
     let mut a = [0.0; ARM];
     for (dst, src) in a.iter_mut().zip(v) { *dst = *src; }
@@ -149,7 +165,7 @@ impl SupervisorInner {
     #[allow(clippy::result_large_err)]
     pub fn gravity_comp_support_for_owner(&self, rt_executor_owned: bool) -> Result<(), ModeReason> {
         self.gravity_comp_driver_support()?;
-        if rt_executor_owned && self.driver.is_some() {
+        if executor_blocks_hardware_gravity_comp(rt_executor_owned, self.driver.is_some()) {
             return Err(reason(
                 "EXECUTOR_CAPABILITY_UNSUPPORTED",
                 "Gravity compensation hardware MIT mode-switch is not supported on the RT executor; set arm.armd_owner to legacy and restart armd",

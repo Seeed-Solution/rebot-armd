@@ -5192,9 +5192,10 @@ function retireSocket(ws, { reconnect = false, markReleased = false, toastExpire
   S.detections = []; S.detLastReceivedAt = 0; clearOverlayCanvas();
   if (leaseOp) { const op = leaseOp; leaseOp = null; if (op.timer) clearTimeout(op.timer); if (op.reject) op.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' })); }
   invalidateControlIntents({ dropOp: true }); resetLease();
-  if (reconnect) scheduleReconnect(1500);
+  if (reconnect) { scheduleReconnect(1500); loadOwnerDiagnostics(); }
 }
 function applyObservation(o, fromWs) {
+  const prevObsOwner = S.obs && isValidEffectiveOwner(S.obs.effective_owner) ? S.obs.effective_owner : null;
   S.obs = o; S.obsAt = Date.now(); if (fromWs) S.wsCount++;
   if (preemptModalOpen() && !leaseOp && S.leaseGeneration == null) {
     const cur = (o.lease_holder === null || o.lease_holder === CLIENT_ID) ? null : o.lease_holder;
@@ -5203,6 +5204,10 @@ function applyObservation(o, fromWs) {
   }
   detHoldOnObs(o); depthOnObs(o); gcOnObs(o);
   renderOwnerStatus();
+  if (isValidEffectiveOwner(o.effective_owner) && (!S.ownerDiag || S.ownerDiag.effective_owner !== o.effective_owner || S.ownerDiag.owner_reason !== (typeof o.owner_reason === 'string' ? o.owner_reason : ''))) {
+    loadOwnerDiagnostics();
+  }
+  if (prevObsOwner !== o.effective_owner && typeof gtRender === 'function' && $('gtool') && !$('gtool').hidden) gtRender();
   renderMotionLimit(o); tkOnObs(o); renderPower(o); graspOnObs(o); msOnObs(o); epOnObs(o); teachOnObs(o);
   syncEpoch(o.epoch_id);
   const st = parseState(o.safety_state), wasStopped = isStopped();
@@ -5241,7 +5246,7 @@ function connectWS() {
   S.sequenceId = 0;
   ws.onopen = () => {
     if (S.ws !== ws) return;
-    if (wsOpenedOnce) loadAuthStatus();
+    if (wsOpenedOnce) { loadAuthStatus(); loadOwnerDiagnostics(); }
     wsOpenedOnce = true;
   };
   // Never acquire_lease on open: the page connects read-only until explicit Enable or operator confirmation.
@@ -9360,15 +9365,18 @@ function effectiveOwnerState() {
   const diag = S.ownerDiag;
   const obsOwner = obs && isValidEffectiveOwner(obs.effective_owner) ? obs.effective_owner : null;
   const diagOwner = diag && isValidEffectiveOwner(diag.effective_owner) ? diag.effective_owner : null;
-  const useDiag = diagOwner === 'failed' || diagOwner === 'transferring' || !obsOwner;
-  const owner = useDiag ? diagOwner : obsOwner;
-  const reason = useDiag
-    ? (diag && typeof diag.owner_reason === 'string' ? diag.owner_reason : '')
-    : (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : '');
+  const obsLive = typeof isLive === 'function' ? isLive() : true;
+  const useObs = !!(obsOwner && obsLive);
+  const owner = useObs ? obsOwner : (diagOwner || obsOwner);
+  const reason = useObs
+    ? (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : '')
+    : (diagOwner
+      ? (diag && typeof diag.owner_reason === 'string' ? diag.owner_reason : '')
+      : (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : ''));
   const routes = diag && diag.legacy_only_routes && typeof diag.legacy_only_routes === 'object'
     ? diag.legacy_only_routes
     : DEFAULT_LEGACY_ONLY_ROUTES;
-  const detachedSafeHold = !!(diag && diag.detached_safe_hold);
+  const detachedSafeHold = !useObs && !!(diag && diag.detached_safe_hold);
   return { owner, reason, routes, detachedSafeHold };
 }
 function isRouteLegacyOnly(routePath) {
@@ -9405,39 +9413,49 @@ function syncLegacyOnlyControls() {
   }
 }
 let ownerDiagRetryTimer = null;
+let ownerDiagInflight = false;
 function scheduleOwnerDiagRetry(delayMs = 3000) {
   if (typeof setTimeout !== 'function' || ownerDiagRetryTimer) return;
   ownerDiagRetryTimer = setTimeout(() => { ownerDiagRetryTimer = null; loadOwnerDiagnostics(); }, delayMs);
 }
 async function loadOwnerDiagnostics() {
+  if (ownerDiagInflight) return;
+  ownerDiagInflight = true;
   let d = null;
   try {
-    d = await api('/api/v1/owner/status', undefined, { quiet: true, method: 'GET' });
-  } catch (_) {
     try {
-      d = await api('/api/v1/diagnostics', undefined, { quiet: true, method: 'GET' });
-    } catch (_) {}
-  }
-  if (d && isValidEffectiveOwner(d.effective_owner)) {
-    const prevOwner = S.ownerDiag ? S.ownerDiag.effective_owner : null;
-    const prevRoutes = S.ownerDiag ? JSON.stringify(S.ownerDiag.legacy_only_routes || null) : null;
-    const nextRoutes = d.legacy_only_routes && typeof d.legacy_only_routes === 'object' ? d.legacy_only_routes : null;
-    S.ownerDiag = {
-      effective_owner: d.effective_owner,
-      owner_state: typeof d.owner_state === 'string' ? d.owner_state : d.effective_owner,
-      owner_reason: typeof d.owner_reason === 'string' ? d.owner_reason : '',
-      detached_safe_hold: !!d.detached_safe_hold,
-      legacy_only_routes: nextRoutes,
-    };
-    renderOwnerStatus();
-    if (prevOwner !== S.ownerDiag.effective_owner || prevRoutes !== JSON.stringify(nextRoutes)) {
-      if (typeof renderGc === 'function') renderGc();
-      if (typeof gtRender === 'function' && $('gtool') && !$('gtool').hidden) gtRender();
-      if (typeof cwRender === 'function' && typeof CWZ !== 'undefined' && CWZ.open) cwRender();
+      d = await api('/api/v1/owner/status', undefined, { quiet: true, method: 'GET' });
+    } catch (_) {
+      try {
+        d = await api('/api/v1/diagnostics', undefined, { quiet: true, method: 'GET' });
+      } catch (_) {}
     }
-    if (S.ownerDiag.effective_owner === 'transferring') scheduleOwnerDiagRetry(2000);
-  } else {
-    scheduleOwnerDiagRetry(3000);
+    if (d && isValidEffectiveOwner(d.effective_owner)) {
+      const prevOwner = S.ownerDiag ? S.ownerDiag.effective_owner : null;
+      const prevReason = S.ownerDiag ? S.ownerDiag.owner_reason : null;
+      const prevRoutes = S.ownerDiag ? JSON.stringify(S.ownerDiag.legacy_only_routes || null) : null;
+      const nextRoutes = d.legacy_only_routes && typeof d.legacy_only_routes === 'object' ? d.legacy_only_routes : null;
+      S.ownerDiag = {
+        effective_owner: d.effective_owner,
+        owner_state: typeof d.owner_state === 'string' ? d.owner_state : d.effective_owner,
+        owner_reason: typeof d.owner_reason === 'string' ? d.owner_reason : '',
+        detached_safe_hold: !!d.detached_safe_hold,
+        legacy_only_routes: nextRoutes,
+      };
+      renderOwnerStatus();
+      if (prevOwner !== S.ownerDiag.effective_owner || prevReason !== S.ownerDiag.owner_reason || prevRoutes !== JSON.stringify(nextRoutes)) {
+        if (typeof renderGc === 'function') renderGc();
+        if (typeof gtRender === 'function' && $('gtool') && !$('gtool').hidden) gtRender();
+        if (typeof cwRender === 'function' && typeof CWZ !== 'undefined' && CWZ.open) cwRender();
+      }
+      if (S.ownerDiag.effective_owner === 'transferring' || S.ownerDiag.effective_owner === 'failed') {
+        scheduleOwnerDiagRetry(2000);
+      }
+    } else {
+      scheduleOwnerDiagRetry(2000);
+    }
+  } finally {
+    ownerDiagInflight = false;
   }
 }
 function renderOwnerStatus() {
