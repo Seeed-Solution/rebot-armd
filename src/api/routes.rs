@@ -865,7 +865,9 @@ mod tests {
             lookup(RouteKey::rest(RestMethod::Get, "/")).unwrap().owner_unavailable,
             OwnerUnavailableAvailability::Allowed
         );
-        assert!(legacy_only_rest_routes().contains(&LEGACY_ONLY_REST_PROBE.1));
+        // Every registered REST route is migrated; the REST probe is an unregistered path that
+        // fails closed on the executor (checked below), so no REST route is LegacyOnly.
+        assert!(legacy_only_rest_routes().is_empty(), "{:?}", legacy_only_rest_routes());
         assert!(legacy_only_ws_commands().contains(&LEGACY_ONLY_WS_PROBE));
         assert_eq!(
             lookup(RouteKey::rest(RestMethod::Post, crate::vision_detector::MODELS_PATH)).unwrap().ownership,
@@ -1230,12 +1232,14 @@ mod tests {
                 .iter()
                 .any(|v| v == crate::gripper_calib::CALIBRATE_PATH)
         );
-        assert!(
+        assert_eq!(
             st_leg["legacy_only_routes"]["rest"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|v| v == LEGACY_ONLY_REST_PROBE.1)
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            legacy_only_rest_routes().iter().map(|s| s.to_string()).collect::<Vec<_>>()
         );
 
         // 2. Active RT executor + internal_fault_fenced().
