@@ -2103,3 +2103,76 @@ fn watchdog_hold_due_time_derives_from_gap_period_and_margin_for_axes_outside_pl
         );
     }
 }
+
+/// Major 2: a caller that never polls (falls behind while later sessions evict the bounded
+/// snapshot history) still receives its session terminal through the shared P-F1 router.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mode_switch_terminal_reaches_caller_that_falls_behind_via_router_credit() {
+    use armd::rt_core::broker::{DeliveryDecision, Outcome, Reply};
+    let h = OwnerHarness::start(OwnerKind::Executor, true, 0, false, false).await;
+    let exec = h.exec.clone().unwrap();
+    let delivered: Arc<std::sync::Mutex<Vec<(ClientId, Reply)>>> = Arc::default();
+    let d_cb = Arc::clone(&delivered);
+    let sink = Arc::new(move |client: ClientId, reply: Reply| {
+        d_cb.lock().unwrap().push((client, reply));
+        DeliveryDecision::Delivered
+    });
+    let caller = ClientId(707);
+    exec.open_connection_sync(707).unwrap().unwrap();
+    let _tok = exec.register_connection_reply_sink(caller, sink, Some(4)).unwrap();
+
+    let plan = ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap();
+    let sid1 = h
+        .sup
+        .start_mode_switch_session(ModeSwitchStartRequest {
+            plan,
+            admission: h.sup.capture_admission_stamp(),
+            operator_required: false,
+            operator_grant: OperatorGrant::unenforced(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            client: caller,
+        })
+        .await
+        .unwrap();
+    // The caller falls behind: three later sessions run to completion first.
+    for _ in 0..3 {
+        let dl = Instant::now() + Duration::from_secs(3);
+        loop {
+            match h
+                .sup
+                .confirm_gripper_mode_session(
+                    6,
+                    ControlMode::PositionForce,
+                    h.sup.capture_admission_stamp(),
+                    OperatorGrant::unenforced(),
+                    Duration::from_secs(1),
+                )
+                .await
+            {
+                Ok(s) => {
+                    assert_eq!(s.progress, ModeProgress::Confirmed);
+                    break;
+                }
+                Err(ConfigError::Busy(_)) => {
+                    assert!(Instant::now() < dl, "previous session never retired");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("later session failed: {e:?}"),
+            }
+        }
+    }
+    assert!(
+        h.sup.poll_mode_switch_session(sid1).await.unwrap().is_none(),
+        "sid1 snapshot must have been evicted from the bounded history"
+    );
+    exec.pump_broker_replies();
+    let got: Vec<_> = delivered.lock().unwrap().clone();
+    let terminals: Vec<_> = got
+        .iter()
+        .filter(|(c, r)| *c == caller && matches!(r, Reply::Terminal { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "caller must receive exactly one terminal: {got:?}");
+    assert!(matches!(terminals[0].1, Reply::Terminal { outcome: Outcome::Completed, .. }));
+    assert_eq!(exec.router_global_reserved(), 0, "terminal credit recovered after delivery");
+    h.shutdown(false).await;
+}

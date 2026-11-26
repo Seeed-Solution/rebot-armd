@@ -12475,6 +12475,7 @@ impl SupervisorInner {
     pub(crate) fn start_mode_switch_rt(
         &mut self,
         req: crate::rt_core::requests::config::ModeSwitchStartRequest,
+        terminal: Option<crate::rt_core::reply_router::SessionTerminalTicket>,
         owner_now: Instant,
     ) -> Result<u64, crate::rt_core::requests::config::ConfigError> {
         use crate::rt_core::requests::config::ConfigError;
@@ -12517,6 +12518,9 @@ impl SupervisorInner {
         prepared.operator_grant = Some(req.operator_grant);
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
+        if let Some(ticket) = terminal.as_ref() {
+            prepared.bind_terminal_ticket(ticket);
+        }
         let sid = admit_session(admitted, prepared, owner_now).map_err(|err| match err {
             SessionAdmitError::SlotBusy | SessionAdmitError::OutputBusy(_) => {
                 ConfigError::Busy(err.code())
@@ -12862,6 +12866,15 @@ impl SupervisorInner {
             self.maybe_escalate_session_safe_hold(outcome, active.escalate_safe_hold_on_uncertain);
         }
     }
+}
+
+/// Allocates a collision-free `ActionId` for a router-bound `ModeSwitch` session terminal
+/// (session-request namespace bit set, never equal to a broker `ActionId`).
+#[cfg(not(target_arch = "wasm32"))]
+fn next_mode_switch_terminal_action_id() -> crate::rt_core::broker::ActionId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    crate::rt_core::broker::ActionId(crate::rt_core::reply_router::SESSION_REQUEST_ID_BIT | n)
 }
 
 /// [`SupervisorInner::keepout_sweep`] with an explicit arm model (planning outside the lock).
@@ -16626,13 +16639,42 @@ impl ArmSupervisor {
             .read_services(crate::rt_core::publish::ReadRequirements::identity())
             .await
             .map_err(|_| ConfigError::OwnerStopped)?;
-        match self
-            .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(req))
-            .await?
+        // Major 2 (R5): on OWNER_EXECUTOR, bind 1 shared P-F1 terminal credit for a caller with an
+        // open reply destination so its terminal is delivered through the router instead of
+        // depending on bounded snapshot history. No destination: polling only (as on Legacy).
+        let handle = self.executor_handle();
+        let terminal = match handle.as_ref() {
+            Some(h) if req.client.0 != 0 => {
+                use crate::rt_core::reply_router::{ExternalDestinationPolicy, ExternalSubmitError};
+                match h.reserve_session_terminal_direct(
+                    req.client,
+                    next_mode_switch_terminal_action_id(),
+                    ExternalDestinationPolicy::ConnectionOnly,
+                ) {
+                    Ok(t) => Some(t),
+                    Err(ExternalSubmitError::Admit(crate::rt_core::broker::AdmitError::RepliesFull)) => {
+                        return Err(ConfigError::Busy("REPLIES_FULL"));
+                    }
+                    Err(ExternalSubmitError::Stopped) => return Err(ConfigError::OwnerStopped),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let res = match self
+            .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(req, terminal))
+            .await
         {
-            ConfigReply::ModeSwitchStarted(res) => res,
-            _ => Err(ConfigError::OwnerStopped),
+            Ok(ConfigReply::ModeSwitchStarted(res)) => res,
+            Ok(_) => Err(ConfigError::OwnerStopped),
+            Err(e) => Err(e),
+        };
+        if res.is_err() {
+            if let (Some(h), Some(t)) = (handle.as_ref(), terminal.as_ref()) {
+                let _ = h.release_session_terminal(t);
+            }
         }
+        res
     }
 
     /// Polls the authoritative [`crate::motor_mode::ModeSwitchSnapshot`] for `session_id`

@@ -1501,7 +1501,12 @@ pub enum ConfigRequest {
         force_reconcile: bool,
     },
     /// Starts one tick-driven PR0C `ModeSwitch` session on `SessionSlot::ExclusiveOutput` (0 alloc).
-    StartModeSwitch(ModeSwitchStartRequest),
+    /// The optional P-F1 terminal ticket (reserved off-RT on the shared router) binds the
+    /// session's terminal for delivery to the caller's reply destination.
+    StartModeSwitch(
+        ModeSwitchStartRequest,
+        Option<crate::rt_core::reply_router::SessionTerminalTicket>,
+    ),
     /// Cancels active `ModeSwitch` session matching `session_id` (stale IDs ignored; 0 alloc).
     CancelModeSwitch { session_id: u64, reason: &'static str },
     /// Clears terminal `ModeSwitch` session slot matching `session_id` once terminal flush completes.
@@ -1545,7 +1550,7 @@ impl ConfigRequest {
             | Self::CancelCommissioning { .. }
             | Self::ClearCommissioning { .. }
             | Self::CommitIntermediateCalibration { .. } => "/api/v1/calibration",
-            Self::StartModeSwitch(_)
+            Self::StartModeSwitch(..)
             | Self::CancelModeSwitch { .. }
             | Self::ClearModeSwitch { .. } => "mode_switch",
             Self::InstallSequenceRunPins(_) | Self::ClearSequenceRunPins { .. } => {
@@ -1790,8 +1795,8 @@ pub(crate) fn handle_config_exchange(
             clean_complete,
             force_reconcile,
         )),
-        ConfigRequest::StartModeSwitch(req) => {
-            ConfigReply::ModeSwitchStarted(core.start_mode_switch_rt(req, ctx.now))
+        ConfigRequest::StartModeSwitch(req, terminal) => {
+            ConfigReply::ModeSwitchStarted(core.start_mode_switch_rt(req, terminal, ctx.now))
         }
         ConfigRequest::CancelModeSwitch { session_id, reason } => {
             ConfigReply::ModeSwitchCancelled(core.cancel_mode_switch_rt(session_id, reason))
