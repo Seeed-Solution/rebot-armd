@@ -878,6 +878,7 @@ impl TrackingRuntime {
 #[derive(Debug, Clone)]
 pub enum TrackingReject {
     Workspace(crate::safety::SafetyError),
+    WorkspaceRt(crate::chain::WorkspaceFailureRt),
     JointLimit(String),
 }
 
@@ -1326,9 +1327,16 @@ impl crate::supervisor::SupervisorInner {
         // 3. Precompute workspace start clearances without mutating live escape state.
         let ws_ctx = if let Some((ws, cam)) = self.workspace_policy() {
             let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+            let use_rt_sweep = eval.total_slots <= crate::kinematics::MAX_STACK_WORKSPACE_SLOTS
+                && scratch.sweep_stack.is_some();
             let mut c_prev = eval.alloc_buf();
-            eval.eval_into(prev_q, &mut c_prev, "tracking_lead")
-                .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
+            if use_rt_sweep {
+                eval.eval_into_slotbuf_rt(prev_q, &mut c_prev, "tracking_lead")
+                    .map_err(TrackingReject::WorkspaceRt)?;
+            } else {
+                eval.eval_into(prev_q, &mut c_prev, "tracking_lead")
+                    .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
+            }
             let min_d_prev = match &self.tracking.ws_min_depths {
                 Some((rev, min_d))
                     if *rev == self.workspace_revision && min_d.as_slice().len() == eval.total_slots =>
@@ -1339,14 +1347,19 @@ impl crate::supervisor::SupervisorInner {
             };
             let meas_ctx = if fresh_meas {
                 let mut c_meas = eval.alloc_buf();
-                eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_lead")
-                    .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
+                if use_rt_sweep {
+                    eval.eval_into_slotbuf_rt(&self.measured_positions, &mut c_meas, "tracking_lead")
+                        .map_err(TrackingReject::WorkspaceRt)?;
+                } else {
+                    eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_lead")
+                        .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
+                }
                 let min_d_meas = eval.init_min_depths(&c_meas);
                 Some((c_meas, min_d_meas))
             } else {
                 None
             };
-            Some((eval, c_prev, min_d_prev, meas_ctx))
+            Some((eval, use_rt_sweep, c_prev, min_d_prev, meas_ctx))
         } else {
             None
         };
@@ -1528,6 +1541,7 @@ impl crate::supervisor::SupervisorInner {
         );
 
         let mut last_err: Option<TrackingReject> = None;
+        let mut last_ws_rt: Option<crate::chain::WorkspaceFailureRt> = None;
         let budget_start = *budget;
         let lead_tried = has_desired_lead;
         let num_cands = if has_desired_lead { 2 } else { 1 };
@@ -1603,14 +1617,10 @@ impl crate::supervisor::SupervisorInner {
 
             // Combined-vector workspace and swept keep-out checks on both segments.
             let mut committed_ws_min_d = None;
-            if let Some((ref eval, ref c_prev, ref min_d_prev, ref meas_ctx)) = ws_ctx {
-                let use_rt_sweep = eval.total_slots <= crate::kinematics::MAX_STACK_WORKSPACE_SLOTS
-                    && scratch.sweep_stack.is_some();
+            if let Some((ref eval, use_rt_sweep, ref c_prev, ref min_d_prev, ref meas_ctx)) = ws_ctx {
                 let mut local_min_d = min_d_prev.clone();
-                let sweep_prev_res = if let (true, Some(stack)) =
-                    (use_rt_sweep, scratch.sweep_stack.as_deref_mut())
-                {
-                    eval.sweep_linear_step_slotbuf_rt(
+                if let (true, Some(stack)) = (use_rt_sweep, scratch.sweep_stack.as_deref_mut()) {
+                    if let Err((_, f)) = eval.sweep_linear_step_slotbuf_rt(
                         prev_q,
                         q_cand,
                         c_prev,
@@ -1620,31 +1630,29 @@ impl crate::supervisor::SupervisorInner {
                         "tracking_lead",
                         "tracking_lead",
                         stack,
-                    )
-                    .map_err(|(_, f)| eval.materialize_failure(f))
-                } else {
-                    eval.sweep_linear_step(
-                        prev_q,
-                        q_cand,
-                        c_prev,
-                        &mut local_min_d,
-                        budget,
-                        MAX_KEEPOUT_EVALS_PER_TICK,
-                        "tracking_lead",
-                        "tracking_lead",
-                    )
-                    .map_err(|(_, f)| f)
-                };
-                if let Err(f) = sweep_prev_res {
+                    ) {
+                        last_ws_rt = Some(f);
+                        last_err = None;
+                        continue 'cand;
+                    }
+                } else if let Err((_, f)) = eval.sweep_linear_step(
+                    prev_q,
+                    q_cand,
+                    c_prev,
+                    &mut local_min_d,
+                    budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    "tracking_lead",
+                    "tracking_lead",
+                ) {
+                    last_ws_rt = None;
                     last_err = Some(TrackingReject::Workspace(SafetyError::from_workspace(f)));
                     continue 'cand;
                 }
                 if let Some((ref c_meas, ref min_d_meas)) = meas_ctx {
                     let mut local_meas_min_d = min_d_meas.clone();
-                    let sweep_meas_res = if let (true, Some(stack)) =
-                        (use_rt_sweep, scratch.sweep_stack.as_deref_mut())
-                    {
-                        eval.sweep_linear_step_slotbuf_rt(
+                    if let (true, Some(stack)) = (use_rt_sweep, scratch.sweep_stack.as_deref_mut()) {
+                        if let Err((_, f)) = eval.sweep_linear_step_slotbuf_rt(
                             &self.measured_positions,
                             q_cand,
                             c_meas,
@@ -1654,22 +1662,22 @@ impl crate::supervisor::SupervisorInner {
                             "tracking_lead",
                             "tracking_lead",
                             stack,
-                        )
-                        .map_err(|(_, f)| eval.materialize_failure(f))
-                    } else {
-                        eval.sweep_linear_step(
-                            &self.measured_positions,
-                            q_cand,
-                            c_meas,
-                            &mut local_meas_min_d,
-                            budget,
-                            MAX_KEEPOUT_EVALS_PER_TICK,
-                            "tracking_lead",
-                            "tracking_lead",
-                        )
-                        .map_err(|(_, f)| f)
-                    };
-                    if let Err(f) = sweep_meas_res {
+                        ) {
+                            last_ws_rt = Some(f);
+                            last_err = None;
+                            continue 'cand;
+                        }
+                    } else if let Err((_, f)) = eval.sweep_linear_step(
+                        &self.measured_positions,
+                        q_cand,
+                        c_meas,
+                        &mut local_meas_min_d,
+                        budget,
+                        MAX_KEEPOUT_EVALS_PER_TICK,
+                        "tracking_lead",
+                        "tracking_lead",
+                    ) {
+                        last_ws_rt = None;
                         last_err = Some(TrackingReject::Workspace(SafetyError::from_workspace(f)));
                         continue 'cand;
                     }
@@ -1693,6 +1701,9 @@ impl crate::supervisor::SupervisorInner {
             });
         }
 
+        if let Some(f) = last_ws_rt {
+            return Err(TrackingReject::WorkspaceRt(f));
+        }
         Err(last_err.unwrap_or_else(|| TrackingReject::JointLimit("no valid tracking candidate".into())))
     }
 
@@ -1852,7 +1863,7 @@ impl crate::supervisor::SupervisorInner {
                 let mut c_prev = eval.alloc_buf();
                 if use_rt_sweep {
                     eval.eval_into_slotbuf_rt(prev_q, &mut c_prev, "tracking_ramp_out")
-                        .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(eval.materialize_failure(f))))?;
+                        .map_err(TrackingReject::WorkspaceRt)?;
                 } else {
                     eval.eval_into(prev_q, &mut c_prev, "tracking_ramp_out")
                         .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
@@ -1883,9 +1894,7 @@ impl crate::supervisor::SupervisorInner {
                         "tracking_ramp_out",
                         stack,
                     ) {
-                        return Err(TrackingReject::Workspace(SafetyError::from_workspace(
-                            eval.materialize_failure(f),
-                        )));
+                        return Err(TrackingReject::WorkspaceRt(f));
                     }
                 } else if let Err((_, f)) = eval.sweep_linear_step(
                     prev_q,
@@ -1907,11 +1916,7 @@ impl crate::supervisor::SupervisorInner {
                             &mut c_meas,
                             "tracking_ramp_out",
                         )
-                        .map_err(|f| {
-                            TrackingReject::Workspace(SafetyError::from_workspace(
-                                eval.materialize_failure(f),
-                            ))
-                        })?;
+                        .map_err(TrackingReject::WorkspaceRt)?;
                     } else {
                         eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_ramp_out")
                             .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
@@ -1929,9 +1934,7 @@ impl crate::supervisor::SupervisorInner {
                             "tracking_ramp_out",
                             stack,
                         ) {
-                            return Err(TrackingReject::Workspace(SafetyError::from_workspace(
-                                eval.materialize_failure(f),
-                            )));
+                            return Err(TrackingReject::WorkspaceRt(f));
                         }
                     } else if let Err((_, f)) = eval.sweep_linear_step(
                         &self.measured_positions,

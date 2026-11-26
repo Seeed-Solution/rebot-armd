@@ -12488,12 +12488,34 @@ impl SupervisorInner {
                                 // Tracking lead or ramp-out output would worsen static load above
                                 // cap or under active static overload restriction: do not emit
                                 // `tr_scratch.out_positions`; halt worsening motion and emit a safe
-                                // hold pose.
-                                if let Some(action_id) =
-                                    self.active_trajectory.as_ref().and_then(|a| a.action_id)
+                                // hold pose. Also cancel any deferred completion captured earlier
+                                // on this tick (e.g. `StepStatus::Done` when `active_trajectory`
+                                // was already retired) or pending from a prior tick so a refused
+                                // release can never report an action as completed.
+                                let deferred_this = deferred_done.take();
+                                let deferred_prev = self.pending_deferred_done.take();
+                                let had_deferred_done = deferred_this.is_some() || deferred_prev.is_some();
+                                let extract_id = |d: DeferredActionDone| match d.target {
+                                    DeferredCompletionTarget::Action(id)
+                                    | DeferredCompletionTarget::MacroSub { action_id: id, .. }
+                                    | DeferredCompletionTarget::MacroFinish { action_id: id, .. } => Some(id),
+                                    DeferredCompletionTarget::ParkRelease(_)
+                                    | DeferredCompletionTarget::Anonymous => None,
+                                };
+                                let deferred_action_id = deferred_this
+                                    .and_then(extract_id)
+                                    .or_else(|| deferred_prev.and_then(extract_id));
+                                if let Some(action_id) = self
+                                    .active_trajectory
+                                    .as_ref()
+                                    .and_then(|a| a.action_id)
+                                    .or(deferred_action_id)
                                 {
                                     self.abort_planned_motion_static_load_rt(Some(action_id));
-                                } else if self.active_trajectory.is_some() {
+                                } else if self.active_trajectory.is_some()
+                                    || had_deferred_done
+                                    || self.pending_normal_unload
+                                {
                                     self.abort_planned_motion_static_load_rt(None);
                                 }
                                 if self.servo_target.is_some() || self.servo_stream_active {
@@ -12553,9 +12575,6 @@ impl SupervisorInner {
                                 );
                                 self.scratch.targets = targets;
                                 tick_output = self.write_output_scratch(servo_dt);
-                                if matches!(tick_output, TickOutput::Complete { .. }) {
-                                    allow_output_accepted = true;
-                                }
                             } else {
                                 let mut targets = std::mem::take(&mut self.scratch.targets);
                                 targets.clear();
@@ -12633,6 +12652,9 @@ impl SupervisorInner {
                                 crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
                                     self.enter_servo_keepout_hold(&ws_err);
                                 }
+                                crate::tracking::TrackingReject::WorkspaceRt(ws_rt) if was_streaming => {
+                                    self.enter_servo_keepout_hold_rt(ws_rt);
+                                }
                                 crate::tracking::TrackingReject::Workspace(ws_err) => {
                                     tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
                                     self.hold_measured_pose();
@@ -12641,6 +12663,17 @@ impl SupervisorInner {
                                         crate::safety::FaultKind::Other,
                                         crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
                                             let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {ws_err}"));
+                                        }),
+                                    );
+                                }
+                                crate::tracking::TrackingReject::WorkspaceRt(ws_rt) => {
+                                    tracing::warn!("Joint tracking output violated workspace ({}: {}): terminating motion", ws_rt.code(), ws_rt.phase);
+                                    self.hold_measured_pose();
+                                    self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
+                                    self.safety.latch(
+                                        crate::safety::FaultKind::Other,
+                                        crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
+                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {} ({})", ws_rt.code(), ws_rt.phase));
                                         }),
                                     );
                                 }
