@@ -3030,6 +3030,7 @@ fn mit_expiry_recover_budgeted_respects_step2_release_rx_frame_budget() {
     bus.with(|s| {
         s.poll_feeds_watchdog = false;
         s.immediate_replies = true;
+        s.tx_step = Duration::from_micros(50);
         for (i, m) in s.motors.iter_mut().enumerate() {
             m.q = rest[i];
             m.v = 0.0;
@@ -3717,6 +3718,7 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         bus.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -3795,6 +3797,7 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         bus.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -3938,6 +3941,7 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         inner.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             s.real_flush = true;
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
@@ -4101,6 +4105,7 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         inner.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -4465,6 +4470,7 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
             inner.with(|s| {
                 s.poll_feeds_watchdog = false;
                 s.immediate_replies = true;
+                s.tx_step = Duration::from_micros(50);
                 for (i, m) in s.motors.iter_mut().enumerate() {
                     m.q = rest[i];
                     m.v = 0.0;
@@ -4548,6 +4554,7 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
             inner.with(|s| {
                 s.poll_feeds_watchdog = false;
                 s.immediate_replies = true;
+                s.tx_step = Duration::from_micros(50);
                 for (i, m) in s.motors.iter_mut().enumerate() {
                     m.q = rest[i];
                     m.v = 0.0;
@@ -5304,6 +5311,7 @@ fn mit_expiry_recover_combined_rx_and_tx_budget_exhaustion() {
     bus.with(|s| {
         s.poll_feeds_watchdog = false;
         s.immediate_replies = true;
+        s.tx_step = Duration::from_micros(50);
         for (i, m) in s.motors.iter_mut().enumerate() {
             m.q = rest[i];
             m.v = 0.0;
@@ -5898,6 +5906,12 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
         .unwrap();
         let slot_h = g_hub.to_plan_slot(None).unwrap();
         let write_h = |dst: &mut armd::rt_core::ops::PlanSlot| *dst = slot_h.clone();
+
+        // Acquire `StateHub::reader_guard()` STRICTLY BEFORE submitting the action so admission,
+        // ACK, execution, retirement, and exact terminal observation all happen strictly while
+        // the StateHub stall is in effect (zero pre-stall completion race).
+        let seq_ret0 = rig.sup.hub().published_seq();
+        let (rel_ret, jh_ret) = pause_hub(&rig.sup);
         let (_req_h, mut ack_rx_h, guard_h) = exec
             .submit_external_action(
                 client_hub,
@@ -5932,13 +5946,7 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
             armd::rt_core::broker::Reply::Ack { action: Some(aid), .. } => aid.0,
             other => panic!("expected Ack(Some(action_id)), got {other:?}"),
         };
-        assert!(
-            hub_stall_terminals.lock().unwrap().is_empty(),
-            "action {hub_action_id} must still be in-flight when StateHub::reader_guard() is acquired"
-        );
 
-        let seq_ret0 = rig.sup.hub().published_seq();
-        let (rel_ret, jh_ret) = pause_hub(&rig.sup);
         let dl_ret = Instant::now() + Duration::from_secs(3);
         loop {
             exec.pump_broker_replies();
@@ -6731,6 +6739,7 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
         inner.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -6850,7 +6859,9 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
             "motors must still be enabled on wire while TX stays queued"
         );
 
-        // Retry after timeout uses fresh probes and never reuses Round 1's reply identity.
+        // Retry after Round 2 timeout resets back to Round 1 so a delayed reply from the timed-out
+        // Round 2 probe landing inside the retry window can at most credit new Round 1 and NEVER
+        // complete confirmation by itself!
         clock.advance(Duration::from_millis(55));
         drv.begin_control_release(7);
         drv.read_joint_states().unwrap();
@@ -6858,26 +6869,62 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
         drv.set_tx_release_deadline(Some(dl7));
         let r7 = drv.mit_expiry_recover_budgeted(dl7, started_at, &mut gate).unwrap();
         drv.set_tx_release_deadline(None);
-        assert!(!r7, "Round 2 retry without second reply must NOT reuse Round 1 reply identity");
+        assert!(!r7, "Round 2 retry without fresh replies must NOT reuse Round 1 reply identity");
         let cc_after_r7 = pending_wire
             .lock()
             .unwrap()
             .iter()
             .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
             .count();
-        assert_eq!(cc_after_r7, 21, "Round 2 retry must submit 7 fresh 0xCC probes");
+        assert_eq!(cc_after_r7, 21, "Retry must submit 7 fresh 0xCC probes");
+
+        // Inject a delayed reply from the timed-out probe inside the retry window (strictly > tx_at).
+        clock.advance(Duration::from_millis(2));
+        let delayed_retry_ts = clock.now();
+        inner.with(|s| {
+            let mut frames = Vec::with_capacity(s.motors.len());
+            for m in s.motors.iter_mut() {
+                let prev_en = m.enabled;
+                let prev_ovr = m.state_override;
+                m.enabled = false;
+                m.state_override = None;
+                frames.push(m.feedback_frame());
+                m.enabled = prev_en;
+                m.state_override = prev_ovr;
+            }
+            for fb in frames {
+                s.push_rx_at(fb, Some(delayed_retry_ts));
+            }
+        });
+        drv.begin_control_release(8);
+        drv.read_joint_states().unwrap();
+        let dl8_retry = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl8_retry));
+        let r8_retry = drv.mit_expiry_recover_budgeted(dl8_retry, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(
+            !r8_retry,
+            "delayed reply from timed-out Round 2 probe landing in retry window MUST NOT confirm"
+        );
+        let cc_after_r8 = pending_wire
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+            .count();
+        assert_eq!(cc_after_r8, 28, "Retry must still require a fresh second round (7 more 0xCC)");
 
         // Phase expiry fails closed (DisableRequestExpired), never reports success.
         clock.advance(Duration::from_millis(1000));
-        drv.begin_control_release(8);
+        drv.begin_control_release(9);
         drv.read_joint_states().unwrap();
-        let dl8 = clock.now() + Duration::from_millis(500);
-        drv.set_tx_release_deadline(Some(dl8));
-        let r8 = drv.mit_expiry_recover_budgeted(dl8, started_at, &mut gate);
+        let dl9 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl9));
+        let r9 = drv.mit_expiry_recover_budgeted(dl9, started_at, &mut gate);
         drv.set_tx_release_deadline(None);
         assert!(
-            matches!(r8, Err(ArmDriverError::DisableRequestExpired)),
-            "unconfirmed recovery past phase window must fail closed with DisableRequestExpired, got {r8:?}"
+            matches!(r9, Err(ArmDriverError::DisableRequestExpired)),
+            "unconfirmed recovery past phase window must fail closed with DisableRequestExpired, got {r9:?}"
         );
     }
 
@@ -6913,6 +6960,9 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
                 drop(q);
                 if reg_cnt == 7 && !self.injected_reg.swap(true, Ordering::AcqRel) {
                     self.inner.with(|s| {
+                        if let Some(c) = &s.clock {
+                            c.advance(Duration::from_micros(50));
+                        }
                         let ts = s.now();
                         let reg_reps: Vec<CanFrame> = s
                             .motors
@@ -6934,6 +6984,9 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
                 }
                 if cc_cnt == 7 && !self.injected_status.swap(true, Ordering::AcqRel) {
                     self.inner.with(|s| {
+                        if let Some(c) = &s.clock {
+                            c.advance(Duration::from_micros(50));
+                        }
                         let ts = s.now();
                         let mut frames = Vec::with_capacity(s.motors.len());
                         for m in s.motors.iter_mut() {
@@ -6980,6 +7033,7 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
         inner.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -7030,6 +7084,7 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
         bus.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -7082,6 +7137,216 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
             "genuine 2-round confirmation across 7 axes must issue exactly 14 0xCC probes (owner_legacy={owner_legacy}), got {cc_cnt}"
         );
         assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
+    }
+
+    // (d) R3 Major 1: Equal-timestamp replies (`rx_at == tx_at` and `rx_at == prev_ack_at`)
+    //     MUST be rejected (strict `>` timestamp ordering on barrier, Round 1, and Round 2).
+    {
+        let clock = MockClock::new();
+        let inner = FakeBus::with_clock(&limits, clock.clone());
+        inner.with(|s| {
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            // Deliberately keep `tx_step == ZERO` so immediate replies carry `rx_at == tx_at`!
+            s.tx_step = Duration::ZERO;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.v = 0.0;
+                m.enabled = i != 3;
+                if i == 3 {
+                    m.state_override = Some(0xD);
+                }
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = build_standalone_mit_recovery_driver(inner.clone(), &rest);
+        drv.read_joint_states().unwrap();
+        let started_at = clock.now();
+        for rel in 1..=3 {
+            clock.advance(Duration::from_millis(25));
+            drv.begin_control_release(rel);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
+        let mut gate = || Ok(());
+        drv.begin_control_release(4);
+        drv.read_joint_states().unwrap();
+        let dl4 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl4));
+        let r4 = drv.mit_expiry_recover_budgeted(dl4, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(!r4, "equal-timestamp barrier/probe replies (rx_at == tx_at) MUST NOT confirm");
+
+        // Now verify Round 2 rejects a reply whose timestamp equals Round 1's confirming reply.
+        let pending_wire = Arc::new(Mutex::new(VecDeque::new()));
+        let hold_wire = Arc::new(AtomicBool::new(true));
+        let inner2 = FakeBus::with_clock(&limits, clock.clone());
+        inner2.with(|s| {
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.v = 0.0;
+                m.enabled = i != 3;
+                if i == 3 {
+                    m.state_override = Some(0xD);
+                }
+            }
+            s.push_all_feedback();
+        });
+        let bus2 = DelayedWireBus {
+            inner: inner2.clone(),
+            pending_wire: Arc::clone(&pending_wire),
+            hold_wire: Arc::clone(&hold_wire),
+        };
+        let mut drv2 = build_standalone_mit_recovery_driver(bus2, &rest);
+        drv2.read_joint_states().unwrap();
+        let started2 = clock.now();
+        for rel in 1..=3 {
+            clock.advance(Duration::from_millis(25));
+            drv2.begin_control_release(rel);
+            inner2.with(|s| s.push_all_feedback());
+            drv2.read_joint_states().unwrap();
+        }
+        // Release 4 queues ClearFault + CMD_DISABLE + barrier.
+        drv2.begin_control_release(4);
+        drv2.read_joint_states().unwrap();
+        let dl = clock.now() + Duration::from_millis(500);
+        drv2.set_tx_release_deadline(Some(dl));
+        assert!(!drv2.mit_expiry_recover_budgeted(dl, started2, &mut gate).unwrap());
+        drv2.set_tx_release_deadline(None);
+        // Inject strictly-later barrier replies.
+        clock.advance(Duration::from_millis(1));
+        let bar_ts = clock.now();
+        inner2.with(|s| {
+            let reps: Vec<CanFrame> = s.motors.iter().map(|m| {
+                let [lo, hi] = m.id.to_le_bytes();
+                let val = m.ctrl_mode().to_le_bytes();
+                CanFrame::new_standard(m.reply_id, &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, val[0], val[1], val[2], val[3]]).unwrap()
+            }).collect();
+            for rep in reps { s.push_rx_at(rep, Some(bar_ts)); }
+        });
+        drv2.begin_control_release(5);
+        drv2.read_joint_states().unwrap();
+        let dl5 = clock.now() + Duration::from_millis(500);
+        drv2.set_tx_release_deadline(Some(dl5));
+        assert!(!drv2.mit_expiry_recover_budgeted(dl5, started2, &mut gate).unwrap());
+        drv2.set_tx_release_deadline(None);
+        // Inject strictly-later Round 1 replies (`p1_ts`).
+        clock.advance(Duration::from_millis(1));
+        let p1_ts = clock.now();
+        inner2.with(|s| {
+            let mut frames = Vec::with_capacity(s.motors.len());
+            for m in s.motors.iter_mut() {
+                m.enabled = false;
+                m.state_override = None;
+                frames.push(m.feedback_frame());
+            }
+            for fb in frames { s.push_rx_at(fb, Some(p1_ts)); }
+        });
+        drv2.begin_control_release(6);
+        drv2.read_joint_states().unwrap();
+        let dl6 = clock.now() + Duration::from_millis(500);
+        drv2.set_tx_release_deadline(Some(dl6));
+        assert!(!drv2.mit_expiry_recover_budgeted(dl6, started2, &mut gate).unwrap());
+        drv2.set_tx_release_deadline(None);
+        // Inject Round 2 replies with timestamp EQUAL to `p1_ts` (== `p2_tx_at` == `p1_ack_at`) -> MUST NOT confirm!
+        inner2.with(|s| {
+            let frames: Vec<CanFrame> = s.motors.iter().map(|m| m.feedback_frame()).collect();
+            for fb in frames { s.push_rx_at(fb, Some(p1_ts)); }
+        });
+        drv2.begin_control_release(7);
+        drv2.read_joint_states().unwrap();
+        let dl7 = clock.now() + Duration::from_millis(500);
+        drv2.set_tx_release_deadline(Some(dl7));
+        let r7 = drv2.mit_expiry_recover_budgeted(dl7, started2, &mut gate).unwrap();
+        drv2.set_tx_release_deadline(None);
+        assert!(!r7, "Round 2 reply with timestamp == Round 1 reply / probe 2 TX MUST NOT confirm");
+    }
+
+    // (e) R3 Major 2: Phase deadline boundary — a final Round 2 reply arriving AT or AFTER the
+    //     phase deadline MUST NOT commit recovery (executor fails closed with DisableRequestExpired).
+    {
+        let clock = MockClock::new();
+        let inner = FakeBus::with_clock(&limits, clock.clone());
+        inner.with(|s| {
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.v = 0.0;
+                m.enabled = i != 3;
+                if i == 3 {
+                    m.state_override = Some(0xD);
+                }
+            }
+            s.push_all_feedback();
+        });
+        let pending_wire = Arc::new(Mutex::new(VecDeque::new()));
+        let hold_wire = Arc::new(AtomicBool::new(false));
+        let bus = DelayedWireBus {
+            inner: inner.clone(),
+            pending_wire: Arc::clone(&pending_wire),
+            hold_wire: Arc::clone(&hold_wire),
+        };
+        let mut drv = build_standalone_mit_recovery_driver(bus, &rest);
+        drv.read_joint_states().unwrap();
+        for rel in 1..=3 {
+            clock.advance(Duration::from_millis(25));
+            drv.begin_control_release(rel);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
+        let started_at = clock.now();
+        let phase_deadline = started_at + Duration::from_secs(1);
+        let mut gate = || Ok(());
+
+        // Advance through ClearFault + CMD_DISABLE + barrier + Round 1 on wire, then hold Round 2.
+        drv.begin_control_release(4);
+        drv.read_joint_states().unwrap();
+        let dl4 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl4));
+        assert!(!drv.mit_expiry_recover_budgeted(dl4, started_at, &mut gate).unwrap());
+        drv.set_tx_release_deadline(None);
+
+        // Hold Round 2 0xCC frames while letting Round 1 finish.
+        hold_wire.store(true, Ordering::Release);
+        // Deliver Round 1 on wire by momentarily releasing hold_wire? Even simpler: push Round 1 replies
+        // strictly after Round 1 TX, then advance right up to `phase_deadline` for Round 2!
+        clock.advance(Duration::from_millis(980));
+        // Keep rest-pose feedback fresh right before deadline while Round 2 is queued.
+        let pre_dl_ts = clock.now();
+        inner.with(|s| {
+            let frames: Vec<CanFrame> = s.motors.iter().map(|m| m.feedback_frame()).collect();
+            for fb in frames { s.push_rx_at(fb, Some(pre_dl_ts)); }
+        });
+        drv.begin_control_release(5);
+        drv.read_joint_states().unwrap();
+        let dl5 = phase_deadline + Duration::from_millis(50);
+        drv.set_tx_release_deadline(Some(dl5));
+        assert!(!drv.mit_expiry_recover_budgeted(dl5, started_at, &mut gate).unwrap());
+        drv.set_tx_release_deadline(None);
+
+        // Advance clock to EXACT `phase_deadline` and inject final Round 2 replies stamped AT `phase_deadline`.
+        let rem_to_dl = phase_deadline.saturating_duration_since(clock.now());
+        clock.advance(rem_to_dl);
+        assert_eq!(clock.now(), phase_deadline);
+        inner.with(|s| {
+            let frames: Vec<CanFrame> = s.motors.iter().map(|m| m.feedback_frame()).collect();
+            for fb in frames { s.push_rx_at(fb, Some(phase_deadline)); }
+        });
+        drv.begin_control_release(6);
+        drv.read_joint_states().unwrap();
+        let dl6 = phase_deadline + Duration::from_millis(50);
+        drv.set_tx_release_deadline(Some(dl6));
+        let r6 = drv.mit_expiry_recover_budgeted(dl6, started_at, &mut gate);
+        drv.set_tx_release_deadline(None);
+        assert!(
+            matches!(r6, Err(ArmDriverError::DisableRequestExpired)),
+            "final reply arriving AT phase_deadline MUST fail closed with DisableRequestExpired, got {r6:?}"
+        );
     }
 }
 
@@ -7197,6 +7462,7 @@ fn legacy_mit_expiry_recovery_preserves_watchdog_continuity_under_lost_or_queued
         inner.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -7259,6 +7525,7 @@ fn legacy_mit_expiry_recovery_preserves_watchdog_continuity_under_lost_or_queued
         inner.with(|s| {
             s.poll_feeds_watchdog = false;
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.q = rest[i];
                 m.v = 0.0;
@@ -7318,6 +7585,149 @@ fn legacy_mit_expiry_recovery_preserves_watchdog_continuity_under_lost_or_queued
             drv.disable_dispatched_mask(),
             0,
             "failed recovery must clear unconfirmed disable_dispatched_mask so SAFE-HOLD continues holding"
+        );
+    }
+
+    // Subcase C (R3 Major 3): Queued CMD_DISABLE on energized J1 + injected stale `state == 0`
+    //            status while continuity hold frames ARE delivered to the fake motor ->
+    //            provisional `state == 0` MUST NOT clear `motor_energized_mask`/`motor_last_ctrl_tx`,
+    //            and J1 keeps receiving real wire hold frames with per-axis gap <= 40 ms!
+    {
+        #[derive(Clone)]
+        struct StaleZeroDeliverHoldsBus {
+            inner: FakeBus,
+            injected_stale_zero_j1: Arc<AtomicBool>,
+            delivered_j1_holds: Arc<Mutex<Vec<Instant>>>,
+        }
+
+        impl CanTransport for StaleZeroDeliverHoldsBus {
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+                self.inner.clock()
+            }
+            fn rx_clock_now(&self) -> Option<CanRxTime> {
+                self.inner.rx_clock_now()
+            }
+            fn rx_clock_sample(&self) -> Option<RxClockSample> {
+                self.inner.rx_clock_sample()
+            }
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+                // Queue CMD_DISABLE and barrier for J1 (never reaching motor 1) and inject one
+                // stale `state == 0` feedback frame for J1 to try to clear `motor_energized_mask`.
+                if frame.id == 1 && frame.data == damiao::CMD_DISABLE {
+                    if !self.injected_stale_zero_j1.swap(true, Ordering::AcqRel) {
+                        self.inner.with(|s| {
+                            if let Some(c) = &s.clock {
+                                c.advance(Duration::from_micros(50));
+                            }
+                            let ts = s.now();
+                            let m = &mut s.motors[0];
+                            let prev_en = m.enabled;
+                            let prev_ovr = m.state_override;
+                            m.enabled = false;
+                            m.state_override = None;
+                            let fb = m.feedback_frame();
+                            m.enabled = prev_en;
+                            m.state_override = prev_ovr;
+                            s.push_rx_at(fb, ts);
+                        });
+                    }
+                    return Ok(());
+                }
+                if frame.id == 0x7FF && u16::from_le_bytes([frame.data[0], frame.data[1]]) == 1 {
+                    return Ok(());
+                }
+                // Deliver all continuity hold frames (`0x101`) to the actual fake motor!
+                if frame.id == 0x101 {
+                    let ts = self.inner.with(|s| s.now()).unwrap_or_else(Instant::now);
+                    self.delivered_j1_holds.lock().unwrap().push(ts);
+                }
+                self.inner.transmit(frame)
+            }
+            fn receive(&mut self) -> Result<CanFrame, TransportError> {
+                self.inner.receive()
+            }
+            fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+                self.inner.receive_timestamped()
+            }
+            fn receive_with_rx_time(&mut self) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
+                self.inner.receive_with_rx_time()
+            }
+            fn flush(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn supports_bounded_flush(&self) -> bool {
+                self.inner.supports_bounded_flush()
+            }
+            fn supports_nonblocking_rt(&self) -> bool {
+                self.inner.supports_nonblocking_rt()
+            }
+            fn flush_is_noop(&self) -> bool {
+                true
+            }
+        }
+
+        let clock = MockClock::new();
+        let inner = FakeBus::with_clock(&limits, clock.clone());
+        inner.with(|s| {
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.v = 0.0;
+                m.enabled = i != 3;
+                if i == 3 {
+                    m.state_override = Some(0xD);
+                }
+            }
+            s.push_all_feedback();
+        });
+        let delivered_j1_holds = Arc::new(Mutex::new(Vec::new()));
+        let injected_stale = Arc::new(AtomicBool::new(false));
+        let bus = StaleZeroDeliverHoldsBus {
+            inner: inner.clone(),
+            injected_stale_zero_j1: Arc::clone(&injected_stale),
+            delivered_j1_holds: Arc::clone(&delivered_j1_holds),
+        };
+        let mut drv = build_standalone_mit_recovery_driver(bus, &rest);
+        for i in 0..7 {
+            if i != 3 {
+                drv.set_axis_confirmed_mode(i, Some(armd::motor_mode::ControlMode::PositionVelocity));
+            }
+        }
+        drv.read_joint_states().unwrap();
+        for rel in 1..=3 {
+            clock.advance(Duration::from_millis(25));
+            drv.begin_control_release(rel);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
+        let t_start = clock.now();
+        let mut gate = || Ok(());
+        let res = drv.mit_expiry_recover_with_gate(&mut gate);
+        let t_end = clock.now();
+        assert!(res.is_err(), "queued J1 disable must fail closed after phase window");
+        assert!(injected_stale.load(Ordering::Acquire), "stale state==0 must have been injected");
+        let mut times = delivered_j1_holds.lock().unwrap().clone();
+        assert!(
+            times.len() >= 9,
+            "stale state==0 MUST NOT stop continuity holds delivered to J1 motor, got {} holds",
+            times.len()
+        );
+        times.insert(0, t_start);
+        times.push(t_end);
+        let max_gap = times
+            .windows(2)
+            .map(|w| w[1].saturating_duration_since(w[0]))
+            .max()
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            max_gap <= Duration::from_millis(40),
+            "J1 delivered wire hold gap exceeded 40 ms after stale state==0: {max_gap:?}"
+        );
+        assert!(
+            inner.with(|s| s.motors[0].enabled && s.motors[0].state_override.is_none()),
+            "J1 must remain cleanly enabled on wire with zero 0xD watchdog expiry"
         );
     }
 }

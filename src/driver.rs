@@ -8063,12 +8063,18 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// RX sequence boundary captured at the start of an active budgeted MIT expiry recovery
     /// (`mit_expiry_recover_budgeted`), cleared on completion or reset.
     mit_expiry_budgeted_boundary: Option<u64>,
+    /// True while synchronous legacy MIT expiry recovery (`mit_expiry_recover_with_gate`) is
+    /// running, keeping provisional `state == 0` feedback from clearing `motor_energized_mask`
+    /// or `motor_last_ctrl_tx` before full two-round confirmation.
+    mit_expiry_recovery_active: bool,
     /// Bitmask of joints that have had `CMD_CLEAR_FAULT` sent during budgeted MIT expiry recovery.
     mit_expiry_cleared_mask: u64,
     /// Per-joint sequential causal disable confirmation state for budgeted MIT expiry recovery:
     /// `CMD_DISABLE` -> `REG_READ(RID_CTRL_MODE)` barrier -> Round 1 `0xCC` (`state == 0`) ->
     /// Round 2 `0xCC` (`state == 0`), draining RX before every probe submission (0 alloc).
     mit_expiry_axes: [MitExpiryAxisState; MAX_MODE_JOINTS],
+    /// Monotonic count of valid timestamped feedback frames decoded per joint (0 alloc).
+    feedback_rx_count: [u64; MAX_MODE_JOINTS],
     /// Most recent `rx_seq` at which each joint reported an adverse (`state_or_error != 0`)
     /// feedback frame (recorded before timestamp filtering so untimestamped adverse frames also
     /// veto disable confirmation).
@@ -9342,10 +9348,10 @@ struct MitExpiryAxisState {
     dis_tx: Option<(u64, Instant)>,
     barrier_tx: Option<(u64, Instant, Option<i128>)>,
     barrier_ack: Option<(u64, Instant)>,
-    probe1_tx: Option<(u64, Instant, Option<i128>)>,
-    probe1_ack: Option<(u64, Instant)>,
-    probe2_tx: Option<(u64, Instant, Option<i128>)>,
-    probe2_ack: Option<(u64, Instant)>,
+    probe1_tx: Option<(u64, Instant, Option<i128>, u64)>,
+    probe1_ack: Option<(u64, Instant, u64)>,
+    probe2_tx: Option<(u64, Instant, Option<i128>, u64)>,
+    probe2_ack: Option<(u64, Instant, u64)>,
     min_next_fb_seq: u64,
 }
 
@@ -9500,8 +9506,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mode_switch_active_mask: 0,
             mode_switch_hold_targets: [None; MAX_MODE_JOINTS],
             mit_expiry_budgeted_boundary: None,
+            mit_expiry_recovery_active: false,
             mit_expiry_cleared_mask: 0,
             mit_expiry_axes: [MitExpiryAxisState::default(); MAX_MODE_JOINTS],
+            feedback_rx_count: [0; MAX_MODE_JOINTS],
             last_adverse_feedback_seq: [0; MAX_MODE_JOINTS],
             release_rx_frames: 0,
             last_feedback_decode_offset_ns: vec![None; dof],
@@ -10198,6 +10206,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn feedback_matches_mit_probe(
         &self,
         now: Instant,
+        phase_deadline: Instant,
         idx: usize,
         req_boundary: u64,
         dis_at: Instant,
@@ -10209,7 +10218,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         probe_tx_off: Option<i128>,
         probe_timeout: Duration,
     ) -> Option<(u64, Instant)> {
-        if self.awaiting_rx_boundary || !self.last_read_drained || self.motor_status[idx] != 0 {
+        if self.awaiting_rx_boundary
+            || !self.last_read_drained
+            || self.motor_status[idx] != 0
+            || now >= phase_deadline
+        {
             return None;
         }
         let fb_seq = self.last_feedback_seq[idx];
@@ -10221,7 +10234,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return None;
         }
         let fb_at = self.last_feedback_instant[idx]?;
-        if fb_at < dis_at || fb_at < prev_at || fb_at < probe_tx_at {
+        // Strict `>` timestamp ordering: a reply must arrive strictly AFTER CMD_DISABLE,
+        // strictly AFTER the previous confirming reply, strictly AFTER this probe's submission,
+        // and strictly BEFORE both the per-probe timeout and the phase deadline.
+        if fb_at <= dis_at || fb_at <= prev_at || fb_at <= probe_tx_at || fb_at >= phase_deadline {
             return None;
         }
         if probe_tx_at.checked_add(probe_timeout).is_some_and(|dl| fb_at >= dl) {
@@ -10254,6 +10270,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn harvest_mit_expiry_confirmations_into(
         &self,
         now: Instant,
+        phase_deadline: Instant,
         n: usize,
         req_boundary: u64,
         probe_timeout: Duration,
@@ -10261,12 +10278,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ) -> (u64, u64) {
         let mut reset_mask = 0u64;
         let mut reclear_mask = 0u64;
-        if self.awaiting_rx_boundary || !self.last_read_drained {
+        if self.awaiting_rx_boundary || !self.last_read_drained || now >= phase_deadline {
             return (0, 0);
         }
         for (i, axis) in axes.iter_mut().enumerate().take(n) {
             if let Some((b_tx_seq, b_tx_at, b_tx_off)) = axis.barrier_tx {
-                let max_rx_at = b_tx_at.checked_add(REGISTER_REPLY_TIMEOUT);
+                let max_rx_at = Some(
+                    b_tx_at
+                        .checked_add(REGISTER_REPLY_TIMEOUT)
+                        .map_or(phase_deadline, |dl| dl.min(phase_deadline)),
+                );
                 match self.commissioning_find_register_reply(
                     i,
                     false,
@@ -10278,9 +10299,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 ) {
                     crate::mit::CommissioningRegMatch::Matched(rep) => {
                         let valid_post_dis = self.valid_register_reply_id(i, rep.reply_id)
+                            && rep.rx_at > b_tx_at
+                            && rep.rx_at < phase_deadline
                             && axis
                                 .dis_tx
-                                .is_some_and(|(dis_seq, dis_at)| rep.rx_seq > dis_seq && rep.rx_at >= dis_at);
+                                .is_some_and(|(dis_seq, dis_at)| rep.rx_seq > dis_seq && rep.rx_at > dis_at);
                         if !valid_post_dis {
                             axis.reset_attempt(self.last_feedback_seq[i]);
                             if i < 64 {
@@ -10344,9 +10367,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
             // Round 1: confirm first post-barrier `state == 0` reply strictly after probe 1 TX.
             if axis.probe1_ack.is_none() {
-                if let Some((p1_tx_seq, p1_tx_at, p1_tx_off)) = axis.probe1_tx {
+                if let Some((p1_tx_seq, p1_tx_at, p1_tx_off, mut p1_fb_before)) = axis.probe1_tx {
+                    // Advance baseline past any already-drained feedback proven by RX timestamp to
+                    // predate `probe1_tx` so only post-submission arrivals count toward ambiguity.
+                    if self.last_feedback_instant[i].is_some_and(|t| t <= p1_tx_at) {
+                        p1_fb_before = self.feedback_rx_count[i];
+                        axis.probe1_tx = Some((p1_tx_seq, p1_tx_at, p1_tx_off, p1_fb_before));
+                    }
+                    let hold_sent_since_probe = self.motor_last_ctrl_tx[i].is_some_and(|t| t >= p1_tx_at);
+                    let arrivals = self.feedback_rx_count[i].saturating_sub(p1_fb_before);
+                    if !hold_sent_since_probe && arrivals > 1 {
+                        // Multiple feedback frames for a single probe indicate delayed/unsolicited
+                        // traffic in flight -> fail closed and restart from CMD_DISABLE.
+                        axis.reset_attempt(self.last_feedback_seq[i]);
+                        if i < 64 {
+                            reset_mask |= 1u64 << i;
+                        }
+                        continue;
+                    }
                     if let Some((fb_seq, fb_at)) = self.feedback_matches_mit_probe(
                         now,
+                        phase_deadline,
                         i,
                         req_boundary,
                         dis_at,
@@ -10358,7 +10399,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         p1_tx_off,
                         probe_timeout,
                     ) {
-                        axis.probe1_ack = Some((fb_seq, fb_at));
+                        axis.probe1_ack = Some((fb_seq, fb_at, self.feedback_rx_count[i]));
                         axis.min_next_fb_seq = axis.min_next_fb_seq.max(fb_seq);
                     }
                 }
@@ -10368,7 +10409,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             // Round 2: confirm second consecutive `state == 0` reply strictly after probe 2 TX
             // AND strictly after Round 1's confirming reply.
             if axis.probe2_ack.is_none() {
-                if let Some((p1_ack_seq, p1_ack_at)) = axis.probe1_ack {
+                if let Some((p1_ack_seq, p1_ack_at, p1_fb_at_ack)) = axis.probe1_ack {
                     if now.saturating_duration_since(p1_ack_at) > STOPPED_DISABLE_FEEDBACK_MAX_AGE {
                         axis.probe1_tx = None;
                         axis.probe1_ack = None;
@@ -10377,9 +10418,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         axis.min_next_fb_seq = axis.min_next_fb_seq.max(self.last_feedback_seq[i]);
                         continue;
                     }
-                    if let Some((p2_tx_seq, p2_tx_at, p2_tx_off)) = axis.probe2_tx {
+                    if let Some((p2_tx_seq, p2_tx_at, p2_tx_off, mut p2_fb_before)) = axis.probe2_tx {
+                        if self.last_feedback_instant[i].is_some_and(|t| t <= p2_tx_at) {
+                            p2_fb_before = self.feedback_rx_count[i];
+                            axis.probe2_tx = Some((p2_tx_seq, p2_tx_at, p2_tx_off, p2_fb_before));
+                        }
+                        let hold_sent_since_probe =
+                            self.motor_last_ctrl_tx[i].is_some_and(|t| t >= p2_tx_at);
+                        let arrivals = self.feedback_rx_count[i].saturating_sub(p2_fb_before);
+                        if !hold_sent_since_probe && arrivals > 1 {
+                            axis.reset_attempt(self.last_feedback_seq[i]);
+                            if i < 64 {
+                                reset_mask |= 1u64 << i;
+                            }
+                            continue;
+                        }
                         if let Some((fb_seq, fb_at)) = self.feedback_matches_mit_probe(
                             now,
+                            phase_deadline,
                             i,
                             req_boundary,
                             dis_at,
@@ -10391,8 +10447,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             p2_tx_off,
                             probe_timeout,
                         ) {
-                            axis.probe2_ack = Some((fb_seq, fb_at));
+                            axis.probe2_ack = Some((fb_seq, fb_at, self.feedback_rx_count[i]));
                             axis.min_next_fb_seq = axis.min_next_fb_seq.max(fb_seq);
+                        }
+                    } else {
+                        // Before Round 2 probe is submitted, an unexpected extra status frame
+                        // (without an intervening continuity hold) indicates delayed traffic.
+                        let hold_sent_since_ack =
+                            self.motor_last_ctrl_tx[i].is_some_and(|t| t >= p1_ack_at);
+                        if !hold_sent_since_ack && self.feedback_rx_count[i] > p1_fb_at_ack {
+                            axis.reset_attempt(self.last_feedback_seq[i]);
+                            if i < 64 {
+                                reset_mask |= 1u64 << i;
+                            }
+                            continue;
                         }
                     }
                 }
@@ -10423,7 +10491,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
             if axis.probe1_ack.is_none() {
-                if let Some((_, p1_tx_at, _)) = axis.probe1_tx {
+                if let Some((_, p1_tx_at, _, _)) = axis.probe1_tx {
                     if now.saturating_duration_since(p1_tx_at) >= probe_timeout {
                         axis.probe1_tx = None;
                         axis.min_next_fb_seq = axis.min_next_fb_seq.max(self.last_feedback_seq[i]);
@@ -10431,33 +10499,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
             if axis.probe2_ack.is_none() {
-                if let Some((_, p2_tx_at, _)) = axis.probe2_tx {
+                if let Some((_, p2_tx_at, _, _)) = axis.probe2_tx {
                     if now.saturating_duration_since(p2_tx_at) >= probe_timeout {
+                        // Reset back to Round 1 on Round 2 timeout so a delayed reply from the
+                        // timed-out probe landing in the retry window can at most credit Round 1
+                        // and NEVER complete confirmation by itself.
+                        axis.probe1_tx = None;
+                        axis.probe1_ack = None;
                         axis.probe2_tx = None;
+                        axis.probe2_ack = None;
                         axis.min_next_fb_seq = axis.min_next_fb_seq.max(self.last_feedback_seq[i]);
-                        if axis
-                            .probe1_ack
-                            .is_some_and(|(_, t)| now.saturating_duration_since(t) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                        {
-                            axis.probe1_tx = None;
-                            axis.probe1_ack = None;
-                        }
                     }
                 }
             } else if axis
                 .probe2_ack
-                .is_some_and(|(_, t)| now.saturating_duration_since(t) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                .is_some_and(|(_, t, _)| now.saturating_duration_since(t) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
             {
+                axis.probe1_tx = None;
+                axis.probe1_ack = None;
                 axis.probe2_tx = None;
                 axis.probe2_ack = None;
                 axis.min_next_fb_seq = axis.min_next_fb_seq.max(self.last_feedback_seq[i]);
-                if axis
-                    .probe1_ack
-                    .is_some_and(|(_, t)| now.saturating_duration_since(t) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                {
-                    axis.probe1_tx = None;
-                    axis.probe1_ack = None;
-                }
             }
         }
         barrier_retried_mask
@@ -10466,45 +10528,52 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn is_mit_expiry_axis_causally_disabled(
         &self,
         now: Instant,
+        phase_deadline: Instant,
         idx: usize,
         req_boundary: u64,
         axis: &MitExpiryAxisState,
     ) -> bool {
+        if now >= phase_deadline {
+            return false;
+        }
         let Some((dis_seq, dis_at)) = axis.dis_tx else {
             return false;
         };
         let Some((b_ack_seq, b_ack_at)) = axis.barrier_ack else {
             return false;
         };
-        let Some((p1_tx_seq, p1_tx_at, _)) = axis.probe1_tx else {
+        let Some((p1_tx_seq, p1_tx_at, _, _)) = axis.probe1_tx else {
             return false;
         };
-        let Some((p1_ack_seq, p1_ack_at)) = axis.probe1_ack else {
+        let Some((p1_ack_seq, p1_ack_at, _)) = axis.probe1_ack else {
             return false;
         };
-        let Some((p2_tx_seq, p2_tx_at, _)) = axis.probe2_tx else {
+        let Some((p2_tx_seq, p2_tx_at, _, _)) = axis.probe2_tx else {
             return false;
         };
-        let Some((p2_ack_seq, p2_ack_at)) = axis.probe2_ack else {
+        let Some((p2_ack_seq, p2_ack_at, _)) = axis.probe2_ack else {
             return false;
         };
         !self.awaiting_rx_boundary
             && self.last_read_drained
             && b_ack_seq > dis_seq
-            && b_ack_at >= dis_at
+            && b_ack_at > dis_at
+            && b_ack_at < phase_deadline
             && p1_ack_seq > req_boundary
             && p1_ack_seq > b_ack_seq
             && p1_ack_seq > p1_tx_seq
-            && p1_ack_at >= dis_at
-            && p1_ack_at >= b_ack_at
-            && p1_ack_at >= p1_tx_at
+            && p1_ack_at > dis_at
+            && p1_ack_at > b_ack_at
+            && p1_ack_at > p1_tx_at
+            && p1_ack_at < phase_deadline
             && p2_tx_seq >= p1_ack_seq
             && p2_tx_at >= p1_ack_at
             && p2_ack_seq > p2_tx_seq
             && p2_ack_seq > p1_ack_seq
-            && p2_ack_at >= dis_at
-            && p2_ack_at >= p2_tx_at
-            && p2_ack_at >= p1_ack_at
+            && p2_ack_at > dis_at
+            && p2_ack_at > p2_tx_at
+            && p2_ack_at > p1_ack_at
+            && p2_ack_at < phase_deadline
             && self.last_feedback_seq[idx] >= p2_ack_seq
             && self.last_adverse_feedback_seq[idx] <= b_ack_seq
             && self.motor_status[idx] == 0
@@ -10512,6 +10581,33 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.feedback_queue_bound[idx].is_some_and(|b| {
                 now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
             })
+    }
+
+    /// Compute the bitmask of axes currently satisfying the full two-round causal disable
+    /// confirmation predicate (zero alloc).
+    fn mit_expiry_confirmed_mask(
+        &self,
+        now: Instant,
+        phase_deadline: Instant,
+        n: usize,
+        req_boundary: u64,
+        axes: &[MitExpiryAxisState; MAX_MODE_JOINTS],
+    ) -> u64 {
+        let mut mask = 0u64;
+        for (i, axis) in axes.iter().enumerate().take(n) {
+            if i < 64
+                && self.is_mit_expiry_axis_causally_disabled(
+                    now,
+                    phase_deadline,
+                    i,
+                    req_boundary,
+                    axis,
+                )
+            {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
     }
 
     /// Interleave SAFE-HOLD-equivalent stationary continuity holds (`TxKind::MeasuredHold`) on
@@ -19918,6 +20014,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         &mut self,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<(), String> {
+        self.mit_expiry_recovery_active = true;
+        let res = (|| -> Result<(), String> {
         self.last_mit_recovery_rx_seq = None;
         let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
         if n == 0 {
@@ -20024,16 +20122,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
         // Phase 2 (2a CMD_DISABLE -> 2b Drain+REG_READ barrier -> 2c-1 Drain+0xCC round 1 ->
         // 2c-2 Drain+0xCC round 2): sequential causal confirmation (zero alloc) with RX-only
-        // drains right before every probe submission.
+        // drains right before every probe submission and strict phase-deadline enforcement.
         self.clear_cached_targets();
         let mut axes = [MitExpiryAxisState::default(); MAX_MODE_JOINTS];
         let phase2_start = self.now();
         let phase2_timeout = REGISTER_REPLY_TIMEOUT.saturating_mul(4);
+        let phase_deadline = phase2_start
+            .checked_add(phase2_timeout)
+            .zip(started_at.checked_add(STOPPED_DISABLE_REQUEST_LIFETIME))
+            .map_or(phase2_start, |(a, b)| a.min(b));
 
         let clear_unconfirmed_dispatched = |d: &mut Self, axes: &[MitExpiryAxisState; MAX_MODE_JOINTS]| {
-            d.disable_rest_established = false;
+            let now = d.now();
+            let confirmed = d.mit_expiry_confirmed_mask(now, phase_deadline, n, req_boundary, axes);
             for (i, axis) in axes.iter().enumerate().take(n) {
-                if i < 64 && axis.dis_tx.is_some() && axis.probe2_ack.is_none() {
+                if i < 64 && axis.dis_tx.is_some() && (confirmed & (1u64 << i)) == 0 {
                     d.disable_dispatched_mask &= !(1u64 << i);
                 }
             }
@@ -20046,6 +20149,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let now = d.now();
             let (reset_mask, _reclear_mask) = d.harvest_mit_expiry_confirmations_into(
                 now,
+                phase_deadline,
                 n,
                 req_boundary,
                 REGISTER_REPLY_TIMEOUT,
@@ -20071,15 +20175,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let _ = self.drain_rx_only_record_registers();
                 harvest_sync(self, &mut axes);
                 let now = self.now();
-                if self.last_read_drained
-                    && (0..n).all(|i| {
-                        self.is_mit_expiry_axis_causally_disabled(now, i, req_boundary, &axes[i])
-                    })
-                {
+                // Enforce phase deadline strictly BEFORE checking confirmation success.
+                if now >= phase_deadline {
                     break;
                 }
-                if now.saturating_duration_since(phase2_start) >= phase2_timeout
-                    || now.saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME
+                if self.last_read_drained
+                    && (0..n).all(|i| {
+                        self.is_mit_expiry_axis_causally_disabled(
+                            now,
+                            phase_deadline,
+                            i,
+                            req_boundary,
+                            &axes[i],
+                        )
+                    })
                 {
                     break;
                 }
@@ -20100,6 +20209,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                 }
             }
+            if self.now() >= phase_deadline {
+                break;
+            }
 
             // Re-clear any axis that reset due to an adverse post-barrier fault state.
             if (0..n).any(|i| axes[i].dis_tx.is_none() && self.motor_status[i] >= 8) {
@@ -20112,7 +20224,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         match self.send_with_commissioning_gate(
                             TxKind::ClearFault,
                             Some(start_stamp),
-                            None,
+                            Some(Deadline { at: phase_deadline }),
                             pre_tx_gate,
                             |d| Some(damiao::build_clear_faults_frame(d.motor_ids[i])),
                         ) {
@@ -20121,6 +20233,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!("PRE_TX_GATE:{code}"));
                             }
+                            Err(Err(TxRefusal::DeadlinePassed)) => break,
                             Err(Err(TxRefusal::Deferred)) => {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!(
@@ -20179,7 +20292,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     match self.send_with_commissioning_gate(
                         TxKind::DisableRequested { started_at },
                         Some(start_stamp),
-                        None,
+                        Some(Deadline { at: phase_deadline }),
                         pre_tx_gate,
                         |d| Some(damiao::build_disable_frame(d.motor_ids[i])),
                     ) {
@@ -20191,6 +20304,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             clear_unconfirmed_dispatched(self, &axes);
                             return Err(format!("PRE_TX_GATE:{code}"));
                         }
+                        Err(Err(TxRefusal::DeadlinePassed)) => break,
                         Err(Err(TxRefusal::DisableWaitEvidence)) => {
                             need_evidence_probe = true;
                             break;
@@ -20231,7 +20345,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         match self.send_with_commissioning_gate(
                             TxKind::DisableProbe,
                             Some(start_stamp),
-                            None,
+                            Some(Deadline { at: phase_deadline }),
                             pre_tx_gate,
                             |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
                         ) {
@@ -20254,6 +20368,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let _ = self.drain_rx_only_record_registers();
                 harvest_sync(self, &mut axes);
                 if self.last_read_drained
+                    && self.now() < phase_deadline
                     && (0..n).any(|i| axes[i].dis_tx.is_some() && axes[i].barrier_tx.is_none())
                 {
                     if !self.in_active_control_release() {
@@ -20269,7 +20384,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         match self.send_with_commissioning_gate(
                             TxKind::Refresh,
                             Some(start_stamp),
-                            None,
+                            Some(Deadline { at: phase_deadline }),
                             pre_tx_gate,
                             |d| {
                                 Some(damiao::build_read_register_frame(
@@ -20286,6 +20401,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!("PRE_TX_GATE:{code}"));
                             }
+                            Err(Err(TxRefusal::DeadlinePassed)) => break,
                             Err(Err(r)) => {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!(
@@ -20325,33 +20441,36 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let _ = self.drain_rx_only_record_registers();
                 harvest_sync(self, &mut axes);
                 if self.last_read_drained
+                    && self.now() < phase_deadline
                     && (0..n).any(|i| axes[i].barrier_ack.is_some() && axes[i].probe1_tx.is_none())
                 {
                     if !self.in_active_control_release() {
                         self.begin_tx_tick();
                     }
                     let mut p1_sent = false;
-                    let mut pass_p1_tx: [Option<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS] =
+                    let mut pass_p1_tx: [Option<(u64, Instant, Option<i128>, u64)>; MAX_MODE_JOINTS] =
                         [None; MAX_MODE_JOINTS];
                     for i in 0..n {
                         if axes[i].barrier_ack.is_none() || axes[i].probe1_tx.is_some() {
                             continue;
                         }
+                        let fb_before = self.feedback_rx_count[i];
                         match self.send_with_commissioning_gate(
                             TxKind::Refresh,
                             Some(start_stamp),
-                            None,
+                            Some(Deadline { at: phase_deadline }),
                             pre_tx_gate,
                             |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
                         ) {
                             Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
                                 p1_sent = true;
-                                pass_p1_tx[i] = Some((tx_seq, tx_started, tx_offset_ns));
+                                pass_p1_tx[i] = Some((tx_seq, tx_started, tx_offset_ns, fb_before));
                             }
                             Err(Ok(code)) => {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!("PRE_TX_GATE:{code}"));
                             }
+                            Err(Err(TxRefusal::DeadlinePassed)) => break,
                             Err(Err(r)) => {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!(
@@ -20388,33 +20507,36 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let _ = self.drain_rx_only_record_registers();
                 harvest_sync(self, &mut axes);
                 if self.last_read_drained
+                    && self.now() < phase_deadline
                     && (0..n).any(|i| axes[i].probe1_ack.is_some() && axes[i].probe2_tx.is_none())
                 {
                     if !self.in_active_control_release() {
                         self.begin_tx_tick();
                     }
                     let mut p2_sent = false;
-                    let mut pass_p2_tx: [Option<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS] =
+                    let mut pass_p2_tx: [Option<(u64, Instant, Option<i128>, u64)>; MAX_MODE_JOINTS] =
                         [None; MAX_MODE_JOINTS];
                     for i in 0..n {
                         if axes[i].probe1_ack.is_none() || axes[i].probe2_tx.is_some() {
                             continue;
                         }
+                        let fb_before = self.feedback_rx_count[i];
                         match self.send_with_commissioning_gate(
                             TxKind::Refresh,
                             Some(start_stamp),
-                            None,
+                            Some(Deadline { at: phase_deadline }),
                             pre_tx_gate,
                             |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
                         ) {
                             Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
                                 p2_sent = true;
-                                pass_p2_tx[i] = Some((tx_seq, tx_started, tx_offset_ns));
+                                pass_p2_tx[i] = Some((tx_seq, tx_started, tx_offset_ns, fb_before));
                             }
                             Err(Ok(code)) => {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!("PRE_TX_GATE:{code}"));
                             }
+                            Err(Err(TxRefusal::DeadlinePassed)) => break,
                             Err(Err(r)) => {
                                 clear_unconfirmed_dispatched(self, &axes);
                                 return Err(format!(
@@ -20445,12 +20567,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
 
-            let mut confirmed_disabled_mask = 0u64;
-            for (i, axis) in axes.iter().enumerate().take(n) {
-                if i < 64 && axis.probe2_ack.is_some() {
-                    confirmed_disabled_mask |= 1u64 << i;
-                }
+            let hold_now = self.now();
+            if hold_now >= phase_deadline {
+                break;
             }
+            let confirmed_disabled_mask =
+                self.mit_expiry_confirmed_mask(hold_now, phase_deadline, n, req_boundary, &axes);
             if let Err(e) = self.service_mit_recovery_continuity_holds(
                 n,
                 start_stamp,
@@ -20471,8 +20593,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         let check_now = self.now();
+        if check_now >= phase_deadline {
+            clear_unconfirmed_dispatched(self, &axes);
+            return Err("MIT expiry recovery phase deadline expired before disable confirmation".into());
+        }
         let missing: Vec<String> = (0..n)
-            .filter(|&i| !self.is_mit_expiry_axis_causally_disabled(check_now, i, req_boundary, &axes[i]))
+            .filter(|&i| {
+                !self.is_mit_expiry_axis_causally_disabled(
+                    check_now,
+                    phase_deadline,
+                    i,
+                    req_boundary,
+                    &axes[i],
+                )
+            })
             .map(|i| format!("J{}", i + 1))
             .collect();
         if !missing.is_empty() {
@@ -20491,8 +20625,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.is_enabling = false;
         self.motor_energized_mask = 0;
         self.disable_dispatched_mask = 0;
-        self.disable_rest_established = false;
         Ok(())
+        })();
+        self.mit_expiry_recovery_active = false;
+        self.disable_rest_established = false;
+        res
     }
 
     fn acknowledge_mit_fence_trip(&mut self) {
@@ -21288,10 +21425,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.mit_expiry_budgeted_boundary.is_some() {
             let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
             for i in 0..n {
-                if i < 64
-                    && self.mit_expiry_axes[i].dis_tx.is_some()
-                    && self.mit_expiry_axes[i].probe2_ack.is_none()
-                {
+                if i < 64 && self.mit_expiry_axes[i].dis_tx.is_some() {
                     self.disable_dispatched_mask &= !(1u64 << i);
                 }
             }
@@ -21315,7 +21449,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.mit_fence = None;
             return Ok(true);
         }
+        let phase_deadline = started_at
+            .checked_add(STOPPED_DISABLE_REQUEST_LIFETIME)
+            .unwrap_or(started_at);
+        let effective_deadline = deadline.min(phase_deadline);
         let now = self.now();
+        if now >= phase_deadline {
+            self.mit_expiry_recover_reset();
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
         if now >= deadline {
             return Ok(false);
         }
@@ -21339,7 +21481,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if rx_budget == 0 {
                 return Ok(false);
             }
-            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+            match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                 Ok((_, true)) => {
                     self.mit_expiry_recover_reset();
                     self.mit_expiry_budgeted_boundary = Some(self.rx_empty_seq);
@@ -21352,6 +21494,27 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         let req_boundary = self.mit_expiry_budgeted_boundary.unwrap_or(0);
 
+        let sync_confirmed_dispatched = |d: &mut Self| {
+            let sync_now = d.now();
+            let axes = d.mit_expiry_axes;
+            let confirmed = d.mit_expiry_confirmed_mask(
+                sync_now,
+                effective_deadline,
+                n,
+                req_boundary,
+                &axes,
+            );
+            for (i, axis) in axes.iter().enumerate().take(n) {
+                if i < 64 && axis.dis_tx.is_some() {
+                    if (confirmed & (1u64 << i)) != 0 {
+                        d.disable_dispatched_mask |= 1u64 << i;
+                    } else {
+                        d.disable_dispatched_mask &= !(1u64 << i);
+                    }
+                }
+            }
+        };
+
         let harvest_and_reset_adverse = |d: &mut Self| {
             if !d.last_read_drained {
                 return;
@@ -21360,6 +21523,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let mut axes = d.mit_expiry_axes;
             let (reset_mask, reclear_mask) = d.harvest_mit_expiry_confirmations_into(
                 harvest_now,
+                effective_deadline,
                 n,
                 req_boundary,
                 REGISTER_REPLY_TIMEOUT,
@@ -21380,6 +21544,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                 }
             }
+            sync_confirmed_dispatched(d);
         };
 
         // Drain existing replies whenever any axis already transmitted CMD_DISABLE, then harvest
@@ -21389,7 +21554,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if rx_budget == 0 {
                 return Ok(false);
             }
-            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+            match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                 Ok((_, true)) => {
                     rx_empty_after_disable = true;
                 }
@@ -21397,6 +21562,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             harvest_and_reset_adverse(self);
             let exp_now = self.now();
+            if exp_now >= phase_deadline {
+                self.mit_expiry_recover_reset();
+                return Err(ArmDriverError::DisableRequestExpired);
+            }
             let mut axes = self.mit_expiry_axes;
             let retried_barriers = self.expire_timed_out_mit_probes(
                 exp_now,
@@ -21415,6 +21584,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                 }
             }
+            sync_confirmed_dispatched(self);
         }
 
         // Phase 1: send clear-error (FF..FB) to every motor reporting an error state (>= 8).
@@ -21425,14 +21595,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if self.motor_status[i] >= 8
                 && ((self.mit_expiry_cleared_mask | pass_cleared_mask) & (1u64 << i)) == 0
             {
-                if self.now() >= deadline {
+                if self.now() >= effective_deadline {
                     any_clear_pending = true;
                     break;
                 }
                 match self.send_with_commissioning_gate(
                     TxKind::ClearFault,
                     Some(start_stamp),
-                    Some(Deadline { at: deadline }),
+                    Some(Deadline { at: effective_deadline }),
                     pre_tx_gate,
                     |d| Some(damiao::build_clear_faults_frame(d.motor_ids[i])),
                 ) {
@@ -21465,33 +21635,31 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         // Phase 2a: Send CMD_DISABLE via TxKind::MitRecoveryDisable (budgeted against TxBudget
-        // AND enforcing Rule A′ + pre_tx_gate at CAN submission).
+        // AND enforcing Rule A′ + pre_tx_gate at CAN submission). Do NOT mark
+        // `disable_dispatched_mask` on host submission alone: keep energized axes eligible for
+        // measured-position holds until full two-round confirmation succeeds.
         self.clear_cached_targets();
         let mut dis_sent = false;
         let mut any_disable_pending = false;
-        let mut pass_dispatched_mask = 0u64;
         let mut pass_disable_tx_seq: [Option<(u64, Instant)>; MAX_MODE_JOINTS] =
             [None; MAX_MODE_JOINTS];
         for i in 0..n {
             if self.mit_expiry_axes[i].dis_tx.is_some() {
                 continue;
             }
-            if self.now() >= deadline {
+            if self.now() >= effective_deadline {
                 any_disable_pending = true;
                 break;
             }
             match self.send_with_commissioning_gate(
                 TxKind::MitRecoveryDisable { started_at },
                 Some(start_stamp),
-                Some(Deadline { at: deadline }),
+                Some(Deadline { at: effective_deadline }),
                 pre_tx_gate,
                 |d| Some(damiao::build_disable_frame(d.motor_ids[i])),
             ) {
                 Ok((_, tx_seq, tx_started, _)) => {
                     dis_sent = true;
-                    if i < 64 {
-                        pass_dispatched_mask |= 1u64 << i;
-                    }
                     pass_disable_tx_seq[i] = Some((tx_seq, tx_started));
                 }
                 Err(Ok(_revoked)) => return Ok(false),
@@ -21521,12 +21689,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.mit_expiry_axes[i].dis_tx = Some(entry);
                 }
             }
-            self.disable_dispatched_mask |= pass_dispatched_mask;
             let rx_budget = self.remaining_release_rx_budget(crate::rt_core::ops::RX_FRAME_BUDGET);
             if rx_budget == 0 {
                 return Ok(false);
             }
-            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+            match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                 Ok((_, true)) => {
                     rx_empty_after_disable = true;
                 }
@@ -21547,7 +21714,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if rx_budget == 0 {
                 return Ok(false);
             }
-            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+            match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                 Ok((_, true)) => {
                     rx_empty_after_disable = true;
                 }
@@ -21565,14 +21732,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 {
                     continue;
                 }
-                if self.now() >= deadline {
+                if self.now() >= effective_deadline {
                     any_barrier_pending = true;
                     break;
                 }
                 match self.send_with_commissioning_gate(
                     TxKind::Refresh,
                     Some(start_stamp),
-                    Some(Deadline { at: deadline }),
+                    Some(Deadline { at: effective_deadline }),
                     pre_tx_gate,
                     |d| Some(damiao::build_read_register_frame(d.motor_ids[i], damiao::RID_CTRL_MODE)),
                 ) {
@@ -21607,7 +21774,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if rx_budget == 0 {
                     return Ok(false);
                 }
-                match self.commissioning_drain_rx_step(rx_budget, deadline) {
+                match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                     Ok((_, true)) => {
                         rx_empty_after_disable = true;
                     }
@@ -21629,7 +21796,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if rx_budget == 0 {
                 return Ok(false);
             }
-            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+            match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                 Ok((_, true)) => {
                     rx_empty_after_disable = true;
                 }
@@ -21639,7 +21806,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
             let mut p1_sent = false;
             let mut any_p1_pending = false;
-            let mut pass_p1_tx: [Option<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS] =
+            let mut pass_p1_tx: [Option<(u64, Instant, Option<i128>, u64)>; MAX_MODE_JOINTS] =
                 [None; MAX_MODE_JOINTS];
             for i in 0..n {
                 if self.mit_expiry_axes[i].barrier_ack.is_none()
@@ -21647,20 +21814,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 {
                     continue;
                 }
-                if self.now() >= deadline {
+                if self.now() >= effective_deadline {
                     any_p1_pending = true;
                     break;
                 }
+                let fb_before = self.feedback_rx_count[i];
                 match self.send_with_commissioning_gate(
                     TxKind::Refresh,
                     Some(start_stamp),
-                    Some(Deadline { at: deadline }),
+                    Some(Deadline { at: effective_deadline }),
                     pre_tx_gate,
                     |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
                 ) {
                     Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
                         p1_sent = true;
-                        pass_p1_tx[i] = Some((tx_seq, tx_started, tx_offset_ns));
+                        pass_p1_tx[i] = Some((tx_seq, tx_started, tx_offset_ns, fb_before));
                     }
                     Err(Ok(_revoked)) => return Ok(false),
                     Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
@@ -21689,7 +21857,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if rx_budget == 0 {
                     return Ok(false);
                 }
-                match self.commissioning_drain_rx_step(rx_budget, deadline) {
+                match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                     Ok((_, true)) => {
                         rx_empty_after_disable = true;
                     }
@@ -21712,7 +21880,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if rx_budget == 0 {
                 return Ok(false);
             }
-            match self.commissioning_drain_rx_step(rx_budget, deadline) {
+            match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                 Ok((_, true)) => {
                     rx_empty_after_disable = true;
                 }
@@ -21722,7 +21890,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
             let mut p2_sent = false;
             let mut any_p2_pending = false;
-            let mut pass_p2_tx: [Option<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS] =
+            let mut pass_p2_tx: [Option<(u64, Instant, Option<i128>, u64)>; MAX_MODE_JOINTS] =
                 [None; MAX_MODE_JOINTS];
             for i in 0..n {
                 if self.mit_expiry_axes[i].probe1_ack.is_none()
@@ -21730,20 +21898,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 {
                     continue;
                 }
-                if self.now() >= deadline {
+                if self.now() >= effective_deadline {
                     any_p2_pending = true;
                     break;
                 }
+                let fb_before = self.feedback_rx_count[i];
                 match self.send_with_commissioning_gate(
                     TxKind::Refresh,
                     Some(start_stamp),
-                    Some(Deadline { at: deadline }),
+                    Some(Deadline { at: effective_deadline }),
                     pre_tx_gate,
                     |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
                 ) {
                     Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
                         p2_sent = true;
-                        pass_p2_tx[i] = Some((tx_seq, tx_started, tx_offset_ns));
+                        pass_p2_tx[i] = Some((tx_seq, tx_started, tx_offset_ns, fb_before));
                     }
                     Err(Ok(_revoked)) => return Ok(false),
                     Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
@@ -21772,7 +21941,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 if rx_budget == 0 {
                     return Ok(false);
                 }
-                match self.commissioning_drain_rx_step(rx_budget, deadline) {
+                match self.commissioning_drain_rx_step(rx_budget, effective_deadline) {
                     Ok((_, true)) => {
                         rx_empty_after_disable = true;
                     }
@@ -21789,9 +21958,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Ok(false);
         }
         let post_now = self.now();
+        if post_now >= phase_deadline {
+            self.mit_expiry_recover_reset();
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        if post_now >= deadline {
+            return Ok(false);
+        }
         for i in 0..n {
             if !self.is_mit_expiry_axis_causally_disabled(
                 post_now,
+                effective_deadline,
                 i,
                 req_boundary,
                 &self.mit_expiry_axes[i],
@@ -25815,6 +25992,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     *slot = decode_offset_ns;
                 }
                 self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
+                if idx < MAX_MODE_JOINTS {
+                    self.feedback_rx_count[idx] = self.feedback_rx_count[idx].saturating_add(1);
+                }
                 self.feedback_queue_bound[idx] = queue_bound;
                 self.last_feedback_seq[idx] = seq;
                 self.motor_status[idx] = feedback.state_or_error;
@@ -25861,7 +26041,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             Some((en_seq, en_at)) => seq > en_seq && rx_at >= en_at,
                             None => true,
                         };
-                        if after_enable && !self.disarm_probe_active {
+                        let mit_recovery_active = self.mit_expiry_recovery_active
+                            || self.mit_expiry_budgeted_boundary.is_some();
+                        if after_enable && !self.disarm_probe_active && !mit_recovery_active {
                             self.motor_disarmed_after_enable[idx] = true;
                             if idx < MAX_MODE_JOINTS && !self.is_enabling {
                                 self.motor_energized_mask &= !(1u32 << idx);
