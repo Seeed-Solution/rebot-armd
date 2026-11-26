@@ -8949,12 +8949,7 @@ impl SupervisorInner {
             drv.sync_release_budget_limits(rx_rem, tx_rem);
             before
         };
-        let use_try = self.rt_executor_owned || self.nonblocking_driver_release;
-        if use_try {
-            d.try_with_mut(apply).unwrap_or((0, 0))
-        } else {
-            d.with_mut(apply).unwrap_or((0, 0))
-        }
+        d.try_with_mut(apply).unwrap_or((0, 0))
     }
 
     /// Charges the driver's newly consumed `(rx_frames, tx_attempts)` since `before` into `budget`.
