@@ -406,6 +406,10 @@ struct Catalog {
     /// Remaining un-deleted episode IDs from a force-delete that encountered an unlink error,
     /// preserved across retries so a retry still removes stranded parquet/sidecar files.
     pending_delete_files: HashMap<String, Vec<String>>,
+    /// Per-episode deletion claims active from catalog removal until all on-disk files are
+    /// unlinked (or through failed-unlink retry). Blocks concurrent `get_or_adopt`, `new_episode`,
+    /// and `publish_complete_episode` from restoring or reusing the ID before cleanup finishes.
+    deleting_episodes: std::collections::HashSet<String>,
     /// Reserved capacity slots held by in-flight manual saves and imports between precheck and
     /// publication Phase 1 claim so concurrent writers cannot race past `MAX_EPISODE_FILES`.
     reserved_slots: usize,
@@ -716,21 +720,21 @@ impl EpisodeStore {
     pub fn contains(&self, id: &str) -> bool { self.cat().episodes.contains_key(id) }
 
     /// [`get`](Self::get), else (episode files written next to the store, tests and tools) adopt
-    /// `<id>.parquet` like boot recovery does (blocking). Never adopts an in-progress publication.
+    /// `<id>.parquet` like boot recovery does (blocking). Never adopts an in-progress publication
+    /// or an episode undergoing deletion.
     pub fn get_or_adopt(&self, id: &str, offsets: &[f32], joint_names: &[String], profile_id: Option<&str>, fps: f64) -> Result<EpisodeSidecar, StoreError> {
         {
             let cat = self.cat();
             if let Some(e) = cat.episodes.get(id) {
                 return Ok(e.sidecar.clone());
             }
-            if cat.in_progress_tokens.contains_key(id) {
+            if cat.in_progress_tokens.contains_key(id) || cat.deleting_episodes.contains(id) {
                 return Err(StoreError::NotFound(id.into()));
             }
         }
         let path = self.path_of(id)?;
         let dir = self.require_dir()?;
         if !path.is_file() { return Err(StoreError::NotFound(id.into())); }
-        let bytes = std::fs::metadata(&path)?.len();
         let sc = read_parquet_kv(&path).ok().and_then(|kv| kv.get(PARQUET_SIDECAR_KEY).cloned())
             .and_then(|t| serde_json::from_str::<EpisodeSidecar>(&t).ok()).filter(|s| s.id == id)
             .or_else(|| adopt_legacy(&path, id, offsets, joint_names, profile_id, fps))
@@ -741,10 +745,14 @@ impl EpisodeStore {
             if let Some(e) = cat.episodes.get(id) {
                 return Ok(e.sidecar.clone());
             }
-            if cat.in_progress_tokens.contains_key(id) {
+            if cat.in_progress_tokens.contains_key(id) || cat.deleting_episodes.contains(id) {
                 return Err(StoreError::NotFound(id.into()));
             }
         }
+        if !path.is_file() {
+            return Err(StoreError::NotFound(id.into()));
+        }
+        let bytes = std::fs::metadata(&path)?.len();
         Self::write_sidecar_file(dir, &sc)?;
         self.cat().episodes.insert(id.into(), Entry { sidecar: sc.clone(), bytes });
         Ok(sc)
@@ -922,13 +930,14 @@ impl EpisodeStore {
     }
 
     /// Change `task` and / or `dataset` of an episode (sidecar rewrite, blocking).
-    /// Honors active dataset deletion guards on both source and destination datasets.
+    /// Atomically pins both source and destination datasets before writing the sidecar so a
+    /// concurrent force-delete cannot race between the check and sidecar write.
     pub fn update(&self, id: &str, task: Option<&str>, dataset: Option<&str>) -> Result<EpisodeSidecar, StoreError> {
         let dir = self.require_dir()?;
         if task.is_some_and(|t| t.chars().count() > 256) { return Err(StoreError::Invalid("task is at most 256 characters".into())); }
         let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sc = {
-            let cat = self.cat();
+        let (mut sc, _src_pin, _dst_pin) = {
+            let mut cat = self.cat();
             if let Some(d) = dataset {
                 if cat.deleting_datasets.contains(d) {
                     return Err(StoreError::DatasetRecordingBusy(d.into()));
@@ -936,6 +945,9 @@ impl EpisodeStore {
                 if d != DEFAULT_DATASET && !cat.datasets.datasets.contains_key(d) {
                     return Err(StoreError::DatasetNotFound(d.into()));
                 }
+            }
+            if cat.deleting_episodes.contains(id) {
+                return Err(StoreError::NotFound(id.into()));
             }
             let sc = cat
                 .episodes
@@ -945,22 +957,25 @@ impl EpisodeStore {
             if cat.deleting_datasets.contains(&sc.dataset) {
                 return Err(StoreError::DatasetRecordingBusy(sc.dataset.clone()));
             }
-            sc
+            *cat.pinned_datasets.entry(sc.dataset.clone()).or_insert(0) += 1;
+            let src_pin = DatasetPinGuard {
+                catalog: Arc::clone(&self.catalog),
+                dataset: sc.dataset.clone(),
+            };
+            let dst_pin = dataset.filter(|d| *d != sc.dataset).map(|d| {
+                *cat.pinned_datasets.entry(d.to_string()).or_insert(0) += 1;
+                DatasetPinGuard {
+                    catalog: Arc::clone(&self.catalog),
+                    dataset: d.to_string(),
+                }
+            });
+            (sc, src_pin, dst_pin)
         };
         if let Some(t) = task { sc.task = t.into(); }
         if let Some(d) = dataset { sc.dataset = d.into(); }
         Self::write_sidecar_file(dir, &sc)?;
-        let mut cat_guard = self.cat();
-        let cat = &mut *cat_guard;
-        if let Some(d) = dataset {
-            if cat.deleting_datasets.contains(d) {
-                return Err(StoreError::DatasetRecordingBusy(d.into()));
-            }
-        }
+        let mut cat = self.cat();
         if let Some(e) = cat.episodes.get_mut(id) {
-            if cat.deleting_datasets.contains(&e.sidecar.dataset) {
-                return Err(StoreError::DatasetRecordingBusy(e.sidecar.dataset.clone()));
-            }
             e.sidecar = sc.clone();
         } else {
             return Err(StoreError::NotFound(id.into()));
@@ -968,12 +983,13 @@ impl EpisodeStore {
         Ok(sc)
     }
 
-    /// Remove `id` from the catalog (no I/O; the caller deletes the files with
-    /// [`delete_files`](Self::delete_files)). Returns whether it was listed.
+    /// Remove `id` from the catalog and install a per-episode deletion claim until
+    /// [`delete_files`](Self::delete_files) finishes unlinking on-disk files.
     pub fn take_for_delete(&self, id: &str) -> bool {
         let mut cat = self.cat();
         if cat.episodes.remove(id).is_some() {
             cat.commit_tokens.remove(id);
+            cat.deleting_episodes.insert(id.to_string());
             true
         } else {
             false
@@ -1015,7 +1031,7 @@ impl EpisodeStore {
     }
 
     /// Atomically checks that `id` is not pinned and `seq_rev` still equals `expected_rev`,
-    /// then removes `id` from the catalog under one lock acquisition.
+    /// then removes `id` from the catalog and installs its deletion claim under one lock acquisition.
     pub fn take_if_unpinned_and_rev_matches(
         &self,
         id: &str,
@@ -1031,6 +1047,7 @@ impl EpisodeStore {
         }
         if cat.episodes.remove(id).is_some() {
             cat.commit_tokens.remove(id);
+            cat.deleting_episodes.insert(id.to_string());
             TakeEpisodeOutcome::Removed
         } else {
             TakeEpisodeOutcome::NotFound
@@ -1040,8 +1057,8 @@ impl EpisodeStore {
     /// Atomically verifies `dataset` is not pinned or already deleting, revalidates that current
     /// catalog membership of `dataset` still exactly equals `ids`, verifies none of `ids` are
     /// pinned by a sequence save and `seq_rev` still equals `expected_rev`, then marks `dataset`
-    /// as mid-deletion (single owner via [`DatasetDeleteGuard`]), retains any prior un-deleted
-    /// retry files, and removes `ids` from the catalog in one lock acquisition.
+    /// as mid-deletion (single owner via [`DatasetDeleteGuard`]), installs per-episode deletion
+    /// claims, retains any prior un-deleted retry files, and removes `ids` from the catalog.
     pub fn take_dataset_if_unpinned_and_rev_matches(
         &self,
         dataset: &str,
@@ -1082,10 +1099,14 @@ impl EpisodeStore {
         for id in ids {
             if cat.episodes.remove(id).is_some() {
                 cat.commit_tokens.remove(id);
+                cat.deleting_episodes.insert(id.clone());
                 if !all_ids.iter().any(|x| x == id) {
                     all_ids.push(id.clone());
                 }
             }
+        }
+        for id in &all_ids {
+            cat.deleting_episodes.insert(id.clone());
         }
         if !all_ids.is_empty() {
             cat.pending_delete_files
@@ -1103,7 +1124,8 @@ impl EpisodeStore {
     /// Delete dataset manifest entry plus already-catalog-removed episode files (blocking).
     /// Takes ownership of `_guard` so async cancellation never releases the dataset deletion
     /// guard before disk cleanup finishes. Any un-deleted files on I/O error stay recorded in
-    /// `pending_delete_files` so a subsequent force-delete retry cleans them up.
+    /// `pending_delete_files` and `deleting_episodes` so a subsequent force-delete retry cleans
+    /// them up without allowing ID reuse.
     pub fn delete_dataset_taken_files(
         &self,
         name: &str,
@@ -1158,6 +1180,8 @@ impl EpisodeStore {
                 Err(e) => return Err(e.into()),
             }
         }
+        // Clear deletion claim ONLY after every file unlink succeeded (or was already absent).
+        self.cat().deleting_episodes.remove(id);
         if found { Ok(()) } else { Err(StoreError::NotFound(id.into())) }
     }
 
@@ -1233,6 +1257,9 @@ impl EpisodeStore {
         {
             let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
             let cat = self.cat();
+            if cat.deleting_episodes.contains(&sidecar.id) {
+                return Err(StoreError::Exists(sidecar.id.clone()));
+            }
             if cat.episodes.contains_key(&sidecar.id) {
                 if let Some(tok) = commit_token {
                     if let Some(done) = cat.commit_tokens.get(&sidecar.id) {
@@ -1433,7 +1460,13 @@ impl EpisodeStore {
             },
         };
         let path = dir.join(format!("{id}.{EPISODE_EXT}"));
-        if path.exists() || self.contains(&id) { return Err(StoreError::Exists(id)); }
+        let claimed = {
+            let cat = self.cat();
+            cat.episodes.contains_key(&id)
+                || cat.in_progress_tokens.contains_key(&id)
+                || cat.deleting_episodes.contains(&id)
+        };
+        if path.exists() || claimed { return Err(StoreError::Exists(id)); }
         Ok((id, path))
     }
 
@@ -1466,26 +1499,32 @@ impl EpisodeStore {
         Ok((bytes, files))
     }
 
-    /// [`StoreError::Full`] when the directory (including in-flight publications and reserved
-    /// capacity slots) is at either cap.
+    /// [`StoreError::Full`] when the directory (including the union of on-disk files and
+    /// in-flight publication claims, plus reserved capacity slots) is at either cap.
     pub fn check_capacity(&self) -> Result<(), StoreError> {
         self.check_capacity_with(MAX_EPISODES_BYTES, MAX_EPISODE_FILES)
     }
 
     pub fn check_capacity_with(&self, max_bytes: u64, max_files: usize) -> Result<(), StoreError> {
         let dir = self.require_dir()?;
-        let (bytes, files) = self.usage()?;
-        let (in_progress_unwritten, reserved_slots) = {
+        let mut bytes = 0u64;
+        let mut disk_stems = std::collections::HashSet::new();
+        for (stem, meta) in episode_files(dir)? {
+            bytes = bytes.saturating_add(meta.len());
+            disk_stems.insert(stem);
+        }
+        let (in_progress_extra, reserved_slots) = {
             let cat = self.cat();
-            let unwritten = cat
+            let extra = cat
                 .in_progress_tokens
                 .keys()
-                .filter(|id| !dir.join(format!("{id}.{EPISODE_EXT}")).is_file())
+                .filter(|id| !disk_stems.contains(id.as_str()))
                 .count();
-            (unwritten, cat.reserved_slots)
+            (extra, cat.reserved_slots)
         };
-        let effective_files = files
-            .saturating_add(in_progress_unwritten)
+        let effective_files = disk_stems
+            .len()
+            .saturating_add(in_progress_extra)
             .saturating_add(reserved_slots);
         if bytes >= max_bytes || effective_files >= max_files {
             return Err(StoreError::Full {

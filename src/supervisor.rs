@@ -19287,7 +19287,7 @@ impl ArmSupervisor {
 fn dispatch_loop(
     hub: &crate::rt_core::publish::StateHub,
     tx: &broadcast::Sender<ArmObservation>,
-    terminals: &TerminalBroadcaster,
+    terminals: &Arc<TerminalBroadcaster>,
     terminal_capture: &terminal_capture::TerminalCaptureChannel,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
     tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
@@ -19437,7 +19437,7 @@ fn dispatch_loop(
     // and emit any final safety overflow summary. Drain `terminal_capture` BEFORE
     // `flush_and_report_shutdown` so final broker reply routing sees every captured entry.
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    terminal_capture.wait_for_sequence_commit_idle(Duration::from_secs(5));
+    terminal_capture.wait_or_defer_shutdown_drain(Duration::from_secs(5), terminals, template_obs);
     let final_snap = hub.latest().or(latest_snap);
     terminal_capture.drain_into(
         terminals,

@@ -1002,7 +1002,8 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
         armd::recording::store::TakeDatasetOutcome::Removed(ids, g) => (ids, g),
         other => panic!("expected Removed, got {other:?}"),
     };
-    // Concurrent second force-delete and episode move into deleting dataset both fail RECORDER_BUSY!
+    // Concurrent second force-delete, episode move into deleting dataset, replay adoption,
+    // and ID reuse via new_episode MUST all be blocked while deletion claim is active (B2/B3/M3).
     assert!(matches!(
         store.take_dataset_if_unpinned_and_rev_matches("del_guard_ds", &[], &seq_rev, 0),
         armd::recording::store::TakeDatasetOutcome::DatasetRecordingBusy
@@ -1010,6 +1011,17 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
     assert_eq!(
         store.update(&sc_rec.id, None, Some("del_guard_ds")).unwrap_err().status_code(),
         (409, "RECORDER_BUSY")
+    );
+    assert_eq!(
+        store
+            .get_or_adopt("dg_ep_1", &[0.0; 7], &sc_dg.joint_names, sc_dg.profile_id.as_deref(), 50.0)
+            .unwrap_err()
+            .status_code(),
+        (404, "EPISODE_NOT_FOUND")
+    );
+    assert_eq!(
+        store.new_episode(Some("dg_ep_1"), None).unwrap_err().status_code(),
+        (409, "EPISODE_EXISTS")
     );
     store.delete_dataset_taken_files("del_guard_ds", &taken_dg, dg_guard).unwrap();
     assert!(!store.has_dataset("del_guard_ds"));
