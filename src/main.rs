@@ -46,7 +46,7 @@ where
             println!("armd - Robotic arm daemon\n\nUSAGE: armd [OPTIONS]\n\n\
                 --follower <MODEL>           rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, sim, mock (default)\n\
                 --follower-port <PORT>       CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
-                --owner <OWNER>              control-loop owner: legacy (default) or executor (explicit opt-in for rebot-dm and mock; or ARMD_RT_OWNER)\n\
+                --owner <OWNER>              control-loop owner: auto (default: executor for rebot-dm and mock, legacy otherwise), legacy, or executor (precedence: CLI > ARMD_RT_OWNER > arm.armd_owner > auto)\n\
                 --config <JSON>              ArmConfig profile (must match follower joint count)\n\
                 --cell <JSON>                Multi-arm cell topology file (rebot-cell/v1; or ARMD_CELL; off by default)\n\
                 --cell-host <ID>             Local host ID inside --cell hosts map (or ARMD_CELL_HOST; default auto-identify)\n\
@@ -227,6 +227,96 @@ fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &ar
             DiagnosticsState::set_global(DiagnosticsState { blackbox_dir: Some(dir), boot: rec.boot });
         }
         Err(e) => warn!("Black box directory {} unavailable ({e}); black box off", dir.display()),
+    }
+}
+
+const DEFAULT_APP_CONFIG_PATH: &str = "/userdata/local/apps/rebot-teleop.config.json";
+
+/// Reads `arm.armd_owner` (falling back to top-level `armd_owner`) from the app config JSON
+/// (`ARMD_APP_CONFIG`, or `/userdata/local/apps/rebot-teleop.config.json` when present).
+/// Fails closed on unreadable/malformed files or invalid values so a typo (e.g. `"legcay"`)
+/// never silently falls through to `auto` and switches real hardware to `executor`.
+fn read_app_config_armd_owner_from_path(path: &std::path::Path) -> Result<Option<String>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "Failed to read app config {} for arm.armd_owner: {e}",
+                path.display()
+            ));
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "Failed to parse app config {} for arm.armd_owner: {e}",
+            path.display()
+        )
+    })?;
+    let root = parsed.as_object().ok_or_else(|| {
+        format!(
+            "App config {} must be a JSON object when checking arm.armd_owner",
+            path.display()
+        )
+    })?;
+    let arm_owner_val = match root.get("arm") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(arm) => {
+            let arm_obj = arm.as_object().ok_or_else(|| {
+                format!(
+                    "App config {} field 'arm' must be a JSON object when checking arm.armd_owner",
+                    path.display()
+                )
+            })?;
+            arm_obj.get("armd_owner").filter(|v| !v.is_null())
+        }
+    };
+    let owner_val = arm_owner_val.or_else(|| root.get("armd_owner").filter(|v| !v.is_null()));
+    let Some(val) = owner_val else {
+        return Ok(None);
+    };
+    let Some(s) = val.as_str() else {
+        return Err(format!(
+            "arm.armd_owner in {} must be 'auto', 'legacy', or 'executor' (got non-string JSON value)",
+            path.display()
+        ));
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn read_app_config_armd_owner() -> Result<Option<String>, String> {
+    if let Some(raw) = std::env::var_os("ARMD_APP_CONFIG") {
+        let s = raw.to_string_lossy();
+        let trimmed = s.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("none")
+        {
+            return Ok(None);
+        }
+        return read_app_config_armd_owner_from_path(std::path::Path::new(&raw));
+    }
+    read_app_config_armd_owner_from_path(std::path::Path::new(DEFAULT_APP_CONFIG_PATH))
+}
+
+fn read_env_rt_owner_os(raw: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
+    let Some(os) = raw else {
+        return Ok(None);
+    };
+    let Some(s) = os.to_str() else {
+        return Err(
+            "ARMD_RT_OWNER must be valid UTF-8 ('auto', 'legacy', or 'executor')".into(),
+        );
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
     }
 }
 
@@ -757,6 +847,9 @@ async fn start_control_owner_with_hooks(
                     error!(
                         "RT executor startup failed on follower '{follower}' while detached writer holds driver in SAFE-HOLD ({e}); keeping daemon alive until deliberate shutdown signal without torque-off"
                     );
+                    supervisor
+                        .set_owner_reason(armd::OwnerReason::StartupFailedDetachedSafeHold)
+                        .await;
                     Ok(StartedControlOwner {
                         executor_handle: None,
                         legacy_control_stop: None,
@@ -773,6 +866,9 @@ async fn start_control_owner_with_hooks(
                     error!(
                         "RT executor startup failed on real follower '{follower}' ({e}); falling back to legacy owner holding (DRV-F1 handback) without torque-off"
                     );
+                    supervisor
+                        .set_owner_reason(armd::OwnerReason::StartupFallbackToLegacy)
+                        .await;
                     let stop = spawn_legacy_control_loop(
                         supervisor,
                         period,
@@ -858,15 +954,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         m => warn!("Process memory not locked ({}); MIT tracking, when configured, is refused", m.describe()),
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
-    let env_rt_owner = std::env::var("ARMD_RT_OWNER").ok();
-    let rt_owner = armd::rt_core::executor::RtOwner::resolve(
+    let env_rt_owner = if cli.owner.is_none() {
+        read_env_rt_owner_os(std::env::var_os("ARMD_RT_OWNER").as_deref())?
+    } else {
+        None
+    };
+    let config_rt_owner = if cli.owner.is_none() && env_rt_owner.is_none() {
+        read_app_config_armd_owner()?
+    } else {
+        None
+    };
+    let (requested_owner, _) = armd::rt_core::executor::RequestedRtOwner::resolve(
         cli.owner.as_deref(),
         env_rt_owner.as_deref(),
+        config_rt_owner.as_deref(),
     )?;
-    armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
+    if requested_owner == armd::rt_core::executor::RequestedRtOwner::Executor {
+        armd::rt_core::executor::validate_startup_owner(
+            armd::rt_core::executor::RtOwner::Executor,
+            follower,
+        )?;
+    }
     let (config, loaded_profile_path) =
         resolve_follower_config_with_path(follower, cli.config.as_deref())?;
     let mut config = apply_cli_tool(config, cli.tool.as_deref())?;
+    let resolved_owner = armd::rt_core::executor::resolve_startup_owner(
+        cli.owner.as_deref(),
+        env_rt_owner.as_deref(),
+        config_rt_owner.as_deref(),
+        follower,
+        &config,
+    )?;
+    let rt_owner = resolved_owner.effective;
+    if let Some(detail) = resolved_owner.fallback_detail.as_deref() {
+        info!(
+            "Startup owner auto resolved to legacy (reason={}): {detail}",
+            resolved_owner.reason.as_str()
+        );
+    } else {
+        info!(
+            "Startup owner resolved: effective={} reason={} follower={follower}",
+            resolved_owner.effective.as_str(),
+            resolved_owner.reason.as_str()
+        );
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let shadow_env = std::env::var(armd::torque::shadow::ENV_TORQUE_SHADOW).ok();
@@ -919,6 +1050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_tx_budget = config.damiao_tx_budget();
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    supervisor.set_owner_reason(resolved_owner.reason).await;
     // Install the process-wide lock-free/zero-alloc tiered panic coordinator strictly BEFORE
     // mounting or enabling any hardware (FU-PANIC / DRV-F1).
     armd::panic_coord::install_process_panic_coordinator(Arc::clone(
@@ -1753,31 +1885,102 @@ mod shutdown_tests {
 
     #[test]
     fn cli_owner_flag_and_follower_gate() {
+        let dm = ArmConfig::rebot_dm();
         let parsed = parse_cli_args_from(["--follower", "rebot-dm", "--owner", "executor"]).unwrap();
         assert_eq!(parsed.follower.as_deref(), Some("rebot-dm"));
         assert_eq!(parsed.owner.as_deref(), Some("executor"));
-        let owner = armd::rt_core::executor::RtOwner::resolve(parsed.owner.as_deref(), Some("legacy")).unwrap();
-        assert_eq!(owner, armd::rt_core::executor::RtOwner::Executor);
-        assert!(armd::rt_core::executor::validate_startup_owner(owner, "rebot-dm").is_ok());
+        let resolved = armd::rt_core::executor::resolve_startup_owner(
+            parsed.owner.as_deref(),
+            Some("legacy"),
+            Some("legacy"),
+            "rebot-dm",
+            &dm,
+        )
+        .unwrap();
+        assert_eq!(resolved.effective, armd::rt_core::executor::RtOwner::Executor);
+        assert_eq!(resolved.reason, armd::OwnerReason::ExplicitCli);
 
         // Missing or empty --owner value is rejected.
         assert!(parse_cli_args_from(["--owner"]).is_err());
         assert!(parse_cli_args_from(["--owner", ""]).is_err());
 
-        // Default stays legacy when neither CLI nor env is set.
+        // Omitted owner defaults to Auto: executor for rebot-dm and mock, legacy for others.
         let default_cli = parse_cli_args_from(["--follower", "rebot-dm"]).unwrap();
-        assert_eq!(
-            armd::rt_core::executor::RtOwner::resolve(default_cli.owner.as_deref(), None).unwrap(),
-            armd::rt_core::executor::RtOwner::Legacy
-        );
+        let auto_dm = armd::rt_core::executor::resolve_startup_owner(
+            default_cli.owner.as_deref(),
+            None,
+            None,
+            "rebot-dm",
+            &dm,
+        )
+        .unwrap();
+        assert_eq!(auto_dm.effective, armd::rt_core::executor::RtOwner::Executor);
+        assert_eq!(auto_dm.reason, armd::OwnerReason::AutoQualified);
 
-        // Unqualified real followers refuse executor with clear error.
+        let auto_so101 = armd::rt_core::executor::resolve_startup_owner(
+            None,
+            None,
+            None,
+            "so-arm101",
+            &ArmConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(auto_so101.effective, armd::rt_core::executor::RtOwner::Legacy);
+        assert_eq!(auto_so101.reason, armd::OwnerReason::AutoFallbackUnqualifiedFollower);
+        assert!(auto_so101.fallback_detail.as_deref().unwrap().contains("so-arm101"));
+
+        // Explicit --owner auto overrides env/config.
+        let cli_auto = parse_cli_args_from(["--follower", "rebot-dm", "--owner", "auto"]).unwrap();
+        let auto_over_env = armd::rt_core::executor::resolve_startup_owner(
+            cli_auto.owner.as_deref(),
+            Some("legacy"),
+            Some("legacy"),
+            "rebot-dm",
+            &dm,
+        )
+        .unwrap();
+        assert_eq!(auto_over_env.effective, armd::rt_core::executor::RtOwner::Executor);
+        assert_eq!(auto_over_env.reason, armd::OwnerReason::AutoQualified);
+
+        // Unqualified real followers refuse explicit executor with clear error.
         let err = armd::rt_core::executor::validate_startup_owner(
             armd::rt_core::executor::RtOwner::Executor,
             "so-arm101",
         )
         .unwrap_err();
         assert!(err.contains("so-arm101"), "{err}");
+
+        // App config lookup reads arm.armd_owner, falls back to top-level armd_owner, and fails
+        // closed on non-string/malformed values (while unrecognized strings are rejected by resolver).
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("rebot-teleop.config.json");
+        std::fs::write(&cfg_path, r#"{"arm":{"armd_owner":"legacy"}}"#).unwrap();
+        assert_eq!(read_app_config_armd_owner_from_path(&cfg_path).unwrap().as_deref(), Some("legacy"));
+        std::fs::write(&cfg_path, r#"{"armd_owner":"executor","arm":{}}"#).unwrap();
+        assert_eq!(read_app_config_armd_owner_from_path(&cfg_path).unwrap().as_deref(), Some("executor"));
+        std::fs::write(&cfg_path, r#"{"armd_owner":"executor","arm":{"armd_owner":"auto"}}"#).unwrap();
+        assert_eq!(read_app_config_armd_owner_from_path(&cfg_path).unwrap().as_deref(), Some("auto"));
+        std::fs::write(&cfg_path, r#"{"arm":{"armd_owner":"legcay"}}"#).unwrap();
+        let bad_val = read_app_config_armd_owner_from_path(&cfg_path).unwrap();
+        assert_eq!(bad_val.as_deref(), Some("legcay"));
+        assert!(armd::rt_core::executor::RequestedRtOwner::resolve(None, None, bad_val.as_deref()).is_err());
+        std::fs::write(&cfg_path, r#"{"arm":{"armd_owner":123}}"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"{"arm":"legacy"}"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"["legacy"]"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+        std::fs::write(&cfg_path, r#"{malformed"#).unwrap();
+        assert!(read_app_config_armd_owner_from_path(&cfg_path).is_err());
+
+        // Non-UTF-8 ARMD_RT_OWNER fails closed instead of silently falling through to Auto.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = std::ffi::OsStr::from_bytes(b"leg\xffacy");
+            let err = read_env_rt_owner_os(Some(non_utf8)).unwrap_err();
+            assert!(err.contains("ARMD_RT_OWNER"), "{err}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

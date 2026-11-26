@@ -1147,6 +1147,10 @@ pub struct TickSnapshot {
     pub diag_dropped: u64,
     /// Active control-loop owner mode (`"legacy"`, `"transferring"`, `"executor"`, `"failed"`).
     pub owner_mode: &'static str,
+    /// Effective control-loop owner (`"legacy"` or `"executor"`).
+    pub effective_owner: &'static str,
+    /// Why the daemon is running under `effective_owner`.
+    pub owner_reason: &'static str,
     /// True while the owning periodic control loop is actively running.
     #[serde(default)]
     pub loop_active: bool,
@@ -2567,6 +2571,8 @@ impl TickWindow {
             skipped_releases: 0,
             diag_dropped: 0,
             owner_mode: "legacy",
+            effective_owner: "legacy",
+            owner_reason: "default",
             loop_active: false,
             reader_hold_us: self.col(|r| r.reader_hold_us),
             writer_hold_us: self.col(|r| r.writer_hold_us),

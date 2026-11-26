@@ -56,13 +56,14 @@
           {
             "key": "armd_owner",
             "type": "select",
-            "title": "Control Loop Owner (legacy = default supervisor-lock loop; executor = synchronous RT executor opt-in for rebot-dm and mock)",
-            "title_zh": "控制循环所有者（legacy = 默认 supervisor 锁循环；executor = 同步实时执行器，仅显式启用用于 rebot-dm 和 mock）",
+            "title": "Control Loop Owner (auto = default: RT executor on rebot-dm/mock, legacy otherwise; legacy = supervisor-lock loop; executor = explicit RT executor request, refusing ineligible configs and preserving DRV-F1 legacy handback on init failure)",
+            "title_zh": "控制循环所有者（auto = 默认：rebot-dm/mock 用实时执行器，其余用 legacy；legacy = supervisor 锁循环；executor = 显式请求实时执行器，不符合条件时拒绝启动，初始化可恢复失败时按 DRV-F1 切回 legacy 保持）",
             "options": [
+              "auto",
               "legacy",
               "executor"
             ],
-            "default": "legacy"
+            "default": "auto"
           }
         ]
       },

@@ -1885,6 +1885,9 @@ body.ui-simple #det-chip { display: none !important; }
 body.ui-simple #cam-chip.is-ok { display: none; }
 body.ui-simple #btn-task:not(.is-live) { display: none; }
 body.ui-simple #tool-badge.is-stock { display: none !important; }
+#owner-badge { font-size: 11px; border: 0; font-family: inherit; cursor: pointer; }
+#owner-badge:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+body.ui-simple #owner-badge:not(.is-fallback) { display: none !important; }
 body.ui-simple #btn-vis { min-height: 32px; padding: 0 12px; font-size: 13px; }
 /* recognition panel */
 .s-vis { display: none; }
@@ -2441,6 +2444,7 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
     <span class="ex-top-grow only-expert"></span>
     <div class="head-stats">
       <button class="speed-pill" id="speed-pill" data-i18n-aria="speed.adjust" aria-label="速度调节">60% ▾</button>
+      <button type="button" class="sc-status-badge plain" id="owner-badge" hidden></button>
       <span class="sc-status-badge plain" id="tool-badge" hidden></span>
       <span class="sc-status-badge" id="link-badge">-- Hz</span>
       <span class="sc-status-badge" id="state-badge" data-i18n="st.Offline">离线</span>
@@ -4441,6 +4445,19 @@ Object.assign(I18N.zh, {
   'task.env.sec.sandbox': '策略 / 沙盒', 'task.env.sec.safety': '安全', 'task.env.sec.cell': '工作单元',
   'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.daemon_tool': '臂端工具', 'task.env.tool_comm': '工具调试', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
   'tool.badge.comm': '{id} · 待调试', 'tool.comm.title': '工具「{id}」未完成调试', 'tool.comm.hint': '请先完成工具调试/标定后再执行常规运动。',
+  'owner.badge.executor': 'RT', 'owner.badge.legacy': 'Legacy', 'owner.badge.fallback': 'Legacy · 回退', 'owner.badge.failed': '控制循环 · 失败', 'owner.badge.transferring': '切换中',
+  'owner.name.executor': '实时执行器 (executor)', 'owner.name.legacy': '传统控制循环 (legacy)', 'owner.name.failed': '控制循环失败 (SAFE-HOLD)', 'owner.name.transferring': '控制循环切换中',
+  'owner.title': '控制循环：{owner}（{reason}）',
+  'owner.reason.default': '默认',
+  'owner.reason.explicit_cli': '命令行 --owner 指定',
+  'owner.reason.explicit_env': '环境变量 ARMD_RT_OWNER 指定',
+  'owner.reason.explicit_config': '配置 arm.armd_owner 指定',
+  'owner.reason.auto_qualified': '自动选择：已认证从手与配置',
+  'owner.reason.auto_fallback_unqualified_follower': '自动回退：从手未通过实时执行器认证',
+  'owner.reason.auto_fallback_mit_profile': '自动回退：配置启用了 MIT 阻抗跟踪',
+  'owner.reason.auto_fallback_dof_limit': '自动回退：自由度超出实时执行器上限',
+  'owner.reason.startup_fallback_to_legacy': '启动回退：实时执行器初始化失败后切回传统保持',
+  'owner.reason.startup_failed_detached_safe_hold': '启动失败：分离安全保持线程持有驱动（未切回 legacy）',
   'task.env.safety': '安全状态', 'task.env.col': '碰撞保护', 'task.env.ml': '运动限制', 'task.env.ko': '禁入区', 'task.env.poses': '已存点位',
   'task.env.col.hold': '触发保持（J{j}）', 'task.env.col.ok': '正常', 'task.env.count': '{n} 个',
   'task.env.na': '不支持', 'task.env.none': '无', 'task.env.loading': '读取中…', 'task.env.updated': '更新于 {t}', 'task.env.err': '读取失败：{list}',
@@ -4459,6 +4476,19 @@ Object.assign(I18N.en, {
   'task.env.sec.sandbox': 'Policy / sandbox', 'task.env.sec.safety': 'Safety', 'task.env.sec.cell': 'Work cell',
   'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.daemon_tool': 'Daemon tool', 'task.env.tool_comm': 'Tool commissioning', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
   'tool.badge.comm': '{id} · needs commissioning', 'tool.comm.title': 'Tool "{id}" needs commissioning', 'tool.comm.hint': 'Complete tool commissioning / calibration before running normal motions.',
+  'owner.badge.executor': 'RT', 'owner.badge.legacy': 'Legacy', 'owner.badge.fallback': 'Legacy · fallback', 'owner.badge.failed': 'Owner · failed', 'owner.badge.transferring': 'Switching',
+  'owner.name.executor': 'RT executor', 'owner.name.legacy': 'Legacy loop', 'owner.name.failed': 'Owner failed (SAFE-HOLD)', 'owner.name.transferring': 'Owner transferring',
+  'owner.title': 'Control owner: {owner} ({reason})',
+  'owner.reason.default': 'default',
+  'owner.reason.explicit_cli': 'explicit --owner CLI flag',
+  'owner.reason.explicit_env': 'explicit ARMD_RT_OWNER env var',
+  'owner.reason.explicit_config': 'explicit arm.armd_owner config',
+  'owner.reason.auto_qualified': 'auto: qualified follower & profile',
+  'owner.reason.auto_fallback_unqualified_follower': 'auto fallback: follower not qualified for RT executor',
+  'owner.reason.auto_fallback_mit_profile': 'auto fallback: MIT-configured profile',
+  'owner.reason.auto_fallback_dof_limit': 'auto fallback: profile DOF exceeds RT executor limit',
+  'owner.reason.startup_fallback_to_legacy': 'startup fallback: RT executor init failed, holding in legacy',
+  'owner.reason.startup_failed_detached_safe_hold': 'startup failed: detached SAFE-HOLD holds driver',
   'task.env.safety': 'Safety state', 'task.env.col': 'Collision guard', 'task.env.ml': 'Motion limit', 'task.env.ko': 'Keep-out boxes', 'task.env.poses': 'Saved poses',
   'task.env.col.hold': 'holding after a hit (J{j})', 'task.env.col.ok': 'normal', 'task.env.count': '{n}',
   'task.env.na': 'not supported', 'task.env.none': 'none', 'task.env.loading': 'Loading…', 'task.env.updated': 'Updated {t}', 'task.env.err': 'Failed: {list}',
@@ -5044,6 +5074,7 @@ function applyObservation(o, fromWs) {
     else if (cur !== preemptTargetHolder) { preemptTargetHolder = cur; preemptChangedAck = true; preemptChangedUntil = Date.now() + 800; renderPreemptModal(); }
   }
   detHoldOnObs(o); depthOnObs(o); gcOnObs(o);
+  renderOwnerStatus();
   renderMotionLimit(o); tkOnObs(o); renderPower(o); graspOnObs(o); msOnObs(o); epOnObs(o); teachOnObs(o);
   syncEpoch(o.epoch_id);
   const st = parseState(o.safety_state), wasStopped = isStopped();
@@ -9175,6 +9206,62 @@ function applyJointMap(map) {
   camMountNow();
   V3.key = ''; PCARD.key = '';
 }
+function isValidEffectiveOwner(v) {
+  return v === 'executor' || v === 'legacy' || v === 'failed' || v === 'transferring';
+}
+function isOwnerFallbackReason(reason) {
+  return typeof reason === 'string' && (reason.startsWith('auto_fallback_') || reason === 'startup_fallback_to_legacy' || reason === 'startup_failed_detached_safe_hold');
+}
+function ownerReasonLabel(reason) {
+  if (!reason) return '';
+  const k = 'owner.reason.' + reason;
+  const translated = t(k);
+  return translated === k ? String(reason) : translated;
+}
+async function loadOwnerDiagnostics() {
+  try {
+    const d = await api('/api/v1/diagnostics', undefined, { quiet: true, method: 'GET' });
+    if (d && isValidEffectiveOwner(d.effective_owner)) {
+      S.ownerDiag = {
+        effective_owner: d.effective_owner,
+        owner_reason: typeof d.owner_reason === 'string' ? d.owner_reason : '',
+      };
+      renderOwnerStatus();
+    }
+  } catch (_) {}
+}
+function renderOwnerStatus() {
+  const badge = $('owner-badge');
+  if (!badge) return;
+  const obs = S.obs;
+  const diag = S.ownerDiag;
+  const obsOwner = obs && isValidEffectiveOwner(obs.effective_owner) ? obs.effective_owner : null;
+  const diagOwner = diag && isValidEffectiveOwner(diag.effective_owner) ? diag.effective_owner : null;
+  const useDiag = diagOwner === 'failed' || !obsOwner;
+  const owner = useDiag ? diagOwner : obsOwner;
+  if (!owner) {
+    badge.hidden = true;
+    return;
+  }
+  const reason = useDiag
+    ? (diag && typeof diag.owner_reason === 'string' ? diag.owner_reason : '')
+    : (obs && typeof obs.owner_reason === 'string' ? obs.owner_reason : '');
+  const failed = owner === 'failed';
+  const fallback = failed || (owner === 'legacy' && isOwnerFallbackReason(reason));
+  badge.hidden = false;
+  setText(badge, failed ? t('owner.badge.failed') : fallback ? t('owner.badge.fallback') : t('owner.badge.' + owner));
+  setCls(badge, 'sc-status-badge plain ' + (fallback ? 'is-warn is-fallback' : owner === 'executor' ? 'is-ok' : ''));
+  const ownerName = t('owner.name.' + owner);
+  const reasonTxt = ownerReasonLabel(reason);
+  const detail = reasonTxt ? t('owner.title', { owner: ownerName, reason: reasonTxt }) : ownerName;
+  badge.title = detail;
+  badge.setAttribute('aria-label', detail);
+}
+if ($('owner-badge')) $('owner-badge').addEventListener('click', () => {
+  const badge = $('owner-badge');
+  if (badge && badge.title) toast(badge.title, badge.classList.contains('is-warn') ? 'warn' : 'info');
+});
+i18nHooks.push(renderOwnerStatus);
 function renderToolStatus() {
   const tool = S.activeTool;
   const badge = $('tool-badge');
@@ -17971,6 +18058,7 @@ i18nHooks.push(() => { if (opIsOpen()) renderOperatorModal(); });
   $('c-rmax').textContent = Math.round(CFG.cart.reachMax * 1000);
 }
 schemaReady = loadSchema();
+loadOwnerDiagnostics();
 loadAuthStatus();
 setInterval(() => { if (S.auth.role === 'operator') { renderOpBadge(); opCheckExpiry(); } }, 10000); // minutes left on the badge, renewal before the end of a flow
 initSandbox();

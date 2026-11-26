@@ -10,6 +10,11 @@ the gates have not been run.
 
 MIT tracking is off by default and is not enabled on the real arm.
 
+**Startup control-loop owner (`auto` default) / 启动控制循环所有者（默认 `auto`）：**
+`armd` resolves its startup owner with precedence `--owner <auto|legacy|executor>` > `ARMD_RT_OWNER` > config `arm.armd_owner` > `auto`. Under `auto`, qualified `rebot-dm` and `mock` profiles default to the synchronous RT executor (`effective_owner = "executor"`, `owner_reason = "auto_qualified"`), while MIT-configured profiles (`joint_tracking` with `strategy = "mit"`) and unqualified followers (`so-arm101`, `so-arm100`, `rebot-rs`, `fashionstar`, `star-arm102`, `sim`) resolve to `legacy` with one startup log line naming the reason (`auto_fallback_mit_profile` / `auto_fallback_unqualified_follower`). Requesting `executor` explicitly on an MIT-configured profile or unqualified follower is refused at startup before opening hardware. Inspect `effective_owner` and `owner_reason` via `GET /api/v1/observation`, `GET /api/v1/diagnostics`, or `GET /api/v1/diagnostics/tick`.
+
+`armd` 按 `--owner <auto|legacy|executor>` > `ARMD_RT_OWNER` > 配置 `arm.armd_owner` > `auto` 的优先级解析启动所有者。在默认 `auto` 模式下，已认证的 `rebot-dm` 与 `mock` 默认运行同步实时执行器（`effective_owner = "executor"`、`owner_reason = "auto_qualified"`）；启用 MIT 的配置（`joint_tracking` 中含 `strategy = "mit"`）及未认证从手自动回退到 `legacy` 并输出一条带原因的启动日志（`auto_fallback_mit_profile` / `auto_fallback_unqualified_follower`）。在 MIT 配置或未认证从手上显式指定 `executor` 会在打开硬件前直接拒绝。可通过 `GET /api/v1/observation`、`GET /api/v1/diagnostics` 或 `GET /api/v1/diagnostics/tick` 查看 `effective_owner` 与 `owner_reason`。
+
 Measured on J4 of a B601-DM (motor ID 4, sw_ver 942747703, 2026-11-22):
 
 - The motor replies on MST_ID 0x14.
