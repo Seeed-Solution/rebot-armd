@@ -19241,7 +19241,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 continue;
             }
             let age = self.motor_last_ctrl_tx[i]
-                .map_or(Duration::ZERO, |t| after.saturating_duration_since(t));
+                .map_or(Duration::MAX, |t| after.saturating_duration_since(t));
             if oldest_joint.is_none() || age > max_energized_age {
                 max_energized_age = age;
                 oldest_joint = Some(i as u8);

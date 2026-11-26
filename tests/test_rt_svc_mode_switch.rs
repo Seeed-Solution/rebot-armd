@@ -1076,17 +1076,7 @@ async fn dual_owner_energized_mode_switch_and_rollback_parity() {
         //    (mismatched TMAX=99.0) before writing J2 -> J1 rolls back causally to PosVel.
         h.shutdown(true).await;
 
-        let h_rb = OwnerHarness::start(owner, true, TIMEOUT_2000_COUNTS, true).await;
-        h_rb.bus.with(|s| {
-            s.motors[1].regs.insert(damiao::RID_TMAX, 99.0f32.to_le_bytes());
-        });
-        // Re-mark J2 range unverified before switching (since startup range check ran before mutation).
-        // Start a fresh harness with J2 mismatched from the start? Startup range_check only runs if
-        // check_mapping_ranges was called; instead use an unsupported mode or fresh unverified J2:
         let snap_rb = {
-            // Confirm J1 -> Impedance, then J2 -> Position (unsupported on Damiao? No, fail before write in init).
-            // For mid-switch rollback on a live owner, use a second harness where J2 wasn't range-verified.
-            h_rb.shutdown(true).await;
             let mut cfg = ArmConfig::rebot_dm();
             cfg.control_frequency_hz = 50;
             let bus_rb = configure_damiao_bus(None, Duration::ZERO, true, TIMEOUT_2000_COUNTS);
