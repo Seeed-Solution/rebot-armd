@@ -13891,7 +13891,13 @@ mod tests {
         // Under saturation: neither maint nor persist pops or drops its payload.
         let mut flags = 0u32;
         let mut req_id = 0u64;
-        state.service_one_maintenance(&mut core, &ctx, Instant::now() + Duration::from_millis(20), 1, &mut flags, &mut req_id);
+        let maint_now = Instant::now();
+        let mut maint_budget = crate::rt_core::budget::ReleaseBudget::for_release(
+            1,
+            maint_now,
+            maint_now + Duration::from_millis(20),
+        );
+        state.service_one_maintenance(&mut core, &ctx, &mut maint_budget, 1, &mut flags, &mut req_id);
         state.service_persistence(&mut core, &ctx);
         assert!(!maint_probe_dropped.load(Ordering::SeqCst), "maint payload must not drop under full reply ring");
         assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must not drop when slots() < 2");
