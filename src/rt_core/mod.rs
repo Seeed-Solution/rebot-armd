@@ -56,6 +56,8 @@ pub mod requests;
 pub mod session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod recorder;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use core::{ArmCore, FeedbackState, MacroTerminal, ObservationBuffer};

@@ -84,6 +84,31 @@ pub enum WorkerReplyError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationScope {
+    /// Ordinary motion stop (`STOPPED`): revokes only sessions with `revoke_on_stop`.
+    MotionStop,
+    /// E-stop or epoch bump (`ESTOP_ACTIVE`, `EPOCH_MISMATCH`): revokes only sessions with `revoke_on_epoch_change`.
+    EpochOrEStop,
+    /// Motion lease loss / preempt (`LEASE_LOST`): revokes only sessions with `require_lease`.
+    LeaseLoss,
+    /// Fatal fence or lifecycle teardown (`SAFE_HOLD`, `INTERNAL_FAULT`, `shutdown`, `handback`,
+    /// `startup_timeout`): revokes every live slot including `Recorder`.
+    FatalOrTeardown,
+}
+
+impl RevocationScope {
+    #[inline]
+    pub fn from_stop_reason(reason: &'static str) -> Self {
+        match reason {
+            "STOPPED" => Self::MotionStop,
+            "ESTOP_ACTIVE" | "EPOCH_MISMATCH" => Self::EpochOrEStop,
+            "LEASE_LOST" => Self::LeaseLoss,
+            _ => Self::FatalOrTeardown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAuthority {
     pub connection_id: u64,
     pub lease_generation: u64,
@@ -93,6 +118,7 @@ pub struct SessionAuthority {
     pub operator_required: bool,
     pub operator_grant: Option<crate::auth::OperatorGrant>,
     pub revoke_on_stop: bool,
+    pub revoke_on_epoch_change: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,9 +133,11 @@ pub struct PreparedSession {
     pub request_id: Option<RequestId>,
     pub route_gen: u64,
     pub client: ClientId,
+    pub require_lease: bool,
     pub operator_required: bool,
     pub operator_grant: Option<crate::auth::OperatorGrant>,
     pub revoke_on_stop: bool,
+    pub revoke_on_epoch_change: bool,
     pub escalate_safe_hold_on_uncertain: bool,
 }
 
@@ -126,9 +154,11 @@ impl PreparedSession {
             request_id: None,
             route_gen: 0,
             client,
+            require_lease: true,
             operator_required: false,
             operator_grant: None,
             revoke_on_stop: true,
+            revoke_on_epoch_change: true,
             escalate_safe_hold_on_uncertain: true,
         }
     }
@@ -145,9 +175,11 @@ impl PreparedSession {
             request_id: None,
             route_gen: 0,
             client,
+            require_lease: false,
             operator_required: false,
             operator_grant: None,
             revoke_on_stop: false,
+            revoke_on_epoch_change: false,
             escalate_safe_hold_on_uncertain: false,
         }
     }
@@ -535,7 +567,7 @@ impl SessionDriver {
         if ctx.safe_hold_active { return Err(SessionTerminalReason::Revoked("SAFE_HOLD")); }
         if ctx.internal_fault_fenced { return Err(SessionTerminalReason::Revoked("INTERNAL_FAULT")); }
         let auth = active.authority;
-        if ctx.estop_latched || ctx.epoch != auth.epoch {
+        if auth.revoke_on_epoch_change && (ctx.estop_latched || ctx.epoch != auth.epoch) {
             return Err(SessionTerminalReason::Revoked("EPOCH_MISMATCH"));
         }
         if auth.revoke_on_stop && (ctx.urgent_stop_pending || ctx.stop_generation != auth.stop_generation) {
@@ -680,22 +712,40 @@ impl SessionDriver {
         self.finish_slot(slot, id, reason, uncertain_hw_state)
     }
 
-    pub fn revoke_live_sessions(
+    pub fn revoke_live_sessions_by_scope(
         &mut self,
         reason: SessionTerminalReason,
-        is_ordinary_stop: bool,
+        scope: RevocationScope,
     ) -> [Option<SessionOutcome>; 2] {
         let mut out = [None, None];
         for slot in [SessionSlot::ExclusiveOutput, SessionSlot::Recorder] {
             let live = self.slot(slot).and_then(|s| {
-                (s.is_live() && (!is_ordinary_stop || s.authority.revoke_on_stop))
-                    .then_some((s.id, s.hw_state_uncertain))
+                let applies = match scope {
+                    RevocationScope::FatalOrTeardown => true,
+                    RevocationScope::MotionStop => s.authority.revoke_on_stop,
+                    RevocationScope::EpochOrEStop => s.authority.revoke_on_epoch_change,
+                    RevocationScope::LeaseLoss => s.authority.require_lease,
+                };
+                (s.is_live() && applies).then_some((s.id, s.hw_state_uncertain))
             });
             if let Some((id, uncertain)) = live {
                 out[slot.index()] = self.finish_slot(slot, id, reason, uncertain);
             }
         }
         out
+    }
+
+    pub fn revoke_live_sessions(
+        &mut self,
+        reason: SessionTerminalReason,
+        is_ordinary_stop: bool,
+    ) -> [Option<SessionOutcome>; 2] {
+        let scope = if is_ordinary_stop {
+            RevocationScope::MotionStop
+        } else {
+            RevocationScope::FatalOrTeardown
+        };
+        self.revoke_live_sessions_by_scope(reason, scope)
     }
 
     pub fn revoke_for_connection(
@@ -774,14 +824,19 @@ impl SupervisorInner {
         }
         let stamp = proof.stamp();
         let authority = SessionAuthority {
-            connection_id: stamp.connection_id,
-            lease_generation: stamp.lease_gen,
+            connection_id: if prepared.slot == SessionSlot::Recorder { 0 } else { stamp.connection_id },
+            lease_generation: if prepared.require_lease { stamp.lease_gen } else { 0 },
             epoch: stamp.estop_epoch,
             stop_generation: stamp.stop_gen,
-            require_lease: self.lease_enabled,
-            operator_required: self.operator_auth_enforced || prepared.operator_required,
+            require_lease: prepared.require_lease && self.lease_enabled,
+            operator_required: if prepared.slot == SessionSlot::Recorder {
+                prepared.operator_required
+            } else {
+                self.operator_auth_enforced || prepared.operator_required
+            },
             operator_grant: prepared.operator_grant,
             revoke_on_stop: prepared.revoke_on_stop,
+            revoke_on_epoch_change: prepared.revoke_on_epoch_change,
         };
         if authority.require_lease
             && !self.is_session_lease_valid_at(authority.connection_id, authority.lease_generation, now)
@@ -991,7 +1046,7 @@ impl SupervisorInner {
                     || self.is_session_lease_valid_at(rec.authority.connection_id, rec.authority.lease_generation, now);
                 let op_ok = !rec.authority.operator_required
                     || self.is_session_operator_valid_at(rec.authority.operator_grant, now);
-                let _ = self.sessions.step_slot(
+                if let Some(SessionStep::Terminal(_)) = self.sessions.step_slot(
                     SessionSlot::Recorder,
                     &rctx,
                     |_| conn_closed,
@@ -999,14 +1054,24 @@ impl SupervisorInner {
                     |_| op_ok,
                     |_, _| false,
                     |_, _, _| PhaseStepOutcome::Pending,
-                );
+                ) {
+                    let _ = self.close_rt_recorder_session(true);
+                    let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, rec.id);
+                }
             }
         }
     }
 
     pub(crate) fn on_safe_hold_enter(&mut self, reason: &'static str) {
         self.cancel_active_commissioning_on_stop(reason);
-        let _ = self.sessions.revoke_live_sessions(SessionTerminalReason::Revoked(reason), false);
+        let outcomes = self.sessions.revoke_live_sessions_by_scope(
+            SessionTerminalReason::Revoked(reason),
+            RevocationScope::FatalOrTeardown,
+        );
+        if let Some(rec_out) = outcomes[SessionSlot::Recorder.index()] {
+            let _ = self.close_rt_recorder_session(true);
+            let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, rec_out.session);
+        }
     }
 
     pub(crate) fn revoke_sessions_on_stop(&mut self, reason: &'static str) {
@@ -1015,12 +1080,16 @@ impl SupervisorInner {
             .sessions
             .slot(SessionSlot::ExclusiveOutput)
             .is_some_and(|s| s.escalate_safe_hold_on_uncertain);
-        let is_ordinary_stop = reason == "STOPPED";
+        let scope = RevocationScope::from_stop_reason(reason);
         let outcomes = self
             .sessions
-            .revoke_live_sessions(SessionTerminalReason::Revoked(reason), is_ordinary_stop);
+            .revoke_live_sessions_by_scope(SessionTerminalReason::Revoked(reason), scope);
         if let Some(outcome) = outcomes[SessionSlot::ExclusiveOutput.index()] {
             self.maybe_escalate_session_safe_hold(outcome, escalate);
+        }
+        if let Some(rec_out) = outcomes[SessionSlot::Recorder.index()] {
+            let _ = self.close_rt_recorder_session(true);
+            let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, rec_out.session);
         }
     }
 
@@ -1035,6 +1104,117 @@ impl SupervisorInner {
         if let Some(outcome) = outcomes[SessionSlot::ExclusiveOutput.index()] {
             self.maybe_escalate_session_safe_hold(outcome, escalate);
         }
+        if let Some(rec_out) = outcomes[SessionSlot::Recorder.index()] {
+            let _ = self.close_rt_recorder_session(true);
+            let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, rec_out.session);
+        }
+    }
+
+    /// Admits a lease-free RT recorder session onto `SessionSlot::Recorder` (0 alloc, 0 lock).
+    pub(crate) fn admit_rt_recorder_session(
+        &mut self,
+        op_id: u64,
+        max_frames: usize,
+        bound_action_id: u64,
+        now: Instant,
+    ) -> Result<super::recorder::RecorderStartAck, super::recorder::RecorderStartError> {
+        use super::recorder::{RecorderStartAck, RecorderStartError};
+        if self.internal_fault_lane.is_fenced() || self.sessions.is_safe_hold_requested() {
+            return Err(RecorderStartError::FaultFenced);
+        }
+        if !self.rt_recorder.has_producer() {
+            return Err(RecorderStartError::StreamUnattached);
+        }
+        if bound_action_id != 0 && !self.macro_alive(bound_action_id) {
+            return Err(RecorderStartError::ParentNotAlive);
+        }
+        if self.sessions.is_slot_occupied(SessionSlot::Recorder) {
+            return Err(RecorderStartError::SlotBusy);
+        }
+        let prepared = PreparedSession::recorder(ClientId(0));
+        let authority = SessionAuthority {
+            connection_id: 0,
+            lease_generation: 0,
+            epoch: self.safety.epoch_id(),
+            stop_generation: self.current_stop_gen(),
+            require_lease: false,
+            operator_required: false,
+            operator_grant: None,
+            revoke_on_stop: false,
+            revoke_on_epoch_change: false,
+        };
+        let session_id = self
+            .sessions
+            .admit_with_authority(prepared, authority, now, true)
+            .map_err(|_| RecorderStartError::SlotBusy)?;
+        self.rt_recorder.begin(op_id, session_id, max_frames, bound_action_id);
+        Ok(RecorderStartAck {
+            op_id,
+            session_id,
+            start_calib_rev: self.calibration_revision,
+            start_tool_digest_hash: super::ops::tool_digest_hash(&self.config.active_tool.config_digest),
+            start_dof: self.config.dof.min(crate::rt_core::mailbox::MAX_DOF) as u8,
+            start_control_hz: self.config.control_frequency_hz.max(1),
+        })
+    }
+
+    /// Single RT close transition for `RtRecorder` + `SessionSlot::Recorder` (0 alloc, 0 lock).
+    pub(crate) fn close_rt_recorder_session(
+        &mut self,
+        revoked: bool,
+    ) -> Option<super::recorder::RecorderStopFence> {
+        let tool_hash = super::ops::tool_digest_hash(&self.config.active_tool.config_digest);
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF) as u8;
+        let hz = self.config.control_frequency_hz.max(1);
+        self.rt_recorder
+            .close_active(self.calibration_revision, tool_hash, dof, hz, revoked)
+    }
+
+    /// Stops an active RT recorder session (0 alloc, 0 lock).
+    /// - If `save && pushed == 0`: refuses `EmptyEpisode` WITHOUT stopping the session.
+    /// - If `save && require_alive_action_id != 0 && !macro_alive(require_alive_action_id)`:
+    ///   atomically closes/discards the session at the RT boundary and returns `ParentNotAlive { fence }`.
+    pub(crate) fn stop_rt_recorder_session(
+        &mut self,
+        op_id: u64,
+        session_id: SessionId,
+        save: bool,
+        reason: &'static str,
+        require_alive_action_id: u64,
+    ) -> Result<super::recorder::RecorderStopFence, super::recorder::RecorderStopError> {
+        use super::recorder::RecorderStopError;
+        let Some(active) = self.sessions.slot(SessionSlot::Recorder).copied() else {
+            if let Some(fence) = self.rt_recorder.last_closed_fence_for(op_id, session_id) {
+                return Ok(fence);
+            }
+            return Err(RecorderStopError::NotActive);
+        };
+        if (session_id.0 != 0 && active.id != session_id)
+            || (op_id != 0 && self.rt_recorder.active_op_id() != op_id)
+        {
+            return Err(RecorderStopError::SessionMismatch);
+        }
+        if save && require_alive_action_id != 0 && !self.macro_alive(require_alive_action_id) {
+            let term_reason = SessionTerminalReason::Cancelled("STOPPED");
+            let _ = self.sessions.finish_slot(SessionSlot::Recorder, active.id, term_reason, false);
+            let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, active.id);
+            let fence = self
+                .close_rt_recorder_session(true)
+                .ok_or(RecorderStopError::NotActive)?;
+            return Err(RecorderStopError::ParentNotAlive { fence });
+        }
+        if save && self.rt_recorder.pushed() == 0 {
+            return Err(RecorderStopError::EmptyEpisode);
+        }
+        let term_reason = if save {
+            SessionTerminalReason::Completed
+        } else {
+            SessionTerminalReason::Cancelled(if reason.is_empty() { "DISCARDED" } else { reason })
+        };
+        let _ = self.sessions.finish_slot(SessionSlot::Recorder, active.id, term_reason, false);
+        let _ = self.sessions.clear_terminal_slot(SessionSlot::Recorder, active.id);
+        self.close_rt_recorder_session(false)
+            .ok_or(RecorderStopError::NotActive)
     }
 
     pub(crate) fn flush_published_session_terminals(&mut self) -> usize {

@@ -3321,6 +3321,7 @@ impl crate::supervisor::SupervisorInner {
             operator_required: self.operator_auth_enforced,
             operator_grant: Some(req.authority.operator_grant),
             revoke_on_stop: true,
+            revoke_on_epoch_change: true,
         };
         let session_id = self
             .sessions

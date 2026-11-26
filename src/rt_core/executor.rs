@@ -897,6 +897,18 @@ pub enum MaintenanceOp {
     },
     MarkBaselineDirty,
     Config(Box<super::requests::config::ConfigExchange>),
+    RecorderStart {
+        op_id: u64,
+        max_frames: usize,
+        bound_action_id: u64,
+    },
+    RecorderStop {
+        op_id: u64,
+        session_id: super::session::SessionId,
+        save: bool,
+        reason: &'static str,
+        require_alive_action_id: u64,
+    },
     #[doc(hidden)]
     ProbeOwnedPayload { payload: Box<dyn Any + Send> },
 }
@@ -919,6 +931,8 @@ pub enum MaintenanceResult {
     BaselineDirtyMarked,
     Config(Box<super::requests::config::ConfigExchange>),
     StoppedWithConfig(Box<super::requests::config::ConfigExchange>),
+    RecorderStarted(Result<super::recorder::RecorderStartAck, super::recorder::RecorderStartError>),
+    RecorderStopped(Result<super::recorder::RecorderStopFence, super::recorder::RecorderStopError>),
     ProbeReturned,
     Stopped,
 }
@@ -2840,6 +2854,8 @@ pub(crate) struct OffThreadSinks {
     servo_dispatcher: Arc<ServoTargetDispatcher>,
     hub: Arc<StateHub>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
+    recorder_assembly: Arc<super::recorder::RecorderAssembly>,
+    recorder_shared: Arc<super::recorder::RtRecorderShared>,
 }
 
 impl OffThreadSinks {
@@ -2910,6 +2926,9 @@ impl OffThreadSinks {
         tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
     ) {
         self.drain_diag(tick_stats);
+        let _ = self
+            .recorder_assembly
+            .drain_bounded(super::recorder::RECORDER_DISPATCH_DRAIN_BOUND);
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
         {
             let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -3053,6 +3072,9 @@ impl OffThreadSinks {
     ) {
         self.drain_pre_broker(tick_stats);
         self.drain_post_terminal(drain_broker);
+        let _ = self
+            .recorder_assembly
+            .drain_bounded(super::recorder::RECORDER_STREAM_CAPACITY);
         let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
         let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
         if total > 0 && total != log_g.2 {
@@ -5574,6 +5596,66 @@ impl RtExecutorHandle {
         Arc::clone(&self.shared.lifecycle.safe_hold)
     }
 
+    pub fn recorder_assembly(&self) -> Arc<super::recorder::RecorderAssembly> {
+        Arc::clone(&self.shared.sinks.recorder_assembly)
+    }
+
+    pub fn recorder_shared(&self) -> Arc<super::recorder::RtRecorderShared> {
+        Arc::clone(&self.shared.sinks.recorder_shared)
+    }
+
+    pub async fn start_recorder_session(
+        &self,
+        op_id: u64,
+        max_frames: usize,
+        bound_action_id: u64,
+    ) -> Result<
+        Result<super::recorder::RecorderStartAck, super::recorder::RecorderStartError>,
+        OwnerError,
+    > {
+        match self
+            .shared
+            .maint_client
+            .call_async(MaintenanceOp::RecorderStart {
+                op_id,
+                max_frames,
+                bound_action_id,
+            })
+            .await?
+        {
+            MaintenanceResult::RecorderStarted(res) => Ok(res),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn stop_recorder_session(
+        &self,
+        op_id: u64,
+        session_id: super::session::SessionId,
+        save: bool,
+        reason: &'static str,
+        require_alive_action_id: u64,
+    ) -> Result<
+        Result<super::recorder::RecorderStopFence, super::recorder::RecorderStopError>,
+        OwnerError,
+    > {
+        match self
+            .shared
+            .maint_client
+            .call_async(MaintenanceOp::RecorderStop {
+                op_id,
+                session_id,
+                save,
+                reason,
+                require_alive_action_id,
+            })
+            .await?
+        {
+            MaintenanceResult::RecorderStopped(res) => Ok(res),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
     #[doc(hidden)]
     pub fn lifecycle_owner_state(&self) -> u8 {
         self.shared.lifecycle.owner_state()
@@ -5925,6 +6007,13 @@ pub(crate) fn spawn_executor(
     let broker = Arc::new(Mutex::new(broker));
     let reply_router = Arc::new(Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)));
     let session_terminal_rx = core.sessions.attach_terminal_channel();
+    let (rec_stream_tx, rec_stream_rx) =
+        super::stream::channel::<super::recorder::RecorderSample>(
+            super::recorder::RECORDER_STREAM_CAPACITY,
+        );
+    core.rt_recorder.attach_producer(rec_stream_tx);
+    let recorder_shared = core.rt_recorder.shared();
+    let recorder_assembly = Arc::new(super::recorder::RecorderAssembly::new(rec_stream_rx));
     let broker_dispatcher = Arc::new(BrokerDispatcher::new(
         Arc::clone(&broker),
         Arc::clone(&conn_lifecycle_client),
@@ -5975,6 +6064,8 @@ pub(crate) fn spawn_executor(
         servo_dispatcher: Arc::clone(&servo_dispatcher),
         hub: Arc::clone(&hub),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
+        recorder_assembly,
+        recorder_shared,
     });
 
     let startup_bound = hooks
@@ -6812,6 +6903,29 @@ impl ControlState {
                 super::requests::config::handle_config_exchange(core, ctx, &mut ex);
                 MaintenanceResult::Config(ex)
             }
+            MaintenanceOp::RecorderStart {
+                op_id,
+                max_frames,
+                bound_action_id,
+            } => MaintenanceResult::RecorderStarted(core.admit_rt_recorder_session(
+                op_id,
+                max_frames,
+                bound_action_id,
+                ctx.now,
+            )),
+            MaintenanceOp::RecorderStop {
+                op_id,
+                session_id,
+                save,
+                reason,
+                require_alive_action_id,
+            } => MaintenanceResult::RecorderStopped(core.stop_rt_recorder_session(
+                op_id,
+                session_id,
+                save,
+                reason,
+                require_alive_action_id,
+            )),
             MaintenanceOp::ProbeOwnedPayload { payload } => {
                 returned_probe = Some(payload);
                 MaintenanceResult::ProbeReturned
