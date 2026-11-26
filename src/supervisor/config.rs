@@ -650,6 +650,9 @@ impl SupervisorInner {
             self.recycle_action_msg_spare(prev);
         }
         if found && matches!(durability, crate::rt_core::config_iface::Durability::DurableUnconfirmed) {
+            const UNCONFIRMED_MSG: &str =
+                "Gripper calibration is active, but persistence is unconfirmed";
+            self.write_action_spare_text(action_id, false, UNCONFIRMED_MSG);
             if let Some(w) = warning.as_deref() {
                 self.write_action_spare_text(action_id, true, w);
             }

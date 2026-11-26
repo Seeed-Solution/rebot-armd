@@ -6266,8 +6266,9 @@ pub(crate) fn zero_check_owner_reconcile_dir_sync_failed(
 }
 
 /// Phase 6 (owner-side, zero-alloc on `armd-control`): post-dir-sync live owner authority recheck
-/// and atomic in-place activation (`Durability::Durable`). Any failure enters `Reconciling`
-/// without mutating live gripper calibration.
+/// and atomic in-place activation. When `defer_publish` is `true` (executor `.pending` flow),
+/// live policy and `ConfigAuthority::activate` complete here, while the action and session stay
+/// running until the worker reports `PersistCmd::Published`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn zero_check_owner_activate(
     core: &mut SupervisorInner,
@@ -6281,6 +6282,7 @@ pub(crate) fn zero_check_owner_activate(
     new_policy: GripperPolicy,
     new_jaw: Option<JawOpening>,
     operator_revoked: bool,
+    defer_publish: bool,
     code_buf: Option<String>,
     msg_buf: Option<String>,
 ) -> Result<
@@ -6310,13 +6312,15 @@ pub(crate) fn zero_check_owner_activate(
                     .config_mut()
                     .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
             }
-            if core.zero_check_persisting == Some(action_id) {
-                core.zero_check_persisting = None;
-                if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
-                    core.zero_check_persisting_grant = None;
+            if !defer_publish {
+                if core.zero_check_persisting == Some(action_id) {
+                    core.zero_check_persisting = None;
+                    if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                        core.zero_check_persisting_grant = None;
+                    }
                 }
+                let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
             }
-            let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
             Ok((old_policy, old_jaw, code_buf, msg_buf))
         }
         Err((state, code, msg)) => {
@@ -6782,6 +6786,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                 policy,
                 jaw,
                 operator_revoked,
+                false,
                 Some(String::with_capacity(64)),
                 Some(String::with_capacity(160)),
             )
@@ -7075,6 +7080,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             policy,
             jaw,
             operator_revoked,
+            false,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         );

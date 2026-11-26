@@ -1643,6 +1643,13 @@ pub struct PersistTestHooks {
     pub fail_zero_check_stream_push_once: Option<Arc<AtomicBool>>,
 }
 
+/// Post-activation disk publication result reported by `armd-persist` via `PersistCmd::Published`.
+enum PersistPublishOutcome {
+    Published,
+    RenameError { message: String },
+    DirFsyncUnconfirmed { warning: String },
+}
+
 enum PersistCmd {
     Reserve {
         action_id: u64,
@@ -1708,6 +1715,10 @@ enum PersistCmd {
         operator_revoked: bool,
         code_buf: String,
         msg_buf: String,
+    },
+    Published {
+        action_id: u64,
+        outcome: PersistPublishOutcome,
     },
     FinishReconcile {
         proposal: ConfigProposal,
@@ -6621,6 +6632,9 @@ struct ControlState {
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     persist_granted: Option<(u64, ConfigDomain)>,
+    /// Action whose live policy activated on `armd-control` while `.pending` awaits publication
+    /// onto the official path (`PersistCmd::Published`).
+    persist_awaiting_publish: Option<u64>,
     /// Operator grant of the zero-check whose dir fsync failed, kept for the owner-side
     /// validation in `FinishReconcile` (the session settle clears `zero_check_persisting_grant`).
     reconcile_operator_grant: Option<crate::auth::OperatorGrant>,
@@ -7371,6 +7385,23 @@ impl ControlState {
                     _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 },
+                PersistCmd::Published { outcome, .. } => {
+                    let (returned_msg, returned_warning) = match outcome {
+                        PersistPublishOutcome::Published => (None, None),
+                        PersistPublishOutcome::RenameError { message } => (Some(message), None),
+                        PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
+                            (None, Some(warning))
+                        }
+                    };
+                    PersistReply::Done {
+                        _returned_policy: None,
+                        _returned_jaw: None,
+                        _returned_code: None,
+                        _returned_msg: returned_msg,
+                        _returned_warning: returned_warning,
+                        _returned_probe: self.take_reply_probe(),
+                    }
+                }
                 PersistCmd::FinishReconcile {
                     new_policy,
                     new_jaw,
@@ -7396,6 +7427,7 @@ impl ControlState {
             woke = true;
         }
         self.persist_granted = None;
+        self.persist_awaiting_publish = None;
         if self.disconnect_code_buf.is_some() || self.disconnect_msg_buf.is_some() {
             let code = self.disconnect_code_buf.take();
             let msg = self.disconnect_msg_buf.take();
@@ -7451,6 +7483,48 @@ impl ControlState {
                     "failed",
                     "PERSIST_FAILED",
                     "Persistence worker disconnected after reservation",
+                    self.disconnect_code_buf.take(),
+                    self.disconnect_msg_buf.take(),
+                );
+                Self::settle_zero_check_session_on_persist_end(
+                    core,
+                    action_id,
+                    false,
+                    "PERSIST_FAILED",
+                    ctx.now,
+                );
+                if old_code.is_some() || old_msg.is_some() {
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Done {
+                            _returned_policy: None,
+                            _returned_jaw: None,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_warning: None,
+                            _returned_probe: None,
+                        },
+                        core,
+                    );
+                }
+            } else if let Some(action_id) = self.persist_awaiting_publish.take() {
+                // Worker exited or crashed after live activation before reporting publication:
+                // fail closed so durability is never claimed falsely (the old calibration remains
+                // on disk; startup cleans up the stale `.pending` candidate).
+                if core.zero_check_persisting == Some(action_id) {
+                    core.zero_check_persisting = None;
+                }
+                if let Some(a) = core
+                    .last_action
+                    .as_mut()
+                    .filter(|a| a.id == action_id && a.is_running())
+                {
+                    a.durability_confirmed = Some(false);
+                }
+                let (old_code, old_msg) = core.finish_zero_check_action_in_place(
+                    action_id,
+                    "failed",
+                    "PERSIST_FAILED",
+                    "Persistence worker disconnected after activation before publishing; the old calibration remains on disk",
                     self.disconnect_code_buf.take(),
                     self.disconnect_msg_buf.take(),
                 );
@@ -8000,18 +8074,15 @@ impl ControlState {
                     new_policy,
                     new_jaw,
                     operator_revoked,
+                    true,
                     Some(code_buf),
                     Some(msg_buf),
                 ) {
                     Ok((old_policy, old_jaw, ret_code, ret_msg)) => {
                         let activated_revision = core.gripper_calib_revision;
-                        Self::settle_zero_check_session_on_persist_end(
-                            core,
-                            action_id,
-                            true,
-                            "",
-                            ctx.now,
-                        );
+                        // Keep action and session running until `PersistCmd::Published` confirms
+                        // the post-activation rename and directory fsync.
+                        self.persist_awaiting_publish = Some(action_id);
                         self.push_persist_reply_or_retain(
                             PersistReply::Activated {
                                 activated_revision,
@@ -8052,6 +8123,92 @@ impl ControlState {
                         );
                     }
                 }
+            }
+            PersistCmd::Published { action_id, outcome } => {
+                let probe = self.take_reply_probe();
+                let (returned_msg, returned_warning) =
+                    if self.persist_awaiting_publish == Some(action_id) {
+                        self.persist_awaiting_publish = None;
+                        if core.zero_check_persisting == Some(action_id) {
+                            core.zero_check_persisting = None;
+                        }
+                        match outcome {
+                            PersistPublishOutcome::Published => {
+                                let _ = core.complete_zero_check_action(
+                                    action_id,
+                                    super::config_iface::Durability::Durable,
+                                    None,
+                                );
+                                Self::settle_zero_check_session_on_persist_end(
+                                    core,
+                                    action_id,
+                                    true,
+                                    "",
+                                    ctx.now,
+                                );
+                                (None, None)
+                            }
+                            PersistPublishOutcome::RenameError { message } => {
+                                if let Some(a) = core
+                                    .last_action
+                                    .as_mut()
+                                    .filter(|a| a.id == action_id && a.is_running())
+                                {
+                                    a.durability_confirmed = Some(false);
+                                }
+                                let _ = core.finish_zero_check_action_in_place(
+                                    action_id,
+                                    "failed",
+                                    "PERSIST_FAILED",
+                                    message.as_str(),
+                                    None,
+                                    None,
+                                );
+                                Self::settle_zero_check_session_on_persist_end(
+                                    core,
+                                    action_id,
+                                    false,
+                                    "PERSIST_FAILED",
+                                    ctx.now,
+                                );
+                                (Some(message), None)
+                            }
+                            PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
+                                let ret_warn = core.complete_zero_check_action(
+                                    action_id,
+                                    super::config_iface::Durability::DurableUnconfirmed,
+                                    Some(warning),
+                                );
+                                Self::settle_zero_check_session_on_persist_end(
+                                    core,
+                                    action_id,
+                                    true,
+                                    "",
+                                    ctx.now,
+                                );
+                                (None, ret_warn)
+                            }
+                        }
+                    } else {
+                        match outcome {
+                            PersistPublishOutcome::Published => (None, None),
+                            PersistPublishOutcome::RenameError { message } => (Some(message), None),
+                            PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
+                                (None, Some(warning))
+                            }
+                        }
+                    };
+                self.push_persist_reply_or_retain(
+                    PersistReply::Done {
+                        _returned_policy: None,
+                        _returned_jaw: None,
+                        _returned_code: None,
+                        _returned_msg: returned_msg,
+                        _returned_warning: returned_warning,
+                        _returned_probe: probe,
+                    },
+                    core,
+                );
             }
             PersistCmd::FinishReconcile {
                 proposal,
@@ -8487,29 +8644,90 @@ struct ExecutorPersistBackend<'a> {
     published: bool,
 }
 
+enum PublishPendingResult {
+    /// Official rename and parent dir fsync succeeded and owner acknowledged `Published`.
+    Published,
+    /// Rename or dir fsync failed and owner acknowledged `Published` with that outcome.
+    ReportedFailure,
+    /// Control thread stopped or channel disconnected while reporting `Published`.
+    WorkerDisconnected,
+}
+
 impl ExecutorPersistBackend<'_> {
-    /// After the owner activated the candidate: rename `.pending` over the official path and
-    /// fsync the directory. A failure leaves the old file (restart loads the old calibration).
-    fn publish_pending(&mut self) {
-        let Some(official) = self.official_path.clone() else { return };
+    /// After the owner activated the candidate: rename `.pending` over the official path,
+    /// fsync the directory, and report the outcome to the owner via `PersistCmd::Published`.
+    /// A rename failure leaves the old file (restart loads the old calibration).
+    fn publish_pending(&mut self, mirror_to_action: bool) -> PublishPendingResult {
+        let Some(official) = self.official_path.clone() else {
+            if !self.push_cmd_inner(
+                PersistCmd::Published {
+                    action_id: self.job.action_id,
+                    outcome: PersistPublishOutcome::Published,
+                },
+                mirror_to_action,
+            ) {
+                return PublishPendingResult::WorkerDisconnected;
+            }
+            if !self.hooks.leave_final_reply_queued && self.wait_reply().is_none() {
+                return PublishPendingResult::WorkerDisconnected;
+            }
+            return PublishPendingResult::Published;
+        };
         let pending = crate::gripper_calib::pending_path_for(&official);
-        match std::fs::rename(&pending, &official) {
+        let (outcome, result) = match std::fs::rename(&pending, &official) {
             Ok(()) => {
                 self.published = true;
                 let ds = crate::persist::PendingDirSync::for_path(&official);
-                let outcome = match self.hooks.dir_sync_override.as_ref() {
+                let dir_outcome = match self.hooks.dir_sync_override.as_ref() {
                     Some(f) => ds.sync_with(|dir| f(dir)),
                     None => ds.sync_parent_dir(),
                 };
-                if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
-                    tracing::error!("Gripper calibration {} renamed but dir fsync failed: {w}", official.display());
+                match dir_outcome {
+                    crate::persist::PublishOutcome::Published => {
+                        (PersistPublishOutcome::Published, PublishPendingResult::Published)
+                    }
+                    crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                        tracing::error!(
+                            "Gripper calibration {} renamed but dir fsync failed: {w}",
+                            official.display()
+                        );
+                        let warning = format!(
+                            "Gripper calibration is active, but persistence is unconfirmed (directory fsync failed: {w})"
+                        );
+                        (
+                            PersistPublishOutcome::DirFsyncUnconfirmed { warning },
+                            PublishPendingResult::ReportedFailure,
+                        )
+                    }
                 }
             }
-            Err(e) => tracing::error!(
-                "Activated gripper calibration not renamed over {} ({e}); a restart loads the previous calibration",
-                official.display()
-            ),
+            Err(e) => {
+                tracing::error!(
+                    "Activated gripper calibration not renamed over {} ({e}); the old calibration remains on disk",
+                    official.display()
+                );
+                let message = format!(
+                    "Activated gripper calibration failed to rename onto disk ({e}); the old calibration remains on disk"
+                );
+                (
+                    PersistPublishOutcome::RenameError { message },
+                    PublishPendingResult::ReportedFailure,
+                )
+            }
+        };
+        if !self.push_cmd_inner(
+            PersistCmd::Published {
+                action_id: self.job.action_id,
+                outcome,
+            },
+            mirror_to_action,
+        ) {
+            return PublishPendingResult::WorkerDisconnected;
         }
+        if !self.hooks.leave_final_reply_queued && self.wait_reply().is_none() {
+            return PublishPendingResult::WorkerDisconnected;
+        }
+        result
     }
 
     /// Refusal or failure before the rename: unlink the candidate (a failed unlink is harmless,
@@ -8524,19 +8742,34 @@ impl ExecutorPersistBackend<'_> {
         }
     }
 
-    fn push_cmd(&mut self, mut cmd: PersistCmd) -> bool {
-        if let Some(ch) = self.terminal_capture {
-            match &cmd {
-                PersistCmd::Fail { action_id, message, .. }
-                | PersistCmd::Abort { action_id, message, .. } => {
-                    ch.mirror_action_message(*action_id, message);
+    fn push_cmd(&mut self, cmd: PersistCmd) -> bool {
+        self.push_cmd_inner(cmd, true)
+    }
+
+    fn push_cmd_inner(&mut self, mut cmd: PersistCmd, mirror_to_action: bool) -> bool {
+        if mirror_to_action {
+            if let Some(ch) = self.terminal_capture {
+                match &cmd {
+                    PersistCmd::Fail { action_id, message, .. }
+                    | PersistCmd::Abort { action_id, message, .. } => {
+                        ch.mirror_action_message(*action_id, message);
+                    }
+                    PersistCmd::DirSyncFailed {
+                        action_id, warning, ..
+                    } => {
+                        ch.mirror_action_durability_warning(*action_id, warning);
+                    }
+                    PersistCmd::Published { action_id, outcome } => match outcome {
+                        PersistPublishOutcome::Published => {}
+                        PersistPublishOutcome::RenameError { message } => {
+                            ch.mirror_action_message(*action_id, message);
+                        }
+                        PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
+                            ch.mirror_action_durability_warning(*action_id, warning);
+                        }
+                    },
+                    _ => {}
                 }
-                PersistCmd::DirSyncFailed {
-                    action_id, warning, ..
-                } => {
-                    ch.mirror_action_durability_warning(*action_id, warning);
-                }
-                _ => {}
             }
         }
         match &mut cmd {
@@ -8546,6 +8779,15 @@ impl ExecutorPersistBackend<'_> {
             PersistCmd::DirSyncFailed { warning, .. } => {
                 *warning = truncate_rt_diagnostic(std::mem::take(warning), 256);
             }
+            PersistCmd::Published { outcome, .. } => match outcome {
+                PersistPublishOutcome::Published => {}
+                PersistPublishOutcome::RenameError { message } => {
+                    *message = truncate_rt_diagnostic(std::mem::take(message), 256);
+                }
+                PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
+                    *warning = truncate_rt_diagnostic(std::mem::take(warning), 256);
+                }
+            },
             _ => {}
         }
         let mut pending = Some(cmd);
@@ -8890,10 +9132,17 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                                     self.hub.update_prep_env(Arc::new(next));
                                 }
                                 // Rename after the published config is current (no stale window).
-                                self.publish_pending();
-                                tracing::info!(
-                                    "Executor zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
-                                );
+                                match self.publish_pending(false) {
+                                    PublishPendingResult::Published => {
+                                        tracing::info!(
+                                            "Executor zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
+                                        );
+                                    }
+                                    PublishPendingResult::ReportedFailure => {}
+                                    PublishPendingResult::WorkerDisconnected => {
+                                        return ZeroCheckCommitStop::WorkerDisconnected;
+                                    }
+                                }
                                 return ZeroCheckCommitStop::Aborted;
                             }
                             Some(_) => {
@@ -8942,7 +9191,7 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
         let new_jaw = self.new_jaw.take();
         let pub_policy = new_policy.clone();
         let pub_jaw = new_jaw.clone();
-        let _ = self.push_cmd(PersistCmd::Activate {
+        if !self.push_cmd(PersistCmd::Activate {
             action_id: self.job.action_id,
             reservation,
             proposal,
@@ -8954,35 +9203,43 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
             operator_revoked,
             code_buf: String::with_capacity(64),
             msg_buf: String::with_capacity(160),
-        });
-        let mut activated = false;
-        if !self.hooks.leave_final_reply_queued {
-            let reply = self.wait_reply();
-            if matches!(reply, Some(PersistReply::Activated { .. }))
-                && self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h())
-            {
-                return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
-            }
-            activated = matches!(reply, Some(PersistReply::Activated { .. }));
-            if let Some(PersistReply::Activated { activated_revision, .. }) = reply {
-                let prep_pol = pub_policy.clone();
-                self.published_config.apply_zero_check_commit(
-                    self.job.offset_rad,
-                    pub_policy,
-                    pub_jaw,
-                    activated_revision,
-                );
-                if let Some(cur) = self.hub.prep_env() {
-                    let mut next = (*cur).clone();
-                    next.config.gripper_policy = Some(prep_pol);
-                    next.gripper_calib_revision = activated_revision;
-                    self.hub.update_prep_env(Arc::new(next));
-                }
-            }
+        }) {
+            return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
         }
+        let Some(reply) = self.wait_reply() else {
+            return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
+        };
+        if matches!(reply, PersistReply::Activated { .. })
+            && self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h())
+        {
+            return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
+        }
+        let activated = if let PersistReply::Activated { activated_revision, .. } = reply {
+            let prep_pol = pub_policy.clone();
+            self.published_config.apply_zero_check_commit(
+                self.job.offset_rad,
+                pub_policy,
+                pub_jaw,
+                activated_revision,
+            );
+            if let Some(cur) = self.hub.prep_env() {
+                let mut next = (*cur).clone();
+                next.config.gripper_policy = Some(prep_pol);
+                next.gripper_calib_revision = activated_revision;
+                self.hub.update_prep_env(Arc::new(next));
+            }
+            true
+        } else {
+            false
+        };
         if activated {
             // Rename after the published config is current (no stale window).
-            self.publish_pending();
+            if matches!(
+                self.publish_pending(true),
+                PublishPendingResult::WorkerDisconnected
+            ) {
+                return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
+            }
         }
         Ok(())
     }
@@ -10265,6 +10522,7 @@ fn control_thread_main_inner(
         offload_reclaim_tx,
         persist_wake,
         persist_granted: None,
+        persist_awaiting_publish: None,
         reconcile_operator_grant: None,
         next_persist_req: 0,
         disconnect_code_buf: Some(String::with_capacity(64)),
@@ -12583,6 +12841,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: Some((action_id, ConfigDomain::GripperCalibration)),
+            persist_awaiting_publish: None,
             reconcile_operator_grant: None,
             next_persist_req: 1,
             disconnect_code_buf: Some(String::from("buf")),
@@ -12692,6 +12951,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
+            persist_awaiting_publish: None,
             reconcile_operator_grant: None,
             next_persist_req: 1,
             disconnect_code_buf: None,
@@ -12949,6 +13209,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
+            persist_awaiting_publish: None,
             reconcile_operator_grant: None,
             next_persist_req: 0,
             disconnect_code_buf: None,
@@ -13125,6 +13386,7 @@ mod tests {
             offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
+            persist_awaiting_publish: None,
             reconcile_operator_grant: None,
             next_persist_req: 0,
             disconnect_code_buf: Some(String::with_capacity(64)),
