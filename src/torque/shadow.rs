@@ -4923,6 +4923,7 @@ mod tests {
         // Even before draining, atomic watermark & blackbox compact reflect loss!
         assert!(hub.overflow_atomics().blackbox_compact().is_some_and(|c| c.u && c.drop == 20));
         hub.drain_now();
+        hub.stop_and_flush_bounded(Duration::from_secs(1));
         let snap = hub.snapshot();
         assert!(snap.ring.interval_unverifiable);
         assert_eq!(snap.ring.ring_dropped_records, 20);
@@ -4962,6 +4963,7 @@ mod tests {
             live_stopped: false,
         });
         rt.flush_and_drain_sync();
+        hub.stop_and_flush_bounded(Duration::from_secs(1));
 
         let snap = hub.snapshot();
         assert_eq!(snap.taxonomy.extra_action, 1);
