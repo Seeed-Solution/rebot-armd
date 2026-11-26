@@ -677,11 +677,19 @@ impl SafeHoldBuffers {
                 }
             }
         }
+        let j7_bit = self
+            .gripper_index
+            .filter(|&j| j < 64)
+            .map_or(0u64, |j| 1u64 << j);
+        let arm_hold_mask = hold_mask & !j7_bit;
+        let has_arm_axes = (0..dof).any(|j| self.gripper_index != Some(j));
         let mut sent_hold_mask = 0u64;
+        let mut sent_arm_hold_mask = 0u64;
         let mut stale_hold_mask = 0u64;
         let mut unverified_mask = 0u64;
-        // A required axis whose hold frame failed (write error or `UnheldTxFailed`).
+        // A required arm axis whose hold frame failed/deferred (write error or unheld/queued).
         let mut hold_tx_failed = false;
+        let mut hold_outcome_incomplete = false;
         if hold_mask != 0 || self.gripper_is_pos_force {
             // Acknowledge any pending external E-stop/stop generations while keeping LATCH_BIT set
             // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
@@ -690,31 +698,48 @@ impl SafeHoldBuffers {
             let hold_res = drv.write_measured_hold_masked(hold_mask, &self.hold_targets[..dof]);
             hold_tx_failed = hold_res.is_err();
             if let Ok(report) = hold_res {
+                let outcome_complete =
+                    matches!(report.outcome, crate::driver::TxBatchOutcome::Complete);
+                if !outcome_complete {
+                    hold_outcome_incomplete = true;
+                }
                 if report.sent_any {
                     ctrl.hold_tx_count.fetch_add(1, Ordering::Release);
                 }
                 for j in 0..dof.min(report.dof) {
+                    let is_j7 = self.gripper_index == Some(j);
                     match report.joint_status[j] {
                         crate::driver::JointHoldStatus::Held => {
                             sent_hold_mask |= 1u64 << j;
+                            if !is_j7 {
+                                sent_arm_hold_mask |= 1u64 << j;
+                            }
                         }
                         crate::driver::JointHoldStatus::HeldStaleTarget => {
                             sent_hold_mask |= 1u64 << j;
                             stale_hold_mask |= 1u64 << j;
+                            if !is_j7 {
+                                sent_arm_hold_mask |= 1u64 << j;
+                            }
                         }
                         crate::driver::JointHoldStatus::UnheldNoVerifiedMode if j < 64 => {
                             unverified_mask |= 1u64 << j;
                         }
                         crate::driver::JointHoldStatus::UnheldTxFailed
-                            if j < 64 && hold_mask & (1u64 << j) != 0 =>
+                        | crate::driver::JointHoldStatus::UnheldNoFreshFeedback
+                        | crate::driver::JointHoldStatus::Queued
+                            if j < 64 && !is_j7 && (arm_hold_mask & (1u64 << j)) != 0 =>
                         {
                             hold_tx_failed = true;
                         }
                         _ => {}
                     }
                 }
-                if sent_hold_mask == 0 && report.sent_any {
+                // Fallback only for minimal drivers that do not populate `joint_status` when the
+                // batch completed with frames transmitted; never mask a deferred/expired outcome.
+                if sent_hold_mask == 0 && report.sent_any && outcome_complete {
                     sent_hold_mask = hold_mask;
+                    sent_arm_hold_mask = arm_hold_mask;
                 }
                 if let Some(j7) = self.gripper_index {
                     if self.gripper_is_pos_force
@@ -746,10 +771,18 @@ impl SafeHoldBuffers {
             }
         }
         if all_bus_fresh {
-            // Fresh feedback confirms holding only when no required axis is left without verified
-            // hold output (`UnheldNoVerifiedMode`); set once per tick, never cleared then re-set.
-            ctrl.holding_unconfirmed
-                .store(unverified_mask != 0 || hold_tx_failed, Ordering::Release);
+            // Fresh feedback confirms holding only when:
+            // - no required axis lacks verified hold output (`UnheldNoVerifiedMode`),
+            // - no required arm axis failed/deferred (`hold_tx_failed`),
+            // - the hold batch outcome is `TxBatchOutcome::Complete` (not `Deferred`/`Expired`),
+            // - and non-J7 arm-axis continuity actually transmitted at least one arm frame
+            //   (J7 gripper traffic alone never confirms arm holding).
+            let zero_arm_frames = has_arm_axes && sent_arm_hold_mask == 0;
+            let unconfirmed = unverified_mask != 0
+                || hold_tx_failed
+                || hold_outcome_incomplete
+                || zero_arm_frames;
+            ctrl.holding_unconfirmed.store(unconfirmed, Ordering::Release);
         }
         if let Some(ref mut sh) = shadow {
             // One checkpoint per tick; with no hold attempted both masks are empty.

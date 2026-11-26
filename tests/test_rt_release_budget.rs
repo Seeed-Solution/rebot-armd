@@ -1308,3 +1308,195 @@ fn pre_command_drain_bounded_by_release_deadline_minus_publish_margin() {
         "disable pre-command drain must stop at 1 frame (1 ms cutoff), not 5 frames"
     );
 }
+
+#[test]
+fn safe_hold_keeps_holding_unconfirmed_on_deferral_and_j7_only_traffic() {
+    use armd::driver::{
+        ArmDriver, ArmDriverError, DriverCapabilities, HoldPassReport, JointHoldStatus,
+        JointTarget, TxBatchOutcome,
+    };
+    use armd::model::JointState;
+    use armd::rt_core::safe_hold::{SafeHoldBuffers, SafeHoldControl};
+
+    struct ScriptedHoldDriver {
+        dof: usize,
+        next_report: HoldPassReport,
+        clock: MockClock,
+    }
+
+    impl ArmDriver for ScriptedHoldDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities::default()
+        }
+        fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState::default(); self.dof])
+        }
+        fn read_joint_states_safe_hold(
+            &mut self,
+            out: &mut Vec<JointState>,
+            _deadline: Instant,
+            _max_rx_frames: u16,
+        ) -> Result<(u16, bool), ArmDriverError> {
+            out.clear();
+            out.resize(self.dof, JointState::default());
+            Ok((self.dof as u16, false))
+        }
+        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn write_measured_hold_masked(
+            &mut self,
+            _hold_mask: u64,
+            _targets: &[JointTarget],
+        ) -> Result<HoldPassReport, ArmDriverError> {
+            Ok(self.next_report)
+        }
+        fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn feedback_all_within(&self, _dof: usize, _max_age: Duration) -> bool {
+            true
+        }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            out.clear();
+            out.resize(self.dof, Some(Duration::from_millis(1)));
+        }
+        fn clock_now(&self) -> Instant {
+            self.clock.now()
+        }
+    }
+
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let dof = cfg.dof;
+    assert_eq!(dof, 7);
+    let mut runner = SafeHoldBuffers::from_config(&cfg, Duration::from_millis(20));
+    let ctrl = SafeHoldControl::new();
+
+    let mut drv = ScriptedHoldDriver {
+        dof,
+        next_report: HoldPassReport::empty(dof),
+        clock: clock.clone(),
+    };
+    let mut step_once = |drv: &mut ScriptedHoldDriver| {
+        let now = clock.now();
+        let mut now_fn = || clock.now();
+        runner.step_driver(drv, &ctrl, now + Duration::from_millis(20), &mut now_fn);
+    };
+
+    // 1. Fully deferred arm batch (`Deferred { pending: 6 }`, `sent_any: false`):
+    //    must keep `holding_unconfirmed == true`.
+    let mut deferred_all = HoldPassReport::empty(dof);
+    deferred_all.outcome = TxBatchOutcome::Deferred { pending: 6 };
+    deferred_all.sent_any = false;
+    for j in 0..6 {
+        deferred_all.joint_status[j] = JointHoldStatus::Queued;
+    }
+    drv.next_report = deferred_all;
+    step_once(&mut drv);
+    assert!(
+        ctrl.holding_unconfirmed(),
+        "deferred arm hold batch must keep holding_unconfirmed set"
+    );
+
+    // 2. Partial deferral (4 arm axes held, 2 queued, `Deferred { pending: 2 }`):
+    //    must keep `holding_unconfirmed == true`.
+    let mut partial_defer = HoldPassReport::empty(dof);
+    partial_defer.outcome = TxBatchOutcome::Deferred { pending: 2 };
+    partial_defer.sent_any = true;
+    for j in 0..4 {
+        partial_defer.joint_status[j] = JointHoldStatus::Held;
+    }
+    partial_defer.joint_status[4] = JointHoldStatus::Queued;
+    partial_defer.joint_status[5] = JointHoldStatus::Queued;
+    drv.next_report = partial_defer;
+    step_once(&mut drv);
+    assert!(
+        ctrl.holding_unconfirmed(),
+        "partial deferred arm hold batch must keep holding_unconfirmed set"
+    );
+
+    // 3. J7-only traffic (`Complete`, `sent_any: true`, J7 = Held, 0 arm axes held):
+    //    J7 traffic MUST NOT count toward arm-axis continuity -> `holding_unconfirmed == true`.
+    let mut j7_only = HoldPassReport::empty(dof);
+    j7_only.outcome = TxBatchOutcome::Complete;
+    j7_only.sent_any = true;
+    j7_only.joint_status[6] = JointHoldStatus::Held;
+    drv.next_report = j7_only;
+    step_once(&mut drv);
+    assert!(
+        ctrl.holding_unconfirmed(),
+        "J7-only hold traffic with zero arm frames must NOT confirm arm holding"
+    );
+
+    // 4. Expired outcome (`Expired { dropped: 1, pending: 0 }`) with `sent_any: true`:
+    //    must keep `holding_unconfirmed == true`.
+    let mut expired = HoldPassReport::empty(dof);
+    expired.outcome = TxBatchOutcome::Expired {
+        dropped: 1,
+        pending: 0,
+    };
+    expired.sent_any = true;
+    for j in 0..5 {
+        expired.joint_status[j] = JointHoldStatus::Held;
+    }
+    drv.next_report = expired;
+    step_once(&mut drv);
+    assert!(
+        ctrl.holding_unconfirmed(),
+        "expired hold batch outcome must keep holding_unconfirmed set"
+    );
+
+    // 5. Complete arm hold batch (all 6 arm axes `Held` + J7 `Held`, `Complete`):
+    //    clears `holding_unconfirmed` to `false`.
+    let mut complete = HoldPassReport::empty(dof);
+    complete.outcome = TxBatchOutcome::Complete;
+    complete.sent_any = true;
+    for j in 0..7 {
+        complete.joint_status[j] = JointHoldStatus::Held;
+    }
+    drv.next_report = complete;
+    step_once(&mut drv);
+    assert!(
+        !ctrl.holding_unconfirmed(),
+        "complete arm hold batch with fresh bus must clear holding_unconfirmed"
+    );
+
+    // 6. End-to-end with real `DamiaoArmDriver`: tightened `tx_budget.max_frames = 2` causes
+    //    `write_measured_hold_masked` to return `Deferred` while J7/arm traffic is partial ->
+    //    SAFE-HOLD must keep `holding_unconfirmed == true`, then clear it once budget allows
+    //    all arm axes to complete.
+    let (bus, mut damiao_drv, cfg2) = make_bus_and_driver(Some(clock.clone()), 2, true);
+    damiao_drv.set_torque(true).expect("enable torque");
+    damiao_drv.set_external_pos_force_emitter(false);
+    let mut runner2 = SafeHoldBuffers::from_config(&cfg2, Duration::from_millis(20));
+    let ctrl2 = SafeHoldControl::new();
+    bus.with(|s| {
+        s.rx.clear();
+        s.push_all_feedback();
+    });
+    let t0 = clock.now();
+    let mut now_fn2 = || clock.now();
+    runner2.step_driver(&mut damiao_drv, &ctrl2, t0 + Duration::from_millis(20), &mut now_fn2);
+    assert!(
+        ctrl2.holding_unconfirmed(),
+        "real DamiaoArmDriver with max_frames=2 defers holds and must keep holding_unconfirmed set"
+    );
+    let mut wide_budget = TxBudget::default();
+    wide_budget.max_frames = 16;
+    damiao_drv.set_tx_budget(wide_budget);
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        s.rx.clear();
+        s.push_all_feedback();
+    });
+    let t1 = clock.now();
+    runner2.step_driver(&mut damiao_drv, &ctrl2, t1 + Duration::from_millis(20), &mut now_fn2);
+    assert!(
+        !ctrl2.holding_unconfirmed(),
+        "real DamiaoArmDriver completing all arm holds must clear holding_unconfirmed"
+    );
+}
