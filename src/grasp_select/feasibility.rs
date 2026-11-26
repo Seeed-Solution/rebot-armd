@@ -9,7 +9,7 @@ use super::geometry as g;
 use super::snapshot::{Snapshot, Target};
 use crate::grasp::{self, TABLE_CLEARANCE_M};
 use crate::kinematics::{self, Pose, Vec3, PAR};
-use crate::motion::{self, GoalFrame, JointPath, MotionError, PathOpts, PlanInput, Speed, IK_LIMIT_MARGIN};
+use crate::motion::{self, GoalFrame, JointPath, MotionError, PathOpts, PlanInput, Speed};
 
 /// Rise from the contact before the loaded lift, straight up (m).
 pub const SEPARATION_M: f64 = 0.01;
@@ -51,17 +51,35 @@ pub struct Work {
     pub path_samples: usize,
 }
 
-fn limits(input: &PlanInput) -> ([f64; 6], [f64; 6]) {
-    let n = input.arm.arm_dof();
-    let lim = |i: usize| input.limits.get(i).filter(|_| i < n);
-    (std::array::from_fn(|i| lim(i).map_or(-std::f64::consts::PI, |l| f64::from(l.min_position) + IK_LIMIT_MARGIN)),
-     std::array::from_fn(|i| lim(i).map_or(std::f64::consts::PI, |l| f64::from(l.max_position) - IK_LIMIT_MARGIN)))
+/// Error from [`endpoint_ik`]: either generic IK non-convergence or a named planning-limit refusal.
+#[derive(Debug, Clone)]
+pub enum EndpointIkError {
+    Unreachable { ep: f64, er: f64 },
+    PlanningLimit(MotionError),
 }
 
-/// IK of the TCP pose `goal` from each of `seeds` (first success wins): Err(position error,
-/// rotation error) of the best attempt.
-pub fn endpoint_ik(input: &PlanInput, goal: &Pose, seeds: &[[f64; 6]], work: &mut Work) -> Result<[f64; 6], (f64, f64)> {
-    let (lo, hi) = limits(input);
+impl EndpointIkError {
+    pub fn into_rejection(self, label: &str) -> Rejection {
+        match self {
+            Self::PlanningLimit(e) => motion_rejection("endpoint_ik", &e),
+            Self::Unreachable { ep, er } => Rejection::new(
+                "endpoint_ik",
+                "IK_UNREACHABLE",
+                format!("{label}: best IK error {:.4} m / {:.2} deg", ep, er.to_degrees()),
+            )
+            .with(ep, PAR.tol_pos),
+        }
+    }
+}
+
+/// IK of the TCP pose `goal` from each of `seeds` (first success wins): Err([`EndpointIkError`]).
+pub fn endpoint_ik(input: &PlanInput, goal: &Pose, seeds: &[[f64; 6]], work: &mut Work) -> Result<[f64; 6], EndpointIkError> {
+    let arm_dof = input.arm.arm_dof();
+    let arm_scope = crate::model::PlanningScope::first_n(arm_dof);
+    if let Err(e) = motion::check_start_planning_limits_f64(&input.q0, &input.limits, arm_scope, Some(0.0)) {
+        return Err(EndpointIkError::PlanningLimit(e));
+    }
+    let (lo, hi) = motion::ik_search_bounds(&input.limits, arm_dof).map_err(EndpointIkError::PlanningLimit)?;
     let end = motion::tcp_to_end(goal, &input.tcp_offset);
     let mut best = (f64::INFINITY, f64::INFINITY);
     for seed in seeds {
@@ -73,13 +91,46 @@ pub fn endpoint_ik(input: &PlanInput, goal: &Pose, seeds: &[[f64; 6]], work: &mu
             work.ik_iterations += sol.iterations as u64;
             if sol.ep + sol.er < best.0 + best.1 { best = (sol.ep, sol.er); }
             q = sol.q;
-            if sol.ok { return Ok(q); }
+            if sol.ok {
+                if motion::check_planning_limits_f64(&q, &input.limits, arm_scope, None).is_ok() {
+                    return Ok(q);
+                }
+                break;
+            }
             let obj = sol.ep + PAR.w * sol.er;
             if obj > prev - 1e-9 { break; }
             prev = obj;
         }
     }
-    Err(best)
+    let has_custom = input.limits.iter().take(arm_dof).any(crate::model::JointLimit::has_custom_planning_limits);
+    if has_custom {
+        let (hard_lo, hard_hi) = motion::hard_ik_search_bounds(&input.limits, arm_dof);
+        for seed in seeds {
+            let mut q: [f64; 6] = std::array::from_fn(|i| seed[i].clamp(hard_lo[i], hard_hi[i]));
+            let mut prev = f64::INFINITY;
+            for _ in 0..ENDPOINT_ROUNDS {
+                let sol = input.arm.solve_dls_ex(&end, &q, &hard_lo, &hard_hi, PAR.w, false);
+                work.ik_iterations += sol.iterations as u64;
+                q = sol.q;
+                if sol.ok {
+                    let hard_ok = (0..arm_dof).all(|i| {
+                        let l = &input.limits[i];
+                        q[i].is_finite() && q[i] >= f64::from(l.min_position) && q[i] <= f64::from(l.max_position)
+                    });
+                    if hard_ok {
+                        if let Err(e) = motion::check_planning_limits_f64(&q, &input.limits, arm_scope, None) {
+                            return Err(EndpointIkError::PlanningLimit(e));
+                        }
+                    }
+                    break;
+                }
+                let obj = sol.ep + PAR.w * sol.er;
+                if obj > prev - 1e-9 { break; }
+                prev = obj;
+            }
+        }
+    }
+    Err(EndpointIkError::Unreachable { ep: best.0, er: best.1 })
 }
 
 /// A path phase's rejection from a planner error.
@@ -87,6 +138,12 @@ pub fn motion_rejection(phase: &'static str, e: &MotionError) -> Rejection {
     let mut r = Rejection::new(phase, e.code(), e.to_string());
     match e {
         MotionError::IkUnreachable { s, ep, .. } => { r.value = Some(*ep); r.bound = Some(PAR.tol_pos); r.s = Some(*s); }
+        MotionError::PlanningLimitExceeded { value, min, max, s, .. } => {
+            r.value = value.is_finite().then_some(*value);
+            r.bound = if value.is_finite() && *value > *max { Some(*max) } else { Some(*min) };
+            r.s = *s;
+            r.planning_limit = true;
+        }
         MotionError::IkBranchFlip { s, dq, .. } => { r.value = Some(*dq); r.bound = Some(motion::MAX_SAMPLE_JUMP_RAD); r.s = Some(*s); }
         MotionError::WorkspaceViolation { s, value, bound, detail, .. } => {
             r.value = Some(*value); r.bound = Some(*bound); r.s = Some(*s);
@@ -200,11 +257,12 @@ pub struct Margins {
     pub payload_capacity_kg: Option<f64>,
 }
 
-/// Smallest normalized joint-limit margin of `q`.
+/// Smallest normalized joint-limit margin of `q` (against effective planning limits).
 pub fn joint_margin(input: &PlanInput, q: &[f64; 6]) -> f64 {
     (0..input.arm.arm_dof()).map(|i| {
         let l = &input.limits[i];
-        let (lo, hi) = (f64::from(l.min_position), f64::from(l.max_position));
+        let Some((lo32, hi32)) = l.effective_planning_range() else { return 0.0; };
+        let (lo, hi) = (f64::from(lo32), f64::from(hi32));
         ((q[i] - lo).min(hi - q[i]) / ((hi - lo) / 2.0)).clamp(0.0, 1.0)
     }).fold(1.0, f64::min)
 }
@@ -974,15 +1032,34 @@ pub fn plan_swept_joint_path(
             arm_dof + 1
         )));
     }
-    let (lo, hi) = limits(input);
+    let arm_scope = crate::model::PlanningScope::first_n(arm_dof);
+    // Check configured planning bounds on start and BOTH effective planning bounds on goal
+    // BEFORE the search-margin guard, so planning-cap violations surface IK_UNREACHABLE naming
+    // the joint and bound while unconfigured sides preserve the original IK_LIMIT_MARGIN guard.
+    motion::check_start_planning_limits_f64(&input.q0, &input.limits, arm_scope, Some(0.0))?;
+    motion::check_planning_limits_f64(&q_goal, &input.limits, arm_scope, Some(1.0))?;
+    // Preserve the original IK_LIMIT_MARGIN guard on every omitted (non-custom) side
+    // independently of `ik_search_bounds`'s narrow-interval fallback.
     for i in 0..arm_dof {
-        if !q_goal[i].is_finite() || q_goal[i] < lo[i] - 1e-6 || q_goal[i] > hi[i] + 1e-6 {
+        let l = &input.limits[i];
+        let (pmin, pmax) = l.effective_planning_range().expect("checked above");
+        let lo_i = if l.planning_min_position.is_some() {
+            f64::from(pmin)
+        } else {
+            f64::from(l.min_position) + motion::IK_LIMIT_MARGIN
+        };
+        let hi_i = if l.planning_max_position.is_some() {
+            f64::from(pmax)
+        } else {
+            f64::from(l.max_position) - motion::IK_LIMIT_MARGIN
+        };
+        if !q_goal[i].is_finite() || q_goal[i] < lo_i - 1e-6 || q_goal[i] > hi_i + 1e-6 {
             return Err(MotionError::InvalidCommand(format!(
                 "swept joint goal J{} ({:.4} rad) outside safe limits [{:.4}, {:.4}]",
                 i + 1,
                 q_goal[i],
-                lo[i],
-                hi[i]
+                lo_i,
+                hi_i
             )));
         }
     }
@@ -997,6 +1074,7 @@ pub fn plan_swept_joint_path(
             0.0
         }
     });
+    motion::check_start_planning_limits_f32(&start_q32, &input.limits, arm_scope, Some(0.0))?;
     let ws_eval = input.ws.as_ref().map(|ws| {
         crate::chain::WorkspaceEvaluator::new_with_tcp(&input.arm, ws, &input.cam, input.tcp_offset)
     });
@@ -1028,13 +1106,17 @@ pub fn plan_swept_joint_path(
         let s = k as f64 / n as f64;
         let q32: [f32; 7] = std::array::from_fn(|i| {
             if i < arm_dof {
-                (input.q0[i] + (q_goal[i] - input.q0[i]) * s) as f32
+                let (a, b) = (input.q0[i], q_goal[i]);
+                let v = (a + (b - a) * s).clamp(a.min(b), a.max(b)) as f32;
+                let (a32, b32) = (a as f32, b as f32);
+                v.clamp(a32.min(b32), a32.max(b32))
             } else if i == arm_dof {
                 input.j7
             } else {
                 0.0
             }
         });
+        motion::check_planning_limits_f32(&q32, &input.limits, arm_scope, Some(s))?;
         if let (Some(ev), Some((c_prev, min_d, rem))) = (&ws_eval, &mut ws_state) {
             match ev.sweep_linear_step(
                 &prev_q32,

@@ -403,10 +403,18 @@ pub fn build_safety_describe(pub_cfg: &crate::rt_core::requests::config::Publish
                 },
             },
             "limits": {
-                "joints": c.limits.iter().map(|l| json!({
-                    "name": l.name, "min": l.min_position, "max": l.max_position,
-                    "max_velocity": l.max_velocity, "max_acceleration": l.max_acceleration,
-                })).collect::<Vec<_>>(),
+                "joints": c.limits.iter().map(|l| {
+                    let planning = l.effective_planning_range();
+                    json!({
+                        "name": l.name,
+                        "min": l.min_position,
+                        "max": l.max_position,
+                        "planning_min": planning.map(|(lo, _)| lo),
+                        "planning_max": planning.map(|(_, hi)| hi),
+                        "max_velocity": l.max_velocity,
+                        "max_acceleration": l.max_acceleration,
+                    })
+                }).collect::<Vec<_>>(),
                 "planned_max_velocity": c.planned_max_velocity,
                 "servo_max_velocity": c.servo_max_velocity,
                 "workspace": workspace,

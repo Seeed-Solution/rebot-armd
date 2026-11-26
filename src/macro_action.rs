@@ -555,11 +555,20 @@ impl MacroCtx {
                 Ok(reply) => {
                     return match reply {
                         Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
-                        Reply::Refused { code, .. } => match code {
+                        Reply::Refused { code, detail, .. } => match code {
                             "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
                             | "PARENT_REPLACED" => Err(Stop::Cancelled),
                             "DEADLINE_EXPIRED" => {
                                 Err(fail(self.timeout_code, self.timeout_message.clone()))
+                            }
+                            "IK_UNREACHABLE" => {
+                                let msg = if let Some(v) = detail {
+                                    let lims = self.sup.hub().prep_env().map(|e| e.config.limits.clone());
+                                    v.into_motion_error(lims.as_deref().unwrap_or(&[]), None).to_string()
+                                } else {
+                                    "Trajectory exceeds joint planning limits at commit".into()
+                                };
+                                Err(fail("IK_UNREACHABLE", msg))
                             }
                             other => Err(fail(other, format!("RT action refused: {other}"))),
                         },
@@ -579,11 +588,20 @@ impl MacroCtx {
                 if let Ok(reply) = rx.try_recv() {
                     return match reply {
                         Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
-                        Reply::Refused { code, .. } => match code {
+                        Reply::Refused { code, detail, .. } => match code {
                             "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
                             | "PARENT_REPLACED" => Err(Stop::Cancelled),
                             "DEADLINE_EXPIRED" => {
                                 Err(fail(self.timeout_code, self.timeout_message.clone()))
+                            }
+                            "IK_UNREACHABLE" => {
+                                let msg = if let Some(v) = detail {
+                                    let lims = self.sup.hub().prep_env().map(|e| e.config.limits.clone());
+                                    v.into_motion_error(lims.as_deref().unwrap_or(&[]), None).to_string()
+                                } else {
+                                    "Trajectory exceeds joint planning limits at commit".into()
+                                };
+                                Err(fail("IK_UNREACHABLE", msg))
                             }
                             other => Err(fail(other, format!("RT action refused: {other}"))),
                         },
@@ -1247,6 +1265,32 @@ impl MacroCtx {
         workspace_rev_override: Option<u64>,
         calibration_rev: Option<u64>,
     ) -> Result<SubDone, (Stop, bool)> {
+        self.install_joint_child_scoped(
+            phase,
+            target,
+            limits,
+            None,
+            check_workspace_rev,
+            workspace_rev_override,
+            calibration_rev,
+        )
+        .await
+    }
+
+    /// Install a joint-space quintic macro child with an optional [`crate::model::PlanningScope`]
+    /// (`Some(scope)` for IK/Cartesian-planned children like `measure_multiview`, `None` for
+    /// explicit saved-pose sequence steps).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install_joint_child_scoped(
+        &self,
+        phase: &str,
+        target: Vec<f32>,
+        limits: Vec<crate::model::JointLimit>,
+        scope: Option<crate::model::PlanningScope>,
+        check_workspace_rev: bool,
+        workspace_rev_override: Option<u64>,
+        calibration_rev: Option<u64>,
+    ) -> Result<SubDone, (Stop, bool)> {
         use crate::rt_core::requests::actions as req;
         let before = |s: Stop| (s, false);
         if !self.alive().await {
@@ -1263,6 +1307,13 @@ impl MacroCtx {
         child_stamp.grasp_setup_revision = None;
         child_stamp.gripper_calib_revision = None;
         child_stamp.power_budget_revision = Some(snap.env.power_budget_revision);
+
+        if let Some(sc) = scope {
+            motion::check_planning_limits_f32(&snap.commanded_positions, &snap.env.config.limits, sc, Some(0.0))
+                .map_err(|e| before(arm_fail(e.into())))?;
+            motion::check_planning_limits_f32(&target, &snap.env.config.limits, sc, None)
+                .map_err(|e| before(arm_fail(e.into())))?;
+        }
 
         let ticket = if self.is_executor() {
             let m = snap.owner.macro_state;
@@ -1290,6 +1341,10 @@ impl MacroCtx {
                 &snap.env.config.arm_model,
             )
             .map_err(|e| before(arm_fail(e)))?;
+            if let Some(sc) = scope {
+                motion::check_quintic_planning_limits(&traj, &snap.env.config.limits, sc)
+                    .map_err(|e| before(arm_fail(e.into())))?;
+            }
             let max_vel: Vec<f32> = limits.iter().map(|l| l.max_velocity).collect();
             let timeout_s = ((traj.duration + motion::SETTLE_MAX_S) * 2.0 + 5.0).min(self.phase_timeout_s);
             let child_spec = ChildSpec {
@@ -1301,13 +1356,14 @@ impl MacroCtx {
                 timeout_code: self.timeout_code,
                 contact: None,
             };
-            let slot = req::prepare_child_joint_slot(
+            let slot = req::prepare_child_joint_slot_scoped(
                 &snap.commanded_positions,
                 &target,
                 &max_vel,
                 traj.duration,
                 power_scale,
                 child_spec,
+                scope,
             )
             .map_err(|c| before(fail(c, format!("failed to stage joint child for {phase}: {c}"))))?;
             self.submit_child_slot_executor(
@@ -1325,7 +1381,7 @@ impl MacroCtx {
                 && calibration_rev.is_none_or(|c| c == snap.env.calibration_revision);
             let (snap, target, limits, prepared_res) = if rev_ok {
                 tokio::task::spawn_blocking(move || {
-                    let r = req::build_prepared_quintic_off_lock(&snap, &target, &limits);
+                    let r = req::build_prepared_quintic_off_lock(&snap, &target, &limits, scope);
                     (snap, target, limits, Some(r))
                 })
                 .await
@@ -1378,6 +1434,7 @@ impl MacroCtx {
                     target,
                     limits,
                     prepared,
+                    checked_joints: scope,
                 },
             ) {
                 Ok(v) => v.ticket,

@@ -1583,10 +1583,12 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
             for i in (0..snap.env.config.dof).filter(|i| Some(*i) != gripper_idx) { target[i] = positions[i]; }
             if let (PoseGripper::Pose, Some(g)) = (gripper, gripper_idx) { target[g] = positions[g]; }
             let limits = snap.env.planning_limits(Some(*speed_scale));
-            ctx.install_joint_child(
+            // Sequence pose steps execute explicit saved joint angles (excluded from Cartesian/IK planning limits).
+            ctx.install_joint_child_scoped(
                 "pose",
                 target,
                 limits,
+                None,
                 true,
                 Some(plan.workspace_revision),
                 Some(plan.calibration_revision),

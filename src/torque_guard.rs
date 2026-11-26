@@ -383,15 +383,24 @@ impl SupervisorInner {
         }
     }
 
+    /// Side-effect-free preview of [`Self::torque_hold_filter`]: clamps `targets` to the active
+    /// torque hold without mutating `motion_limit` or clearing `workspace_violation`.
+    pub(crate) fn preview_torque_hold_filter(&self, targets: &mut [f32]) -> Option<usize> {
+        let h = self.torque_guard.hold?;
+        let t = targets.get_mut(h.joint)?;
+        if (*t - h.hold_q) * h.sign > 0.0 {
+            *t = h.hold_q;
+            return Some(h.joint);
+        }
+        None
+    }
+
     /// While a torque hold is in force: a servo / jog target that moves the held joint
     /// past the hold position in the push direction is clamped to the hold position.
     /// Targets that keep it there or move it the other way (reducing the load) pass.
     pub(crate) fn torque_hold_filter(&mut self, targets: &mut [f32]) {
-        let Some(h) = self.torque_guard.hold else { return; };
-        let Some(t) = targets.get_mut(h.joint) else { return; };
-        if (*t - h.hold_q) * h.sign > 0.0 {
-            *t = h.hold_q;
-            self.note_motion_limit(MotionLimitReason::Torque, Some(h.joint));
+        if let Some(j) = self.preview_torque_hold_filter(targets) {
+            self.note_motion_limit(MotionLimitReason::Torque, Some(j));
         }
     }
 }

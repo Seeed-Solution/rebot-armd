@@ -664,6 +664,7 @@ fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_allo
             power_scale: None,
             settle: false,
             approach_then: None,
+            checked_joints: None,
         }));
     };
     jog_broker

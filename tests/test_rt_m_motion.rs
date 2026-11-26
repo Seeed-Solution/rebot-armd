@@ -584,9 +584,9 @@ async fn executor_broker_jog_home_park_supersession_and_zero_alloc_b1_b2() {
     clock.run_steps(period_ns, home_ticks);
 
     let replies = drain_replies(&handle);
-    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_stale)), "{replies:?}");
-    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_rev)), "{replies:?}");
-    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "EPOCH_MISMATCH" } if *request == r_ep)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE", .. } if *request == r_stale)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE", .. } if *request == r_rev)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "EPOCH_MISMATCH", .. } if *request == r_ep)), "{replies:?}");
     let sup_idx = replies.iter().position(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Superseded, .. } if *request == r_jog)).expect("jog superseded");
     let home_ack_idx = replies.iter().position(|r| matches!(r, Reply::Ack { request, .. } if *request == r_home)).expect("home ack");
     assert!(sup_idx < home_ack_idx, "Superseded must precede new Ack");
@@ -2342,6 +2342,8 @@ fn nine_dof_urdf_plus_gripper_config(urdf_path: &std::path::Path) -> ArmConfig {
             max_position: 3.0,
             max_velocity: if i < 8 { 2.0 } else { 3.0 },
             max_acceleration: 5.0,
+            planning_min_position: None,
+            planning_max_position: None,
         })
         .collect();
     cfg.home_positions = vec![0.0; 9];

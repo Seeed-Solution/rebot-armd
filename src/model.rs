@@ -117,9 +117,25 @@ pub struct JointLimit {
     pub max_position: f32,
     pub max_velocity: f32,
     pub max_acceleration: f32,
+    /// Optional tighter lower position bound enforced during autonomous planning only.
+    /// Absent defaults to `min_position`; hard limits remain authoritative for safety,
+    /// RT tracking, gravity compensation, servo/policy streaming, and recovery motions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_min_position: Option<f32>,
+    /// Optional tighter upper position bound enforced during autonomous planning only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_max_position: Option<f32>,
 }
 
-crate::fieldwise_clone!(JointLimit { name, min_position, max_position, max_velocity, max_acceleration });
+crate::fieldwise_clone!(JointLimit {
+    name,
+    min_position,
+    max_position,
+    max_velocity,
+    max_acceleration,
+    planning_min_position,
+    planning_max_position
+});
 
 impl JointLimit {
     pub fn new(
@@ -135,7 +151,102 @@ impl JointLimit {
             max_position,
             max_velocity,
             max_acceleration,
+            planning_min_position: None,
+            planning_max_position: None,
         }
+    }
+
+    pub fn with_planning_min(mut self, planning_min_position: f32) -> Self {
+        self.planning_min_position = Some(planning_min_position);
+        self
+    }
+
+    pub fn with_planning_max(mut self, planning_max_position: f32) -> Self {
+        self.planning_max_position = Some(planning_max_position);
+        self
+    }
+
+    /// Effective planning position range derived purely from intersecting the hard range
+    /// `[min_position, max_position]` with optional `[planning_min_position, planning_max_position]`.
+    /// Returns `None` if runtime driver narrowing made the intersection empty or non-finite.
+    pub fn effective_planning_range(&self) -> Option<(f32, f32)> {
+        let lo = self
+            .planning_min_position
+            .map_or(self.min_position, |p| p.max(self.min_position));
+        let hi = self
+            .planning_max_position
+            .map_or(self.max_position, |p| p.min(self.max_position));
+        (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
+    }
+
+    /// True when at least one optional planning-only position bound is configured.
+    pub fn has_custom_planning_limits(&self) -> bool {
+        self.planning_min_position.is_some() || self.planning_max_position.is_some()
+    }
+}
+
+/// Zero-allocation joint selection mask for planning-limit enforcement (`bit i == 1` => joint `i` checked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlanningScope {
+    pub mask: u16,
+}
+
+impl PlanningScope {
+    pub const fn from_mask(mask: u16) -> Self {
+        Self { mask }
+    }
+
+    /// Arm joints only (uses `ArmConfig::arm_joints()`, supporting profiles with no gripper
+    /// or a non-trailing gripper).
+    pub fn arm_only(cfg: &ArmConfig) -> Self {
+        let mut mask = 0u16;
+        for &i in cfg.arm_joints().iter() {
+            if i < 16 {
+                mask |= 1u16 << i;
+            }
+        }
+        Self { mask }
+    }
+
+    /// First `count` joints (0..count), used for IK arrays indexed `0..arm_dof`.
+    pub fn first_n(count: usize) -> Self {
+        let n = count.min(16);
+        let mask = if n == 16 { u16::MAX } else { (1u16 << n) - 1 };
+        Self { mask }
+    }
+
+    /// All configured joints (`0..cfg.dof`).
+    pub fn all_joints(dof: usize) -> Self {
+        Self::first_n(dof)
+    }
+
+    /// Saved-pose / sequence-pose scope: all joints when gripper is targeted, arm joints only otherwise.
+    pub fn for_pose(cfg: &ArmConfig, include_gripper: bool) -> Self {
+        if include_gripper {
+            Self::all_joints(cfg.dof)
+        } else {
+            Self::arm_only(cfg)
+        }
+    }
+
+    /// Arm joints plus gripper if and only if the target moves the gripper from `start`.
+    pub fn from_target_delta(cfg: &ArmConfig, start: &[f32], target: &[f32]) -> Self {
+        let mut scope = Self::arm_only(cfg);
+        if let Some(g) = cfg.gripper_index() {
+            if g < 16
+                && g < start.len()
+                && g < target.len()
+                && (target[g] - start[g]).abs() > 1e-6
+            {
+                scope.mask |= 1u16 << g;
+            }
+        }
+        scope
+    }
+
+    #[inline]
+    pub const fn contains(self, joint_idx: usize) -> bool {
+        joint_idx < 16 && (self.mask & (1u16 << joint_idx)) != 0
     }
 }
 
@@ -2078,6 +2189,18 @@ impl ArmConfig {
 
     /// Validate configuration invariants and auto-normalize joint names
     pub fn validate(&mut self) -> Result<(), String> {
+        self.validate_inner(true)
+    }
+
+    /// Runtime re-validation after hardware driver limit narrowing: enforces every hard-limit,
+    /// resting-pose, home-position, and gripper invariant while validating raw planning fields
+    /// independently of narrowed hard bounds so a clipped/empty planning intersection never
+    /// triggers a hardware joint-limit fault or blocks rearm.
+    pub(crate) fn validate_runtime_narrowed(&mut self) -> Result<(), String> {
+        self.validate_inner(false)
+    }
+
+    fn validate_inner(&mut self, check_planning_against_hard: bool) -> Result<(), String> {
         if self.profile_version == 0 || self.profile_version > ARM_PROFILE_VERSION {
             return Err(format!(
                 "profile_version {} is not supported (this armd reads 1..={ARM_PROFILE_VERSION})",
@@ -2401,6 +2524,36 @@ impl ArmConfig {
         for (i, lim) in self.limits.iter().enumerate() {
             if !lim.min_position.is_finite() || !lim.max_position.is_finite() || lim.min_position >= lim.max_position {
                 return Err(format!("Joint {} min position >= max position", i));
+            }
+            if let Some(pmin) = lim.planning_min_position {
+                if !pmin.is_finite() {
+                    return Err(format!("Joint {} planning_min_position must be finite", i));
+                }
+                if check_planning_against_hard && (pmin < lim.min_position || pmin > lim.max_position) {
+                    return Err(format!(
+                        "Joint {} planning_min_position ({}) must be within [{}, {}]",
+                        i, pmin, lim.min_position, lim.max_position
+                    ));
+                }
+            }
+            if let Some(pmax) = lim.planning_max_position {
+                if !pmax.is_finite() {
+                    return Err(format!("Joint {} planning_max_position must be finite", i));
+                }
+                if check_planning_against_hard && (pmax < lim.min_position || pmax > lim.max_position) {
+                    return Err(format!(
+                        "Joint {} planning_max_position ({}) must be within [{}, {}]",
+                        i, pmax, lim.min_position, lim.max_position
+                    ));
+                }
+            }
+            if let (Some(pmin), Some(pmax)) = (lim.planning_min_position, lim.planning_max_position) {
+                if pmin >= pmax {
+                    return Err(format!("Joint {} planning_min_position >= planning_max_position", i));
+                }
+            }
+            if check_planning_against_hard && lim.effective_planning_range().is_none() {
+                return Err(format!("Joint {} planning_min_position >= planning_max_position", i));
             }
             if lim.max_velocity <= 0.0 || !lim.max_velocity.is_finite() || lim.max_acceleration <= 0.0 || !lim.max_acceleration.is_finite() {
                 return Err(format!("Joint {} max_velocity must be positive finite", i));
@@ -3426,8 +3579,11 @@ impl ArmConfig {
 
         let limits = vec![
             JointLimit::new("joint_1", -3.14159, 3.14159, 2.0, 5.0),
-            JointLimit::new("joint_2", -2.0944, 2.0944, 2.0, 5.0),
-            JointLimit::new("joint_3", -2.61799, 2.61799, 2.0, 5.0),
+            // On the real B601-DM from folded home (J2 = J3 = 0): +J2 hits a mechanical stop
+            // near +0.033 rad and +J3 pushes against the arm near +0.05 rad; keep hard limits
+            // symmetric for gravity comp / idle checks / recovery and cap autonomous planning.
+            JointLimit::new("joint_2", -2.0944, 2.0944, 2.0, 5.0).with_planning_max(0.03),
+            JointLimit::new("joint_3", -2.61799, 2.61799, 2.0, 5.0).with_planning_max(0.04),
             JointLimit::new("joint_4", -3.14159, 3.14159, 3.0, 8.0),
             JointLimit::new("joint_5", -2.0944, 2.0944, 3.0, 8.0),
             JointLimit::new("joint_6", -6.28318, 6.28318, 4.0, 10.0),

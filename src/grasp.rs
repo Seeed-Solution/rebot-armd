@@ -6725,7 +6725,11 @@ impl Orchestrator {
             let sign = inner.config.arm_model.joint_map().get(roll_idx).map_or(1.0, |m| m.sign);
             (q_roll, lim, sign)
         };
-        let room = |t: f64| { let q = q_roll + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
+        let room = |t: f64| {
+            let Some((lo, hi)) = lim.effective_planning_range() else { return false; };
+            let q = q_roll + sign * t;
+            q >= f64::from(lo) + 0.1 && q <= f64::from(hi) - 0.1
+        };
         // an image angle: the long side on the plane, seen from the pose of the centring frames
         let angle_turn = |alpha: f64| -> Result<Option<f64>, &'static str> {
             let px = self.cam.to_px(box_centre(&c.last.box_norm));

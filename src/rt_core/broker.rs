@@ -314,7 +314,11 @@ pub enum Reply {
         outcome: super::requests::lease::LeaseOutcome,
     },
     /// Not committed (nothing changed on the RT side; a plan slot was retired).
-    Refused { request: RequestId, code: &'static str },
+    Refused {
+        request: RequestId,
+        code: &'static str,
+        detail: Option<crate::motion::PlanningLimitViolationRt>,
+    },
     /// The physical completion of an acknowledged action; `children`: the child primitives
     /// a macro action ran (0 for a plain primitive or a transition).
     Terminal { request: RequestId, action: ActionId, outcome: Outcome, children: u32 },
@@ -1022,6 +1026,7 @@ impl<P> Broker<P> {
                             Reply::Refused {
                                 request,
                                 code: "PROTOCOL_ERROR",
+                                detail: None,
                             },
                         );
                     }
@@ -1244,7 +1249,16 @@ impl<P> Taken<'_, P> {
 
     /// Refuses the command without emitting the reply yet (retires any plan slot now; the
     /// `Reply::Refused` is emitted in Step 7 strictly after Step 6 publication).
-    pub fn refuse_deferred(mut self, code: &'static str) -> Reply {
+    pub fn refuse_deferred(self, code: &'static str) -> Reply {
+        self.refuse_deferred_with(code, None)
+    }
+
+    /// Refuses the command with an optional fixed-size per-request RT diagnostic detail.
+    pub fn refuse_deferred_with(
+        mut self,
+        code: &'static str,
+        detail: Option<crate::motion::PlanningLimitViolationRt>,
+    ) -> Reply {
         self.answered = true;
         if let Some(plan) = self.d.kind.plan() {
             self.intake.plans.retire(plan);
@@ -1252,6 +1266,7 @@ impl<P> Taken<'_, P> {
         Reply::Refused {
             request: self.d.stamp.request,
             code,
+            detail,
         }
     }
 
@@ -1262,7 +1277,7 @@ impl<P> Taken<'_, P> {
         self.answered = true;
         if let Some(plan) = self.d.kind.plan() { self.intake.plans.retire(plan); }
         let request = self.d.stamp.request;
-        self.intake.reply(Reply::Refused { request, code });
+        self.intake.reply(Reply::Refused { request, code, detail: None });
     }
 }
 
@@ -1486,7 +1501,7 @@ mod tests {
         assert_eq!(b.reserved(), 2);
         rt.begin_release(1);
         rt.take().unwrap().refuse("STOPPED");
-        assert_eq!(b.poll(|_, r| { assert_eq!(r, Reply::Refused { request: RequestId(1), code: "STOPPED" }); true }), 1);
+        assert_eq!(b.poll(|_, r| { assert_eq!(r, Reply::Refused { request: RequestId(1), code: "STOPPED", detail: None }); true }), 1);
         assert_eq!((b.reserved(), b.stats().retired), (0, 1));
         assert!(b.submit(ClientId(1), 1, Authority::default(), later(), Submit::Install(&plan(2.0))).is_ok(), "slot reused");
     }
@@ -1507,7 +1522,7 @@ mod tests {
         assert_eq!(t.ack(super::super::ops::Committed::for_tests(r2, Some(ActionId(1)))).unwrap().installed, None);
         let mut got = Vec::new();
         b.poll(|_, r| { got.push(r); true });
-        assert_eq!(got, vec![Reply::Refused { request: r1, code: "COMMIT_MISMATCH" }, Reply::Ack { request: r2, commit_seq: 1, action: Some(ActionId(1)) }]);
+        assert_eq!(got, vec![Reply::Refused { request: r1, code: "COMMIT_MISMATCH", detail: None }, Reply::Ack { request: r2, commit_seq: 1, action: Some(ActionId(1)) }]);
         assert_eq!((b.reserved(), b.outstanding(), b.stats().unexpected, rt.installed()), (0, 0, 0, 0));
     }
 
@@ -1527,7 +1542,7 @@ mod tests {
         let mut got = Vec::new();
         b.poll(|_, r| { got.push(r); true });
         assert_eq!(got, vec![
-            Reply::Refused { request: r1, code: "INTERNAL" },
+            Reply::Refused { request: r1, code: "INTERNAL", detail: None },
             Reply::Ack { request: r2, commit_seq: 1, action: Some(ActionId(9)) },
             Reply::Terminal { request: r2, action: ActionId(9), outcome: Outcome::Completed, children: 0 },
         ]);

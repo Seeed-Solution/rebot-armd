@@ -741,13 +741,15 @@ async fn submit_prepared_executor_ws(
                 drop(ack_guard);
                 return Err(ArmError::Internal("InstallPrepared ACK omitted ActionId".into()));
             }
-            Ok(Ok(Ok(Reply::Refused { code, .. }))) => {
+            Ok(Ok(Ok(Reply::Refused { code, detail, .. }))) => {
                 drop(ack_guard);
                 let cur_epoch = sup
                     .hub()
                     .latest()
                     .map_or(auth.epoch, |s| s.rt.owner.authority.epoch);
-                return Err(ActionRefusal::new(code).into_arm_error_with_epoch(cur_epoch));
+                let lims = sup.hub().prep_env().map(|e| e.config.limits.clone());
+                return Err(ActionRefusal::new(code)
+                    .into_arm_error_with_detail(cur_epoch, detail, lims.as_deref()));
             }
             Ok(Ok(Ok(Reply::Terminal { .. } | Reply::Lease { .. }))) => {
                 drop(ack_guard);

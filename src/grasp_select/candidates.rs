@@ -81,11 +81,13 @@ pub struct Rejection {
     pub geometry: Option<String>,
     /// Path parameter of the failure within its phase (0..1).
     pub s: Option<f64>,
+    /// True when this rejection came from a planning-only joint limit violation.
+    pub planning_limit: bool,
 }
 
 impl Rejection {
     pub fn new(phase: &'static str, code: &str, message: impl Into<String>) -> Self {
-        Self { phase, code: code.into(), message: message.into(), value: None, bound: None, geometry: None, s: None }
+        Self { phase, code: code.into(), message: message.into(), value: None, bound: None, geometry: None, s: None, planning_limit: false }
     }
     pub fn with(mut self, value: f64, bound: f64) -> Self { self.value = Some(value); self.bound = Some(bound); self }
 }

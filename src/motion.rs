@@ -11,7 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::kinematics::{self, Pose};
-use crate::model::{CameraMount, JointLimit, WorkspacePolicy};
+use crate::model::{CameraMount, JointLimit, PlanningScope, WorkspacePolicy};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{GripperPolicy, HoldingMode};
 #[cfg(not(target_arch = "wasm32"))]
@@ -28,6 +28,15 @@ pub enum MotionError {
     /// `path: "joint"`: no IK seed reached the goal pose within the joint limits (best of `seeds`).
     #[error("No IK solution for the goal pose within the joint limits (best of {seeds} seeds: position error {ep:.4} m, rotation error {er:.4} rad)")]
     IkGoalUnreachable { ep: f64, er: f64, seeds: usize },
+    /// Autonomous planning rejected a target, sample, or trajectory exceeding a joint's planning limit.
+    #[error("{}", planning_limit_message(.joint, *.value, *.min, *.max, *.s))]
+    PlanningLimitExceeded {
+        joint: String,
+        value: f64,
+        min: f64,
+        max: f64,
+        s: Option<f64>,
+    },
     #[error("{}", format_motion_workspace_violation(*s, *point, limit, *value, *bound, detail))]
     WorkspaceViolation {
         s: f64,
@@ -72,7 +81,9 @@ fn format_motion_workspace_violation(
 impl MotionError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::IkUnreachable { .. } | Self::IkGoalUnreachable { .. } => "IK_UNREACHABLE",
+            Self::IkUnreachable { .. }
+            | Self::IkGoalUnreachable { .. }
+            | Self::PlanningLimitExceeded { .. } => "IK_UNREACHABLE",
             Self::IkBranchFlip { .. } => "IK_BRANCH_FLIP",
             Self::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
             Self::MotionBusy(_) => "MOTION_BUSY",
@@ -82,6 +93,316 @@ impl MotionError {
             Self::PowerBudget(_) => "POWER_BUDGET",
         }
     }
+}
+
+fn planning_limit_message(joint: &str, value: f64, min: f64, max: f64, s: Option<f64>) -> String {
+    let at_s = s.map_or_else(String::new, |sv| format!(" at s={sv:.3}"));
+    if !min.is_finite() || !max.is_finite() || min >= max {
+        format!(
+            "Target exceeds planning limit on joint '{joint}'{at_s}: effective planning range [{min:.4}, {max:.4}] rad is empty"
+        )
+    } else {
+        format!(
+            "Target exceeds planning limit on joint '{joint}' ({value:.4} rad outside planning limit [{min:.4}, {max:.4}] rad){at_s}"
+        )
+    }
+}
+
+/// Zero-allocation RT descriptor of a planning-limit rejection (`Copy + Eq` via IEEE-754 bits
+/// so it can be carried directly in per-request [`crate::rt_core::broker::Reply::Refused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningLimitViolationRt {
+    pub joint_idx: u8,
+    pub value_bits: u32,
+    pub min_bits: u32,
+    pub max_bits: u32,
+}
+
+impl PlanningLimitViolationRt {
+    #[inline]
+    pub fn new(joint_idx: u8, value: f32, min: f32, max: f32) -> Self {
+        Self {
+            joint_idx,
+            value_bits: value.to_bits(),
+            min_bits: min.to_bits(),
+            max_bits: max.to_bits(),
+        }
+    }
+
+    #[inline]
+    pub fn value(self) -> f32 {
+        f32::from_bits(self.value_bits)
+    }
+
+    #[inline]
+    pub fn min(self) -> f32 {
+        f32::from_bits(self.min_bits)
+    }
+
+    #[inline]
+    pub fn max(self) -> f32 {
+        f32::from_bits(self.max_bits)
+    }
+
+    pub fn into_motion_error(self, limits: &[JointLimit], s: Option<f64>) -> MotionError {
+        let joint = limits
+            .get(usize::from(self.joint_idx))
+            .map_or_else(|| format!("joint_{}", usize::from(self.joint_idx) + 1), |l| l.name.clone());
+        MotionError::PlanningLimitExceeded {
+            joint,
+            value: f64::from(self.value()),
+            min: f64::from(self.min()),
+            max: f64::from(self.max()),
+            s,
+        }
+    }
+}
+
+/// Effective hard IK search bounds (`[min_position + IK_LIMIT_MARGIN, max_position - IK_LIMIT_MARGIN]`),
+/// used strictly for bounded failure diagnosis when custom planning limits are configured.
+pub fn hard_ik_search_bounds(limits: &[JointLimit], arm_dof: usize) -> ([f64; 6], [f64; 6]) {
+    let lo = std::array::from_fn(|i| {
+        if i < arm_dof && i < limits.len() {
+            let l = &limits[i];
+            let lo_i = f64::from(l.min_position) + IK_LIMIT_MARGIN;
+            let hi_i = f64::from(l.max_position) - IK_LIMIT_MARGIN;
+            if lo_i >= hi_i { f64::from(l.min_position) } else { lo_i }
+        } else {
+            -std::f64::consts::PI
+        }
+    });
+    let hi = std::array::from_fn(|i| {
+        if i < arm_dof && i < limits.len() {
+            let l = &limits[i];
+            let lo_i = f64::from(l.min_position) + IK_LIMIT_MARGIN;
+            let hi_i = f64::from(l.max_position) - IK_LIMIT_MARGIN;
+            if lo_i >= hi_i { f64::from(l.max_position) } else { hi_i }
+        } else {
+            std::f64::consts::PI
+        }
+    });
+    (lo, hi)
+}
+
+/// Single-authority IK search bounds for autonomous planning:
+/// applies `IK_LIMIT_MARGIN` only on endpoints without an explicit planning bound, and falls back
+/// to the full effective planning range `(pmin, pmax)` whenever `lo >= hi` (so legal narrow or
+/// near-stop planning bands are never collapsed to a single point or inverted).
+pub fn ik_search_bounds(limits: &[JointLimit], arm_dof: usize) -> Result<([f64; 6], [f64; 6]), MotionError> {
+    let mut lo = [-std::f64::consts::PI; 6];
+    let mut hi = [std::f64::consts::PI; 6];
+    for i in 0..arm_dof.min(6).min(limits.len()) {
+        let l = &limits[i];
+        let Some((pmin_f32, pmax_f32)) = l.effective_planning_range() else {
+            let raw_lo = l.planning_min_position.map_or(l.min_position, |p| p.max(l.min_position));
+            let raw_hi = l.planning_max_position.map_or(l.max_position, |p| p.min(l.max_position));
+            return Err(MotionError::PlanningLimitExceeded {
+                joint: l.name.clone(),
+                value: f64::NAN,
+                min: f64::from(raw_lo),
+                max: f64::from(raw_hi),
+                s: None,
+            });
+        };
+        let (pmin, pmax) = (f64::from(pmin_f32), f64::from(pmax_f32));
+        let lo_c = if l.planning_min_position.is_some() { pmin } else { pmin + IK_LIMIT_MARGIN };
+        let hi_c = if l.planning_max_position.is_some() { pmax } else { pmax - IK_LIMIT_MARGIN };
+        if lo_c >= hi_c {
+            lo[i] = pmin;
+            hi[i] = pmax;
+        } else {
+            lo[i] = lo_c;
+            hi[i] = hi_c;
+        }
+    }
+    Ok((lo, hi))
+}
+
+fn empty_range_err(l: &JointLimit, value: f64, s: Option<f64>) -> MotionError {
+    let raw_lo = l.planning_min_position.map_or(l.min_position, |p| p.max(l.min_position));
+    let raw_hi = l.planning_max_position.map_or(l.max_position, |p| p.min(l.max_position));
+    MotionError::PlanningLimitExceeded {
+        joint: l.name.clone(),
+        value,
+        min: f64::from(raw_lo),
+        max: f64::from(raw_hi),
+        s,
+    }
+}
+
+/// Check `f64` starting joint positions (`s = 0.0`) against configured custom planning limits
+/// and empty effective planning ranges for all joints in `scope`.
+///
+/// Unconfigured hard-limit sides are not newly rejected on the pre-existing start pose so
+/// profiles without custom planning limits (e.g., scans starting 4e-5 rad beyond a rounded hard
+/// bound) retain their existing start acceptance behavior while all planned samples and continuous
+/// trajectories enforce both effective bounds.
+pub fn check_start_planning_limits_f64(
+    q: &[f64],
+    limits: &[JointLimit],
+    scope: PlanningScope,
+    s: Option<f64>,
+) -> Result<(), MotionError> {
+    for (i, l) in limits.iter().enumerate() {
+        if !scope.contains(i) { continue; }
+        let Some(&v) = q.get(i) else { continue; };
+        let Some((pmin, pmax)) = l.effective_planning_range() else {
+            return Err(empty_range_err(l, v, s));
+        };
+        if !v.is_finite() {
+            return Err(MotionError::PlanningLimitExceeded {
+                joint: l.name.clone(),
+                value: v,
+                min: f64::from(pmin),
+                max: f64::from(pmax),
+                s,
+            });
+        }
+        if !l.has_custom_planning_limits() { continue; }
+        let (lo, hi) = (f64::from(pmin), f64::from(pmax));
+        let lo_bad = l.planning_min_position.is_some() && v < lo - 1e-9;
+        let hi_bad = l.planning_max_position.is_some() && v > hi + 1e-9;
+        if lo_bad || hi_bad {
+            return Err(MotionError::PlanningLimitExceeded {
+                joint: l.name.clone(),
+                value: v,
+                min: lo,
+                max: hi,
+                s,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Zero-allocation RT check of starting `f32` joint positions (`s = 0.0`) against configured
+/// custom planning limits and empty effective planning ranges.
+pub fn check_start_planning_limits_rt(
+    q: &[f32],
+    limits: &[JointLimit],
+    scope: PlanningScope,
+) -> Result<(), PlanningLimitViolationRt> {
+    for (i, l) in limits.iter().enumerate() {
+        if !scope.contains(i) { continue; }
+        let Some(&v) = q.get(i) else { continue; };
+        let Some((lo, hi)) = l.effective_planning_range() else {
+            let raw_lo = l.planning_min_position.map_or(l.min_position, |p| p.max(l.min_position));
+            let raw_hi = l.planning_max_position.map_or(l.max_position, |p| p.min(l.max_position));
+            return Err(PlanningLimitViolationRt::new(i as u8, v, raw_lo, raw_hi));
+        };
+        if !v.is_finite() {
+            return Err(PlanningLimitViolationRt::new(i as u8, v, lo, hi));
+        }
+        if !l.has_custom_planning_limits() { continue; }
+        let lo_bad = l.planning_min_position.is_some() && v < lo;
+        let hi_bad = l.planning_max_position.is_some() && v > hi;
+        if lo_bad || hi_bad {
+            return Err(PlanningLimitViolationRt::new(i as u8, v, lo, hi));
+        }
+    }
+    Ok(())
+}
+
+/// Check starting `f32` joint positions (`s = 0.0`) against configured custom planning limits.
+pub fn check_start_planning_limits_f32(
+    q: &[f32],
+    limits: &[JointLimit],
+    scope: PlanningScope,
+    s: Option<f64>,
+) -> Result<(), MotionError> {
+    check_start_planning_limits_rt(q, limits, scope).map_err(|v| v.into_motion_error(limits, s))
+}
+
+/// Check `f64` planned joint positions against BOTH effective planning bounds `(pmin, pmax)`
+/// (defaulting omitted sides to hard limits) for all joints in `scope`.
+pub fn check_planning_limits_f64(
+    q: &[f64],
+    limits: &[JointLimit],
+    scope: PlanningScope,
+    s: Option<f64>,
+) -> Result<(), MotionError> {
+    for (i, l) in limits.iter().enumerate() {
+        if !scope.contains(i) { continue; }
+        let Some(&v) = q.get(i) else { continue; };
+        let Some((pmin, pmax)) = l.effective_planning_range() else {
+            return Err(empty_range_err(l, v, s));
+        };
+        let (lo, hi) = (f64::from(pmin), f64::from(pmax));
+        if !v.is_finite() || v < lo - 1e-9 || v > hi + 1e-9 {
+            return Err(MotionError::PlanningLimitExceeded {
+                joint: l.name.clone(),
+                value: v,
+                min: lo,
+                max: hi,
+                s,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Check `f32` planned joint positions against BOTH effective planning bounds for all joints in `scope`.
+pub fn check_planning_limits_f32(
+    q: &[f32],
+    limits: &[JointLimit],
+    scope: PlanningScope,
+    s: Option<f64>,
+) -> Result<(), MotionError> {
+    check_planning_limits_rt(q, limits, scope).map_err(|v| v.into_motion_error(limits, s))
+}
+
+/// Zero-allocation RT check of `f32` planned joint positions against BOTH effective planning bounds
+/// (defaulting omitted sides to hard limits) for all joints in `scope`.
+pub fn check_planning_limits_rt(
+    q: &[f32],
+    limits: &[JointLimit],
+    scope: PlanningScope,
+) -> Result<(), PlanningLimitViolationRt> {
+    for (i, l) in limits.iter().enumerate() {
+        if !scope.contains(i) { continue; }
+        let Some(&v) = q.get(i) else { continue; };
+        let Some((lo, hi)) = l.effective_planning_range() else {
+            let raw_lo = l.planning_min_position.map_or(l.min_position, |p| p.max(l.min_position));
+            let raw_hi = l.planning_max_position.map_or(l.max_position, |p| p.min(l.max_position));
+            return Err(PlanningLimitViolationRt::new(i as u8, v, raw_lo, raw_hi));
+        };
+        if !v.is_finite() || v < lo || v > hi {
+            return Err(PlanningLimitViolationRt::new(i as u8, v, lo, hi));
+        }
+    }
+    Ok(())
+}
+
+/// Certify every checked joint of a multi-joint quintic trajectory stays inside BOTH effective
+/// planning bounds `(lo, hi)` over `[0, duration]` (zero heap allocations).
+pub fn check_quintic_planning_limits_rt(
+    traj: &MultiJointQuinticTrajectory,
+    limits: &[JointLimit],
+    scope: PlanningScope,
+) -> Result<(), PlanningLimitViolationRt> {
+    for (i, l) in limits.iter().enumerate() {
+        if !scope.contains(i) { continue; }
+        let Some(poly) = traj.polynomials.get(i) else { continue; };
+        let Some((lo, hi)) = l.effective_planning_range() else {
+            let raw_lo = l.planning_min_position.map_or(l.min_position, |p| p.max(l.min_position));
+            let raw_hi = l.planning_max_position.map_or(l.max_position, |p| p.min(l.max_position));
+            return Err(PlanningLimitViolationRt::new(i as u8, poly.p1 as f32, raw_lo, raw_hi));
+        };
+        if let Err(bad) = poly.certify_f32_within(lo, hi) {
+            return Err(PlanningLimitViolationRt::new(i as u8, bad as f32, lo, hi));
+        }
+    }
+    Ok(())
+}
+
+/// Certify every checked joint of a multi-joint quintic trajectory stays inside its effective
+/// planning range over `[0, duration]`, returning a named [`MotionError::PlanningLimitExceeded`].
+pub fn check_quintic_planning_limits(
+    traj: &MultiJointQuinticTrajectory,
+    limits: &[JointLimit],
+    scope: PlanningScope,
+) -> Result<(), MotionError> {
+    check_quintic_planning_limits_rt(traj, limits, scope).map_err(|v| v.into_motion_error(limits, None))
 }
 
 /// Message suffix of an IK failure whose sample yaw is off the outward direction.
@@ -421,7 +742,10 @@ impl JointPath {
         let b = self.s.partition_point(|x| *x <= s).clamp(1, self.s.len() - 1);
         let a = b - 1;
         let f = ((s - self.s[a]) / (self.s[b] - self.s[a])).clamp(0.0, 1.0) as f32;
-        std::array::from_fn(|i| self.q[a][i] + (self.q[b][i] - self.q[a][i]) * f)
+        std::array::from_fn(|i| {
+            let (qa, qb) = (self.q[a][i], self.q[b][i]);
+            (qa + (qb - qa) * f).clamp(qa.min(qb), qa.max(qb))
+        })
     }
 
     /// Fit the path into the power budget's planning limit (`src/power_plan.rs`): the
@@ -504,21 +828,17 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
     }
     let n = raw as usize;
 
-    let lo: [f64; 6] = std::array::from_fn(|i| {
-        if i < input.limits.len() {
-            f64::from(input.limits[i].min_position) + IK_LIMIT_MARGIN
-        } else {
-            -std::f64::consts::PI
-        }
-    });
-    let hi: [f64; 6] = std::array::from_fn(|i| {
-        if i < input.limits.len() {
-            f64::from(input.limits[i].max_position) - IK_LIMIT_MARGIN
-        } else {
-            std::f64::consts::PI
-        }
-    });
+    let (lo, hi) = ik_search_bounds(&input.limits, arm_dof)?;
+    let arm_scope = PlanningScope::first_n(arm_dof);
+    check_start_planning_limits_f64(&input.q0, &input.limits, arm_scope, Some(0.0))?;
+    let has_custom_planning = input
+        .limits
+        .iter()
+        .take(arm_dof)
+        .any(JointLimit::has_custom_planning_limits);
+    let (hard_lo, hard_hi) = hard_ik_search_bounds(&input.limits, arm_dof);
     let start_q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { input.q0[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
+    check_start_planning_limits_f32(&start_q32, &input.limits, arm_scope, Some(0.0))?;
     let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new_with_tcp(&input.arm, ws, &input.cam, input.tcp_offset));
     let mut ws_state = match &ws_eval {
         Some(ev) => {
@@ -560,14 +880,26 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
         }
         let sol = solve_ik_in_frame(input, &Pose::new(r, p), &prev, &lo, &hi, yaw_free);
         if !sol.ok {
+            if has_custom_planning {
+                let hard_sol = solve_ik_in_frame(input, &Pose::new(r, p), &prev, &hard_lo, &hard_hi, yaw_free);
+                if hard_sol.ok {
+                    let jump_ok = (0..arm_dof)
+                        .all(|i| (hard_sol.q[i] - prev[i]).abs() <= MAX_SAMPLE_JUMP_RAD);
+                    if jump_ok {
+                        check_planning_limits_f64(&hard_sol.q, &input.limits, arm_scope, Some(s))?;
+                    }
+                }
+            }
             return Err(MotionError::IkUnreachable { s, ep: sol.ep, er: sol.er, yaw_off_deg });
         }
+        check_planning_limits_f64(&sol.q, &input.limits, arm_scope, Some(s))?;
         if let Some((joint, dq)) = (0..arm_dof).map(|i| (i, (sol.q[i] - prev[i]).abs())).max_by(|a, b| a.1.total_cmp(&b.1)) {
             if dq > MAX_SAMPLE_JUMP_RAD {
                 return Err(MotionError::IkBranchFlip { s, joint: joint + 1, dq, yaw_off_deg });
             }
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
+        check_planning_limits_f32(&q32, &input.limits, arm_scope, Some(s))?;
         if let (Some(ev), Some((c_prev, min_d, rem))) = (&ws_eval, &mut ws_state) {
             match ev.sweep_linear_step(
                 &prev_q32,
@@ -691,9 +1023,14 @@ pub fn solve_goal_joints(input: &PlanInput, goal: &Pose, opts: PathOpts, seeds: 
             "yaw \"outward\" is undefined near the base z axis: the goal is {:.3} m from it (minimum {OUTWARD_MIN_RADIUS_M} m)",
             goal.p[0].hypot(goal.p[1]))));
     }
-    let lim = |i: usize| input.limits.get(i).filter(|_| i < arm_dof);
-    let lo: [f64; 6] = std::array::from_fn(|i| lim(i).map_or(-std::f64::consts::PI, |l| f64::from(l.min_position) + IK_LIMIT_MARGIN));
-    let hi: [f64; 6] = std::array::from_fn(|i| lim(i).map_or(std::f64::consts::PI, |l| f64::from(l.max_position) - IK_LIMIT_MARGIN));
+    let (lo, hi) = ik_search_bounds(&input.limits, arm_dof)?;
+    let arm_scope = PlanningScope::first_n(arm_dof);
+    check_start_planning_limits_f64(&input.q0, &input.limits, arm_scope, Some(0.0))?;
+    let has_custom_planning = input
+        .limits
+        .iter()
+        .take(arm_dof)
+        .any(JointLimit::has_custom_planning_limits);
     // workspace rule at the goal as for a path sample: no constraint deeper than at the start
     let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new_with_tcp(&input.arm, ws, &input.cam, input.tcp_offset));
     let mut ws_state = match &ws_eval {
@@ -733,7 +1070,7 @@ pub fn solve_goal_joints(input: &PlanInput, goal: &Pose, opts: PathOpts, seeds: 
         let within = (0..arm_dof).all(|i| {
             let l = &input.limits[i];
             sol.q[i].is_finite() && sol.q[i] >= f64::from(l.min_position) && sol.q[i] <= f64::from(l.max_position)
-        });
+        }) && check_planning_limits_f64(&sol.q, &input.limits, arm_scope, None).is_ok();
         if !within { continue; }
         if let (Some(ev), Some((min_d, buf))) = (&ws_eval, ws_state.as_mut()) {
             let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
@@ -748,7 +1085,35 @@ pub fn solve_goal_joints(input: &PlanInput, goal: &Pose, opts: PathOpts, seeds: 
     match (best, ws_failure) {
         (Some((q, _)), _) => Ok(q),
         (None, Some(e)) => Err(e),
-        (None, None) => Err(MotionError::IkGoalUnreachable { ep: best_ep, er: best_er, seeds: seeds.len() }),
+        (None, None) => {
+            if has_custom_planning {
+                let (hard_lo, hard_hi) = hard_ik_search_bounds(&input.limits, arm_dof);
+                for seed in seeds {
+                    let mut q: [f64; 6] = std::array::from_fn(|i| if i < arm_dof { seed[i].clamp(hard_lo[i], hard_hi[i]) } else { seed[i] });
+                    let mut sol = solve_ik_in_frame(input, goal, &q, &hard_lo, &hard_hi, opts.yaw_free);
+                    for _ in 1..GOAL_IK_ROUNDS {
+                        if sol.ok { break; }
+                        let before = sol.ep + kinematics::PAR.w * sol.er;
+                        q = sol.q;
+                        let next = solve_ik_in_frame(input, goal, &q, &hard_lo, &hard_hi, opts.yaw_free);
+                        let stalled = next.ep + kinematics::PAR.w * next.er > before - 1e-9;
+                        sol = next;
+                        if stalled && !sol.ok { break; }
+                    }
+                    if !sol.ok { continue; }
+                    let hard_ok = (0..arm_dof).all(|i| {
+                        let l = &input.limits[i];
+                        sol.q[i].is_finite()
+                            && sol.q[i] >= f64::from(l.min_position)
+                            && sol.q[i] <= f64::from(l.max_position)
+                    });
+                    if hard_ok {
+                        check_planning_limits_f64(&sol.q, &input.limits, arm_scope, None)?;
+                    }
+                }
+            }
+            Err(MotionError::IkGoalUnreachable { ep: best_ep, er: best_er, seeds: seeds.len() })
+        }
     }
 }
 
@@ -1608,7 +1973,7 @@ impl PathTrajectory {
         let qa = self.source.sample7(a);
         let qb = self.source.sample7(b);
         let f = ((s - ss[a]) / (ss[b] - ss[a])).clamp(0.0, 1.0) as f32;
-        std::array::from_fn(|i| qa[i] + (qb[i] - qa[i]) * f)
+        std::array::from_fn(|i| (qa[i] + (qb[i] - qa[i]) * f).clamp(qa[i].min(qb[i]), qa[i].max(qb[i])))
     }
 
     step_into_via_with!();

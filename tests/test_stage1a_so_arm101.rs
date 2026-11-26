@@ -49,6 +49,8 @@ fn so_arm101_config() -> ArmConfig {
         max_position: std::f32::consts::PI,
         max_velocity: 1.0,
         max_acceleration: 2.0,
+        planning_min_position: None,
+        planning_max_position: None,
     }).collect();
     c.home_positions = vec![0.0; 6];
     c.gripper_joint = Some(5);

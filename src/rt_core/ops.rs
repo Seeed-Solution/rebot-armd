@@ -717,6 +717,40 @@ pub enum SubReleaseWakeKind {
 }
 
 /// The narrow operations of one arm's core.
+/// Zero-allocation RT commit refusal carrying a static error code and an optional per-request
+/// diagnostic attached directly to the request's [`Reply::Refused`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitRefusal {
+    pub code: &'static str,
+    pub detail: Option<crate::motion::PlanningLimitViolationRt>,
+}
+
+impl CommitRefusal {
+    #[inline]
+    pub const fn code(code: &'static str) -> Self {
+        Self { code, detail: None }
+    }
+
+    #[inline]
+    pub const fn planning_limit(v: crate::motion::PlanningLimitViolationRt) -> Self {
+        Self { code: "IK_UNREACHABLE", detail: Some(v) }
+    }
+}
+
+impl From<&'static str> for CommitRefusal {
+    #[inline]
+    fn from(code: &'static str) -> Self {
+        Self::code(code)
+    }
+}
+
+impl From<crate::motion::PlanningLimitViolationRt> for CommitRefusal {
+    #[inline]
+    fn from(v: crate::motion::PlanningLimitViolationRt) -> Self {
+        Self::planning_limit(v)
+    }
+}
+
 pub trait CoreOps {
     /// Current authority at `ctx.now` and `ctx.stop_generation` (the urgent-stop generation
     /// is not core state): the lease generation of a lease valid at `ctx.now` (0: none), the
@@ -784,6 +818,10 @@ pub trait CoreOps {
     /// Default delegates to [`Self::commit_prepared`].
     fn commit_prepared_slot(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, &'static str> {
         self.commit_prepared(d, &slot.primitive, &slot.path, ctx)
+    }
+    /// [`Self::commit_prepared_slot`] preserving per-request [`CommitRefusal`] details for `Reply::Refused`.
+    fn commit_prepared_slot_with_detail(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, CommitRefusal> {
+        self.commit_prepared_slot(d, slot, ctx).map_err(CommitRefusal::code)
     }
     /// Starts a driver transition after rechecking the stamp; its progress and outcome come
     /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
@@ -975,7 +1013,8 @@ pub trait CoreOps {
     /// Current local monotonic observation timestamp (seconds), used when publishing after
     /// a sub-release transition wake before delivering its terminal.
     fn now_timestamp(&self) -> f64 { 0.0 }
-    /// Commits one action-family broker command (`InstallPrepared`, `BeginMacro`, `InstallChild`, `FinishMacro`).
+    /// Zero-alloc RT commit refusal carrying a static code plus an optional fixed-size
+    /// per-request planning-limit diagnostic delivered directly in `Reply::Refused`.
     #[cfg(not(target_arch = "wasm32"))]
     fn commit_action(
         &mut self,
@@ -983,8 +1022,8 @@ pub trait CoreOps {
         _cmd: super::requests::actions::ActionCommand,
         _slot: Option<PlanSlotRef<PlanSlot>>,
         _ctx: &CommitCtx,
-    ) -> Result<Committed, &'static str> {
-        Err("UNSUPPORTED")
+    ) -> Result<Committed, CommitRefusal> {
+        Err(CommitRefusal::code("UNSUPPORTED"))
     }
     /// Commits one policy lifecycle broker command (`ReserveLoad`, `BeginPolicy`, `EndPolicy`).
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
@@ -1438,6 +1477,14 @@ impl CoreOps for SupervisorInner {
                 if !start_matches(&start[..n], &self.commanded_positions) {
                     return Err("PLAN_STALE");
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                super::requests::actions::check_cartesian_path_planning_rt(
+                    self,
+                    n,
+                    &self.commanded_positions,
+                    path.samples(),
+                )
+                .map_err(|r| r.code)?;
                 let joint_path = self.prepared_joint_path(n, path, duration_s, power_scale)?;
                 match child {
                     None => {
@@ -1476,6 +1523,10 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_prepared_slot(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        self.commit_prepared_slot_with_detail(d, slot, ctx).map_err(|r| r.code)
+    }
+
+    fn commit_prepared_slot_with_detail(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, CommitRefusal> {
         let primitive = slot.primitive;
         self.check_motion_commit(d, &primitive, ctx)?;
         self.sync_stop_generation(ctx.stop_generation);
@@ -1485,38 +1536,55 @@ impl CoreOps for SupervisorInner {
             d.stamp.authority.lease_generation,
             d.stamp.request.0,
         );
-        self.preflight_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
+        self.preflight_admission(stamp)
+            .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = primitive else {
-            return Err("INVALID_COMMAND");
+            return Err(CommitRefusal::code("INVALID_COMMAND"));
         };
         let n = usize::from(dof);
         if n == 0 || n > MAX_DOF {
-            return Err("INVALID_COMMAND");
+            return Err(CommitRefusal::code("INVALID_COMMAND"));
         }
         let epoch = d.stamp.authority.epoch;
-        let committed = |r: Result<u64, ArmError>| r.map(|id| Committed::authorized(d, Some(ActionId(id)))).map_err(static_code);
+        let committed = |r: Result<u64, ArmError>| {
+            r.map(|id| Committed::authorized(d, Some(ActionId(id))))
+                .map_err(|e| CommitRefusal::code(static_code(e)))
+        };
         match kind {
             PathKind::Cartesian => {
                 if !start_matches(&start[..n], &self.commanded_positions) {
-                    return Err("PLAN_STALE");
+                    return Err(CommitRefusal::code("PLAN_STALE"));
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                super::requests::actions::check_cartesian_path_planning_rt(
+                    self,
+                    n,
+                    &self.commanded_positions,
+                    slot.path.samples(),
+                )?;
                 match child {
                     None => {
                         self.validate_prepared_joint_path(n, &slot.path, duration_s)?;
                         self.check_prepared_fresh_static(epoch)?;
-                        let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
+                        let admitted = self
+                            .check_admission(stamp)
+                            .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
                         SupervisorInner::install_prepared_path_slot(admitted, epoch, n, slot, duration_s, power_scale)
                             .map(|(id, _)| Committed::authorized(d, Some(ActionId(id))))
+                            .map_err(CommitRefusal::code)
                     }
-                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
-                        SupervisorInner::install_macro_prepared_path_slot(admitted, id, n, slot, duration_s, power_scale).map(drop)
-                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                    Some(spec) => self
+                        .commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                            let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
+                            SupervisorInner::install_macro_prepared_path_slot(admitted, id, n, slot, duration_s, power_scale).map(drop)
+                        })
+                        .map(|parent| Committed::authorized(d, Some(parent)))
+                        .map_err(CommitRefusal::code),
                 }
             }
             PathKind::Replay { approach_duration_s, approach_power_scale, .. } => {
                 if !start_matches(&start[..n], &self.commanded_positions) {
-                    return Err("PLAN_STALE");
+                    return Err(CommitRefusal::code("PLAN_STALE"));
                 }
                 match child {
                     None => {
@@ -1531,7 +1599,9 @@ impl CoreOps for SupervisorInner {
                             approach_duration_s,
                             approach_power_scale,
                         )?;
-                        let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
+                        let admitted = self
+                            .check_admission(stamp)
+                            .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
                     Some(spec) => {
@@ -1550,7 +1620,9 @@ impl CoreOps for SupervisorInner {
                         self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
                             let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
                             SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
-                        }).map(|parent| Committed::authorized(d, Some(parent)))
+                        })
+                        .map(|parent| Committed::authorized(d, Some(parent)))
+                        .map_err(CommitRefusal::code)
                     }
                 }
             }
@@ -2002,7 +2074,7 @@ impl CoreOps for SupervisorInner {
         cmd: super::requests::actions::ActionCommand,
         slot: Option<PlanSlotRef<PlanSlot>>,
         ctx: &CommitCtx,
-    ) -> Result<Committed, &'static str> {
+    ) -> Result<Committed, CommitRefusal> {
         super::requests::actions::commit_action(self, d, cmd, slot, ctx)
     }
 
@@ -2642,7 +2714,7 @@ impl ReleaseEngine {
                     } else {
                         None
                     };
-                    let result = match d.kind {
+                    let result: Result<Committed, CommitRefusal> = match d.kind {
                         CommandKind::Install { .. } => {
                             #[cfg(not(target_arch = "wasm32"))]
                             let mixed_a7_child = matches!(self.active, Some(ActiveSlot::Macro { .. }))
@@ -2650,35 +2722,35 @@ impl ReleaseEngine {
                             #[cfg(target_arch = "wasm32")]
                             let mixed_a7_child = false;
                             if mixed_a7_child {
-                                Err("UNSUPPORTED")
+                                Err(CommitRefusal::code("UNSUPPORTED"))
                             } else {
                                 match t.plan() {
-                                    None => Err("PLAN_RETIRED"),
+                                    None => Err(CommitRefusal::code("PLAN_RETIRED")),
                                     Some(slot) if slot.motion.is_some() => {
                                         let m = slot.motion.expect("checked is_some");
-                                        core.commit_install_slot(&d, &m, &ctx)
+                                        core.commit_install_slot(&d, &m, &ctx).map_err(CommitRefusal::code)
                                     }
                                     Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
-                                        Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
-                                        None => Err("PLAN_RETIRED"),
+                                        Some(slot_ref) => core.commit_prepared_slot_with_detail(&d, slot_ref, &ctx),
+                                        None => Err(CommitRefusal::code("PLAN_RETIRED")),
                                     },
-                                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
+                                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx).map_err(CommitRefusal::code),
                                 }
                             }
                         }
                         CommandKind::InstallHome { .. } => match t.plan().and_then(|s| s.motion) {
-                            Some(m) => core.commit_home(&d, &m, &ctx),
-                            None => Err("PLAN_RETIRED"),
+                            Some(m) => core.commit_home(&d, &m, &ctx).map_err(CommitRefusal::code),
+                            None => Err(CommitRefusal::code("PLAN_RETIRED")),
                         },
                         CommandKind::InstallPark { .. } => match t.plan().and_then(|s| s.motion) {
-                            Some(m) => core.commit_park(&d, &m, &ctx),
-                            None => Err("PLAN_RETIRED"),
+                            Some(m) => core.commit_park(&d, &m, &ctx).map_err(CommitRefusal::code),
+                            None => Err(CommitRefusal::code("PLAN_RETIRED")),
                         },
                         CommandKind::ContinuePark { .. } => match t.plan().and_then(|s| s.motion) {
-                            Some(m) => core.commit_park_continuation(&d, &m, &ctx),
-                            None => Err("PLAN_RETIRED"),
+                            Some(m) => core.commit_park_continuation(&d, &m, &ctx).map_err(CommitRefusal::code),
+                            None => Err(CommitRefusal::code("PLAN_RETIRED")),
                         },
-                        CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
+                        CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx).map_err(CommitRefusal::code),
                         CommandKind::Transition(op) => {
                             core.commit_transition_for_release_with_clock(
                                 &d,
@@ -2687,22 +2759,23 @@ impl ReleaseEngine {
                                 release_deadline,
                                 &mut now_fn,
                             )
+                            .map_err(CommitRefusal::code)
                         }
                         #[cfg(not(target_arch = "wasm32"))]
                         CommandKind::Action(cmd) => {
                             let slot_res = if cmd.plan().is_some() {
-                                t.plan_ref().map(Some).ok_or("PLAN_RETIRED")
+                                t.plan_ref().map(Some).ok_or(CommitRefusal::code("PLAN_RETIRED"))
                             } else {
                                 Ok(None)
                             };
                             match slot_res {
                                 Ok(slot_ref) => core.commit_action(&d, cmd, slot_ref, &ctx),
-                                Err(code) => Err(code),
+                                Err(err) => Err(err),
                             }
                         }
                         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
                         CommandKind::Policy(cmd) => {
-                            let r = core.commit_policy(&d, cmd, &ctx);
+                            let r = core.commit_policy(&d, cmd, &ctx).map_err(CommitRefusal::code);
                             core.finish_policy_command(d.stamp.request.0);
                             r
                         }
@@ -2783,9 +2856,9 @@ impl ReleaseEngine {
                                 })
                             }
                         }
-                        Err(code) => {
-                            deferred_step3_reply = Some(t.refuse_deferred(code));
-                            Err(code)
+                        Err(refusal) => {
+                            deferred_step3_reply = Some(t.refuse_deferred_with(refusal.code, refusal.detail));
+                            Err(refusal.code)
                         }
                     }));
                 }

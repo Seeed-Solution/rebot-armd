@@ -756,7 +756,14 @@ pub fn select_adaptive_route(
     let raw_canonical = [az, -1.167, -1.565, 1.435, 0.0, 0.0];
     let canonical_seed: [f64; 6] = std::array::from_fn(|j| {
         let lim = &s.input.limits[j];
-        raw_canonical[j].clamp(f64::from(lim.min_position) + 0.05, f64::from(lim.max_position) - 0.05)
+        match lim.effective_planning_range() {
+            Some((lo32, hi32)) => {
+                let (lo, hi) = (f64::from(lo32), f64::from(hi32));
+                let margin = 0.05f64.min((hi - lo) * 0.25);
+                raw_canonical[j].clamp(lo + margin, hi - margin)
+            }
+            None => raw_canonical[j].clamp(f64::from(lim.min_position), f64::from(lim.max_position)),
+        }
     });
     let mut seed_cache: BTreeMap<(DirClass, bool), [f64; 6]> = BTreeMap::new();
     let mut screened: Vec<(Hypothesis, [f64; 6], [f64; 6], f64)> = Vec::new();
@@ -782,17 +789,8 @@ pub fn select_adaptive_route(
         seeds.push(canonical_seed);
         let q_g = match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
             Ok(q) => q,
-            Err((ep, er)) => {
-                se.reject(
-                    &hy,
-                    Rejection::new(
-                        "endpoint_ik",
-                        "IK_UNREACHABLE",
-                        format!("contact pose: best IK error {:.4} m / {:.2} deg", ep, er.to_degrees()),
-                    )
-                    .with(ep, kinematics::PAR.tol_pos),
-                    false,
-                );
+            Err(err) => {
+                se.reject(&hy, err.into_rejection("contact pose"), false);
                 continue;
             }
         };
@@ -803,17 +801,8 @@ pub fn select_adaptive_route(
         pre_seeds.push(canonical_seed);
         let q_pre_seed = match feasibility::endpoint_ik(&s.input, &hy.pregrasp_pose(), &pre_seeds, &mut work) {
             Ok(q) => q,
-            Err((ep, er)) => {
-                se.reject(
-                    &hy,
-                    Rejection::new(
-                        "endpoint_ik",
-                        "IK_UNREACHABLE",
-                        format!("pre-grasp pose: best IK error {:.4} m / {:.2} deg", ep, er.to_degrees()),
-                    )
-                    .with(ep, kinematics::PAR.tol_pos),
-                    false,
-                );
+            Err(err) => {
+                se.reject(&hy, err.into_rejection("pre-grasp pose"), false);
                 continue;
             }
         };
@@ -1010,28 +999,10 @@ pub fn select_adaptive_route(
                                     &mut entries,
                                     &mut deepest,
                                 ),
-                                Err((ep, _)) => se.reject(
-                                    &hy,
-                                    Rejection::new(
-                                        "endpoint_ik",
-                                        "IK_UNREACHABLE",
-                                        format!("refined pre-grasp pose: IK error {ep:.4} m"),
-                                    )
-                                    .with(ep, kinematics::PAR.tol_pos),
-                                    true,
-                                ),
+                                Err(err) => se.reject(&hy, err.into_rejection("refined pre-grasp pose"), true),
                             }
                         }
-                        Err((ep, _)) => se.reject(
-                            &hy,
-                            Rejection::new(
-                                "endpoint_ik",
-                                "IK_UNREACHABLE",
-                                format!("refined contact pose: IK error {ep:.4} m"),
-                            )
-                            .with(ep, kinematics::PAR.tol_pos),
-                            true,
-                        ),
+                        Err(err) => se.reject(&hy, err.into_rejection("refined contact pose"), true),
                     }
                 }
                 Err(b) => {
@@ -1203,6 +1174,12 @@ fn preflight_candidate_from_start(
                 Ok(jp) => {
                     work.path_samples += jp.q.len();
                     (jp, PregraspMode::SweptJoint)
+                }
+                Err(e @ crate::motion::MotionError::PlanningLimitExceeded { .. }) => {
+                    if cart_rej.planning_limit {
+                        return Err(cart_rej);
+                    }
+                    return Err(feasibility::motion_rejection("transition", &e));
                 }
                 Err(_) => return Err(cart_rej),
             }
@@ -1673,10 +1650,10 @@ pub fn select(s: &Snapshot) -> Selection {
         if let Some(q) = seed_cache.get(&(hy.class, hy.half_turn)) { seeds.insert(0, *q); }
         let q_g = match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
             Ok(q) => q,
-            Err((ep, er)) => { se.reject(&hy, Rejection::new("endpoint_ik", "IK_UNREACHABLE", format!("contact pose: best IK error {:.4} m / {:.2} deg", ep, er.to_degrees())).with(ep, kinematics::PAR.tol_pos), false); continue; }
+            Err(err) => { se.reject(&hy, err.into_rejection("contact pose"), false); continue; }
         };
-        if let Err((ep, er)) = feasibility::endpoint_ik(&s.input, &hy.pregrasp_pose(), &[q_g, acq.q_end], &mut work) {
-            se.reject(&hy, Rejection::new("endpoint_ik", "IK_UNREACHABLE", format!("pre-grasp pose: best IK error {:.4} m / {:.2} deg", ep, er.to_degrees())).with(ep, kinematics::PAR.tol_pos), false);
+        if let Err(err) = feasibility::endpoint_ik(&s.input, &hy.pregrasp_pose(), &[q_g, acq.q_end], &mut work) {
+            se.reject(&hy, err.into_rejection("pre-grasp pose"), false);
             continue;
         }
         seed_cache.insert((hy.class, hy.half_turn), q_g);
@@ -1735,7 +1712,7 @@ pub fn select(s: &Snapshot) -> Selection {
                     let seeds = [ranked.iter().find(|c| c.hy.index == b.index).map_or(acq.q_end, |c| c.checked.q_grasp), acq.q_end];
                     match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
                         Ok(_) => run(&mut se, &hy, &mut work, &mut ranked, &mut deepest),
-                        Err((ep, _)) => se.reject(&hy, Rejection::new("endpoint_ik", "IK_UNREACHABLE", format!("refined contact pose: IK error {ep:.4} m")).with(ep, kinematics::PAR.tol_pos), true),
+                        Err(err) => se.reject(&hy, err.into_rejection("refined contact pose"), true),
                     }
                 }
                 Err(b) => { let (hy, r) = *b; se.reject(&hy, r, true) }

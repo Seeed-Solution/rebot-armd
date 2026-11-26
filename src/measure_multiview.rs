@@ -573,6 +573,12 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     };
     inner.plan_input()?;
     if !inner.is_torqued { return Err(crate::safety::SafetyError::NotArmed(inner.safety.state().clone()).into()); }
+    crate::motion::check_start_planning_limits_f32(
+        &inner.commanded_positions,
+        &inner.config.limits,
+        crate::model::PlanningScope::arm_only(&inner.config),
+        Some(0.0),
+    )?;
     let cam = CamModel::assumed(&inner.config.arm_model, &setup, &inner.config.camera_mount);
     // bound: per view one joint move (up to 2 rad at the slowest planning speed), settle, captures
     let vmin = inner.planning_limits().iter().take(inner.config.arm_dof()).map(|l| l.max_velocity).fold(f32::INFINITY, f32::min).max(0.05);
@@ -621,6 +627,12 @@ pub fn prepare_from_snapshot(
     if !snap.owner.is_torqued {
         return Err(crate::safety::SafetyError::NotArmed(snap.safety_state.clone()).into());
     }
+    crate::motion::check_start_planning_limits_f32(
+        &snap.commanded_positions,
+        &snap.env.config.limits,
+        crate::model::PlanningScope::arm_only(&snap.env.config),
+        Some(0.0),
+    )?;
     let cam = CamModel::assumed(&snap.env.config.arm_model, &setup, &snap.env.config.camera_mount);
     let vmin = snap
         .env
@@ -1619,10 +1631,12 @@ async fn move_joints(ctx: &MacroCtx, plan: &Plan, phase: &str, q: &[f64; 6]) -> 
     if !ctx.is_executor() {
         ctx.sup.inner().write().await.set_action_phase(ctx.id, phase, 0.0, None, None);
     }
-    ctx.install_joint_child(
+    let scope = Some(crate::model::PlanningScope::arm_only(&snap.env.config));
+    ctx.install_joint_child_scoped(
         phase,
         target,
         limits,
+        scope,
         true,
         Some(plan.workspace_revision),
         Some(plan.calibration_revision),

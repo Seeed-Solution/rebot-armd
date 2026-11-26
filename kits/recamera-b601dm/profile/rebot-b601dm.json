@@ -24,14 +24,16 @@
       "min_position": -2.0944,
       "max_position": 2.0944,
       "max_velocity": 2.0,
-      "max_acceleration": 5.0
+      "max_acceleration": 5.0,
+      "planning_max_position": 0.03
     },
     {
       "name": "joint_3",
       "min_position": -2.61799,
       "max_position": 2.61799,
       "max_velocity": 2.0,
-      "max_acceleration": 5.0
+      "max_acceleration": 5.0,
+      "planning_max_position": 0.04
     },
     {
       "name": "joint_4",

@@ -375,7 +375,8 @@ impl SupervisorInner {
         for (i, l) in limits.iter_mut().enumerate() {
             if Some(i) != gripper_idx { l.max_velocity *= speed_scale as f32; }
         }
-        let (_, id, duration) = self.start_quintic_same_side(proof, target, Some(epoch), "move_to_pose", tag, &limits, "move_to_pose", approach)?;
+        // Saved poses are explicit joint-space targets (excluded from Cartesian/IK planning limits).
+        let (_, id, duration) = self.start_quintic_same_side_scoped(proof, target, Some(epoch), "move_to_pose", tag, &limits, "move_to_pose", approach, None)?;
         Ok((id, duration))
     }
 }
