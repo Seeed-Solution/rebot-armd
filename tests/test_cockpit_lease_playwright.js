@@ -682,6 +682,7 @@ async function main() {
         log(`PASS Scenario 2: watchdog park overlapped load+reload (Moving, 0 acquire_lease) -> Idle J1=${obsDone.positions[0].toFixed(3)}.`);
 
         log('=== Scenario 3: Explicit Enable acquires exactly 1 lease ===');
+        await waitFn(page, () => S.state === 'Idle' && S.obs?.is_torqued === false && S.obs?.lease_holder == null, null, 4000);
         const m3 = rec.mark(), clientId = await page.evaluate(() => CLIENT_ID);
         await holdButton(page, '#btn-enable', 750);
         await waitFn(page, () => S.state === 'Armed' && S.leaseGeneration != null && S.obs?.is_torqued === true, null, 6000);
@@ -1583,7 +1584,7 @@ async function main() {
         await extObs.auth(opToken);
         await extObs.acquireLease({ force: true, heartbeat: true });
         await extObs.command('/api/v1/torque', { enable: true });
-        await waitFn(page, () => S.leaseGeneration === null && S.obs?.lease_holder === 'ext-obs' && S.state === 'Armed' && S.obs?.is_torqued === true && document.getElementById('lease-status').className.includes('is-other'), null, 5000);
+        await waitFn(page, () => S.leaseGeneration === null && S.obs?.lease_holder === 'ext-obs' && S.state === 'Armed' && S.obs?.is_torqued === true && document.getElementById('lease-status').className.includes('is-other') && document.getElementById('enable-txt')?.textContent?.trim() === 'Torque on · not in control', null, 5000);
         assert.equal(await page.evaluate(() => document.getElementById('enable-txt')?.textContent?.trim()), 'Torque on · not in control');
         assert.equal(await page.evaluate(() => document.getElementById('btn-enable').disabled), true);
         await assertControlInputsState(page, 'unavailable', 'Scenario 7(c) observer armed');
@@ -1644,10 +1645,27 @@ async function main() {
                 const tb = document.querySelector('.topbar');
                 const lb = document.getElementById('btn-lang');
                 const seg = document.getElementById('ui-seg');
-                const sp = document.getElementById('speed-pill');
+                const visHeight = (el) => {
+                  if (!el || el.hidden) return 0;
+                  const cs = getComputedStyle(el);
+                  if (cs.display === 'none' || cs.visibility === 'hidden') return 0;
+                  const b = el.getBoundingClientRect();
+                  return b.width > 0 && b.height > 0 ? Math.round(b.height) : 0;
+                };
+                const refCandidates = m === 'simple'
+                  ? [['#speed-pill', document.getElementById('speed-pill')]]
+                  : [
+                      ['#ex-ph-status', document.getElementById('ex-ph-status')],
+                      ['.brand-mark', tb.querySelector('.brand-mark')],
+                    ];
+                let refLabel = 'none', refHeight = 0;
+                for (const [label, el] of refCandidates) {
+                  const h = visHeight(el);
+                  if (h > 0) { refLabel = label; refHeight = h; break; }
+                }
                 const r = lb ? lb.getBoundingClientRect() : null;
                 const segR = seg ? seg.getBoundingClientRect() : null;
-                const spR = sp ? sp.getBoundingClientRect() : null;
+                const tbR = tb ? tb.getBoundingClientRect() : null;
                 const segBtns = seg ? [...seg.querySelectorAll('button')].map((b) => ({
                   ui: b.dataset.ui,
                   text: b.textContent.trim(),
@@ -1666,7 +1684,11 @@ async function main() {
                   langRect: r ? { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height } : null,
                   hasOldBtnUi: !!document.getElementById('btn-ui'),
                   segHeight: segR ? Math.round(segR.height) : 0,
-                  speedHeight: spR ? Math.round(spR.height) : 0,
+                  segMidY: segR ? segR.top + segR.height / 2 : 0,
+                  langMidY: r ? r.top + r.height / 2 : 0,
+                  topbarHeight: tbR ? Math.round(tbR.height) : 0,
+                  refLabel,
+                  refHeight,
                   segBtns,
                   activeMode: S.ui,
                   clipped,
@@ -1680,8 +1702,10 @@ async function main() {
               assert.deepEqual(metrics.segBtns.map((b) => b.text), expectedLabels, `${tag}: unexpected #ui-seg labels`);
               assert(metrics.segBtns.every((b) => (b.ui === mode) === (b.on && b.checked === 'true')),
                 `${tag}: #ui-seg active highlight mismatch: ${JSON.stringify(metrics.segBtns)}`);
-              assert(metrics.segHeight >= 24 && metrics.segHeight <= 30 && Math.abs(metrics.segHeight - metrics.speedHeight) <= 4,
-                `${tag}: #ui-seg height ${metrics.segHeight}px should match pill height ${metrics.speedHeight}px`);
+              assert(metrics.segHeight >= 24 && metrics.segHeight <= 30 && metrics.refHeight > 0 && Math.abs(metrics.segHeight - metrics.refHeight) <= 4,
+                `${tag}: #ui-seg height ${metrics.segHeight}px should match visible ${metrics.refLabel} height ${metrics.refHeight}px`);
+              assert(metrics.topbarHeight <= 56 && Math.abs(metrics.segMidY - metrics.langMidY) <= 10,
+                `${tag}: topbar must stay single-row (height=${metrics.topbarHeight}px, segMidY=${metrics.segMidY}, langMidY=${metrics.langMidY})`);
               assert.equal(metrics.scrollWidth, metrics.innerWidth, `${tag}: scrollWidth ${metrics.scrollWidth} !== innerWidth ${metrics.innerWidth}`);
               assert.equal(metrics.clipped.length, 0, `${tag}: clipped header items: ${JSON.stringify(metrics.clipped)}`);
               assert(metrics.langRect && metrics.langRect.left >= 0 && metrics.langRect.right <= metrics.innerWidth
@@ -1690,7 +1714,13 @@ async function main() {
               await assertReachable(page, '#btn-lang', tag);
 
               // Open settings drawer: verify no floating controls overlap it and E-stop remains hit-testable immediately, settled, & scrolled
-              await page.click('#btn-sset');
+              if (mode === 'expert') {
+                await page.click('#btn-ex-more');
+                await page.waitForSelector('#ex-more:not([hidden])', { timeout: 2000 });
+                await page.click('#ex-m-sset');
+              } else {
+                await page.click('#btn-sset');
+              }
               await page.waitForSelector('#sset:not([hidden])', { timeout: 2000 });
               for (const settleLabel of ['immediate', 'settled', 'scrolled']) {
                 if (settleLabel === 'settled') await page.waitForTimeout(260);

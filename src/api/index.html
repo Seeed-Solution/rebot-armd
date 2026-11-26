@@ -2375,13 +2375,25 @@ body.ui-expert .ops .ex-presets .gc-sw { grid-column: 1 / -1; min-height: 44px; 
 @media (max-width: 600px) {
   body.ui-expert { overflow: hidden; height: 100vh; height: 100dvh; }
   body.ui-expert .app { height: 100vh; height: 100dvh; overflow: hidden; }
-  body.ui-expert .topbar { height: 48px; padding: 0 8px; gap: 5px; position: relative; z-index: 1050; }
+  body.ui-expert:not(.is-fs):not(.is-hud) .topbar {
+    height: 48px; min-height: 48px; flex-wrap: nowrap;
+    padding: 0 8px; gap: 5px; position: relative; z-index: 1050;
+    padding-left: max(8px, env(safe-area-inset-left));
+    padding-right: max(8px, env(safe-area-inset-right));
+  }
   body.ui-expert .topbar .brand-text { display: none; }
-  body.ui-expert .topbar #ex-ph-status { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; font-size: 11.5px; }
+  body.ui-expert .topbar #ex-ph-status {
+    display: block; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    line-height: 24px; padding: 0 7px; font-size: 11px;
+  }
+  body.ui-expert .topbar #ex-ph-status::before {
+    display: inline-block; vertical-align: middle; margin-right: 5px;
+  }
+  body.ui-expert .topbar .ex-top-grow { flex: 1 1 0; min-width: 0; }
   body.ui-expert .topbar #btn-pset { display: none !important; }
   body.ui-expert .topbar .ui-mode-btn { height: 38px; min-height: 38px; padding: 0 8px; font-size: 12px; }
   body.ui-expert .topbar .ui-mode-btn svg { display: none; }
-  body.ui-expert .topbar #btn-ex-more, body.ui-expert .topbar #btn-op, body.ui-expert .topbar #btn-lang { height: 38px; min-height: 38px; min-width: 38px; padding: 0 8px; font-size: 12px; }
+  body.ui-expert .topbar #btn-ex-more, body.ui-expert .topbar #btn-op, body.ui-expert .topbar #btn-lang { height: 34px; min-height: 34px; min-width: 34px; padding: 0 7px; font-size: 12px; }
   body.ui-expert .topbar #btn-ex-more .ex-lbl-ph, body.ui-expert .topbar #btn-op .op-lbl { display: none; }
 
   body.ui-expert .main {
@@ -2455,7 +2467,7 @@ body.ui-expert .ops .ex-presets .gc-sw { grid-column: 1 / -1; min-height: 44px; 
   .ex-drawer-mask, body.ui-expert .calib-mask {
     top: var(--ex-safe-bot, 118px); left: 0; right: 0; bottom: 0; z-index: 1030;
   }
-  .ex-drawer, body.ui-expert .calib-drawer { width: 100%; max-width: 100%; border-right: 0; border-radius: 16px 16px 0 0; }
+  .ex-drawer, body.ui-expert .calib-drawer { width: 100%; max-width: 100%; max-height: 100%; border-right: 0; border-radius: 16px 16px 0 0; }
 }
 body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
 </style>
