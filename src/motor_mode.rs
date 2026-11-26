@@ -1890,9 +1890,10 @@ pub mod switch {
                 }
             }
 
-            // 1. Ensure RX has been drained in this release so causal replies & confirmation
-            //    closure (`last_read_drained`) see all arrived frames before evaluation.
-            if !drv.rx_drained() && drv.clock_now() < budget.cutoff {
+            // 1. Drain any newly arrived RX frames up to the bounded budget so causal replies
+            //    arriving between Step 2 RX and Step 2b (and confirmation closure via
+            //    `last_read_drained`) see all pending wire replies before evaluation.
+            if drv.clock_now() < budget.cutoff {
                 if let Err(reason) = drv.drain_rx_step(budget.max_rx_frames, budget.cutoff) {
                     return self.handle_axis_failure(drv, self.current_joint(), reason, false);
                 }
@@ -2801,17 +2802,15 @@ pub mod switch {
             // If we failed cleanly while already in `Recovering` (e.g. range check or refused
             // write before sending), axes remain in mixed/unrestored state; if any write failed
             // or rollback couldn't finish on an energized axis, mark Ambiguous.
-            if matches!(self.phase, RunnerPhase::Recovering { .. }) {
-                if drv.any_axis_energized() {
-                    self.ambiguous_mask |= 1u32 << failed_joint;
-                    return self.finish(
-                        drv,
-                        ModeProgress::Ambiguous {
-                            failed_joint,
-                            reason,
-                        },
-                    );
-                }
+            if matches!(self.phase, RunnerPhase::Recovering { .. }) && drv.any_axis_energized() {
+                self.ambiguous_mask |= 1u32 << failed_joint;
+                return self.finish(
+                    drv,
+                    ModeProgress::Ambiguous {
+                        failed_joint,
+                        reason,
+                    },
+                );
             }
 
             self.finish(
