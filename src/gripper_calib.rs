@@ -489,6 +489,8 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
             inner.gripper_calib_invalid = true;
         }
     }
+    drop(inner);
+    supervisor.refresh_motion_config_cache().await;
 }
 
 // ---- gripper_calibrate: one action, strokes with nothing in the jaws ----

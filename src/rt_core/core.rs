@@ -289,6 +289,19 @@ impl ArmCore {
         session
     }
 
+    /// Like [`begin_recording`](Self::begin_recording), using a caller-prepared ring allocated
+    /// off the supervisor lock so the write guard neither allocates nor touches `StateHub`'s
+    /// mutex. Returns `(session, ring_to_publish_off_lock, unused_ring_to_drop_off_lock)`.
+    pub fn begin_recording_with_ring(
+        &mut self,
+        prepared: Option<Arc<RecordRing>>,
+    ) -> (u64, Option<Arc<RecordRing>>, Option<Arc<RecordRing>>) {
+        let had_ring = self.record.ring().is_some();
+        let (session, unused) = self.record.begin_with_ring(prepared);
+        let to_publish = if !had_ring { self.record.ring().cloned() } else { None };
+        (session, to_publish, unused)
+    }
+
     /// Stop fence (`RecordProducer::end`): collect the returned fence off the tick.
     pub fn end_recording(&mut self) -> Option<Fence> { self.record.end() }
 

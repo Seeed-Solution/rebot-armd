@@ -440,7 +440,7 @@ type SummaryCache = Arc<Mutex<HashMap<String, (SystemTime, u64, EpisodeInfo)>>>;
 /// catalog.
 #[derive(Debug, Clone, Default)]
 pub struct EpisodeStore {
-    dir: Option<PathBuf>,
+    dir: Option<Arc<Path>>,
     cache: SummaryCache,
     catalog: Arc<Mutex<Catalog>>,
     /// Test hook: free bytes reported instead of the file system's.
@@ -458,7 +458,9 @@ fn recorded_ms(s: &str) -> u64 {
 fn is_temp_name(name: &str) -> bool { name.contains(".tmp") }
 
 impl EpisodeStore {
-    pub fn new(dir: Option<PathBuf>) -> Self { Self { dir, ..Default::default() } }
+    pub fn new(dir: Option<PathBuf>) -> Self {
+        Self { dir: dir.map(Arc::<Path>::from), ..Default::default() }
+    }
 
     /// `--episodes-dir` value, else `ARMD_EPISODES_DIR`, else [`DEFAULT_EPISODES_DIR`] when
     /// `/userdata` exists, else [`FALLBACK_EPISODES_DIR`]. `off`, `none` or empty: storage off.

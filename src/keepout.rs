@@ -197,6 +197,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) -> Result<(), St
     if loaded.is_ok() && reconciling {
         supervisor.inner().write().await.finish_reconcile(ConfigDomain::Keepout);
     }
+    supervisor.refresh_motion_config_cache().await;
     loaded
 }
 

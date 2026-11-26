@@ -115,6 +115,32 @@ impl MotionConfigSnapshot {
         }
     }
 
+    /// Zero-allocation coherence check confirming this cached snapshot still matches `inner`'s
+    /// live motion planning configuration (`workspace`, `limits`, `home/resting_positions`,
+    /// `speed_cap`, `power_budget`, `driver_caps`, `commissioning_required`, `tcp_offset`).
+    pub fn matches_supervisor(&self, inner: &SupervisorInner) -> bool {
+        self.workspace_revision == inner.workspace_revision
+            && self.motion_config_revision == inner.motion_config_revision
+            && self.driver_present == inner.driver.is_some()
+            && self.driver_caps == inner.driver_caps
+            && self.power_budget_hash == power_budget_fingerprint(inner.power_budget())
+            && self.config.tcp_offset == inner.config.tcp_offset
+            && self.workspace.is_some() == inner.workspace_policy().is_some()
+            && self.config.active_tool.commissioning_required
+                == inner.config.active_tool.commissioning_required
+            && self.config.speed_cap == inner.config.speed_cap
+            && self.config.planned_max_velocity == inner.config.planned_max_velocity
+            && self.config.home_positions == inner.config.home_positions
+            && self.config.resting_positions() == inner.config.resting_positions()
+            && self.config.limits.len() == inner.config.limits.len()
+            && self.config.limits.iter().zip(&inner.config.limits).all(|(a, b)| {
+                a.min_position == b.min_position
+                    && a.max_position == b.max_position
+                    && a.max_velocity == b.max_velocity
+                    && a.max_acceleration == b.max_acceleration
+            })
+    }
+
     pub fn planning_limits(&self, speed_scale: Option<f64>) -> Vec<JointLimit> {
         let scale = self.config.speed_cap.and_then(|c| c.joint_velocity_scale).unwrap_or(1.0);
         let (gripper, comm) = (self.config.gripper_index(), self.config.active_tool.commissioning_required);
@@ -149,6 +175,19 @@ pub struct MotionPlanSnapshot {
 impl MotionPlanSnapshot {
     pub fn from_supervisor(inner: &SupervisorInner) -> Self {
         Self::from_supervisor_with_config(inner, Arc::new(MotionConfigSnapshot::from_supervisor(inner)))
+    }
+
+    /// Reuses `cached` (`Arc::clone`, zero `ArmConfig` clone under lock) when it still matches
+    /// `inner`; falls back to building a fresh snapshot otherwise. Returns `(snapshot, cache_hit)`.
+    pub fn from_supervisor_with_cached_config(
+        inner: &SupervisorInner,
+        cached: Option<&Arc<MotionConfigSnapshot>>,
+    ) -> (Self, bool) {
+        if let Some(cfg) = cached.filter(|c| c.matches_supervisor(inner)) {
+            (Self::from_supervisor_with_config(inner, Arc::clone(cfg)), true)
+        } else {
+            (Self::from_supervisor(inner), false)
+        }
     }
 
     pub fn from_supervisor_with_config(inner: &SupervisorInner, config: Arc<MotionConfigSnapshot>) -> Self {
@@ -576,6 +615,21 @@ pub fn preflight_motion_request_at(
     expected_epoch: Option<u64>,
     request_at: Instant,
 ) -> Result<MotionPlanSnapshot, ArmError> {
+    preflight_motion_request_at_with_config(inner, stamp, req, expected_epoch, request_at, None)
+        .map(|(snap, _)| snap)
+}
+
+/// Like [`preflight_motion_request_at`], reusing an off-lock cached [`MotionConfigSnapshot`]
+/// whenever it still matches `inner` so the supervisor lock performs zero `ArmConfig` /
+/// `WorkspacePolicy` / `PowerBudget` clones. Returns `(snapshot, cache_hit)`.
+pub fn preflight_motion_request_at_with_config(
+    inner: &SupervisorInner,
+    stamp: AdmissionStamp,
+    req: &MotionRequest,
+    expected_epoch: Option<u64>,
+    request_at: Instant,
+    cached_config: Option<&Arc<MotionConfigSnapshot>>,
+) -> Result<(MotionPlanSnapshot, bool), ArmError> {
     if let Some(s) = req.speed_scale {
         if !s.is_finite() || !(0.05..=1.0).contains(&s) { return Err(MotionError::InvalidCommand("speed_scale must be in [0.05, 1.0]".into()).into()); }
     }
@@ -598,10 +652,13 @@ pub fn preflight_motion_request_at(
         stop_generation: stamp.stop_gen,
         deadline: request_at + inner.motion_plan_deadline,
     };
-    Ok(MotionPlanSnapshot::from_supervisor_with_authority(
-        inner,
-        Arc::new(MotionConfigSnapshot::from_supervisor(inner)),
-        authority,
+    let (config, cache_hit) = match cached_config.filter(|c| c.matches_supervisor(inner)) {
+        Some(cfg) => (Arc::clone(cfg), true),
+        None => (Arc::new(MotionConfigSnapshot::from_supervisor(inner)), false),
+    };
+    Ok((
+        MotionPlanSnapshot::from_supervisor_with_authority(inner, config, authority),
+        cache_hit,
     ))
 }
 
