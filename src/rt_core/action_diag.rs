@@ -290,12 +290,7 @@ impl EstimateStaging {
         }
         *slot = Some(entry);
         if self.received == self.total_len {
-            let mut out = Vec::with_capacity(usize::from(total_len));
-            for item in self.items.drain(..) {
-                if let Some(e) = item {
-                    out.push(e);
-                }
-            }
+            let out: Vec<EstimateEntry> = self.items.drain(..).flatten().collect();
             self.total_len = 0;
             self.received = 0;
             return Some(out);
@@ -702,9 +697,7 @@ impl ActionDiagEntry {
                 a.progress = prog;
             }
         }
-        if a.iteration.is_none() {
-            a.iteration = self.iteration;
-        } else if self.iteration.is_some() {
+        if self.iteration.is_some() {
             a.iteration = self.iteration;
         }
         if self.error_px.is_some() {
