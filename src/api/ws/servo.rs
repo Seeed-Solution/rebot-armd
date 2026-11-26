@@ -169,6 +169,8 @@ fn format_servo_command_refusal(
             });
             if let crate::rt_core::mailbox::RefusalDetail::CurrentRevision(rev) = refusal.detail {
                 reply["current_revision"] = json!(rev);
+            } else {
+                crate::chain::attach_workspace_box_edge_fields(&mut reply, refusal.detail, "servo_target");
             }
             reply
         }

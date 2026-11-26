@@ -718,6 +718,10 @@ pub struct Violation {
 pub const WORKSPACE_EPS: f64 = 1e-4;
 /// Jitter tolerance for monotonic escape of already-violated constraints during `park` (m).
 pub const WORKSPACE_PARK_ESCAPE_EPS: f64 = 1e-3;
+/// Escape tolerance (m) for already-violated outer workspace box boundaries (`box_min/max x/y/z`).
+/// Allows small incidental deepening (e.g. lateral/upward jogs on a stretched arm) without
+/// loosening new-intrusion checks, the floor (`floor_z`), or keep-out boxes.
+pub const WORKSPACE_ESCAPE_TOL_M: f64 = 0.005;
 
 pub const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "box_y_max"], ["box_z_min", "box_z_max"]];
 pub const BOX_CONSTRAINT_IDS: [[&str; 2]; 3] = [["box_min_x", "box_max_x"], ["box_min_y", "box_max_y"], ["box_min_z", "box_max_z"]];
@@ -965,6 +969,17 @@ pub fn first_workspace_rejection_with_tol(
     min_depths: &[f64],
     escape_tol: f64,
 ) -> Option<(usize, f64, f64, f64)> {
+    first_workspace_rejection_with_slot_tol(clearances, min_depths, |_| escape_tol)
+}
+
+/// [`first_workspace_rejection`] with a per-slot escape tolerance `escape_tol_for_slot(slot)`
+/// applied only to constraints that are already violated (`min_depth > WORKSPACE_EPS`).
+/// New intrusions (`min_depth <= WORKSPACE_EPS`) always keep [`WORKSPACE_EPS`].
+pub fn first_workspace_rejection_with_slot_tol(
+    clearances: &[f64],
+    min_depths: &[f64],
+    mut escape_tol_for_slot: impl FnMut(usize) -> f64,
+) -> Option<(usize, f64, f64, f64)> {
     for (idx, (&clr, &min_d)) in clearances.iter().zip(min_depths).enumerate() {
         if clr.is_nan() || !min_d.is_finite() {
             return Some((idx, f64::NAN, min_d, WORKSPACE_EPS));
@@ -973,7 +988,11 @@ pub fn first_workspace_rejection_with_tol(
         if !depth.is_finite() {
             return Some((idx, f64::INFINITY, min_d, WORKSPACE_EPS));
         }
-        let allowed = if min_d <= WORKSPACE_EPS { WORKSPACE_EPS } else { min_d + escape_tol };
+        let allowed = if min_d <= WORKSPACE_EPS {
+            WORKSPACE_EPS
+        } else {
+            min_d + escape_tol_for_slot(idx)
+        };
         if depth > allowed {
             return Some((idx, depth, min_d, allowed));
         }
