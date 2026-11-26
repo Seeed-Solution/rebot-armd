@@ -4476,6 +4476,9 @@ impl SupervisorInner {
                     .authority
                     .and_then(|a| (a.lease_generation != 0).then_some(a.lease_generation));
                 let measured_positions = &self.measured_positions;
+                let conservative_cap = self.pending_conservative_tx_cap;
+                let mut cons_rx_delta = 0u16;
+                let mut cons_tx_delta = 0u16;
                 let lock_res = {
                     #[cfg(not(target_arch = "wasm32"))]
                     let shadow_rt = &mut self.torque_shadow;
@@ -4498,11 +4501,23 @@ impl SupervisorInner {
                                         drv_now + dl.saturating_duration_since(live_owner_now)
                                     });
                                     drv.set_enable_authority(tx_dl, expected_lease_gen);
+                                    let before_cons = if conservative_cap {
+                                        let bc = drv.release_budget_consumed();
+                                        drv.sync_release_budget_limits(0, 0);
+                                        Some(bc)
+                                    } else {
+                                        None
+                                    };
                                     let r = if reducer.budgeted {
                                         drv.poll_torque_budgeted(drv_deadline, b.max_rx_frames)
                                     } else {
                                         drv.poll_torque(drv_deadline)
                                     };
+                                    if let Some(bc) = before_cons {
+                                        let after = drv.release_budget_consumed();
+                                        cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(bc.0));
+                                        cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(bc.1));
+                                    }
                                     let rx = drv.take_last_poll_rx();
                                     (drv_now, r, rx, None)
                                 }
@@ -4550,6 +4565,12 @@ impl SupervisorInner {
                         d.with_mut(run_poll).ok_or(false)
                     }
                 };
+                if conservative_cap {
+                    self.conservative_step_rx_delta =
+                        self.conservative_step_rx_delta.saturating_add(cons_rx_delta);
+                    self.conservative_step_tx_delta =
+                        self.conservative_step_tx_delta.saturating_add(cons_tx_delta);
+                }
                 let (poll_res, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap, expired_defer) = match lock_res {
                     Ok(v) => v,
                     Err(true) => {
@@ -7866,6 +7887,9 @@ impl SupervisorInner {
         let dof = self.config.dof;
         let feedback_numeric_valid = self.feedback_numeric_valid;
         let measured_positions = &self.measured_positions;
+        let conservative_cap = self.pending_conservative_tx_cap;
+        let mut cons_rx_delta = 0u16;
+        let mut cons_tx_delta = 0u16;
         let mut new_snap = None;
         let step = {
             #[cfg(not(target_arch = "wasm32"))]
@@ -7885,7 +7909,19 @@ impl SupervisorInner {
                     else {
                         return BgPollStep::BudgetExpired;
                     };
+                    let before_cons = if conservative_cap {
+                        let bc = drv.release_budget_consumed();
+                        drv.sync_release_budget_limits(0, 0);
+                        Some(bc)
+                    } else {
+                        None
+                    };
                     let poll_res = drv.poll_torque_budgeted(drv_deadline, budget.max_rx_frames);
+                    if let Some(bc) = before_cons {
+                        let after = drv.release_budget_consumed();
+                        cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(bc.0));
+                        cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(bc.1));
+                    }
                     let rx = drv.take_last_poll_rx();
                     let post_now = drv.clock_now();
                     new_snap = Some(OwnerDriverSnapshot::capture_from_driver(
@@ -7918,6 +7954,12 @@ impl SupervisorInner {
                 Err(crate::supervisor_lock::DriverTryError::Poisoned) => BgPollStep::Poisoned,
             }
         };
+        if conservative_cap {
+            self.conservative_step_rx_delta =
+                self.conservative_step_rx_delta.saturating_add(cons_rx_delta);
+            self.conservative_step_tx_delta =
+                self.conservative_step_tx_delta.saturating_add(cons_tx_delta);
+        }
         self.scratch.ages = ages_buf;
         self.scratch.fb.bounds = bounds_buf;
         if let Some(snap) = new_snap {
@@ -8470,6 +8512,9 @@ impl SupervisorInner {
                 let dof = self.config.dof;
                 let feedback_numeric_valid = self.feedback_numeric_valid;
                 let measured_positions = &self.measured_positions;
+                let conservative_cap = self.pending_conservative_tx_cap;
+                let mut cons_rx_delta = 0u16;
+                let mut cons_tx_delta = 0u16;
                 let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                 let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
                 #[allow(clippy::large_enum_variant)] // RT stack-only enum; avoids heap Box
@@ -8520,11 +8565,23 @@ impl SupervisorInner {
                         let use_budgeted = broker_owned
                             || rt_executor_owned
                             || drv.supports_rt_executor().is_ok();
+                        let before_cons = if conservative_cap {
+                            let bc = drv.release_budget_consumed();
+                            drv.sync_release_budget_limits(0, 0);
+                            Some(bc)
+                        } else {
+                            None
+                        };
                         let r = if use_budgeted {
                             drv.poll_torque_budgeted(drv_deadline, budget.max_rx_frames)
                         } else {
                             drv.poll_torque(drv_deadline)
                         };
+                        if let Some(bc) = before_cons {
+                            let after = drv.release_budget_consumed();
+                            cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(bc.0));
+                            cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(bc.1));
+                        }
                         if applied_ws_dl {
                             drv.set_tx_release_deadline(None);
                         }
@@ -8566,6 +8623,12 @@ impl SupervisorInner {
                         d.with_mut(run_poll).unwrap_or(DisablePollOutcome::Poisoned)
                     }
                 };
+                if conservative_cap {
+                    self.conservative_step_rx_delta =
+                        self.conservative_step_rx_delta.saturating_add(cons_rx_delta);
+                    self.conservative_step_tx_delta =
+                        self.conservative_step_tx_delta.saturating_add(cons_tx_delta);
+                }
                 self.scratch.ages = ages_buf;
                 self.scratch.fb.bounds = bounds_buf;
                 let (drv_now, r, frames_dispatched, dispatched_mask, rx, post_now, snap) = match poll_out {

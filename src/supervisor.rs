@@ -1262,6 +1262,12 @@ pub struct SupervisorInner {
     /// post-tick commissioning draws from the exact same `ReleaseBudget` as RX/transitions/output.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) last_legacy_release_budget: Option<crate::rt_core::budget::ReleaseBudget>,
+    /// Set when `sync_driver_budget_before` returned `None` under contention so any subsequent
+    /// driver borrow in the same step installs the conservative `(rx=0, tx=0)` cap and accounts
+    /// exact incremental `(rx, tx)` deltas inside that borrow.
+    pub(crate) pending_conservative_tx_cap: bool,
+    pub(crate) conservative_step_rx_delta: u16,
+    pub(crate) conservative_step_tx_delta: u16,
     /// Owner-recorded proof of applied general stops: incremented only on the owner thread inside
     /// [`Self::authorized_stop`] after motion is halted (never by a policy-only STOP and never by
     /// the request side), so a stop-generation race cannot fabricate stop proof.
@@ -2691,6 +2697,9 @@ impl SupervisorInner {
             mode_switch_ran_release_seq: 0,
             #[cfg(not(target_arch = "wasm32"))]
             last_legacy_release_budget: None,
+            pending_conservative_tx_cap: false,
+            conservative_step_rx_delta: 0,
+            conservative_step_tx_delta: 0,
             applied_general_stop_seq: 0,
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
@@ -4418,21 +4427,21 @@ impl SupervisorInner {
     }
 
     /// The command `hold_measured_pose` holds: the measured pose clamped to the limits
-    /// (the current command when a measurement is not finite), the gripper keeping its command.
-    pub(crate) fn measured_hold_pose(&self) -> Vec<f32> {
-        let mut hold = self.commanded_positions.clone();
+    /// (the current command when a measurement is not finite), the gripper keeping its command,
+    /// written strictly in place into `dst` (0 heap alloc when `dst.capacity() >= dof`).
+    pub(crate) fn measured_hold_pose_into(&self, dst: &mut Vec<f32>) {
+        crate::rt_core::scratch::copy_into(dst, &self.commanded_positions);
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            for (i, (c, m)) in hold.iter_mut().zip(&self.measured_positions).enumerate() {
+            for (i, (c, m)) in dst.iter_mut().zip(&self.measured_positions).enumerate() {
                 let l = &self.config.limits[i];
                 *c = m.clamp(l.min_position, l.max_position);
             }
         }
         if let Some(g) = self.config.gripper_index() {
-            if let (Some(c), Some(&cmd)) = (hold.get_mut(g), self.commanded_positions.get(g)) {
+            if let (Some(c), Some(&cmd)) = (dst.get_mut(g), self.commanded_positions.get(g)) {
                 *c = cmd;
             }
         }
-        hold
     }
 
     /// End every motion and hold the measured pose (clamped to the limits) with torque on;
@@ -9002,6 +9011,29 @@ impl SupervisorInner {
         }
     }
 
+    /// Arms conservative in-borrow `(rx=0, tx=0)` cap installation and incremental accounting when
+    /// a pre-snapshot failed under contention (`before.is_none()`).
+    #[inline]
+    pub(crate) fn arm_conservative_cap_if_contended(&mut self, before: Option<(u16, u16)>) {
+        self.pending_conservative_tx_cap = before.is_none();
+        self.conservative_step_rx_delta = 0;
+        self.conservative_step_tx_delta = 0;
+    }
+
+    /// Disarms conservative in-borrow capping and returns the incremental `(rx, tx)` deltas
+    /// accumulated during any driver borrow that ran after a contended pre-snapshot.
+    #[inline]
+    pub(crate) fn take_conservative_step_deltas(&mut self) -> (u16, u16) {
+        self.pending_conservative_tx_cap = false;
+        let out = (
+            self.conservative_step_rx_delta,
+            self.conservative_step_tx_delta,
+        );
+        self.conservative_step_rx_delta = 0;
+        self.conservative_step_tx_delta = 0;
+        out
+    }
+
     /// Shared Step-2 hardware poll implementation for [`crate::rt_core::ops::CoreOps::poll_hardware`]
     /// and [`crate::rt_core::ops::CoreOps::poll_hardware_for_release`].
     pub(crate) fn poll_hardware_with_release_deadline(
@@ -9125,6 +9157,7 @@ impl SupervisorInner {
                 if before_t.is_none() {
                     sb_t.max_rx_frames = 0;
                 }
+                self.arm_conservative_cap_if_contended(before_t);
                 let trans = self.service_torque_transition_with_clock(&sb_t, now_fn);
                 let t_rx = if let Some(tp) = trans {
                     if tp.broker_owned {
@@ -9139,10 +9172,23 @@ impl SupervisorInner {
                 } else {
                     self.service_background_disable_with_clock(&sb_t, now_fn)
                 };
+                let (cons_rx, cons_tx) = self.take_conservative_step_deltas();
                 if let Some((tf, tex)) = t_rx {
-                    self.charge_driver_budget_after(budget, before_t, tf, tex || rx_zero_before_t, 0);
+                    self.charge_driver_budget_after(
+                        budget,
+                        before_t,
+                        tf.max(cons_rx),
+                        tex || rx_zero_before_t,
+                        cons_tx,
+                    );
                 } else {
-                    self.charge_driver_budget_after(budget, before_t, 0, rx_zero_before_t, 0);
+                    self.charge_driver_budget_after(
+                        budget,
+                        before_t,
+                        cons_rx,
+                        rx_zero_before_t,
+                        cons_tx,
+                    );
                 }
                 if rx_zero_before_t && (self.torque_transition.is_some() || self.disable_pending || t_rx.is_some()) {
                     Some((t_rx.map_or(0, |(f, _)| f), true))
@@ -10033,12 +10079,20 @@ impl SupervisorInner {
                         0
                     },
                 };
+                self.arm_conservative_cap_if_contended(before_t);
                 let trans = self.service_torque_transition_with_clock(&budget, now_fn);
+                let (cons_rx, cons_tx) = self.take_conservative_step_deltas();
                 let transition_rx = trans.and_then(|tp| tp.rx);
                 if let Some((tf, tex)) = transition_rx {
-                    self.charge_driver_budget_after(&mut leg_budget, before_t, tf, tex, 0);
+                    self.charge_driver_budget_after(
+                        &mut leg_budget,
+                        before_t,
+                        tf.max(cons_rx),
+                        tex,
+                        cons_tx,
+                    );
                 } else {
-                    self.charge_driver_budget_after(&mut leg_budget, before_t, 0, false, 0);
+                    self.charge_driver_budget_after(&mut leg_budget, before_t, cons_rx, false, cons_tx);
                 }
                 if self.driver_supports_rt_executor_nonblocking() {
                     let after = now_fn();
@@ -10119,7 +10173,9 @@ impl SupervisorInner {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let legacy_output_before = if let Some(ref leg_budget) = legacy_ledger {
-            self.sync_driver_budget_before(leg_budget)
+            let b = self.sync_driver_budget_before(leg_budget);
+            self.arm_conservative_cap_if_contended(b);
+            b
         } else {
             None
         };
@@ -12003,8 +12059,13 @@ impl SupervisorInner {
                     && self.tracking.fallback_ramp.is_some()
                     && (self.active_trajectory.is_some() || self.servo_target.is_some() || self.pending_normal_unload)
                 {
-                    // A new motion or park took over from the issued (braking) state.
-                    self.tracking.fallback_ramp = None;
+                    // A new motion or park took over from the issued (braking) state; recycle
+                    // buffers into spare_fallback_ramp to avoid RT deallocation.
+                    if let Some(old_ramp) = self.tracking.fallback_ramp.take() {
+                        if self.tracking.spare_fallback_ramp.is_none() {
+                            self.tracking.spare_fallback_ramp = Some(old_ramp);
+                        }
+                    }
                 }
                 if tracking_active && self.tracking.recovery_suspended {
                     // Driver emitted an autonomous recovery write; suspend supervisor target
@@ -12014,18 +12075,31 @@ impl SupervisorInner {
                     // The rejected motion's caps (`FallbackRamp::limits`) stay in force, tightened
                     // by the current power governor limit; the ramp keeps its original caps.
                     let mut ramp = self.tracking.fallback_ramp.take().expect("checked above");
-                    let governed = self.active_tracking_limits(servo_dt, time_scale);
+                    let mut governed = std::mem::take(&mut self.scratch.step_limits);
+                    self.active_tracking_limits_into(servo_dt, time_scale, &mut governed);
                     let mut orig_limits = std::mem::take(&mut self.scratch.fallback_limits);
                     copy_limits(&mut orig_limits, &ramp.limits);
                     for (l, g) in ramp.limits.iter_mut().zip(&governed) {
                         l.max_velocity = l.max_velocity.min(g.max_velocity);
                         l.max_acceleration = l.max_acceleration.min(g.max_acceleration);
                     }
+                    self.scratch.step_limits = governed;
+                    let mut tr_scratch = std::mem::take(&mut self.scratch.tracking);
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let mut pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
+                    let mut pending = self.tracking_fallback_compute_into(
+                        ramp,
+                        servo_dt,
+                        &mut tick_sweep_budget,
+                        &mut tr_scratch,
+                    );
                     std::mem::swap(&mut pending.ramp.limits, &mut orig_limits);
                     self.scratch.fallback_limits = orig_limits;
-                    tick_output = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                    tick_output = self.apply_tracking_fallback_step_into(
+                        pending,
+                        &tr_scratch,
+                        gravity_output_enabled,
+                    );
+                    self.scratch.tracking = tr_scratch;
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else if ramp_out_handover || tracking_owned {
@@ -12110,12 +12184,22 @@ impl SupervisorInner {
                             // output toward the measured hold within the active limits (continued
                             // on later ticks by `fallback_ramp`), or latches a fault without
                             // sending a frame when no step is feasible.
-                            let ramp = crate::tracking::FallbackRamp {
-                                hold: self.measured_hold_pose(),
-                                keepout_only: self.pending_normal_unload,
-                                limits: active_limits.clone(),
-                            };
-                            let pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
+                            let mut ramp = self.tracking.spare_fallback_ramp.take().unwrap_or_else(|| {
+                                crate::tracking::FallbackRamp {
+                                    hold: Vec::with_capacity(self.config.dof),
+                                    keepout_only: false,
+                                    limits: Vec::with_capacity(self.config.dof),
+                                }
+                            });
+                            self.measured_hold_pose_into(&mut ramp.hold);
+                            ramp.keepout_only = self.pending_normal_unload;
+                            copy_limits(&mut ramp.limits, &active_limits);
+                            let pending = self.tracking_fallback_compute_into(
+                                ramp,
+                                servo_dt,
+                                &mut tick_sweep_budget,
+                                &mut tr_scratch,
+                            );
                             match reject {
                                 crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
                                     self.enter_servo_keepout_hold(&ws_err);
@@ -12143,7 +12227,11 @@ impl SupervisorInner {
                                     );
                                 }
                             }
-                            tick_output = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                            tick_output = self.apply_tracking_fallback_step_into(
+                                pending,
+                                &tr_scratch,
+                                gravity_output_enabled,
+                            );
                         }
                     }
                     self.scratch.tracking = tr_scratch;
@@ -12751,7 +12839,14 @@ impl SupervisorInner {
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ref mut leg_budget) = legacy_ledger {
-            self.charge_driver_budget_after(leg_budget, legacy_output_before, 0, false, 0);
+            let (cons_rx, cons_tx) = self.take_conservative_step_deltas();
+            self.charge_driver_budget_after(
+                leg_budget,
+                legacy_output_before,
+                cons_rx,
+                false,
+                cons_tx,
+            );
         }
 
         // Legacy ticked hardware commissioning for direct `tick_control*` callers

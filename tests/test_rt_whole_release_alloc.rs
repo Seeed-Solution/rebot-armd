@@ -2826,3 +2826,90 @@ async fn rt_gate_counts_enabled_post_publish_delay_once_hook_lock() {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rt_gate_tracking_rejection_braking_fallback_ramp_zero_alloc_zero_lock() {
+    use armd::rt_core::rt_gate::RtReleaseGate;
+    use armd::tracking::{
+        FallbackRamp, JointTrackingConfig, JointTrackingJoint, TrackingHistoryState,
+        TrackingStrategy,
+    };
+
+    let clock = ScriptedClock::new();
+    let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+    drv.enabled = true;
+    drv.q[0] = 0.10;
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.joint_tracking = Some(JointTrackingConfig {
+        enabled: true,
+        joints: (0..6)
+            .map(|_| JointTrackingJoint {
+                strategy: TrackingStrategy::PositionLead,
+                lag_s: 0.08,
+                max_lead_rad: 0.03,
+                ..Default::default()
+            })
+            .collect(),
+    });
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    // Pre-install an energized arm with an active `FallbackRamp` rejection braking state
+    // off-thread before handing ownership to `armd-control`, so the RT thread executes
+    // multi-release rejection braking + completion purely on `armd-control`.
+    {
+        let mut inner = sup.inner().write().await;
+        inner.is_torqued = true;
+        inner.torque_intent = armd::supervisor::TorqueIntent::On;
+        let q_start = vec![0.10f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v_start = vec![0.50f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let q_hold = vec![0.0f32; 7];
+        inner.commanded_positions = q_start.clone();
+        inner.target_positions = q_start.clone();
+        inner.measured_positions = q_start.clone();
+        inner.commanded_velocities = v_start.clone();
+        inner.tracking.record_issued_in_place(&q_start, &v_start, None, None);
+        inner.tracking.history_state = TrackingHistoryState::Issued;
+        inner.tracking.fallback_ramp = Some(FallbackRamp {
+            hold: q_hold,
+            keepout_only: false,
+            limits: cfg.limits.clone(),
+        });
+    }
+    let period_ns = 20_000_000u64;
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let gate = RtReleaseGate::new(&sup, &handle);
+    let (_, delta) = gate.run_phase("tracking_rejection_braking_fallback_ramp", || {
+        let mut saw_braking_step = false;
+        let mut prev_q0 = 0.10f32;
+        for _ in 0..40 {
+            clock.run_steps(period_ns, 1);
+            if let Some(s) = sup.hub().latest() {
+                if (s.rt.commanded_positions[0] - prev_q0).abs() > 1e-4 {
+                    saw_braking_step = true;
+                }
+                prev_q0 = s.rt.commanded_positions[0];
+            }
+        }
+        let s_end = sup.hub().latest().unwrap();
+        let settled_at_hold = s_end.rt.commanded_positions[0].abs() < 0.02;
+        ((), saw_braking_step && settled_at_hold)
+    });
+    assert!(
+        delta.is_clean(),
+        "tracking rejection braking fallback_ramp must be zero-alloc/zero-lock: {delta:?}"
+    );
+
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+}

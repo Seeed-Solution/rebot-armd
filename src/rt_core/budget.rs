@@ -687,6 +687,7 @@ mod tests {
                 Ok((used, max_rx_frames == 0))
             }
             fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                self.tx_consumed.fetch_add(2, Ordering::SeqCst);
                 Ok(())
             }
             fn sync_release_budget_limits(&mut self, rx_rem: u16, tx_rem: u16) {
@@ -825,6 +826,46 @@ mod tests {
             (post_ledger.rx_used(), post_ledger.tx_used()),
             (3, 2),
             "contended post-tick commissioning must not double-charge cumulative usage"
+        );
+
+        // 3. Contention clearing BETWEEN `sync_driver_budget_before` and the operation borrow:
+        //    the operation's own driver borrow must install the conservative `(rx=0, tx=0)` cap
+        //    AND account the exact incremental TX consumed inside that borrow (neither 0 uncharged
+        //    nor cumulative double-charged).
+        rx_consumed.store(5, Ordering::SeqCst);
+        tx_consumed.store(3, Ordering::SeqCst);
+        last_synced_rx.store(u16::MAX, Ordering::SeqCst);
+        last_synced_tx.store(u16::MAX, Ordering::SeqCst);
+        let mut ledger3 = ReleaseBudget::new(501, t1, t1 + Duration::from_millis(20), 16, 16);
+        ledger3.charge_rx(5, false);
+        ledger3.charge_tx(3);
+        let before_contended_out = core.with_contended_driver_for_test(|c| {
+            let b = c.sync_driver_budget_before(&ledger3);
+            c.arm_conservative_cap_if_contended(b);
+            b
+        });
+        assert_eq!(before_contended_out, None);
+        // Contention has now cleared before the output write runs!
+        let mut targets = vec![JointTarget::position(0.0); dof];
+        let _ = core.write_output_slice(&mut targets, 0.02, None);
+        let (cons_rx, cons_tx) = core.take_conservative_step_deltas();
+        core.charge_driver_budget_after(&mut ledger3, before_contended_out, cons_rx, false, cons_tx);
+        assert_eq!(
+            (
+                last_synced_rx.load(Ordering::SeqCst),
+                last_synced_tx.load(Ordering::SeqCst)
+            ),
+            (0, 0),
+            "operation borrow after contended pre-snapshot must install conservative (0, 0) cap"
+        );
+        assert_eq!(
+            cons_tx, 2,
+            "incremental TX consumed inside borrow after contention cleared must be captured"
+        );
+        assert_eq!(
+            (ledger3.rx_used(), ledger3.tx_used()),
+            (5, 5),
+            "ledger must charge exact incremental TX (3 + 2 = 5), never 3 (uncharged) or 8 (cumulative)"
         );
     }
 }

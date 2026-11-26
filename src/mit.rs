@@ -1219,10 +1219,20 @@ impl crate::supervisor::SupervisorInner {
         });
         let mut computed_j7_intent: Option<PosForceIntent> = None;
         let cutoff = self.active_tx_cutoff;
+        let conservative_cap = self.pending_conservative_tx_cap;
+        let mut cons_rx_delta = 0u16;
+        let mut cons_tx_delta = 0u16;
         #[cfg(not(target_arch = "wasm32"))]
         let shadow_rt = &mut self.torque_shadow;
         let res = self.driver.as_mut().and_then(|d| {
             d.with_mut(|drv| {
+                let before_cons = if conservative_cap {
+                    let b = drv.release_budget_consumed();
+                    drv.sync_release_budget_limits(0, 0);
+                    Some(b)
+                } else {
+                    None
+                };
                 // Resolve the J7 PosForce intent (never writing a 0x307 frame here: the tick
                 // epilogue's ONE J7 emitter writes every 0x307 frame after arm output finishes).
                 // - In stopped hold (`is_hold`), caller's J7 target is ignored and intent is `Stop`.
@@ -1309,6 +1319,11 @@ impl crate::supervisor::SupervisorInner {
                     drv.set_output_lease_gen(0);
                     r
                 };
+                if let Some(b) = before_cons {
+                    let after = drv.release_budget_consumed();
+                    cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(b.0));
+                    cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(b.1));
+                }
                 let now = drv.clock_now();
                 #[cfg(not(target_arch = "wasm32"))]
                 shadow_rt.drain_from_driver(drv);
@@ -1332,6 +1347,12 @@ impl crate::supervisor::SupervisorInner {
             })
         })
         .unwrap_or(TickOutput::None);
+        if conservative_cap {
+            self.conservative_step_rx_delta =
+                self.conservative_step_rx_delta.saturating_add(cons_rx_delta);
+            self.conservative_step_tx_delta =
+                self.conservative_step_tx_delta.saturating_add(cons_tx_delta);
+        }
         if let Some(intent) = computed_j7_intent {
             self.j7_intent = Some(intent);
         }

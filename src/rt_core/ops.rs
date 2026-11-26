@@ -2021,13 +2021,15 @@ impl CoreOps for SupervisorInner {
                 if before.is_none() {
                     sb.max_rx_frames = 0;
                 }
+                self.arm_conservative_cap_if_contended(before);
                 let mut poll = self.poll_transition_wake_with_clock(&sb, now_fn);
+                let (cons_rx, cons_tx) = self.take_conservative_step_deltas();
                 self.charge_driver_budget_after(
                     budget,
                     before,
-                    poll.rx_frames,
+                    poll.rx_frames.max(cons_rx),
                     poll.budget_exhausted || rx_was_zero,
-                    0,
+                    cons_tx,
                 );
                 poll.budget_exhausted |= budget.rx_exhausted();
                 if outcome == crate::supervisor::DriverTxCapOutcome::Installed {
