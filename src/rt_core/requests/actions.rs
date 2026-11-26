@@ -1394,6 +1394,7 @@ impl ReadOnlySnapshot {
             epoch: self.owner.authority.epoch,
             workspace_revision: self.env.workspace_revision,
             power: self.env.power_budget.clone(),
+            static_restricted: self.owner.static_restricted,
             tcp_offset: self.env.config.tcp_offset,
             goal_frame,
         })
@@ -1490,6 +1491,7 @@ impl ActionSnapshot {
             epoch: self.owner.authority.epoch,
             workspace_revision: self.env.workspace_revision,
             power: self.env.power_budget.clone(),
+            static_restricted: self.owner.static_restricted,
             tcp_offset: self.env.config.tcp_offset,
             goal_frame,
         })
@@ -1548,6 +1550,7 @@ impl ActionSnapshot {
             epoch,
             workspace_revision: self.env.workspace_revision,
             power: self.env.power_budget.clone(),
+            static_restricted: self.owner.static_restricted,
             store: self.env.episodes.clone(),
             zero_offsets: self.env.joint_zero_offsets.clone(),
             tcp_offset: self.env.config.tcp_offset,
@@ -1638,6 +1641,7 @@ fn validate_approach_segment_off_lock(
     arm: &crate::chain::ArmModel,
     tcp_offset: [f64; 3],
     power_budget: Option<&PowerBudget>,
+    static_restricted: bool,
     commissioning_required: bool,
     rules: Option<&backlash::DescentRules>,
 ) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>, Vec<Vec<f32>>), String> {
@@ -1679,6 +1683,7 @@ fn validate_approach_segment_off_lock(
         seg_limits,
         power_budget,
         arm,
+        static_restricted,
     )
     .map_err(|e| format!("segment: {}", arm_err_code_str(e)))?;
     let seg_samples = if let Some(ws) = ws {
@@ -1758,6 +1763,7 @@ pub fn resolve_cartesian_legs_with_rules(
         &input.arm,
         input.tcp_offset,
         input.power.as_ref(),
+        input.static_restricted,
         commissioning_required,
         rules,
     );
@@ -1835,6 +1841,7 @@ impl PreparedCartesianAction {
             approach_then,
             lock_j7_hold: false,
         });
+        slot.static_restricted = self.input.static_restricted;
         Ok(slot)
     }
 }
@@ -1893,6 +1900,7 @@ impl PreparedJointAction {
             settle: self.settle,
             approach_then,
         }));
+        slot.static_restricted = self.prepared_quintic.static_restricted;
         Ok(slot)
     }
 }
@@ -1978,6 +1986,7 @@ impl PreparedReplayAction {
             approach_power_scale: approach.power_scale,
             tool_digest: self.tool_digest,
         });
+        slot.static_restricted = self.plan.input.static_restricted;
         Ok(slot)
     }
 }
@@ -2778,9 +2787,11 @@ pub fn prepare_child_replay_slot(
         approach_power_scale: approach.power_scale,
         tool_digest,
     });
+    slot.static_restricted = plan.input.static_restricted;
     Ok(slot)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_quintic_power_off_lock(
     traj: crate::trajectory::MultiJointQuinticTrajectory,
     start: &[f32],
@@ -2789,6 +2800,7 @@ pub(crate) fn fit_quintic_power_off_lock(
     limits: &[JointLimit],
     budget: Option<&PowerBudget>,
     arm: &crate::chain::ArmModel,
+    strict_lowering: bool,
 ) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), ArmError> {
     crate::power::power_fit_quintic_with(
         budget,
@@ -2800,6 +2812,7 @@ pub(crate) fn fit_quintic_power_off_lock(
         target,
         limits,
         true,
+        strict_lowering,
     )
 }
 
@@ -2886,6 +2899,7 @@ pub(crate) fn build_prepared_quintic_off_lock(
         limits,
         snap.env.power_budget.as_ref(),
         &cfg.arm_model,
+        snap.owner.static_restricted,
     )?;
     if let Some(ws) = snap.env.workspace_policy.as_ref() {
         check_quintic_workspace_off_lock(
@@ -2905,6 +2919,7 @@ pub(crate) fn build_prepared_quintic_off_lock(
         workspace_revision: snap.env.workspace_revision,
         tcp_offset: cfg.tcp_offset,
         power: snap.env.power_budget.clone(),
+        static_restricted: snap.owner.static_restricted,
         checked_workspace: snap.env.workspace_policy.is_some(),
         traj,
         power_scale,
@@ -2960,6 +2975,7 @@ fn prepare_joint_motion_off_lock(
         &cfg.arm_model,
         cfg.tcp_offset,
         snap.env.power_budget.as_ref(),
+        snap.owner.static_restricted,
         cfg.active_tool.commissioning_required,
         None,
     ) {
@@ -4321,6 +4337,12 @@ fn install_macro_child_slot_rt(
     }
     let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start_arr[..dof])
         .map_err(|r| r.code)?;
+    if !matches!(staged, StagedAction::Gripper { .. })
+        && inner.power.is_static_restricted()
+        && !slot.static_restricted
+    {
+        return Err("PLAN_STALE");
+    }
 
     match staged {
         StagedAction::Cartesian {
@@ -4835,6 +4857,12 @@ pub fn commit_action(
             };
             if staged.child().is_some() {
                 return Err("INVALID_COMMAND");
+            }
+            if !matches!(staged, StagedAction::Gripper { .. })
+                && inner.power.is_static_restricted()
+                && !slot.static_restricted
+            {
+                return Err("PLAN_STALE");
             }
             let (id, _) = match staged {
                 StagedAction::Cartesian {

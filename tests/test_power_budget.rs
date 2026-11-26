@@ -532,19 +532,38 @@ fn planned_move_is_slowed_and_fails_with_power_limit() {
     assert!(d["stops"].as_array().unwrap().iter().any(|s| s["id"] == "power_limit_hold" && s["action_code"] == "POWER_LIMIT"));
 }
 
-/// Holding still above hard: no hold (stopping cannot lower a static load), scale at the floor.
+/// Holding still above hard: no power hold (stopping cannot lower a static load), scale at the
+/// floor, static overload warning latches, worsening jog is refused and load-lowering jog runs.
 #[test]
 fn static_overload_does_not_hold() {
     let (mut inner, arm) = rig_at(ArmConfig::rebot_dm(), INSPECT);
-    arm.with(|s| { s.forced[1] = Some(14.0); s.forced[2] = Some(14.0); s.forced[3] = Some(5.5); });
+    arm.with(|s| { s.forced[1] = Some(14.0); s.forced[2] = Some(-14.0); s.forced[3] = Some(5.5); });
     let obs = ticks(&mut inner, 25);
     let p = power(&obs);
     assert!(p.ratio > 0.95 && !p.hold && p.scale == 0.25, "{p:?}");
-    // a jog yielding J2 (against its torque) runs
-    let mut t = inner.commanded_positions.clone();
-    t[1] -= 0.1;
+    assert_eq!(p.severity, armd::power::StaticOverloadSeverity::Warning, "{p:?}");
+    assert!(p.static_restricted, "{p:?}");
+    // A jog that increases predicted static holding current is refused with STATIC_LOAD_LIMIT,
+    // while a load-lowering jog (against the forced torque and reducing predicted gravity draw) runs.
+    let budget = inner.power_budget().unwrap().clone();
+    let arm_model = inner.config.arm_model.clone();
+    let base_a = armd::power::predict_static_holding_current_a(&budget, &arm_model, &inner.commanded_positions).unwrap();
+    let mut t_worse = inner.commanded_positions.clone();
+    t_worse[1] -= 0.1;
+    let worse_a = armd::power::predict_static_holding_current_a(&budget, &arm_model, &t_worse).unwrap();
+    assert!(worse_a > base_a, "expected J2 -0.1 from INSPECT to raise gravity draw: base={base_a:.3} worse={worse_a:.3}");
     let epoch = inner.safety.epoch_id();
-    let (_, id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, t, None, Some(epoch), "joint_move")) } }.unwrap();
+    let s = inner.current_admission_stamp();
+    let err = inner.check_admission(s).map_err(armd::ArmError::from)
+        .and_then(|a| armd::SupervisorInner::jog_action(a, t_worse, None, Some(epoch), "joint_move"))
+        .unwrap_err();
+    assert!(matches!(err, armd::ArmError::Motion(armd::motion::MotionError::StaticLoadLimit)), "{err:?}");
+
+    let mut t_lower = inner.commanded_positions.clone();
+    t_lower[2] += 0.1;
+    let lower_a = armd::power::predict_static_holding_current_a(&budget, &arm_model, &t_lower).unwrap();
+    assert!(lower_a <= base_a, "expected J3 +0.1 from INSPECT to lower gravity draw: base={base_a:.3} lower={lower_a:.3}");
+    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|a| armd::SupervisorInner::jog_action(a, t_lower, None, Some(epoch), "joint_move")) }.unwrap();
     for _ in 0..400 { inner.tick(DT); if !inner.last_action.as_ref().unwrap().is_running() { break; } }
     let a = inner.last_action.clone().unwrap();
     assert_eq!((a.id, a.state.as_str()), (id, "done"), "{a:?}");
@@ -730,6 +749,7 @@ fn replay_is_slowed_to_fit() {
         limits: inner.config.limits.clone(), speed_limits: inner.planning_limits(), ws: None,
         arm: inner.config.arm_model.clone(), start: STRETCHED.to_vec(), control_hz: 50, epoch: inner.safety.epoch_id(),
         workspace_revision: 0, power: inner.power_budget().cloned(),
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(None),
         zero_offsets: vec![0.0; 6],
         tcp_offset: inner.config.tcp_offset,

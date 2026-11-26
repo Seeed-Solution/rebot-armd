@@ -1455,6 +1455,7 @@ impl SupervisorInner {
                 && p.workspace_revision == self.workspace_revision
                 && p.tcp_offset == self.config.tcp_offset
                 && p.power.as_ref() == self.power_budget()
+                && (!self.power.is_static_restricted() || p.static_restricted)
                 && p.checked_workspace == self.workspace_policy().is_some()
         });
         let (traj, power_scale) = if let Some(p) = reuse {
@@ -1605,6 +1606,7 @@ impl SupervisorInner {
             epoch: self.safety.epoch_id(),
             workspace_revision: self.workspace_revision,
             power: self.power_budget().cloned(),
+            static_restricted: self.power.is_static_restricted(),
             tcp_offset: self.config.tcp_offset,
             goal_frame,
         })
@@ -1826,6 +1828,9 @@ impl SupervisorInner {
         }
         if self.workspace_revision != input.workspace_revision {
             return Err(MotionError::PlanStale("workspace or keep-out boxes changed while planning".into()).into());
+        }
+        if self.power.is_static_restricted() && !input.static_restricted {
+            return Err(MotionError::PlanStale("static overload restriction activated while planning".into()).into());
         }
         match self.action_preconditions() {
             Err(ArmError::Motion(MotionError::MotionBusy(reason))) => {

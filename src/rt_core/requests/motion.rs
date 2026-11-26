@@ -143,6 +143,7 @@ pub struct MotionPlanSnapshot {
     pub measured_positions: Vec<f32>,
     pub torque_hold: Option<TorqueHold>,
     pub power_hold: Option<PowerHold>,
+    pub static_restricted: bool,
     pub holding_after_clear: bool,
     pub mit_active: bool,
     pub authority: PlanAuthority,
@@ -180,6 +181,7 @@ impl MotionPlanSnapshot {
             measured_positions: inner.measured_positions.clone(),
             torque_hold: inner.torque_guard.hold,
             power_hold: inner.power.gov.hold,
+            static_restricted: inner.power.is_static_restricted(),
             holding_after_clear: inner.holding_after_clear(),
             mit_active: inner.mit_active(),
             authority,
@@ -219,6 +221,7 @@ impl MotionPlanSnapshot {
             measured_positions: snap.obs.positions.clone(),
             torque_hold: None,
             power_hold: None,
+            static_restricted: snap.rt.owner.static_restricted,
             holding_after_clear: snap.rt.holding_after_clear,
             mit_active: false,
             authority: PlanAuthority {
@@ -262,6 +265,7 @@ pub struct PreparedMotionSlot {
     pub duration: f64,
     pub power_scale: Option<f64>,
     pub power_budget_hash: u64,
+    pub static_restricted: bool,
     pub tcp_offset: [f64; 3],
     pub checked_workspace: bool,
     pub workspace_revision: u64,
@@ -452,6 +456,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
                 start: [0.0; MAX_MOTION_DOF], v0: [0.0; MAX_MOTION_DOF], requested_target: [0.0; MAX_MOTION_DOF], target: [0.0; MAX_MOTION_DOF], vel_caps: [0.0; MAX_MOTION_DOF],
                 has_speed_scale: false, speed_scale: 1.0, polynomials: [zero_poly(); INLINE_POLYS],
                 duration: PARK_DURATION_S, power_scale: None, power_budget_hash: cfg.power_budget_hash,
+                static_restricted: snap.static_restricted,
                 tcp_offset: arm_cfg.tcp_offset, checked_workspace: cfg.workspace.is_some(),
                 workspace_revision: snap.workspace_revision, motion_config_revision: snap.motion_config_revision,
                 authority: snap.authority,
@@ -498,7 +503,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
     let traj = TrajectoryPlanner::plan(&start, &snap.commanded_velocities, &target, &zeros, duration_secs, &limits)?;
     let (traj, power_scale) = match crate::power::power_fit_quintic_with(
         cfg.power_budget.as_ref(), &arm_cfg.arm_model, arm_cfg.arm_dof(), traj.clone(),
-        &start, &snap.commanded_velocities, &target, &limits, !is_park,
+        &start, &snap.commanded_velocities, &target, &limits, !is_park, snap.static_restricted,
     ) {
         Ok(pair) => pair,
         Err(_) if is_park => (traj, None),
@@ -556,7 +561,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
             kind: req.kind, dof: dof as u8, start: s_arr, v0: v_arr, requested_target: r_arr, target: t_arr, vel_caps: vc_arr,
             has_speed_scale: req.speed_scale.is_some(), speed_scale: req.speed_scale.unwrap_or(1.0),
             polynomials: p_arr, duration: traj.duration, power_scale,
-            power_budget_hash: cfg.power_budget_hash, tcp_offset: arm_cfg.tcp_offset,
+            power_budget_hash: cfg.power_budget_hash, static_restricted: snap.static_restricted, tcp_offset: arm_cfg.tcp_offset,
             checked_workspace: cfg.workspace.is_some(), workspace_revision: snap.workspace_revision,
             motion_config_revision: snap.motion_config_revision, authority: snap.authority,
             for_holding_after_clear: false,
@@ -718,6 +723,7 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
     if slot.workspace_revision != inner.workspace_revision || slot.motion_config_revision != inner.motion_config_revision
         || slot.tcp_offset != inner.config.tcp_offset || slot.checked_workspace != inner.workspace_policy().is_some()
         || slot.power_budget_hash != power_budget_fingerprint(inner.power_budget())
+        || (slot.kind != MotionKind::Park && inner.power.is_static_restricted() && !slot.static_restricted)
     { return Err(MotionInstallError::PlanStale); }
     let Some((limits, lim_n)) = inner.planning_limits_inline(slot.speed_scale_opt()) else { return Err(MotionInstallError::InvalidCommand); };
     if lim_n != dof || (0..dof).any(|i| (limits[i].max_velocity - slot.vel_caps[i]).abs() > EXACT_START_TOL) {

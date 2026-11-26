@@ -6863,6 +6863,7 @@ impl SupervisorInner {
             policy_busy,
             zero_check_persisting: self.zero_check_persisting.is_some(),
             torque_or_power_hold: self.torque_guard.hold.is_some() || self.power.gov.hold.is_some(),
+            static_restricted: self.power.is_static_restricted(),
             watchdog_park_active: self.watchdog_park.is_some(),
             active_lease_present: self.active_lease.is_some(),
             held,
@@ -13212,6 +13213,7 @@ pub struct PreparedQuintic {
     pub(crate) workspace_revision: u64,
     pub(crate) tcp_offset: [f64; 3],
     pub(crate) power: Option<crate::power::PowerBudget>,
+    pub(crate) static_restricted: bool,
     pub(crate) checked_workspace: bool,
     pub(crate) traj: MultiJointQuinticTrajectory,
     pub(crate) power_scale: Option<f64>,
@@ -13225,7 +13227,7 @@ pub fn prepare_quintic(input: &PlanInput, snap: &JointGoalSnapshot, q: &[f64; 6]
     let zeros = vec![0.0; target.len()];
     let traj = TrajectoryPlanner::plan(&snap.start, &snap.v0, &target, &zeros, None, &snap.limits).ok()?;
     let (traj, power_scale) = crate::power::power_fit_quintic_with(
-        input.power.as_ref(), &input.arm, input.arm.arm_dof(), traj, &snap.start, &snap.v0, &target, &snap.limits, true).ok()?;
+        input.power.as_ref(), &input.arm, input.arm.arm_dof(), traj, &snap.start, &snap.v0, &target, &snap.limits, true, input.static_restricted).ok()?;
     if let Some(ws) = input.ws.as_ref() {
         let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
         let at = |t: f64| traj.sample(t).positions;
@@ -13242,6 +13244,7 @@ pub fn prepare_quintic(input: &PlanInput, snap: &JointGoalSnapshot, q: &[f64; 6]
         workspace_revision: input.workspace_revision,
         tcp_offset: input.tcp_offset,
         power: input.power.clone(),
+        static_restricted: input.static_restricted,
         checked_workspace: input.ws.is_some(),
         traj,
         power_scale,

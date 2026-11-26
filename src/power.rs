@@ -66,6 +66,24 @@ pub const STATIC_LOAD_LIMIT_MSG: &str =
     "Estimated holding current too high. Fold the arm back along a clear path.";
 /// Tolerance (A) when comparing an already-above-cap pose against itself (e.g. hold / gripper-only).
 pub const STATIC_LOAD_EPS_A: f32 = 1e-4;
+/// Joint speed bound (rad/s) for a pose to count as stationary for the static overload alarm.
+pub const STATIC_VELOCITY_RAD_S: f32 = 0.02;
+/// Continuous persistence above `governor.hard * supply_rated_a` before `Warning` (ms).
+pub const STATIC_HARD_MS: u64 = 200;
+/// Continuous persistence above `supply_trip_a` before `Trip` (ms).
+pub const STATIC_TRIP_MS: u64 = 100;
+/// Continuous fresh time below `governor.soft * supply_rated_a` to clear an active alarm (ms).
+pub const STATIC_CLEAR_MS: u64 = 300;
+
+/// Independent static overload alarm severity published in `observation.power`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaticOverloadSeverity {
+    #[default]
+    None,
+    Warning,
+    Trip,
+}
 
 /// Section `power_budget.governor`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -660,6 +678,33 @@ pub fn check_static_load_quintic(
     Ok(())
 }
 
+/// Zero-allocation static-load check across a sequence of joint poses (Cartesian path or replay).
+pub fn check_static_load_poses<'a, I>(
+    budget: &PowerBudget,
+    arm: &crate::chain::ArmModel,
+    start: &[f32],
+    poses: I,
+    strict_lowering: bool,
+) -> Result<(), crate::motion::MotionError>
+where
+    I: IntoIterator<Item = &'a [f32]>,
+{
+    let cap_a = match budget.static_admission_cap_a() {
+        Some(c) => c,
+        None if strict_lowering => 0.0,
+        None => return Ok(()),
+    };
+    let base_a = predict_static_holding_current_a(budget, arm, start)
+        .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
+    for q in poses {
+        let cand_a = predict_static_holding_current_a(budget, arm, q)
+            .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
+        check_static_admission_values(base_a, cand_a, cap_a, strict_lowering)
+            .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
+    }
+    Ok(())
+}
+
 /// Maximum over a sliding window kept in `N` buckets of `bucket_s` (no allocation).
 #[derive(Debug, Clone, Copy)]
 pub struct PeakWindow<const N: usize> {
@@ -717,6 +762,13 @@ pub struct PowerMonitor {
     /// Last valid display/fast estimates preserved across invalidation (e.g. BusLoss diagnostics).
     pub last_valid_bus_a: Option<f32>,
     pub last_valid_fast_a: Option<f32>,
+    /// Independent static overload alarm severity (preserved across stale/invalid feedback).
+    pub static_severity: StaticOverloadSeverity,
+    /// Continuous stationary persistence timers (s); broken by stale/invalid samples.
+    static_hard_s: f64,
+    static_trip_s: f64,
+    /// Continuous fresh time below `governor.soft * supply_rated_a` while restricted (s).
+    static_below_s: f64,
     pub gov: Governor,
     primed: bool,
     /// Time since the last fresh feedback (s).
@@ -728,12 +780,115 @@ impl Default for PowerMonitor {
         Self {
             valid: false, raw_a: 0.0, fast_a: 0.0, bus_a: 0.0, regen_w: 0.0, joint_a: [0.0; MAX_JOINTS],
             peak_5s: PeakWindow::new(PEAK_WINDOW_S / 10.0), peak_60s: PeakWindow::new(1.0),
-            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, last_valid_bus_a: None, last_valid_fast_a: None, gov: Governor::default(), primed: false, stale_s: 0.0,
+            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, last_valid_bus_a: None, last_valid_fast_a: None,
+            static_severity: StaticOverloadSeverity::None, static_hard_s: 0.0, static_trip_s: 0.0, static_below_s: 0.0,
+            gov: Governor::default(), primed: false, stale_s: 0.0,
         }
     }
 }
 
 impl PowerMonitor {
+    /// Whether load-lowering-only motion restriction is active due to static overload.
+    #[inline]
+    pub fn is_static_restricted(&self) -> bool {
+        self.static_severity != StaticOverloadSeverity::None
+    }
+
+    /// Break persistence timers on stale/invalid samples without clearing an active restriction.
+    #[inline]
+    pub fn reset_static_persistence(&mut self) {
+        self.static_hard_s = 0.0;
+        self.static_trip_s = 0.0;
+        self.static_below_s = 0.0;
+    }
+
+    /// Clear any active static overload alarm and persistence timers (e.g. on torque off).
+    #[inline]
+    pub fn clear_static_overload(&mut self) {
+        self.static_severity = StaticOverloadSeverity::None;
+        self.reset_static_persistence();
+    }
+
+    /// Advance the static overload alarm state machine on fresh feedback.
+    /// Returns `Some(new_severity)` when `static_severity` changes.
+    /// Alarm only: never commands motion or torque-off.
+    pub fn step_static_overload(
+        &mut self,
+        budget: &PowerBudget,
+        dt: f64,
+        is_torqued: bool,
+        gravity_comp: bool,
+        measured_velocities: &[f32],
+        commanded_velocities: &[f32],
+    ) -> Option<StaticOverloadSeverity> {
+        let prev = self.static_severity;
+        if !is_torqued {
+            self.clear_static_overload();
+            return (self.static_severity != prev).then_some(self.static_severity);
+        }
+        let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
+        let soft_a = budget.governor.soft * budget.supply_rated_a;
+        let hard_a = budget.governor.hard * budget.supply_rated_a;
+        let trip_a = budget.supply_trip_a;
+        let n = budget.joints.len().min(MAX_JOINTS);
+        let stationary = !gravity_comp
+            && n > 0
+            && measured_velocities.len() >= n
+            && commanded_velocities.len() >= n
+            && (0..n).all(|j| {
+                measured_velocities[j].is_finite()
+                    && commanded_velocities[j].is_finite()
+                    && measured_velocities[j].abs() <= STATIC_VELOCITY_RAD_S
+                    && commanded_velocities[j].abs() <= STATIC_VELOCITY_RAD_S
+            });
+
+        let mut above_hard_stationary = false;
+        if stationary && self.fast_a.is_finite() && self.fast_a >= trip_a {
+            above_hard_stationary = true;
+            self.static_trip_s += dt;
+            self.static_hard_s += dt;
+            if self.static_trip_s >= STATIC_TRIP_MS as f64 / 1000.0 - 1e-6 {
+                self.static_severity = StaticOverloadSeverity::Trip;
+                self.static_below_s = 0.0;
+            } else if self.static_severity == StaticOverloadSeverity::None
+                && self.static_hard_s >= STATIC_HARD_MS as f64 / 1000.0 - 1e-6
+            {
+                self.static_severity = StaticOverloadSeverity::Warning;
+                self.static_below_s = 0.0;
+            }
+        } else if stationary && self.fast_a.is_finite() && self.fast_a >= hard_a {
+            above_hard_stationary = true;
+            self.static_trip_s = 0.0;
+            self.static_hard_s += dt;
+            if self.static_severity == StaticOverloadSeverity::None
+                && self.static_hard_s >= STATIC_HARD_MS as f64 / 1000.0 - 1e-6
+            {
+                self.static_severity = StaticOverloadSeverity::Warning;
+                self.static_below_s = 0.0;
+            }
+        } else {
+            self.static_trip_s = 0.0;
+            self.static_hard_s = 0.0;
+        }
+
+        // Restriction stays active through attempted motion; only clears after continuous
+        // fresh feedback below `soft` for `STATIC_CLEAR_MS`.
+        if self.static_severity != StaticOverloadSeverity::None {
+            if !above_hard_stationary && self.bus_a.is_finite() && self.bus_a < soft_a {
+                self.static_below_s += dt;
+                if self.static_below_s >= STATIC_CLEAR_MS as f64 / 1000.0 - 1e-6 {
+                    self.static_severity = StaticOverloadSeverity::None;
+                    self.static_below_s = 0.0;
+                }
+            } else {
+                self.static_below_s = 0.0;
+            }
+        } else {
+            self.static_below_s = 0.0;
+        }
+        (self.static_severity != prev).then_some(self.static_severity)
+    }
+
     /// Feed one estimate taken `dt` s after the previous one at observation time `now_s`.
     pub fn update(&mut self, budget: &PowerBudget, e: &Estimate, dt: f32, now_s: f64) {
         let lp = |y: f32, x: f32, tc: f32| if tc <= 0.0 { x } else { y + (x - y) * (dt / (tc + dt)) };
@@ -757,17 +912,20 @@ impl PowerMonitor {
         if self.fast_a > budget.supply_rated_a { self.over_rated_s += f64::from(dt); }
     }
 
-    /// Feedback is stale this tick: keep the last estimate for up to [`STALE_HOLD_S`], then
-    /// invalidate.
+    /// Feedback is stale this tick: break static persistence, keep the last estimate for up to
+    /// [`STALE_HOLD_S`], then invalidate. Active static overload restriction is never cleared.
     pub fn stale(&mut self, dt: f32) {
+        self.reset_static_persistence();
         self.stale_s += dt;
         if self.stale_s >= STALE_HOLD_S { self.invalidate(); }
     }
 
-    /// No estimate (lost or invalid feedback): the filters restart from the next one.
+    /// No estimate (lost or invalid feedback): the filters restart from the next one and
+    /// static persistence is broken, while any active static overload restriction is preserved.
     pub fn invalidate(&mut self) {
         self.valid = false;
         self.primed = false;
+        self.reset_static_persistence();
     }
 
     /// Advance filters and the governor using caller-supplied simulation time.
@@ -806,9 +964,15 @@ pub struct PowerObservation {
     pub limiting: bool,
     /// A power hold is in force (`motion_limit.reason` = `power`).
     pub hold: bool,
+    /// Independent static overload alarm severity (`none` / `warning` / `trip`).
+    #[serde(default)]
+    pub severity: StaticOverloadSeverity,
+    /// True while load-lowering-only motion restriction is active from static overload.
+    #[serde(default)]
+    pub static_restricted: bool,
 }
 
-crate::fieldwise_clone!(PowerObservation { valid, bus_a, peak_a, rated_a, ratio, regen_w, per_joint_a, scale, limiting, hold });
+crate::fieldwise_clone!(PowerObservation { valid, bus_a, peak_a, rated_a, ratio, regen_w, per_joint_a, scale, limiting, hold, severity, static_restricted });
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SupervisorInner {
@@ -818,6 +982,9 @@ impl SupervisorInner {
     /// One control tick, after this tick's feedback. `dt` is the control-loop step (s).
     pub(crate) fn power_tick(&mut self, dt: f64) {
         let Some(budget) = self.config.power_budget.as_ref().filter(|p| p.enabled) else { return; };
+        if !self.is_torqued {
+            self.power.clear_static_overload();
+        }
         if self.driver.is_none() || !self.collision.torque_feedback || !self.feedback_numeric_valid {
             self.power.invalidate();
             return;
@@ -829,6 +996,7 @@ impl SupervisorInner {
         let e = budget.estimate(&self.torques, &self.measured_velocities);
         let now = self.start_time.elapsed().as_secs_f64();
         let rated = budget.supply_rated_a;
+        let trip_a = budget.supply_trip_a;
         let policy = budget.governor;
         let result = self.power.step(budget, &e, dt, now, GovernorInput {
             operational: self.is_torqued && self.safety.state().is_operational()
@@ -839,7 +1007,35 @@ impl SupervisorInner {
             commanded_velocities: &self.commanded_velocities,
             hold_positions: &self.measured_positions,
         });
+        let sev_change = self.power.step_static_overload(
+            budget,
+            dt,
+            self.is_torqued,
+            self.gravity_comp.is_some(),
+            &self.measured_velocities,
+            &self.commanded_velocities,
+        );
         self.apply_governor_step(result, rated, policy);
+        if let Some(sev) = sev_change {
+            if !self.safety.deferred_logging() {
+                match sev {
+                    StaticOverloadSeverity::Warning => tracing::warn!(
+                        "Static supply overload warning: fast_a={:.2} A ({:.0}% of {rated} A rated); holding torque, load-lowering motion only",
+                        self.power.fast_a,
+                        self.power.fast_a / rated * 100.0
+                    ),
+                    StaticOverloadSeverity::Trip => tracing::error!(
+                        "Static supply overload trip: fast_a={:.2} A (>= {:.2} A trip); alarm only, keeping hold, load-lowering motion only",
+                        self.power.fast_a,
+                        trip_a
+                    ),
+                    StaticOverloadSeverity::None => tracing::info!(
+                        "Static supply overload cleared: bus_a={:.2} A below soft threshold",
+                        self.power.bus_a
+                    ),
+                }
+            }
+        }
     }
 
     /// Speed scale every motion reference applies this tick (1 = unchanged). Gravity
@@ -933,8 +1129,11 @@ impl SupervisorInner {
         let Some(budget) = self.config.power_budget.as_ref().filter(|p| p.enabled) else {
             return Ok(());
         };
-        let Some(cap_a) = budget.static_admission_cap_a() else {
-            return Ok(());
+        let strict_lowering = self.power.is_static_restricted();
+        let cap_a = match budget.static_admission_cap_a() {
+            Some(c) => c,
+            None if strict_lowering => 0.0,
+            None => return Ok(()),
         };
         let base_a = self
             .static_load_cache
@@ -942,7 +1141,7 @@ impl SupervisorInner {
             .map_err(|_| StaticLoadRefusal { base_a: f32::NAN, cand_a: f32::NAN, cap_a, nonfinite: true })?;
         let cand_a = predict_static_holding_current_a(budget, &self.config.arm_model, candidate)
             .map_err(|_| StaticLoadRefusal { base_a, cand_a: f32::NAN, cap_a, nonfinite: true })?;
-        check_static_admission_values(base_a, cand_a, cap_a, false)
+        check_static_admission_values(base_a, cand_a, cap_a, strict_lowering)
     }
 
     /// Fit a joint quintic from `start` / `v0` to `target` into the power budget
@@ -951,19 +1150,31 @@ impl SupervisorInner {
     /// `min_scale` does not fit; otherwise run at `min_scale` (park).
     pub(crate) fn power_fit_quintic(&self, traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
         limits: &[crate::model::JointLimit], refuse: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
-        power_fit_quintic_with(self.power_budget(), &self.config.arm_model, self.config.arm_dof(), traj, start, v0, target, limits, refuse)
+        power_fit_quintic_with(
+            self.power_budget(),
+            &self.config.arm_model,
+            self.config.arm_dof(),
+            traj,
+            start,
+            v0,
+            target,
+            limits,
+            refuse,
+            self.power.is_static_restricted(),
+        )
     }
 }
 
 /// [`SupervisorInner::power_fit_quintic`] with the budget and arm model given (no lock).
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::chain::ArmModel, dof: usize,
     traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
-    limits: &[crate::model::JointLimit], refuse: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
+    limits: &[crate::model::JointLimit], refuse: bool, strict_lowering: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
         use crate::power_plan::plan_scale_quintic;
         if refuse {
             if let Some(b) = budget.filter(|b| b.enabled) {
-                check_static_load_quintic(b, arm, dof, start, &traj, false)?;
+                check_static_load_quintic(b, arm, dof, start, &traj, strict_lowering)?;
             }
         }
         let Some(b) = budget.filter(|b| b.planning.enabled) else { return Ok((traj, None)); };
@@ -1026,6 +1237,7 @@ impl SupervisorInner {
         let o = out.get_or_insert_with(|| PowerObservation {
             valid: false, bus_a: 0.0, peak_a: 0.0, rated_a: 0.0, ratio: 0.0, regen_w: 0.0,
             per_joint_a: Vec::with_capacity(MAX_JOINTS), scale: 1.0, limiting: false, hold: false,
+            severity: StaticOverloadSeverity::None, static_restricted: false,
         });
         o.valid = m.valid;
         o.bus_a = v(m.bus_a);
@@ -1038,6 +1250,8 @@ impl SupervisorInner {
         o.scale = r3(m.gov.scale);
         o.limiting = m.gov.scale < 0.999 || m.gov.hold.is_some();
         o.hold = m.gov.hold.is_some();
+        o.severity = m.static_severity;
+        o.static_restricted = m.is_static_restricted();
     }
 
     /// `GET /api/v1/diagnostics/power`.
@@ -1054,6 +1268,8 @@ impl SupervisorInner {
             "raw_a": r3(m.raw_a),
             "last_valid_bus_a": m.last_valid_bus_a.map(r3),
             "last_valid_fast_a": m.last_valid_fast_a.map(r3),
+            "static_severity": m.static_severity,
+            "static_restricted": m.is_static_restricted(),
             "peak_5s_a": r3(m.peak_5s.max()),
             "peak_60s_a": r3(m.peak_60s.max()),
             "max_a": r3(m.max_a),

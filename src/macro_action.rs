@@ -941,7 +941,7 @@ impl MacroCtx {
                 timeout_code: self.timeout_code,
                 contact,
             };
-            let slot = req::prepare_child_cartesian_slot_with_approach(
+            let mut slot = req::prepare_child_cartesian_slot_with_approach(
                 &snap.commanded_positions,
                 &resolved.path,
                 input.power.as_ref().map(|_| resolved.path.power_scale),
@@ -949,6 +949,7 @@ impl MacroCtx {
                 child_spec,
             )
             .map_err(|c| before(fail(c, format!("failed to stage Cartesian child: {c}"))))?;
+            slot.static_restricted = input.static_restricted;
             self.submit_child_slot_executor(&child_stamp, slot, true, None)
                 .await
                 .map_err(before)?;
@@ -1105,7 +1106,7 @@ impl MacroCtx {
                 timeout_code: self.timeout_code,
                 contact,
             };
-            let slot = req::prepare_child_cartesian_slot_with_options(
+            let mut slot = req::prepare_child_cartesian_slot_with_options(
                 &snap.commanded_positions,
                 &path,
                 input.power.as_ref().map(|_| path.power_scale),
@@ -1114,6 +1115,7 @@ impl MacroCtx {
                 child_spec,
             )
             .map_err(|c| before(fail(c, format!("[{phase}] failed to stage adaptive path child: {c}"))))?;
+            slot.static_restricted = input.static_restricted;
             self.submit_child_slot_executor(
                 &child_stamp,
                 slot,
@@ -1288,6 +1290,7 @@ impl MacroCtx {
                 &limits,
                 snap.env.power_budget.as_ref(),
                 &snap.env.config.arm_model,
+                snap.owner.static_restricted,
             )
             .map_err(|e| before(arm_fail(e)))?;
             let max_vel: Vec<f32> = limits.iter().map(|l| l.max_velocity).collect();
@@ -1301,7 +1304,7 @@ impl MacroCtx {
                 timeout_code: self.timeout_code,
                 contact: None,
             };
-            let slot = req::prepare_child_joint_slot(
+            let mut slot = req::prepare_child_joint_slot(
                 &snap.commanded_positions,
                 &target,
                 &max_vel,
@@ -1310,6 +1313,7 @@ impl MacroCtx {
                 child_spec,
             )
             .map_err(|c| before(fail(c, format!("failed to stage joint child for {phase}: {c}"))))?;
+            slot.static_restricted = snap.owner.static_restricted;
             self.submit_child_slot_executor(
                 &child_stamp,
                 slot,

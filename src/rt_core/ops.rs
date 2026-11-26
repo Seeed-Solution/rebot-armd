@@ -217,6 +217,8 @@ pub struct PlanSlot {
     pub motion: Option<super::requests::motion::PreparedMotionSlot>,
     #[cfg(not(target_arch = "wasm32"))]
     pub replay_approach: Option<crate::replay::PreparedReplayApproach>,
+    /// True when this slot's motion plan was validated under active static-overload restriction.
+    pub static_restricted: bool,
 }
 
 impl Default for PlanSlot {
@@ -232,6 +234,7 @@ impl PlanSlot {
             motion: None,
             #[cfg(not(target_arch = "wasm32"))]
             replay_approach: None,
+            static_restricted: false,
         }
     }
 
@@ -247,6 +250,7 @@ impl PlanSlot {
         {
             self.replay_approach = None;
         }
+        self.static_restricted = false;
     }
 
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
@@ -257,6 +261,7 @@ impl PlanSlot {
         {
             self.replay_approach = None;
         }
+        self.static_restricted = false;
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
         self.motion = other.motion;
@@ -264,6 +269,7 @@ impl PlanSlot {
         {
             self.replay_approach = other.replay_approach;
         }
+        self.static_restricted = other.static_restricted;
         Ok(())
     }
 }

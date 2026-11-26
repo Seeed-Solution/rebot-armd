@@ -506,6 +506,7 @@ impl WasmEngine {
                     epoch: self.generation,
                     workspace_revision: self.workspace_revision,
                     power: self.config.power_budget.clone(),
+                    static_restricted: false,
                     tcp_offset: self.config.tcp_offset,
                     goal_frame,
                 };
