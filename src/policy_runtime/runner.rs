@@ -3095,6 +3095,7 @@ pub struct ExecutorPolicyRunParams {
     pub has_driver: bool,
     pub token_guard: crate::rt_core::requests::policy::PolicyTokenGuard,
     pub pending_qual_guard: Option<crate::rt_core::requests::policy::PendingQualGuard>,
+    pub policy_run_use_guard: Option<crate::api::sandbox::PolicyRunUseGuard>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3554,6 +3555,7 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
         has_driver,
         mut token_guard,
         mut pending_qual_guard,
+        policy_run_use_guard,
     } = params;
 
     let clamped_fps = if fps.is_finite() && fps > 0.0 {
@@ -3593,6 +3595,7 @@ pub fn spawn_executor_policy_runner(params: ExecutorPolicyRunParams) -> tokio::t
             }
         }
 
+        let _policy_run_use_guard = policy_run_use_guard;
         let _close_guard = ClosePolicyGuard {
             handle: handle.clone(),
             action_id,
@@ -6108,6 +6111,7 @@ mod chunking_tests {
             has_driver: false,
             token_guard: guard_a,
             pending_qual_guard: None,
+            policy_run_use_guard: None,
         });
         runner_a.await.unwrap();
         let obs_a = sup_a.get_observation().await;
@@ -6166,6 +6170,7 @@ mod chunking_tests {
             has_driver: false,
             token_guard: guard_b,
             pending_qual_guard: None,
+            policy_run_use_guard: None,
         })
         .await
         .unwrap();
@@ -6220,6 +6225,7 @@ mod chunking_tests {
             has_driver: false,
             token_guard: guard_c,
             pending_qual_guard: None,
+            policy_run_use_guard: None,
         })
         .await
         .unwrap();
@@ -6369,6 +6375,7 @@ mod chunking_tests {
             has_driver: false,
             token_guard: guard_d,
             pending_qual_guard: None,
+            policy_run_use_guard: None,
         });
 
         // Wait for first replan (chunk 0 -> 0.11).

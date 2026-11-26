@@ -1645,6 +1645,79 @@ impl CachedBundle {
     }
 }
 
+#[derive(Default)]
+struct PolicyPackUseState {
+    loading_count: usize,
+    active_runs: HashMap<String, usize>,
+    deleting: HashSet<String>,
+}
+
+/// RAII pin held while an executor `policy/start` is preparing (`ReserveLoad` -> `spawn_blocking`
+/// `prepare_policy` -> `BeginPolicy`). Moving this guard into the `spawn_blocking` closure keeps
+/// the pack pinned even if the async WS waiter is aborted mid-load.
+pub struct PolicyLoadUseGuard {
+    gate: Arc<std::sync::Mutex<PolicyPackUseState>>,
+    policy_id: String,
+    armed: bool,
+}
+
+impl PolicyLoadUseGuard {
+    /// Atomically transitions this load pin into an active-run pin (inserting into `active_runs`
+    /// before decrementing `loading_count`, closing any 1-tick StateHub publication lag).
+    pub fn into_active_run(mut self) -> PolicyRunUseGuard {
+        let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        *st.active_runs.entry(self.policy_id.clone()).or_insert(0) += 1;
+        st.loading_count = st.loading_count.saturating_sub(1);
+        self.armed = false;
+        PolicyRunUseGuard {
+            gate: Arc::clone(&self.gate),
+            policy_id: std::mem::take(&mut self.policy_id),
+        }
+    }
+}
+
+impl Drop for PolicyLoadUseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            st.loading_count = st.loading_count.saturating_sub(1);
+        }
+    }
+}
+
+/// RAII pin held by the executor policy runner for the full lifetime of a committed policy run.
+pub struct PolicyRunUseGuard {
+    gate: Arc<std::sync::Mutex<PolicyPackUseState>>,
+    policy_id: String,
+}
+
+impl Drop for PolicyRunUseGuard {
+    fn drop(&mut self) {
+        if self.policy_id.is_empty() {
+            return;
+        }
+        let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cnt) = st.active_runs.get_mut(&self.policy_id) {
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                st.active_runs.remove(&self.policy_id);
+            }
+        }
+    }
+}
+
+struct PolicyDeleteGuard {
+    gate: Arc<std::sync::Mutex<PolicyPackUseState>>,
+    policy_id: String,
+}
+
+impl Drop for PolicyDeleteGuard {
+    fn drop(&mut self) {
+        let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        st.deleting.remove(&self.policy_id);
+    }
+}
+
 pub struct SandboxState {
     pub root: PathBuf,
     pub active: RwLock<ActiveState>,
@@ -1661,6 +1734,7 @@ pub struct SandboxState {
     peak_concurrent_rebuilds: Arc<AtomicUsize>,
     bundle_rebuild_delay_ms: AtomicU64,
     builtin_roots: Option<Vec<PathBuf>>,
+    policy_use_gate: Arc<std::sync::Mutex<PolicyPackUseState>>,
     #[cfg(feature = "policy-runtime")]
     policy_load_delay_ms: AtomicU64,
     #[cfg(feature = "policy-runtime")]
@@ -1696,11 +1770,59 @@ impl SandboxState {
             peak_concurrent_rebuilds: Arc::new(AtomicUsize::new(0)),
             bundle_rebuild_delay_ms: AtomicU64::new(0),
             builtin_roots: None,
+            policy_use_gate: Arc::new(std::sync::Mutex::new(PolicyPackUseState::default())),
             #[cfg(feature = "policy-runtime")]
             policy_load_delay_ms: AtomicU64::new(0),
             #[cfg(feature = "policy-runtime")]
             policy_infer_delay_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Atomically pins `policy_id` for an executor `policy/start` load unless a concurrent
+    /// `DELETE /api/v1/sandbox/policies/{id}` is currently deleting it. Never blocks or performs I/O.
+    pub fn try_begin_policy_load(&self, policy_id: &str) -> Result<PolicyLoadUseGuard, &'static str> {
+        let mut st = self
+            .policy_use_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if st.deleting.contains(policy_id) {
+            return Err("POLICY_NOT_FOUND");
+        }
+        st.loading_count = st.loading_count.saturating_add(1);
+        Ok(PolicyLoadUseGuard {
+            gate: Arc::clone(&self.policy_use_gate),
+            policy_id: policy_id.to_string(),
+            armed: true,
+        })
+    }
+
+    fn try_begin_policy_delete(
+        &self,
+        id: &str,
+    ) -> Result<PolicyDeleteGuard, (StatusCode, Json<serde_json::Value>)> {
+        let mut st = self
+            .policy_use_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if st.loading_count > 0 {
+            return Err(policy_delete_error(
+                StatusCode::CONFLICT,
+                "POLICY_IN_USE",
+                "A policy pack is being loaded for a run; delete it after the start finishes".into(),
+            ));
+        }
+        if st.active_runs.contains_key(id) {
+            return Err(policy_delete_error(
+                StatusCode::CONFLICT,
+                "POLICY_IN_USE",
+                format!("Policy pack '{id}' is used by a running policy action"),
+            ));
+        }
+        st.deleting.insert(id.to_string());
+        Ok(PolicyDeleteGuard {
+            gate: Arc::clone(&self.policy_use_gate),
+            policy_id: id.to_string(),
+        })
     }
 
     /// Number of full disk reread/validate/hash/compose bundle rebuilds performed by `get_bundle`.
@@ -2599,7 +2721,7 @@ pub async fn get_catalog(
             active_policy: active.active_policy.clone(),
         }
     };
-    let running_robot = running_robot_id(&supervisor).await;
+    let running_robot = running_robot_id(&supervisor).await?;
     let state_scan = state.clone();
     let catalog = tokio::task::spawn_blocking(move || {
         build_catalog_blocking(&state_scan, &active_snapshot, &running_robot)
@@ -3273,7 +3395,7 @@ pub async fn delete_policy(
     // Holding activate_lock across the check + rename ensures concurrent activate() calls
     // (including mode="sim" upstream round-trips) cannot select a policy being deleted.
     let _act_guard = state.activate_lock.lock().await;
-    let legacy_guard = if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+    let (legacy_guard, _delete_use_guard) = if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
         let inner = supervisor.inner().read().await;
         #[cfg(feature = "policy-runtime")]
         {
@@ -3292,18 +3414,26 @@ pub async fn delete_policy(
                 ));
             }
         }
-        Some(inner)
+        (Some(inner), None)
     } else {
+        // Atomically verify no executor policy load/run pins `id` and block new executor loads
+        // of `id` while deletion runs (gate mutex is never held across I/O or awaits).
+        let del_guard = state.try_begin_policy_delete(&id)?;
+        // Fail closed if the RT executor cannot supply a live coherent service snapshot.
+        let svc = supervisor
+            .read_services(crate::rt_core::publish::ReadRequirements::default())
+            .await
+            .map_err(arm_err_to_sandbox)?;
         #[cfg(feature = "policy-runtime")]
-        if let Some(snap) = supervisor.hub().latest() {
-            if let Some(p) = snap.obs.policy.as_ref().filter(|p| p.active && p.policy_id == id) {
+        {
+            if let Some(p) = svc.snapshot.obs.policy.as_ref().filter(|p| p.active && p.policy_id == id) {
                 return Err(policy_delete_error(
                     StatusCode::CONFLICT,
                     "POLICY_IN_USE",
                     format!("Policy pack '{id}' is used by the running policy action {}", p.action_id),
                 ));
             }
-            if snap.rt.owner.policy_busy {
+            if svc.snapshot.rt.owner.policy_busy {
                 return Err(policy_delete_error(
                     StatusCode::CONFLICT,
                     "POLICY_IN_USE",
@@ -3311,7 +3441,9 @@ pub async fn delete_policy(
                 ));
             }
         }
-        None
+        #[cfg(not(feature = "policy-runtime"))]
+        let _ = svc;
+        (None, Some(del_guard))
     };
     let active = state.active.read().await;
     if active.active_policy.as_deref() == Some(id.as_str()) {
@@ -3329,6 +3461,7 @@ pub async fn delete_policy(
     })?;
     drop(active);
     drop(legacy_guard);
+    drop(_delete_use_guard);
     state.invalidate_bundle_cache_for_policy(&id).await;
     Ok(Json(serde_json::json!({"id": id, "deleted": true})))
 }
@@ -3629,21 +3762,38 @@ pub async fn serve_base_asset(UrlPath(rel): UrlPath<String>) -> Response {
 // Activation, State, Reset, IO, Telemetry
 // ---------------------------------------------------------------------------
 
-async fn running_robot_id(supervisor: &crate::supervisor::ArmSupervisor) -> String {
-    let inner = supervisor.inner().read().await;
-    if let Some(ref pid) = inner.config.profile_id {
+fn arm_err_to_sandbox(err: crate::supervisor::ArmError) -> (StatusCode, Json<serde_json::Value>) {
+    let api = crate::api::rest::ApiError::from(err);
+    let code = api.code.unwrap_or(api.error);
+    (
+        api.status,
+        Json(serde_json::json!({
+            "error": api.message,
+            "code": code,
+        })),
+    )
+}
+
+async fn running_robot_id(
+    supervisor: &crate::supervisor::ArmSupervisor,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let svc = supervisor
+        .read_services(crate::rt_core::publish::ReadRequirements::identity())
+        .await
+        .map_err(arm_err_to_sandbox)?;
+    if let Some(ref pid) = svc.identity.profile_id {
         if let Some(norm) = normalize_robot_id(pid) {
-            return norm;
+            return Ok(norm);
         }
     }
-    if let Some(ref follower) = inner.follower {
+    if let Some(ref follower) = svc.identity.follower {
         if !matches!(follower.as_str(), "mock" | "sim") {
             if let Some(norm) = normalize_robot_id(follower) {
-                return norm;
+                return Ok(norm);
             }
         }
     }
-    "b601dm".to_string()
+    Ok("b601dm".to_string())
 }
 
 fn robot_incompatible_error(
@@ -5662,7 +5812,7 @@ pub async fn activate(
     let _act_guard = state.activate_lock.lock().await;
 
     // 1. Refuse any new activation while SandboxState is DEGRADED_SPLIT (or reconcile Unknown first).
-    let running_robot = running_robot_id(&supervisor).await;
+    let running_robot = running_robot_id(&supervisor).await?;
     reconcile_unknown_tx(&state, &running_robot).await?;
 
     // Validate requested robot/profile against running robot BEFORE resolving scene/tool/policy.
@@ -6191,7 +6341,7 @@ pub async fn recover_split(
     };
 
     let _act_guard = state.activate_lock.lock().await;
-    let running_robot = running_robot_id(&supervisor).await;
+    let running_robot = running_robot_id(&supervisor).await?;
     let sim_url = sim_upstream_url()?;
     let upstream = DetectorUpstream::parse(&sim_url)
         .map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e, "sim_url": sim_url}))))?;
@@ -6699,7 +6849,7 @@ pub async fn get_bundle(
     Query(query): Query<BundleQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Validate requested robot/profile against running robot BEFORE resolving scene/tool/policy.
-    let running_robot = running_robot_id(&supervisor).await;
+    let running_robot = running_robot_id(&supervisor).await?;
     let requested_robot = resolve_requested_robot(
         query.robot.as_deref(),
         query.profile.as_deref(),
