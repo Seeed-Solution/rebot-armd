@@ -1124,9 +1124,16 @@ impl StatePublisher {
         slot.rt.holding_after_clear = rt.meta.holding_after_clear;
         slot.rt.watchdog_park_pending_gen = rt.meta.watchdog_park_pending_gen;
         slot.rt.watchdog_park_pending_attempt = rt.meta.watchdog_park_pending_attempt;
-        if let Some(tb) = rt.torque_backoff {
-            if slot.rt.torque_backoff.revision != tb.revision {
-                slot.rt.torque_backoff = *tb;
+        match rt.torque_backoff {
+            Some(tb) => {
+                if slot.rt.torque_backoff.revision != tb.revision {
+                    slot.rt.torque_backoff = *tb;
+                }
+            }
+            None => {
+                if slot.rt.torque_backoff.revision != 0 || !slot.rt.torque_backoff.is_empty() {
+                    slot.rt.torque_backoff = crate::torque_guard::TorqueBackoffHistory::default();
+                }
             }
         }
         let _ = self.producer.publish();

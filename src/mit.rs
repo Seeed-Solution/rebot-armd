@@ -1336,14 +1336,23 @@ impl crate::supervisor::SupervisorInner {
             self.j7_intent = Some(intent);
         }
         if matches!(res, TickOutput::Complete { .. }) {
-            if let Some(rec) = self.torque_guard.backoff_history.latest() {
-                if rec.transmitted_q.is_none() {
-                    let j = usize::from(rec.joint);
-                    if let Some(t) = targets.get(j) {
-                        self.torque_guard
-                            .backoff_history
-                            .record_transmitted(j, t.position);
-                    }
+            if let Some(j) = self
+                .torque_guard
+                .backoff_history
+                .latest()
+                .filter(|rec| rec.transmitted_q.is_none() && !rec.capture_closed)
+                .map(|rec| usize::from(rec.joint))
+            {
+                let committed = self
+                    .driver
+                    .as_ref()
+                    .and_then(|d| d.try_with_ref(|drv| drv.last_committed_wire_position(j)).ok())
+                    .flatten();
+                if let Some((tx_seq, wire_user_q)) = committed {
+                    let fb_seq = self.core.feedback().seqs().get(j).copied().unwrap_or(0);
+                    self.torque_guard
+                        .backoff_history
+                        .record_transmitted(j, tx_seq, wire_user_q, fb_seq);
                 }
             }
         }
@@ -1442,6 +1451,9 @@ impl crate::supervisor::SupervisorInner {
                 );
             }),
         );
+        if code == crate::safety::FaultCode::BusLoss {
+            self.notify_driver_bus_loss();
+        }
     }
 
     /// Cancel the group: no further output, latched fault, history and caches dropped.

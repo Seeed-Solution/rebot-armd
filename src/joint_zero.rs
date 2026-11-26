@@ -445,6 +445,12 @@ impl ArmDriver for ZeroOffsetDriver {
     fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
     fn notify_bus_loss(&mut self) { self.inner.notify_bus_loss() }
+    fn last_committed_wire_position(&self, joint: usize) -> Option<(u64, f32)> {
+        let (seq, wire_q) = self.inner.last_committed_wire_position(joint)?;
+        let o = self.off(joint);
+        let user_q = if o != 0.0 { wire_q - o } else { wire_q };
+        user_q.is_finite().then_some((seq, user_q))
+    }
     fn prepare_safe_hold(&mut self) { self.inner.prepare_safe_hold() }
     fn enable_frames_dispatched(&self) -> bool { self.inner.enable_frames_dispatched() }
     fn abort_pending_disable(&mut self) -> bool { self.inner.abort_pending_disable() }

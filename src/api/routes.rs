@@ -374,7 +374,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/diagnostics/blackbox",      diagnostics::get_blackbox,          OwnerAgnostic,   None,      None,              Allowed),
     rr!(GET    "/api/v1/diagnostics/tick",          diagnostics::get_tick,              ExecutorRequest, None,      None,              Allowed),
     rr!(POST   "/api/v1/diagnostics/tick/mark",     diagnostics::post_tick_mark,        ExecutorRequest, Required,  None,              Fenced),
-    rr!(GET    "/api/v1/diagnostics/power",         diagnostics::get_power,             LegacyOnly,      None,      None,              Allowed),
+    rr!(GET    "/api/v1/diagnostics/power",         diagnostics::get_power,             ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/ws",                        super::ws::ws_handler,              ExecutorRequest, None,      None,              Allowed),
     // Reverse proxy & vision routes
     rr!(GET    "/api/v1/detection/ws",              proxy::proxy_detection_ws,          OwnerAgnostic,   None,      None,              Allowed),

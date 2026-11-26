@@ -3117,6 +3117,7 @@ fn validate_approach_leg_rt(
     inner
         .check_workspace_quintic_inline(&seg)
         .map_err(|e| static_code(ArmError::Safety(e)))?;
+    inner.check_static_load_quintic_inline(&leg_start[..dof], &seg)?;
     Ok((seg, leg))
 }
 
@@ -3213,6 +3214,12 @@ pub fn install_move_joint(
                 inner.check_commissioning_for_ordinary_motion("move_to_pose")?;
             }
             inner.check_prepared_fresh(stamp.admission.estop_epoch)?;
+            if inner.power.is_static_restricted() && !prep.prepared_quintic.static_restricted {
+                return Err(MotionError::PlanStale(
+                    "static overload restriction activated after plan preparation".into(),
+                )
+                .into());
+            }
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
@@ -3378,6 +3385,7 @@ fn install_move_joint_rt(
     inner
         .check_workspace_quintic_inline(&traj)
         .map_err(|e| static_code(ArmError::Safety(e)))?;
+    inner.check_static_load_quintic_inline(&post_q[..dof], &traj)?;
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
             inner,
@@ -3638,6 +3646,12 @@ pub fn install_replay(
                 return Err(ActionRefusal::new("TOOL_MISMATCH").into_arm_error(inner));
             }
             inner.check_prepared_fresh(stamp.admission.estop_epoch)?;
+            if inner.power.is_static_restricted() && !prep.plan.input.static_restricted {
+                return Err(MotionError::PlanStale(
+                    "static overload restriction activated after plan preparation".into(),
+                )
+                .into());
+            }
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
@@ -4506,6 +4520,7 @@ fn install_macro_child_slot_rt(
             inner
                 .check_workspace_quintic_inline(&traj)
                 .map_err(|e| static_code(ArmError::Safety(e)))?;
+            inner.check_static_load_quintic_inline(&inner.commanded_positions[..dof], &traj)?;
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,

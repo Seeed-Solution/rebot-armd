@@ -9838,7 +9838,6 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.watchdog_park_blocked_reason = None;
         self.bus_loss_instant = None;
-        self.last_bus_loss_detail = None;
         self.output_suspended = false;
         self.reset_gripper_stall();
         self.handover_settling_since = None;

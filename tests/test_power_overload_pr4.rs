@@ -329,22 +329,18 @@ fn torque_backoff_default_bounds_and_ring_capacity() {
     // Fixed-storage ring keeps at most TORQUE_BACKOFF_DIAG_CAPACITY records without allocating.
     let mut hist = TorqueBackoffHistory::default();
     for seq in 1..=(TORQUE_BACKOFF_DIAG_CAPACITY as u64 + 4) {
-        hist.push(TorqueBackoffRecord {
-            trip_seq: seq,
-            joint: 3,
-            since_s: seq as f64,
-            sign: -1.0,
-            torque_at_trip_nm: -9.46,
-            threshold_nm: 6.0,
-            anchor_q: -1.612,
-            measured_at_trip_q: -1.612,
-            requested_q: -1.607,
-            transmitted_q: None,
-            post_trip_measured_q: None,
-            post_trip_torque_nm: None,
-            post_trip_samples: 0,
-            push_in: false,
-        });
+        hist.push(TorqueBackoffRecord::new(
+            seq,
+            3,
+            seq as f64,
+            -1.0,
+            -9.46,
+            6.0,
+            -1.612,
+            -1.612,
+            -1.607,
+            false,
+        ));
     }
     assert_eq!(hist.len(), TORQUE_BACKOFF_DIAG_CAPACITY);
     assert_eq!(hist.trips_total, TORQUE_BACKOFF_DIAG_CAPACITY as u64 + 4);
@@ -402,18 +398,16 @@ fn fake_bus_real_incident_reproduction_both_owners() {
         assert!((p1.bus_a - 5.41).abs() < 0.25, "step 1 expected ~5.41 A, got {:.2} A", p1.bus_a);
         assert_eq!(p1.severity, StaticOverloadSeverity::None);
 
-        // Step 2: J4 spikes to -9.46 N·m at -1.612 rad -> J4 torque_guard trip & 0.005 rad back-off.
-        // Step 3: Stationary ~8.56+ A (J4=-9.46 N·m + J2 holding gravity) -> static overload Trip.
+        // Step 2 (isolated): J4 spikes to -9.46 N·m at -1.612 rad alone (below 8.5 A static trip)
+        // -> J4 torque_guard first trip & 0.005 rad back-off, wire confirmation, post-trip feedback.
         bus.with(|s| {
-            s.motors[1].tau = 4.5;
+            s.motors[1].tau = 0.0;
             s.motors[2].tau = 0.0;
             s.motors[3].tau = -9.46;
             s.motors[3].q = -1.612;
             s.tx_log.clear();
         });
-        // Run 17 ticks (340 ms; 17 % 5 == 2 ticks after the latest re-trip) so J4 trips,
-        // transmits backed-off target, records post-trip feedback, and fast_a persists >= 8.5 A.
-        for _ in 0..17 {
+        for _ in 0..8 {
             clock.advance(ms(20));
             bus.push_all_fb();
             inner.tick(DT);
@@ -422,7 +416,7 @@ fn fake_bus_real_incident_reproduction_both_owners() {
             .torque_guard
             .backoff_history
             .latest()
-            .expect("J4 torque back-off diagnostic captured");
+            .expect("J4 torque back-off diagnostic captured on stage 2");
         assert_eq!(rec.joint, 3);
         assert!((rec.measured_at_trip_q - (-1.612)).abs() < 1e-3, "meas={}", rec.measured_at_trip_q);
         assert!((rec.requested_q - (-1.607)).abs() < 1e-3, "req={}", rec.requested_q);
@@ -439,6 +433,18 @@ fn fake_bus_real_incident_reproduction_both_owners() {
         let hub_snap = inner.core.hub().latest().expect("published StateHub snapshot");
         assert_eq!(hub_snap.rt.torque_backoff.latest(), Some(&rec));
 
+        // Step 3 (separate stage): Stationary ~8.56+ A (J4=-9.46 N·m + J2 holding gravity) -> static overload Trip.
+        bus.with(|s| {
+            s.motors[1].tau = 4.5;
+            s.motors[2].tau = 0.0;
+            s.motors[3].tau = -9.46;
+        });
+        for _ in 0..17 {
+            clock.advance(ms(20));
+            bus.push_all_fb();
+            inner.tick(DT);
+        }
+
         // Verify Trip alarm + torque limit coexist independently.
         let obs3 = inner.current_observation();
         let p3 = obs3.power.as_ref().unwrap();
@@ -447,7 +453,8 @@ fn fake_bus_real_incident_reproduction_both_owners() {
         assert!(p3.bus_a > 7.8, "expected ~8.56 A display estimate, got {:.2} A", p3.bus_a);
         assert_eq!(obs3.motion_limit.as_ref().map(|m| m.reason), Some(MotionLimitReason::Torque));
 
-        // Hold for 1.7 s (85 ticks): no autonomous retreat, no autonomous enable.
+        // Hold for 1.7 s (85 ticks): verify EVERY transmitted J4 POS_VEL wire frame holds the
+        // exact backed-off pose (zero transient retreat) and zero autonomous enable frames.
         let cmd_before_wait = inner.commanded_positions.clone();
         bus.with(|s| s.tx_log.clear());
         for _ in 0..85 {
@@ -456,17 +463,30 @@ fn fake_bus_real_incident_reproduction_both_owners() {
             inner.tick(DT);
         }
         assert_eq!(inner.commanded_positions, cmd_before_wait, "no autonomous retreat");
+        let j4_wire_frames: Vec<f32> = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.id == 0x104 && f.dlc == 8)
+                .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
+                .collect()
+        });
+        assert!(!j4_wire_frames.is_empty(), "expected J4 wire hold frames during 1.7 s hold");
+        for &wq in &j4_wire_frames {
+            assert!(
+                (wq - cmd_before_wait[3]).abs() < 1e-4,
+                "transient J4 wire retreat detected during 1.7 s hold: wire={wq} expected={}",
+                cmd_before_wait[3]
+            );
+        }
         assert_eq!(bus.enable_cmd_count(), 0, "no autonomous enable");
 
-        // Step 4: Synchronized silence 1.7 s later, motors reboot with J1-J6 TIMEOUT=0 & J7 CTRL_MODE=2.
+        // Step 4: Synchronized silence 1.7 s later; isolate J1-J6 TIMEOUT=0 first (J7 CTRL_MODE stays valid=3).
         bus.with(|s| {
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.silent = true;
                 m.enabled = false;
                 if i < 6 {
                     m.timeout_counts = 0;
-                } else {
-                    m.ctrl_mode = damiao::CTRL_MODE_POS_VEL;
                 }
             }
             s.tx_log.clear();
@@ -503,7 +523,7 @@ fn fake_bus_real_incident_reproduction_both_owners() {
             "static overload Trip alarm must persist through BusLoss (legacy)"
         );
 
-        // Motors come back with reset registers (J1-J6 TIMEOUT=0, J7 CTRL_MODE=2).
+        // Motors come back with isolated J1-J6 TIMEOUT=0 (J7 CTRL_MODE=3 valid).
         bus.with(|s| {
             for m in &mut s.motors {
                 m.silent = false;
@@ -518,15 +538,32 @@ fn fake_bus_real_incident_reproduction_both_owners() {
         bus.with(|s| s.tx_log.clear());
         let stamp = inner.current_admission_stamp();
         let adm = inner.check_admission(stamp).unwrap();
-        let _ = SupervisorInner::enable_torque(adm);
-        for _ in 0..25 {
-            clock.advance(ms(20));
-            bus.push_all_fb();
-            inner.tick(DT);
-        }
+        let en_err = SupervisorInner::enable_torque(adm).unwrap_err().to_string();
+        assert!(
+            en_err.contains("joint 1 TIMEOUT readback mismatch: expected 2000 counts, observed 0 counts"),
+            "expected isolated J1 TIMEOUT mismatch on legacy, got: {en_err}"
+        );
         assert!(!inner.safety.state().is_operational(), "enable must be refused on J1-J6 TIMEOUT=0");
-        assert_eq!(bus.enable_cmd_count(), 0, "zero CMD_ENABLE frames may leave wire on mismatch");
+        assert_eq!(bus.enable_cmd_count(), 0, "zero CMD_ENABLE frames may leave wire on TIMEOUT mismatch");
         assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)));
+
+        // Now isolate J7 CTRL_MODE=2 (restore J1-J6 TIMEOUT=2000) -> CTRL_MODE mismatch refusal!
+        inner.clear_fault().expect("clear EnableFailed before isolated J7 CTRL_MODE test");
+        bus.with(|s| {
+            for i in 0..6 {
+                s.motors[i].timeout_counts = 2000;
+            }
+            s.motors[6].ctrl_mode = damiao::CTRL_MODE_POS_VEL;
+            s.tx_log.clear();
+        });
+        let stamp2 = inner.current_admission_stamp();
+        let adm2 = inner.check_admission(stamp2).unwrap();
+        let cm_err = SupervisorInner::enable_torque(adm2).unwrap_err().to_string();
+        assert!(
+            cm_err.contains("joint 7 CTRL_MODE readback: reads 2, expected 4"),
+            "expected isolated J7 CTRL_MODE mismatch on legacy, got: {cm_err}"
+        );
+        assert_eq!(bus.enable_cmd_count(), 0, "zero CMD_ENABLE frames on J7 CTRL_MODE mismatch");
     }
 
     // =========================================================================
@@ -586,21 +623,19 @@ fn fake_bus_real_incident_reproduction_both_owners() {
         let p1 = fx.core.current_observation().power.unwrap();
         assert!((p1.bus_a - 5.41).abs() < 0.25, "RT step 1 got {:.2} A", p1.bus_a);
 
-        // Steps 2 & 3: J4 trip (-9.46 N·m at -1.612 rad) + stationary ~8.56+ A -> Trip.
+        // Step 2 (isolated): J4 first trip (-9.46 N·m at -1.612 rad) -> back-off & post-trip feedback.
         bus.with(|s| {
-            s.motors[1].tau = 4.5;
+            s.motors[1].tau = 0.0;
             s.motors[2].tau = 0.0;
             s.motors[3].tau = -9.46;
             s.motors[3].q = -1.612;
             s.tx_log.clear();
         });
-        // Run 17 ticks (340 ms) so J4 trips, transmits backed-off target, records post-trip feedback,
-        // and fast_a persists >= supply_trip_a (8.5 A) for >= 100 ms.
-        for _ in 0..17 {
+        for _ in 0..8 {
             bus.push_all_fb();
             let _ = fx.step();
         }
-        let rec = fx
+        let rec = *fx
             .core
             .torque_guard
             .backoff_history
@@ -613,14 +648,26 @@ fn fake_bus_real_incident_reproduction_both_owners() {
         assert!((wire_j4 - tx_q).abs() < 1e-4);
         assert!(rec.post_trip_measured_q.is_some());
         assert!(rec.post_trip_torque_nm.is_some());
+        assert!(rec.post_trip_samples >= 1);
         let hub_snap = fx.core.core.hub().latest().expect("RT published StateHub snapshot");
-        assert_eq!(hub_snap.rt.torque_backoff.latest(), Some(rec));
-        assert_eq!(
-            fx.core.current_observation().power.unwrap().severity,
-            StaticOverloadSeverity::Trip
-        );
+        assert_eq!(hub_snap.rt.torque_backoff.latest(), Some(&rec));
 
-        // Hold 1.7 s: no autonomous retreat or enable.
+        // Step 3 (separate stage): Stationary ~8.56+ A on RT -> Trip + bus_a > 7.8 A.
+        bus.with(|s| {
+            s.motors[1].tau = 4.5;
+            s.motors[2].tau = 0.0;
+            s.motors[3].tau = -9.46;
+        });
+        for _ in 0..17 {
+            bus.push_all_fb();
+            let _ = fx.step();
+        }
+        let p3_rt = fx.core.current_observation().power.unwrap();
+        assert_eq!(p3_rt.severity, StaticOverloadSeverity::Trip);
+        assert!(p3_rt.static_restricted);
+        assert!(p3_rt.bus_a > 7.8, "RT stage 3 expected >7.8 A, got {:.2} A", p3_rt.bus_a);
+
+        // Hold 1.7 s: assert EVERY J4 wire frame holds exact backed-off pose (zero transient retreat).
         let cmd_before_wait = fx.core.commanded_positions.clone();
         bus.with(|s| s.tx_log.clear());
         for _ in 0..85 {
@@ -628,17 +675,30 @@ fn fake_bus_real_incident_reproduction_both_owners() {
             let _ = fx.step();
         }
         assert_eq!(fx.core.commanded_positions, cmd_before_wait);
+        let rt_j4_wire: Vec<f32> = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.id == 0x104 && f.dlc == 8)
+                .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
+                .collect()
+        });
+        assert!(!rt_j4_wire.is_empty());
+        for &wq in &rt_j4_wire {
+            assert!(
+                (wq - cmd_before_wait[3]).abs() < 1e-4,
+                "RT transient J4 wire retreat: wire={wq} expected={}",
+                cmd_before_wait[3]
+            );
+        }
         assert_eq!(bus.enable_cmd_count(), 0);
 
-        // Step 4: Synchronized silence + reset registers.
+        // Step 4: Synchronized silence + isolated J1-J6 TIMEOUT=0 (J7 CTRL_MODE=3 valid).
         bus.with(|s| {
             for (i, m) in s.motors.iter_mut().enumerate() {
                 m.silent = true;
                 m.enabled = false;
                 if i < 6 {
                     m.timeout_counts = 0;
-                } else {
-                    m.ctrl_mode = damiao::CTRL_MODE_POS_VEL;
                 }
             }
             s.tx_log.clear();
@@ -665,7 +725,7 @@ fn fake_bus_real_incident_reproduction_both_owners() {
         );
         assert_eq!(bus.enable_cmd_count(), 0);
 
-        // Recover with reset registers -> clear fault -> RT enable MUST be refused.
+        // Recover with isolated J1-J6 TIMEOUT=0 -> clear fault -> RT enable MUST fail with exact J1 TIMEOUT mismatch.
         bus.with(|s| for m in &mut s.motors { m.silent = false; });
         for _ in 0..4 {
             bus.push_all_fb();
@@ -693,6 +753,11 @@ fn fake_bus_real_incident_reproduction_both_owners() {
             }
         }
         assert!(matches!(rearm_out, Some(Outcome::Failed(_))), "expected Failed, got {rearm_out:?}");
+        let rt_msg = fx.core.safety.fault().map(|f| f.message.as_str().to_string()).unwrap_or_default();
+        assert!(
+            rt_msg.contains("joint 1 TIMEOUT readback mismatch: expected 2000 counts, observed 0 counts"),
+            "RT must report exact J1 TIMEOUT mismatch, got: {rt_msg}"
+        );
         assert!(!fx.core.safety.state().is_operational());
         assert_eq!(bus.enable_cmd_count(), 0);
         assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)));
@@ -786,4 +851,100 @@ async fn diagnostics_routes_publish_torque_backoff_off_thread() {
         .await
         .unwrap();
     assert!((pwr["torque_backoff"]["backoff_rad"].as_f64().unwrap() - 0.005).abs() < 1e-6);
+}
+
+#[test]
+fn m11_m12_tx_seq_and_post_fb_seq_gating() {
+    let mut hist = TorqueBackoffHistory::default();
+    let rec = TorqueBackoffRecord::new(1, 3, 1.0, -1.0, -9.46, 6.0, -1.612, -1.612, -1.607, false);
+    hist.push(rec);
+    // M12: cached feedback BEFORE transmitted_q is recorded must NOT increment post_trip_samples.
+    hist.record_post_trip_feedback(3, 10, 1.02, -1.610, -8.5);
+    assert_eq!(hist.latest().unwrap().post_trip_samples, 0);
+
+    // M11: wire_tx_seq == 0 (no new wire commit since trip at seq 0) must NOT set transmitted_q.
+    hist.record_transmitted(3, 0, -1.607, 10);
+    assert!(hist.latest().unwrap().transmitted_q.is_none());
+
+    // Valid new wire commit at seq 1 -> sets transmitted_q and baselines fb_seq = 10.
+    hist.record_transmitted(3, 1, -1.607, 10);
+    assert!((hist.latest().unwrap().transmitted_q.unwrap() - (-1.607)).abs() < 1e-6);
+
+    // M12: same cached fb_seq=10 must NOT count as a post-trip sample!
+    hist.record_post_trip_feedback(3, 10, 1.04, -1.609, -8.1);
+    assert_eq!(hist.latest().unwrap().post_trip_samples, 0);
+
+    // New fb_seq=11 counts once; repeating fb_seq=11 does NOT double-count.
+    hist.record_post_trip_feedback(3, 11, 1.06, -1.608, -7.8);
+    hist.record_post_trip_feedback(3, 11, 1.08, -1.608, -7.8);
+    assert_eq!(hist.latest().unwrap().post_trip_samples, 1);
+
+    // Disarm closes capture so a later rearm cannot append into the old record.
+    hist.close_open_capture();
+    hist.record_post_trip_feedback(3, 12, 1.10, -1.607, -7.5);
+    assert_eq!(hist.latest().unwrap().post_trip_samples, 1);
+}
+
+#[tokio::test]
+async fn m13_rt_executor_diagnostics_power_reads_live_state_hub() {
+    let mut cfg = b601dm_config();
+    cfg.lease_timeout_ms = 600_000;
+    let lims = b601_limits();
+    let (bus, _clock) = FakeBus::new(&lims);
+    bus.with(|s| {
+        s.motors[3].q = -1.612;
+        s.motors[3].tau = 0.0;
+    });
+    let drv = make_driver(&cfg, bus.clone());
+
+    let sup = std::sync::Arc::new(armd::ArmSupervisor::new(cfg.clone()));
+    sup.inner().write().await.lease_enabled = false;
+    sup.set_driver(Box::new(drv)).await;
+    bus.push_all_fb();
+    let _ = sup.tick(DT).await;
+    // Arm with zero load BEFORE handoff so the detached Legacy shell has trips_total == 0.
+    let stamp = sup.capture_admission_stamp();
+    sup.enable_torque(stamp).await.expect("initial enable before RT handoff");
+    assert_eq!(sup.inner().read().await.torque_guard.backoff_history.trips_total, 0);
+
+    // Hand off ownership to the synchronous RT executor; detached Legacy shell keeps trips_total == 0.
+    let exec_cfg = armd::rt_core::executor::ExecutorConfig::for_tests(Duration::from_millis(20));
+    let handle = sup.start_executor(exec_cfg).await.expect("start RT executor");
+    let app = armd::api::create_router(sup.clone(), armd::auth::OperatorAuth::disabled());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Now inject J4 torque spike exclusively under RT executor ownership!
+    bus.with(|s| {
+        s.motors[3].tau = -9.46;
+    });
+    let feeder = tokio::spawn({
+        let bus = bus.clone();
+        async move {
+            for _ in 0..60 {
+                bus.push_all_fb();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let pwr: serde_json::Value = reqwest::get(format!("http://{addr}/api/v1/diagnostics/power"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pwr["enabled"], true, "RT /diagnostics/power: {pwr}");
+    let trips = pwr["torque_backoff"]["trips_total"].as_u64().unwrap_or(0);
+    assert!(
+        trips >= 1,
+        "M13: RT /diagnostics/power must read live StateHub torque_backoff (not detached Legacy shell), got: {pwr}"
+    );
+    assert_eq!(pwr["torque_backoff"]["latest"]["joint"], 3);
+
+    feeder.abort();
+    drop(handle);
+    server.abort();
 }

@@ -412,3 +412,84 @@ fn host_microbench_four_gravity_solves_per_release() {
     }
     let _ = Outcome::Completed;
 }
+
+#[test]
+fn m5_rebound_above_cap_minor5_model_validation_and_m6_workspace_rollback() {
+    let arm = ArmModel::REBOT_DEV_ARM;
+    let kit_budget = PowerBudget::rebot_dm();
+    let cap = kit_budget.static_admission_cap_a().unwrap();
+
+    // M5: A path 7 A -> 6 A -> 6.5 A (above cap) must be rejected on the upward rebound step,
+    // even though 6.5 A < 7 A start baseline!
+    let q_hi = [0.0, -0.2, 2.2, 0.0, 0.0, 0.0, 0.0];
+    let q_mid = [0.0, -0.5, 1.5, 0.0, 0.0, 0.0, 0.0];
+    let q_low = [0.0, -0.9, 0.8, 0.0, 0.0, 0.0, 0.0];
+    let i_hi = predict_static_holding_current_a(&kit_budget, &arm, &q_hi).unwrap();
+    let i_mid = predict_static_holding_current_a(&kit_budget, &arm, &q_mid).unwrap();
+    let i_low = predict_static_holding_current_a(&kit_budget, &arm, &q_low).unwrap();
+    assert!(
+        i_hi > i_mid + 0.1 && i_mid > i_low + 0.1,
+        "expected descending static load: hi={i_hi:.3} mid={i_mid:.3} low={i_low:.3}"
+    );
+    let mut b_rebound = kit_budget.clone();
+    b_rebound.static_reserve_a = cap - i_low + 0.25;
+    assert!(i_low + b_rebound.static_reserve_a > cap);
+    // Monotone lowering passes:
+    armd::power::check_static_load_poses(
+        &b_rebound,
+        &arm,
+        &q_hi,
+        [q_mid.as_slice(), q_low.as_slice()],
+        false,
+    )
+    .expect("monotone lowering above cap must pass");
+    // Rebound hi -> low -> mid must FAIL (even though mid < hi!):
+    let rebound_err = armd::power::check_static_load_poses(
+        &b_rebound,
+        &arm,
+        &q_hi,
+        [q_low.as_slice(), q_mid.as_slice()],
+        false,
+    );
+    assert!(
+        matches!(rebound_err, Err(MotionError::StaticLoadLimit)),
+        "rebound above cap must be refused with StaticLoadLimit, got {rebound_err:?}"
+    );
+
+    // Minor 5: ArmConfig::validate rejects dof < arm_model.arm_dof() when static cap is enabled.
+    let mut short_cfg = ArmConfig::default();
+    short_cfg.dof = 4;
+    short_cfg.joint_names = (1..=4).map(|i| format!("joint_{i}")).collect();
+    short_cfg.limits.truncate(4);
+    short_cfg.home_positions = vec![0.0; 4];
+    let mut pb4 = PowerBudget::rebot_dm();
+    pb4.joints.truncate(4);
+    short_cfg.power_budget = Some(pb4);
+    let val_err = short_cfg.validate().unwrap_err();
+    assert!(
+        val_err.contains("static_admission_fraction"),
+        "expected static_admission_fraction dof mismatch error, got: {val_err}"
+    );
+
+    // M6: Refused servo step MUST NOT commit workspace escape clearance (`servo_ws_min_depths`).
+    let mut ws_cfg = ArmConfig::rebot_dm();
+    ws_cfg.power_budget.as_mut().unwrap().static_reserve_a = cap - 0.5 * (i_low + i_hi);
+    if let Some(ws) = ws_cfg.workspace.as_mut() {
+        ws.floor_z_m = 0.05;
+    }
+    let mut inner = armed_legacy(ws_cfg, q_low);
+    // Ensure start pose has a known workspace state and `servo_ws_min_depths` is initially None.
+    assert!(inner.servo_ws_min_depths.is_none());
+    let ep = inner.safety.epoch_id();
+    let s = inner.current_admission_stamp();
+    // Force a servo_target directly that worsens static load above cap so the tick hits
+    // `servo_step_workspace_rt` -> `check_static_load_admission` refusal.
+    let _ = ep;
+    let _ = s;
+    inner.servo_target = Some(q_hi.to_vec());
+    inner.tick(DT);
+    assert!(
+        inner.servo_ws_min_depths.is_none(),
+        "M6: workspace clearance depths must NOT be committed when static-load admission refuses the step"
+    );
+}

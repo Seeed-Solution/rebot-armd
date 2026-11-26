@@ -547,9 +547,18 @@ impl SupervisorInner {
                         Some(1.5),
                         &self.planning_limits(),
                     ) {
-                        // power budget: slowed to fit, never refused
+                        // dynamic power budget: slowed to fit, never refused; static overload
+                        // restriction MUST still refuse load-increasing park paths and keep hold.
                         let traj = match self.power_fit_quintic(traj.clone(), &clamped_start, &self.commanded_velocities, &home, &self.planning_limits(), false) {
                             Ok((t, _)) => t,
+                            Err(ArmError::Motion(crate::motion::MotionError::StaticLoadLimit)) => {
+                                tracing::warn!("Park path refused by static load restriction; maintaining safe hold");
+                                self.pending_normal_unload = false;
+                                self.unload_settle = None;
+                                self.replace_active_trajectory(None);
+                                self.note_motion_limit(MotionLimitReason::Power, None);
+                                return;
+                            }
                             Err(e) => { tracing::warn!("Park power planning failed ({e}); parking as planned"); traj }
                         };
                         // Park checks all enabled workspace constraints: destination resting pose
@@ -707,11 +716,7 @@ impl SupervisorInner {
                 if self.bus_loss_instant.is_none() {
                     self.bus_loss_instant = Some(Instant::now());
                 }
-                let bus_loss_detail = self.classify_bus_loss_detail();
-                if bus_loss_detail.is_some() {
-                    self.last_bus_loss_detail = bus_loss_detail;
-                }
-                let fault_detail = match bus_loss_detail {
+                let fault_detail = match self.classify_bus_loss_detail() {
                     Some(d) => crate::safety::FaultDetail::BusLossAnnotated(d),
                     None => crate::safety::FaultDetail::BusLoss,
                 };

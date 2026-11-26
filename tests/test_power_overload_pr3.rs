@@ -534,4 +534,228 @@ fn cockpit_static_overload_banner_independent_of_motion_limit() {
         html.contains("p.severity === 'trip' || p.severity === 'warning'"),
         "renderPower must read observation.power.severity directly"
     );
+
+    // Minor 6: Execute the real `renderPower` JS logic from `src/api/index.html` in Node with
+    // mock DOM elements covering valid trip, invalid-telemetry warning, clear, and concurrent
+    // torque-limit motion_limit priority.
+    let script = r#"
+const fs = require('fs');
+const html = fs.readFileSync('src/api/index.html', 'utf8');
+const dictStart = html.indexOf("const I18N = {");
+const dictEnd = html.indexOf("function t(", dictStart);
+const rpStart = html.indexOf("function renderPower(");
+const rpEnd = html.indexOf("\nfunction ", rpStart + 10);
+if (dictStart < 0 || rpStart < 0 || rpEnd < 0) throw new Error('missing renderPower or I18N');
+
+function makeEl() {
+  const attrs = {};
+  return {
+    hidden: true,
+    textContent: '',
+    title: '',
+    style: {},
+    classes: new Set(),
+    classList: {
+      add(c) { this._s.add(c); },
+      remove(...cs) { cs.forEach(c => this._s.delete(c)); },
+      toggle(c, on) { if (on) this._s.add(c); else this._s.delete(c); },
+      contains(c) { return this._s.has(c); },
+    },
+    setAttribute(k, v) { attrs[k] = v; },
+    attrs,
+    dataset: {},
+  };
+}
+const els = {};
+for (const id of ['pwr','pwr-alarm','pwr-alarm-title','pwr-alarm-sub','pwr-fill','pwr-soft','pwr-hard','pwr-peak','pwr-pct']) {
+  const e = makeEl();
+  e.classList._s = e.classes;
+  els[id] = e;
+}
+const document = { getElementById: (id) => els[id] || null };
+const vm = require('vm');
+const ctx = {
+  document,
+  $: (id) => els[id] || null,
+  setText: (el, txt) => { if (el) el.textContent = txt; },
+  PWR: { key: '', alarmKey: '' },
+  S: { powerGov: { soft: 0.8, hard: 0.95 } },
+  console,
+  Math,
+  Number,
+  String,
+  Array,
+  Object,
+  isFinite,
+  store: () => null,
+  navigator: { language: 'en' },
+};
+vm.createContext(ctx);
+vm.runInContext(
+  html.slice(dictStart, dictEnd) +
+  "\nLANG = 'en';\nfunction t(k, vars){ let s = (I18N[LANG] && I18N[LANG][k]) || (I18N.en && I18N.en[k]) || k; if (vars) for (const [a,b] of Object.entries(vars)) s = s.replace('{'+a+'}', b); return s; }\n" +
+  html.slice(rpStart, rpEnd),
+  ctx
+);
+
+// 1. Valid trip with concurrent torque limit (renderPower takes full observation, independent of motion_limit).
+ctx.renderPower({
+  motion_limit: { reason: 'torque', joint: 3 },
+  power: { valid: true, bus_a: 8.56, peak_a: 8.6, rated_a: 6.5, ratio: 1.317, severity: 'trip', static_restricted: true, hold: false, limiting: false },
+});
+if (els['pwr-alarm'].hidden !== false) throw new Error('trip banner must be visible');
+if (!els['pwr-alarm'].classes.has('trip')) throw new Error('trip class missing');
+if (!els['pwr-alarm-title'].textContent.length || !els['pwr-alarm-sub'].textContent.length) throw new Error('empty trip text');
+
+// 2. Invalid telemetry during active warning (e.g. after BusLoss): banner MUST stay visible!
+ctx.renderPower({
+  motion_limit: { reason: 'torque', joint: 3 },
+  power: { valid: false, bus_a: 0, peak_a: 0, rated_a: 6.5, ratio: 0, severity: 'warning', static_restricted: true, hold: false, limiting: false },
+});
+if (els['pwr-alarm'].hidden !== false) throw new Error('warning banner must stay visible when valid=false');
+if (!els['pwr-alarm'].classes.has('warn')) throw new Error('warn class missing');
+
+// 3. Cleared severity -> banner hidden.
+ctx.renderPower({
+  power: { valid: true, bus_a: 2.0, peak_a: 2.1, rated_a: 6.5, ratio: 0.31, severity: 'none', static_restricted: false, hold: false, limiting: false },
+});
+if (els['pwr-alarm'].hidden !== true) throw new Error('cleared banner must be hidden');
+"#;
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run node to execute cockpit renderPower");
+    assert!(
+        out.status.success(),
+        "cockpit renderPower JS verification failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn b6_b7_m7_m8_m9_restriction_fences_park_gravity_comp_static_band_and_nonfinite() {
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
+    let kit_budget = PowerBudget::rebot_dm();
+    let mid_q = [0.0, -0.8, 0.8, 0.0, 0.0, 0.0, 0.0];
+    let heavy_rest_q = [0.0, -0.2, 2.2, 0.0, 0.0, 0.0, 0.0];
+    let i_mid = armd::power::predict_static_holding_current_a(&kit_budget, &arm, &mid_q).unwrap();
+    let i_heavy = armd::power::predict_static_holding_current_a(&kit_budget, &arm, &heavy_rest_q).unwrap();
+    assert!(i_heavy > i_mid + 0.5);
+
+    let make_armed = |cfg: ArmConfig, q: [f32; 7]| {
+        let (drv, st) = FakeStaticDriver::new(q.to_vec(), vec![0.0; 7]);
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.tick(DT);
+        let s = inner.current_admission_stamp();
+        inner
+            .check_admission(s)
+            .and_then(|a| SupervisorInner::enable_torque(a))
+            .unwrap();
+        inner.tick(DT);
+        (inner, st)
+    };
+
+    // B7: Park path that increases load MUST be refused under static restriction (both prepare_motion
+    // and verify_motion_freshness for pre-alarm Park slots, and Legacy inline unload!).
+    let mut cfg = config_no_pr2_cap();
+    cfg.resting_pose = None;
+    cfg.zero_reference = None;
+    cfg.home_positions = heavy_rest_q.to_vec();
+    let (mut inner, st) = make_armed(cfg.clone(), mid_q);
+
+    // Prepare a Park slot BEFORE static restriction activates (`static_restricted == false`).
+    let pre_snap = MotionPlanSnapshot::from_supervisor(&inner);
+    assert!(!pre_snap.static_restricted);
+    let pre_park = prepare_motion(&pre_snap, &MotionRequest::park())
+        .expect("pre-restriction park prepares");
+    assert!(!pre_park.slot.static_restricted);
+
+    // Activate static Trip alarm (8.6 A stationary for 0.32 s).
+    st.lock().unwrap().tau = vec![0.0, 14.0, 12.0, -8.5, 0.0, 0.0, 0.0];
+    for _ in 0..16 {
+        st.lock().unwrap().rx_at = Some(Instant::now());
+        inner.tick(DT);
+    }
+    assert!(inner.power.is_static_restricted());
+
+    // B7 (freshness): pre-alarm Park slot MUST be rejected as PlanStale once restricted!
+    let fresh_err = armd::rt_core::requests::motion::verify_motion_freshness(&inner, &pre_park.slot);
+    assert_eq!(
+        fresh_err,
+        Err(armd::rt_core::requests::motion::MotionInstallError::PlanStale),
+        "B7: pre-restriction Park slot must be rejected as PlanStale"
+    );
+
+    // B7 (prepare_motion): re-preparing load-increasing Park under restriction MUST fail StaticLoadLimit!
+    let restricted_snap = MotionPlanSnapshot::from_supervisor(&inner);
+    assert!(restricted_snap.static_restricted);
+    let park_err = prepare_motion(&restricted_snap, &MotionRequest::park());
+    assert!(
+        matches!(park_err, Err(ArmError::Motion(MotionError::StaticLoadLimit))),
+        "B7: load-increasing Park under static restriction must fail StaticLoadLimit, got {park_err:?}"
+    );
+
+    // M7: Nonfinite estimate (e.g. inf from extreme Kt) MUST invalidate without contaminating
+    // filters, while preserving `last_valid_bus_a` and active `static_severity`!
+    let last_good = inner.power.last_valid_bus_a.expect("last valid bus_a recorded");
+    assert!(last_good.is_finite() && last_good > 0.0);
+    let bad_est = estimate_of(f32::INFINITY);
+    let b = inner.power_budget().unwrap().clone();
+    let step = inner.power.step(
+        &b,
+        &bad_est,
+        DT,
+        10.0,
+        armd::power::GovernorInput {
+            operational: true,
+            gravity_comp: false,
+            moving: false,
+            torques: &[],
+            commanded_velocities: &[],
+            hold_positions: &[],
+        },
+    );
+    assert!(step.trip_joint.is_none());
+    assert!(!inner.power.valid, "M7: nonfinite estimate must invalidate PowerMonitor");
+    assert!(inner.power.fast_a.is_finite() && inner.power.bus_a.is_finite(), "M7: filters must not be contaminated");
+    assert_eq!(inner.power.last_valid_bus_a, Some(last_good), "M7: last_valid_bus_a preserved");
+    assert_eq!(inner.power.static_severity, StaticOverloadSeverity::Trip, "M7: active alarm preserved");
+
+    // M8: Low-speed static band (0.01 rad/s commanded & measured, active target, dominant pushing
+    // joint above trip current) MUST trigger static alarm ONLY and NOT dynamic `power_trip`!
+    let mut cfg_m8 = cfg;
+    cfg_m8.torque_guard = None;
+    let (mut inner_m8, st_m8) = make_armed(cfg_m8, mid_q);
+    st_m8.lock().unwrap().tau = vec![0.0, 14.0, 12.0, -8.5, 0.0, 0.0, 0.0];
+    st_m8.lock().unwrap().v = vec![0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let mut slow_target = mid_q.to_vec();
+    slow_target[1] += 0.0001;
+    let ref_before = inner_m8.commanded_positions.clone();
+    for _ in 0..16 {
+        st_m8.lock().unwrap().rx_at = Some(Instant::now());
+        inner_m8.commanded_velocities.fill(0.0);
+        inner_m8.commanded_velocities[1] = 0.01;
+        inner_m8.servo_target = Some(slow_target.clone());
+        inner_m8.tick(DT);
+    }
+    assert_eq!(
+        inner_m8.power.static_severity,
+        StaticOverloadSeverity::Trip,
+        "M8: static alarm must trip (fast_a={}, bus_a={}, valid={}, torqued={}, state={:?}, v_meas={:?}, v_cmd={:?})",
+        inner_m8.power.fast_a,
+        inner_m8.power.bus_a,
+        inner_m8.power.valid,
+        inner_m8.is_torqued,
+        inner_m8.safety.state(),
+        inner_m8.measured_velocities,
+        inner_m8.commanded_velocities
+    );
+    assert!(inner_m8.power.gov.hold.is_none(), "M8: dynamic governor must NOT trip inside static velocity band");
+    assert!(
+        (inner_m8.commanded_positions[1] - ref_before[1]).abs() <= 0.001,
+        "M8: held reference must not be replaced by power_trip"
+    );
 }

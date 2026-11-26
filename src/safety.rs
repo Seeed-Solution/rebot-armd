@@ -124,6 +124,25 @@ pub struct BusLossDetail {
 }
 
 impl BusLossDetail {
+    /// Writes only the synchronized-loss annotation suffix into `out` without heap allocation.
+    pub fn write_annotation_suffix_into(&self, out: &mut impl core::fmt::Write) {
+        if !self.synchronized {
+            return;
+        }
+        let _ = match self.last_power_a.filter(|a| a.is_finite()) {
+            Some(a) => write!(
+                out,
+                "Suspected motor power loss or shared CAN interruption. ({} motors silent within {} ms; last power estimate {a:.2} A)",
+                self.reporting_motors, self.spread_ms
+            ),
+            None => write!(
+                out,
+                "Suspected motor power loss or shared CAN interruption. ({} motors silent within {} ms)",
+                self.reporting_motors, self.spread_ms
+            ),
+        };
+    }
+
     /// Formats a human-readable bus-loss message directly into a [`core::fmt::Write`] sink
     /// without heap allocation.
     pub fn write_message_into(&self, out: &mut impl core::fmt::Write) {
@@ -131,18 +150,8 @@ impl BusLossDetail {
             let _ = out.write_str("No fresh feedback from every joint (bus loss)");
             return;
         }
-        let _ = match self.last_power_a.filter(|a| a.is_finite()) {
-            Some(a) => write!(
-                out,
-                "No fresh feedback from every joint (bus loss). Suspected motor power loss or shared CAN interruption. ({} motors silent within {} ms; last power estimate {a:.2} A)",
-                self.reporting_motors, self.spread_ms
-            ),
-            None => write!(
-                out,
-                "No fresh feedback from every joint (bus loss). Suspected motor power loss or shared CAN interruption. ({} motors silent within {} ms)",
-                self.reporting_motors, self.spread_ms
-            ),
-        };
+        let _ = out.write_str("No fresh feedback from every joint (bus loss). ");
+        self.write_annotation_suffix_into(out);
     }
 }
 
@@ -426,7 +435,7 @@ pub const JOINT_LIMIT_ARC_POOL_CAPACITY: usize = 8;
 /// Capacity of [`SafetyManager`]'s bounded deferred safety log event ring.
 pub const SAFETY_LOG_CAPACITY: usize = 64;
 /// Maximum inline text bytes stored in a deferred safety log event's `FaultReason::Other`.
-pub const SAFETY_LOG_TEXT_CAPACITY: usize = 320;
+pub const SAFETY_LOG_TEXT_CAPACITY: usize = 448;
 /// Maximum inline bytes stored for a joint name in a deferred safety log event.
 pub const SAFETY_JOINT_NAME_CAPACITY: usize = 64;
 /// Fallback message recorded when a latched fault's detail storage is unavailable.
@@ -1560,6 +1569,10 @@ pub struct SafetyManager {
     /// Fixed-size preallocated record of the representative detail per latched [`FaultKind`]
     /// (`FaultKind::COUNT` slots, allocated once at startup; zero RT heap ops).
     latched_fault_details: Box<[Option<LatchedFaultDetail>]>,
+    /// Preserved synchronized-bus-loss annotation for the active `FaultKind::BusLoss` incident
+    /// so MIT fence latches or later synchronized staleness detection keep both the MIT recovery
+    /// instructions and the power-loss annotation without truncation or overwrite.
+    synchronized_bus_loss: Option<BusLossDetail>,
     /// Atomic stopped-state signal (`state.is_stopped() || has_latched_fault()`) shared with
     /// hardware drivers so their transmit choke point enforces Rule A′ without locks.
     stopped_flag: Arc<AtomicBool>,
@@ -1616,6 +1629,7 @@ impl Clone for SafetyManager {
             latched_fault_codes: self.latched_fault_codes,
             has_non_recoverable: self.has_non_recoverable,
             latched_fault_details: self.latched_fault_details.clone(),
+            synchronized_bus_loss: self.synchronized_bus_loss,
             stopped_flag: Arc::new(AtomicBool::new(
                 self.state_arc.is_stopped() || self.latched_fault_kinds != 0,
             )),
@@ -1680,6 +1694,7 @@ impl Default for SafetyManager {
             latched_fault_codes: 0,
             has_non_recoverable: false,
             latched_fault_details: vec![None; FaultKind::COUNT].into_boxed_slice(),
+            synchronized_bus_loss: None,
             stopped_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -2344,6 +2359,13 @@ impl SafetyManager {
                 }) if d.synchronized
             )
             && matches!(bounded_reason, BoundedFaultReason::BusLoss);
+        if kind == FaultKind::BusLoss {
+            if let BoundedFaultReason::BusLossAnnotated(d) = bounded_reason {
+                if d.synchronized && self.synchronized_bus_loss.is_none() {
+                    self.synchronized_bus_loss = Some(d);
+                }
+            }
+        }
         if !keep_prev_other_detail && !keep_prev_bus_loss_detail {
             self.latched_fault_details[kind as usize] = Some(LatchedFaultDetail {
                 code,
@@ -2585,6 +2607,7 @@ impl SafetyManager {
             self.latched_fault_codes = 0;
             self.has_non_recoverable = false;
             self.latched_fault_details.fill(None);
+            self.synchronized_bus_loss = None;
             self.sync_stopped_flag();
             self.bump_epoch();
             Ok(SafetyState::Idle)
@@ -2621,6 +2644,34 @@ impl SafetyManager {
         }
     }
 
+    /// True when the active `FaultKind::BusLoss` incident already carries a synchronized
+    /// multi-motor power-loss / shared-CAN annotation.
+    #[inline]
+    pub fn has_synchronized_bus_loss(&self) -> bool {
+        self.synchronized_bus_loss.is_some()
+    }
+
+    /// Enriches an already-latched `FaultKind::BusLoss` (e.g. an early 45 ms MIT deadline fence
+    /// latch) once synchronized multi-motor silence is observed, preserving any existing MIT
+    /// recovery instructions without heap allocation.
+    pub fn enrich_bus_loss_detail(&mut self, detail: BusLossDetail) {
+        if !detail.synchronized || !self.has_latched_fault_kind(FaultKind::BusLoss) {
+            return;
+        }
+        if self.synchronized_bus_loss.is_none() {
+            self.synchronized_bus_loss = Some(detail);
+        }
+        if matches!(
+            self.latched_fault_details[FaultKind::BusLoss as usize],
+            None | Some(LatchedFaultDetail { reason: BoundedFaultReason::BusLoss, .. })
+        ) {
+            self.latched_fault_details[FaultKind::BusLoss as usize] = Some(LatchedFaultDetail {
+                code: FaultCode::BusLoss,
+                reason: BoundedFaultReason::BusLossAnnotated(detail),
+            });
+        }
+    }
+
     /// Structured `observation.fault` for the most severe recorded kind, with `recoverable`
     /// computed by [`Self::recoverable`] (0 heap allocations).
     pub fn fault(&self) -> Option<FaultInfo> {
@@ -2628,6 +2679,14 @@ impl SafetyManager {
         let code = if let Some(kind) = self.highest_severity_kind() {
             if let Some(detail) = self.latched_fault_details[kind as usize] {
                 detail.reason.write_message_into(&mut message);
+                if kind == FaultKind::BusLoss {
+                    if let Some(sync) = self.synchronized_bus_loss {
+                        if !matches!(detail.reason, BoundedFaultReason::BusLossAnnotated(_)) {
+                            let _ = core::fmt::Write::write_str(&mut message, " ");
+                            sync.write_annotation_suffix_into(&mut message);
+                        }
+                    }
+                }
                 detail.code
             } else {
                 message.push_str(DETAIL_UNAVAILABLE);

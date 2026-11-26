@@ -204,6 +204,9 @@ impl SupervisorInner {
             || !self.safety.state().is_operational() {
             return Some(reason("NOT_ARMED", "Enable the arm first"));
         }
+        if self.power.is_static_restricted() {
+            return Some(reason("STATIC_LOAD_LIMIT", crate::power::STATIC_LOAD_LIMIT_MSG));
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_loading {
             return Some(reason("MOTION_BUSY", "a policy is loading"));

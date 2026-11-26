@@ -259,21 +259,12 @@ impl SupervisorInner {
     pub(super) fn enter_servo_static_load_hold_rt(&mut self) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
-            if self.rt_executor_owned {
-                self.terminate_policy_run_static(
-                    "STATIC_LOAD_LIMIT",
-                    "failed",
-                    Some("STATIC_LOAD_LIMIT"),
-                    Some(crate::power::STATIC_LOAD_LIMIT_MSG),
-                );
-            } else {
-                self.terminate_policy_run(
-                    "STATIC_LOAD_LIMIT",
-                    "failed",
-                    Some("STATIC_LOAD_LIMIT"),
-                    Some(crate::power::STATIC_LOAD_LIMIT_MSG.to_string()),
-                );
-            }
+            self.terminate_policy_run_static(
+                "STATIC_LOAD_LIMIT",
+                "failed",
+                Some("STATIC_LOAD_LIMIT"),
+                Some(crate::power::STATIC_LOAD_LIMIT_MSG),
+            );
         }
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
@@ -325,11 +316,16 @@ impl SupervisorInner {
     /// uses pre-sized clearance slices and sweep slab from `self.ws_eval_bufs` (zero heap ops
     /// for any legal workspace size, including 32 end points + multiple keep-out boxes and
     /// refusal / budget-exceeded paths).
+    ///
+    /// Does NOT commit `self.servo_ws_min_depths`: returns `Ok(Some(updated_len))` when candidate
+    /// clearance depths were computed into `self.ws_eval_bufs.scratch_cand_min_d[..updated_len]`,
+    /// and the caller must invoke [`Self::commit_servo_ws_min_depths_rt`] ONLY after all sibling
+    /// step gates (including static-load admission) also pass.
     pub(super) fn servo_step_workspace_rt(
         &mut self,
         next: &[f32],
         phase: &'static str,
-    ) -> Result<(), crate::chain::WorkspaceFailureRt> {
+    ) -> Result<Option<usize>, crate::chain::WorkspaceFailureRt> {
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let mut updated_len = 0usize;
         let result = (|| {
@@ -411,9 +407,16 @@ impl SupervisorInner {
             eval.recycle(&mut bufs);
             checked
         })();
+        self.ws_eval_bufs = bufs;
+        result.map(|updated| updated.then_some(updated_len))
+    }
+
+    /// Commit candidate workspace clearance depths computed by [`Self::servo_step_workspace_rt`]
+    /// into `self.servo_ws_min_depths` (0 heap ops) atomically alongside the accepted step.
+    pub(super) fn commit_servo_ws_min_depths_rt(&mut self, updated_len: usize) {
         let rev = self.workspace_revision;
-        if result.as_ref().is_ok_and(|&updated| updated) {
-            // Update `servo_ws_min_depths` in place (or from `bufs.min_depths_spare`) with 0 heap ops.
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        if updated_len <= bufs.scratch_cand_min_d.len() {
             let src = &bufs.scratch_cand_min_d[..updated_len];
             let updated_in_place = match self.servo_ws_min_depths.as_mut() {
                 Some((cur_rev, dst)) if dst.as_slice().len() == updated_len => {
@@ -451,7 +454,6 @@ impl SupervisorInner {
             }
         }
         self.ws_eval_bufs = bufs;
-        result.map(|_| ())
     }
 
     /// `check_workspace_path(commanded, [target])` with the evaluator's reused vectors (no
@@ -2677,9 +2679,8 @@ impl SupervisorInner {
         run.authorization.revoke();
         self.record_pending_policy_close(action_id);
         self.end_policy_stream(action_id);
-        self.set_action_policy_stats(action_id, final_stats.unwrap_or_else(|| run.step_stats.report()));
-        run.stop_reason = Some(stop_reason.to_string());
-        self.record_policy_qualification(&run, stop_reason, action_state);
+        let stats_report = final_stats.unwrap_or_else(|| run.step_stats.report());
+        self.set_action_policy_stats(action_id, stats_report);
         if run.mode == crate::policy_runtime::PolicyMode::Live {
             self.release_servo_target();
             self.servo_settled_ticks.fill(0);
@@ -2687,8 +2688,11 @@ impl SupervisorInner {
             self.j7_admitted_stamp = None;
             copy_into(&mut self.target_positions, &self.commanded_positions);
         }
+        if self.last_policy_obs.is_none() {
+            self.last_policy_obs = self.last_policy_obs_spare.take();
+        }
         if let Some(obs) = self.last_policy_obs.as_mut() {
-            run.to_observation_into(false, obs);
+            run.to_observation_into_with_vec_spare(false, obs, &mut self.last_policy_obs_vec_spare);
             obs.stop_reason = Some(crate::model::HolderLabel::new(stop_reason));
         } else {
             let mut obs = run.to_observation(false);
@@ -2704,7 +2708,29 @@ impl SupervisorInner {
             None,
             None,
         );
-        self.retire_policy_run(run);
+        if self.defer_zero_check_persist {
+            // Defer supervised_first_run ledger I/O (open/write/sync_all) off the Legacy control
+            // release lock without allocating on the control path (B4).
+            let needs_qual = run.mode == crate::policy_runtime::PolicyMode::Live
+                && !self.policy_live_allowed()
+                && self.policy_ledger_path.is_some()
+                && run.verified_release_gate.as_ref().is_some_and(|g| {
+                    g.authorization_tier() == crate::policy_runtime::AuthorizationTier::SupervisedFirstRun
+                });
+            if needs_qual {
+                self.pending_policy_qual_persist = Some((
+                    run,
+                    crate::model::HolderLabel::new(stop_reason),
+                    crate::model::HolderLabel::new(action_state),
+                ));
+            } else {
+                self.retire_policy_run(run);
+            }
+        } else {
+            run.stop_reason = Some(stop_reason.to_string());
+            self.record_policy_qualification(&run, stop_reason, action_state);
+            self.retire_policy_run(run);
+        }
     }
 
     pub(crate) fn terminate_policy_run(

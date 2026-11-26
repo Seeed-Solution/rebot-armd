@@ -664,6 +664,7 @@ pub fn check_static_load_quintic(
     };
     let base_a = predict_static_holding_current_a(budget, arm, start)
         .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
+    let mut prev_a = base_a;
     let n = crate::power_plan::Samples::count(&budget.planning, traj.duration);
     let sample_dof = dof.min(traj.polynomials.len()).min(crate::chain::MAX_CHAIN_JOINTS);
     let mut q = [0.0f32; crate::chain::MAX_CHAIN_JOINTS];
@@ -674,8 +675,9 @@ pub fn check_static_load_quintic(
         }
         let cand_a = predict_static_holding_current_a(budget, arm, &q[..sample_dof])
             .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
-        check_static_admission_values(base_a, cand_a, cap_a, strict_lowering)
+        check_static_admission_values(prev_a, cand_a, cap_a, strict_lowering)
             .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
+        prev_a = cand_a;
     }
     Ok(())
 }
@@ -696,13 +698,14 @@ where
         None if strict_lowering => 0.0,
         None => return Ok(()),
     };
-    let base_a = predict_static_holding_current_a(budget, arm, start)
+    let mut prev_a = predict_static_holding_current_a(budget, arm, start)
         .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
     for q in poses {
         let cand_a = predict_static_holding_current_a(budget, arm, q)
             .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
-        check_static_admission_values(base_a, cand_a, cap_a, strict_lowering)
+        check_static_admission_values(prev_a, cand_a, cap_a, strict_lowering)
             .map_err(|_| crate::motion::MotionError::StaticLoadLimit)?;
+        prev_a = cand_a;
     }
     Ok(())
 }
@@ -811,6 +814,26 @@ impl PowerMonitor {
         self.reset_static_persistence();
     }
 
+    /// Shared stationary-band classification used by both the static overload alarm and the
+    /// dynamic power governor so a low-speed (`<= STATIC_VELOCITY_RAD_S`) overload never triggers
+    /// a reference-changing dynamic `power_trip` in the alarm-only static band.
+    pub fn in_static_velocity_band(
+        budget: &PowerBudget,
+        measured_velocities: &[f32],
+        commanded_velocities: &[f32],
+    ) -> bool {
+        let n = budget.joints.len().min(MAX_JOINTS);
+        n > 0
+            && measured_velocities.len() >= n
+            && commanded_velocities.len() >= n
+            && (0..n).all(|j| {
+                measured_velocities[j].is_finite()
+                    && commanded_velocities[j].is_finite()
+                    && measured_velocities[j].abs() <= STATIC_VELOCITY_RAD_S
+                    && commanded_velocities[j].abs() <= STATIC_VELOCITY_RAD_S
+            })
+    }
+
     /// Advance the static overload alarm state machine on fresh feedback.
     /// Returns `Some(new_severity)` when `static_severity` changes.
     /// Alarm only: never commands motion or torque-off.
@@ -832,17 +855,8 @@ impl PowerMonitor {
         let soft_a = budget.governor.soft * budget.supply_rated_a;
         let hard_a = budget.governor.hard * budget.supply_rated_a;
         let trip_a = budget.supply_trip_a;
-        let n = budget.joints.len().min(MAX_JOINTS);
         let stationary = !gravity_comp
-            && n > 0
-            && measured_velocities.len() >= n
-            && commanded_velocities.len() >= n
-            && (0..n).all(|j| {
-                measured_velocities[j].is_finite()
-                    && commanded_velocities[j].is_finite()
-                    && measured_velocities[j].abs() <= STATIC_VELOCITY_RAD_S
-                    && commanded_velocities[j].abs() <= STATIC_VELOCITY_RAD_S
-            });
+            && Self::in_static_velocity_band(budget, measured_velocities, commanded_velocities);
 
         let mut above_hard_stationary = false;
         if stationary && self.fast_a.is_finite() && self.fast_a >= trip_a {
@@ -892,7 +906,19 @@ impl PowerMonitor {
     }
 
     /// Feed one estimate taken `dt` s after the previous one at observation time `now_s`.
+    /// Rejects any nonfinite estimate before touching filters or validity, preserving the
+    /// last valid estimate and any active static overload alarm.
     pub fn update(&mut self, budget: &PowerBudget, e: &Estimate, dt: f32, now_s: f64) {
+        let finite = e.bus_a.is_finite()
+            && e.regen_w.is_finite()
+            && dt.is_finite()
+            && dt >= 0.0
+            && now_s.is_finite()
+            && e.joint_a[..e.n.min(MAX_JOINTS)].iter().all(|v| v.is_finite());
+        if !finite {
+            self.invalidate();
+            return;
+        }
         let lp = |y: f32, x: f32, tc: f32| if tc <= 0.0 { x } else { y + (x - y) * (dt / (tc + dt)) };
         if self.primed {
             self.fast_a = lp(self.fast_a, e.bus_a, FAST_FILTER_S);
@@ -906,8 +932,8 @@ impl PowerMonitor {
         self.valid = true;
         self.stale_s = 0.0;
         self.raw_a = e.bus_a;
-        if self.bus_a.is_finite() { self.last_valid_bus_a = Some(self.bus_a); }
-        if self.fast_a.is_finite() { self.last_valid_fast_a = Some(self.fast_a); }
+        self.last_valid_bus_a = Some(self.bus_a);
+        self.last_valid_fast_a = Some(self.fast_a);
         self.peak_5s.push(now_s, self.fast_a);
         self.peak_60s.push(now_s, self.fast_a);
         if self.fast_a > self.max_a { self.max_a = self.fast_a; self.max_at_s = now_s; }
@@ -934,6 +960,9 @@ impl PowerMonitor {
     pub fn step(&mut self, budget: &PowerBudget, estimate: &Estimate, dt_s: f64,
         now_s: f64, input: GovernorInput<'_>) -> GovernorStep {
         self.update(budget, estimate, dt_s as f32, now_s);
+        if !self.valid {
+            return GovernorStep::default();
+        }
         self.gov.step(&budget.clone_policy(), estimate, self.fast_a, self.bus_a,
             dt_s, now_s, input)
     }
@@ -1000,23 +1029,32 @@ impl SupervisorInner {
         let rated = budget.supply_rated_a;
         let trip_a = budget.supply_trip_a;
         let policy = budget.governor;
+        let in_static_band = PowerMonitor::in_static_velocity_band(
+            budget,
+            &self.measured_velocities,
+            &self.commanded_velocities,
+        );
         let result = self.power.step(budget, &e, dt, now, GovernorInput {
             operational: self.is_torqued && self.safety.state().is_operational()
                 && !self.disable_pending && !self.pending_rearm,
             gravity_comp: self.gravity_comp.is_some(),
-            moving: self.active_trajectory.is_some() || self.servo_target.is_some(),
+            moving: (self.active_trajectory.is_some() || self.servo_target.is_some()) && !in_static_band,
             torques: &self.torques,
             commanded_velocities: &self.commanded_velocities,
             hold_positions: &self.measured_positions,
         });
-        let sev_change = self.power.step_static_overload(
-            budget,
-            dt,
-            self.is_torqued,
-            self.gravity_comp.is_some(),
-            &self.measured_velocities,
-            &self.commanded_velocities,
-        );
+        let sev_change = if self.power.valid {
+            self.power.step_static_overload(
+                budget,
+                dt,
+                self.is_torqued,
+                self.gravity_comp.is_some(),
+                &self.measured_velocities,
+                &self.commanded_velocities,
+            )
+        } else {
+            None
+        };
         self.apply_governor_step(result, rated, policy);
         if let Some(sev) = sev_change {
             if !self.safety.deferred_logging() {
@@ -1146,6 +1184,27 @@ impl SupervisorInner {
         check_static_admission_values(base_a, cand_a, cap_a, strict_lowering)
     }
 
+    /// Zero-allocation static-load recertification of a rebuilt quintic trajectory on the RT
+    /// owner install boundary (M4).
+    pub(crate) fn check_static_load_quintic_inline(
+        &self,
+        start: &[f32],
+        traj: &crate::trajectory::MultiJointQuinticTrajectory,
+    ) -> Result<(), &'static str> {
+        let Some(budget) = self.power_budget() else {
+            return Ok(());
+        };
+        check_static_load_quintic(
+            budget,
+            &self.config.arm_model,
+            self.config.arm_dof(),
+            start,
+            traj,
+            self.power.is_static_restricted(),
+        )
+        .map_err(|_| "STATIC_LOAD_LIMIT")
+    }
+
     /// Fit a joint quintic from `start` / `v0` to `target` into the power budget
     /// (`src/power_plan.rs`): returns the trajectory to run (re-planned longer when slowed)
     /// and its scale (None without a planning budget). `refuse`: return POWER_BUDGET when even
@@ -1174,7 +1233,8 @@ pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::
     traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
     limits: &[crate::model::JointLimit], refuse: bool, strict_lowering: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
         use crate::power_plan::plan_scale_quintic;
-        if refuse {
+        let check_static = refuse || strict_lowering;
+        if check_static {
             if let Some(b) = budget.filter(|b| b.enabled) {
                 check_static_load_quintic(b, arm, dof, start, &traj, strict_lowering)?;
             }
@@ -1198,9 +1258,13 @@ pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::
             zero_vec = vec![0.0; target.len()];
             &zero_vec
         };
-        // from rest the longer quintic is an exact time scaling of this one: no re-check
+        // from rest the longer quintic is an exact time scaling of this one, still re-verify
+        // static admission on the returned curve so dynamic retiming can never bypass it.
         if v0.iter().all(|v| v.abs() < 1e-6) {
             let t2 = crate::trajectory::TrajectoryPlanner::plan(start, v0, target, zeros, Some(full / s), limits)?;
+            if check_static && b.enabled {
+                check_static_load_quintic(b, arm, dof, start, &t2, strict_lowering)?;
+            }
             let scale = full / t2.duration;
             tracing::debug!("Power planning (joint move): scale {scale:.3}, {:.2} s -> {:.2} s, {} µs", full, t2.duration, t0.elapsed().as_micros());
             return Ok((t2, Some(scale)));
@@ -1215,6 +1279,9 @@ pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::
             s = (s * 0.9).max(p.min_scale);
         }
         let t2 = best.expect("at least one plan");
+        if check_static && b.enabled {
+            check_static_load_quintic(b, arm, dof, start, &t2, strict_lowering)?;
+        }
         let scale = full / t2.duration;
         tracing::debug!("Power planning (joint move): scale {scale:.3}, {:.2} s -> {:.2} s, {} µs", full, t2.duration, t0.elapsed().as_micros());
         Ok((t2, Some(scale)))

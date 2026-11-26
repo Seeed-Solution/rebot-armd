@@ -2245,6 +2245,18 @@ impl ArmConfig {
         if self.kinematics == Some(KinematicsModel::RebotDevArm) && self.dof != 7 {
             return Err("kinematics requires dof == 7 (6 arm joints + gripper)".into());
         }
+        if self
+            .power_budget
+            .as_ref()
+            .is_some_and(|b| b.enabled && b.static_admission_fraction.is_some())
+            && self.dof < self.arm_dof()
+        {
+            return Err(format!(
+                "power_budget static_admission_fraction requires dof ({}) >= arm_model dof ({})",
+                self.dof,
+                self.arm_dof()
+            ));
+        }
         if let Some(g) = self.gripper_joint {
             if g >= self.dof || g < self.arm_dof() {
                 return Err(format!("gripper_joint {g} must be an index in {}..{} (after the arm joints)", self.arm_dof(), self.dof));

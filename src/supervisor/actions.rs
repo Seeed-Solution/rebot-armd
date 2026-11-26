@@ -1472,6 +1472,7 @@ impl SupervisorInner {
                 && p.tcp_offset == self.config.tcp_offset
                 && p.power.as_ref() == self.power_budget()
                 && p.checked_workspace == self.workspace_policy().is_some()
+                && (!self.power.is_static_restricted() || p.static_restricted)
         });
         let (traj, power_scale) = if let Some(p) = reuse {
             self.prepared_quintics_used += 1;

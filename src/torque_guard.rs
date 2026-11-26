@@ -171,9 +171,15 @@ pub enum Retreat {
 pub const TORQUE_BACKOFF_DIAG_CAPACITY: usize = 8;
 /// Number of fresh post-trip feedback ticks sampled to measure post-trip position & torque.
 pub const TORQUE_BACKOFF_POST_SAMPLES: u16 = 5;
+/// Bounded post-trip capture window (s) after which the record closes even if fewer samples arrived.
+pub const TORQUE_BACKOFF_CAPTURE_WINDOW_S: f64 = 0.5;
 
 /// Bounded per-trip back-off measurement record captured in fixed storage on the RT thread
 /// and published off-thread via [`crate::rt_core::publish::StateHub`].
+///
+/// Coordinate system: `anchor_q`, `measured_at_trip_q`, `requested_q`, `transmitted_q`, and
+/// `post_trip_measured_q` are all in user-space radians (zero-offset removed; `transmitted_q`
+/// reflects the actual wire-quantized frame committed at the CAN flush boundary).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TorqueBackoffRecord {
     pub trip_seq: u64,
@@ -184,17 +190,64 @@ pub struct TorqueBackoffRecord {
     pub threshold_nm: f32,
     pub anchor_q: f32,
     pub measured_at_trip_q: f32,
-    /// Backed-off target position requested by `torque_trip` (clamped to joint limits).
+    /// Backed-off target position requested by `torque_trip` (user-space rad, clamped to limits).
     pub requested_q: f32,
-    /// Wire position actually transmitted for the tripped joint on the first completed TX after the trip.
+    /// Actual wire-quantized position (converted back to user-space rad) committed at the CAN
+    /// flush boundary for the tripped joint on the first non-skipped control frame after the trip.
     pub transmitted_q: Option<f32>,
-    /// Post-trip measured position observed on subsequent fresh feedback ticks.
+    /// Post-trip measured position (user-space rad) observed on new post-TX feedback frames.
     pub post_trip_measured_q: Option<f32>,
-    /// Post-trip measured torque (N·m) observed on subsequent fresh feedback ticks.
+    /// Post-trip measured torque (N·m) observed on new post-TX feedback frames.
     pub post_trip_torque_nm: Option<f32>,
-    /// Count of fresh post-trip feedback samples observed (capped at [`TORQUE_BACKOFF_POST_SAMPLES`]).
+    /// Count of distinct fresh post-TX feedback frames observed (capped at [`TORQUE_BACKOFF_POST_SAMPLES`]).
     pub post_trip_samples: u16,
     pub push_in: bool,
+    /// Driver wire-commit sequence snapshot at the moment of `torque_trip` (gates `transmitted_q`).
+    #[serde(skip)]
+    pub(crate) tx_seq_at_trip: u64,
+    /// Last per-axis feedback sequence counted into `post_trip_*` (prevents duplicate cached reads).
+    #[serde(skip)]
+    pub(crate) last_post_fb_seq: u64,
+    /// True once the post-trip capture window closed (sample cap, window expiry, or disarm/stop).
+    #[serde(skip)]
+    pub(crate) capture_closed: bool,
+}
+
+impl TorqueBackoffRecord {
+    /// Construct a fresh trip record awaiting wire TX confirmation and post-trip feedback samples.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        trip_seq: u64,
+        joint: u8,
+        since_s: f64,
+        sign: f32,
+        torque_at_trip_nm: f32,
+        threshold_nm: f32,
+        anchor_q: f32,
+        measured_at_trip_q: f32,
+        requested_q: f32,
+        push_in: bool,
+    ) -> Self {
+        Self {
+            trip_seq,
+            joint,
+            since_s,
+            sign,
+            torque_at_trip_nm,
+            threshold_nm,
+            anchor_q,
+            measured_at_trip_q,
+            requested_q,
+            transmitted_q: None,
+            post_trip_measured_q: None,
+            post_trip_torque_nm: None,
+            post_trip_samples: 0,
+            push_in,
+            tx_seq_at_trip: 0,
+            last_post_fb_seq: 0,
+            capture_closed: false,
+        }
+    }
 }
 
 /// Fixed-capacity, `Copy`, zero-allocation ring buffer of recent [`TorqueBackoffRecord`]s.
@@ -243,7 +296,7 @@ impl TorqueBackoffHistory {
     }
 
     #[inline]
-    pub fn latest_mut(&mut self) -> Option<&mut TorqueBackoffRecord> {
+    fn latest_mut(&mut self) -> Option<&mut TorqueBackoffRecord> {
         if self.len == 0 {
             return None;
         }
@@ -261,16 +314,39 @@ impl TorqueBackoffHistory {
         self.len == 0
     }
 
-    /// Records the first transmitted wire position for the most recent trip on `joint`.
+    /// Closes any open post-trip capture record (e.g. on disarm, fault, or non-operational state)
+    /// so a later rearm cannot resume writing samples into an older trip record.
     #[inline]
-    pub fn record_transmitted(&mut self, joint: usize, transmitted_q: f32) {
+    pub fn close_open_capture(&mut self) {
+        if let Some(rec) = self.latest_mut() {
+            if !rec.capture_closed {
+                rec.capture_closed = true;
+            }
+        }
+    }
+
+    /// Records the first wire-committed position for the most recent trip on `joint`, gated by
+    /// `wire_tx_seq > rec.tx_seq_at_trip` so skipped/mode-uncertain axes never fabricate TX.
+    #[inline]
+    pub fn record_transmitted(
+        &mut self,
+        joint: usize,
+        wire_tx_seq: u64,
+        transmitted_q: f32,
+        post_fb_seq_baseline: u64,
+    ) {
         if !transmitted_q.is_finite() {
             return;
         }
         let mut changed = false;
         if let Some(rec) = self.latest_mut() {
-            if usize::from(rec.joint) == joint && rec.transmitted_q.is_none() {
+            if usize::from(rec.joint) == joint
+                && !rec.capture_closed
+                && rec.transmitted_q.is_none()
+                && wire_tx_seq > rec.tx_seq_at_trip
+            {
                 rec.transmitted_q = Some(transmitted_q);
+                rec.last_post_fb_seq = rec.last_post_fb_seq.max(post_fb_seq_baseline);
                 changed = true;
             }
         }
@@ -280,14 +356,30 @@ impl TorqueBackoffHistory {
     }
 
     /// Updates post-trip measured position and torque for the most recent trip up to
-    /// [`TORQUE_BACKOFF_POST_SAMPLES`] fresh feedback ticks.
+    /// [`TORQUE_BACKOFF_POST_SAMPLES`] distinct post-TX feedback frames within
+    /// [`TORQUE_BACKOFF_CAPTURE_WINDOW_S`]. Never counts cached feedback or pre-TX frames.
     #[inline]
-    pub fn record_post_trip_feedback(&mut self, joint: usize, measured_q: f32, torque_nm: f32) {
+    pub fn record_post_trip_feedback(
+        &mut self,
+        joint: usize,
+        fb_seq: u64,
+        now_s: f64,
+        measured_q: f32,
+        torque_nm: f32,
+    ) {
         let mut changed = false;
         if let Some(rec) = self.latest_mut() {
-            if usize::from(rec.joint) == joint
-                && rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES
-            {
+            if rec.capture_closed || usize::from(rec.joint) != joint {
+                return;
+            }
+            if !now_s.is_finite() || now_s - rec.since_s > TORQUE_BACKOFF_CAPTURE_WINDOW_S {
+                rec.capture_closed = true;
+                return;
+            }
+            if rec.transmitted_q.is_none() || fb_seq <= rec.last_post_fb_seq {
+                return;
+            }
+            if rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES {
                 if measured_q.is_finite() {
                     rec.post_trip_measured_q = Some(measured_q);
                 }
@@ -295,6 +387,10 @@ impl TorqueBackoffHistory {
                     rec.post_trip_torque_nm = Some(torque_nm);
                 }
                 rec.post_trip_samples = rec.post_trip_samples.saturating_add(1);
+                rec.last_post_fb_seq = fb_seq;
+                if rec.post_trip_samples >= TORQUE_BACKOFF_POST_SAMPLES {
+                    rec.capture_closed = true;
+                }
                 changed = true;
             }
         }
@@ -466,7 +562,8 @@ impl SupervisorInner {
 
     /// One control tick, after this tick's feedback and before the motion reference is
     /// stepped. `dt` is the control-loop step (s).
-    pub(crate) fn torque_guard_tick(&mut self, dt: f64) {
+    #[doc(hidden)]
+    pub fn torque_guard_tick(&mut self, dt: f64) {
         let Some(p) = self.config.torque_guard.filter(|p| p.enabled) else { return; };
         let operational = self.is_torqued && self.safety.state().is_operational() && self.gravity_comp.is_none()
             && !self.disable_pending && !self.pending_rearm;
@@ -478,21 +575,27 @@ impl SupervisorInner {
         let settling = self.pending_normal_unload && self.active_trajectory.is_none();
         let watching = operational && !settling && self.driver.is_some() && self.collision.torque_feedback
             && self.feedback_numeric_valid && self.hardware_feedback_fresh(std::time::Duration::from_millis(100));
-        if watching {
-            if let Some(rec) = self.torque_guard.backoff_history.latest() {
-                if rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES {
-                    let j = usize::from(rec.joint);
-                    if let (Some(&q_meas), Some(&tau)) =
-                        (self.measured_positions.get(j), self.torques.get(j))
-                    {
-                        self.torque_guard
-                            .backoff_history
-                            .record_post_trip_feedback(j, q_meas, tau);
-                    }
+        let now = self.start_time.elapsed().as_secs_f64();
+        if !operational {
+            self.torque_guard.backoff_history.close_open_capture();
+        } else if watching {
+            if let Some(j) = self
+                .torque_guard
+                .backoff_history
+                .latest()
+                .filter(|rec| !rec.capture_closed && rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES)
+                .map(|rec| usize::from(rec.joint))
+            {
+                let fb_seq = self.core.feedback().seqs().get(j).copied().unwrap_or(0);
+                if let (Some(&q_meas), Some(&tau)) =
+                    (self.measured_positions.get(j), self.torques.get(j))
+                {
+                    self.torque_guard
+                        .backoff_history
+                        .record_post_trip_feedback(j, fb_seq, now, q_meas, tau);
                 }
             }
         }
-        let now = self.start_time.elapsed().as_secs_f64();
         let previous_hold = self.torque_guard.hold;
         let had_hold = previous_hold.is_some();
         let motion_target = if let Some(t) = self.servo_target.as_deref() { Some(t) }
@@ -511,40 +614,73 @@ impl SupervisorInner {
     /// Trip on joint `j`: fail the running action with `TORQUE_LIMIT`, end every motion and
     /// hold the measured pose with torque on (gripper keeps its command), the held joint
     /// backed off by [`TORQUE_HOLD_BACKOFF_RAD`] in the relieving direction.
+    /// Zero heap allocations on the control thread (B8).
     fn torque_trip(&mut self, j: usize, torque: f32, threshold: f32, p: &TorqueGuardPolicy, again: bool) {
         let tmax = threshold / p.ratio;
         let push_in = self.torque_guard.hold.is_some_and(|h| h.push_in);
-        let message = if push_in {
-            let past = self.torque_guard.hold.map_or(0.0, |h| (self.commanded_positions[j] - h.anchor_q) * h.sign);
-            format!("Torque limit on joint {}: the motion pushes {past:.3} rad past the position of the torque trip, into the load ({torque:.2} N·m, threshold {threshold:.2} N·m)", j + 1)
-        } else {
-            format!("Torque limit on joint {}: {torque:.2} N·m at or above {threshold:.2} N·m ({:.0}% of {tmax:.1} N·m) for {} ms",
-                j + 1, p.ratio * 100.0, p.persist_ms)
-        };
+        let past = self.torque_guard.hold.map_or(0.0, |h| (self.commanded_positions[j] - h.anchor_q) * h.sign);
         let running = self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id);
-        if again && !push_in && running.is_none() && self.watchdog_park.is_none() {
-            tracing::debug!("{message}; holding the new measured position");
-        } else {
-            tracing::warn!("{message} (cmd {:.3} meas {:.3} rad); motion stopped, holding position",
-                self.commanded_positions[j], self.measured_positions[j]);
+        let write_trip_msg = |buf: &mut dyn core::fmt::Write| {
+            if push_in {
+                let _ = write!(
+                    buf,
+                    "Torque limit on joint {}: the motion pushes {past:.3} rad past the position of the torque trip, into the load ({torque:.2} N·m, threshold {threshold:.2} N·m)",
+                    j + 1
+                );
+            } else {
+                let _ = write!(
+                    buf,
+                    "Torque limit on joint {}: {torque:.2} N·m at or above {threshold:.2} N·m ({:.0}% of {tmax:.1} N·m) for {} ms",
+                    j + 1,
+                    p.ratio * 100.0,
+                    p.persist_ms
+                );
+            }
+        };
+        let action_msg = running.map(|id| {
+            let mut msg = self.take_action_msg_buf(id, 256);
+            msg.clear();
+            write_trip_msg(&mut msg);
+            msg
+        });
+        if !self.safety.deferred_logging() {
+            let mut log_buf = crate::safety::BoundedText::<256>::empty();
+            let text = match action_msg.as_deref() {
+                Some(s) => s,
+                None => {
+                    write_trip_msg(&mut log_buf);
+                    log_buf.as_str()
+                }
+            };
+            if again && !push_in && running.is_none() && self.watchdog_park.is_none() {
+                tracing::debug!("{text}; holding the new measured position");
+            } else {
+                tracing::warn!(
+                    "{text} (cmd {:.3} meas {:.3} rad); motion stopped, holding position",
+                    self.commanded_positions[j],
+                    self.measured_positions[j]
+                );
+            }
         }
         if let Some(id) = running {
-            self.finish_action(id, "failed", Some("TORQUE_LIMIT"), Some(message), None, None, None);
+            self.finish_action(id, "failed", Some("TORQUE_LIMIT"), action_msg, None, None, None);
         }
         self.drop_macro_run("failed", Some("TORQUE_LIMIT"));
-        // M1: preserve previous tracking output across the torque-guard backoff so active
-        // lead ramps smoothly in the relieving direction instead of dropping in one tick.
-        let preserved_tracking = self
+        // M1 + B8: preserve previous tracking state across `hold_measured_pose` in place
+        // (0 heap allocs, 0 moves, 0 Vec clones) so active lead ramps smoothly in the relieving
+        // direction instead of dropping in one tick.
+        let keep_tracking = self
             .config
             .joint_tracking
             .as_ref()
-            .is_some_and(|jt| jt.enabled)
-            .then(|| self.tracking.clone());
-        self.hold_measured_pose();
-        if let Some(prev) = preserved_tracking {
-            self.tracking = prev;
-        }
+            .is_some_and(|jt| jt.enabled);
+        self.hold_measured_pose_inner(keep_tracking);
         self.note_motion_limit(MotionLimitReason::Torque, Some(j));
+        let tx_seq_at_trip = self
+            .read_driver_for_tick()
+            .and_then(|drv| drv.last_committed_wire_position(j))
+            .map_or(0, |(seq, _)| seq);
+        let fb_seq_at_trip = self.core.feedback().seqs().get(j).copied().unwrap_or(0);
         if let Some(h) = self.torque_guard.hold.as_mut() {
             let l = &self.config.limits[j];
             let q = self.measured_positions[j];
@@ -568,6 +704,9 @@ impl SupervisorInner {
                 post_trip_torque_nm: None,
                 post_trip_samples: 0,
                 push_in,
+                tx_seq_at_trip,
+                last_post_fb_seq: fb_seq_at_trip,
+                capture_closed: false,
             };
             self.torque_guard.backoff_history.push(rec);
         }
@@ -575,12 +714,19 @@ impl SupervisorInner {
         // into the load, or the retreat allowance ended). Hold torque at the backed-off pose
         // and latch WatchdogTimeout, naming the cause (torque off would drop the arm).
         if self.watchdog_park.is_some() {
-            tracing::warn!("Watchdog park stopped by the torque guard on joint {} ({}); holding torque at the backed-off pose and latching WatchdogTimeout",
-                j + 1, if push_in { "the park path pushes into the load" } else { "the load did not relax during the park" });
-            let hold = self.commanded_positions.clone();
+            if !self.safety.deferred_logging() {
+                tracing::warn!(
+                    "Watchdog park stopped by the torque guard on joint {} ({}); holding torque at the backed-off pose and latching WatchdogTimeout",
+                    j + 1,
+                    if push_in { "the park path pushes into the load" } else { "the load did not relax during the park" }
+                );
+            }
+            let mut hold = [0.0f32; crate::model::MAX_MOTION_DOF];
+            let n = self.commanded_positions.len().min(hold.len());
+            hold[..n].copy_from_slice(&self.commanded_positions[..n]);
             self.latch_watchdog_fault();
-            self.target_positions = hold.clone();
-            self.commanded_positions = hold;
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &hold[..n]);
+            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &hold[..n]);
         }
     }
 

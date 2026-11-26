@@ -1461,7 +1461,6 @@ async fn dual_owner_multiview_and_motion_action_rest_stubs_lease_contract() {
         if owner == OwnerKind::Executor {
             for (method, path) in [
                 ("POST", "/api/v1/action/gripper_zero_check"),
-                ("GET", "/api/v1/diagnostics/power"),
             ] {
                 let r = if method == "POST" {
                     http.post(format!("{base}{path}")).bearer_auth(&tok).json(&json!({})).send().await.unwrap()
@@ -1471,6 +1470,9 @@ async fn dual_owner_multiview_and_motion_action_rest_stubs_lease_contract() {
                 assert_eq!(r.status().as_u16(), 503, "{path} must stay LegacyOnly");
                 assert_eq!(r.json::<Value>().await.unwrap()["code"], "EXECUTOR_ROUTING_PENDING");
             }
+            // GET /api/v1/diagnostics/power now serves live StateHub telemetry off-thread on Executor.
+            let pwr = http.get(format!("{base}/api/v1/diagnostics/power")).send().await.unwrap();
+            assert_eq!(pwr.status().as_u16(), 200, "/api/v1/diagnostics/power must be served on Executor");
         }
 
         results.push((without_lease, with_lease));

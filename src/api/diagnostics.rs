@@ -87,5 +87,5 @@ pub async fn post_tick_mark(
 /// `GET /api/v1/diagnostics/power`: supply-current estimate, recent peaks and the budget in
 /// force (`{"enabled": false}` without one).
 pub async fn get_power(axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>) -> Response {
-    axum::Json(supervisor.inner().read().await.power_diagnostics()).into_response()
+    axum::Json(supervisor.power_diagnostics().await).into_response()
 }

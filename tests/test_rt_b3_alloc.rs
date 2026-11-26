@@ -2087,8 +2087,16 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::PosForceTargetNotFinite { .. } => "PosForceTargetNotFinite",
             ArmDriverError::PosForceSpeedZero { .. } => "PosForceSpeedZero",
             ArmDriverError::PosForceReadbackTxFailed { .. } => "PosForceReadbackTxFailed",
+            ArmDriverError::CtrlModeReadbackMismatch { .. } => "CtrlModeReadbackMismatch",
+            ArmDriverError::CtrlModeReadbackMissing { .. } => "CtrlModeReadbackMissing",
+            ArmDriverError::CtrlModeReadbackAmbiguous { .. } => "CtrlModeReadbackAmbiguous",
+            ArmDriverError::PosForcePreEnableRefreshMissing { .. } => "PosForcePreEnableRefreshMissing",
+            ArmDriverError::PosForcePreEnableRefreshTxFailed { .. } => "PosForcePreEnableRefreshTxFailed",
+            ArmDriverError::PosForcePreEnableHoldUnsafe { .. } => "PosForcePreEnableHoldUnsafe",
+            ArmDriverError::PosForcePreEnableHoldUnavailable { .. } => "PosForcePreEnableHoldUnavailable",
             ArmDriverError::TimeoutReadbackMismatch { .. } => "TimeoutReadbackMismatch",
             ArmDriverError::TimeoutReadbackMissing { .. } => "TimeoutReadbackMissing",
+            ArmDriverError::TimeoutReadbackAmbiguous { .. } => "TimeoutReadbackAmbiguous",
             ArmDriverError::TimeoutReadbackTxFailed { .. } => "TimeoutReadbackTxFailed",
             ArmDriverError::PosForcePreEnableHoldBudgetExhausted { .. } => "PosForcePreEnableHoldBudgetExhausted",
             ArmDriverError::PosForcePreEnableHoldTxFailed { .. } => "PosForcePreEnableHoldTxFailed",
@@ -2158,8 +2166,16 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         ArmDriverError::PosForceTargetNotFinite { joint: 6 },
         ArmDriverError::PosForceSpeedZero { joint: 6 },
         ArmDriverError::PosForceReadbackTxFailed { joint: 6, kind: TxFailKind::WouldBlock },
+        ArmDriverError::CtrlModeReadbackMismatch { joint: 6, expected: 3, observed: 2 },
+        ArmDriverError::CtrlModeReadbackMissing { joint: 0, timeout_ms: 50 },
+        ArmDriverError::CtrlModeReadbackAmbiguous { joint: 0 },
+        ArmDriverError::PosForcePreEnableRefreshMissing { joint: 6 },
+        ArmDriverError::PosForcePreEnableRefreshTxFailed { joint: 6, kind: TxFailKind::WouldBlock },
+        ArmDriverError::PosForcePreEnableHoldUnsafe { joint: 6, still: false, off: true, status: 0 },
+        ArmDriverError::PosForcePreEnableHoldUnavailable { joint: 6 },
         ArmDriverError::TimeoutReadbackMismatch { joint: 0, expected: 2000, observed: 0 },
         ArmDriverError::TimeoutReadbackMissing { joint: 0, timeout_ms: 50 },
+        ArmDriverError::TimeoutReadbackAmbiguous { joint: 0 },
         ArmDriverError::TimeoutReadbackTxFailed { joint: 0, kind: TxFailKind::WouldBlock },
         ArmDriverError::PosForcePreEnableHoldBudgetExhausted { joint: 6 },
         ArmDriverError::PosForcePreEnableHoldTxFailed { joint: 6, kind: TxFailKind::Enobufs },
@@ -4083,4 +4099,253 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
             && gc_logs.contains("Gravity compensation exit: ESTOP E-stop"),
         "missing deferred gravity_comp logs:\n{gc_logs}"
     );
+}
+
+#[test]
+fn b3_and_b8_ctrl_mode_rejection_and_torque_trip_zero_alloc() {
+    use armd::driver::{ArmDriver, DamiaoArmDriver, TorqueProgress};
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::transport::{CanFrame, MockCanTransport};
+
+    alloc::time_this_thread();
+
+    // Part 1 (B3): CTRL_MODE mismatch & TIMEOUT mismatch transitions allocate 0 bytes on armd-control.
+    {
+        let can = MockCanTransport::new();
+        let limits = vec![DamiaoLimits::default(); 2];
+        let mut drv = DamiaoArmDriver::new(can, vec![1, 2])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_expected_timeout_counts(vec![Some(2000), Some(2000)])
+            .unwrap();
+        // Inject wrong CTRL_MODE=1 (MIT instead of POS_VEL=2) on J1.
+        let reply = |id: u16, rid: u8, val: u32| {
+            let [lo, hi] = id.to_le_bytes();
+            let b = val.to_le_bytes();
+            CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, rid, b[0], b[1], b[2], b[3]]).unwrap()
+        };
+        drv.can_mut().respond_to_transmit(
+            damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE),
+            reply(1, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT),
+        );
+        drv.can_mut().respond_to_transmit(
+            damiao::build_read_register_frame(2, damiao::RID_CTRL_MODE),
+            reply(2, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL),
+        );
+        let fb = |id: u8| {
+            let mut d = [0u8; 8];
+            d[0] = id & 0x0f;
+            CanFrame::new_standard(0x10 + u16::from(id), &d).unwrap()
+        };
+        // Pre-warm MockCanTransport's internal tx_frames/rx_frames VecDeques so we measure only
+        // DamiaoArmDriver's own enable/readback failure transition (0 mock-harness noise).
+        {
+            use armd::transport::CanTransport;
+            let dummy = CanFrame::new_standard(0x7FE, &[0; 8]).unwrap();
+            for _ in 0..8 {
+                let _ = drv.can_mut().transmit(&dummy);
+                drv.can_mut().provide_rx_frame(dummy);
+            }
+            drv.can_mut().clear();
+        }
+        drv.can_mut().provide_rx_frame(fb(1));
+        drv.can_mut().provide_rx_frame(fb(2));
+        let _ = drv.read_joint_states();
+
+        let dl = Instant::now() + Duration::from_secs(2);
+        let _ = alloc::take();
+        drv.begin_torque(true).unwrap();
+        let mut got_err = None;
+        for _ in 0..8 {
+            match drv.poll_torque(dl) {
+                Ok(TorqueProgress::Pending { .. }) => {}
+                Ok(TorqueProgress::Done(_)) => panic!("wrong CTRL_MODE must not enable"),
+                Err(e) => {
+                    got_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let a = alloc::take();
+        assert_eq!(a.calls, 0, "B3: CTRL_MODE mismatch transition allocated on armd-control: {a:?}");
+        assert!(
+            matches!(
+                got_err,
+                Some(ArmDriverError::CtrlModeReadbackMismatch { joint: 0, expected: 2, observed: 1 })
+            ),
+            "expected CtrlModeReadbackMismatch, got {got_err:?}"
+        );
+    }
+
+    // Part 2 (B8): J4 torque_trip release with fixed TorqueBackoffHistory capture allocates 0 bytes
+    // on armd-control — both (a) full `tick_control` release AND (b) `torque_guard_tick` with
+    // `joint_tracking` enabled and Vec-backed tracking history populated!
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.collision = None;
+        cfg.resting_pose = None;
+        cfg.workspace = None;
+        cfg.joint_tracking = None;
+        let q = vec![0.0, -0.5, 0.5, -1.612, 0.0, 0.0, 0.0];
+        let torques = Arc::new(Mutex::new(vec![0.0f32; 7]));
+        let drv = ZeroAllocTorqueDriver::new(q.clone(), Arc::clone(&torques));
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.safety.set_deferred_logging(true);
+        inner.safety.set_off_thread_reclaim(true);
+        inner.measured_positions = q.clone();
+        inner.commanded_positions = q.clone();
+        inner.target_positions = q.clone();
+        let _ = inner.tick_control(0.02);
+        let stamp = inner.current_admission_stamp();
+        let adm = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(adm).unwrap();
+        for _ in 0..5 {
+            let _ = inner.tick_control(0.02);
+        }
+        // Baseline steady tick must be 0 allocs.
+        let _ = alloc::take();
+        let _ = inner.tick_control(0.02);
+        assert_eq!(alloc::take().calls, 0, "steady tick must be 0 allocs");
+
+        // (a) Inject J4 -9.46 N·m spike; measure every tick through the actual torque_trip release!
+        torques.lock().unwrap()[3] = -9.46;
+        let _ = alloc::take();
+        for _ in 0..8 {
+            let _ = inner.tick_control(0.02);
+        }
+        let trip_allocs = alloc::take();
+        assert_eq!(
+            trip_allocs.calls, 0,
+            "B8(a): full torque_trip control release must do 0 heap allocations: {trip_allocs:?}"
+        );
+        let rec = inner
+            .torque_guard
+            .backoff_history
+            .latest()
+            .expect("J4 torque_trip record captured");
+        assert_eq!(rec.joint, 3);
+        assert!((rec.requested_q - (-1.607)).abs() < 1e-3);
+
+        // (b) Enable joint_tracking (`enabled: true`) and seed Vec-backed tracking history, then
+        // trigger a second torque_trip via `torque_guard_tick` — MUST do 0 allocs and 0 deallocs!
+        let mut jt = ArmConfig::rebot_dm().joint_tracking.unwrap();
+        jt.enabled = true;
+        inner.config.joint_tracking = Some(jt);
+        inner.tracking.history_state = armd::tracking::TrackingHistoryState::Issued;
+        inner.tracking.last_issued_positions = Some(q.clone());
+        inner.tracking.last_issued_velocities = Some(vec![0.0; 7]);
+        inner.tracking.last_nominal = Some((q.clone(), vec![0.0; 7]));
+        inner.torque_guard.hold = None;
+        let mut per_tick = [0u64; 6];
+        for slot in &mut per_tick {
+            let _ = alloc::take();
+            inner.torque_guard_tick(0.02);
+            *slot = alloc::take().calls;
+        }
+        let total: u64 = per_tick.iter().sum();
+        assert_eq!(
+            total, 0,
+            "B8(b): torque_trip with Vec-backed tracking history must do 0 allocs: per_tick={per_tick:?}, trips={}",
+            inner.torque_guard.trips_total
+        );
+        assert!(
+            inner.tracking.last_issued_positions.is_some(),
+            "B8(b): tracking history must be preserved across torque_trip"
+        );
+        assert!(inner.torque_guard.trips_total >= 2);
+        inner.safety.drain_log_events_off_thread();
+        inner.safety.drain_retired_state_arcs_off_thread();
+    }
+}
+
+struct ZeroAllocTorqueDriver {
+    q: Vec<f32>,
+    torques: Arc<Mutex<Vec<f32>>>,
+    enabled: bool,
+    now: Instant,
+}
+
+impl ZeroAllocTorqueDriver {
+    fn new(q: Vec<f32>, torques: Arc<Mutex<Vec<f32>>>) -> Self {
+        Self { q, torques, enabled: false, now: Instant::now() }
+    }
+}
+
+impl armd::driver::ArmDriver for ZeroAllocTorqueDriver {
+    fn capabilities(&self) -> armd::driver::DriverCapabilities {
+        armd::driver::DriverCapabilities {
+            temperature_feedback: true,
+            load_feedback: false,
+            torque_feedback: true,
+            velocity_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: false,
+        }
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, ArmDriverError> {
+        let mut out = Vec::with_capacity(self.q.len());
+        self.read_joint_states_into(&mut out)?;
+        Ok(out)
+    }
+    fn read_joint_states_into(&mut self, out: &mut Vec<armd::model::JointState>) -> Result<(), ArmDriverError> {
+        self.now = Instant::now();
+        let tau = self.torques.lock().unwrap();
+        out.clear();
+        for i in 0..self.q.len() {
+            out.push(armd::model::JointState {
+                position: self.q[i],
+                velocity: 0.0,
+                torque: tau[i],
+                temperature: 30.0,
+            });
+        }
+        Ok(())
+    }
+    fn write_joint_targets(&mut self, _targets: &[armd::driver::JointTarget]) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+        self.enabled = enable;
+        Ok(())
+    }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.enabled }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        vec![Some(Duration::ZERO); self.q.len()]
+    }
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        vec![Some(self.now); self.q.len()]
+    }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        for _ in 0..self.q.len() {
+            out.push(Some(Duration::ZERO));
+        }
+    }
+    fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.q.len() == dof }
+    fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
+        joints.iter().all(|&j| j < self.q.len())
+    }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        out.clear();
+        for _ in 0..self.q.len() { out.push(Some(0)); }
+    }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        for _ in 0..self.q.len() { out.push(Some(self.now)); }
+    }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        for _ in 0..self.q.len() {
+            out.push(Some(self.now));
+        }
+    }
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        for _ in 0..self.q.len() {
+            out.push(Some(self.now));
+        }
+    }
 }

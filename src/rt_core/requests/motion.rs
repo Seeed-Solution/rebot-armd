@@ -506,6 +506,9 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         &start, &snap.commanded_velocities, &target, &limits, !is_park, snap.static_restricted,
     ) {
         Ok(pair) => pair,
+        Err(ArmError::Motion(crate::motion::MotionError::StaticLoadLimit)) => {
+            return Err(ArmError::Motion(crate::motion::MotionError::StaticLoadLimit));
+        }
         Err(_) if is_park => (traj, None),
         Err(e) => return Err(e),
     };
@@ -723,7 +726,7 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
     if slot.workspace_revision != inner.workspace_revision || slot.motion_config_revision != inner.motion_config_revision
         || slot.tcp_offset != inner.config.tcp_offset || slot.checked_workspace != inner.workspace_policy().is_some()
         || slot.power_budget_hash != power_budget_fingerprint(inner.power_budget())
-        || (slot.kind != MotionKind::Park && inner.power.is_static_restricted() && !slot.static_restricted)
+        || (inner.power.is_static_restricted() && !slot.static_restricted)
     { return Err(MotionInstallError::PlanStale); }
     let Some((limits, lim_n)) = inner.planning_limits_inline(slot.speed_scale_opt()) else { return Err(MotionInstallError::InvalidCommand); };
     if lim_n != dof || (0..dof).any(|i| (limits[i].max_velocity - slot.vel_caps[i]).abs() > EXACT_START_TOL) {

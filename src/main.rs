@@ -1125,9 +1125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         driver = driver.with_joint_limits(limits)?;
                     }
                     driver = driver.with_gripper_drive(gripper_drive)?;
-                    if let Some(expected) = expected_timeout_counts {
-                        driver = driver.with_expected_timeout_counts(expected)?;
-                    }
+                    driver = driver.with_timeout_verification(expected_timeout_counts)?;
                     // Read-only register check before anything can enable the motors.
                     driver.check_mapping_ranges();
                     supervisor.set_driver(Box::new(driver)).await;

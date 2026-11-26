@@ -1201,6 +1201,11 @@ impl CoreOps for SupervisorInner {
                 if primitive.child().is_none() {
                     return Err("UNSUPPORTED");
                 }
+                if !matches!(primitive, Primitive::Gripper { .. })
+                    && self.power.is_static_restricted()
+                {
+                    return Err("PLAN_STALE");
+                }
                 let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                 SupervisorInner::commit_macro_child(admitted, primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
             }
@@ -1241,6 +1246,9 @@ impl CoreOps for SupervisorInner {
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = *primitive else {
             return Err("INVALID_COMMAND");
         };
+        if self.power.is_static_restricted() {
+            return Err("PLAN_STALE");
+        }
         let n = usize::from(dof);
         if n == 0 || n > MAX_DOF {
             return Err("INVALID_COMMAND");
@@ -1303,6 +1311,9 @@ impl CoreOps for SupervisorInner {
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = primitive else {
             return Err("INVALID_COMMAND");
         };
+        if self.power.is_static_restricted() && !slot.static_restricted {
+            return Err("PLAN_STALE");
+        }
         let n = usize::from(dof);
         if n == 0 || n > MAX_DOF {
             return Err("INVALID_COMMAND");

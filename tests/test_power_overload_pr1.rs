@@ -451,7 +451,10 @@ fn synchronized_loss_annotates_bus_loss_even_if_j7_faults_first_and_requires_pos
     }
     .unwrap_err()
     .to_string();
-    assert!(err.contains("TIMEOUT") && err.contains("2000") && err.contains("0"), "got: {err}");
+    assert!(
+        err.contains("joint 1 TIMEOUT readback mismatch: expected 2000 counts, observed 0 counts"),
+        "expected exact J1 TIMEOUT mismatch, got: {err}"
+    );
 }
 
 #[test]
@@ -584,6 +587,11 @@ fn synchronized_loss_and_post_bus_loss_timeout_refusal_on_rt_executor() {
         matches!(rearm_out, Some(Outcome::Failed(_))),
         "RT re-enable must fail on TIMEOUT=0: {rearm_out:?}"
     );
+    let rt_cause = fx.core.safety.fault().map(|f| f.message.as_str().to_string()).unwrap_or_default();
+    assert!(
+        rt_cause.contains("joint 1 TIMEOUT readback mismatch: expected 2000 counts, observed 0 counts"),
+        "RT re-enable must report exact J1 TIMEOUT mismatch, got: {rt_cause}"
+    );
     assert!(
         !fx.core.safety.state().is_operational(),
         "arm must not become operational when TIMEOUT=0: {:?}",
@@ -596,4 +604,260 @@ fn synchronized_loss_and_post_bus_loss_timeout_refusal_on_rt_executor() {
     });
     assert!(!sent_enable, "RT re-enable must send zero CMD_ENABLE frames on TIMEOUT mismatch");
     assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)));
+}
+
+#[test]
+fn b1_deferred_tx_stale_reply_and_spoofed_reply_id_rejected() {
+    let cfg = ArmConfig::rebot_dm();
+    let limits = b601_limits();
+
+    // Case 1 (B1): TX budget defers J2's TIMEOUT REG_READ; a stale J2 TIMEOUT=2000 reply arrives
+    // before J2's new REG_READ is transmitted while J2 is rebooted/silent -> MUST refuse enable!
+    {
+        let (bus, clock) = FakeBus::new(&limits);
+        let mut drv = make_driver(bus.clone(), &cfg).with_tx_budget(armd::driver::TxBudget {
+            max_frames: 1,
+            max_duration: ms(10),
+            frame_max_age: ms(500),
+        });
+        bus.push_all_fb();
+        let _ = drv.read_joint_states();
+        // Let CTRL_MODE stage succeed cleanly first (all 7 motors reply to CTRL_MODE).
+        // Silence J2 only for TIMEOUT readbacks, and inject a stale J2 TIMEOUT=2000 right after
+        // poll 1 of TIMEOUT stage (when only J1's TIMEOUT REG_READ was sent under max_frames=1).
+        bus.with(|s| {
+            s.motors[1].answer_timeout = false;
+            s.motors[1].timeout_counts = 0;
+        });
+        let dl = clock.now() + Duration::from_secs(2);
+        drv.begin_torque(true).unwrap();
+        let mut injected_stale = false;
+        let mut final_err = None;
+        for _ in 0..80 {
+            clock.advance(ms(5));
+            bus.push_all_fb();
+            let j1_timeout_sent = bus.with(|s| {
+                s.tx_log
+                    .iter()
+                    .any(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_TIMEOUT)
+            });
+            let j2_timeout_sent = bus.with(|s| {
+                s.tx_log
+                    .iter()
+                    .any(|f| f.id == 0x7FF && f.data[0] == 2 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_TIMEOUT)
+            });
+            if j1_timeout_sent && !j2_timeout_sent && !injected_stale {
+                bus.push_reg_reply(2, damiao::RID_TIMEOUT, 2000);
+                injected_stale = true;
+            }
+            let _ = drv.read_joint_states();
+            match drv.poll_torque(dl) {
+                Ok(armd::driver::TorqueProgress::Pending { .. }) => {}
+                Ok(armd::driver::TorqueProgress::Done(_)) => panic!("stale pre-TX J2 TIMEOUT reply must NOT authorize enable!"),
+                Err(e) => {
+                    final_err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(injected_stale, "expected J2 TIMEOUT TX to be deferred behind J1 under 1-frame budget");
+        let err = final_err.expect("expected TIMEOUT missing refusal").to_string();
+        assert!(
+            err.contains("joint 2 TIMEOUT readback: no fresh reply"),
+            "expected J2 TIMEOUT missing, got: {err}"
+        );
+    }
+
+    // Case 2 (B1): Spoofed reply CAN ID (0x16 claiming motor_id=1) rejected as ambiguous!
+    {
+        let (bus, clock) = FakeBus::new(&limits);
+        bus.with(|s| s.motors[0].answer_timeout = false);
+        let mut drv = make_driver(bus.clone(), &cfg);
+        bus.push_all_fb();
+        let _ = drv.read_joint_states();
+        let dl = clock.now() + Duration::from_secs(2);
+        drv.begin_torque(true).unwrap();
+        let mut injected = false;
+        let mut err = None;
+        for _ in 0..40 {
+            clock.advance(ms(5));
+            bus.push_all_fb();
+            let j1_timeout_sent = bus.with(|s| {
+                s.tx_log
+                    .iter()
+                    .any(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_TIMEOUT)
+            });
+            if j1_timeout_sent && !injected {
+                // Wrong CAN ID 0x16 (motor 6's MST_ID) claiming motor_id=1!
+                let b = 2000u32.to_le_bytes();
+                let spoof = CanFrame::new_standard(0x16, &[1, 0, damiao::REG_READ, damiao::RID_TIMEOUT, b[0], b[1], b[2], b[3]]).unwrap();
+                let now = clock.now();
+                bus.with(|s| s.rx.push_back((spoof, Some(CanRxTime::Monotonic(now)))));
+                injected = true;
+            }
+            let _ = drv.read_joint_states();
+            match drv.poll_torque(dl) {
+                Ok(armd::driver::TorqueProgress::Pending { .. }) => {}
+                Ok(armd::driver::TorqueProgress::Done(_)) => panic!("spoofed reply CAN ID must NOT authorize enable"),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(injected);
+        let msg = err.expect("spoofed reply ID must fail").to_string();
+        assert!(msg.contains("joint 1 TIMEOUT readback: ambiguous"), "got: {msg}");
+    }
+}
+
+#[test]
+fn b2_aborted_enable_preserves_startup_readback_requirement() {
+    let cfg = ArmConfig::rebot_dm();
+    let limits = b601_limits();
+    let (bus, clock) = FakeBus::new(&limits);
+    let mut drv = make_driver(bus.clone(), &cfg);
+    bus.push_all_fb();
+    let _ = drv.read_joint_states();
+    let dl = clock.now() + Duration::from_secs(2);
+    drv.begin_torque(true).unwrap();
+    // Advance poll-by-poll until CTRL_MODE and TIMEOUT readbacks have BOTH passed (i.e. J7
+    // pre-enable hold 0x307 or CMD_ENABLE is sent), without pushing post-enable state=1 feedback,
+    // then abort BEFORE enable confirms!
+    let mut reached_post_readback = false;
+    for _ in 0..10 {
+        clock.advance(ms(5));
+        let _ = drv.read_joint_states();
+        match drv.poll_torque(dl).unwrap() {
+            armd::driver::TorqueProgress::Pending { .. } => {
+                if bus.with(|s| {
+                    s.tx_log
+                        .iter()
+                        .any(|f| f.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC])
+                }) {
+                    reached_post_readback = true;
+                    break;
+                }
+            }
+            armd::driver::TorqueProgress::Done(_) => panic!("must not confirm without enabled feedback"),
+        }
+    }
+    assert!(reached_post_readback, "expected enable to pass readbacks and send CMD_ENABLE before abort");
+    assert!(drv.torque_transition_pending(), "enable must still be pending before abort");
+    drv.abort_enable();
+
+    // Now J1 reboots with TIMEOUT=0. The next enable MUST NOT reuse proofs from the aborted attempt!
+    bus.with(|s| {
+        s.motors[0].timeout_counts = 0;
+        s.tx_log.clear();
+    });
+    let dl2 = clock.now() + Duration::from_secs(2);
+    drv.begin_torque(true).unwrap();
+    let mut err = None;
+    for _ in 0..40 {
+        clock.advance(ms(10));
+        bus.push_all_fb();
+        let _ = drv.read_joint_states();
+        match drv.poll_torque(dl2) {
+            Ok(armd::driver::TorqueProgress::Pending { .. }) => {}
+            Ok(armd::driver::TorqueProgress::Done(_)) => panic!("aborted enable must not leak TIMEOUT proofs!"),
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let msg = err.expect("retried enable must fail on J1 TIMEOUT=0").to_string();
+    assert!(
+        msg.contains("joint 1 TIMEOUT readback mismatch: expected 2000 counts, observed 0 counts"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn m1_timeout_verification_mandatory_when_expected_omitted_or_axis_null() {
+    let cfg = ArmConfig::rebot_dm();
+    let limits = b601_limits();
+    let drive = gripper_drive_from_profile(&cfg).unwrap();
+    for expected_opt in [None, Some(vec![None; 7])] {
+        let (bus, clock) = FakeBus::new(&limits);
+        bus.with(|s| s.motors[1].answer_timeout = false);
+        let mut drv = DamiaoArmDriver::new(bus.clone(), (1..=7).collect())
+            .with_joint_limits(limits.to_vec())
+            .unwrap()
+            .with_gripper_drive(drive.clone())
+            .unwrap()
+            .with_timeout_verification(expected_opt.clone())
+            .unwrap();
+        bus.push_all_fb();
+        let _ = drv.read_joint_states();
+        let dl = clock.now() + Duration::from_secs(2);
+        drv.begin_torque(true).unwrap();
+        let mut err = None;
+        for _ in 0..40 {
+            clock.advance(ms(10));
+            bus.push_all_fb();
+            let _ = drv.read_joint_states();
+            match drv.poll_torque(dl) {
+                Ok(armd::driver::TorqueProgress::Pending { .. }) => {}
+                Ok(armd::driver::TorqueProgress::Done(_)) => panic!("missing J2 TIMEOUT reply must fail even for {expected_opt:?}"),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let msg = err.expect("must fail on silent J2 TIMEOUT").to_string();
+        assert!(msg.contains("joint 2 TIMEOUT readback: no fresh reply"), "got: {msg}");
+    }
+}
+
+#[test]
+fn m2_mit_bus_loss_enrichment_preserves_recovery_instructions() {
+    let cfg = ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() };
+    let limits = b601_limits();
+    let (bus, clock) = FakeBus::new(&limits);
+    let drv = make_driver(bus.clone(), &cfg);
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    bus.push_all_fb();
+    inner.tick(DT);
+    {
+        let s = inner.current_admission_stamp();
+        inner.check_admission(s).and_then(|a| SupervisorInner::enable_torque(a)).unwrap();
+    }
+    for _ in 0..10 {
+        clock.advance(ms(20));
+        bus.push_all_fb();
+        inner.tick(DT);
+    }
+    // Simulate early MIT deadline fence BusLoss latch at ~45 ms (before 250 ms synchronized silence).
+    inner.safety.latch(
+        armd::FaultKind::BusLoss,
+        armd::safety::FaultDetail::formatted(FaultCode::BusLoss, |buf| {
+            let _ = core::fmt::Write::write_str(
+                buf,
+                "MIT_LOST: driver deadline fence: feedback stale on J2; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint",
+            );
+        }),
+    );
+    // Now all 7 motors go silent synchronously; after >600 ms the supervisor enriches the same
+    // BusLoss incident with the synchronized power-loss annotation without losing MIT instructions!
+    bus.with(|s| for m in &mut s.motors { m.silent = true; m.enabled = false; });
+    for _ in 0..35 {
+        clock.advance(ms(20));
+        inner.tick(DT);
+    }
+    let fi = inner.safety.fault().expect("BusLoss fault");
+    assert_eq!(fi.code, FaultCode::BusLoss);
+    let msg = fi.message.as_str();
+    assert!(msg.contains("MIT_LOST:"), "MIT recovery instructions must be preserved: {msg}");
+    assert!(
+        msg.contains("clear_fault recovers by turning torque off"),
+        "MIT recovery detail truncated: {msg}"
+    );
+    assert!(
+        msg.contains("Suspected motor power loss or shared CAN interruption."),
+        "synchronized BusLoss annotation missing after MIT early latch: {msg}"
+    );
 }

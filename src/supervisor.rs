@@ -1315,8 +1315,6 @@ pub struct SupervisorInner {
     pub(crate) last_valid_motor_rx: [Option<Instant>; crate::model::MAX_MOTION_DOF],
     /// Deferred `ArmDriver::notify_bus_loss` if the driver slot could not be locked during BusLoss.
     pub(crate) pending_driver_bus_loss_notify: bool,
-    /// Last classified synchronized BusLoss evidence (cleared on successful `clear_fault`).
-    pub(crate) last_bus_loss_detail: Option<crate::safety::BusLossDetail>,
     /// RT-owned state of this arm (`crate::rt_core`): per-joint feedback receive instants and
     /// sequence counters, the state publisher and the recording ring.
     pub core: crate::rt_core::ArmCore,
@@ -1446,6 +1444,14 @@ pub struct SupervisorInner {
     pub zero_check_persisting: Option<u64>,
     /// Pending disk persist + commit payload produced by finish_action during ArmSupervisor::tick.
     pub pending_zero_check_persist: Option<PendingZeroCheckPersist>,
+    /// Pending Legacy supervised_first_run qualification ledger write deferred off the control
+    /// release lock (0 alloc, 0 file I/O in tick; B4).
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) pending_policy_qual_persist: Option<(
+        crate::policy_runtime::PolicyRun,
+        crate::model::HolderLabel,
+        crate::model::HolderLabel,
+    )>,
     /// Retired `ZeroCheckPersistContext` payloads waiting for off-thread drop (never dropped on RT).
     pub(crate) retired_zero_check_ctx: std::collections::VecDeque<Box<ZeroCheckPersistContext>>,
     /// Whether operator auth is enforced (exposed in GET /api/v1/safety/describe).
@@ -2603,7 +2609,6 @@ impl SupervisorInner {
             last_can_feedback_instant: None,
             last_valid_motor_rx: [None; crate::model::MAX_MOTION_DOF],
             pending_driver_bus_loss_notify: false,
-            last_bus_loss_detail: None,
             core: crate::rt_core::ArmCore::new(dof),
             joint_feedback_queue_bounds: Vec::with_capacity(dof),
             scratch: crate::rt_core::scratch::TickScratch::with_dof(dof),
@@ -2668,6 +2673,8 @@ impl SupervisorInner {
             tick_phases_us: [0; 5],
             zero_check_persisting: None,
             pending_zero_check_persist: None,
+            #[cfg(feature = "policy-runtime")]
+            pending_policy_qual_persist: None,
             retired_zero_check_ctx: std::collections::VecDeque::with_capacity(4),
             operator_auth_enforced: false,
             tool_commissioning_path: None,
@@ -4318,9 +4325,18 @@ impl SupervisorInner {
     /// End every motion and hold the measured pose (clamped to the limits) with torque on;
     /// the gripper keeps its command so that a held object stays held.
     pub(crate) fn hold_measured_pose(&mut self) {
+        self.hold_measured_pose_inner(false);
+    }
+
+    /// [`Self::hold_measured_pose`] with optional tracking-history preservation (zero heap ops,
+    /// zero moves/clones of `self.tracking`; used by `torque_trip` so active tracking lead ramps
+    /// smoothly in the relieving direction).
+    pub(crate) fn hold_measured_pose_inner(&mut self, preserve_tracking: bool) {
         self.stop_motion();
         self.servo_stream_active = false;
-        self.tracking.invalidate();
+        if !preserve_tracking {
+            self.tracking.invalidate();
+        }
         let gripper_idx = self.config.gripper_index();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             for (i, (c, m)) in self
@@ -7224,7 +7240,6 @@ impl SupervisorInner {
         self.driver_clock = driver.driver_clock();
         self.last_valid_motor_rx = [None; crate::model::MAX_MOTION_DOF];
         self.pending_driver_bus_loss_notify = false;
-        self.last_bus_loss_detail = None;
         let caps = driver.capabilities();
         self.driver_has_torque_feedback = caps.torque_feedback;
         self.driver_has_load_feedback = caps.load_feedback;
@@ -8378,6 +8393,44 @@ impl SupervisorInner {
         copy_into(&mut self.target_positions, &self.commanded_positions);
     }
 
+    /// Zero-allocation refusal for an in-flight planned motion (Cartesian path, replay, or
+    /// quintic) whose next discrete tick increment fails static-load admission or restriction (M5).
+    /// Keeps `commanded_positions` at the last safe reference, zeroes velocity, and fails the
+    /// active action/macro with `STATIC_LOAD_LIMIT`.
+    pub(crate) fn abort_planned_motion_static_load_rt(&mut self, action_id: Option<u64>) {
+        if let Some(id) = action_id {
+            let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
+            if is_macro {
+                self.drop_macro_run("failed", Some("STATIC_LOAD_LIMIT"));
+            } else if self
+                .last_action
+                .as_ref()
+                .is_some_and(|a| a.id == id && a.is_running())
+            {
+                let mut msg = self.take_action_msg_buf(id, 192);
+                msg.clear();
+                let _ = core::fmt::Write::write_str(&mut msg, crate::power::STATIC_LOAD_LIMIT_MSG);
+                self.finish_action(
+                    id,
+                    "failed",
+                    Some("STATIC_LOAD_LIMIT"),
+                    Some(msg),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+        self.replace_active_trajectory(None);
+        self.pending_normal_unload = false;
+        self.clear_unload_settle();
+        self.quintic_settle = None;
+        self.commanded_velocities.fill(0.0);
+        copy_into(&mut self.target_positions, &self.commanded_positions);
+        self.safety.mark_motion_finished();
+        self.note_motion_limit(MotionLimitReason::Power, None);
+    }
+
     /// Classify whether a `BusLoss` matches a synchronized multi-motor feedback drop (all
     /// previously reporting motors stale, with their last valid RX timestamps clustered within
     /// [`POWER_LOSS_SYNC_WINDOW_MS`]). Zero heap allocations, O(dof) timestamp comparisons.
@@ -9201,11 +9254,12 @@ impl SupervisorInner {
                         driver.feedback_receive_instants_into(&mut sc.rx);
                         let rx_dof = self.config.dof.min(crate::model::MAX_MOTION_DOF);
                         for i in 0..rx_dof {
-                            let st_ok = sc.states.get(i).is_some_and(|st| {
-                                st.position.is_finite()
-                                    && (!caps.velocity_feedback || st.velocity.is_finite())
-                                    && (!caps.torque_feedback || st.torque.is_finite())
-                            });
+                            let st_ok = sc
+                                .states
+                                .get(i)
+                                .is_some_and(|st| crate::driver::joint_state_valid(st, caps))
+                                && (!caps.load_feedback
+                                    || (has_loads && sc.loads.get(i).is_some_and(|l| l.is_finite())));
                             if !st_ok {
                                 continue;
                             }
@@ -10608,9 +10662,15 @@ impl SupervisorInner {
         if self.is_torqued
             && self.driver.is_some()
             && !(self.feedback_numeric_valid && bus_feedback_fresh)
-            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::BusLoss)
         {
-            self.execute_stop_in_tick(StopPolicy::BusLossFallback);
+            if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::BusLoss) {
+                self.execute_stop_in_tick(StopPolicy::BusLossFallback);
+            } else if !self.safety.has_synchronized_bus_loss() {
+                if let Some(detail) = self.classify_bus_loss_detail() {
+                    self.safety.enrich_bus_loss_detail(detail);
+                    self.notify_driver_bus_loss();
+                }
+            }
         }
 
         // Check hardware motor faults / error flags from feedback (0 heap allocs on RT).
@@ -11079,37 +11139,49 @@ impl SupervisorInner {
                 reference_stepped = true;
                 self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
-                deferred_done = self.apply_action_step(action_id, out);
+                if self.check_static_load_admission(&out.positions).is_err() {
+                    self.abort_planned_motion_static_load_rt(action_id);
+                } else {
+                    deferred_done = self.apply_action_step(action_id, out);
+                }
             }
             Some((action_id, Stepped::Replay(mut out, phase, t_s))) => {
                 reference_stepped = true;
                 self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
-                if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
-                    if a.id == id && a.is_running() {
-                        a.phase = Some(phase.into());
-                        a.t_s = Some(t_s as f32);
+                if self.check_static_load_admission(&out.positions).is_err() {
+                    self.abort_planned_motion_static_load_rt(action_id);
+                } else {
+                    if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
+                        if a.id == id && a.is_running() {
+                            a.phase = Some(phase.into());
+                            a.t_s = Some(t_s as f32);
+                        }
                     }
+                    deferred_done = self.apply_action_step(action_id, out);
                 }
-                deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Quintic(finished, progress))) => {
                 reference_stepped = true;
                 self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut point_buf.positions, &mut point_buf.velocities);
-                // swap: the previous command's memory goes back to the scratch
-                std::mem::swap(&mut self.commanded_positions, &mut point_buf.positions);
-                std::mem::swap(&mut self.commanded_velocities, &mut point_buf.velocities);
-                let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
-                if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
-                    if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
-                }
-                if finished && approach_started.is_none() {
-                    self.replace_active_trajectory(None);
-                    self.commanded_velocities.fill(0.0);
-                    if !self.pending_normal_unload {
-                        self.safety.mark_motion_finished();
-                        if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
+                if self.check_static_load_admission(&point_buf.positions).is_err() {
+                    self.abort_planned_motion_static_load_rt(action_id);
+                } else {
+                    // swap: the previous command's memory goes back to the scratch
+                    std::mem::swap(&mut self.commanded_positions, &mut point_buf.positions);
+                    std::mem::swap(&mut self.commanded_velocities, &mut point_buf.velocities);
+                    let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
+                    if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
+                        if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
+                    }
+                    if finished && approach_started.is_none() {
+                        self.replace_active_trajectory(None);
+                        self.commanded_velocities.fill(0.0);
+                        if !self.pending_normal_unload {
+                            self.safety.mark_motion_finished();
+                            if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
+                        }
                     }
                 }
             }
@@ -11321,38 +11393,46 @@ impl SupervisorInner {
                         self.latch_servo_fault(i);
                     } else if let Some(i) = blocked {
                         self.enter_servo_blocked_hold(i, "no progress at the lead cap");
-                    } else if let Err(f) = self.servo_step_workspace_rt(&next_positions, "servo_step") {
-                        self.enter_servo_keepout_hold_rt(f);
-                    } else if self.check_static_load_admission(&next_positions).is_err() {
-                        self.enter_servo_static_load_hold_rt();
                     } else {
-                        // swap: the previous command's memory goes back to the scratch
-                        std::mem::swap(&mut self.commanded_positions, &mut next_positions);
-                        std::mem::swap(&mut self.commanded_velocities, &mut next_velocities);
-                        copy_into(&mut self.target_positions, &self.commanded_positions);
+                        match self.servo_step_workspace_rt(&next_positions, "servo_step") {
+                            Err(f) => self.enter_servo_keepout_hold_rt(f),
+                            Ok(pending_ws) => {
+                                if self.check_static_load_admission(&next_positions).is_err() {
+                                    self.enter_servo_static_load_hold_rt();
+                                } else {
+                                    if let Some(n) = pending_ws {
+                                        self.commit_servo_ws_min_depths_rt(n);
+                                    }
+                                    // swap: the previous command's memory goes back to the scratch
+                                    std::mem::swap(&mut self.commanded_positions, &mut next_positions);
+                                    std::mem::swap(&mut self.commanded_velocities, &mut next_velocities);
+                                    copy_into(&mut self.target_positions, &self.commanded_positions);
 
-                        // Update hysteresis counter for each axis: if reached, increment; if not reached, reset to 0
-                        for i in 0..self.config.dof {
-                            if reached_flags[i] {
-                                self.servo_settled_ticks[i] = self.servo_settled_ticks[i].saturating_add(1);
-                            } else {
-                                self.servo_settled_ticks[i] = 0;
-                            }
-                        }
+                                    // Update hysteresis counter for each axis: if reached, increment; if not reached, reset to 0
+                                    for i in 0..self.config.dof {
+                                        if reached_flags[i] {
+                                            self.servo_settled_ticks[i] = self.servo_settled_ticks[i].saturating_add(1);
+                                        } else {
+                                            self.servo_settled_ticks[i] = 0;
+                                        }
+                                    }
 
-                        // If all axes have servo_settled_ticks[i] >= 2, mark motion finished
-                        if self.servo_settled_ticks.iter().all(|&ticks| ticks >= 2) {
-                            self.release_servo_target();
-                            self.safety.mark_motion_finished();
-                            if self.commanded_velocities.iter().all(|&v| v == 0.0) {
-                                self.clear_servo_ws_min_depths_rt();
-                                let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
-                                    && self.tracking.has_residual_lead(
-                                        &self.commanded_positions,
-                                        &self.config.arm_joints(),
-                                    );
-                                if !keep_stream {
-                                    self.servo_stream_active = false;
+                                    // If all axes have servo_settled_ticks[i] >= 2, mark motion finished
+                                    if self.servo_settled_ticks.iter().all(|&ticks| ticks >= 2) {
+                                        self.release_servo_target();
+                                        self.safety.mark_motion_finished();
+                                        if self.commanded_velocities.iter().all(|&v| v == 0.0) {
+                                            self.clear_servo_ws_min_depths_rt();
+                                            let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
+                                                && self.tracking.has_residual_lead(
+                                                    &self.commanded_positions,
+                                                    &self.config.arm_joints(),
+                                                );
+                                            if !keep_stream {
+                                                self.servo_stream_active = false;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -11404,26 +11484,39 @@ impl SupervisorInner {
             let braking = self.commanded_velocities.iter().any(|&v| v != 0.0);
             if let Some(i) = infeasible {
                 self.latch_servo_fault(i);
-            } else if let Some(f) = braking.then(|| self.servo_step_workspace_rt(&next_positions, "braking").err()).flatten() {
-                self.enter_servo_keepout_hold_rt(f);
-            } else if braking && self.check_static_load_admission(&next_positions).is_err() {
-                self.enter_servo_static_load_hold_rt();
             } else {
-                // swap: the previous command's memory goes back to the scratch
-                std::mem::swap(&mut self.commanded_positions, &mut next_positions);
-                std::mem::swap(&mut self.commanded_velocities, &mut next_velocities);
-                copy_into(&mut self.target_positions, &self.commanded_positions);
-                if self.commanded_velocities.iter().all(|&v| v == 0.0) {
-                    self.safety.mark_motion_finished();
-                    self.clear_servo_ws_min_depths_rt();
-                    let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
-                        && (braking
-                            || self.tracking.has_residual_lead(
-                                &self.commanded_positions,
-                                &self.config.arm_joints(),
-                            ));
-                    if !keep_stream {
-                        self.servo_stream_active = false;
+                let ws_res = if braking {
+                    self.servo_step_workspace_rt(&next_positions, "braking")
+                } else {
+                    Ok(None)
+                };
+                match ws_res {
+                    Err(f) => self.enter_servo_keepout_hold_rt(f),
+                    Ok(pending_ws) => {
+                        if braking && self.check_static_load_admission(&next_positions).is_err() {
+                            self.enter_servo_static_load_hold_rt();
+                        } else {
+                            if let Some(n) = pending_ws {
+                                self.commit_servo_ws_min_depths_rt(n);
+                            }
+                            // swap: the previous command's memory goes back to the scratch
+                            std::mem::swap(&mut self.commanded_positions, &mut next_positions);
+                            std::mem::swap(&mut self.commanded_velocities, &mut next_velocities);
+                            copy_into(&mut self.target_positions, &self.commanded_positions);
+                            if self.commanded_velocities.iter().all(|&v| v == 0.0) {
+                                self.safety.mark_motion_finished();
+                                self.clear_servo_ws_min_depths_rt();
+                                let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
+                                    && (braking
+                                        || self.tracking.has_residual_lead(
+                                            &self.commanded_positions,
+                                            &self.config.arm_joints(),
+                                        ));
+                                if !keep_stream {
+                                    self.servo_stream_active = false;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -11451,11 +11544,7 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
                 self.output_suspended = false;
-                let bus_loss_detail = self.classify_bus_loss_detail();
-                if bus_loss_detail.is_some() {
-                    self.last_bus_loss_detail = bus_loss_detail;
-                }
-                let fault_detail = match bus_loss_detail {
+                let fault_detail = match self.classify_bus_loss_detail() {
                     Some(d) => crate::safety::FaultDetail::BusLossAnnotated(d),
                     None => crate::safety::FaultDetail::BusLoss,
                 };
@@ -16635,6 +16724,49 @@ impl ArmSupervisor {
             .unwrap_or_else(|_| crate::torque_guard::TorqueBackoffHistory::default().to_diagnostics())
     }
 
+    /// Off-thread `/api/v1/diagnostics/power` payload that reads live published RT telemetry and
+    /// `torque_backoff` history from [`StateHub`] when executor-owned (never reading the detached
+    /// Legacy shell), and reads `SupervisorInner::power_diagnostics()` under Legacy ownership.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn power_diagnostics(&self) -> serde_json::Value {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            let budget = self
+                .published_config_hub()
+                .latest()
+                .and_then(|c| c.config.power_budget.clone())
+                .filter(|b| b.enabled);
+            let Some(budget) = budget else {
+                return serde_json::json!({"enabled": false});
+            };
+            let snap = self.hub().latest();
+            let obs_power = snap.as_ref().and_then(|s| s.obs.power.clone());
+            let static_severity = obs_power
+                .as_ref()
+                .map_or(crate::power::StaticOverloadSeverity::None, |p| p.severity);
+            let static_restricted = snap
+                .as_ref()
+                .is_some_and(|s| s.rt.owner.static_restricted)
+                || obs_power.as_ref().is_some_and(|p| p.static_restricted);
+            let torque_backoff = snap
+                .as_ref()
+                .map(|s| s.rt.torque_backoff.to_diagnostics())
+                .unwrap_or_else(|| {
+                    crate::torque_guard::TorqueBackoffHistory::default().to_diagnostics()
+                });
+            return serde_json::json!({
+                "enabled": true,
+                "estimate_only": true,
+                "observation": obs_power,
+                "static_severity": static_severity,
+                "static_restricted": static_restricted,
+                "idle_a": (budget.idle_a() * 1000.0).round() / 1000.0,
+                "torque_backoff": torque_backoff,
+                "budget": budget,
+            });
+        }
+        self.inner().read().await.power_diagnostics()
+    }
+
     /// Shared handle to the off-thread shadow comparator/diagnostics hub.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn torque_shadow_hub(&self) -> &Arc<crate::torque::shadow::TorqueShadowHub> {
@@ -20328,6 +20460,7 @@ impl ArmSupervisor {
             wait,
             control_hz,
             pending_zc,
+            pending_qual,
             pending_wd,
             phases,
             log,
@@ -20466,6 +20599,21 @@ impl ArmSupervisor {
             #[cfg(target_arch = "wasm32")]
             let legacy_comm_plan: Option<(Instant, Duration, Duration)> = None;
             let pending_zc = inner.pending_zero_check_persist.take();
+            #[cfg(feature = "policy-runtime")]
+            let pending_qual = inner
+                .pending_policy_qual_persist
+                .take()
+                .map(|(run, reason, state)| {
+                    (
+                        run,
+                        reason,
+                        state,
+                        inner.policy_ledger_path.clone(),
+                        inner.policy_live_allowed(),
+                    )
+                });
+            #[cfg(not(feature = "policy-runtime"))]
+            let pending_qual: Option<()> = None;
             let pending_wd = inner.watchdog_park_pending.filter(|p| !p.waiting_mit_handback);
             let control_hz = inner.config.control_frequency_hz;
             let mid_csw_start = mid_csw_start.unwrap_or_else(CswMark::now);
@@ -20481,6 +20629,7 @@ impl ArmSupervisor {
                 locked.saturating_duration_since(started),
                 control_hz,
                 pending_zc,
+                pending_qual,
                 pending_wd,
                 phases,
                 log,
@@ -20570,6 +20719,45 @@ impl ArmSupervisor {
                 )
                 .await;
             });
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        let _ = pending_qual;
+        #[cfg(feature = "policy-runtime")]
+        if let Some((run, reason, state, ledger_path, live_allowed)) = pending_qual {
+            if !live_allowed {
+                if let (Some(gate), Some(path)) = (
+                    run.verified_release_gate.as_ref().filter(|g| {
+                        g.authorization_tier()
+                            == crate::policy_runtime::AuthorizationTier::SupervisedFirstRun
+                    }),
+                    ledger_path,
+                ) {
+                    let stop_reason = reason.as_str().to_string();
+                    let passed = stop_reason == "MAX_SECONDS" && state.as_str() == "done";
+                    let record = crate::policy_runtime::qualification::QualificationRecord::for_run(
+                        gate,
+                        run.action_id,
+                        run.steps,
+                        &stop_reason,
+                        passed,
+                    )
+                    .with_policy_stats(run.step_stats.report());
+                    let qual_coord = Arc::clone(&self.policy_qualification);
+                    let persist = move || {
+                        if let Err(e) = qual_coord.append_and_release_pending(&path, &record, None) {
+                            tracing::warn!(
+                                "Cannot append policy qualification record to {}: {e}",
+                                path.display()
+                            );
+                        }
+                    };
+                    if keep {
+                        let _ = tokio::task::spawn_blocking(persist).await;
+                    } else {
+                        drop(tokio::task::spawn_blocking(persist));
+                    }
+                }
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some((comm_rd, comm_margin, tx_budget_dur)) = legacy_comm_plan {
