@@ -2506,6 +2506,9 @@ impl SupervisorInner {
             crate::torque::shadow::ShadowRuntime::disabled(&config)
         };
 
+        let mut scratch = crate::rt_core::scratch::TickScratch::with_dof(dof);
+        copy_limits(&mut scratch.step_limits, &config.limits);
+
         let mut inner = Self {
             config,
             safety: SafetyManager::new(),
@@ -2710,7 +2713,7 @@ impl SupervisorInner {
             last_can_feedback_instant: None,
             core: crate::rt_core::ArmCore::new(dof),
             joint_feedback_queue_bounds: Vec::with_capacity(dof),
-            scratch: crate::rt_core::scratch::TickScratch::with_dof(dof),
+            scratch,
             ws_eval_bufs: Default::default(),
             bus_loss_instant: None,
             estop_state,
@@ -11963,35 +11966,28 @@ impl SupervisorInner {
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else if ramp_out_handover || tracking_owned {
-                    let jt = self.config.joint_tracking.as_ref().unwrap();
-                    let active_limits = self.active_tracking_limits(servo_dt, time_scale);
+                    let mut active_limits = std::mem::take(&mut self.scratch.step_limits);
+                    self.active_tracking_limits_into(servo_dt, time_scale, &mut active_limits);
+                    let mut tr_scratch = std::mem::take(&mut self.scratch.tracking);
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
                     let eval_res = if ramp_out_handover {
-                        self.compute_lead_ramp_out_with_budget(
+                        self.compute_lead_ramp_out_into(
                             servo_dt,
                             &active_limits,
                             self.pending_normal_unload,
                             &mut tick_sweep_budget,
-                        )
-                    } else if self.handover_settling_since.is_some() {
-                        // Moving lease handover with lead already ramped out: validate nominal
-                        // handover hold/braking without adding new lead.
-                        let mut zero_jt = jt.clone();
-                        for j in &mut zero_jt.joints {
-                            j.strategy = crate::tracking::TrackingStrategy::Position;
-                        }
-                        self.compute_position_lead_output_with_limits_and_budget(
-                            servo_dt,
-                            &zero_jt,
-                            &active_limits,
-                            &mut tick_sweep_budget,
+                            &mut tr_scratch,
                         )
                     } else {
-                        self.compute_position_lead_output_with_limits_and_budget(
+                        let jt = self.config.joint_tracking.as_ref().unwrap();
+                        let force_pos_only = self.handover_settling_since.is_some();
+                        self.compute_position_lead_output_into(
                             servo_dt,
                             jt,
+                            force_pos_only,
                             &active_limits,
                             &mut tick_sweep_budget,
+                            &mut tr_scratch,
                         )
                     };
                     match eval_res {
@@ -11999,7 +11995,8 @@ impl SupervisorInner {
                             let mut targets = std::mem::take(&mut self.scratch.targets);
                             targets.clear();
                             targets.extend(
-                                out.positions
+                                tr_scratch
+                                    .out_positions
                                     .iter()
                                     .zip(self.commanded_velocities.iter())
                                     .enumerate()
@@ -12019,14 +12016,14 @@ impl SupervisorInner {
                             tick_output = self.write_output_scratch(servo_dt);
                             match &tick_output {
                                 TickOutput::Complete { .. } => {
-                                    let nominal = self.tracking.nominal_entry(&self.commanded_positions, servo_dt);
-                                    self.tracking.record_issued_with_ws_depths(
-                                        out.positions,
-                                        out.velocities,
+                                    self.tracking.record_issued_and_nominal_in_place(
+                                        &tr_scratch.out_positions,
+                                        &tr_scratch.out_velocities,
+                                        &self.commanded_positions,
+                                        servo_dt,
                                         out.ws_min_depths,
                                         out.ws_keepout_min_depths,
                                     );
-                                    self.tracking.last_nominal = Some(nominal);
                                     if out.withdrawn {
                                         self.tracking.withdrawal_ticks += 1;
                                     }
@@ -12086,6 +12083,8 @@ impl SupervisorInner {
                             tick_output = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
                         }
                     }
+                    self.scratch.tracking = tr_scratch;
+                    self.scratch.step_limits = active_limits;
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else {

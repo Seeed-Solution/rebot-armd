@@ -2584,3 +2584,201 @@ fn rt_gate_lock_boundary_assertions_reject_before_touching_lock() {
     .join()
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rt_gate_tracking_position_lead_and_ramp_out_zero_alloc_zero_lock() {
+    use armd::rt_core::requests::motion::{
+        prepare_motion, stage_jog, stage_park, MotionConfigSnapshot, MotionPlanSnapshot,
+        MotionRequest,
+    };
+    use armd::rt_core::rt_gate::RtReleaseGate;
+    use armd::safety::SafetyState;
+    use armd::tracking::{JointTrackingConfig, JointTrackingJoint, TrackingStrategy};
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.control_frequency_hz = 50;
+    cfg.joint_tracking = Some(JointTrackingConfig {
+        enabled: true,
+        joints: vec![
+            JointTrackingJoint {
+                strategy: TrackingStrategy::PositionLead,
+                lag_s: 0.06,
+                max_lead_rad: 0.03,
+                ..Default::default()
+            };
+            6
+        ],
+    });
+    let dof = cfg.dof;
+    let clock = ScriptedClock::new();
+    let (drv, _fail_en) = WakeDriver::new(dof, Duration::from_millis(4), Some(Arc::clone(&clock)));
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
+    let motion_cfg = {
+        let inner = sup.inner().read().await;
+        Arc::new(MotionConfigSnapshot::from_supervisor(&inner))
+    };
+
+    let period = Duration::from_millis(20);
+    let period_ns = period.as_nanos() as u64;
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(period),
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Warm up 2 releases so initial snapshot is published.
+    clock.run_steps(period_ns, 2);
+    wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+
+    let gate = RtReleaseGate::new(&sup, &handle);
+    let mut client_seq = 0u64;
+    let next_auth = || {
+        let s = sup.hub().latest().unwrap();
+        Authority {
+            lease_generation: 0,
+            epoch: s.obs.epoch_id,
+            stop_generation: handle.stop_requests().current(),
+            config_revision: 0,
+            parent_generation: 0,
+        }
+    };
+
+    // 1. Enable torque with position-lead tracking enabled (seeds tracking history zero-alloc).
+    let (_, en_delta) = gate.run_phase("tracking_enable_torque", || {
+        let auth = next_auth();
+        client_seq += 1;
+        let req = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                auth,
+                clock.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        let mut confirmed = false;
+        for _ in 0..20 {
+            clock.run_steps(period_ns, 1);
+            let rs = drain_broker(&handle);
+            if rs.iter().any(|r| {
+                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == req)
+            }) {
+                confirmed = true;
+                break;
+            }
+        }
+        let s = sup.hub().latest().unwrap();
+        ((), confirmed && s.obs.is_torqued)
+    });
+    assert!(en_delta.is_clean(), "enable with tracking must be zero-alloc/zero-lock: {en_delta:?}");
+
+    // 2. Active position-lead tracking during a jog motion + residual lead ramp-out on settling.
+    let (_, track_delta) = gate.run_phase("tracking_position_lead_and_ramp_out", || {
+        let snap = sup.hub().latest().unwrap();
+        let msnap = MotionPlanSnapshot::from_published(&snap, Arc::clone(&motion_cfg)).unwrap();
+        let mut to = snap.rt.commanded_positions.clone();
+        to[0] += 0.25;
+        let prepared = prepare_motion(
+            &msnap,
+            &MotionRequest::jog(to.clone(), Some(0.5), None),
+        )
+        .unwrap();
+        let auth = next_auth();
+        client_seq += 1;
+        let req = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                auth,
+                clock.now() + Duration::from_secs(5),
+                Submit::Install(&|s: &mut PlanSlot| stage_jog(s, &prepared.slot)),
+            )
+            .unwrap();
+        let mut completed = false;
+        let mut saw_positive_lead = false;
+        for _ in 0..120 {
+            clock.run_steps(period_ns, 1);
+            if let Some(s) = sup.hub().latest() {
+                // WakeDriver sets measured q[0] = written target (nominal + lead); while moving
+                // positively with PositionLead, written target exceeds nominal commanded_positions[0].
+                if s.rt.positions[0] > s.rt.commanded_positions[0] + 1e-4 {
+                    saw_positive_lead = true;
+                }
+            }
+            let rs = drain_broker(&handle);
+            if rs.iter().any(|r| {
+                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == req)
+            }) {
+                completed = true;
+                break;
+            }
+        }
+        // Run additional releases at rest so any residual lead ramps out cleanly to nominal.
+        clock.run_steps(period_ns, 10);
+        let s_after = sup.hub().latest().unwrap();
+        let reached = (s_after.rt.commanded_positions[0] - to[0]).abs() < 1e-3
+            && (s_after.rt.positions[0] - to[0]).abs() < 1e-3;
+        ((), completed && saw_positive_lead && reached)
+    });
+    assert!(
+        track_delta.is_clean(),
+        "tracking-active position-lead and lead ramp-out must be zero-alloc/zero-lock: {track_delta:?}"
+    );
+
+    // 3. Park with tracking active (exercises keepout_only ramp-out + park motion + disable).
+    let (_, park_delta) = gate.run_phase("tracking_park_ramp_out_and_disable", || {
+        let snap = sup.hub().latest().unwrap();
+        let msnap = MotionPlanSnapshot::from_published(&snap, Arc::clone(&motion_cfg)).unwrap();
+        let park_plan = prepare_motion(&msnap, &MotionRequest::park()).unwrap();
+        let auth = next_auth();
+        client_seq += 1;
+        let r_park = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                auth,
+                clock.now() + Duration::from_secs(10),
+                Submit::InstallPark(&|s: &mut PlanSlot| stage_park(s, &park_plan.slot)),
+            )
+            .unwrap();
+        let mut park_done = false;
+        for _ in 0..320 {
+            clock.run_steps(period_ns, 2);
+            let rs = drain_broker(&handle);
+            if rs.iter().any(|r| {
+                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == r_park)
+            }) {
+                park_done = true;
+                break;
+            }
+        }
+        let s_after = sup.hub().latest().unwrap();
+        let parked_ok =
+            park_done && !s_after.obs.is_torqued && s_after.obs.safety_state == SafetyState::Idle;
+        ((), parked_ok)
+    });
+    assert!(
+        park_delta.is_clean(),
+        "park with tracking active must be zero-alloc/zero-lock: {park_delta:?}"
+    );
+
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+}
