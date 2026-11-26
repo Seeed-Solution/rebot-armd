@@ -2637,6 +2637,158 @@ async fn pre_activation_failures_and_handback_never_strand_reconciling_hold_for_
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handback_publish_gate_serializes_in_flight_rename_and_bounds_stuck_fs() {
+    // (a) Worker passes the stop check inside `publish_gate` and pauses right before the official
+    //     rename: handback MUST wait for the publish gate (not transfer ownership while rename +
+    //     dir fsync is in flight), and once the worker finishes, Legacy receives ownership with
+    //     the official file already updated and no concurrent rename in flight.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gripper_calib_gate_wait.json");
+        let (sup, _action_id) = prepare_zero_check_supervisor(path.clone()).await;
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+        let resume_rx = Arc::new(Mutex::new(resume_rx));
+        let hooks = PersistTestHooks {
+            before_publish_rename: Some(Arc::new(move || {
+                let _ = entered_tx.send(());
+                let _ = resume_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            })),
+            handback_publish_gate_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let h = sup
+            .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+            .await
+            .unwrap();
+
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .await
+            .unwrap();
+
+        let sup_hb = Arc::clone(&sup);
+        let hb_done = Arc::new(AtomicBool::new(false));
+        let hb_done_t = Arc::clone(&hb_done);
+        let hb_task = tokio::spawn(async move {
+            let res = sup_hb
+                .handback_to_legacy_with_live_loop(Duration::from_secs(3), Duration::from_millis(5))
+                .await;
+            hb_done_t.store(true, Ordering::Release);
+            res
+        });
+
+        // Give handback time to set `persist_stop` and block on `publish_gate`: ownership MUST
+        // NOT transfer while the worker is still inside the publish critical section.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !hb_done.load(Ordering::Acquire),
+            "handback must not transfer ownership while official publish is in flight"
+        );
+        assert!(
+            !path.exists(),
+            "worker is still paused before official rename"
+        );
+
+        // Unblock worker -> rename + dir fsync completes -> publish gate releases -> handback completes.
+        resume_tx.send(()).unwrap();
+        let (legacy_stop, legacy_join) = hb_task
+            .await
+            .unwrap()
+            .expect("handback must succeed once in-flight publish completes");
+        h.stop_and_join();
+
+        assert!(
+            path.exists(),
+            "in-flight official rename must have completed BEFORE handback transferred ownership"
+        );
+        let file_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!((file_json["offset_rad"].as_f64().unwrap() - 0.05).abs() < 1e-3);
+        assert!(
+            !armd::gripper_calib::pending_path_for(&path).exists(),
+            ".pending must have been renamed onto the official path"
+        );
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.zero_check_persisting.is_none());
+            assert!(
+                !inner.core.motion_inhibited_by_config(),
+                "completed in-flight publish before handback must leave Legacy uninhibited"
+            );
+        }
+        legacy_stop.store(true, Ordering::Release);
+        let _ = legacy_join.join();
+    }
+
+    // (b) Stuck filesystem (worker stays blocked inside `publish_gate` past the gate timeout):
+    //     handback proceeds after the bounded timeout and Legacy starts with GripperCalibration
+    //     marked unconfirmed (`HoldState::Reconciling` + `durability_confirmed == Some(false)`).
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gripper_calib_gate_timeout.json");
+        let (sup, action_id) = prepare_zero_check_supervisor(path.clone()).await;
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let hooks = PersistTestHooks {
+            before_publish_rename: Some(Arc::new(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            })),
+            handback_publish_gate_timeout: Some(Duration::from_millis(80)),
+            ..Default::default()
+        };
+        let h = sup
+            .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+            .await
+            .unwrap();
+
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .await
+            .unwrap();
+
+        // Handback while worker remains stuck past the 80 ms publish-gate timeout.
+        let t0 = Instant::now();
+        let (legacy_stop, legacy_join) = sup
+            .handback_to_legacy_with_live_loop(Duration::from_millis(600), Duration::from_millis(5))
+            .await
+            .expect("handback must proceed after bounded publish-gate timeout on stuck filesystem");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(70),
+            "handback returned too early before publish-gate timeout: {elapsed:?}"
+        );
+
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.zero_check_persisting.is_none());
+            assert!(
+                inner.core.motion_inhibited_by_config(),
+                "Legacy must start with motion inhibited (Reconciling) after publish-gate timeout"
+            );
+            assert_eq!(
+                inner
+                    .core
+                    .config_held(ConfigDomain::GripperCalibration)
+                    .map(|h| h.state),
+                Some(armd::rt_core::config_iface::HoldState::Reconciling),
+                "GripperCalibration must be Reconciling on Legacy after publish-gate timeout"
+            );
+            let a = inner.last_action.as_ref().expect("last_action present");
+            assert_eq!(a.id, action_id);
+            assert_eq!(a.durability_confirmed, Some(false), "{a:?}");
+        }
+
+        // Release the simulated stuck filesystem so the detached persist worker exits cleanly.
+        let _ = release_tx.send(());
+        wait_until_async(Duration::from_secs(2), || h.persist_worker_exited()).await;
+        h.stop_and_join();
+        legacy_stop.store(true, Ordering::Release);
+        let _ = legacy_join.join();
+    }
+}
+
 // ============================================================================
 // 11. Off-thread reclamation (> 30 ops) and diagnostics under paused dispatcher
 // ============================================================================

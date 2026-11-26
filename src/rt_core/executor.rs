@@ -1634,6 +1634,13 @@ pub struct PersistTestHooks {
     /// Fault-injection hook: fails the post-activation parent-directory fsync once in
     /// `publish_pending` (`DirFsyncUnconfirmed`).
     pub fail_publish_dir_sync_once: Option<Arc<AtomicBool>>,
+    /// Deterministic barrier on `armd-persist` strictly AFTER the stop check inside `publish_gate`
+    /// and strictly BEFORE `std::fs::rename(&pending, &official)` (tests stop-vs-rename handback
+    /// serialization and publish-gate timeout).
+    pub before_publish_rename: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Overrides [`DEFAULT_HANDBACK_PUBLISH_GATE_TIMEOUT`] for deterministic stuck-filesystem
+    /// handback tests.
+    pub handback_publish_gate_timeout: Option<Duration>,
     /// Fault-injection hook: panics in `control_thread_main` startup setup BEFORE `init_res`
     /// `catch_unwind` to verify outer unwind ownership retention.
     pub panic_in_startup_setup: bool,
@@ -4587,6 +4594,71 @@ impl Drop for SerialDrainGuard<'_> {
 #[derive(Clone, Copy, Default)]
 struct ControlExitState;
 
+/// Default off-RT timeout for handback to wait on [`PublishGate`] when an official gripper
+/// calibration rename + dir-fsync is already in flight on `armd-persist`.
+///
+/// If the filesystem is stuck beyond this bound, handback logs an error, proceeds with ownership
+/// transfer, and starts Legacy with `ConfigDomain::GripperCalibration` marked unconfirmed
+/// (`HoldState::Reconciling` + `durability_confirmed = Some(false)`).
+const DEFAULT_HANDBACK_PUBLISH_GATE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Small off-RT publish gate serializing `armd-persist`'s `check stop -> rename -> dir fsync`
+/// critical section against handback ownership transfer (never acquired on `armd-control`).
+struct PublishGate {
+    in_flight: Mutex<bool>,
+    cv: Condvar,
+}
+
+struct PublishGateGuard<'a> {
+    gate: &'a PublishGate,
+}
+
+impl Drop for PublishGateGuard<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.gate.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        *in_flight = false;
+        self.gate.cv.notify_all();
+    }
+}
+
+impl PublishGate {
+    fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn enter(&self) -> PublishGateGuard<'_> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        while *in_flight {
+            in_flight = self.cv.wait(in_flight).unwrap_or_else(|e| e.into_inner());
+        }
+        *in_flight = true;
+        PublishGateGuard { gate: self }
+    }
+
+    fn try_acquire_until(&self, deadline: Instant) -> Option<PublishGateGuard<'_>> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        while *in_flight {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return None;
+            }
+            let (guard, wait_res) = self
+                .cv
+                .wait_timeout(in_flight, rem)
+                .unwrap_or_else(|e| e.into_inner());
+            in_flight = guard;
+            if wait_res.timed_out() && *in_flight {
+                return None;
+            }
+        }
+        *in_flight = true;
+        Some(PublishGateGuard { gate: self })
+    }
+}
+
 struct RtExecutorShared {
     boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
@@ -4606,6 +4678,8 @@ struct RtExecutorShared {
     executor_thread_id: ThreadId,
     control_stop: Arc<AtomicBool>,
     persist_stop: Arc<AtomicBool>,
+    publish_gate: Arc<PublishGate>,
+    handback_publish_gate_timeout: Duration,
     exited: Arc<AtomicBool>,
     control_rt_state: std::sync::atomic::AtomicU8,
     _control_exited_cv: Arc<(Mutex<ControlExitState>, Condvar)>,
@@ -6018,6 +6092,17 @@ impl RtExecutorHandle {
     /// `Box<SupervisorInner>` into the lock-free `AtomicPtr` slot (`HB_HANDED_BACK` guarantees
     /// immediate payload availability with zero post-deadline spin, B1).
     ///
+    /// Before signaling `control_stop` or transferring ownership, sets `persist_stop` and
+    /// acquires the off-RT [`PublishGate`] (bounded by `handback_publish_gate_timeout`, clamped
+    /// to half the remaining handback budget) so an in-flight official rename + dir-fsync on
+    /// `armd-persist` finishes before Legacy takes ownership.
+    ///
+    /// **Stuck-filesystem fallback**: if [`PublishGate`] cannot be acquired within the timeout
+    /// (for example because the kernel is wedged in `rename` or directory `fsync`), handback logs
+    /// an error, proceeds with ownership transfer, and marks `ConfigDomain::GripperCalibration`
+    /// unconfirmed (`HoldState::Reconciling` + `durability_confirmed = Some(false)`) on the
+    /// handed-back `SupervisorInner` before Legacy starts.
+    ///
     /// Returns `Ok(core)` IMMEDIATELY without waiting for monitor/persist cleanup so the caller
     /// can restore the legacy owner and unpark the live legacy receiver first (B2), then finish
     /// worker cleanup via [`Self::finish_handback_cleanup_until`].
@@ -6026,9 +6111,26 @@ impl RtExecutorHandle {
         deadline: Instant,
         has_live_receiver: bool,
     ) -> Result<Box<SupervisorInner>, HandbackFailure> {
-        let token = self.shared.lifecycle.begin_handback(deadline, has_live_receiver);
         self.shared.persist_stop.store(true, Ordering::Release);
         self.shared.persist_park_thread.unpark();
+        let rem_for_gate = deadline.saturating_duration_since(Instant::now());
+        let gate_budget = self
+            .shared
+            .handback_publish_gate_timeout
+            .min(rem_for_gate / 2);
+        let gate_deadline = Instant::now() + gate_budget;
+        let publish_gate_acquired = self
+            .shared
+            .publish_gate
+            .try_acquire_until(gate_deadline)
+            .is_some();
+        if !publish_gate_acquired {
+            tracing::error!(
+                "Handback timed out after {:?} waiting for in-flight gripper calibration publish gate (stuck filesystem); proceeding with ownership transfer and marking gripper calibration unconfirmed",
+                gate_budget
+            );
+        }
+        let token = self.shared.lifecycle.begin_handback(deadline, has_live_receiver);
         self.shared.maint_client.close();
         self.shared.urgent_stop_client.close();
         self.shared.conn_lifecycle_client.close();
@@ -6057,7 +6159,21 @@ impl RtExecutorHandle {
         }
         let final_state = self.shared.lifecycle.finish_handback_timeout_check(token);
         if final_state == HB_HANDED_BACK {
-            if let Some(core) = self.shared.lifecycle.take_handed_back_core() {
+            if let Some(mut core) = self.shared.lifecycle.take_handed_back_core() {
+                if !publish_gate_acquired {
+                    let active_rev =
+                        ConfigAuthority::revision(&*core, ConfigDomain::GripperCalibration);
+                    core.core
+                        .config_mut()
+                        .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                    if let Some(a) = core
+                        .last_action
+                        .as_mut()
+                        .filter(|a| a.kind == "gripper_zero_check")
+                    {
+                        a.durability_confirmed = Some(false);
+                    }
+                }
                 return Ok(core);
             }
         }
@@ -6185,6 +6301,10 @@ pub(crate) fn spawn_executor(
     let control_stop = Arc::new(AtomicBool::new(false));
     let persist_stop = Arc::new(AtomicBool::new(false));
     let persist_official_untouched = Arc::new(AtomicBool::new(false));
+    let publish_gate = Arc::new(PublishGate::new());
+    let handback_publish_gate_timeout = hooks
+        .handback_publish_gate_timeout
+        .unwrap_or(DEFAULT_HANDBACK_PUBLISH_GATE_TIMEOUT);
     let exited = Arc::new(AtomicBool::new(false));
     let (urgent_stop_client, urgent_stop_intake) =
         urgent_stop_channel(URGENT_STOP_CAPACITY, exited.clone());
@@ -6295,6 +6415,7 @@ pub(crate) fn spawn_executor(
         Arc::clone(&published_config),
         persist_stop.clone(),
         persist_official_untouched.clone(),
+        Arc::clone(&publish_gate),
         exited.clone(),
         persist_worker_exited.clone(),
         persist_exited_cv.clone(),
@@ -6502,6 +6623,8 @@ pub(crate) fn spawn_executor(
         executor_thread_id,
         control_stop,
         persist_stop,
+        publish_gate,
+        handback_publish_gate_timeout,
         exited,
         control_rt_state: std::sync::atomic::AtomicU8::new(RT_STATE_RUNNING),
         _control_exited_cv: control_exited_cv,
@@ -8220,6 +8343,7 @@ fn spawn_persist_worker(
     published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
     persist_official_untouched: Arc<AtomicBool>,
+    publish_gate: Arc<PublishGate>,
     control_exited: Arc<AtomicBool>,
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
@@ -8507,6 +8631,7 @@ fn spawn_persist_worker(
                 terminal_capture: terminal_capture.as_deref(),
                 persist_stop: &persist_stop,
                 official_file_untouched: &persist_official_untouched,
+                publish_gate: &publish_gate,
                 control_exited: &control_exited,
                 hooks: &hooks,
                 job,
@@ -8554,6 +8679,7 @@ struct ExecutorPersistBackend<'a> {
     terminal_capture: Option<&'a crate::supervisor::terminal_capture::TerminalCaptureChannel>,
     persist_stop: &'a Arc<AtomicBool>,
     official_file_untouched: &'a Arc<AtomicBool>,
+    publish_gate: &'a Arc<PublishGate>,
     control_exited: &'a Arc<AtomicBool>,
     hooks: &'a PersistTestHooks,
     job: PendingZeroCheckPersist,
@@ -8581,97 +8707,106 @@ enum PublishPendingResult {
 }
 
 impl ExecutorPersistBackend<'_> {
-    /// After the owner activated the candidate: rename `.pending` over the official path,
-    /// fsync the directory, and report the outcome to the owner via `PersistCmd::Published`.
-    /// A rename failure leaves the old file (restart loads the old calibration).
+    /// After the owner activated the candidate: hold `publish_gate` across
+    /// `check stop -> rename -> dir fsync` so handback never transfers ownership while an official
+    /// publish is in flight, then release the gate and report the outcome to the owner via
+    /// `PersistCmd::Published`. A rename failure leaves the old file (restart loads the old
+    /// calibration).
     fn publish_pending(&mut self, mirror_to_action: bool) -> PublishPendingResult {
-        if self.persist_stop.load(Ordering::Acquire)
-            || self.control_exited.load(Ordering::Acquire)
-            || self.cmd_tx.is_abandoned()
-        {
-            return PublishPendingResult::WorkerDisconnected;
-        }
-        let Some(official) = self.official_path.clone() else {
-            self.official_file_untouched.store(false, Ordering::Release);
-            if !self.push_cmd_inner(
-                PersistCmd::Published {
-                    action_id: self.job.action_id,
-                    outcome: PersistPublishOutcome::Published,
-                },
-                mirror_to_action,
-            ) {
-                return PublishPendingResult::WorkerDisconnected;
-            }
-            if !self.hooks.leave_final_reply_queued
-                && !matches!(self.wait_reply(), Some(PersistReply::PublishedAck { .. }))
+        let (outcome, result) = {
+            let _publish_guard = self.publish_gate.enter();
+            if self.persist_stop.load(Ordering::Acquire)
+                || self.control_exited.load(Ordering::Acquire)
+                || self.cmd_tx.is_abandoned()
             {
                 return PublishPendingResult::WorkerDisconnected;
             }
-            return PublishPendingResult::Published;
-        };
-        let pending = crate::gripper_calib::pending_path_for(&official);
-        // Official rename is about to start: the official file is no longer guaranteed untouched.
-        self.official_file_untouched.store(false, Ordering::Release);
-        let rename_res = if self
-            .hooks
-            .fail_publish_rename_once
-            .as_ref()
-            .is_some_and(|f| f.swap(false, Ordering::AcqRel))
-        {
-            Err(std::io::Error::other("simulated official rename failure"))
-        } else {
-            std::fs::rename(&pending, &official)
-        };
-        let (outcome, result) = match rename_res {
-            Ok(()) => {
-                self.published = true;
-                let ds = crate::persist::PendingDirSync::for_path(&official);
-                let dir_outcome = if self
-                    .hooks
-                    .fail_publish_dir_sync_once
-                    .as_ref()
-                    .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+            let Some(official) = self.official_path.clone() else {
+                self.official_file_untouched.store(false, Ordering::Release);
+                drop(_publish_guard);
+                if !self.push_cmd_inner(
+                    PersistCmd::Published {
+                        action_id: self.job.action_id,
+                        outcome: PersistPublishOutcome::Published,
+                    },
+                    mirror_to_action,
+                ) {
+                    return PublishPendingResult::WorkerDisconnected;
+                }
+                if !self.hooks.leave_final_reply_queued
+                    && !matches!(self.wait_reply(), Some(PersistReply::PublishedAck { .. }))
                 {
-                    crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(
-                        "simulated official dir fsync failure".into(),
-                    )
-                } else {
-                    match self.hooks.dir_sync_override.as_ref() {
-                        Some(f) => ds.sync_with(|dir| f(dir)),
-                        None => ds.sync_parent_dir(),
-                    }
-                };
-                match dir_outcome {
-                    crate::persist::PublishOutcome::Published => {
-                        (PersistPublishOutcome::Published, PublishPendingResult::Published)
-                    }
-                    crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
-                        tracing::error!(
-                            "Gripper calibration {} renamed but dir fsync failed: {w}",
-                            official.display()
-                        );
-                        let warning = format!(
-                            "Gripper calibration is active, but persistence is unconfirmed (directory fsync failed: {w})"
-                        );
-                        (
-                            PersistPublishOutcome::DirFsyncUnconfirmed { warning },
-                            PublishPendingResult::ReportedFailure,
+                    return PublishPendingResult::WorkerDisconnected;
+                }
+                return PublishPendingResult::Published;
+            };
+            let pending = crate::gripper_calib::pending_path_for(&official);
+            // Official rename is about to start: the official file is no longer guaranteed untouched.
+            self.official_file_untouched.store(false, Ordering::Release);
+            if let Some(h) = self.hooks.before_publish_rename.as_ref() {
+                h();
+            }
+            let rename_res = if self
+                .hooks
+                .fail_publish_rename_once
+                .as_ref()
+                .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+            {
+                Err(std::io::Error::other("simulated official rename failure"))
+            } else {
+                std::fs::rename(&pending, &official)
+            };
+            match rename_res {
+                Ok(()) => {
+                    self.published = true;
+                    let ds = crate::persist::PendingDirSync::for_path(&official);
+                    let dir_outcome = if self
+                        .hooks
+                        .fail_publish_dir_sync_once
+                        .as_ref()
+                        .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+                    {
+                        crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(
+                            "simulated official dir fsync failure".into(),
                         )
+                    } else {
+                        match self.hooks.dir_sync_override.as_ref() {
+                            Some(f) => ds.sync_with(|dir| f(dir)),
+                            None => ds.sync_parent_dir(),
+                        }
+                    };
+                    match dir_outcome {
+                        crate::persist::PublishOutcome::Published => {
+                            (PersistPublishOutcome::Published, PublishPendingResult::Published)
+                        }
+                        crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                            tracing::error!(
+                                "Gripper calibration {} renamed but dir fsync failed: {w}",
+                                official.display()
+                            );
+                            let warning = format!(
+                                "Gripper calibration is active, but persistence is unconfirmed (directory fsync failed: {w})"
+                            );
+                            (
+                                PersistPublishOutcome::DirFsyncUnconfirmed { warning },
+                                PublishPendingResult::ReportedFailure,
+                            )
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Activated gripper calibration not renamed over {} ({e}); the old calibration remains on disk",
-                    official.display()
-                );
-                let message = format!(
-                    "Activated gripper calibration failed to rename onto disk ({e}); the old calibration remains on disk"
-                );
-                (
-                    PersistPublishOutcome::RenameError { message },
-                    PublishPendingResult::ReportedFailure,
-                )
+                Err(e) => {
+                    tracing::error!(
+                        "Activated gripper calibration not renamed over {} ({e}); the old calibration remains on disk",
+                        official.display()
+                    );
+                    let message = format!(
+                        "Activated gripper calibration failed to rename onto disk ({e}); the old calibration remains on disk"
+                    );
+                    (
+                        PersistPublishOutcome::RenameError { message },
+                        PublishPendingResult::ReportedFailure,
+                    )
+                }
             }
         };
         if !self.push_cmd_inner(
