@@ -6993,3 +6993,240 @@ fn mit_expiry_recovery_sequential_two_round_confirmation_rejects_in_window_stale
         assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
     }
 }
+
+// ============================================================================
+// 27. R3 Major 2: Legacy MIT expiry recovery preserves watchdog continuity
+//     (per-axis hold frame gap <= 40 ms) under lost or queued disable
+// ============================================================================
+
+#[test]
+fn legacy_mit_expiry_recovery_preserves_watchdog_continuity_under_lost_or_queued_disable() {
+    use armd::transport::{CanRxTime, CanTransport, DriverClock, RxClockSample, TransportError};
+
+    let cfg = mit_config_j4();
+    let rest = rest_pose_of(&cfg);
+    let limits = b601_limits();
+
+    #[derive(Clone)]
+    struct ContinuityTestBus {
+        inner: FakeBus,
+        /// When true, queue all TX without delivering to motors (simulates queued disable/barrier).
+        queue_all: Arc<AtomicBool>,
+        /// Remaining `CMD_DISABLE` drops for motor_id 1 (J1).
+        drop_j1_disable_remaining: Arc<Mutex<usize>>,
+        /// Drop J1's first `REG_READ(RID_CTRL_MODE)` barrier once (forces >= 50 ms wait).
+        drop_j1_barrier_once: Arc<AtomicBool>,
+        /// All transmitted `(timestamp, frame)` recorded at host TX submission.
+        recorded_tx: Arc<Mutex<Vec<(Instant, CanFrame)>>>,
+    }
+
+    impl CanTransport for ContinuityTestBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            self.inner.clock()
+        }
+        fn rx_clock_now(&self) -> Option<CanRxTime> {
+            self.inner.rx_clock_now()
+        }
+        fn rx_clock_sample(&self) -> Option<RxClockSample> {
+            self.inner.rx_clock_sample()
+        }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let now = self.inner.with(|s| s.now()).unwrap_or_else(Instant::now);
+            self.recorded_tx.lock().unwrap().push((now, *frame));
+            if self.queue_all.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if frame.id == 1 && frame.data == damiao::CMD_DISABLE {
+                let mut rem = self.drop_j1_disable_remaining.lock().unwrap();
+                if *rem > 0 {
+                    *rem -= 1;
+                    return Ok(());
+                }
+            }
+            if frame.id == 0x7FF
+                && u16::from_le_bytes([frame.data[0], frame.data[1]]) == 1
+                && frame.data[2] == damiao::REG_READ
+                && frame.data[3] == damiao::RID_CTRL_MODE
+                && self.drop_j1_barrier_once.swap(false, Ordering::AcqRel)
+            {
+                return Ok(());
+            }
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn receive_with_rx_time(&mut self) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
+            self.inner.receive_with_rx_time()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn flush_is_noop(&self) -> bool {
+            true
+        }
+    }
+
+    let check_axis_max_gap = |recorded: &[(Instant, CanFrame)],
+                              motor_id: u16,
+                              window_start: Instant,
+                              window_end: Instant|
+     -> (usize, Duration) {
+        let ctrl_id = 0x100u32 + u32::from(motor_id);
+        let mut times: Vec<Instant> = recorded
+            .iter()
+            .filter(|(t, f)| *t >= window_start && *t <= window_end && f.id == ctrl_id)
+            .map(|(t, _)| *t)
+            .collect();
+        let count = times.len();
+        times.insert(0, window_start);
+        times.push(window_end);
+        let max_gap = times
+            .windows(2)
+            .map(|w| w[1].saturating_duration_since(w[0]))
+            .max()
+            .unwrap_or(Duration::ZERO);
+        (count, max_gap)
+    };
+
+    // Subcase A: Lost CMD_DISABLE (dropped 2x) + dropped barrier (50 ms wait) on energized J1 ->
+    //            recovers cleanly on retry AND keeps per-axis hold frame gap <= 40 ms throughout!
+    {
+        let clock = MockClock::new();
+        let inner = FakeBus::with_clock(&limits, clock.clone());
+        inner.with(|s| {
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.v = 0.0;
+                m.enabled = i != 3;
+                if i == 3 {
+                    m.state_override = Some(0xD);
+                }
+            }
+            s.push_all_feedback();
+        });
+        let recorded_tx = Arc::new(Mutex::new(Vec::new()));
+        let bus = ContinuityTestBus {
+            inner: inner.clone(),
+            queue_all: Arc::new(AtomicBool::new(false)),
+            drop_j1_disable_remaining: Arc::new(Mutex::new(2)),
+            drop_j1_barrier_once: Arc::new(AtomicBool::new(true)),
+            recorded_tx: Arc::clone(&recorded_tx),
+        };
+        let mut drv = build_standalone_mit_recovery_driver(bus, &rest);
+        for i in 0..7 {
+            if i != 3 {
+                drv.set_axis_confirmed_mode(i, Some(armd::motor_mode::ControlMode::PositionVelocity));
+            }
+        }
+        drv.read_joint_states().unwrap();
+        for rel in 1..=3 {
+            clock.advance(Duration::from_millis(25));
+            drv.begin_control_release(rel);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
+        let t_start = clock.now();
+        let mut gate = || Ok(());
+        drv.mit_expiry_recover_with_gate(&mut gate)
+            .expect("lost disable + dropped barrier must still recover on retry");
+        let t_end = clock.now();
+        assert!(
+            t_end.saturating_duration_since(t_start) >= Duration::from_millis(50),
+            "dropped barrier must exercise >= 50 ms wait window, elapsed={:?}",
+            t_end.saturating_duration_since(t_start)
+        );
+        let rec = recorded_tx.lock().unwrap();
+        let (j1_holds, j1_max_gap) = check_axis_max_gap(&rec, 1, t_start, t_end);
+        assert!(
+            j1_holds >= 2,
+            "energized J1 with lost disable + 50 ms barrier wait must receive continuity holds, got {j1_holds}"
+        );
+        assert!(
+            j1_max_gap <= Duration::from_millis(40),
+            "J1 per-axis hold frame gap during legacy recovery exceeded 40 ms: {j1_max_gap:?}"
+        );
+        assert!(inner.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
+    }
+
+    // Subcase B: Queued CMD_DISABLE on all energized arm axes (J1..J3, J5..J6) for entire 200 ms
+    //            phase window -> fails closed AND keeps every energized axis frame gap <= 40 ms!
+    {
+        let clock = MockClock::new();
+        let inner = FakeBus::with_clock(&limits, clock.clone());
+        inner.with(|s| {
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.v = 0.0;
+                m.enabled = i != 3;
+                if i == 3 {
+                    m.state_override = Some(0xD);
+                }
+            }
+            s.push_all_feedback();
+        });
+        let recorded_tx = Arc::new(Mutex::new(Vec::new()));
+        let queue_all = Arc::new(AtomicBool::new(false));
+        let bus = ContinuityTestBus {
+            inner: inner.clone(),
+            queue_all: Arc::clone(&queue_all),
+            drop_j1_disable_remaining: Arc::new(Mutex::new(0)),
+            drop_j1_barrier_once: Arc::new(AtomicBool::new(false)),
+            recorded_tx: Arc::clone(&recorded_tx),
+        };
+        let mut drv = build_standalone_mit_recovery_driver(bus, &rest);
+        for i in 0..7 {
+            if i != 3 {
+                drv.set_axis_confirmed_mode(i, Some(armd::motor_mode::ControlMode::PositionVelocity));
+            }
+        }
+        drv.read_joint_states().unwrap();
+        for rel in 1..=3 {
+            clock.advance(Duration::from_millis(25));
+            drv.begin_control_release(rel);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
+        queue_all.store(true, Ordering::Release);
+        let t_start = clock.now();
+        let mut gate = || Ok(());
+        let res = drv.mit_expiry_recover_with_gate(&mut gate);
+        let t_end = clock.now();
+        assert!(res.is_err(), "queued disable must fail closed after phase window");
+        assert!(
+            t_end.saturating_duration_since(t_start) >= Duration::from_millis(190),
+            "queued disable must run full phase window (~200 ms), elapsed={:?}",
+            t_end.saturating_duration_since(t_start)
+        );
+        let rec = recorded_tx.lock().unwrap();
+        for motor_id in [1u16, 2, 3, 5, 6] {
+            let (holds, max_gap) = check_axis_max_gap(&rec, motor_id, t_start, t_end);
+            assert!(
+                holds >= 9,
+                "energized motor {motor_id} over 200 ms queued recovery must receive >= 9 holds, got {holds}"
+            );
+            assert!(
+                max_gap <= Duration::from_millis(40),
+                "energized motor {motor_id} per-axis frame gap exceeded 40 ms: {max_gap:?}"
+            );
+        }
+        assert_eq!(
+            drv.disable_dispatched_mask(),
+            0,
+            "failed recovery must clear unconfirmed disable_dispatched_mask so SAFE-HOLD continues holding"
+        );
+    }
+}

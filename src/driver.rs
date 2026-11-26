@@ -9389,6 +9389,13 @@ struct ModeWrite {
 
 /// Time allowed for register replies (mode switch, range readback).
 const REGISTER_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
+/// Maximum interval between continuity holds on energized axes during synchronous legacy MIT
+/// expiry recovery (strictly <= 20 ms so per-axis control-frame gaps stay <= 40 ms well below
+/// Damiao's 100 ms hardware watchdog).
+const MIT_RECOVERY_CONTINUITY_HOLD_INTERVAL: Duration = Duration::from_millis(18);
+/// Maximum single wait/sleep duration between continuity holds during synchronous legacy MIT
+/// expiry recovery.
+const MIT_RECOVERY_MAX_WAIT_BETWEEN_HOLDS: Duration = Duration::from_millis(20);
 /// Time allowed per motor for the four register replies of the startup range check
 /// (7 silent motors: 140 ms).
 const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
@@ -10504,6 +10511,150 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.feedback_queue_bound[idx].is_some_and(|b| {
                 now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
             })
+    }
+
+    /// Interleave SAFE-HOLD-equivalent stationary continuity holds (`TxKind::MeasuredHold`) on
+    /// every still-energized, unconfirmed, watchdog-bearing verified axis during synchronous
+    /// legacy MIT expiry recovery whenever its control-frame age reaches
+    /// `MIT_RECOVERY_CONTINUITY_HOLD_INTERVAL` (<= 20 ms). Zero heap allocation.
+    fn service_mit_recovery_continuity_holds(
+        &mut self,
+        n: usize,
+        start_stamp: StopStamp,
+        confirmed_disabled_mask: u64,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<bool, String> {
+        let now = self.now();
+        let pf_joint = self.active_pos_force_joint();
+        let mut due = [(0usize, Duration::ZERO); MAX_MODE_JOINTS];
+        let mut due_len = 0usize;
+        for i in 0..n {
+            if i < 64 && (confirmed_disabled_mask & (1u64 << i)) != 0 {
+                continue;
+            }
+            let energized =
+                (i < 32 && (self.motor_energized_mask & (1u32 << i)) != 0) || self.motor_status[i] == 1;
+            if !energized {
+                continue;
+            }
+            if pf_joint == Some(i) || self.base_mode(i) == DamiaoControlMode::PosForce {
+                continue;
+            }
+            if self.verified_hold_mode(i).is_none() {
+                continue;
+            }
+            let age = self.motor_last_ctrl_tx[i]
+                .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+            if age >= MIT_RECOVERY_CONTINUITY_HOLD_INTERVAL {
+                due[due_len] = (i, age);
+                due_len += 1;
+            }
+        }
+        if due_len == 0 {
+            return Ok(false);
+        }
+        for idx in 1..due_len {
+            let key = due[idx];
+            let mut j = idx;
+            while j > 0 && due[j - 1].1 < key.1 {
+                due[j] = due[j - 1];
+                j -= 1;
+            }
+            due[j] = key;
+        }
+        if !self.in_active_control_release() {
+            self.begin_tx_tick();
+        }
+        self.discard_staged_ctrl_tx();
+        let mut sent_any = false;
+        self.in_urgent_watchdog_hold = true;
+        for &(i, _) in &due[..due_len] {
+            let Some(pos) = self.motor_keepalive_hold_pos[i].or_else(|| {
+                self.cached_states
+                    .get(i)
+                    .map(|s| s.position)
+                    .filter(|p| p.is_finite())
+            }) else {
+                continue;
+            };
+            let target = JointTarget::position(pos);
+            match self.send_with_commissioning_gate(
+                TxKind::MeasuredHold(i),
+                Some(start_stamp),
+                None,
+                pre_tx_gate,
+                |d| d.build_verified_hold_frame(i, &target),
+            ) {
+                Ok(_) => sent_any = true,
+                Err(Ok(code)) => {
+                    self.in_urgent_watchdog_hold = false;
+                    self.discard_staged_ctrl_tx();
+                    return Err(format!("PRE_TX_GATE:{code}"));
+                }
+                Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                    self.in_urgent_watchdog_hold = false;
+                    self.discard_staged_ctrl_tx();
+                    return Err(format!(
+                        "continuity hold to J{} inhibited: {}",
+                        i + 1,
+                        ArmDriverError::EstopInhibited
+                    ));
+                }
+                Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => break,
+                Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => break,
+                Err(Err(_)) => {}
+            }
+        }
+        self.in_urgent_watchdog_hold = false;
+        if sent_any {
+            if let Err(e) = self.pending_stop_check(Some(start_stamp)) {
+                self.discard_staged_ctrl_tx();
+                return Err(format!("continuity hold flush inhibited: {e}"));
+            }
+            if let Err(e) = self.flush_can_and_commit() {
+                self.discard_staged_ctrl_tx();
+                return Err(format!("continuity hold flush: {e}"));
+            }
+        } else {
+            self.discard_staged_ctrl_tx();
+        }
+        Ok(sent_any)
+    }
+
+    /// Cap any sleep/wait during synchronous legacy MIT expiry recovery at
+    /// `MIT_RECOVERY_MAX_WAIT_BETWEEN_HOLDS` (20 ms) and no longer than the remaining time until
+    /// the oldest still-energized axis needs its next continuity hold.
+    fn mit_recovery_capped_wait(
+        &self,
+        n: usize,
+        confirmed_disabled_mask: u64,
+        requested: Duration,
+    ) -> Duration {
+        let mut cap = requested.min(MIT_RECOVERY_MAX_WAIT_BETWEEN_HOLDS);
+        let now = self.now();
+        let pf_joint = self.active_pos_force_joint();
+        for i in 0..n {
+            if i < 64 && (confirmed_disabled_mask & (1u64 << i)) != 0 {
+                continue;
+            }
+            let energized =
+                (i < 32 && (self.motor_energized_mask & (1u32 << i)) != 0) || self.motor_status[i] == 1;
+            if !energized {
+                continue;
+            }
+            if pf_joint == Some(i) || self.base_mode(i) == DamiaoControlMode::PosForce {
+                continue;
+            }
+            if self.verified_hold_mode(i).is_none() {
+                continue;
+            }
+            let age = self.motor_last_ctrl_tx[i]
+                .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+            let rem = MIT_RECOVERY_CONTINUITY_HOLD_INTERVAL.saturating_sub(age);
+            cap = cap.min(rem);
+        }
+        cap.max(Duration::from_micros(500).min(requested))
+            .min(MIT_RECOVERY_MAX_WAIT_BETWEEN_HOLDS)
     }
 
     fn abort_enable_for_estop(&mut self) {
@@ -19780,6 +19931,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             .map_err(|e| format!("receive boundary before MIT recovery: {e}"))?;
         self.comm_reg_reply_len = 0;
         self.comm_reg_reply_overflow = false;
+        let _ = self.service_mit_recovery_continuity_holds(n, start_stamp, 0, pre_tx_gate)?;
 
         // Phase 1: ClearFault to every motor reporting a fault state (>= 8) via pre_tx_gate.
         let mut clear_sent = false;
@@ -19852,12 +20004,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         }
                     }
                     let _ = self.flush_can_and_commit();
-                    self.pause(EVIDENCE_PROBE_INTERVAL);
+                    let _ = self.service_mit_recovery_continuity_holds(
+                        n,
+                        start_stamp,
+                        0,
+                        pre_tx_gate,
+                    )?;
+                    let wait = self.mit_recovery_capped_wait(n, 0, EVIDENCE_PROBE_INTERVAL);
+                    if !wait.is_zero() {
+                        self.pause(wait);
+                    }
                     let _ = self.drain_rx_only_record_registers();
                 }
                 Err(r) => return Err(Self::refusal_to_driver_err(r).to_string()),
             }
         }
+        self.disable_rest_established = true;
 
         // Phase 2 (2a CMD_DISABLE -> 2b Drain+REG_READ barrier -> 2c-1 Drain+0xCC round 1 ->
         // 2c-2 Drain+0xCC round 2): sequential causal confirmation (zero alloc) with RX-only
@@ -19868,6 +20030,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let phase2_timeout = REGISTER_REPLY_TIMEOUT.saturating_mul(4);
 
         let clear_unconfirmed_dispatched = |d: &mut Self, axes: &[MitExpiryAxisState; MAX_MODE_JOINTS]| {
+            d.disable_rest_established = false;
             for (i, axis) in axes.iter().enumerate().take(n) {
                 if i < 64 && axis.dis_tx.is_some() && axis.probe2_ack.is_none() {
                     d.disable_dispatched_mask &= !(1u64 << i);
@@ -20005,6 +20168,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.begin_tx_tick();
                 }
                 let mut dis_sent = false;
+                let mut need_evidence_probe = false;
                 let mut pass_dis_tx: [Option<(u64, Instant)>; MAX_MODE_JOINTS] =
                     [None; MAX_MODE_JOINTS];
                 for i in 0..n {
@@ -20025,6 +20189,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         Err(Ok(code)) => {
                             clear_unconfirmed_dispatched(self, &axes);
                             return Err(format!("PRE_TX_GATE:{code}"));
+                        }
+                        Err(Err(TxRefusal::DisableWaitEvidence)) => {
+                            need_evidence_probe = true;
+                            break;
                         }
                         Err(Err(r)) => {
                             clear_unconfirmed_dispatched(self, &axes);
@@ -20048,6 +20216,34 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 self.disable_dispatched_mask |= 1u64 << i;
                             }
                         }
+                    }
+                }
+                if need_evidence_probe {
+                    if !self.in_active_control_release() {
+                        self.begin_tx_tick();
+                    }
+                    let mut probe_sent = false;
+                    for i in 0..n {
+                        if axes[i].dis_tx.is_some() {
+                            continue;
+                        }
+                        match self.send_with_commissioning_gate(
+                            TxKind::DisableProbe,
+                            Some(start_stamp),
+                            None,
+                            pre_tx_gate,
+                            |d| Some(damiao::build_refresh_frame(d.motor_ids[i])),
+                        ) {
+                            Ok(_) => probe_sent = true,
+                            Err(Ok(code)) => {
+                                clear_unconfirmed_dispatched(self, &axes);
+                                return Err(format!("PRE_TX_GATE:{code}"));
+                            }
+                            Err(Err(_)) => break,
+                        }
+                    }
+                    if probe_sent {
+                        let _ = self.flush_can_and_commit();
                     }
                 }
             }
@@ -20248,7 +20444,29 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
 
-            self.pause(Duration::from_micros(500));
+            let mut confirmed_disabled_mask = 0u64;
+            for (i, axis) in axes.iter().enumerate().take(n) {
+                if i < 64 && axis.probe2_ack.is_some() {
+                    confirmed_disabled_mask |= 1u64 << i;
+                }
+            }
+            if let Err(e) = self.service_mit_recovery_continuity_holds(
+                n,
+                start_stamp,
+                confirmed_disabled_mask,
+                pre_tx_gate,
+            ) {
+                clear_unconfirmed_dispatched(self, &axes);
+                return Err(e);
+            }
+            let wait = self.mit_recovery_capped_wait(
+                n,
+                confirmed_disabled_mask,
+                Duration::from_micros(500),
+            );
+            if !wait.is_zero() {
+                self.pause(wait);
+            }
         }
 
         let check_now = self.now();
@@ -20272,6 +20490,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.is_enabling = false;
         self.motor_energized_mask = 0;
         self.disable_dispatched_mask = 0;
+        self.disable_rest_established = false;
         Ok(())
     }
 
