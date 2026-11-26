@@ -207,8 +207,23 @@ impl DualRig {
         configure_inner: impl FnOnce(&mut armd::SupervisorInner),
         hooks: PersistTestHooks,
     ) -> Self {
+        Self::start_with_calib(owner, auth, configure_cfg, configure_inner, hooks, None).await
+    }
+
+    /// As [`Self::start`], with `initial_calib` written to `gripper_calib.json` before it loads.
+    async fn start_with_calib(
+        owner: RtOwner,
+        auth: OperatorAuth,
+        configure_cfg: impl FnOnce(&mut ArmConfig),
+        configure_inner: impl FnOnce(&mut armd::SupervisorInner),
+        hooks: PersistTestHooks,
+        initial_calib: Option<&str>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let calib_path = dir.path().join("gripper_calib.json");
+        if let Some(text) = initial_calib {
+            std::fs::write(&calib_path, text).unwrap();
+        }
 
         let mut cfg = ArmConfig::rebot_dm();
         cfg.collision = None;
@@ -1912,6 +1927,102 @@ async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked
         "GripperCalibration must stay held (reconciliation refused)"
     );
     rig.wait_zero_check_ctx_empty("reconcile_revoked").await;
+    rig.shutdown().await;
+}
+
+/// Policy a fresh supervisor loads at startup from `path` (restart behavior).
+async fn policy_after_restart(path: &std::path::Path) -> (f32, f32) {
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    armd::gripper_calib::load_into(&sup, path).await;
+    let inner = sup.inner().read().await;
+    assert!(!inner.gripper_calib_invalid, "calibration file must load");
+    let p = inner.config.gripper_policy.as_ref().expect("gripper policy");
+    (p.closed_rad, p.open_rad)
+}
+
+/// Cancellation boundary at the file commit point: authority lost after the owner approved the
+/// write but before the rename makes the worker abort without renaming, so the file keeps the old
+/// contents and a restart loads the old calibration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_revoked_before_rename_aborts_without_rename_and_restart_loads_old() {
+    const OLD_CALIB: &str = "{\"offset_rad\":0.02}";
+    let client = reqwest::Client::new();
+    let auth = OperatorAuth::enforced("123456", 1800);
+    let auth_hook = auth.clone();
+    let tok_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let tok_hook = Arc::clone(&tok_slot);
+    let hooks = PersistTestHooks {
+        before_rename_after_verify: Some(Arc::new(move || {
+            if let Some(tok) = tok_hook.lock().unwrap().as_deref() {
+                auth_hook.lock(Some(tok));
+            }
+        })),
+        ..Default::default()
+    };
+    let rig = DualRig::start_with_calib(
+        RtOwner::Executor,
+        auth,
+        |_| {},
+        |inner| {
+            inner.set_mock_gripper_stall_offset(Some(0.05));
+        },
+        hooks,
+        Some(OLD_CALIB),
+    )
+    .await;
+    let old_policy = policy_after_restart(&rig.calib_path).await;
+    let base = format!("http://{}", rig.addr);
+    let unlock: Value = client
+        .post(format!("{base}/api/v1/auth/unlock"))
+        .json(&json!({"pin": "123456"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = unlock["token"].as_str().unwrap().to_string();
+    *tok_slot.lock().unwrap() = Some(token.clone());
+
+    let mut ws = connect_ws(rig.addr, Some(&token)).await;
+    let gen = acquire_lease(&mut ws, "c-rb", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let (_, term, _) = run_cmd_to_terminal(
+        &mut ws,
+        gen,
+        ep,
+        "/api/v1/action/gripper_zero_check",
+        json!({"store_offset": true}),
+        Duration::from_secs(8),
+    )
+    .await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "OPERATOR_REQUIRED", "{term}");
+
+    assert_eq!(
+        std::fs::read_to_string(&rig.calib_path).unwrap(),
+        OLD_CALIB,
+        "revocation before the rename must leave the file untouched"
+    );
+    // The abort released the reservation instead of entering Reconciling.
+    let reply = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply, ConfigReply::HoldInspected { state: None, .. }),
+        "GripperCalibration must not stay held after an abort before the rename"
+    );
+    assert_eq!(
+        policy_after_restart(&rig.calib_path).await,
+        old_policy,
+        "restart must load the old calibration"
+    );
+    rig.wait_zero_check_ctx_empty("abort_before_rename").await;
+    rig.assert_zero_rt_allocs("abort_before_rename");
     rig.shutdown().await;
 }
 

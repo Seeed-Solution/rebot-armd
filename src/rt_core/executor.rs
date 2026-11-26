@@ -1625,6 +1625,9 @@ pub struct PersistTestHooks {
     /// Runs on `armd-persist` in zero-check reconciliation after the worker-side operator sample
     /// and before `FinishReconcile` is queued (tests owner-side grant validation at commit time).
     pub before_finish_reconcile: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `armd-persist` after the owner's pre-rename verification and before the worker's
+    /// lock-free re-check (tests the abort-without-rename boundary).
+    pub before_rename_after_verify: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Fault-injection hook: panics in `control_thread_main` startup setup BEFORE `init_res`
     /// `catch_unwind` to verify outer unwind ownership retention.
     pub panic_in_startup_setup: bool,
@@ -8521,6 +8524,41 @@ impl ExecutorPersistBackend<'_> {
         }
     }
 
+    /// Authority captured at approval vs. the owner's latest published snapshot (lock-free
+    /// `StateHub::latest`) and the operator session; codes match `check_zero_check_authority`.
+    fn lock_free_authority_refusal(&self) -> Option<(&'static str, &'static str)> {
+        let Some(snap) = self.hub.latest() else {
+            return Some(("PERSIST_FAILED", "Owner state unavailable before gripper calibration persisted"));
+        };
+        if snap.obs.safety_state == crate::safety::SafetyState::EStop {
+            return Some(("ESTOP_ACTIVE", "Emergency stop intervened before gripper calibration persisted"));
+        }
+        if !self.op_auth_ok() {
+            return Some((
+                "OPERATOR_REQUIRED",
+                "Operator session expired or locked before gripper calibration persisted",
+            ));
+        }
+        if self
+            .job
+            .lease_owner
+            .as_ref()
+            .is_some_and(|(_, gen)| snap.owner.lease_generation != *gen)
+        {
+            return Some(("LEASE_LOST", "Control lease lost or expired before gripper calibration persisted"));
+        }
+        if snap.owner.epoch != self.job.estop_epoch {
+            return Some(("EPOCH_MISMATCH", "Safety epoch changed before gripper calibration persisted"));
+        }
+        if snap.owner.stop_generation != self.job.stop_gen {
+            return Some(("STOPPED", "Authorized stop intervened before gripper calibration persisted"));
+        }
+        if Instant::now() >= self.job.deadline {
+            return Some(("DEADLINE_EXPIRED", "Gripper calibration persistence deadline expired"));
+        }
+        None
+    }
+
     fn op_auth_ok(&self) -> bool {
         self.job
             .ctx
@@ -8661,6 +8699,33 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                 Err(ZeroCheckCommitStop::WorkerDisconnected)
             }
         }
+    }
+
+    fn recheck_authority_before_rename(&mut self) -> Result<(), Self::Err> {
+        use super::requests::config::ZeroCheckCommitStop;
+        if let Some(h) = self.hooks.before_rename_after_verify.as_ref() {
+            h();
+        }
+        let Some(refusal) = self.lock_free_authority_refusal() else {
+            return Ok(());
+        };
+        let (code, message) = refusal;
+        if let Some(reservation) = self.reservation.take() {
+            let unused_policy = self.new_policy.take();
+            let unused_jaw = self.new_jaw.take();
+            let _ = self.push_cmd(PersistCmd::Abort {
+                action_id: self.job.action_id,
+                reservation,
+                code: code.into(),
+                message: message.into(),
+                unused_policy,
+                unused_jaw,
+            });
+            if !self.hooks.leave_final_reply_queued {
+                let _ = self.wait_reply();
+            }
+        }
+        Err(ZeroCheckCommitStop::Aborted)
     }
 
     async fn mark_persisted(&mut self) -> Result<(), Self::Err> {

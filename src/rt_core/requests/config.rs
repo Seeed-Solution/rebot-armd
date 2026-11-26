@@ -4321,6 +4321,12 @@ pub(crate) trait CommonCommitWorker: Send {
     fn verify_authority_before_rename(
         &mut self,
     ) -> impl std::future::Future<Output = Result<(), Self::Err>> + Send;
+    /// Step 3b: lock-free re-check on the worker immediately before the rename, against the
+    /// authority captured at approval (never takes the RT owner's locks). `Err` aborts without
+    /// renaming; the backend reports the same refusal code as the owner's activation check.
+    fn recheck_authority_before_rename(&mut self) -> Result<(), Self::Err> {
+        Ok(())
+    }
     /// Called immediately before the blocking rename/remove step starts (marks publication phase).
     fn on_rename_starting(&mut self) {}
     /// Called immediately after at least one file rename/remove succeeded (before `mark_persisted`).
@@ -4560,7 +4566,13 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
 
     // 3. Fresh pre-rename off-thread auth + live owner authority recheck (immediately before
     //    blocking target renames; no blocking marker I/O runs after this check).
-    if let Err(err) = w.verify_authority_before_rename().await {
+    //    3b. Lock-free worker re-check right before the rename (authority can change while the
+    //    owner's approval travels back to this worker).
+    let verified = match w.verify_authority_before_rename().await {
+        Ok(()) => w.recheck_authority_before_rename(),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = verified {
         abort_staged_ops(staged_ops);
         if !w.preserve_marker_on_abort() {
             if let Some(mp) = worker_marker.take() {
@@ -4591,6 +4603,10 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
     if !staged_ops.is_empty() {
         let sim_rename_fail = w.should_fail_rename_once();
         let fail_idx = w.fail_rename_at_index();
+        // FOLLOW-UP: a stop, E-stop, lease loss or operator revocation that lands between the
+        // step 3b re-check and the rename below is still renamed; activation then refuses it and
+        // the domain enters `Reconciling`, but a restart loads the renamed file. Closing that window
+        // needs a crash-safe pending-commit marker for every domain (out of scope for 1.6.1).
         w.on_rename_starting();
 
         let rename_outcome = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
