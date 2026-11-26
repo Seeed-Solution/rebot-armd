@@ -1501,6 +1501,7 @@ fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() 
     let gripper = gripper_drive_from_profile(&cfg).unwrap();
     let mut rf_budget = cfg.damiao_tx_budget();
     rf_budget.max_frames = 24;
+    rf_budget.max_duration = Duration::from_millis(18);
     let mut rf_drv = DamiaoArmDriver::new(rf_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits)
         .unwrap()
