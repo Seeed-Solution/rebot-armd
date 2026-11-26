@@ -892,3 +892,155 @@ fn tightened_zero_tx_release_does_not_leak_to_standalone_driver_tx() {
         "standalone TX must send all 7 motor frames"
     );
 }
+
+#[test]
+fn clear_fault_maintenance_shares_release_ledger_and_begin_tx_tick_preserves_spent_attempts() {
+    use armd::driver::JointTarget;
+    use armd::safety::{FaultCode, FaultKind, FaultReason};
+
+    let clock = MockClock::new();
+    let (bus, mut drv, cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    drv.set_torque(true).expect("enable torque");
+
+    // Part 1: Direct driver proof — `begin_tx_tick` and `probe_tx_ready_budgeted` inside an
+    // active managed control release MUST NOT reset TX attempts already spent in that release.
+    let t0 = clock.now();
+    drv.begin_control_release(101);
+    drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 4);
+    let targets = vec![JointTarget::position(0.0); 7];
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    // Spend all 4 TX slots of the release on partial output (4 frames sent, 3 deferred).
+    let _ = drv.write_joint_targets_bounded(&targets).unwrap();
+    let (_, tx_spent_before) = drv.release_budget_consumed();
+    assert_eq!(tx_spent_before, 4, "must have spent 4 TX attempts in release 101");
+
+    // Calling `begin_tx_tick()` inside the same active control release must NOT wipe spent attempts.
+    drv.begin_tx_tick();
+    let (_, tx_spent_after_begin) = drv.release_budget_consumed();
+    assert_eq!(
+        tx_spent_after_begin, 4,
+        "begin_tx_tick in active control release must preserve already-spent TX attempts"
+    );
+
+    // Calling `probe_tx_ready_budgeted` inside the same exhausted release must see 0 remaining
+    // TX and defer (emitting 0 additional CAN TX frames), never regaining spent TX.
+    drv.discard_pending_tx();
+    bus.with(|s| s.tx_log.clear());
+    let probe_res = drv.probe_tx_ready_budgeted(t0 + Duration::from_millis(10));
+    assert!(
+        matches!(probe_res, Err(armd::driver::ArmDriverError::TxDeferred { .. })),
+        "probe_tx_ready_budgeted at 0 remaining release TX must defer, got {probe_res:?}"
+    );
+    assert_eq!(
+        bus.with(|s| s.tx_log.len()),
+        0,
+        "probe_tx_ready_budgeted must emit 0 wire TX when release TX budget is already spent"
+    );
+    drv.set_tx_release_deadline(None);
+
+    // Part 2: Supervisor `clear_fault_executor_bounded_for_release_with_budget` debits the
+    // shared `ReleaseBudget` ledger and refuses to transmit when TX is already exhausted.
+    let (bus2, mut drv2, _) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    drv2.set_torque(true).expect("enable");
+    bus2.with(|s| s.push_all_feedback());
+    let _ = drv2.read_joint_states();
+    let mut core = SupervisorInner::new(cfg).with_driver(Box::new(drv2));
+    core.lease_enabled = false;
+    core.rt_executor_owned = true;
+    // Run one normal poll so `core` has fresh measured feedback and clear_check reaches TxProbeRequired.
+    {
+        let t_init = clock.now();
+        let mut init_ledger = ReleaseBudget::new(199, t_init, t_init + Duration::from_millis(15), 64, 16);
+        let mut init_now = || clock.now();
+        let _ = core.poll_hardware_with_budget(&mut init_ledger, &mut init_now);
+    }
+    core.safety.trigger_fault_coded(
+        FaultCode::Other,
+        FaultReason::Other("injected can tx stall".into()),
+    );
+    core.safety.latch(
+        FaultKind::CanTxStalled,
+        armd::safety::FaultDetail::from_reason(
+            FaultCode::Other,
+            &FaultReason::Other("injected can tx stall".into()),
+        ),
+    );
+
+    let t1 = clock.now();
+    let mut ledger = ReleaseBudget::new(200, t1, t1 + Duration::from_millis(15), 64, 1);
+    core.driver
+        .as_mut()
+        .unwrap()
+        .try_with_mut(|d| d.begin_control_release(200))
+        .unwrap();
+    // Spend the single TX slot in `ledger` BEFORE ClearFault maintenance runs.
+    ledger.charge_tx(1);
+    assert_eq!(ledger.tx_remaining(), 0);
+    bus2.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    let mut now_fn = || clock.now();
+    let res_exhausted = core.clear_fault_executor_bounded_for_release_with_budget(
+        t1,
+        &mut ledger,
+        None,
+        &mut now_fn,
+    );
+    assert!(
+        matches!(
+            res_exhausted,
+            Err(armd::safety::ClearFaultError::Rejected(
+                armd::safety::ClearRefusal::DriverError(_)
+            ))
+        ),
+        "ClearFault at 0 remaining ledger TX must reach probe and defer cleanly, got {res_exhausted:?}"
+    );
+    assert_eq!(
+        bus2.with(|s| s.tx_log.len()),
+        0,
+        "ClearFault at 0 remaining ledger TX must emit 0 wire frames"
+    );
+
+    // Next release with 2 remaining TX slots: ClearFault sends 1 probe frame and charges it to `ledger`.
+    clock.advance(Duration::from_millis(20));
+    let t2 = clock.now();
+    let mut ledger2 = ReleaseBudget::new(201, t2, t2 + Duration::from_millis(15), 64, 2);
+    core.driver
+        .as_mut()
+        .unwrap()
+        .try_with_mut(|d| d.begin_control_release(201))
+        .unwrap();
+    bus2.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    let res_ok = core.clear_fault_executor_bounded_for_release_with_budget(
+        t2,
+        &mut ledger2,
+        None,
+        &mut now_fn,
+    );
+    assert!(
+        matches!(
+            res_ok,
+            Ok(_)
+                | Err(armd::safety::ClearFaultError::Rejected(
+                    armd::safety::ClearRefusal::TxProbeFeedbackRequired
+                ))
+        ),
+        "ClearFault with remaining TX budget must send 0xCC probe (and either clear or await probe reply), got {res_ok:?}"
+    );
+    let sent = bus2.with(|s| s.tx_log.len());
+    assert_eq!(sent, 1, "ClearFault probe should emit exactly 1 0xCC frame");
+    assert_eq!(
+        ledger2.tx_used(),
+        1,
+        "ClearFault probe TX attempt must be charged to the shared ReleaseBudget"
+    );
+    assert_eq!(ledger2.tx_remaining(), 1);
+}

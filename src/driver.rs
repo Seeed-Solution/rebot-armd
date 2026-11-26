@@ -9430,7 +9430,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Open a fresh per-tick TX budget window. Called automatically at the start of
     /// `receive_feedback()`; exposed for direct driver tests and executors that step TX
     /// independently of `read_joint_states()`.
+    ///
+    /// While executing inside an active managed control release that already opened its TX pass,
+    /// `begin_tx_tick` preserves attempts and coalescing state already spent in this release so
+    /// intra-release maintenance or recovery calls can never regain spent TX slots.
     pub fn begin_tx_tick(&mut self) {
+        if self.in_active_control_release()
+            && self.release_tx_pass_release_id == self.control_release_id
+        {
+            self.discard_staged_ctrl_tx();
+            return;
+        }
         self.tick_tx = None;
         self.refresh_scheduler.begin_tick();
         self.release_ctrl_tx_mask = 0;
@@ -9839,7 +9849,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return true;
         }
         let attempts = self.tick_tx.map_or(0, |p| p.attempts);
-        attempts.saturating_add(1).saturating_add(reserved) <= self.effective_tx_max_frames()
+        attempts.saturating_add(1).saturating_add(reserved) <= self.tx_budget.max_frames
     }
 
     /// Remaining TX frame slots in the active tick pass (`0` if backpressured or past deadline).
@@ -12551,10 +12561,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
         self.tx_probe = None;
-        // Preserve any active `self.tx_release_deadline` cap installed by the release owner so
-        // the clear-fault probe uses the exact same `release_deadline - publish_margin` cutoff
-        // as every other TX in the release.
-        self.begin_tx_tick();
+        // Preserve any active `self.tx_release_deadline` cap and already-spent release TX
+        // attempts installed by the release owner so the clear-fault probe uses the exact same
+        // release ledger and cutoff as every other TX in the release.
+        self.ensure_release_tx_tick();
         let probe_joint = 0usize;
         match self.send_plain(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
             Some(damiao::build_refresh_frame(d.motor_ids[probe_joint]))
@@ -20720,7 +20730,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut tx_boundary_seq = [0u64; 64];
         let mut sent_mask: u64 = 0;
         self.discard_all_pending_tx();
-        self.begin_tx_tick();
+        self.ensure_release_tx_tick();
         let mut tx_err: Option<ArmDriverError> = None;
         for idx in 0..n {
             if (affected_mask & (1u64 << idx)) == 0 {

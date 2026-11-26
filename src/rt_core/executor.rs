@@ -7404,7 +7404,7 @@ impl ControlState {
         &mut self,
         core: &mut SupervisorInner,
         ctx: &super::ops::CommitCtx,
-        release_deadline: Instant,
+        release_budget: &mut super::budget::ReleaseBudget,
         step_num: u64,
         release_flags: &mut u32,
         maint_req_id: &mut u64,
@@ -7468,9 +7468,9 @@ impl ControlState {
                 self.shutdown_committed = false;
                 let clock_hook = self.hooks.clock.clone();
                 let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
-                let res = core.clear_fault_executor_bounded_for_release_with_clock(
+                let res = core.clear_fault_executor_bounded_for_release_with_budget(
                     ctx.now,
-                    release_deadline,
+                    release_budget,
                     expected_epoch,
                     &mut live_now,
                 );
@@ -7493,7 +7493,7 @@ impl ControlState {
             } => {
                 let clock_hook = self.hooks.clock.clone();
                 let mut live_now = || clock_hook.as_ref().map_or_else(Instant::now, |c| c.now());
-                let out = super::requests::lease::install_lease_clear_fault_rt_with_clock(
+                let out = super::requests::lease::install_lease_clear_fault_rt_with_budget(
                     core,
                     connection,
                     lease_generation,
@@ -7503,7 +7503,7 @@ impl ControlState {
                     auth_policy,
                     operator,
                     ctx.now,
-                    release_deadline,
+                    release_budget,
                     &mut live_now,
                 );
                 if matches!(out, super::requests::lease::LeaseClearFaultOutcome::Cleared { .. }) {
@@ -11137,7 +11137,7 @@ fn control_thread_main_inner(
                             state.service_one_maintenance(
                                 core,
                                 ctx,
-                                release_budget.deadline(),
+                                release_budget,
                                 step_num,
                                 &mut release_flags,
                                 &mut maint_req_id,

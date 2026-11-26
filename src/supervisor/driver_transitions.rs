@@ -9097,6 +9097,7 @@ impl SupervisorInner {
                         None,
                         expected_epoch,
                         authority,
+                        None,
                     )
                     .map_err(|e| match e {
                         ClearFaultWithAuthError::Authority(a) => {
@@ -10112,7 +10113,7 @@ impl SupervisorInner {
         expected_epoch: Option<u64>,
     ) -> Result<SafetyState, crate::safety::ClearFaultError> {
         let mut wall_now = Instant::now;
-        match self.clear_fault_executor_inner(&mut wall_now, deadline, expected_epoch, None) {
+        match self.clear_fault_executor_inner(&mut wall_now, deadline, expected_epoch, None, None) {
             Ok(state) => Ok(state),
             Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
             Err(ClearFaultWithAuthError::Authority(_)) => {
@@ -10153,11 +10154,42 @@ impl SupervisorInner {
         let tx_deadline = release_deadline
             .checked_sub(self.tx_release_publish_margin())
             .unwrap_or(now);
-        match self.clear_fault_executor_inner(now_fn, tx_deadline, expected_epoch, None) {
+        match self.clear_fault_executor_inner(now_fn, tx_deadline, expected_epoch, None, None) {
             Ok(state) => Ok(state),
             Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
             Err(ClearFaultWithAuthError::Authority(_)) => {
                 unreachable!("authority is None on clear_fault_executor_bounded_for_release")
+            }
+        }
+    }
+
+    /// Release-ledger-threaded form of [`Self::clear_fault_executor_bounded_for_release_with_clock`]:
+    /// enforces and debits the shared [`crate::rt_core::budget::ReleaseBudget`] across RX drain,
+    /// `0xCC` TX probes, and motor fault resets so maintenance never regains TX/RX spent earlier
+    /// in the same release.
+    #[allow(clippy::result_large_err)]
+    pub fn clear_fault_executor_bounded_for_release_with_budget(
+        &mut self,
+        now: Instant,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
+        expected_epoch: Option<u64>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        let tx_deadline = release_budget
+            .deadline()
+            .checked_sub(self.tx_release_publish_margin())
+            .unwrap_or(now);
+        match self.clear_fault_executor_inner(
+            now_fn,
+            tx_deadline,
+            expected_epoch,
+            None,
+            Some(release_budget),
+        ) {
+            Ok(state) => Ok(state),
+            Err(ClearFaultWithAuthError::Clear(e)) => Err(e),
+            Err(ClearFaultWithAuthError::Authority(_)) => {
+                unreachable!("authority is None on clear_fault_executor_bounded_for_release_with_budget")
             }
         }
     }
@@ -10180,6 +10212,29 @@ impl SupervisorInner {
             tx_deadline,
             Some(authority.expected_epoch),
             Some(authority),
+            None,
+        )
+    }
+
+    /// Release-ledger-threaded form of [`Self::clear_fault_executor_bounded_for_release_with_authority_clock`].
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn clear_fault_executor_bounded_for_release_with_authority_budget(
+        &mut self,
+        now: Instant,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
+        authority: crate::rt_core::requests::lease::ClearFaultAuthority,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> Result<SafetyState, ClearFaultWithAuthError> {
+        let tx_deadline = release_budget
+            .deadline()
+            .checked_sub(self.tx_release_publish_margin())
+            .unwrap_or(now);
+        self.clear_fault_executor_inner(
+            now_fn,
+            tx_deadline,
+            Some(authority.expected_epoch),
+            Some(authority),
+            Some(release_budget),
         )
     }
 
@@ -10190,6 +10245,7 @@ impl SupervisorInner {
         deadline: Instant,
         expected_epoch: Option<u64>,
         authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+        mut release_budget: Option<&mut crate::rt_core::budget::ReleaseBudget>,
     ) -> Result<SafetyState, ClearFaultWithAuthError> {
         use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearFaultError as E, ClearRefusal as R};
@@ -10242,6 +10298,7 @@ impl SupervisorInner {
                     Some(deadline),
                     expected_epoch,
                     authority,
+                    release_budget,
                 )?;
                 if let Some(ref cand) = candidate_limits {
                     self.commit_driver_limits_bounded(cand);
@@ -10368,6 +10425,11 @@ impl SupervisorInner {
                     BudgetExpired,
                     Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
                 }
+                let budget_rem = release_budget
+                    .as_deref()
+                    .map(|b| (b.rx_remaining(), b.tx_remaining()));
+                let mut probe_rx_delta = 0u16;
+                let mut probe_tx_delta = 0u16;
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
                 let probe_outcome = self.with_driver_and_owner_ref(|owner, drv| {
                     if let Some(auth) = authority {
@@ -10385,9 +10447,16 @@ impl SupervisorInner {
                     else {
                         return BudgetedProbeAttempt::BudgetExpired;
                     };
+                    let before_budget = drv.release_budget_consumed();
+                    if let Some((rx_rem, tx_rem)) = budget_rem {
+                        drv.sync_release_budget_limits(rx_rem, tx_rem);
+                    }
                     drv.set_tx_release_deadline(Some(drv_deadline));
                     let res = drv.probe_tx_ready_budgeted(drv_deadline);
                     drv.set_tx_release_deadline(None);
+                    let after_budget = drv.release_budget_consumed();
+                    probe_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                    probe_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     drv.feedback_ages_into(&mut scratch_ages);
                     let ages_ok = scratch_ages.len() == owner.config.dof
                         && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
@@ -10403,6 +10472,14 @@ impl SupervisorInner {
                     ))
                 });
                 self.scratch.ages = scratch_ages;
+                if let Some(b) = release_budget.as_deref_mut() {
+                    if probe_rx_delta > 0 {
+                        b.charge_rx(probe_rx_delta, false);
+                    }
+                    if probe_tx_delta > 0 {
+                        b.charge_tx(probe_tx_delta);
+                    }
+                }
                 let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, fb_valid_after, j7_fresh_after, ages_valid_after) =
                     match probe_outcome
                         .ok_or(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable))?
@@ -10453,6 +10530,11 @@ impl SupervisorInner {
                         StoppedTorqueOff(crate::supervisor::StoppedTorqueOffRefusal),
                         Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
                     }
+                    let budget_rem = release_budget
+                        .as_deref()
+                        .map(|b| (b.rx_remaining(), b.tx_remaining()));
+                    let mut reset_rx_delta = 0u16;
+                    let mut reset_tx_delta = 0u16;
                     let reset_outcome = self
                         .with_driver_and_owner_ref(|owner, drv| {
                             if let Some(auth) = authority {
@@ -10486,12 +10568,27 @@ impl SupervisorInner {
                             else {
                                 return BudgetedResetAttempt::Refusal(R::BudgetExpired);
                             };
+                            let before_budget = drv.release_budget_consumed();
+                            if let Some((rx_rem, tx_rem)) = budget_rem {
+                                drv.sync_release_budget_limits(rx_rem, tx_rem);
+                            }
                             drv.set_tx_release_deadline(Some(drv_deadline));
                             let res = drv.clear_fault_budgeted(drv_deadline);
                             drv.set_tx_release_deadline(None);
+                            let after_budget = drv.release_budget_consumed();
+                            reset_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                            reset_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                             BudgetedResetAttempt::Ran(res)
                         })
                         .ok_or(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable))?;
+                    if let Some(b) = release_budget.as_deref_mut() {
+                        if reset_rx_delta > 0 {
+                            b.charge_rx(reset_rx_delta, false);
+                        }
+                        if reset_tx_delta > 0 {
+                            b.charge_tx(reset_tx_delta);
+                        }
+                    }
                     let reset_res = match reset_outcome {
                         BudgetedResetAttempt::Ran(res) => res,
                         BudgetedResetAttempt::Refusal(R::EStopActive) => {
@@ -10696,6 +10793,7 @@ impl SupervisorInner {
         deadline: Option<Instant>,
         expected_epoch: Option<u64>,
         authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+        mut release_budget: Option<&mut crate::rt_core::budget::ReleaseBudget>,
     ) -> Result<SafetyState, ClearFaultWithAuthError> {
         use crate::driver::CarryoverMotorClearOutcome;
         use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly_with_op;
@@ -10758,9 +10856,18 @@ impl SupervisorInner {
             Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
         }
 
+        let budget_rem = release_budget
+            .as_deref()
+            .map(|b| (b.rx_remaining(), b.tx_remaining()));
+        let mut co_rx_delta = 0u16;
+        let mut co_tx_delta = 0u16;
         let mut scratch_status = std::mem::take(&mut self.scratch.status);
         let attempt = self
             .with_driver_and_owner_ref(|owner, drv| {
+                let before_budget = drv.release_budget_consumed();
+                if let Some((rx_rem, tx_rem)) = budget_rem {
+                    drv.sync_release_budget_limits(rx_rem, tx_rem);
+                }
                 let drv_deadline = if let Some(dl) = deadline {
                     let Ok((_, _, translated)) =
                         crate::supervisor::translate_driver_cutoff_conservative(drv, dl, now_fn)
@@ -10779,6 +10886,9 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
+                    let after_budget = drv.release_budget_consumed();
+                    co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                    co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::DriverError(clear_fault_driver_error(&e)));
                 }
 
@@ -10790,6 +10900,9 @@ impl SupervisorInner {
                         if deadline.is_some() {
                             drv.set_tx_release_deadline(None);
                         }
+                        let after_budget = drv.release_budget_consumed();
+                        co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                        co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                         return CarryoverAttempt::Authority(auth_err);
                     }
                 }
@@ -10797,6 +10910,9 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
+                    let after_budget = drv.release_budget_consumed();
+                    co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                    co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::EStopActive);
                 }
 
@@ -10812,12 +10928,18 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
+                    let after_budget = drv.release_budget_consumed();
+                    co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                    co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::MotorErrorClearRequiresDisarmed);
                 }
                 if !has_all_fresh_feedback {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
+                    let after_budget = drv.release_budget_consumed();
+                    co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                    co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::FreshFeedbackRequiredForRestingSupport);
                 }
 
@@ -10827,6 +10949,9 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
+                    let after_budget = drv.release_budget_consumed();
+                    co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                    co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(refusal);
                 }
 
@@ -10855,6 +10980,9 @@ impl SupervisorInner {
                 if deadline.is_some() {
                     drv.set_tx_release_deadline(None);
                 }
+                let after_budget = drv.release_budget_consumed();
+                co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
+                co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                 if let Ok(CarryoverMotorClearOutcome::Revoked(code)) = outcome {
                     if let Some(auth_err) = revoked_auth {
                         return CarryoverAttempt::Authority(auth_err);
@@ -10896,6 +11024,14 @@ impl SupervisorInner {
                 return Err(e);
             }
         };
+        if let Some(b) = release_budget.as_deref_mut() {
+            if co_rx_delta > 0 {
+                b.charge_rx(co_rx_delta, false);
+            }
+            if co_tx_delta > 0 {
+                b.charge_tx(co_tx_delta);
+            }
+        }
 
         let result = match attempt {
             CarryoverAttempt::Ran {
