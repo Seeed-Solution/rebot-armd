@@ -1005,8 +1005,8 @@ fn armed_mit_continuity_hold_rejects_pending_target_torque_and_j7_motion_past_cu
     };
     let j7_out = drv.emit_pos_force_j7(j7_intent, stamp).unwrap();
     assert!(
-        matches!(j7_out, PosForceEmitOutcome::Sent { .. }),
-        "J7 past cutoff under armed MIT must degrade to stationary Hold and send: {j7_out:?}"
+        matches!(j7_out, PosForceEmitOutcome::SentHoldInsteadOfTarget { .. }),
+        "J7 past cutoff under armed MIT must degrade to stationary Hold and return SentHoldInsteadOfTarget: {j7_out:?}"
     );
     drv.set_tx_release_deadline(None);
     let r3_frames = bus.with(|s| s.tx_log.clone());
@@ -1929,6 +1929,280 @@ fn j7_continuity_bypass_never_leaks_to_motion_target_after_arm_batch_cutoff() {
         assert_eq!(
             j7_count, 0,
             "unfenced external J7 Target past cutoff must transmit 0 frames"
+        );
+    }
+}
+
+#[test]
+fn j7_continuity_hold_fallback_does_not_count_as_accepted_motion_in_supervisor() {
+    use armd::driver::{
+        ArmDriver, JointMode, JointTarget, PosForceEmitOutcome, PosForceIntent,
+        PosForceIntentKind,
+    };
+    use armd::motion::{GripperCommand, GripperRequest};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Run under BOTH owners (Legacy and RT Executor) to verify bookkeeping parity.
+    for is_executor in [false, true] {
+        let clock = MockClock::new();
+        let (bus, drv, cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+        let expire_j7_target = Arc::new(AtomicBool::new(false));
+        let hook_expire = expire_j7_target.clone();
+        let hook_clock = clock.clone();
+        let mut drv = drv.with_before_final_tx_gate_hook(Arc::new(move |frame| {
+            if frame.id == 0x307 {
+                let vel_raw = u16::from_le_bytes([frame.data[4], frame.data[5]]);
+                if vel_raw > 0 && hook_expire.swap(false, Ordering::SeqCst) {
+                    hook_clock.advance(Duration::from_millis(15));
+                }
+            }
+        }));
+        bus.with(|s| {
+            for m in s.motors.iter_mut().take(6) {
+                m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
+            }
+            s.motors[6].q = 0.0;
+            s.push_all_feedback();
+        });
+        drv.set_torque(true).expect("enable torque");
+
+        let mut base_targets = vec![JointTarget::position(0.0); 7];
+        for t in base_targets.iter_mut().take(6) {
+            t.kp = Some(12.0);
+            t.kd = Some(0.8);
+            t.torque = Some(0.0);
+        }
+        let modes = [
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Position,
+        ];
+        let mut core = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        core.lease_enabled = false;
+        core.rt_executor_owned = is_executor;
+        // Enable torque through SupervisorInner so safety transitions cleanly to Armed.
+        {
+            let t0 = clock.now();
+            let mut now_fn = || clock.now();
+            core.tick_control_with_clock(0.02, &mut now_fn, t0 + Duration::from_millis(10));
+        }
+        {
+            let s = core.current_admission_stamp();
+            core.check_admission(s)
+                .and_then(SupervisorInner::enable_torque)
+                .expect("enable torque on supervisor");
+        }
+        // Switch J1..J6 to MIT mode and arm the MIT deadline fence on the driver.
+        core.driver
+            .as_mut()
+            .unwrap()
+            .try_with_mut(|d| {
+                d.set_joint_modes(&modes, &base_targets)
+                    .expect("set MIT modes");
+                d.set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
+                clock.advance(Duration::from_millis(10));
+                bus.with(|s| {
+                    s.tx_log.clear();
+                    s.push_all_feedback();
+                });
+                let _ = d.read_joint_states();
+                assert_eq!(
+                    d.write_joint_targets_bounded(&base_targets).unwrap(),
+                    armd::driver::TxBatchOutcome::Complete
+                );
+            })
+            .unwrap();
+
+        // Warm up 1 release so feedback timing is fresh and valid in the supervisor.
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.push_all_feedback();
+        });
+        {
+            let t0 = clock.now();
+            let mut now_fn = || clock.now();
+            core.tick_control_with_clock(0.02, &mut now_fn, t0 + Duration::from_millis(10));
+        }
+
+        // Start a gripper Move to current closed position (fraction = 0.0) so Release 1 finishes
+        // the gripper reference immediately and produces `pending_deferred_done` while emitting a
+        // J7 `PosForceIntent::Target` (with quantized wire speed `vel_raw > 0`).
+        let epoch = core.safety.epoch_id();
+        let stamp = core.current_admission_stamp();
+        let req = GripperRequest {
+            command: GripperCommand::Move,
+            fraction: Some(0.0),
+            grasp: false,
+            speed: 1.0,
+            timeout_s: Some(5.0),
+            tag: Some("j7_hold_bookkeeping".into()),
+        };
+        let (action_id, _) = core
+            .check_admission(stamp)
+            .map_err(armd::ArmError::from)
+            .and_then(|admitted| SupervisorInner::start_gripper(admitted, req, epoch))
+            .expect("start gripper move");
+
+        // Advance 10 pre-ticks (1 enter-settle + 9 settle ticks) cleanly so the next tick
+        // (Release 1) is the exact completing release that produces `pending_deferred_done`.
+        for k in 0..10 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| {
+                s.tx_log.clear();
+                s.push_all_feedback();
+            });
+            let tk = clock.now();
+            let mut now_fn = || clock.now();
+            core.tick_control_with_clock(0.02, &mut now_fn, tk + Duration::from_millis(10));
+            assert!(
+                core.last_action.as_ref().is_some_and(|a| a.is_running()),
+                "owner executor={is_executor}: gripper action must still be running at settle tick {k}/10"
+            );
+        }
+
+        // Release 1 (10th settle tick): cutoff expires right before J7 Target submits -> armed MIT
+        // continuity fallback emits stationary Hold (`vel_raw == 0`) instead of the requested Target.
+        // Supervisor MUST NOT mark the requested J7 target accepted (`last_action` stays running).
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.push_all_feedback();
+        });
+        expire_j7_target.store(true, Ordering::SeqCst);
+        {
+            let t1 = clock.now();
+            let mut now_fn = || clock.now();
+            core.tick_control_with_clock(0.02, &mut now_fn, t1 + Duration::from_millis(10));
+        }
+
+        let r1_j7: Vec<_> = bus.with(|s| s.tx_log.iter().filter(|f| f.id == 0x307).cloned().collect());
+        assert_eq!(
+            r1_j7.len(),
+            1,
+            "owner executor={is_executor}: Release 1 must emit exactly 1 J7 continuity Hold frame"
+        );
+        let r1_vel_raw = u16::from_le_bytes([r1_j7[0].data[4], r1_j7[0].data[5]]);
+        assert_eq!(
+            r1_vel_raw, 0,
+            "owner executor={is_executor}: Release 1 J7 frame must be stationary Hold (vel_raw=0), got {r1_vel_raw}"
+        );
+        assert!(
+            !core.safety.state().is_stopped(),
+            "owner executor={is_executor}: continuity Hold fallback must not fault/stop arm: {:?}",
+            core.safety.state()
+        );
+        let a1 = core.last_action.as_ref().expect("gripper action present");
+        assert_eq!(a1.id, action_id);
+        assert!(
+            a1.is_running(),
+            "owner executor={is_executor}: J7 continuity Hold fallback MUST NOT count as accepted motion (action finished prematurely: {a1:?})"
+        );
+
+        // Release 2: cutoff stays open -> J7 Target (`vel_raw > 0`) transmits cleanly and
+        // supervisor now accepts the output and completes the deferred gripper action.
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.push_all_feedback();
+        });
+        {
+            let t2 = clock.now();
+            let mut now_fn = || clock.now();
+            core.tick_control_with_clock(0.02, &mut now_fn, t2 + Duration::from_millis(10));
+        }
+        let r2_j7: Vec<_> = bus.with(|s| s.tx_log.iter().filter(|f| f.id == 0x307).cloned().collect());
+        assert_eq!(
+            r2_j7.len(),
+            1,
+            "owner executor={is_executor}: Release 2 must emit J7 Target frame"
+        );
+        let r2_vel_raw = u16::from_le_bytes([r2_j7[0].data[4], r2_j7[0].data[5]]);
+        assert!(
+            r2_vel_raw > 0,
+            "owner executor={is_executor}: Release 2 J7 frame must carry motion Target (vel_raw > 0), got {r2_vel_raw}"
+        );
+        let a2 = core.last_action.as_ref().expect("gripper action present");
+        assert_eq!(
+            a2.state.as_str(),
+            "done",
+            "owner executor={is_executor}: Release 2 accepted J7 Target must complete deferred action: {a2:?}"
+        );
+    }
+
+    // Direct driver outcome check: `emit_pos_force_j7` returns `SentHoldInsteadOfTarget`,
+    // does not set J7's target-sent bit, and retains pending deferral age.
+    {
+        let clock = MockClock::new();
+        let (bus, mut drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+        bus.with(|s| {
+            for m in s.motors.iter_mut().take(6) {
+                m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
+            }
+        });
+        drv.set_torque(true).expect("enable torque");
+        let mut base_targets = vec![JointTarget::position(0.0); 7];
+        for t in base_targets.iter_mut().take(6) {
+            t.kp = Some(12.0);
+            t.kd = Some(0.8);
+            t.torque = Some(0.0);
+        }
+        let modes = [
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Position,
+        ];
+        drv.set_joint_modes(&modes, &base_targets)
+            .expect("set MIT modes");
+        drv.set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
+        drv.set_external_pos_force_emitter(true);
+
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.push_all_feedback();
+        });
+        let _ = drv.read_joint_states();
+
+        let t0 = clock.now();
+        drv.begin_control_release(50);
+        drv.set_tx_release_deadline(Some(t0)); // already expired
+        drv.sync_release_budget_limits(64, 16);
+        let stamp = drv.current_j7_intent_stamp();
+        let out = drv
+            .emit_pos_force_j7(
+                PosForceIntent {
+                    kind: PosForceIntentKind::Target {
+                        position: -0.2,
+                        velocity: Some(0.5),
+                        current_raw: None,
+                    },
+                    stamp,
+                },
+                stamp,
+            )
+            .unwrap();
+        assert!(
+            matches!(out, PosForceEmitOutcome::SentHoldInsteadOfTarget { joint: 6, .. }),
+            "cutoff fallback must return SentHoldInsteadOfTarget, got {out:?}"
+        );
+        assert_eq!(
+            drv.last_target_tx_sent_mask() & (1u64 << 6),
+            0,
+            "J7 continuity Hold fallback must not set J7 in last_target_tx_sent_mask"
+        );
+        assert!(
+            drv.oldest_pending_tx_age().is_some(),
+            "J7 continuity Hold fallback must keep pending deferral tracked for next release"
         );
     }
 }

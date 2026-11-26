@@ -1130,6 +1130,11 @@ pub enum PosForceEmitOutcome {
     AwaitingFirstFresh { joint: usize, pf_status: PosForceTxStatus },
     /// J7 `0x307` frame was transmitted and flushed to the transport.
     Sent { joint: usize, freeze: bool, pf_status: PosForceTxStatus },
+    /// A requested J7 `Target` motion intent hit the per-release cutoff or budget under an armed
+    /// MIT fence and degraded to a stationary continuity `Hold` frame that was transmitted and
+    /// flushed. Continuity is preserved, while the requested `Target` was NOT accepted and stays
+    /// pending/deferred for the next release.
+    SentHoldInsteadOfTarget { joint: usize, freeze: bool, pf_status: PosForceTxStatus },
     /// J7 `0x307` frame was deferred by per-tick TX budget or backpressure.
     Deferred { joint: usize, pf_status: PosForceTxStatus },
 }
@@ -13168,7 +13173,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 Ok(arm_out)
             }
-            PosForceEmitOutcome::Deferred { pf_status, .. } => {
+            PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. }
+            | PosForceEmitOutcome::Deferred { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
                 Ok(match arm_out {
                     TxBatchOutcome::Complete => TxBatchOutcome::Deferred { pending: 1 },
@@ -20262,8 +20268,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     && (self.release_ctrl_tx_mask & (1u32 << pf_j)) == 0
                 {
                     let stamp = self.current_j7_intent_stamp();
-                    if let Ok(PosForceEmitOutcome::Sent { .. }) =
-                        self.emit_pos_force_j7(PosForceIntent::hold(stamp), stamp)
+                    if let Ok(
+                        PosForceEmitOutcome::Sent { .. }
+                        | PosForceEmitOutcome::SentHoldInsteadOfTarget { .. },
+                    ) = self.emit_pos_force_j7(PosForceIntent::hold(stamp), stamp)
                     {
                         frames_sent = frames_sent.saturating_add(1);
                         if pf_j < 32 {
@@ -22327,7 +22335,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 arm_res
             }
-            Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
+            Ok(
+                PosForceEmitOutcome::Sent { joint, pf_status, .. }
+                | PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, pf_status, .. },
+            ) => {
                 let pf_bit = joint.saturating_mul(2);
                 let pf_mask = if pf_bit < 64 { 1u64 << pf_bit } else { 0 };
                 self.last_hold_tx_sent_any = true;
@@ -22412,7 +22423,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         let hold_bypass = self.j7_hold_continuity_bypass();
         let res = pos_force_emitter::emit_tick(self, intent, current, hold_bypass);
-        if let Ok(PosForceEmitOutcome::Sent { joint, .. }) = res {
+        if let Ok(
+            PosForceEmitOutcome::Sent { joint, .. }
+            | PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, .. },
+        ) = res
+        {
             if self.mit_fence.is_some() && joint < self.mit_fence_last_cmd.len() {
                 self.mit_fence_last_cmd[joint] = Some(self.now());
             }
@@ -23220,7 +23235,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 arm_res.map(|()| report)
             }
-            Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
+            Ok(
+                PosForceEmitOutcome::Sent { joint, pf_status, .. }
+                | PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, pf_status, .. },
+            ) => {
                 let pf_bit = joint.saturating_mul(2);
                 let pf_mask = if pf_bit < 64 { 1u64 << pf_bit } else { 0 };
                 self.last_hold_tx_sent_any = true;
@@ -23866,6 +23884,33 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                     arm_res
                 }
+                Ok(PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. }) => {
+                    self.last_tx_pf_status = pf_status;
+                    if arm_res.is_ok() {
+                        self.mit_fence_last_cmd[pf_j] = Some(self.now());
+                        if let PosForceTxStatus::Stale { .. } = pf_status {
+                            self.trip_fence(MitFenceTripReason::TargetUnavailable {
+                                joint: (pf_j + 1) as u8,
+                                completed_joints: pf_j as u8,
+                                total_joints,
+                            });
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                        }
+                    }
+                    match arm_res {
+                        Ok(TxBatchOutcome::Complete) => Ok(TxBatchOutcome::Deferred { pending: 1 }),
+                        Ok(TxBatchOutcome::Deferred { pending }) => {
+                            Ok(TxBatchOutcome::Deferred { pending: pending.saturating_add(1) })
+                        }
+                        Ok(TxBatchOutcome::Expired { dropped, pending }) => {
+                            Ok(TxBatchOutcome::Expired {
+                                dropped,
+                                pending: pending.saturating_add(1),
+                            })
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
                 Ok(PosForceEmitOutcome::Deferred { pf_status, .. }) => {
                     self.last_tx_pf_status = pf_status;
                     if arm_res.is_ok() {
@@ -23995,7 +24040,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 Ok(arm_out)
             }
-            PosForceEmitOutcome::Deferred { pf_status, .. } => {
+            PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. }
+            | PosForceEmitOutcome::Deferred { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
                 Ok(match arm_out {
                     TxBatchOutcome::Complete => TxBatchOutcome::Deferred { pending: 1 },
@@ -25486,6 +25532,7 @@ mod pos_force_emitter {
         let armed_mit = driver.mit_fence.is_some() && driver.mit_fence_trip.is_none();
         let mut active_kind = effective_kind;
         let mut retried = false;
+        let mut degraded_target_to_continuity_hold = false;
         let sent_frame = loop {
             let (kind, target_lease_gen) = match active_kind {
                 PosForceIntentKind::Target { .. } => (TxKind::Target, intent.stamp.lease_gen),
@@ -25567,6 +25614,7 @@ mod pos_force_emitter {
                         retried = true;
                         active_kind = PosForceIntentKind::Hold;
                         is_target_intent = false;
+                        degraded_target_to_continuity_hold = true;
                         continue;
                     }
                     if !driver.pos_force_feedback_valid(pf_j, driver.now()) {
@@ -25685,20 +25733,32 @@ mod pos_force_emitter {
         }
 
         driver.pf_hold_on_first_fresh = false;
-        driver.pf_deferred_ticks = 0;
-        driver.pf_deferred_motion = false;
-        driver.pf_deferred_since = None;
-        driver.pf_deferred_intent = None;
         let sent_vel_raw = u16::from_le_bytes([sent_frame.data[4], sent_frame.data[5]]);
         driver.record_flushed_joint_tx(pf_j, 0, sent_vel_raw > 0);
-        if pf_j < 64 {
-            driver.last_target_tx_sent_mask |= 1u64 << pf_j;
-        }
         if driver.mit_fence.is_some() && driver.mit_fence_trip.is_none() {
             driver.mit_fence_last_cmd[pf_j] = Some(entry_now);
         }
         let pf_status = driver.take_last_pos_force_tx_status();
-        Ok(PosForceEmitOutcome::Sent { joint: pf_j, freeze: is_freeze, pf_status })
+        if degraded_target_to_continuity_hold {
+            driver.pf_deferred_ticks = driver.pf_deferred_ticks.saturating_add(1);
+            driver.pf_deferred_motion = true;
+            driver.pf_deferred_since.get_or_insert(entry_now);
+            driver.pf_deferred_intent = Some(intent);
+            Ok(PosForceEmitOutcome::SentHoldInsteadOfTarget {
+                joint: pf_j,
+                freeze: is_freeze,
+                pf_status,
+            })
+        } else {
+            driver.pf_deferred_ticks = 0;
+            driver.pf_deferred_motion = false;
+            driver.pf_deferred_since = None;
+            driver.pf_deferred_intent = None;
+            if pf_j < 64 {
+                driver.last_target_tx_sent_mask |= 1u64 << pf_j;
+            }
+            Ok(PosForceEmitOutcome::Sent { joint: pf_j, freeze: is_freeze, pf_status })
+        }
     }
 }
 

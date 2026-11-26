@@ -8081,7 +8081,8 @@ impl SupervisorInner {
         if !j7_effective_hold_or_freeze
             && matches!(
                 emit_res,
-                Ok(PosForceEmitOutcome::Deferred { .. })
+                Ok(PosForceEmitOutcome::Deferred { .. }
+                    | PosForceEmitOutcome::SentHoldInsteadOfTarget { .. })
                     | Err(ArmDriverError::Transport(
                         crate::transport::TransportError::Timeout
                     ))
@@ -8090,7 +8091,10 @@ impl SupervisorInner {
         {
             let refused_now = drv.clock_now();
             let pf_status = match emit_res {
-                Ok(PosForceEmitOutcome::Deferred { pf_status, .. }) => pf_status,
+                Ok(
+                    PosForceEmitOutcome::Deferred { pf_status, .. }
+                    | PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. },
+                ) => pf_status,
                 _ => drv.take_last_pos_force_tx_status(),
             };
             drv.discard_pending_tx();
@@ -8186,6 +8190,127 @@ impl SupervisorInner {
                         *dst_pf = pf_status;
                     }
                     TickOutput::EstopInhibited { .. } | TickOutput::LeaseFenced => {}
+                }
+            }
+            Ok(PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, pf_status, .. }) => {
+                // Stationary continuity Hold reached the wire (keeping J7 held), while the
+                // requested J7 motion Target was NOT transmitted: never count the requested
+                // output as accepted; defer it to the next release.
+                let status = if matches!(pf_status, crate::driver::PosForceTxStatus::Stale { .. }) {
+                    JointHoldStatus::HeldStaleTarget
+                } else {
+                    JointHoldStatus::Held
+                };
+                hold_status_update = Some((joint, status));
+                *allow_output_accepted = false;
+                let pf_bit_hold = if joint.saturating_mul(2) < 64 {
+                    1u64 << (joint * 2)
+                } else {
+                    0
+                };
+                match std::mem::replace(tick_output, TickOutput::None) {
+                    TickOutput::None => {
+                        *tick_output = TickOutput::Deferred {
+                            pending: 1,
+                            now,
+                            max_age,
+                            oldest_age: drv.oldest_pending_tx_age(),
+                            due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
+                            is_hold: j7_is_hold,
+                            sent_mask: if j7_is_hold { pf_bit_hold } else { 0 },
+                            pf_status,
+                        };
+                    }
+                    TickOutput::ActionDeadlineRefused { drv_now, .. } => {
+                        *tick_output = TickOutput::ActionDeadlineRefused { drv_now, pf_status };
+                    }
+                    TickOutput::Complete { is_hold, now, max_age, due_mask, sent_mask, .. } => {
+                        *tick_output = TickOutput::Deferred {
+                            pending: 1,
+                            now,
+                            max_age,
+                            oldest_age: drv.oldest_pending_tx_age(),
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { 0 },
+                            is_hold,
+                            sent_mask: if is_hold {
+                                sent_mask | pf_bit_hold
+                            } else {
+                                drv.last_target_tx_sent_mask()
+                            },
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Deferred {
+                        pending,
+                        now,
+                        max_age,
+                        oldest_age,
+                        due_mask,
+                        is_hold,
+                        sent_mask,
+                        ..
+                    } => {
+                        *tick_output = TickOutput::Deferred {
+                            pending: pending.saturating_add(1),
+                            now,
+                            max_age,
+                            oldest_age: oldest_age.or_else(|| drv.oldest_pending_tx_age()),
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
+                            is_hold,
+                            sent_mask: if is_hold { sent_mask | pf_bit_hold } else { sent_mask },
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Expired {
+                        dropped,
+                        pending,
+                        now,
+                        max_age,
+                        oldest_age,
+                        due_mask,
+                        sent_mask,
+                        is_hold,
+                        ..
+                    } => {
+                        *tick_output = TickOutput::Expired {
+                            dropped,
+                            pending: pending.saturating_add(1),
+                            now,
+                            max_age,
+                            oldest_age,
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
+                            sent_mask: if is_hold { sent_mask | pf_bit_hold } else { sent_mask },
+                            is_hold,
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Error {
+                        message,
+                        now,
+                        max_age,
+                        is_hold,
+                        sent_any,
+                        due_mask,
+                        sent_mask,
+                        ..
+                    } => {
+                        *tick_output = TickOutput::Error {
+                            message,
+                            now,
+                            max_age,
+                            is_hold,
+                            sent_any: sent_any || is_hold,
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
+                            sent_mask: if is_hold { sent_mask | pf_bit_hold } else { sent_mask },
+                            pf_status,
+                        };
+                    }
+                    TickOutput::EstopInhibited { is_hold } => {
+                        *tick_output = TickOutput::EstopInhibited { is_hold };
+                    }
+                    TickOutput::LeaseFenced => {
+                        *tick_output = TickOutput::LeaseFenced;
+                    }
                 }
             }
             Ok(PosForceEmitOutcome::Deferred { joint, pf_status }) => {
