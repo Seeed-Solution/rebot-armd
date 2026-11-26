@@ -168,21 +168,27 @@ body.locked .pose-go { cursor: not-allowed; }
 .brand-mark svg { width: 20px; height: 20px; }
 .brand-text { font-size: 16px; font-weight: 600; white-space: nowrap; }
 .brand-text small { display: block; font-size: 11px; font-weight: 400; color: var(--sc-color-text-tertiary); line-height: 1.2; }
-.ui-switch { margin: 0 auto; }
-.ui-switch button { min-width: 112px; }
-.ui-switch .short { display: none; }
+.ui-switch {
+  flex: none; margin: 0 auto; height: 28px; padding: 2px; gap: 2px; border-radius: 14px;
+  background: rgba(15, 23, 42, 0.06); border: 1px solid var(--sc-color-border-neutral);
+  align-items: center;
+}
+.ui-switch button {
+  min-width: 0; min-height: 22px; height: 22px; padding: 0 10px; border-radius: 11px;
+  font-size: 12px; font-weight: 500; line-height: 1; color: var(--sc-color-text-secondary);
+}
+.ui-switch button.on {
+  background: #fff; color: var(--sc-color-text); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.10);
+}
 /* the title never runs under the mode switch: it does not shrink below its text; it drops the subtitle, then the
    text, as the header narrows (header probe at 360-1440 px, zh / en, simple / expert) */
 .brand { flex: none; }
 @media (max-width: 1279px) { .brand-text .full { display: none; } }
 @media (max-width: 999px) { .brand-text { display: none; } }
-@media (max-width: 1279px) { .ui-switch button { min-width: 88px; } }
 @media (max-width: 899px) {
   .topbar { gap: 8px; }
   .head-stats #link-badge { display: none; }
-  .topbar:has(.hd-btn:not([hidden])) .ui-switch .full { display: none; }
-  .topbar:has(.hd-btn:not([hidden])) .ui-switch .short { display: inline; }
-  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { min-width: 0; padding: 0 10px; }
 }
 .head-stats { display: flex; align-items: center; gap: 8px; }
 .speed-pill {
@@ -377,9 +383,9 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 
 /* ---------- hand-eye calibration drawer ---------- */
 .calib-mask { position: fixed; inset: 0; z-index: 1040; display: flex; justify-content: flex-end; background: rgba(15, 23, 42, 0.32); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); animation: cfade .18s ease; }
-.calib-drawer { width: min(440px, 100%); height: 100%; display: flex; flex-direction: column; gap: 14px; padding: max(18px, env(safe-area-inset-top)) max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) 18px;
+.calib-drawer { width: min(440px, 100%); height: 100%; display: flex; flex-direction: column; gap: 14px; padding: 0 max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) 18px;
   background: var(--sc-color-bg-container); border-left: 1px solid var(--sc-color-border); box-shadow: -12px 0 40px rgba(31,41,55,0.16); overflow-y: auto; overscroll-behavior: contain; animation: cslide .22s cubic-bezier(.2,.8,.2,1); }
-.calib-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.calib-head { position: sticky; top: 0; z-index: 3; flex: none; padding: max(18px, env(safe-area-inset-top)) 0 10px; background: inherit; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .calib-head h3 { font-size: 17px; font-weight: 600; color: var(--sc-color-text); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .btn.head-estop { flex: none; min-height: 40px; padding: 0 14px; font-size: 14px; font-weight: 700; color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); touch-action: none; }
 .head-estop[hidden] { display: none; }
@@ -410,12 +416,12 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .calib-actions #calib-cap { grid-column: 1 / -1; }
 .calib-actions .calib-reset { color: var(--sc-status-danger-fg); }
 .calib-actions .calib-reset.armed { background: var(--sc-status-danger-bg); border-color: #ffccc7; }
-@keyframes cfade { from { opacity: 0; } }
-@keyframes cslide { from { transform: translateX(32px); opacity: 0; } }
+@keyframes cfade { from { background: rgba(15, 23, 42, 0); } }
+@keyframes cslide { from { transform: translateX(24px); } }
 @media (max-width: 640px) {
   .calib-mask { align-items: flex-end; }
   .calib-drawer { width: 100%; height: auto; max-height: 92dvh; border-left: 0; border-top: 1px solid var(--sc-color-border); border-radius: 16px 16px 0 0; animation-name: cup; }
-  @keyframes cup { from { transform: translateY(32px); opacity: 0; } }
+  @keyframes cup { from { transform: translateY(24px); } }
 }
 .cwiz-mask { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; pointer-events: none; }
 .cwiz-mask .calib-drawer { pointer-events: auto; box-shadow: -8px 0 28px rgba(15, 23, 42, 0.14); overflow: hidden; }
@@ -668,11 +674,8 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
 .hd-btn svg { width: 18px; height: 18px; }
 .hd-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
 .hd-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
-/* narrow phones: short UI-mode labels make room for the header icon buttons and the operator badge */
+/* narrow phones: tighten header spacing for the icon buttons and operator badge */
 @media (max-width: 559px) {
-  .topbar:has(.hd-btn:not([hidden])) .ui-switch .full { display: none; }
-  .topbar:has(.hd-btn:not([hidden])) .ui-switch .short { display: inline; }
-  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 10px; }
   .hd-btn { width: 32px; }
 }
 @media (max-width: 419px) {
@@ -680,7 +683,6 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
   .hd-btn { width: 28px; }
   .op-btn { padding: 0 7px; gap: 3px; }
   .lang-btn { padding: 0 6px; }
-  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 8px; }
 }
 @media (max-width: 369px) {
   .topbar:has(.hd-btn:not([hidden])) { gap: 3px; padding-left: 8px; padding-right: 8px; }
@@ -1587,11 +1589,17 @@ body::before {
   body.ui-simple.tb-compact-3 .op-btn .op-lbl { display: none; }
   body.ui-simple.tb-compact-3 .topbar { gap: 4px; }
   body.ui-simple.tb-compact-3 .op-btn { padding: 0 7px; }
-  body.ui-simple .ui-switch { margin: 0; padding: 2px; background: rgba(255,255,255,0.3); border-color: transparent; border-radius: 13px; }
-  body.ui-simple .ui-switch button { min-width: 0; min-height: 24px; padding: 0 10px; border-radius: 11px; font-size: 12px; color: #1f2937; }
-  body.ui-simple .ui-switch button.on { background: rgba(255,255,255,0.9); }
-  body.ui-simple .ui-switch .full { display: none; }
-  body.ui-simple .ui-switch .short { display: inline; }
+  body.ui-simple .ui-switch {
+    margin: 0; height: 26px; padding: 2px; border-radius: 13px;
+    background: rgba(255,255,255,0.45); border: 1px solid rgba(255,255,255,0.55);
+  }
+  body.ui-simple .ui-switch button {
+    min-width: 0; min-height: 20px; height: 20px; padding: 0 9px; border-radius: 10px;
+    font-size: 12px; color: #374151;
+  }
+  body.ui-simple .ui-switch button.on {
+    background: #fff; color: #111827; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,0.14);
+  }
   body.ui-simple .fs-btn { width: 26px; height: 26px; border-radius: 13px; border-color: transparent; background: rgba(255,255,255,0.6); color: #1f2937; flex-shrink: 0; display: inline-flex !important; }
   body.ui-simple .lang-btn { height: 26px; min-width: 26px; padding: 0 8px; border-radius: 13px; border-color: transparent; background: rgba(255,255,255,0.6); color: #1f2937; font-size: 12px; }
   body.ui-simple .fs-btn.on { background: var(--sc-color-primary); color: #fff; }
@@ -1874,18 +1882,14 @@ body.controls-unavailable .grip-slider input[type=range]::-moz-range-thumb { bor
 .act-row.one { grid-template-columns: repeat(var(--n, 2), minmax(0, 1fr)); }
 .act-row.one > .act-full { grid-column: auto; }
 .act-row > .act-back:not(.armed):not(:disabled), .act-row > .tch-del:not(.armed) { background: transparent; box-shadow: none; color: var(--sc-color-text-secondary); }
-/* ===== simple mode (2026-11-25): one mode entry, recognition panel, object card, grasp tasks ===== */
-#ui-seg { display: none !important; }
-.ui-mode-btn { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 36px; margin: 0 auto; padding: 0 14px; border-radius: 18px; border: 1px solid rgba(255,255,255,0.35);
-  background: var(--sc-color-primary-dark); color: #fff; font: 600 13px/1 inherit; font-family: inherit; white-space: nowrap; cursor: pointer; touch-action: manipulation; }
-.ui-mode-btn svg { width: 16px; height: 16px; flex: none; }
-.ui-mode-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
-body.ui-simple .ui-mode-btn { margin: 0; }
+/* ===== simple mode: compact segmented mode switch, recognition panel, object card, grasp tasks ===== */
+.topbar .ui-switch { background: rgba(15, 23, 42, 0.06); border: 1px solid var(--sc-color-border-neutral); border-radius: 14px; }
+body.ui-simple .ui-switch { margin: 0; }
 @media (max-width: 639px) {
-  .ui-mode-btn { margin: 0; }
+  .ui-switch { margin: 0; }
 }
-/* phones (360-479 px): compact the mode button, icon controls and operator pill so the header fits inside the viewport
-   in en/zh and simple/expert without pushing #btn-lang off-screen; wrap only as a safety net for extra badges */
+/* phones (360-479 px): compact the segmented mode toggle, icon controls and operator pill so the header fits inside
+   the viewport in en/zh and simple/expert without pushing #btn-lang off-screen; wrap only as a safety net */
 @media (max-width: 479px) {
   body:not(.is-fs):not(.is-hud) .topbar {
     gap: 4px; row-gap: 4px; padding: 6px 8px;
@@ -1893,8 +1897,8 @@ body.ui-simple .ui-mode-btn { margin: 0; }
     padding-right: max(8px, env(safe-area-inset-right));
     height: auto; min-height: var(--head-h); flex-wrap: wrap;
   }
-  .ui-mode-btn { height: 32px; padding: 0 9px; gap: 4px; font-size: 12px; }
-  .ui-mode-btn svg { width: 15px; height: 15px; }
+  .ui-switch { height: 28px; padding: 2px; border-radius: 14px; }
+  .ui-switch button { height: 22px; min-height: 22px; padding: 0 7px; border-radius: 11px; font-size: 11px; }
   .speed-pill { width: 46px; height: 26px; font-size: 11px; }
   .fs-btn, .hd-btn { width: 30px; height: 32px; }
   .fs-btn svg, .hd-btn svg { width: 16px; height: 16px; }
@@ -1908,8 +1912,8 @@ body.ui-simple .ui-mode-btn { margin: 0; }
     padding-left: max(6px, env(safe-area-inset-left));
     padding-right: max(6px, env(safe-area-inset-right));
   }
-  .ui-mode-btn { height: 30px; padding: 0 8px; font-size: 11px; }
-  .ui-mode-btn svg { width: 14px; height: 14px; }
+  .ui-switch { height: 26px; padding: 2px; border-radius: 13px; }
+  .ui-switch button { height: 20px; min-height: 20px; padding: 0 6px; border-radius: 10px; font-size: 11px; }
   .speed-pill { width: 44px; height: 26px; font-size: 11px; }
   .fs-btn, .hd-btn { width: 28px; height: 30px; }
   .op-btn { height: 28px; min-width: 28px; }
@@ -2034,7 +2038,17 @@ body.ui-simple.oc-slot.vis-open .s-vis:not([hidden]) { position: fixed; top: var
   body.ui-simple #gset { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; pointer-events: none; }
   body.ui-simple #gset .calib-drawer { pointer-events: auto; }
   body.ui-simple #gset .calib-drawer { position: fixed; top: 52px; right: max(12px, env(safe-area-inset-right)); bottom: 12px; width: min(380px, calc(100vw - 24px)); height: auto;
-    padding: 14px; border-radius: 22px; border: 1px solid rgba(255,255,255,0.75); background: rgba(255,255,255,0.92); box-shadow: 0 16px 40px rgba(0,0,0,0.3); }
+    padding: 0 14px 14px; border-radius: 22px; border: 1px solid rgba(255,255,255,0.75); background: rgba(255,255,255,0.92); box-shadow: 0 16px 40px rgba(0,0,0,0.3); }
+}
+/* hide floating simple-mode controls while a modal drawer (e.g. settings, not non-modal #gset or wizards) is open so they never overlap or bleed through */
+body.ui-simple:has(.calib-mask:not(.cwiz-mask):not(#gset):not([hidden])) .presets,
+body.ui-simple:has(.calib-mask:not(.cwiz-mask):not(#gset):not([hidden])) .disc,
+body.ui-simple:has(.calib-mask:not(.cwiz-mask):not(#gset):not([hidden])) .cluster,
+body.ui-simple:has(.calib-mask:not(.cwiz-mask):not(#gset):not([hidden])) .pose-btn,
+body.ui-simple:has(.calib-mask:not(.cwiz-mask):not(#gset):not([hidden])) .move-hint,
+body.ui-simple:has(.calib-mask:not(.cwiz-mask):not(#gset):not([hidden])) .topbar {
+  visibility: hidden !important;
+  pointer-events: none !important;
 }
 /* keep toasts clear of open drawer headers and top controls (phone bottom-sheet & tablet side-drawer) */
 body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; max-width: calc(100vw - 32px); flex-direction: column-reverse; }
@@ -2066,12 +2080,9 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       <span class="brand-text">reBot<span class="full" data-i18n="brand.sub"> 机械臂遥控</span><small>SenseCraft · armd</small></span>
     </div>
     <div class="seg ui-switch" id="ui-seg" role="radiogroup" data-i18n-aria="ui.mode" aria-label="界面模式">
-      <button data-ui="simple" role="radio"><span class="full" data-i18n="ui.simple">简化模式</span><span class="short" data-i18n="ui.simple.s">简</span></button>
-      <button data-ui="expert" role="radio"><span class="full" data-i18n="ui.expert">专家模式</span><span class="short" data-i18n="ui.expert.s">专</span></button>
+      <button type="button" data-ui="simple" role="radio" data-i18n="ui.simple" data-i18n-title="ui.to_simple.t" title="回到简易模式：画面、摇杆和点选抓取">简易</button>
+      <button type="button" data-ui="expert" role="radio" data-i18n="ui.expert" data-i18n-title="ui.to_expert.t" title="切换到专家模式：关节点动、遥测、标定、录制和全部抓取参数">专家</button>
     </div>
-    <button class="ui-mode-btn" id="btn-ui" type="button" data-i18n-title="ui.to_expert.t" title="切换到专家模式：关节点动、遥测、标定、录制和全部抓取参数">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h7"/><circle cx="17" cy="6" r="2"/><circle cx="14" cy="18" r="2"/></svg><span id="btn-ui-txt" data-i18n="ui.to_expert">专家模式</span>
-    </button>
     <div class="head-stats">
       <button class="speed-pill" id="speed-pill" data-i18n-aria="speed.adjust" aria-label="速度调节">60% ▾</button>
       <span class="sc-status-badge plain" id="tool-badge" hidden></span>
@@ -2867,7 +2878,7 @@ const I18N = {
   zh: {
     'doc.title': 'reBot Teleop · 机械臂遥控',
     'brand.sub': ' 机械臂遥控',
-    'ui.mode': '界面模式', 'ui.simple': '简化模式', 'ui.simple.s': '简', 'ui.expert': '专家模式', 'ui.expert.s': '专',
+    'ui.mode': '界面模式', 'ui.simple': '简易', 'ui.simple.s': '简', 'ui.expert': '专家', 'ui.expert.s': '专',
     'lang.btn': 'EN', 'lang.aria': '切换语言',
     'speed': '速度', 'speed.adjust': '速度调节', 'speed.mult': '速度倍率',
     'fs.enter': '进入全屏', 'fs.title': '全屏', 'fs.exit': '退出全屏 / 展开布局', 'fs.hud': '全屏 HUD 沉浸模式',
@@ -3429,10 +3440,28 @@ Object.assign(I18N.zh, {
   'lease.tq.on': '扭矩开', 'lease.tq.off': '扭矩关',
   'ec.vision_busy': '抓取或测量正在使用识别：结束（或按停止）后再切换', 'ec.ion_budget': '相机内存不够同时加载这个模型和已加载的模型：保持当前识别方式',
   'ec.model_nf': '设备上没有这种识别方式的默认模型：在设备上安装模型，或在机械臂配置的 vision_detectors 中指定',
+  'ws.box_edge': '{part}超出工作空间{edge} {dist}，请{dir}或按 Home',
+  'ws.box_edge_nocm': '{part}超出工作空间{edge}，请{dir}或按 Home',
+  'ws.part.gripper': '夹爪', 'ws.part.camera': '相机', 'ws.part.arm': '机械臂',
+  'ws.edge.box_max_x': '前方边界', 'ws.dir.box_max_x': '向后移动',
+  'ws.edge.box_min_x': '后方边界', 'ws.dir.box_min_x': '向前移动',
+  'ws.edge.box_max_y': '左侧边界', 'ws.dir.box_max_y': '向右移动',
+  'ws.edge.box_min_y': '右侧边界', 'ws.dir.box_min_y': '向左移动',
+  'ws.edge.box_max_z': '顶部边界', 'ws.dir.box_max_z': '向下移动',
+  'ws.edge.box_min_z': '底部边界', 'ws.dir.box_min_z': '向上移动',
 });
 Object.assign(I18N.en, {
   'ui.to_expert': 'Expert mode', 'ui.to_simple': 'Simple mode',
   'ui.to_expert.t': 'Switch to expert mode: joint jog, telemetry, calibration, recording and every grasp parameter', 'ui.to_simple.t': 'Back to simple mode: video, sticks and tap to grasp',
+  'ws.box_edge': '{part} is {dist} beyond the workspace {edge} ({cid}); {dir} or press Home',
+  'ws.box_edge_nocm': '{part} is beyond the workspace {edge} ({cid}); {dir} or press Home',
+  'ws.part.gripper': 'gripper', 'ws.part.camera': 'camera', 'ws.part.arm': 'arm',
+  'ws.edge.box_max_x': 'front edge', 'ws.dir.box_max_x': 'move back',
+  'ws.edge.box_min_x': 'back edge', 'ws.dir.box_min_x': 'move forward',
+  'ws.edge.box_max_y': 'left edge', 'ws.dir.box_max_y': 'move right',
+  'ws.edge.box_min_y': 'right edge', 'ws.dir.box_min_y': 'move left',
+  'ws.edge.box_max_z': 'top edge', 'ws.dir.box_max_z': 'move down',
+  'ws.edge.box_min_z': 'bottom edge', 'ws.dir.box_min_z': 'move up',
   'sv.title': 'Recognition', 'sv.chip.n': 'Recognition · {n} objects', 'sv.chip.0': 'Recognition · no objects', 'sv.chip.wait': 'Recognition · on', 'sv.on.aria': 'Recognition on/off',
   'sv.meta.video': 'video {fps} fps · {ms} ms', 'sv.meta.det': 'recognition {fps} fps', 'sv.meta.off': 'recognition off',
   'sv.kind': 'Detection kind', 'sv.kind.detect': 'Detect (boxes)', 'sv.kind.segment': 'Segment (outlines)',
@@ -4246,6 +4275,18 @@ function syncEpoch(epoch) {
   }
   S.epoch = epoch;
 }
+function formatWorkspaceViolation(o) {
+  if (!o || typeof o !== 'object') return '';
+  const cid = o.constraint_id;
+  if (!cid || !/^box_(?:min|max)_[xyz]$/.test(cid)) return '';
+  const gid = typeof o.geometry_id === 'string' ? o.geometry_id : '';
+  const partKey = gid === 'camera_mount' ? 'ws.part.camera' : gid.startsWith('capsule:') ? 'ws.part.arm' : 'ws.part.gripper';
+  const raw = String(o.reason || o.message || '');
+  const m = /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
+  const args = { part: t(partKey), edge: t('ws.edge.' + cid), dir: t('ws.dir.' + cid), cid };
+  if (m) return t('ws.box_edge', { ...args, dist: m[1] + ' ' + m[2].toLowerCase() });
+  return t('ws.box_edge_nocm', args);
+}
 function rpcError(response) {
   let message;
   if (response.code === 'HANDOVER_SETTLING') {
@@ -4257,6 +4298,8 @@ function rpcError(response) {
   } else if (response.code === 'OPERATOR_REQUIRED') {
     message = t('err.operator_required');
     opRefused();
+  } else if (response.code === 'WORKSPACE_VIOLATION') {
+    message = formatWorkspaceViolation(response) || response.reason || response.message || response.error || t('err.workspace');
   } else {
     message = response.message || response.error || t('err.rejected');
   }
@@ -4539,10 +4582,12 @@ function connectWS() {
       if (o.code === 'WORKSPACE_VIOLATION') {
         const cid = o.constraint_id;
         const gid = o.geometry_id;
-        const nonFloor = (cid && cid !== 'floor_z')
+        const boxMsg = formatWorkspaceViolation(o);
+        const nonFloor = !!boxMsg
+          || (cid && cid !== 'floor_z')
           || (gid && gid.startsWith('capsule:'))
           || (!cid && typeof o.message === 'string' && /keepout|box_|reach|capsule:/i.test(o.message));
-        const detail = o.reason || o.message;
+        const detail = boxMsg || o.reason || o.message;
         if (nonFloor && detail) {
           if (S.mode === 'cart') cartReject(detail);
           else toastOnce({ message: detail, code: o.code });
@@ -4570,10 +4615,12 @@ function connectWS() {
       syncEpoch(o.epoch_id);
       S.presetRunning = false;
       S.preset = null;
-      const nonFloor = (o.constraint_id && o.constraint_id !== 'floor_z')
+      const boxMsg = formatWorkspaceViolation(o);
+      const nonFloor = !!boxMsg
+        || (o.constraint_id && o.constraint_id !== 'floor_z')
         || (o.geometry_id && o.geometry_id.startsWith('capsule:'))
         || (!o.constraint_id && typeof o.message === 'string' && /keepout|box_|reach|capsule:/i.test(o.message));
-      const wsMsg = nonFloor ? (o.reason || o.message || t('err.workspace')) : t('err.workspace');
+      const wsMsg = boxMsg || (nonFloor ? (o.reason || o.message || t('err.workspace')) : t('err.workspace'));
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling3')
         : o.code === 'COLLISION_HOLD' ? t('err.collision_hold')
@@ -9283,7 +9330,12 @@ function renderMotionLimit(o) {
       : ml.reason === 'gripper_force' ? 'ml.grip_force'
       : ml.reason === 'power' ? (o.power && o.power.hold ? 'ml.power' : 'ml.power_slow')
       : age >= 1000 ? (ml.joint != null && ml.joint < 3 ? 'ml.slow_big' : 'ml.slow') : '';
-    if (key) { ML.key = key; ML.j = ml.joint == null ? '' : 'J' + (ml.joint + 1); ML.until = now + 1000; }
+    if (key) {
+      ML.key = key;
+      ML.j = ml.joint == null ? '' : 'J' + (ml.joint + 1);
+      ML.wsDetail = ml.reason === 'workspace' ? (o.workspace_violation || null) : null;
+      ML.until = now + 1000;
+    }
     // armd ended the stream in a hold: drop the queued motion once so the goal does not pull on
     const held = ml.reason === 'blocked' || ml.reason === 'torque' || (ml.reason === 'power' && !!(o.power && o.power.hold));
     if (held && !ML.blocked) cartHoldStill();
@@ -9291,7 +9343,10 @@ function renderMotionLimit(o) {
   } else ML.blocked = false;
   const show = !!ML.key && now < ML.until;
   el.hidden = !show;
-  if (show) setText(el, t(ML.key, { j: ML.j }));
+  if (show) {
+    const wsBox = ML.key === 'ml.workspace' && ML.wsDetail ? formatWorkspaceViolation(ML.wsDetail) : '';
+    setText(el, wsBox || t(ML.key, { j: ML.j }));
+  }
 }
 function cartReject(err) {
   C.goal = { ...C.cmd };
@@ -10702,13 +10757,8 @@ function setUi(ui) {
   document.body.classList.toggle('ui-expert', ui === 'expert');
   for (const b of $('ui-seg').children) {
     const on = b.dataset.ui === ui;
-    b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
+    b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); b.tabIndex = on ? 0 : -1;
   }
-  // one mode entry in the top bar: it names the other mode
-  const mb = $('btn-ui'), next = ui === 'simple' ? 'expert' : 'simple';
-  mb.dataset.ui = next;
-  $('btn-ui-txt').dataset.i18n = 'ui.to_' + next; setText($('btn-ui-txt'), t('ui.to_' + next));
-  mb.dataset.i18nTitle = 'ui.to_' + next + '.t'; mb.title = t('ui.to_' + next + '.t');
   if (typeof renderSVis === 'function') { placeSlot(); renderSVis(); renderGrasp(); }
   // simple mode always drives the TCP (cartesian); expert restores its own last choice
   // simple: safety lives inside the cockpit; expert: first card of the side column
@@ -10728,7 +10778,15 @@ function setUi(ui) {
   }
 }
 $('ui-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { S.uiUserSet = true; setUi(b.dataset.ui); } });
-$('btn-ui').addEventListener('click', () => { S.uiUserSet = true; setUi($('btn-ui').dataset.ui); });
+$('ui-seg').addEventListener('keydown', (e) => {
+  if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+  e.preventDefault();
+  const next = S.ui === 'simple' ? 'expert' : 'simple';
+  S.uiUserSet = true;
+  setUi(next);
+  const btn = $('ui-seg').querySelector(`button[data-ui="${next}"]`);
+  if (btn) btn.focus();
+});
 
 /* =================================================================
    Dataset recording
@@ -11857,7 +11915,11 @@ const GR = {
 // size measurement state (msRender, below); declared here because renderGrasp reads it
 const MS = { state: null, sel: null, id: null, res: null, err: null, est: null, phase: '', progress: 0 };
 const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
-function graspCodeText(code, message) {
+function graspCodeText(code, message, detail) {
+  if (code === 'WORKSPACE_VIOLATION') {
+    const wsBox = formatWorkspaceViolation(detail);
+    if (wsBox) return wsBox;
+  }
   const k = 'grasp.code.' + graspCodeKey(code);
   const s = t(k);
   // a refused request: armd's message says which value (e.g. the box ray misses the table)
@@ -11871,7 +11933,7 @@ function graspRunningAction() {
 const graspDetOn = () => (S.dof === 7 || isSoArmProfile()) && DET.avail && DET.enabled;
 function graspRPC(path, body) {
   return commandRPC(path, body).then((d) => { syncEpoch(d.epoch_id); return d; }, (e) => {
-    if (!isCancelledErr(e)) toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message) : e.message, 'err', e.code || '');
+    if (!isCancelledErr(e)) toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message, e.reply) : e.message, 'err', e.code || '');
     throw e;
   });
 }
@@ -11900,7 +11962,7 @@ async function graspSetupGaps() {
   return gaps;
 }
 async function graspFailToast(r) {
-  const msg = t('grasp.res.fail', { why: graspCodeText(r.code, r.message) });
+  const msg = t('grasp.res.fail', { why: graspCodeText(r.code, r.message, r) });
   const gaps = await graspSetupGaps();
   if (!gaps.length) { toast(msg, 'err', r.code || ''); return; }
   toast(msg + ' ' + t('grasp.gap', { g: gaps.join(t('cw.f.sep')) }), 'err', r.code || '', { act: { label: t('gset.title'), fn: () => gsetOpen(true) } });
@@ -11916,7 +11978,7 @@ function graspOnObs(o) {
     if (r.id === GR.id) { GR.id = null; GR.sel = null; }
     if (r.state === 'done') toast(t('grasp.res.ok'), 'ok');
     else if (r.state === 'failed' && GRASP_AIM_CODES.has(r.code)) graspFailToast(r);
-    else toast(t(r.state === 'failed' ? 'grasp.res.fail' : 'grasp.res.cancel', { why: graspCodeText(r.code, r.message) }), r.state === 'failed' ? 'err' : 'warn', r.code || '');
+    else toast(t(r.state === 'failed' ? 'grasp.res.fail' : 'grasp.res.cancel', { why: graspCodeText(r.code, r.message, r) }), r.state === 'failed' ? 'err' : 'warn', r.code || '');
   }
 }
 function graspStop(reason) {
@@ -12721,6 +12783,7 @@ async function colWrite(patch) {
 }
 function ssetOpen(open) {
   $('sset').hidden = !open;
+  estopPinSync();
   clearInterval(TL.live); TL.live = null;
   if (open) {
     if (colAvail()) { colRenderSet(); colLoad(false); }

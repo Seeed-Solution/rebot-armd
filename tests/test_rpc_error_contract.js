@@ -14,7 +14,9 @@ function source(name) {
 function i18nSource() {
   const start = html.indexOf('const I18N = {');
   assert.notEqual(start, -1, 'I18N');
-  return html.slice(start, html.indexOf('\n};', start) + 3);
+  const end = html.indexOf('\n// ----', start);
+  const assignEnd = html.indexOf('\n});', html.indexOf('Object.assign(I18N.en', start));
+  return html.slice(start, assignEnd !== -1 ? assignEnd + 4 : html.indexOf('\n};', start) + 3);
 }
 const context = vm.createContext({ console });
 vm.runInContext(`
@@ -26,6 +28,7 @@ let messages = [], unloadCalls = 0, rejection;
 const toast = (...args) => messages.push(args);
 let api = async () => { throw rejection; };
 let controlledUnload = () => { unloadCalls++; };
+${source('formatWorkspaceViolation')}
 ${source('rpcError')}
 ${source('disableTorque')}
 `, context);
@@ -87,4 +90,68 @@ ${source('disableTorque')}
   assert.equal(lost('zh', 'preempted', 3), null, 'stale generation is ignored');
   assert.equal(vm.runInContext('S.leaseGeneration', context), 7);
   console.log('PASS: lease_lost reason selects preempted / connection-dropped / released wording');
+
+  // Workspace box-edge rejection formatting in zh and en (all 6 edges + exact 1.0 cm wording).
+  const wsErr = (lang, payload) => vm.runInContext(`
+    LANG = ${JSON.stringify(lang)};
+    rpcError(${JSON.stringify(payload)}).message`, context);
+  assert.equal(
+    wsErr('zh', {
+      code: 'WORKSPACE_VIOLATION',
+      constraint_id: 'box_max_x',
+      geometry_id: 'end_point:5',
+      reason: 'gripper is 1.0 cm beyond the workspace front edge (box_max_x); move back or press Home',
+    }),
+    '夹爪超出工作空间前方边界 1.0 cm，请向后移动或按 Home',
+  );
+  assert.equal(
+    wsErr('en', {
+      code: 'WORKSPACE_VIOLATION',
+      constraint_id: 'box_max_x',
+      geometry_id: 'end_point:5',
+      reason: 'gripper is 1.0 cm beyond the workspace front edge (box_max_x); move back or press Home',
+    }),
+    'gripper is 1.0 cm beyond the workspace front edge (box_max_x); move back or press Home',
+  );
+  for (const [cid, zhEdge, zhDir, enEdge, enDir] of [
+    ['box_max_x', '前方边界', '向后移动', 'front edge', 'move back'],
+    ['box_min_x', '后方边界', '向前移动', 'back edge', 'move forward'],
+    ['box_max_y', '左侧边界', '向右移动', 'left edge', 'move right'],
+    ['box_min_y', '右侧边界', '向左移动', 'right edge', 'move left'],
+    ['box_max_z', '顶部边界', '向下移动', 'top edge', 'move down'],
+    ['box_min_z', '底部边界', '向上移动', 'bottom edge', 'move up'],
+  ]) {
+    const payload = {
+      code: 'WORKSPACE_VIOLATION',
+      constraint_id: cid,
+      geometry_id: 'end_origin',
+      reason: `gripper is 2.3 cm beyond the workspace ${enEdge} (${cid}); ${enDir} or press Home`,
+    };
+    assert.equal(wsErr('zh', payload), `夹爪超出工作空间${zhEdge} 2.3 cm，请${zhDir}或按 Home`);
+    assert.equal(wsErr('en', payload), payload.reason);
+  }
+  // Sub-millimetre new intrusion preserves mm precision (never "0.0 cm") and graspCodeText uses it
+  assert.equal(
+    wsErr('zh', {
+      code: 'WORKSPACE_VIOLATION',
+      constraint_id: 'box_max_x',
+      geometry_id: 'end_point:5',
+      reason: 'gripper is 0.2 mm beyond the workspace front edge (box_max_x); move back or press Home',
+    }),
+    '夹爪超出工作空间前方边界 0.2 mm，请向后移动或按 Home',
+  );
+  vm.runInContext(`
+    const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
+    ${source('graspCodeText')}
+  `, context);
+  const graspWs = vm.runInContext(`
+    LANG = 'zh';
+    graspCodeText('WORKSPACE_VIOLATION', 'raw', {
+      code: 'WORKSPACE_VIOLATION',
+      constraint_id: 'box_max_x',
+      geometry_id: 'end_point:5',
+      reason: 'gripper is 1.0 cm beyond the workspace front edge (box_max_x); move back or press Home',
+    })`, context);
+  assert.equal(graspWs, '夹爪超出工作空间前方边界 1.0 cm，请向后移动或按 Home');
+  console.log('PASS: workspace box-edge rejections translate cleanly in zh/en for all 6 edges (cm/mm + grasp)');
 })().catch(error => { console.error(error); process.exitCode = 1; });
