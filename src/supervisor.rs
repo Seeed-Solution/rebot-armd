@@ -10088,6 +10088,18 @@ impl SupervisorInner {
                     }
                 }
             } else if !self.gripper_stalled && !gripper_hw_overload {
+                let active_gripper_motion = self.active_trajectory.as_ref().and_then(|a| match &a.reference {
+                    crate::motion::Reference::Gripper(gm) if gm.gripper_index == g_idx => Some(gm),
+                    _ => None,
+                });
+                // When driven open, only torque pushing in the opening direction (`-close_dir`)
+                // counts as stall effort — residual closing preload from a closed stop or squeeze
+                // (`tau_g * close_dir > 0`) must not falsely latch an opening stall while the
+                // command unwinds (same signed opening rule as `over_cap` above). Closing and idle
+                // keep unsigned `|tau_g| >= stall_nm`.
+                let opening_drive = active_gripper_motion
+                    .is_some_and(|gm| (gm.target - gm.start) * close_dir < -1e-6)
+                    || (active_gripper_motion.is_none() && opening);
                 let high_effort = if has_torque_feedback {
                     // the stream contact regulator holds the grip instead of the stall hold at
                     // the measured jaw (which reads ~0 N·m on a rigid object and re-squeezes);
@@ -10096,8 +10108,13 @@ impl SupervisorInner {
                     // during a calibration stroke the command must also lead the jaw: a free jaw
                     // settling onto its target reads its friction torque at low speed with the
                     // command next to it, and every stall fails the calibration
+                    let torque_high = if opening_drive {
+                        -tau_g * close_dir >= stall_nm
+                    } else {
+                        tau_g.abs() >= stall_nm
+                    };
                     self.gripper_stream_contact.is_none()
-                        && tau_g.abs() >= stall_nm
+                        && torque_high
                         && (self.gripper_calibration.is_none() || gap.abs() > GRIPPER_STALL_MIN_LEAD_RAD)
                 } else {
                     let stall_load_thresh = self.config.gripper_policy.as_ref()
@@ -10108,10 +10125,6 @@ impl SupervisorInner {
                     let load_condition = if has_load_feedback { load_g.abs() > stall_load_thresh } else { true };
                     gap.abs() > 0.08 && load_condition
                 };
-                let active_gripper_motion = self.active_trajectory.as_ref().and_then(|a| match &a.reference {
-                    crate::motion::Reference::Gripper(gm) if gm.gripper_index == g_idx => Some(gm),
-                    _ => None,
-                });
                 let active_gripper_speed = active_gripper_motion
                     .map(|gm| gm.planned_speed)
                     .or(stream_window_speed)
