@@ -3819,7 +3819,11 @@ pub fn begin_with_stamp(
         parent_generation: 0,
         deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
     };
-    let vision_guard = crate::vision_detector::try_begin_vision_action()?;
+    let vision_guard = if planned.mode.as_ref().is_some_and(Result::is_err) {
+        crate::vision_detector::vision_action_in_flight()
+    } else {
+        crate::vision_detector::try_begin_vision_action()?
+    };
     let owner_ctx = OwnerCheckCtx::for_legacy(inner);
     let id = install_begin_macro(
         inner,
@@ -3845,7 +3849,11 @@ pub fn begin_with_stamp(
 pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
     let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
     let (inner, proof) = admitted.consume()?;
-    let vision_guard = crate::vision_detector::try_begin_vision_action()?;
+    let vision_guard = if planned.mode.as_ref().is_some_and(Result::is_err) {
+        crate::vision_detector::vision_action_in_flight()
+    } else {
+        crate::vision_detector::try_begin_vision_action()?
+    };
     if planned.adaptive.is_some() {
         inner.j7_admitted_stamp = None;
     }
@@ -3984,7 +3992,11 @@ async fn begin_executor_inner(
         parent_generation: 0,
         deadline: now + DEFAULT_ACTION_DEADLINE,
     };
-    let vision_guard = crate::vision_detector::begin_vision_action(source.as_ref()).await?;
+    let vision_guard = if planned.mode.as_ref().is_some_and(Result::is_err) {
+        crate::vision_detector::vision_action_in_flight()
+    } else {
+        crate::vision_detector::begin_vision_action(source.as_ref()).await?
+    };
     let (id, _req_id, ack_guard) = crate::macro_action::begin_macro_executor_with_barrier(
         supervisor,
         &action_stamp,
