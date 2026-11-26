@@ -2907,6 +2907,7 @@ impl SupervisorInner {
             self.torque_shadow.enqueue(
                 crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
                     hold_mask: crate::torque::ChannelMask::EMPTY,
+                    stale_held_mask: crate::torque::ChannelMask::EMPTY,
                     contended: true,
                     escalated: self.measured_hold.lock_contended_escalated,
                     live_intent: self.shadow_live_intent(),
@@ -2921,15 +2922,26 @@ impl SupervisorInner {
         let shadow_hold_mask = write_result.as_ref().map_or(hold_mask, |t| t.10);
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let checkpoint_now = write_result
+                .as_ref()
+                .map_or_else(|| self.cached_driver_clock_now(), |t| t.1);
             let mut hm = crate::torque::ChannelMask::EMPTY;
+            let mut stale_hm = crate::torque::ChannelMask::EMPTY;
             for i in 0..self.config.dof.min(crate::torque::MAX_CHANNELS) {
                 if (shadow_hold_mask & (1u64 << i)) != 0 {
                     hm.insert(i as u8);
+                    if i < crate::rt_core::mailbox::MAX_DOF
+                        && self.measured_hold.joint_status[i] == JointHoldStatus::HeldStaleTarget
+                    {
+                        stale_hm.insert(i as u8);
+                    }
                 }
             }
-            self.torque_shadow.enqueue(
+            self.torque_shadow.enqueue_at(
+                checkpoint_now,
                 crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
                     hold_mask: hm,
+                    stale_held_mask: stale_hm,
                     contended: false,
                     escalated: false,
                     live_intent: self.shadow_live_intent(),
@@ -4125,6 +4137,17 @@ impl SupervisorInner {
             self.is_torqued = true;
             self.torque_intent = TorqueIntent::On;
             self.pending_rearm = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::HandshakeResult {
+                    live_op_id: self.shadow_enable_op_id,
+                    confirmed_mask: crate::torque::ChannelMask::EMPTY,
+                    outcome: crate::torque::HandshakeOutcome::Failed,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                },
+            );
         } else if let Some(prev_intent) = restore_intent {
             // Reconcile provisional FailedHold from contended clean Stop once driver confirms
             // zero enable frames were dispatched and zero joints are energized (R5 M5).
@@ -4134,6 +4157,15 @@ impl SupervisorInner {
                 self.torque_intent = prev_intent;
                 self.pending_rearm = false;
                 self.measured_hold.clear();
+                #[cfg(not(target_arch = "wasm32"))]
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::EnableCancelledPreTx {
+                        live_op_id: self.shadow_enable_op_id,
+                        live_intent: self.shadow_live_intent(),
+                        live_is_torqued: self.is_torqued,
+                        live_stopped: self.safety.state().is_stopped(),
+                    },
+                );
             }
         }
         EnableStepOutcome::Failed {
@@ -5838,6 +5870,28 @@ impl SupervisorInner {
         let (drv_any_enabled, _) = self.abort_enable_driver_nonblocking(was_torqued, true);
         self.is_torqued = was_torqued || drv_any_enabled;
         self.pending_rearm = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        if !was_torqued && !drv_any_enabled {
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::EnableCancelledPreTx {
+                    live_op_id: self.shadow_enable_op_id,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                },
+            );
+        } else {
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::HandshakeResult {
+                    live_op_id: self.shadow_enable_op_id,
+                    confirmed_mask: crate::torque::ChannelMask::EMPTY,
+                    outcome: crate::torque::HandshakeOutcome::Failed,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                },
+            );
+        }
     }
 
     /// Starts a torque-disable transition without waiting for its confirmation.
@@ -6188,6 +6242,15 @@ impl SupervisorInner {
             self.torque_intent = prev_torque_intent;
             self.pending_rearm = false;
             self.measured_hold.clear();
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::EnableCancelledPreTx {
+                    live_op_id: self.shadow_enable_op_id,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                },
+            );
         } else {
             let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
             for j in 0..dof {
@@ -6212,6 +6275,17 @@ impl SupervisorInner {
             self.is_torqued = true;
             self.torque_intent = TorqueIntent::On;
             self.pending_rearm = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            self.torque_shadow.enqueue(
+                crate::torque::shadow::ShadowInputKind::HandshakeResult {
+                    live_op_id: self.shadow_enable_op_id,
+                    confirmed_mask: crate::torque::ChannelMask::EMPTY,
+                    outcome: crate::torque::HandshakeOutcome::Failed,
+                    live_intent: self.shadow_live_intent(),
+                    live_is_torqued: self.is_torqued,
+                    live_stopped: self.safety.state().is_stopped(),
+                },
+            );
         }
         self.settle_legacy_ws_failed(token, slot, LegacyTorqueFailure::Stopped);
         false
@@ -6905,6 +6979,15 @@ impl SupervisorInner {
                         self.torque_intent = prev_torque_intent;
                         self.pending_rearm = false;
                         self.measured_hold.clear();
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.torque_shadow.enqueue(
+                            crate::torque::shadow::ShadowInputKind::EnableCancelledPreTx {
+                                live_op_id: self.shadow_enable_op_id,
+                                live_intent: self.shadow_live_intent(),
+                                live_is_torqued: self.is_torqued,
+                                live_stopped: self.safety.state().is_stopped(),
+                            },
+                        );
                     } else {
                         let _ = self.enter_failed_hold(reducer.was_torqued, |buf| {
                             buf.push_str("enable transition timed out");
@@ -7020,13 +7103,6 @@ impl SupervisorInner {
             );
             return;
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        self.torque_shadow
-            .enqueue(crate::torque::shadow::ShadowInputKind::ParkLifecycle {
-                live_op_id: action_id.unwrap_or(0),
-                admitted: true,
-                settled_ok: None,
-            });
         // Route park disable through the torque-off rest-pose gate (both RT non-blocking and legacy).
         if self.rt_executor_owned {
             match self.may_disable_torque_while_stopped_nonblocking() {
@@ -7135,8 +7211,48 @@ impl SupervisorInner {
         }
         if self.driver.is_none() {
             if !watchdog && self.urgent_stop_unapplied() {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::ParkLifecycle {
+                            live_op_id: action_id.unwrap_or(0),
+                            admitted: false,
+                            settled_ok: Some(false),
+                        },
+                    );
+                    self.torque_shadow.enqueue(
+                        crate::torque::shadow::ShadowInputKind::Stop {
+                            kind: crate::torque::StopKind::Stop,
+                            live_intent: self.shadow_live_intent(),
+                            live_is_torqued: self.is_torqued,
+                            live_stopped: true,
+                        },
+                    );
+                }
                 self.cancel_park_before_disable(action_id);
                 return;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let live_op_id = action_id
+                    .unwrap_or_else(|| self.torque_shadow.alloc_live_op_id());
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::ParkLifecycle {
+                        live_op_id,
+                        admitted: true,
+                        settled_ok: None,
+                    },
+                );
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::DisableRequest {
+                        live_op_id,
+                        explicit_release_authorized: false,
+                        live_refusal: None,
+                        live_intent: self.shadow_live_intent(),
+                        live_is_torqued: self.is_torqued,
+                        live_stopped: self.safety.state().is_stopped(),
+                    },
+                );
             }
             self.retire_motion_payloads();
             self.pending_deferred_done = None;
@@ -7187,7 +7303,13 @@ impl SupervisorInner {
         let current_stop_gen_now = || {
             Self::compute_current_stop_gen(stop_gen_atomic, stop_requests)
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let pre_live_intent = self.shadow_live_intent();
+        #[cfg(not(target_arch = "wasm32"))]
+        let pre_live_torqued = self.is_torqued;
         let start = {
+            #[cfg(not(target_arch = "wasm32"))]
+            let shadow_rt = &mut self.torque_shadow;
             let d = self.driver.as_mut().expect("checked is_some");
             let run_start = |drv: &mut dyn crate::driver::ArmDriver| -> ParkDisableStart {
                 // Linearize client Stop and hardware E-stop against EVERY motor's disable transmit
@@ -7195,9 +7317,33 @@ impl SupervisorInner {
                 // (`DamiaoArmDriver::send(TxKind::ClientParkDisable)` /
                 // `FeetechArmDriver::write_torque_off_checked_budgeted`).
                 if !watchdog && urgent_stop_unapplied_now() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        shadow_rt.drain_from_driver(drv);
+                        let now = drv.clock_now();
+                        shadow_rt.enqueue_at(
+                            now,
+                            crate::torque::shadow::ShadowInputKind::ParkLifecycle {
+                                live_op_id: action_id.unwrap_or(0),
+                                admitted: false,
+                                settled_ok: Some(false),
+                            },
+                        );
+                        shadow_rt.enqueue_at(
+                            now,
+                            crate::torque::shadow::ShadowInputKind::Stop {
+                                kind: crate::torque::StopKind::Stop,
+                                live_intent: pre_live_intent,
+                                live_is_torqued: pre_live_torqued,
+                                live_stopped: true,
+                            },
+                        );
+                    }
                     ParkDisableStart::CancelBeforeDisable
                 } else if stop_before_write.load(Ordering::SeqCst) || estop_pending_now() {
                     let now = drv.clock_now();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    shadow_rt.drain_from_driver(drv);
                     let disable_kind =
                         crate::driver::DisableKind::DisableRequested { started_at: now };
                     let snap = OwnerDriverSnapshot::capture_from_driver(
@@ -7222,6 +7368,31 @@ impl SupervisorInner {
                     let disable_kind = crate::driver::DisableKind::DisableRequested {
                         started_at: requested_at,
                     };
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        shadow_rt.drain_from_driver(drv);
+                        let live_op_id =
+                            action_id.unwrap_or_else(|| shadow_rt.alloc_live_op_id());
+                        shadow_rt.enqueue_at(
+                            requested_at,
+                            crate::torque::shadow::ShadowInputKind::ParkLifecycle {
+                                live_op_id,
+                                admitted: true,
+                                settled_ok: None,
+                            },
+                        );
+                        shadow_rt.enqueue_at(
+                            requested_at,
+                            crate::torque::shadow::ShadowInputKind::DisableRequest {
+                                live_op_id,
+                                explicit_release_authorized: false,
+                                live_refusal: None,
+                                live_intent: pre_live_intent,
+                                live_is_torqued: pre_live_torqued,
+                                live_stopped: safety_stopped,
+                            },
+                        );
+                    }
                     let res = if !watchdog {
                         let max_rx = if rt_executor_owned || drv.supports_rt_executor().is_ok() {
                             Some(0)
@@ -7234,6 +7405,8 @@ impl SupervisorInner {
                     } else {
                         drv.begin_disable_torque(disable_kind)
                     };
+                    #[cfg(not(target_arch = "wasm32"))]
+                    shadow_rt.drain_from_driver(drv);
                     let frames_dispatched = drv.disable_frames_dispatched();
                     let dispatched_mask = drv.disable_dispatched_mask();
                     let post_now = drv.clock_now();
@@ -7246,6 +7419,26 @@ impl SupervisorInner {
                         && (urgent_stop_unapplied_now()
                             || expected_stop_gen.is_some_and(|g| current_stop_gen_now() != g))
                     {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            shadow_rt.enqueue_at(
+                                post_now,
+                                crate::torque::shadow::ShadowInputKind::Stop {
+                                    kind: crate::torque::StopKind::Stop,
+                                    live_intent: pre_live_intent,
+                                    live_is_torqued: pre_live_torqued,
+                                    live_stopped: true,
+                                },
+                            );
+                            shadow_rt.enqueue_at(
+                                post_now,
+                                crate::torque::shadow::ShadowInputKind::ParkLifecycle {
+                                    live_op_id: action_id.unwrap_or(0),
+                                    admitted: false,
+                                    settled_ok: Some(false),
+                                },
+                            );
+                        }
                         // Driver stop-gated client park before any disable frame reached the wire:
                         // zero disable frames were transmitted, so cancel cleanly and hold torque.
                         ParkDisableStart::CancelBeforeDisable
@@ -10384,6 +10577,13 @@ impl SupervisorInner {
         timeout: Duration,
         is_caught_panic: bool,
     ) -> PanicDisableOutcome {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (pre_intent, pre_torqued, pre_stopped, pre_ts) = (
+            self.shadow_live_intent(),
+            self.is_torqued,
+            self.safety.state().is_stopped(),
+            self.cached_driver_clock_now(),
+        );
         self.mark_panic_disable_requested();
         let origin = Instant::now();
         let (coop_deadline, hard_deadline) = panic_disable_deadlines(origin, timeout);
@@ -10398,7 +10598,14 @@ impl SupervisorInner {
         )
         .unwrap_or(PanicDisableOutcome::TimedOut);
         #[cfg(not(target_arch = "wasm32"))]
-        self.record_post_panic_disable_shadow(is_caught_panic, &outcome);
+        self.record_post_panic_disable_shadow_at(
+            is_caught_panic,
+            &outcome,
+            pre_intent,
+            pre_torqued,
+            pre_stopped,
+            pre_ts,
+        );
         outcome
     }
 
@@ -10411,6 +10618,32 @@ impl SupervisorInner {
         is_caught_panic: bool,
         outcome: &PanicDisableOutcome,
     ) {
+        let pre_intent = self.shadow_live_intent();
+        let pre_torqued = self.is_torqued;
+        let pre_stopped = self.safety.state().is_stopped();
+        let pre_ts = self.cached_driver_clock_now();
+        self.record_post_panic_disable_shadow_at(
+            is_caught_panic,
+            outcome,
+            pre_intent,
+            pre_torqued,
+            pre_stopped,
+            pre_ts,
+        );
+    }
+
+    /// Record panic or forced-teardown shadow state using the pre-disable live state and causal
+    /// timestamp captured BEFORE `attempt_panic_disable_until` ran.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn record_post_panic_disable_shadow_at(
+        &mut self,
+        is_caught_panic: bool,
+        outcome: &PanicDisableOutcome,
+        pre_intent: crate::torque::TorqueIntent,
+        pre_torqued: bool,
+        pre_stopped: bool,
+        pre_ts: Instant,
+    ) {
         if !self.torque_shadow.is_enabled() {
             return;
         }
@@ -10418,7 +10651,8 @@ impl SupervisorInner {
         // AFTER the live panic deadline observer has sealed `outcome`.
         let deferred_mit = self.torque_shadow.take_deferred_mit_off();
         if !deferred_mit.is_empty() {
-            self.torque_shadow.enqueue(
+            self.torque_shadow.enqueue_at(
+                pre_ts,
                 crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
                     channels: deferred_mit,
                     target_mode: crate::motor_mode::ControlMode::PositionVelocity,
@@ -10427,20 +10661,24 @@ impl SupervisorInner {
             );
         }
         if is_caught_panic {
-            self.torque_shadow
-                .enqueue(crate::torque::shadow::ShadowInputKind::Panic {
+            self.torque_shadow.enqueue_at(
+                pre_ts,
+                crate::torque::shadow::ShadowInputKind::Panic {
                     tier: crate::torque::PanicTier::CaughtControlPanic,
-                    live_intent: self.shadow_live_intent(),
-                    live_is_torqued: self.is_torqued,
-                    live_stopped: true,
-                });
+                    live_intent: pre_intent,
+                    live_is_torqued: pre_torqued,
+                    live_stopped: pre_stopped,
+                },
+            );
         } else {
-            self.torque_shadow
-                .enqueue(crate::torque::shadow::ShadowInputKind::ProcessExit {
-                    live_intent: self.shadow_live_intent(),
-                    live_is_torqued: self.is_torqued,
-                    live_stopped: true,
-                });
+            self.torque_shadow.enqueue_at(
+                pre_ts,
+                crate::torque::shadow::ShadowInputKind::ProcessExit {
+                    live_intent: pre_intent,
+                    live_is_torqued: pre_torqued,
+                    live_stopped: pre_stopped,
+                },
+            );
         }
         match outcome {
             PanicDisableOutcome::Confirmed

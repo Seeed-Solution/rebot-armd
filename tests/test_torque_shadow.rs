@@ -1076,6 +1076,7 @@ fn run_fuzz_trace_on_owner(owner: ShadowOwner, ops: &[FuzzOp]) -> ShadowRunOutco
                         } else {
                             ChannelMask::from_count(7)
                         },
+                        stale_held_mask: ChannelMask::EMPTY,
                         contended,
                         escalated: false,
                         live_intent,
@@ -2073,6 +2074,7 @@ async fn r1_review_regressions_comparator_remount_unknown_queue_and_disabled_all
         });
         rt.enqueue(ShadowInputKind::LiveHoldCheckpoint {
             hold_mask: ChannelMask::EMPTY,
+            stale_held_mask: ChannelMask::EMPTY,
             contended: true,
             escalated: false,
             live_intent: TorqueIntent::On,
@@ -2383,6 +2385,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t1,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x3c),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2408,6 +2411,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t2,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7c),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2433,6 +2437,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t3,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7f),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2458,6 +2463,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t4,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7f),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2503,6 +2509,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t5,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7e), // live dropped J1 while reducer predicts 0x7f
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
