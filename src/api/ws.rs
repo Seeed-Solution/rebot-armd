@@ -3143,6 +3143,54 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     continue;
                                 }
                             }
+                            ExecutorWsRoute::LeaseFree => {
+                                if let Some((auth_req, DispatchHandler::LeaseFree(handler))) =
+                                    entry.map(|e| (e.auth, e.handler))
+                                {
+                                    let request_id =
+                                        value.get("request_id").and_then(Value::as_u64);
+                                    if request_id.is_none()
+                                        || last_ordinary_request
+                                            .is_some_and(|last| request_id.unwrap() <= last)
+                                    {
+                                        let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
+                                        if !worker_writer.send_ordinary_control(reply).await {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    last_ordinary_request = request_id;
+                                    let path = value.get("path").and_then(Value::as_str).unwrap_or("");
+                                    if let Some(error) =
+                                        auth_req.check_lease_free(&ws_auth, path, &value["body"])
+                                    {
+                                        let reject_epoch = recv_supervisor
+                                            .fresh_snapshot(None)
+                                            .await
+                                            .map_or_else(
+                                                |_| recv_supervisor.estop_epoch(),
+                                                |s| s.obs.epoch_id,
+                                            );
+                                        let mut reply =
+                                            rejection(error, "command_reject", reject_epoch);
+                                        reply["request_id"] = value["request_id"].clone();
+                                        if !worker_writer.send_ordinary_control(reply).await {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    handler(LeaseFreeCtx {
+                                        value,
+                                        recv_supervisor: &recv_supervisor,
+                                        recv_deps: &recv_deps,
+                                        recv_connection: &recv_connection,
+                                        recv_client_label: &recv_client_label,
+                                        ack_tx: &ack_tx,
+                                        worker_tasks: &worker_tasks,
+                                    });
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
@@ -3657,9 +3705,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // then abort any remaining and join EVERY handle before releasing the owner lease.
     tasks.shutdown_and_join(WS_TEARDOWN_JOIN_TIMEOUT).await;
 
-    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
-        supervisor.recorder_connection_closed(&connection).await;
-    }
+    supervisor.recorder_connection_closed(&connection).await;
     if !ws_slot_guard.disarmed {
         supervisor.finish_ws_connection(conn_handle).await;
         ws_slot_guard.disarmed = true;

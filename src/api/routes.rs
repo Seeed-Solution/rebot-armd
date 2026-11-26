@@ -354,17 +354,17 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/poses",                     rest::get_poses,                    ExecutorRequest, None,      None,              Allowed),
     rr!(POST   "/api/v1/safety/e_stop",             rest::safety_e_stop,                ExecutorRequest, None,      None,              Allowed),
     rr!(POST   "/api/v1/safety/clear_fault",        rest::safety_clear_fault,           ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/dataset/record/start",      rest::dataset_record_start,         LegacyOnly,      Required,  None,              Fenced),
-    rr!(POST   "/api/v1/dataset/record/save",       rest::dataset_record_save,          LegacyOnly,      Required,  None,              Fenced),
-    rr!(POST   "/api/v1/dataset/record/discard",    rest::dataset_record_discard,       LegacyOnly,      Required,  None,              Fenced),
-    rr!(GET    "/api/v1/dataset/episodes",          rest::dataset_episodes,             LegacyOnly,      None,      None,              Allowed),
-    rr!(DELETE "/api/v1/dataset/episodes/{id}",     rest::dataset_episode_delete,       LegacyOnly,      Required,  None,              Fenced),
-    rr!(GET    "/api/v1/episodes",                  rest::get_episodes,                 LegacyOnly,      None,      None,              Allowed),
+    rr!(POST   "/api/v1/dataset/record/start",      rest::dataset_record_start,         ExecutorRequest, Required,  None,              Fenced),
+    rr!(POST   "/api/v1/dataset/record/save",       rest::dataset_record_save,          ExecutorRequest, Required,  None,              Fenced),
+    rr!(POST   "/api/v1/dataset/record/discard",    rest::dataset_record_discard,       ExecutorRequest, Required,  None,              Fenced),
+    rr!(GET    "/api/v1/dataset/episodes",          rest::dataset_episodes,             ExecutorRequest, None,      None,              Allowed),
+    rr!(DELETE "/api/v1/dataset/episodes/{id}",     rest::dataset_episode_delete,       ExecutorRequest, Required,  None,              Fenced),
+    rr!(GET    "/api/v1/episodes",                  rest::get_episodes,                 ExecutorRequest, None,      None,              Allowed),
     rr!(POST_LIMIT super::IMPORT_BODY_LIMIT,
-               "/api/v1/episodes/import",           rest::episodes_import,              LegacyOnly,      Required,  None,              Fenced),
-    rr!(GET    "/api/v1/episodes/{id}",             rest::get_episode,                  LegacyOnly,      None,      None,              Allowed),
-    rr!(GET    "/api/v1/episodes/{id}/data",        rest::get_episode_data,             LegacyOnly,      None,      None,              Allowed),
-    rr!(GET    "/api/v1/datasets",                  rest::get_datasets,                 LegacyOnly,      None,      None,              Allowed),
+               "/api/v1/episodes/import",           rest::episodes_import,              ExecutorRequest, Required,  None,              Fenced),
+    rr!(GET    "/api/v1/episodes/{id}",             rest::get_episode,                  ExecutorRequest, None,      None,              Allowed),
+    rr!(GET    "/api/v1/episodes/{id}/data",        rest::get_episode_data,             ExecutorRequest, None,      None,              Allowed),
+    rr!(GET    "/api/v1/datasets",                  rest::get_datasets,                 ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/sequences",                 rest::get_sequences,                ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/sequences/{id}",            rest::get_sequence,                 ExecutorRequest, None,      None,              Allowed),
     rr!(POST   "/api/v1/action/run_sequence",       rest::action_requires_lease,        LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
@@ -749,6 +749,10 @@ mod tests {
         );
         assert_eq!(
             lookup(RouteKey::ws_command("/api/v1/record/start")).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::ws_command("/api/v1/grasp/measure")).unwrap().ownership,
             RouteOwnership::LegacyOnly
         );
         assert_eq!(

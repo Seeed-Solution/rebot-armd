@@ -178,9 +178,9 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         lease: LeaseRequirement::None,
         auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
-        ownership: RouteOwnership::LegacyOnly,
+        ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::None,
+        executor_route: ExecutorWsRoute::LeaseFree,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/record/stop"),
@@ -190,9 +190,9 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         lease: LeaseRequirement::None,
         auth: AuthRequirement::ConditionalLeaseFree(record_stop_auth_check),
         reply: ReplyPolicy::CommandDeferred,
-        ownership: RouteOwnership::LegacyOnly,
+        ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::None,
+        executor_route: ExecutorWsRoute::LeaseFree,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/episodes/update"),
@@ -202,9 +202,9 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         lease: LeaseRequirement::None,
         auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
-        ownership: RouteOwnership::LegacyOnly,
+        ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::None,
+        executor_route: ExecutorWsRoute::LeaseFree,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/episodes/delete"),
@@ -214,9 +214,9 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         lease: LeaseRequirement::None,
         auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
-        ownership: RouteOwnership::LegacyOnly,
+        ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::None,
+        executor_route: ExecutorWsRoute::LeaseFree,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/datasets/create"),
@@ -226,9 +226,9 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         lease: LeaseRequirement::None,
         auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
-        ownership: RouteOwnership::LegacyOnly,
+        ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::None,
+        executor_route: ExecutorWsRoute::LeaseFree,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/datasets/delete"),
@@ -238,9 +238,9 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         lease: LeaseRequirement::None,
         auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
-        ownership: RouteOwnership::LegacyOnly,
+        ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::None,
+        executor_route: ExecutorWsRoute::LeaseFree,
     },
 ];
 
@@ -1083,7 +1083,14 @@ pub(super) async fn handle_executor_ws_action(
             Some(ExecutorActionDispatch::Macro(check))
         }
         "/api/v1/action/run_sequence" => {
-            let plan = match crate::sequences::prepare_run_from_snapshot(&snap, body, epoch, true) {
+            let plan = match crate::sequences::prepare_run_from_snapshot_with_recorder(
+                recv_supervisor,
+                &snap,
+                body,
+                epoch,
+            )
+            .await
+            {
                 Ok(p) => p,
                 Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
             };
