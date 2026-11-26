@@ -3715,16 +3715,22 @@ async fn merge_b3_epoch_mirror_sync_and_i16_gripper_calibrate_admission_and_fifo
         let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
 
         // Saturated terminal FIFO refuses /api/v1/action/gripper_calibrate with 503 TERMINALS_BUSY.
+        // Saturate capacity=2 deterministically: 2 back-to-back jogs supersede action 1
+        // synchronously into FIFO slot 1 (inflight=0, avoiding the mid-handoff conservative
+        // double-count window between `sup.tick()` and the async terminal capture drain), then
+        // stop + tick fills slot 2.
         sup.test_set_terminal_dispatch_paused(true);
-        for _ in 0..2 {
+        for k in 0..2u64 {
             let ack = rpc(&mut ws, gen, ep, "/api/v1/motion/jog", json!({
-                "target_positions": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "target_positions": [0.1 * (k + 1) as f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 "duration_secs": 2.0
             })).await;
             assert_eq!(ack["type"], "command_ack", "{ack}");
-            assert_eq!(rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await["type"], "command_ack");
-            sup.tick(0.02).await;
         }
+        assert_eq!(sup.test_pending_terminal_count(), 1);
+        assert_eq!(rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await["type"], "command_ack");
+        sup.tick(0.02).await;
+        wait_until(Duration::from_secs(2), || sup.test_pending_terminal_count() == 2).await;
         assert_eq!(sup.test_pending_terminal_count(), 2);
         let busy = rpc(&mut ws, gen, ep, armd::gripper_calib::CALIBRATE_PATH, json!({})).await;
         assert_eq!(
