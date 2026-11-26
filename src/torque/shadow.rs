@@ -4573,6 +4573,9 @@ mod tests {
         assert!(snap.ring.interval_unverifiable);
         assert_eq!(snap.ring.ring_dropped_records, 20);
         assert_eq!(snap.ring.first_unverifiable_seq, Some(SHADOW_RING_CAPACITY as u64 + 1));
+        // Flush the decoupled "armd-shadow-bb" writer thread before asserting on the sink.
+        hub.stop_and_flush_bounded(Duration::from_secs(2));
+        assert!(hub.snapshot().ring.blackbox_written >= 1);
         assert!(
             lines.lock().unwrap().iter().any(|l| l.contains("\"event\":\"overflow\"")),
             "expected overflow blackbox line: {:?}",
@@ -4617,12 +4620,15 @@ mod tests {
             snap.recent_divergences[0].category,
             DivergenceCategory::ExtraAction
         );
+        assert!(hub.overflow_atomics().blackbox_compact().is_some_and(|c| c.d == 1));
+        // Flush the decoupled "armd-shadow-bb" writer thread before asserting on the sink.
+        hub.stop_and_flush_bounded(Duration::from_secs(2));
+        assert!(hub.snapshot().ring.blackbox_written >= 1);
         assert!(lines
             .lock()
             .unwrap()
             .iter()
             .any(|l| l.contains("\"event\":\"divergence\"") && l.contains("extra_action")));
-        assert!(hub.overflow_atomics().blackbox_compact().is_some_and(|c| c.d == 1));
     }
 
     #[test]
