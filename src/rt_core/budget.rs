@@ -658,6 +658,7 @@ mod tests {
             last_synced_rx: Arc<AtomicU16>,
             last_synced_tx: Arc<AtomicU16>,
             last_poll_max_rx: Arc<AtomicU16>,
+            set_zero_calls: Arc<AtomicU16>,
             dof: usize,
         }
 
@@ -703,6 +704,63 @@ mod tests {
             fn tx_budget_max_frames(&self) -> Option<u16> {
                 Some(16)
             }
+            fn supports_nonblocking_commissioning(&self) -> bool {
+                true
+            }
+            fn supports_nonblocking_motor_zero(&self) -> bool {
+                true
+            }
+            fn commissioning_motor_id(&self, joint: usize) -> Option<u16> {
+                Some((joint + 1) as u16)
+            }
+            fn commissioning_drain_rx_step(
+                &mut self,
+                max_frames: u16,
+                _deadline: Instant,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                let used = max_frames.min(4);
+                self.rx_consumed.fetch_add(used, Ordering::SeqCst);
+                Ok((used, true))
+            }
+            fn commissioning_try_send_register_read(
+                &mut self,
+                _joint: usize,
+                _rid: u8,
+                _deadline: Instant,
+                _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+            ) -> crate::mit::CommissioningTxStatus {
+                self.tx_consumed.fetch_add(1, Ordering::SeqCst);
+                crate::mit::CommissioningTxStatus::Sent {
+                    tx_seq: 1,
+                    tx_started: Instant::now(),
+                    tx_offset_ns: None,
+                }
+            }
+            fn commissioning_try_send_set_zero(
+                &mut self,
+                _joint: usize,
+                _deadline: Instant,
+                _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+            ) -> crate::mit::CommissioningTxStatus {
+                self.set_zero_calls.fetch_add(1, Ordering::SeqCst);
+                self.tx_consumed.fetch_add(1, Ordering::SeqCst);
+                crate::mit::CommissioningTxStatus::Refused("stub set-zero")
+            }
+            fn commissioning_raw_feedback(
+                &self,
+                _joint: usize,
+            ) -> Option<crate::mit::CommissioningFeedback> {
+                let now = Instant::now();
+                Some(crate::mit::CommissioningFeedback {
+                    raw_position: 0.0,
+                    joint_position: 0.0,
+                    velocity: 0.0,
+                    motor_status: 0,
+                    rx_seq: 10,
+                    rx_at: now,
+                    queue_bound: Some(now),
+                })
+            }
         }
 
         let rx_consumed = Arc::new(AtomicU16::new(5));
@@ -710,6 +768,7 @@ mod tests {
         let last_synced_rx = Arc::new(AtomicU16::new(u16::MAX));
         let last_synced_tx = Arc::new(AtomicU16::new(u16::MAX));
         let last_poll_max_rx = Arc::new(AtomicU16::new(u16::MAX));
+        let set_zero_calls = Arc::new(AtomicU16::new(0));
         let cfg = ArmConfig::rebot_dm();
         let dof = cfg.dof;
         let drv = StubBudgetDriver {
@@ -718,6 +777,7 @@ mod tests {
             last_synced_rx: Arc::clone(&last_synced_rx),
             last_synced_tx: Arc::clone(&last_synced_tx),
             last_poll_max_rx: Arc::clone(&last_poll_max_rx),
+            set_zero_calls: Arc::clone(&set_zero_calls),
             dof,
         };
         let mut core = SupervisorInner::new(cfg).with_driver(Box::new(drv));
@@ -867,5 +927,165 @@ mod tests {
             (5, 5),
             "ledger must charge exact incremental TX (3 + 2 = 5), never 3 (uncharged) or 8 (cumulative)"
         );
+
+        // 4. Single-borrow commissioning budget enforcement:
+        //    (a) `ReadIdentity` draining RX inside its single driver borrow charges the exact RX
+        //        delta directly into `release_budget` (no post-op second lock window).
+        //    (b) `MotorZeroWriteVerify` obeys `tx_remaining == 0` inside the driver borrow and
+        //        must NEVER submit `commissioning_try_send_set_zero` when TX budget is exhausted.
+        let t2 = Instant::now();
+        let mut clock_t2 = || t2;
+        core.lease_enabled = false;
+        core.operator_auth_enforced = false;
+        core.set_active_lease_in_place(1, "c1", "test", 1, t2);
+        let auth_id = crate::mit::CommissioningAuthority {
+            conn_id: 1,
+            lease_holder: Some((crate::model::HolderLabel::new("c1"), 1)),
+            operator_grant: crate::auth::OperatorGrant::unenforced(),
+            expected_epoch: core.safety.epoch_id(),
+            expected_stop_gen: core.current_stop_gen(),
+            grant_id: None,
+            txn_id: 0,
+        };
+        let mut joints = [0usize; crate::rt_core::mailbox::MAX_DOF];
+        joints[0] = 0;
+        let req_id = crate::mit::CommissioningStartRequest {
+            kind: crate::mit::CommissioningOpKind::ReadIdentity,
+            joints,
+            joint_len: 1,
+            timeout_counts: 0,
+            references: [0.0; crate::rt_core::mailbox::MAX_DOF],
+            authority: auth_id,
+            txn_deadline: t2 + Duration::from_secs(5),
+            prior_disk_mutated: false,
+        };
+        let op_id = core.start_commissioning_rt(req_id, t2).expect("start ReadIdentity");
+        let mut ledger4 = ReleaseBudget::new(502, t2, t2 + Duration::from_millis(20), 10, 4);
+        ledger4.charge_rx(2, false);
+        ledger4.charge_tx(3); // 1 TX remaining, 8 RX remaining
+        last_synced_rx.store(u16::MAX, Ordering::SeqCst);
+        last_synced_tx.store(u16::MAX, Ordering::SeqCst);
+        let ctx4 = crate::rt_core::ops::CommitCtx {
+            arm: core.core.id(),
+            boot: crate::rt_core::broker::BootId::process(),
+            now: t2,
+            stop_generation: core.current_stop_gen(),
+        };
+        let _ = core.service_commissioning_step_with_budget(
+            &ctx4,
+            &mut ledger4,
+            t2 + Duration::from_millis(18),
+            2,
+            None,
+            true,
+            &mut clock_t2,
+        );
+        assert_eq!(
+            (
+                last_synced_rx.load(Ordering::SeqCst),
+                last_synced_tx.load(Ordering::SeqCst)
+            ),
+            (8, 1),
+            "single-borrow commissioning must tighten driver caps from live release_budget"
+        );
+        assert_eq!(
+            ledger4.tx_used(),
+            4,
+            "single-borrow commissioning must charge exact TX delta (3 + 1 = 4)"
+        );
+        // Step 2 (AwaitReply): drains RX inside the single driver borrow and charges exact RX delta.
+        let _ = core.service_commissioning_step_with_budget(
+            &ctx4,
+            &mut ledger4,
+            t2 + Duration::from_millis(18),
+            2,
+            None,
+            false,
+            &mut clock_t2,
+        );
+        assert!(
+            ledger4.rx_used() > 2,
+            "single-borrow commissioning must charge exact RX delta before releasing driver lock, got {}",
+            ledger4.rx_used()
+        );
+        let _ = core.cancel_commissioning_rt(op_id, "test");
+        assert!(core.clear_commissioning_rt(op_id, true, false));
+
+        // Now verify `MotorZeroWriteVerify` obeys `tx_remaining == 0` (0 set-zero TX).
+        use crate::rt_core::config_iface::{
+            CandidateId, ConfigAuthority, ConfigDomain, ConfigProposal, Reserved,
+        };
+        core.config.resting_pose = None;
+        let cal_rev = core.revision(ConfigDomain::Calibration);
+        let proposal = ConfigProposal {
+            domain: ConfigDomain::Calibration,
+            expected_revision: cal_rev,
+            candidate: CandidateId(1),
+            stamp: crate::rt_core::broker::Stamp {
+                arm: ctx4.arm,
+                boot: ctx4.boot,
+                request: crate::rt_core::broker::RequestId(1),
+                client: crate::rt_core::broker::ClientId(1),
+                client_seq: 1,
+                authority: crate::rt_core::broker::Authority {
+                    stop_generation: ctx4.stop_generation,
+                    epoch: core.safety.epoch_id(),
+                    lease_generation: 0,
+                    parent_generation: 0,
+                    config_revision: cal_rev,
+                },
+                deadline: t2 + Duration::from_secs(5),
+            },
+        };
+        let reservation = match core.reserve(&proposal, &ctx4) {
+            Reserved::Granted(r) => r,
+            other => panic!("expected Calibration reservation, got {other:?}"),
+        };
+        let grant_id = reservation.grant();
+        core.core
+            .config_mut()
+            .bind_commissioning_marker(grant_id)
+            .expect("bind marker");
+        core.calibration_txn_id = Some(77);
+        let auth_mz = crate::mit::CommissioningAuthority {
+            conn_id: 1,
+            lease_holder: Some((crate::model::HolderLabel::new("c1"), 1)),
+            operator_grant: crate::auth::OperatorGrant::unenforced(),
+            expected_epoch: core.safety.epoch_id(),
+            expected_stop_gen: core.current_stop_gen(),
+            grant_id: Some(grant_id),
+            txn_id: 77,
+        };
+        let req_mz = crate::mit::CommissioningStartRequest {
+            kind: crate::mit::CommissioningOpKind::MotorZeroWriteVerify,
+            joints,
+            joint_len: 1,
+            timeout_counts: 0,
+            references: [0.0; crate::rt_core::mailbox::MAX_DOF],
+            authority: auth_mz,
+            txn_deadline: t2 + Duration::from_secs(5),
+            prior_disk_mutated: false,
+        };
+        let _mz_id = core
+            .start_commissioning_rt(req_mz, t2)
+            .expect("start MotorZeroWriteVerify");
+        let mut ledger_zero_tx = ReleaseBudget::new(503, t2, t2 + Duration::from_millis(20), 10, 4);
+        ledger_zero_tx.charge_tx(4); // 0 TX remaining
+        set_zero_calls.store(0, Ordering::SeqCst);
+        let _ = core.service_commissioning_step_with_budget(
+            &ctx4,
+            &mut ledger_zero_tx,
+            t2 + Duration::from_millis(18),
+            2,
+            None,
+            true,
+            &mut clock_t2,
+        );
+        assert_eq!(
+            set_zero_calls.load(Ordering::SeqCst),
+            0,
+            "MotorZeroWriteVerify must not submit set-zero TX when release_budget has 0 TX remaining"
+        );
+        let _ = core.release(reservation);
     }
 }
