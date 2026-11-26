@@ -597,6 +597,18 @@ impl SupervisorInner {
         }
     }
 
+    fn zero_check_revoke_terminal(reason: &'static str) -> (&'static str, &'static str, &'static str) {
+        match reason {
+            "STOPPED" => ("cancelled", "STOPPED", "Motion stopped"),
+            "LEASE_LOST" => ("cancelled", "LEASE_LOST", "Control lease lost or released"),
+            "DISCONNECTED" => ("cancelled", "DISCONNECTED", "Client connection closed"),
+            "ESTOP_ACTIVE" => ("failed", "ESTOP_ACTIVE", "E-stop latched"),
+            "INTERNAL_FAULT" => ("failed", "INTERNAL_FAULT", "Internal fault latched"),
+            "OPERATOR_REQUIRED" => ("failed", "OPERATOR_REQUIRED", "Operator session expired or locked"),
+            other => ("cancelled", other, "Gripper zero check cancelled"),
+        }
+    }
+
     /// Immediate owner-side cleanup hook for Stop / E-stop / SAFE-HOLD / shutdown during the
     /// motion phase of `SessionKind::GripperZeroCheck`. If persistence handoff already started
     /// (`zero_check_persisting == Some(action_id)`), PR C owns settlement.
@@ -614,10 +626,12 @@ impl SupervisorInner {
         if self.zero_check_persisting == Some(action_id) {
             return;
         }
+        let (t_state, t_code, t_msg) = Self::zero_check_revoke_terminal(reason);
+        self.finish_zero_check_session_abort_rt(action_id, t_state, t_code, t_msg);
         self.teardown_gripper_zero_check_session_rt(
             action_id,
             Some(active.id),
-            false,
+            true,
             None,
             SessionTerminalReason::Revoked(reason),
             Instant::now(),
@@ -649,10 +663,12 @@ impl SupervisorInner {
         if self.zero_check_persisting == Some(action_id) {
             return;
         }
+        let (t_state, t_code, t_msg) = Self::zero_check_revoke_terminal(reason);
+        self.finish_zero_check_session_abort_rt(action_id, t_state, t_code, t_msg);
         self.teardown_gripper_zero_check_session_rt(
             action_id,
             Some(active.id),
-            false,
+            true,
             None,
             SessionTerminalReason::Revoked(reason),
             Instant::now(),

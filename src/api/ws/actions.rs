@@ -995,6 +995,21 @@ pub(super) async fn handle_executor_ws_action(
         } else {
             0
         };
+        struct StagedZeroCheckGuard {
+            handle: crate::rt_core::executor::RtExecutorHandle,
+            ctx_id: u64,
+        }
+        impl Drop for StagedZeroCheckGuard {
+            fn drop(&mut self) {
+                if self.ctx_id != 0 {
+                    self.handle.remove_zero_check_context(self.ctx_id);
+                }
+            }
+        }
+        let mut staged_guard = StagedZeroCheckGuard {
+            handle,
+            ctx_id: persist_ctx_id,
+        };
         let cur_epoch = recv_supervisor
             .hub()
             .latest()
@@ -1016,6 +1031,7 @@ pub(super) async fn handle_executor_ws_action(
         .await
         {
             Ok((started, ack_guard)) => {
+                staged_guard.ctx_id = 0;
                 let reply = off_lock_action_ack(recv_supervisor, &request_id_val, Some(started), cur_epoch);
                 return Some(ExecutorActionDispatch::Reply {
                     reply,
@@ -1024,6 +1040,7 @@ pub(super) async fn handle_executor_ws_action(
                 });
             }
             Err(error) => {
+                drop(staged_guard);
                 drop(gate);
                 let post_ep = recv_supervisor
                     .hub()
