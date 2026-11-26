@@ -9980,8 +9980,9 @@ fn control_thread_main_inner(
                     }
                     let post_exec_optional_cutoff = release_deadline
                         .checked_sub(
-                            crate::driver::OPTIONAL_WORK_RELEASE_MARGIN
-                                .min(Duration::from_nanos(release_period_ns / 3)),
+                            crate::driver::OPTIONAL_WORK_RELEASE_MARGIN.min(Duration::from_nanos(
+                                next_release_ns.saturating_sub(scheduled_ns).max(1) / 3,
+                            )),
                         )
                         .unwrap_or(release_start);
                     let post_cutoff = if is_urgent || engine.has_pending_urgent(&*core) {
