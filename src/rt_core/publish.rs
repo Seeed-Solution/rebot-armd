@@ -825,6 +825,8 @@ pub struct Snapshot {
     pub rt: RtSample,
     /// Off-RT policy diagnostic overlay revision reflected in `obs` (`0` before first update).
     pub policy_diag_seq: u64,
+    /// Off-RT action diagnostic stream sequence reflected in `obs` (`0` before first patch).
+    pub action_diag_seq: u64,
 }
 
 /// Off-RT policy diagnostic overlay update emitted by the executor policy runner (never touched
@@ -1119,6 +1121,7 @@ struct HubState {
     consumer: Consumer<Slot>,
     latest: Option<Arc<Snapshot>>,
     last_policy_diag_seq: u64,
+    last_action_diag_seq: u64,
 }
 
 /// Result of [`StateHub::try_latest`].
@@ -1169,6 +1172,16 @@ pub struct StateHub {
     /// Monotonic revision bumped on every accepted [`Self::update_policy_diag`] call.
     #[cfg(feature = "policy-runtime")]
     policy_diag_seq: AtomicU64,
+    /// Off-RT SPSC stream producer for grasp/macro [`ActionDiagPatch`] updates (never touched on
+    /// `armd-control`; never nested with `state` or `action_diag`).
+    action_diag_tx: Mutex<super::stream::StreamProducer<super::action_diag::ActionDiagPatch>>,
+    /// Single off-RT consumer and bounded diagnostic overlay table (`state -> action_diag`,
+    /// `terminal_capture.rx -> action_diag`, `maint_client -> action_diag`; leaf lock).
+    action_diag: Mutex<super::action_diag::ActionDiagStore>,
+    /// Monotonic revision bumped on every pushed [`ActionDiagPatch`].
+    action_diag_seq: AtomicU64,
+    /// Test hook: when true, pauses automatic consumer drain to exercise drop-newest overflow.
+    action_diag_consumer_paused: AtomicBool,
     /// Number of off-RT readers currently waiting to acquire `self.state` inside `latest()`.
     latest_waiters: AtomicUsize,
 }
@@ -1183,8 +1196,15 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         rt: RtSample::with_dof(dof),
     };
     let (producer, consumer) = triple_buffer(slot(), slot(), slot());
+    let (action_diag_tx, action_diag_store) =
+        super::action_diag::ActionDiagStore::new_channel(super::action_diag::ACTION_DIAG_STREAM_CAP);
     let hub = Arc::new(StateHub {
-        state: Mutex::new(HubState { consumer, latest: None, last_policy_diag_seq: 0 }),
+        state: Mutex::new(HubState {
+            consumer,
+            latest: None,
+            last_policy_diag_seq: 0,
+            last_action_diag_seq: 0,
+        }),
         published: AtomicU64::new(0),
         dispatcher: OnceLock::new(),
         closed: AtomicBool::new(false),
@@ -1203,6 +1223,10 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         policy_diag: Mutex::new(std::collections::VecDeque::with_capacity(POLICY_DIAG_CAPACITY)),
         #[cfg(feature = "policy-runtime")]
         policy_diag_seq: AtomicU64::new(0),
+        action_diag_tx: Mutex::new(action_diag_tx),
+        action_diag: Mutex::new(action_diag_store),
+        action_diag_seq: AtomicU64::new(0),
+        action_diag_consumer_paused: AtomicBool::new(false),
         latest_waiters: AtomicUsize::new(0),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
@@ -1249,7 +1273,9 @@ impl StateHub {
         // `middle` for the RT producer.
         let has_fresh = st.consumer.has_fresh();
         let diag_seq = self.policy_diag_seq();
-        let diag_changed = diag_seq != st.last_policy_diag_seq;
+        let action_diag_seq = self.action_diag_seq();
+        let diag_changed =
+            diag_seq != st.last_policy_diag_seq || action_diag_seq != st.last_action_diag_seq;
         let mut refreshed = false;
         if has_fresh {
             if st.consumer.front().obs.is_none() {
@@ -1276,13 +1302,16 @@ impl StateHub {
                 let mut obs = obs.clone();
                 self.attach_action_measurement(&mut obs);
                 self.attach_policy_diag(&mut obs);
+                self.attach_action_diag(&mut obs);
                 st.last_policy_diag_seq = diag_seq;
+                st.last_action_diag_seq = action_diag_seq;
                 let snap = Snapshot {
                     meta,
                     obs,
                     owner: slot.owner,
                     rt: slot.rt.clone(),
                     policy_diag_seq: diag_seq,
+                    action_diag_seq,
                 };
                 st.latest = Some(Arc::new(snap));
             }
@@ -1316,6 +1345,234 @@ impl StateHub {
         {
             0
         }
+    }
+
+    /// Monotonic sequence of off-RT action diagnostic stream patches (`0` before first patch).
+    pub fn action_diag_seq(&self) -> u64 {
+        self.action_diag_seq.load(Ordering::Acquire)
+    }
+
+    /// Pushes one [`ActionDiagPatch`](super::action_diag::ActionDiagPatch) onto the bounded
+    /// `rt_core::stream` SPSC channel (off-RT only; never called on `armd-control`).
+    ///
+    /// If the ring is full and the consumer is not paused, drains the single off-RT consumer
+    /// outside the producer lock and retries once so production grasp diagnostics remain lossless
+    /// while paused-consumer overflow tests observe real `StreamPushError::Full` + loss counters.
+    pub fn push_action_diag(
+        &self,
+        patch: super::action_diag::ActionDiagPatch,
+    ) -> Result<u64, super::stream::StreamPushError> {
+        if patch.action_id == 0 {
+            return Ok(0);
+        }
+        let first = {
+            let mut tx = self
+                .action_diag_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tx.try_push(patch)
+        };
+        let res = match first {
+            Ok(seq) => Ok(seq),
+            Err(super::stream::StreamPushError::Full)
+                if !self.action_diag_consumer_paused.load(Ordering::Acquire) =>
+            {
+                self.drain_action_diag();
+                let mut tx = self
+                    .action_diag_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                tx.try_push(patch)
+            }
+            Err(e) => Err(e),
+        };
+        if res.is_ok() {
+            self.action_diag_seq.fetch_add(1, Ordering::Release);
+            self.wake();
+        }
+        res
+    }
+
+    /// Interns a lossless string for `action_id` (inline when `<= 48` bytes, else off-RT side slot).
+    pub fn intern_action_diag_str(
+        &self,
+        action_id: u64,
+        s: &str,
+    ) -> super::action_diag::DiagStr {
+        if let Some(inline) = super::action_diag::ShortLabel::<48>::try_new(s) {
+            return super::action_diag::DiagStr::Inline(inline);
+        }
+        self.action_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .intern_str(action_id, s)
+    }
+
+    /// Emits an atomic estimate list replacement batch (`height_estimates`, `yaw_estimates`, or
+    /// `width_estimates`) over the `rt_core::stream` channel.
+    pub fn push_action_estimates(
+        &self,
+        action_id: u64,
+        list: super::action_diag::EstimateListKind,
+        entries: &[crate::motion::EstimateEntry],
+    ) {
+        if action_id == 0 {
+            return;
+        }
+        let (batch_gen, prepared) = {
+            let mut store = self.action_diag.lock().unwrap_or_else(|e| e.into_inner());
+            let batch_gen = store.next_batch_gen();
+            let mut items = Vec::with_capacity(entries.len());
+            for e in entries {
+                let reason = e.reason.as_deref().map(|r| store.intern_str(action_id, r));
+                items.push((
+                    super::action_diag::ShortLabel::<32>::new_truncated(&e.source),
+                    e.value,
+                    e.used,
+                    e.record_only,
+                    reason,
+                ));
+            }
+            (batch_gen, items)
+        };
+        if prepared.is_empty() {
+            let _ = self.push_action_diag(super::action_diag::ActionDiagPatch {
+                action_id,
+                kind: super::action_diag::ActionDiagKind::EstimateBatchEmpty { list, batch_gen },
+            });
+            return;
+        }
+        let total_len = prepared.len().min(u8::MAX as usize) as u8;
+        for (idx, (source, value, used, record_only, reason)) in
+            prepared.into_iter().take(usize::from(total_len)).enumerate()
+        {
+            let _ = self.push_action_diag(super::action_diag::ActionDiagPatch {
+                action_id,
+                kind: super::action_diag::ActionDiagKind::EstimateBatchItem {
+                    list,
+                    batch_gen,
+                    index: idx as u8,
+                    total_len,
+                    source,
+                    value,
+                    used,
+                    record_only,
+                    reason,
+                },
+            });
+        }
+    }
+
+    /// Emits a lossless `backlash::Outcome` approach patch for `action_id`.
+    pub fn push_action_approach(&self, action_id: u64, outcome: &crate::backlash::Outcome) {
+        let Some(ref ap) = outcome.approach else {
+            return;
+        };
+        let kind = if ap == "same_side" {
+            super::action_diag::ApproachKind::SameSide
+        } else {
+            super::action_diag::ApproachKind::Direct
+        };
+        let (reason, flipped_blob) = {
+            let mut store = self.action_diag.lock().unwrap_or_else(|e| e.into_inner());
+            let reason = outcome
+                .reason
+                .as_deref()
+                .map(|r| store.intern_str(action_id, r));
+            let flipped_blob = outcome
+                .flipped
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(|v| store.intern_flipped_joints(action_id, v.clone()));
+            (reason, flipped_blob)
+        };
+        let mut signs = [0i8; 6];
+        let mut signs_len = 0u8;
+        if let Some(ref s) = outcome.signs {
+            let n = s.len().min(signs.len());
+            signs[..n].copy_from_slice(&s[..n]);
+            signs_len = n as u8;
+        }
+        let _ = self.push_action_diag(super::action_diag::ActionDiagPatch {
+            action_id,
+            kind: super::action_diag::ActionDiagKind::Approach {
+                kind,
+                reason,
+                signs,
+                signs_len,
+                flipped_blob,
+            },
+        });
+    }
+
+    /// Emits a lossless `WorkspaceViolationDetail` patch for `action_id`.
+    pub fn push_action_workspace_violation(
+        &self,
+        action_id: u64,
+        detail: crate::kinematics::WorkspaceViolationDetail,
+    ) {
+        if action_id == 0 {
+            return;
+        }
+        let blob = self
+            .action_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .intern_workspace_violation(action_id, detail);
+        let _ = self.push_action_diag(super::action_diag::ActionDiagPatch {
+            action_id,
+            kind: super::action_diag::ActionDiagKind::WorkspaceViolation { blob },
+        });
+    }
+
+    /// Drains pending `ActionDiagPatch` records from the SPSC stream into the off-RT store.
+    pub fn drain_action_diag(&self) -> usize {
+        if self.action_diag_consumer_paused.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.action_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+    }
+
+    /// Applies accumulated (and seals terminal) action diagnostics onto `obs.action` and
+    /// `obs.previous_action` (leaf lock; never calls back into `state` or `terminal_capture`).
+    pub fn attach_action_diag(&self, obs: &mut ArmObservation) {
+        if self.action_diag_consumer_paused.load(Ordering::Acquire) {
+            return;
+        }
+        self.action_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_to_observation(obs);
+    }
+
+    /// Single terminal freeze cutoff: drains pending patches, seals `action.id`, and overlays the
+    /// frozen diagnostics onto a committed terminal `ActionStatus`.
+    pub fn seal_and_attach_action_diag_to_action(&self, action: &mut crate::motion::ActionStatus) {
+        if self.action_diag_consumer_paused.load(Ordering::Acquire) {
+            return;
+        }
+        self.action_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_to_action(action, true);
+    }
+
+    /// Returns lock-free [`StreamStats`](super::stream::StreamStats) for the action diagnostics stream.
+    pub fn action_diag_stats(&self) -> super::stream::StreamStats {
+        self.action_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
+    }
+
+    /// Test helper: pause/unpause the action diagnostic stream consumer to test drop-newest overflow.
+    #[doc(hidden)]
+    pub fn set_action_diag_consumer_paused_for_tests(&self, paused: bool) {
+        self.action_diag_consumer_paused
+            .store(paused, Ordering::Release);
     }
 
     /// Binds the RT pre-publication policy diagnostic seal watermark (`AtomicU64`).

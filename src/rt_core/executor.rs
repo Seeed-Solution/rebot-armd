@@ -982,6 +982,7 @@ impl MaintClientInner {
                     }
                     MaintenanceResult::Observation(mut obs) => {
                         self.hub.attach_policy_diag(&mut obs);
+                        self.hub.attach_action_diag(&mut obs);
                         Ok(MaintenanceResult::Observation(obs))
                     }
                     other => Ok(other),

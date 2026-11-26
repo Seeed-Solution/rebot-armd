@@ -1254,6 +1254,7 @@ impl TerminalCaptureChannel {
             let mut action = resolve_full_action(&rec, live_slots, latest_obs, self)
                 .unwrap_or_else(|| rec.build_action_status());
             hub.attach_action_measurement_to_action(&mut action);
+            hub.seal_and_attach_action_diag_to_action(&mut action);
 
             let needs_captured_obs = rec.publish_seq.is_none()
                 || (latest_obs.is_none() && hub.published_seq() == 0)

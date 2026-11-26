@@ -4586,6 +4586,7 @@ impl SupervisorInner {
             owner,
             rt,
             policy_diag_seq: 0,
+            action_diag_seq: 0,
         }
     }
 
@@ -15659,6 +15660,7 @@ impl ArmSupervisor {
                     if let Some(h) = self.executor_handle() {
                         if let Ok(mut obs) = h.observation_async().await {
                             self.hub.attach_action_measurement(&mut obs);
+                            self.hub.attach_action_diag(&mut obs);
                             return obs;
                         }
                     }
@@ -15675,6 +15677,7 @@ impl ArmSupervisor {
                 if let Some(h) = self.executor_handle() {
                     if let Ok(mut obs) = h.observation_async().await {
                         self.hub.attach_action_measurement(&mut obs);
+                        self.hub.attach_action_diag(&mut obs);
                         return obs;
                     }
                 }
@@ -19252,6 +19255,7 @@ fn dispatch_loop(
     }
     let mut last = 0u64;
     let mut last_diag = 0u64;
+    let mut last_action_diag = 0u64;
     let mut latest_snap: Option<Arc<crate::rt_core::publish::Snapshot>> = None;
     let mut pending_telemetry: Option<ArmObservation> = None;
     while !hub.is_closed() {
@@ -19264,20 +19268,23 @@ fn dispatch_loop(
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
                 last_diag = last_diag.max(s.policy_diag_seq);
+                last_action_diag = last_action_diag.max(s.action_diag_seq);
                 pending_telemetry = Some(s.obs.clone());
                 latest_snap = Some(s);
             }
-        } else if hub.policy_diag_seq() != last_diag {
+        } else if hub.policy_diag_seq() != last_diag || hub.action_diag_seq() != last_action_diag {
             if let Some(s) = hub.latest() {
                 if s.meta.seq > last {
                     last = s.meta.seq;
                     last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
-                } else if s.policy_diag_seq > last_diag {
-                    last_diag = s.policy_diag_seq;
-                    // Diagnostic-only overlay update (Shadow steps / timing stats): forward
-                    // telemetry without re-enqueuing action terminals.
+                } else if s.policy_diag_seq > last_diag || s.action_diag_seq > last_action_diag {
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
+                    // Diagnostic-only overlay update (Shadow steps / timing stats / grasp diag
+                    // stream patch): forward telemetry without re-enqueuing action terminals.
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
                 }
@@ -19300,6 +19307,7 @@ fn dispatch_loop(
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
                 last_diag = last_diag.max(s.policy_diag_seq);
+                last_action_diag = last_action_diag.max(s.action_diag_seq);
                 pending_telemetry = Some(s.obs.clone());
                 latest_snap = Some(s);
                 let _ = terminal_capture.drain_into(
@@ -19333,6 +19341,7 @@ fn dispatch_loop(
                 if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                     last = s.meta.seq;
                     last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
                     pending_telemetry = Some(s.obs.clone());
                     latest_snap = Some(s);
                     let _ = terminal_capture.drain_into(
