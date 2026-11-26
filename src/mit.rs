@@ -3500,16 +3500,21 @@ impl crate::supervisor::SupervisorInner {
             .checked_sub(publish_margin)
             .unwrap_or(owner_now);
         let mut now_mut = || owner_now_fn();
-        let rx_cap = release_budget.rx_remaining().min(16);
-        let tx_cap = u16::from(COMM_MAX_TX_PER_RELEASE)
-            .min(release_budget.tx_remaining())
-            .min(u16::from(u8::MAX)) as u8;
         let before = self.sync_driver_budget_before(release_budget);
+        let (rx_cap, tx_cap, probe_cap) = if before.is_some() {
+            let rx = release_budget.rx_remaining().min(16);
+            let tx = u16::from(COMM_MAX_TX_PER_RELEASE)
+                .min(release_budget.tx_remaining())
+                .min(u16::from(u8::MAX)) as u8;
+            (rx, tx, None)
+        } else {
+            (0, 0, Some(0))
+        };
         let progress = self.service_commissioning_step_with_cutoff_and_rx(
             ctx,
             owner_cutoff,
             tx_cap,
-            None,
+            probe_cap,
             rx_cap,
             true,
             &mut now_mut,
@@ -3518,9 +3523,57 @@ impl crate::supervisor::SupervisorInner {
             release_budget,
             before,
             0,
-            rx_cap == 0,
+            release_budget.rx_remaining() == 0,
             u16::from(progress.reg_tx_attempted.saturating_add(progress.probe_tx_attempted)),
         );
+    }
+
+    /// Advances the single preallocated commissioning state machine by one bounded non-blocking
+    /// step while drawing from and charging a shared per-release [`crate::rt_core::budget::ReleaseBudget`].
+    ///
+    /// Used by legacy post-tick and inline commissioning so every guard step shares the exact
+    /// same RX/TX ledger as the control tick. When the driver pre-snapshot cannot be taken under
+    /// contention, runs under the most conservative cap `(rx = 0, tx = 0, probe = 0)` and does
+    /// not post-charge cumulative driver counters.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn service_commissioning_step_with_budget(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        release_budget: &mut crate::rt_core::budget::ReleaseBudget,
+        owner_cutoff: std::time::Instant,
+        max_tx: u8,
+        probe_tx_cap: Option<u8>,
+        is_new_release: bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
+    ) -> CommissioningStepProgress {
+        let before = self.sync_driver_budget_before(release_budget);
+        let (rx_cap, eff_max_tx, eff_probe_tx) = if before.is_some() {
+            let rx = release_budget.rx_remaining().min(16);
+            let tx_rem = release_budget.tx_remaining();
+            let reg_tx = u16::from(max_tx).min(tx_rem).min(u16::from(u8::MAX)) as u8;
+            let probe_tx = probe_tx_cap.map(|p| u16::from(p).min(tx_rem).min(u16::from(u8::MAX)) as u8);
+            (rx, reg_tx, probe_tx)
+        } else {
+            (0, 0, Some(0))
+        };
+        let eff_cutoff = owner_cutoff.min(release_budget.deadline());
+        let progress = self.service_commissioning_step_with_cutoff_and_rx(
+            ctx,
+            eff_cutoff,
+            eff_max_tx,
+            eff_probe_tx,
+            rx_cap,
+            is_new_release,
+            owner_now_fn,
+        );
+        self.charge_driver_budget_after(
+            release_budget,
+            before,
+            0,
+            release_budget.rx_remaining() == 0,
+            u16::from(progress.reg_tx_attempted.saturating_add(progress.probe_tx_attempted)),
+        );
+        progress
     }
 
     /// Advances the single preallocated commissioning state machine by one bounded non-blocking

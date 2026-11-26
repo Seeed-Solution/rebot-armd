@@ -2017,7 +2017,10 @@ impl CoreOps for SupervisorInner {
                     let _ = d.try_with_mut(|drv| drv.begin_wake_tx_pass());
                 }
                 let before = self.sync_driver_budget_before(budget);
-                let sb = budget.poll_service_budget(now);
+                let mut sb = budget.poll_service_budget(now);
+                if before.is_none() {
+                    sb.max_rx_frames = 0;
+                }
                 let mut poll = self.poll_transition_wake_with_clock(&sb, now_fn);
                 self.charge_driver_budget_after(
                     budget,

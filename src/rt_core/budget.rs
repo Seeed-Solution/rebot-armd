@@ -640,4 +640,191 @@ mod tests {
         assert_eq!(root.rx_used(), 5);
         assert_eq!(root.tx_used(), 5);
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn legacy_sync_driver_budget_before_under_contention_no_double_charge_and_shared_comm_ledger() {
+        use std::sync::{
+            atomic::{AtomicU16, Ordering},
+            Arc,
+        };
+        use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, JointTarget};
+        use crate::model::{ArmConfig, JointState};
+        use crate::supervisor::SupervisorInner;
+
+        struct StubBudgetDriver {
+            rx_consumed: Arc<AtomicU16>,
+            tx_consumed: Arc<AtomicU16>,
+            last_synced_rx: Arc<AtomicU16>,
+            last_synced_tx: Arc<AtomicU16>,
+            last_poll_max_rx: Arc<AtomicU16>,
+            dof: usize,
+        }
+
+        impl ArmDriver for StubBudgetDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities::default()
+            }
+            fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> {
+                Ok(())
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                self.rx_consumed.fetch_add(3, Ordering::SeqCst);
+                self.tx_consumed.fetch_add(2, Ordering::SeqCst);
+                Ok(vec![JointState::default(); self.dof])
+            }
+            fn read_joint_states_budgeted(
+                &mut self,
+                out: &mut Vec<JointState>,
+                _deadline: Instant,
+                max_rx_frames: u16,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                self.last_poll_max_rx.store(max_rx_frames, Ordering::SeqCst);
+                out.clear();
+                out.resize(self.dof, JointState::default());
+                let used = max_rx_frames.min(2);
+                self.rx_consumed.fetch_add(used, Ordering::SeqCst);
+                Ok((used, max_rx_frames == 0))
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                Ok(())
+            }
+            fn sync_release_budget_limits(&mut self, rx_rem: u16, tx_rem: u16) {
+                self.last_synced_rx.store(rx_rem, Ordering::SeqCst);
+                self.last_synced_tx.store(tx_rem, Ordering::SeqCst);
+            }
+            fn release_budget_consumed(&self) -> (u16, u16) {
+                (
+                    self.rx_consumed.load(Ordering::SeqCst),
+                    self.tx_consumed.load(Ordering::SeqCst),
+                )
+            }
+            fn tx_budget_max_frames(&self) -> Option<u16> {
+                Some(16)
+            }
+        }
+
+        let rx_consumed = Arc::new(AtomicU16::new(5));
+        let tx_consumed = Arc::new(AtomicU16::new(3));
+        let last_synced_rx = Arc::new(AtomicU16::new(u16::MAX));
+        let last_synced_tx = Arc::new(AtomicU16::new(u16::MAX));
+        let last_poll_max_rx = Arc::new(AtomicU16::new(u16::MAX));
+        let cfg = ArmConfig::rebot_dm();
+        let dof = cfg.dof;
+        let drv = StubBudgetDriver {
+            rx_consumed: Arc::clone(&rx_consumed),
+            tx_consumed: Arc::clone(&tx_consumed),
+            last_synced_rx: Arc::clone(&last_synced_rx),
+            last_synced_tx: Arc::clone(&last_synced_tx),
+            last_poll_max_rx: Arc::clone(&last_poll_max_rx),
+            dof,
+        };
+        let mut core = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+
+        // 1. Contended `sync_driver_budget_before` MUST return `None` (never `(0, 0)`), and
+        //    `charge_driver_budget_after(..., None, ...)` MUST NOT post-charge cumulative driver
+        //    counters once contention clears.
+        let t0 = Instant::now();
+        let mut ledger = ReleaseBudget::new(500, t0, t0 + Duration::from_millis(20), 16, 16);
+        ledger.charge_rx(5, false);
+        ledger.charge_tx(3);
+
+        let before_contended = core.with_contended_driver_for_test(|c| {
+            let b = c.sync_driver_budget_before(&ledger);
+            // Also verify `poll_hardware_with_budget_and_clock` under contention does not double-charge.
+            let mut now_fn = || t0;
+            let _ = c.poll_hardware_with_budget_and_clock(&mut ledger, &mut now_fn);
+            b
+        });
+        assert_eq!(
+            before_contended, None,
+            "contended sync_driver_budget_before must return None, not (0, 0)"
+        );
+        // Now lock is uncontended again: calling `charge_driver_budget_after` with `None` must NOT
+        // read cumulative `(5, 3)` from the driver and double-charge into `ledger`.
+        core.charge_driver_budget_after(&mut ledger, before_contended, 0, false, 0);
+        assert_eq!(
+            (ledger.rx_used(), ledger.tx_used()),
+            (5, 3),
+            "failed pre-snapshot must not double-charge cumulative driver usage"
+        );
+
+        // Uncontended snapshot returns `Some((5, 3))` and charges only the incremental delta.
+        let before_ok = core.sync_driver_budget_before(&ledger);
+        assert_eq!(before_ok, Some((5, 3)));
+        assert_eq!(last_synced_rx.load(Ordering::SeqCst), 11);
+        assert_eq!(last_synced_tx.load(Ordering::SeqCst), 13);
+        rx_consumed.fetch_add(2, Ordering::SeqCst);
+        tx_consumed.fetch_add(1, Ordering::SeqCst);
+        core.charge_driver_budget_after(&mut ledger, before_ok, 0, false, 0);
+        assert_eq!((ledger.rx_used(), ledger.tx_used()), (7, 4));
+
+        // 2. Legacy tick saves its `ReleaseBudget` (`last_legacy_release_budget`) reflecting the
+        //    tick's RX/TX usage so post-tick commissioning draws from the exact same ledger.
+        core.pending_rx_poll.active = false;
+        rx_consumed.store(0, Ordering::SeqCst);
+        tx_consumed.store(0, Ordering::SeqCst);
+        core.defer_legacy_commissioning = true;
+        let t1 = Instant::now();
+        let mut clock_now = || t1;
+        let _ = core.tick_control_legacy_with_clock(0.02, &mut clock_now);
+        let mut post_ledger = core
+            .last_legacy_release_budget
+            .take()
+            .expect("legacy tick must populate last_legacy_release_budget for post-tick commissioning");
+        assert_eq!(
+            post_ledger.rx_used(),
+            3,
+            "shared legacy ledger must carry forward tick RX consumption"
+        );
+        assert_eq!(
+            post_ledger.tx_used(),
+            2,
+            "shared legacy ledger must carry forward tick TX consumption"
+        );
+        // Feeding that same ledger into `service_commissioning_step_with_budget` synchronizes the
+        // remaining tick budget (not a fresh `RX_FRAME_BUDGET`) to the driver, and under
+        // contention does not double-charge cumulative usage.
+        let ctx = crate::rt_core::ops::CommitCtx {
+            arm: core.core.id(),
+            boot: crate::rt_core::broker::BootId::process(),
+            now: t1,
+            stop_generation: core.current_stop_gen(),
+        };
+        let _ = core.service_commissioning_step_with_budget(
+            &ctx,
+            &mut post_ledger,
+            t1 + Duration::from_millis(18),
+            1,
+            Some(1),
+            true,
+            &mut clock_now,
+        );
+        assert_eq!(
+            last_synced_rx.load(Ordering::SeqCst),
+            RX_FRAME_BUDGET - 3,
+            "legacy post-tick commissioning must tighten driver RX from the tick's shared ledger"
+        );
+        assert_eq!(
+            last_synced_tx.load(Ordering::SeqCst),
+            16 - 2,
+            "legacy post-tick commissioning must tighten driver TX from the tick's shared ledger"
+        );
+        core.with_contended_driver_for_test(|c| {
+            let _ = c.service_commissioning_step_with_budget(
+                &ctx,
+                &mut post_ledger,
+                t1 + Duration::from_millis(18),
+                1,
+                Some(1),
+                false,
+                &mut clock_now,
+            );
+        });
+        assert_eq!(
+            (post_ledger.rx_used(), post_ledger.tx_used()),
+            (3, 2),
+            "contended post-tick commissioning must not double-charge cumulative usage"
+        );
+    }
 }

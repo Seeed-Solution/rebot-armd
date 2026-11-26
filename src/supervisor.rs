@@ -1258,6 +1258,10 @@ pub struct SupervisorInner {
     /// output and the J7 tick epilogue never emit duplicate frames after ModeSwitch finishes).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) mode_switch_ran_release_seq: u64,
+    /// Shared per-release resource ledger captured at the end of the legacy control tick so
+    /// post-tick commissioning draws from the exact same `ReleaseBudget` as RX/transitions/output.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) last_legacy_release_budget: Option<crate::rt_core::budget::ReleaseBudget>,
     /// Owner-recorded proof of applied general stops: incremented only on the owner thread inside
     /// [`Self::authorized_stop`] after motion is halted (never by a policy-only STOP and never by
     /// the request side), so a stop-generation race cannot fabricate stop proof.
@@ -2685,6 +2689,8 @@ impl SupervisorInner {
             mode_switch: ModeSwitchRunner::new(),
             #[cfg(not(target_arch = "wasm32"))]
             mode_switch_ran_release_seq: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_legacy_release_budget: None,
             applied_general_stop_seq: 0,
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
@@ -8937,13 +8943,18 @@ impl SupervisorInner {
 
     /// Snapshots the driver's current `(rx_frames, tx_attempts)` consumed in this control release
     /// and monotonically tightens the driver's remaining RX/TX caps from `budget`.
+    ///
+    /// Returns `Some((0, 0))` when no driver is attached, `Some(before)` when the snapshot and
+    /// cap tightening succeeded, and `None` if the driver lock was contended/unavailable (callers
+    /// must then run under the most conservative cap and `charge_driver_budget_after` must not
+    /// post-charge cumulative driver counters).
     #[inline]
     pub(crate) fn sync_driver_budget_before(
         &mut self,
         budget: &crate::rt_core::budget::ReleaseBudget,
-    ) -> (u16, u16) {
+    ) -> Option<(u16, u16)> {
         let Some(d) = self.driver.as_mut() else {
-            return (0, 0);
+            return Some((0, 0));
         };
         let rx_rem = budget.rx_remaining();
         let tx_rem = budget.tx_remaining();
@@ -8952,26 +8963,37 @@ impl SupervisorInner {
             drv.sync_release_budget_limits(rx_rem, tx_rem);
             before
         };
-        d.try_with_mut(apply).unwrap_or((0, 0))
+        d.try_with_mut(apply).ok()
     }
 
     /// Charges the driver's newly consumed `(rx_frames, tx_attempts)` since `before` into `budget`.
+    ///
+    /// When `before` is `None` (pre-snapshot failed under contention), cumulative driver counters
+    /// are NEVER read or charged so earlier-in-release usage cannot be double-charged; only the
+    /// explicit incremental `(reported_rx, rx_exhausted)` and `reported_tx` from this step apply.
     #[inline]
     pub(crate) fn charge_driver_budget_after(
         &self,
         budget: &mut crate::rt_core::budget::ReleaseBudget,
-        before: (u16, u16),
+        before: Option<(u16, u16)>,
         reported_rx: u16,
         rx_exhausted: bool,
         reported_tx: u16,
     ) {
-        let after = self
-            .driver
-            .as_ref()
-            .and_then(|d| d.try_with_ref_recover(|drv| drv.release_budget_consumed()))
-            .unwrap_or(before);
-        let rx_delta = after.0.saturating_sub(before.0).max(reported_rx);
-        let tx_delta = after.1.saturating_sub(before.1).max(reported_tx);
+        let (rx_delta, tx_delta) = match before {
+            Some(before) => {
+                let after = self
+                    .driver
+                    .as_ref()
+                    .and_then(|d| d.try_with_ref_recover(|drv| drv.release_budget_consumed()))
+                    .unwrap_or(before);
+                (
+                    after.0.saturating_sub(before.0).max(reported_rx),
+                    after.1.saturating_sub(before.1).max(reported_tx),
+                )
+            }
+            None => (reported_rx, reported_tx),
+        };
         if rx_delta > 0 || rx_exhausted {
             budget.charge_rx(rx_delta, rx_exhausted);
         }
@@ -9072,7 +9094,10 @@ impl SupervisorInner {
             // staging an expired driver deadline, and still read RX feedback so `bus_feedback_fresh`
             // remains accurate.
             let before_rx = self.sync_driver_budget_before(budget);
-            let sb = make_sb(budget, step_now);
+            let mut sb = make_sb(budget, step_now);
+            if before_rx.is_none() {
+                sb.max_rx_frames = 0;
+            }
             let mut rx = self.poll_hardware_rx_with_clock(Some(&sb), None, None, now_fn);
             rx.budget_exhausted = true;
             self.charge_driver_budget_after(budget, before_rx, rx.rx_frames, true, 0);
@@ -9081,7 +9106,7 @@ impl SupervisorInner {
             self.pending_rx_poll = rx;
             (rx_frames, true)
         } else {
-            let sb_t = make_sb(budget, step_now);
+            let mut sb_t = make_sb(budget, step_now);
             let rx_zero_before_t = sb_t.max_rx_frames == 0;
             if rx_zero_before_t {
                 budget.mark_rx_exhausted();
@@ -9097,6 +9122,9 @@ impl SupervisorInner {
                 // but MUST still run TX-capable transition work (inline watchdog holds and
                 // protective disable retries).
                 let before_t = self.sync_driver_budget_before(budget);
+                if before_t.is_none() {
+                    sb_t.max_rx_frames = 0;
+                }
                 let trans = self.service_torque_transition_with_clock(&sb_t, now_fn);
                 let t_rx = if let Some(tp) = trans {
                     if tp.broker_owned {
@@ -9123,7 +9151,10 @@ impl SupervisorInner {
                 }
             };
             let before_rx = self.sync_driver_budget_before(budget);
-            let sb_rx = make_sb(budget, now_fn());
+            let mut sb_rx = make_sb(budget, now_fn());
+            if before_rx.is_none() {
+                sb_rx.max_rx_frames = 0;
+            }
             // `sb_rx.max_rx_frames` already reflects `budget.rx_remaining()` after Phase 2a,
             // so pass `(0, exhausted)` to avoid double-subtracting transition RX frames.
             let rx_marker = transition_rx.map(|(_, ex)| (0u16, ex));
@@ -9992,12 +10023,16 @@ impl SupervisorInner {
             } else if self.has_non_broker_torque_transition() {
                 let now = legacy_step_start.unwrap_or_else(&mut *now_fn);
                 let deadline = legacy_rx_deadline.unwrap_or_else(|| now + LEGACY_TORQUE_STEP_BUDGET);
+                let before_t = self.sync_driver_budget_before(&leg_budget);
                 let budget = crate::rt_core::ops::ServiceBudget {
                     now,
                     deadline: deadline.min(leg_budget.deadline()),
-                    max_rx_frames: leg_budget.rx_remaining(),
+                    max_rx_frames: if before_t.is_some() {
+                        leg_budget.rx_remaining()
+                    } else {
+                        0
+                    },
                 };
-                let before_t = self.sync_driver_budget_before(&leg_budget);
                 let trans = self.service_torque_transition_with_clock(&budget, now_fn);
                 let transition_rx = trans.and_then(|tp| tp.rx);
                 if let Some((tf, tex)) = transition_rx {
@@ -10011,7 +10046,11 @@ impl SupervisorInner {
                     let rem_budget = crate::rt_core::ops::ServiceBudget {
                         now: after,
                         deadline: deadline.min(leg_budget.deadline()),
-                        max_rx_frames: leg_budget.rx_remaining(),
+                        max_rx_frames: if before_rx.is_some() {
+                            leg_budget.rx_remaining()
+                        } else {
+                            0
+                        },
                     };
                     let rx_marker = transition_rx.map(|(_, ex)| (0u16, ex));
                     let mut r = self.poll_hardware_rx_with_clock(
@@ -10025,13 +10064,23 @@ impl SupervisorInner {
                     r
                 } else {
                     let before_rx = self.sync_driver_budget_before(&leg_budget);
-                    let r = self.poll_hardware_rx_with_clock(None, None, None, now_fn);
+                    let r = if before_rx.is_some() {
+                        self.poll_hardware_rx_with_clock(None, None, None, now_fn)
+                    } else {
+                        let conservative = leg_budget.service_budget(now_fn(), Duration::ZERO, 0);
+                        self.poll_hardware_rx_with_clock(Some(&conservative), None, None, now_fn)
+                    };
                     self.charge_driver_budget_after(&mut leg_budget, before_rx, r.rx_frames, r.budget_exhausted, 0);
                     r
                 }
             } else {
                 let before_rx = self.sync_driver_budget_before(&leg_budget);
-                let r = self.poll_hardware_rx_with_clock(None, None, None, now_fn);
+                let r = if before_rx.is_some() {
+                    self.poll_hardware_rx_with_clock(None, None, None, now_fn)
+                } else {
+                    let conservative = leg_budget.service_budget(now_fn(), Duration::ZERO, 0);
+                    self.poll_hardware_rx_with_clock(Some(&conservative), None, None, now_fn)
+                };
                 self.charge_driver_budget_after(&mut leg_budget, before_rx, r.rx_frames, r.budget_exhausted, 0);
                 r
             };
@@ -10068,6 +10117,12 @@ impl SupervisorInner {
                 self.service_mode_switch_release_with_clock(&ms_ctx, ms_rd, now_fn);
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let legacy_output_before = if let Some(ref leg_budget) = legacy_ledger {
+            self.sync_driver_budget_before(leg_budget)
+        } else {
+            None
+        };
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
         let driver_enable_confirmed_ok = rx.driver_enable_confirmed_ok;
@@ -12692,6 +12747,11 @@ impl SupervisorInner {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref mut leg_budget) = legacy_ledger {
+            self.charge_driver_budget_after(leg_budget, legacy_output_before, 0, false, 0);
+        }
+
         // Legacy ticked hardware commissioning for direct `tick_control*` callers
         // (`ArmSupervisor::tick_shared` sets `defer_legacy_commissioning = true` and services
         // commissioning in separate <= 2 ms write guards strictly AFTER tick output & publish).
@@ -12714,14 +12774,26 @@ impl SupervisorInner {
                 now: comm_now,
                 stop_generation: self.current_stop_gen(),
             };
-            let _ = self.service_commissioning_step_with_cutoff(
-                &comm_ctx,
-                comm_cutoff,
-                crate::mit::COMM_MAX_TX_PER_RELEASE,
-                None,
-                true,
-                now_fn,
-            );
+            if let Some(ref mut leg_budget) = legacy_ledger {
+                let _ = self.service_commissioning_step_with_budget(
+                    &comm_ctx,
+                    leg_budget,
+                    comm_cutoff,
+                    crate::mit::COMM_MAX_TX_PER_RELEASE,
+                    None,
+                    true,
+                    now_fn,
+                );
+            } else {
+                let _ = self.service_commissioning_step_with_cutoff(
+                    &comm_ctx,
+                    comm_cutoff,
+                    crate::mit::COMM_MAX_TX_PER_RELEASE,
+                    None,
+                    true,
+                    now_fn,
+                );
+            }
         }
 
         self.active_tx_cutoff = None;
@@ -12730,6 +12802,10 @@ impl SupervisorInner {
             if let Some(mut drv) = self.write_driver_for_tick() {
                 drv.set_tx_release_deadline(None);
             }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !was_step2_poll {
+            self.last_legacy_release_budget = legacy_ledger;
         }
         #[cfg(not(target_arch = "wasm32"))]
         if !self.rt_executor_owned {
@@ -13250,8 +13326,15 @@ impl SupervisorInner {
             .max_frames
             .min(u8::MAX as usize) as u8;
         let before_drv = self.sync_driver_budget_before(release_budget);
-        let ledger_rx_rem = release_budget.rx_remaining();
-        let ledger_tx_rem = release_budget.tx_remaining();
+        let (ledger_rx_rem, ledger_tx_rem, max_tx_frames) = if before_drv.is_some() {
+            (
+                release_budget.rx_remaining(),
+                release_budget.tx_remaining(),
+                max_tx_frames,
+            )
+        } else {
+            (0, 0, 0)
+        };
         let ledger_seq = release_budget.release_seq();
 
         // Temporarily take driver out (restored unconditionally even on unwind) so the live
@@ -16397,9 +16480,17 @@ impl ArmSupervisor {
             now: step_now,
             stop_generation: inner.current_stop_gen(),
         };
+        let mut headless_ledger = crate::rt_core::budget::ReleaseBudget::new(
+            seq,
+            step_now,
+            step_now + LEGACY_HEADLESS_COMM_BUDGET,
+            crate::rt_core::ops::RX_FRAME_BUDGET,
+            inner.release_tx_budget_limit(),
+        );
         let mut sys_now = Instant::now;
-        let _ = inner.service_commissioning_step_with_cutoff(
+        let _ = inner.service_commissioning_step_with_budget(
             &ctx,
+            &mut headless_ledger,
             step_now + LEGACY_HEADLESS_COMM_BUDGET,
             1,
             Some(1),
@@ -16430,6 +16521,7 @@ impl ArmSupervisor {
         release_deadline: Instant,
         comm_margin: Duration,
         tx_budget_dur: Duration,
+        mut ledger: crate::rt_core::budget::ReleaseBudget,
     ) {
         const OFF_LOCK_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
         const MAX_OFF_LOCK_POLLS_PER_REQ: u8 = 3;
@@ -16500,8 +16592,9 @@ impl ArmSupervisor {
                 let step_reg_tx = reg_tx_left.min(1);
                 let step_probe_tx = probe_tx_left.min(1);
                 let mut sys_now = Instant::now;
-                let p = inner.service_commissioning_step_with_cutoff(
+                let p = inner.service_commissioning_step_with_budget(
                     &ctx,
+                    &mut ledger,
                     comm_release_cap,
                     step_reg_tx,
                     Some(step_probe_tx),
@@ -20805,12 +20898,23 @@ impl ArmSupervisor {
             }
             #[cfg(not(target_arch = "wasm32"))]
             let legacy_comm_plan = if inner.legacy_commissioning_eligible() {
+                let comm_ledger = inner.last_legacy_release_budget.take().unwrap_or_else(|| {
+                    crate::rt_core::budget::ReleaseBudget::new(
+                        inner.control_release_seq,
+                        started,
+                        release_deadline,
+                        crate::rt_core::ops::RX_FRAME_BUDGET,
+                        inner.release_tx_budget_limit(),
+                    )
+                });
                 Some((
                     release_deadline,
                     inner.tx_release_publish_margin(),
                     inner.config.damiao_tx_budget().max_duration,
+                    comm_ledger,
                 ))
             } else {
+                inner.last_legacy_release_budget = None;
                 None
             };
             #[cfg(target_arch = "wasm32")]
@@ -20923,9 +21027,15 @@ impl ArmSupervisor {
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some((comm_rd, comm_margin, tx_budget_dur)) = legacy_comm_plan {
-            self.service_legacy_commissioning_post_tick(started, comm_rd, comm_margin, tx_budget_dur)
-                .await;
+        if let Some((comm_rd, comm_margin, tx_budget_dur, comm_ledger)) = legacy_comm_plan {
+            self.service_legacy_commissioning_post_tick(
+                started,
+                comm_rd,
+                comm_margin,
+                tx_budget_dur,
+                comm_ledger,
+            )
+            .await;
         }
         #[cfg(target_arch = "wasm32")]
         let _ = legacy_comm_plan;
