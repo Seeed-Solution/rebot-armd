@@ -1373,6 +1373,7 @@ pub struct SupervisorInner {
     /// Supply-current estimate (`src/power.rs`).
     pub power: crate::power::PowerMonitor,
     pub(crate) static_load_cache: crate::power::StaticLoadBaselineCache,
+    pub(crate) static_load_tracking_cache: crate::power::StaticLoadBaselineCache,
     /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
     pub follower: Option<String>,
     /// Base gripper policy from profile (unshifted).
@@ -2639,6 +2640,7 @@ impl SupervisorInner {
             tracking: crate::tracking::TrackingRuntime::with_capacity(dof),
             power: crate::power::PowerMonitor::default(),
             static_load_cache: crate::power::StaticLoadBaselineCache::default(),
+            static_load_tracking_cache: crate::power::StaticLoadBaselineCache::default(),
             follower: None,
             base_gripper_policy,
             gripper_calib_offset: None,
@@ -4639,6 +4641,7 @@ impl SupervisorInner {
             watchdog_park_pending_gen: wd_gen,
             watchdog_park_pending_attempt: wd_attempt,
             torque_backoff: self.torque_guard.backoff_history,
+            power_diag: self.power.diagnostics_snapshot(),
         };
         crate::rt_core::publish::Snapshot {
             meta: crate::rt_core::publish::SampleMeta {
@@ -4710,8 +4713,10 @@ impl SupervisorInner {
             commanded_velocities,
             joint_feedback_queue_bounds,
             torque_guard,
+            power,
             ..
         } = self;
+        let power_diag = power.diagnostics_snapshot();
         core.publish_with_rt_meta(
             obs,
             generation,
@@ -4726,6 +4731,7 @@ impl SupervisorInner {
             owner,
             meta,
             Some(&torque_guard.backoff_history),
+            power_diag,
         );
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.flush_published_session_terminals();
@@ -8399,10 +8405,7 @@ impl SupervisorInner {
     /// active action/macro with `STATIC_LOAD_LIMIT`.
     pub(crate) fn abort_planned_motion_static_load_rt(&mut self, action_id: Option<u64>) {
         if let Some(id) = action_id {
-            let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
-            if is_macro {
-                self.drop_macro_run("failed", Some("STATIC_LOAD_LIMIT"));
-            } else if self
+            if self
                 .last_action
                 .as_ref()
                 .is_some_and(|a| a.id == id && a.is_running())
@@ -8419,6 +8422,9 @@ impl SupervisorInner {
                     None,
                     None,
                 );
+            }
+            if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
+                self.drop_macro_run("failed", Some("STATIC_LOAD_LIMIT"));
             }
         }
         self.replace_active_trajectory(None);
@@ -11139,7 +11145,9 @@ impl SupervisorInner {
                 reference_stepped = true;
                 self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
-                if self.check_static_load_admission(&out.positions).is_err() {
+                if self.check_static_load_admission_commit(&out.positions).is_err() {
+                    self.scratch.step_out.positions = out.positions;
+                    self.scratch.step_out.velocities = out.velocities;
                     self.abort_planned_motion_static_load_rt(action_id);
                 } else {
                     deferred_done = self.apply_action_step(action_id, out);
@@ -11149,7 +11157,9 @@ impl SupervisorInner {
                 reference_stepped = true;
                 self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
-                if self.check_static_load_admission(&out.positions).is_err() {
+                if self.check_static_load_admission_commit(&out.positions).is_err() {
+                    self.scratch.step_out.positions = out.positions;
+                    self.scratch.step_out.velocities = out.velocities;
                     self.abort_planned_motion_static_load_rt(action_id);
                 } else {
                     if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
@@ -11165,7 +11175,7 @@ impl SupervisorInner {
                 reference_stepped = true;
                 self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut point_buf.positions, &mut point_buf.velocities);
-                if self.check_static_load_admission(&point_buf.positions).is_err() {
+                if self.check_static_load_admission_commit(&point_buf.positions).is_err() {
                     self.abort_planned_motion_static_load_rt(action_id);
                 } else {
                     // swap: the previous command's memory goes back to the scratch
@@ -11397,7 +11407,7 @@ impl SupervisorInner {
                         match self.servo_step_workspace_rt(&next_positions, "servo_step") {
                             Err(f) => self.enter_servo_keepout_hold_rt(f),
                             Ok(pending_ws) => {
-                                if self.check_static_load_admission(&next_positions).is_err() {
+                                if self.check_static_load_admission_commit(&next_positions).is_err() {
                                     self.enter_servo_static_load_hold_rt();
                                 } else {
                                     if let Some(n) = pending_ws {
@@ -11493,7 +11503,7 @@ impl SupervisorInner {
                 match ws_res {
                     Err(f) => self.enter_servo_keepout_hold_rt(f),
                     Ok(pending_ws) => {
-                        if braking && self.check_static_load_admission(&next_positions).is_err() {
+                        if braking && self.check_static_load_admission_commit(&next_positions).is_err() {
                             self.enter_servo_static_load_hold_rt();
                         } else {
                             if let Some(n) = pending_ws {
@@ -11895,50 +11905,123 @@ impl SupervisorInner {
                     };
                     match eval_res {
                         Ok(out) => {
-                            let mut targets = std::mem::take(&mut self.scratch.targets);
-                            targets.clear();
-                            targets.extend(
-                                out.positions
-                                    .iter()
-                                    .zip(self.commanded_velocities.iter())
-                                    .enumerate()
-                                    .map(|(i, (&p, &v))| JointTarget {
-                                        position: p,
-                                        velocity: Some(v),
-                                        torque: if gravity_output_enabled {
-                                            self.gravity_torques_ramped.get(i).copied()
-                                        } else {
-                                            Some(0.0)
-                                        },
-                                        kp: None,
-                                        kd: None,
-                                    }),
-                            );
-                            self.scratch.targets = targets;
-                            tick_output = self.write_output_scratch(servo_dt);
-                            match &tick_output {
-                                TickOutput::Complete { .. } => {
-                                    let nominal = self.tracking.nominal_entry(&self.commanded_positions, servo_dt);
-                                    self.tracking.record_issued_with_ws_depths(
-                                        out.positions,
-                                        out.velocities,
-                                        out.ws_min_depths,
-                                        out.ws_keepout_min_depths,
-                                    );
-                                    self.tracking.last_nominal = Some(nominal);
-                                    if out.withdrawn {
-                                        self.tracking.withdrawal_ticks += 1;
+                            if self.check_static_load_tracking_output(&out.positions, true).is_err() {
+                                // Tracking lead or ramp-out output would worsen static load above
+                                // cap or under active static overload restriction: do not emit
+                                // `out.positions`; halt worsening motion and emit a safe hold pose.
+                                if let Some(action_id) =
+                                    self.active_trajectory.as_ref().and_then(|a| a.action_id)
+                                {
+                                    self.abort_planned_motion_static_load_rt(Some(action_id));
+                                } else if self.active_trajectory.is_some() {
+                                    self.abort_planned_motion_static_load_rt(None);
+                                }
+                                if self.servo_target.is_some() || self.servo_stream_active {
+                                    self.enter_servo_static_load_hold_rt();
+                                }
+                                // If nominal `commanded_positions` is worse than the last issued
+                                // wire pose, stay on the last issued arm pose; otherwise keep the
+                                // safe nominal pose.
+                                let nominal_worse = self
+                                    .tracking
+                                    .last_issued_positions
+                                    .as_ref()
+                                    .is_some_and(|v| v.len() == self.commanded_positions.len())
+                                    && {
+                                        let mut nom_buf = [0.0f32; crate::model::MAX_MOTION_DOF];
+                                        let n = self.commanded_positions.len().min(nom_buf.len());
+                                        nom_buf[..n].copy_from_slice(&self.commanded_positions[..n]);
+                                        self.check_static_load_tracking_output(&nom_buf[..n], false).is_err()
+                                    };
+                                if nominal_worse {
+                                    if let Some(prev) = self.tracking.last_issued_positions.as_deref() {
+                                        let gripper_idx = self.config.gripper_index();
+                                        for (i, (c, &p)) in self
+                                            .commanded_positions
+                                            .iter_mut()
+                                            .zip(prev.iter())
+                                            .enumerate()
+                                        {
+                                            if Some(i) != gripper_idx {
+                                                *c = p;
+                                            }
+                                        }
                                     }
+                                }
+                                copy_into(&mut self.target_positions, &self.commanded_positions);
+                                self.commanded_velocities.fill(0.0);
+                                self.commanded_accelerations.fill(0.0);
+                                self.tracking.invalidate();
+                                self.note_motion_limit(MotionLimitReason::Power, None);
+                                let mut targets = std::mem::take(&mut self.scratch.targets);
+                                targets.clear();
+                                targets.extend(
+                                    self.commanded_positions
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, &p)| JointTarget {
+                                            position: p,
+                                            velocity: Some(0.0),
+                                            torque: if gravity_output_enabled {
+                                                self.gravity_torques_ramped.get(i).copied()
+                                            } else {
+                                                Some(0.0)
+                                            },
+                                            kp: None,
+                                            kd: None,
+                                        }),
+                                );
+                                self.scratch.targets = targets;
+                                tick_output = self.write_output_scratch(servo_dt);
+                                if matches!(tick_output, TickOutput::Complete { .. }) {
                                     allow_output_accepted = true;
                                 }
-                                TickOutput::Deferred { .. }
-                                | TickOutput::Expired { .. }
-                                | TickOutput::Error { .. }
-                                | TickOutput::EstopInhibited { .. }
-                                | TickOutput::LeaseFenced
-                                | TickOutput::ActionDeadlineRefused { .. }
-                                | TickOutput::None => {
-                                    self.tracking.invalidate();
+                            } else {
+                                let mut targets = std::mem::take(&mut self.scratch.targets);
+                                targets.clear();
+                                targets.extend(
+                                    out.positions
+                                        .iter()
+                                        .zip(self.commanded_velocities.iter())
+                                        .enumerate()
+                                        .map(|(i, (&p, &v))| JointTarget {
+                                            position: p,
+                                            velocity: Some(v),
+                                            torque: if gravity_output_enabled {
+                                                self.gravity_torques_ramped.get(i).copied()
+                                            } else {
+                                                Some(0.0)
+                                            },
+                                            kp: None,
+                                            kd: None,
+                                        }),
+                                );
+                                self.scratch.targets = targets;
+                                tick_output = self.write_output_scratch(servo_dt);
+                                match &tick_output {
+                                    TickOutput::Complete { .. } => {
+                                        let nominal = self.tracking.nominal_entry(&self.commanded_positions, servo_dt);
+                                        self.tracking.record_issued_with_ws_depths(
+                                            out.positions,
+                                            out.velocities,
+                                            out.ws_min_depths,
+                                            out.ws_keepout_min_depths,
+                                        );
+                                        self.tracking.last_nominal = Some(nominal);
+                                        if out.withdrawn {
+                                            self.tracking.withdrawal_ticks += 1;
+                                        }
+                                        allow_output_accepted = true;
+                                    }
+                                    TickOutput::Deferred { .. }
+                                    | TickOutput::Expired { .. }
+                                    | TickOutput::Error { .. }
+                                    | TickOutput::EstopInhibited { .. }
+                                    | TickOutput::LeaseFenced
+                                    | TickOutput::ActionDeadlineRefused { .. }
+                                    | TickOutput::None => {
+                                        self.tracking.invalidate();
+                                    }
                                 }
                             }
                         }
@@ -16740,29 +16823,17 @@ impl ArmSupervisor {
             };
             let snap = self.hub().latest();
             let obs_power = snap.as_ref().and_then(|s| s.obs.power.clone());
-            let static_severity = obs_power
+            let power_diag = snap
                 .as_ref()
-                .map_or(crate::power::StaticOverloadSeverity::None, |p| p.severity);
-            let static_restricted = snap
-                .as_ref()
-                .is_some_and(|s| s.rt.owner.static_restricted)
-                || obs_power.as_ref().is_some_and(|p| p.static_restricted);
+                .map(|s| s.rt.power_diag)
+                .unwrap_or_default();
             let torque_backoff = snap
                 .as_ref()
                 .map(|s| s.rt.torque_backoff.to_diagnostics())
                 .unwrap_or_else(|| {
                     crate::torque_guard::TorqueBackoffHistory::default().to_diagnostics()
                 });
-            return serde_json::json!({
-                "enabled": true,
-                "estimate_only": true,
-                "observation": obs_power,
-                "static_severity": static_severity,
-                "static_restricted": static_restricted,
-                "idle_a": (budget.idle_a() * 1000.0).round() / 1000.0,
-                "torque_backoff": torque_backoff,
-                "budget": budget,
-            });
+            return power_diag.to_json(&budget, obs_power, torque_backoff);
         }
         self.inner().read().await.power_diagnostics()
     }

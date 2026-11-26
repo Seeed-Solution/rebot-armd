@@ -870,6 +870,7 @@ pub struct RtSample {
     pub watchdog_park_pending_gen: u64,
     pub watchdog_park_pending_attempt: u8,
     pub torque_backoff: crate::torque_guard::TorqueBackoffHistory,
+    pub power_diag: crate::power::PowerDiagnosticsSnapshot,
 }
 
 impl Default for RtSample {
@@ -899,6 +900,7 @@ impl RtSample {
             watchdog_park_pending_gen: 0,
             watchdog_park_pending_attempt: 0,
             torque_backoff: crate::torque_guard::TorqueBackoffHistory::default(),
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         }
     }
 
@@ -1072,6 +1074,7 @@ pub struct RtInputs<'a> {
     pub owner: PublishedOwnerMeta,
     pub meta: RtMotionMeta,
     pub torque_backoff: Option<&'a crate::torque_guard::TorqueBackoffHistory>,
+    pub power_diag: crate::power::PowerDiagnosticsSnapshot,
 }
 
 impl StatePublisher {
@@ -1136,6 +1139,7 @@ impl StatePublisher {
                 }
             }
         }
+        slot.rt.power_diag = rt.power_diag;
         let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();
@@ -2331,6 +2335,7 @@ mod tests {
             owner: PublishedOwnerMeta::default(),
             meta: RtMotionMeta::default(),
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         }
     }
 
@@ -2388,6 +2393,7 @@ mod tests {
             feedback_queue_bounds: &[], owner: PublishedOwnerMeta::default(),
             meta: RtMotionMeta::default(),
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         });
         let (p, v, i, s) = hub.latest().unwrap().rt.arm_feedback(&[0, 2]);
         assert_eq!((p, v, i, s), (vec![1.0, 2.0, 3.0], vec![0.1, 0.3], vec![Some(now), Some(now)], vec![5, 7]));
@@ -2497,6 +2503,7 @@ mod tests {
             owner: owner_meta,
             meta: rt_meta,
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         };
         publisher.publish_with_owner(20, now, now + Duration::from_secs(5), obs(1.0), owner_state, rt);
 
@@ -2622,6 +2629,7 @@ mod tests {
             owner: owner_meta,
             meta: rt_meta,
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         };
         publisher.publish_with_owner(21, now, now + Duration::from_secs(5), obs(2.0), owner_state, rt_missing);
         assert_eq!(
@@ -2643,6 +2651,7 @@ mod tests {
             owner: gc_owner,
             meta: rt_meta,
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         };
         publisher.publish_with_owner(22, now, now + Duration::from_secs(5), obs(3.0), owner_state, rt_gc);
         assert_eq!(
@@ -2661,6 +2670,7 @@ mod tests {
             owner: owner_meta,
             meta: rt_meta,
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         };
         publisher.publish_with_owner(23, now, now + Duration::from_secs(5), obs(4.0), owner_state, rt_moving);
         assert_eq!(
@@ -2687,6 +2697,7 @@ mod tests {
             owner: hs_owner,
             meta: rt_meta,
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         };
         publisher.publish_with_owner(24, now, now + Duration::from_secs(5), obs(4.5), owner_state, rt_hs);
         assert_eq!(
@@ -2707,6 +2718,7 @@ mod tests {
             owner: owner_meta,
             meta: rt_meta,
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         };
         publisher.publish_with_owner(25, past, past, obs(5.0), owner_state, rt_expired);
         assert_eq!(

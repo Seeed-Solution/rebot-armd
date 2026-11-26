@@ -290,6 +290,7 @@ pub enum StagedAction {
         kind: PreparedActionKind,
         dof: u8,
         start: [f32; MAX_DOF],
+        v0: [f32; MAX_DOF],
         target: [f32; MAX_DOF],
         duration_s: f64,
         max_velocity: [f32; MAX_DOF],
@@ -1877,9 +1878,12 @@ impl PreparedJointAction {
             return Err("INVALID_COMMAND");
         }
         let mut start = [0.0f32; MAX_DOF];
+        let mut v0 = [0.0f32; MAX_DOF];
         let mut target = [0.0f32; MAX_DOF];
         let mut max_velocity = [0.0f32; MAX_DOF];
         start[..dof].copy_from_slice(&self.start);
+        let v0_n = self.prepared_quintic.v0.len().min(dof);
+        v0[..v0_n].copy_from_slice(&self.prepared_quintic.v0[..v0_n]);
         target[..dof].copy_from_slice(&self.prepared_quintic.target);
         for (i, l) in self.limits.iter().enumerate() {
             max_velocity[i] = l.max_velocity;
@@ -1893,6 +1897,7 @@ impl PreparedJointAction {
             kind: self.kind,
             dof: dof as u8,
             start,
+            v0,
             target,
             duration_s,
             max_velocity,
@@ -2708,6 +2713,7 @@ pub fn prepare_child_joint_slot(
         kind: PreparedActionKind::MoveToPose,
         dof: dof as u8,
         start: s,
+        v0: [0.0; MAX_DOF],
         target: t,
         duration_s,
         max_velocity: mv,
@@ -3117,7 +3123,8 @@ fn validate_approach_leg_rt(
     inner
         .check_workspace_quintic_inline(&seg)
         .map_err(|e| static_code(ArmError::Safety(e)))?;
-    inner.check_static_load_quintic_inline(&leg_start[..dof], &seg)?;
+    // O(1) endpoint fence (full curve was certified off-thread; shared tick also checks every step).
+    inner.check_static_load_endpoint_inline(&leg_start[..dof], &leg.target[..dof])?;
     Ok((seg, leg))
 }
 
@@ -3268,6 +3275,7 @@ pub fn install_move_joint(
             kind,
             dof,
             start,
+            v0,
             target,
             duration_s,
             max_velocity,
@@ -3281,6 +3289,7 @@ pub fn install_move_joint(
             kind,
             dof,
             &start,
+            &v0,
             &target,
             duration_s,
             max_velocity,
@@ -3293,12 +3302,14 @@ pub fn install_move_joint(
 }
 
 /// Payload for [`install_move_joint`].
+#[allow(clippy::large_enum_variant)]
 pub enum JointInstallPayload {
     Legacy(Box<PreparedJointAction>),
     Rt {
         kind: PreparedActionKind,
         dof: usize,
         start: [f32; MAX_DOF],
+        v0: [f32; MAX_DOF],
         target: [f32; MAX_DOF],
         duration_s: f64,
         max_velocity: [f32; MAX_DOF],
@@ -3316,6 +3327,7 @@ fn install_move_joint_rt(
     kind: PreparedActionKind,
     dof: usize,
     start: &[f32; MAX_DOF],
+    staged_v0: &[f32; MAX_DOF],
     target: &[f32; MAX_DOF],
     duration_s: f64,
     max_velocity: [f32; MAX_DOF],
@@ -3373,6 +3385,17 @@ fn install_move_joint_rt(
             start_vel[g] = 0.0;
         }
     }
+    // O(1) exact-input fence when static admission or restriction is active: if a hold filter
+    // mutated an arm joint target or start velocity drifted from the off-thread certified curve,
+    // reject PLAN_STALE so the full curve is re-certified off-thread (never running a multi-sample
+    // gravity loop on `armd-control`).
+    if inner.static_load_check_active() {
+        let arm_n = inner.config.arm_dof().min(dof);
+        if (0..arm_n).any(|i| (tgt[i] - target[i]).abs() > 1e-6 || (start_vel[i] - staged_v0[i]).abs() > 1e-3) {
+            return Err("PLAN_STALE");
+        }
+        inner.check_static_load_endpoint_inline(&post_q[..dof], &tgt[..dof])?;
+    }
     // Install with exact prepared timing verbatim (preserves ACK duration parity even within 1e-4 start drift).
     let traj = crate::trajectory::MultiJointQuinticTrajectory::new(
         &post_q[..dof],
@@ -3385,7 +3408,6 @@ fn install_move_joint_rt(
     inner
         .check_workspace_quintic_inline(&traj)
         .map_err(|e| static_code(ArmError::Safety(e)))?;
-    inner.check_static_load_quintic_inline(&post_q[..dof], &traj)?;
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
             inner,
@@ -4468,6 +4490,7 @@ fn install_macro_child_slot_rt(
             })
         }
         StagedAction::Joint {
+            v0: staged_v0,
             target,
             duration_s,
             max_velocity,
@@ -4508,6 +4531,18 @@ fn install_macro_child_slot_rt(
             }
             inner.torque_hold_filter(&mut tgt[..dof]);
             inner.power_hold_filter(&mut tgt[..dof]);
+            if inner.static_load_check_active() {
+                let arm_n = inner.config.arm_dof().min(dof);
+                if (0..arm_n).any(|i| {
+                    (tgt[i] - target[i]).abs() > 1e-6
+                        || (inner.commanded_velocities[i] - staged_v0[i]).abs() > 1e-3
+                }) {
+                    return Err("PLAN_STALE");
+                }
+                let mut cur_q = [0.0f32; MAX_DOF];
+                cur_q[..dof].copy_from_slice(&inner.commanded_positions[..dof]);
+                inner.check_static_load_endpoint_inline(&cur_q[..dof], &tgt[..dof])?;
+            }
             let zeros = [0.0f32; MAX_DOF];
             let traj = crate::trajectory::MultiJointQuinticTrajectory::new(
                 &inner.commanded_positions[..dof],
@@ -4520,7 +4555,6 @@ fn install_macro_child_slot_rt(
             inner
                 .check_workspace_quintic_inline(&traj)
                 .map_err(|e| static_code(ArmError::Safety(e)))?;
-            inner.check_static_load_quintic_inline(&inner.commanded_positions[..dof], &traj)?;
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,
@@ -4902,6 +4936,7 @@ pub fn commit_action(
                 StagedAction::Joint {
                     dof,
                     start,
+                    v0,
                     target,
                     duration_s,
                     max_velocity,
@@ -4916,6 +4951,7 @@ pub fn commit_action(
                     kind,
                     usize::from(dof),
                     &start,
+                    &v0,
                     &target,
                     duration_s,
                     max_velocity,

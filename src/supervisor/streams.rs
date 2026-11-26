@@ -1132,6 +1132,50 @@ impl SupervisorInner {
         let crate::tracking::PendingFallback { step, ramp, other_depths } = pending;
         match step {
             Ok(fb) => {
+                if self.check_static_load_tracking_output(&fb.positions, true).is_err() {
+                    if self.scratch.fallback_prev_confirmed_valid
+                        && self.scratch.fallback_prev_confirmed.len() == self.commanded_positions.len()
+                    {
+                        let gripper_idx = self.config.gripper_index();
+                        for (i, (c, &p)) in self
+                            .commanded_positions
+                            .iter_mut()
+                            .zip(self.scratch.fallback_prev_confirmed.iter())
+                            .enumerate()
+                        {
+                            if Some(i) != gripper_idx {
+                                *c = p;
+                            }
+                        }
+                    }
+                    crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+                    self.commanded_velocities.fill(0.0);
+                    self.commanded_accelerations.fill(0.0);
+                    self.tracking.invalidate();
+                    self.tracking.holding_fallback_pose = true;
+                    self.note_motion_limit(MotionLimitReason::Power, None);
+                    let mut targets = std::mem::take(&mut self.scratch.targets);
+                    targets.clear();
+                    targets.extend(
+                        self.commanded_positions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &p)| JointTarget {
+                                position: p,
+                                velocity: Some(0.0),
+                                torque: if gravity_output_enabled {
+                                    self.gravity_torques_ramped.get(i).copied()
+                                } else {
+                                    Some(0.0)
+                                },
+                                kp: None,
+                                kd: None,
+                            }),
+                    );
+                    self.scratch.targets = targets;
+                    let dt = 1.0 / f64::from(self.config.control_frequency_hz.max(1));
+                    return self.write_output_scratch(dt);
+                }
                 crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &fb.positions);
                 crate::rt_core::scratch::copy_into(&mut self.target_positions, &fb.positions);
                 crate::rt_core::scratch::copy_into(&mut self.commanded_velocities, &fb.velocities);

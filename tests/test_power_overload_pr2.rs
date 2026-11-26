@@ -493,3 +493,228 @@ fn m5_rebound_above_cap_minor5_model_validation_and_m6_workspace_rollback() {
         "M6: workspace clearance depths must NOT be committed when static-load admission refuses the step"
     );
 }
+
+#[test]
+fn r2_m2_non_accumulating_static_load_eps_ceiling() {
+    let mut budget = PowerBudget::rebot_dm();
+    let arm = ArmConfig::rebot_dm().arm_model;
+    let cap = budget.static_admission_cap_a().unwrap();
+
+    // Find a monotone curve where J2 moves from -0.20 (lower load ~1.01 A) toward -0.80 (higher load ~1.71 A).
+    let q_start = [0.0, -0.20, 1.5, 0.0, 0.0, 0.0, 0.0];
+    let q_end = [0.0, -0.80, 1.5, 0.0, 0.0, 0.0, 0.0];
+    let i_start = predict_static_holding_current_a(&budget, &arm, &q_start).unwrap();
+    let i_end = predict_static_holding_current_a(&budget, &arm, &q_end).unwrap();
+    assert!(i_end > i_start + 0.5, "expected J2 extension to increase load: {i_start:.3} -> {i_end:.3}");
+
+    // Place start already above cap (`cap + 0.30 A`) so only non-worsening motion is legal.
+    budget.static_reserve_a = cap - i_start + 0.30;
+    let base_a = predict_static_holding_current_a(&budget, &arm, &q_start).unwrap();
+    assert!(base_a > cap + 0.25);
+
+    // Build 3,000 tiny upward increments (< 5e-5 A per step, total > 0.15 A creep).
+    let steps = 3_000usize;
+    let mut poses: Vec<[f32; 7]> = Vec::with_capacity(steps);
+    for k in 1..=steps {
+        let alpha = k as f32 / steps as f32;
+        let mut q = q_start;
+        q[1] = q_start[1] + (q_end[1] - q_start[1]) * alpha * 0.25;
+        poses.push(q);
+    }
+    let final_a = predict_static_holding_current_a(&budget, &arm, poses.last().unwrap()).unwrap();
+    assert!(
+        final_a > base_a + 0.05,
+        "creep path must represent real upward drift: base={base_a:.5} final={final_a:.5}"
+    );
+    // 1. Multi-pose trajectory check must reject cumulative creep!
+    let pose_err = armd::power::check_static_load_poses(
+        &budget,
+        &arm,
+        &q_start,
+        poses.iter().map(|p| p.as_slice()),
+        false,
+    );
+    assert!(
+        matches!(pose_err, Err(MotionError::StaticLoadLimit)),
+        "R2-M2: 3000-step +eps creep in check_static_load_poses must be rejected, got {pose_err:?}"
+    );
+
+    // 2. Tick-by-tick owner servo step commits must also stop before creeping > STATIC_LOAD_EPS_A!
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.power_budget = Some(budget.clone());
+    let mut inner = armed_legacy(cfg, q_start);
+    let mut max_accepted_a = base_a;
+    let mut refused = false;
+    for q in &poses {
+        // Drive servo_target directly to exercise the tick-by-tick admission commit ceiling.
+        inner.servo_target = Some(q.to_vec());
+        inner.tick(DT);
+        let cur_a = predict_static_holding_current_a(&budget, &arm, &inner.commanded_positions).unwrap();
+        if cur_a > max_accepted_a {
+            max_accepted_a = cur_a;
+        }
+        if inner.servo_target.is_none() {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "R2-M2: tick-by-tick creep must trigger static-load refusal");
+    assert!(
+        max_accepted_a <= base_a + armd::power::STATIC_LOAD_EPS_A + 1e-4,
+        "R2-M2: accepted holding current drifted too far above base: base={base_a:.5}, max={max_accepted_a:.5}"
+    );
+}
+
+#[test]
+fn r2_m1_tracking_position_lead_cannot_worsen_static_load() {
+    use armd::tracking::{JointTrackingConfig, JointTrackingJoint, TrackingStrategy};
+    let mut cfg = ArmConfig::rebot_dm();
+    let arm = cfg.arm_model.clone();
+    let cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+    let q_low = [0.0, -0.35, 1.4, 0.0, 0.0, 0.0, 0.0];
+    let q_higher = [0.0, -0.75, 1.4, 0.0, 0.0, 0.0, 0.0];
+    let i_low = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_low).unwrap();
+    let i_hi = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_higher).unwrap();
+    assert!(i_hi > i_low + 0.3);
+
+    // Put start just below cap so even a 0.03 rad position-lead overshoot toward J2=-0.38 exceeds cap!
+    cfg.power_budget.as_mut().unwrap().static_reserve_a = cap - i_low - 0.005;
+    let mut joints = vec![JointTrackingJoint::default(); cfg.arm_dof()];
+    joints[1] = JointTrackingJoint {
+        strategy: TrackingStrategy::PositionLead,
+        lag_s: 0.03,
+        max_lead_rad: 0.03,
+        ..Default::default()
+    };
+    cfg.joint_tracking = Some(JointTrackingConfig {
+        enabled: true,
+        joints,
+    });
+
+    // Attach a recording driver so we verify the ACTUAL wire-emitted target never exceeds cap.
+    struct RecordDriver {
+        q: Vec<f32>,
+        written: std::sync::Arc<std::sync::Mutex<Vec<Vec<f32>>>>,
+        now: std::time::Instant,
+    }
+    impl armd::driver::ArmDriver for RecordDriver {
+        fn capabilities(&self) -> armd::driver::DriverCapabilities {
+            armd::driver::DriverCapabilities {
+                temperature_feedback: true,
+                load_feedback: false,
+                torque_feedback: true,
+                velocity_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: false,
+            }
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+            self.now = std::time::Instant::now();
+            Ok(self.q.iter().map(|&p| armd::model::JointState { position: p, velocity: 0.0, torque: 0.0, temperature: 30.0 }).collect())
+        }
+        fn write_joint_targets(&mut self, targets: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
+            self.written.lock().unwrap().push(targets.iter().map(|t| t.position).collect());
+            Ok(())
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), armd::driver::ArmDriverError> { Ok(()) }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn is_enabled(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<std::time::Duration>> { vec![Some(std::time::Duration::ZERO); self.q.len()] }
+        fn feedback_receive_instants(&self) -> Vec<Option<std::time::Instant>> { vec![Some(self.now); self.q.len()] }
+    }
+
+    let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drv = RecordDriver {
+        q: q_low.to_vec(),
+        written: written.clone(),
+        now: std::time::Instant::now(),
+    };
+    let budget = cfg.power_budget.clone().unwrap();
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.is_torqued = true;
+    inner.feedback_numeric_valid = true;
+    inner.measured_positions = q_low.to_vec();
+    inner.commanded_positions = q_low.to_vec();
+    inner.target_positions = q_low.to_vec();
+    inner.measured_velocities = vec![0.0; 7];
+    // Negative commanded velocity on J2 triggers PositionLead (-lag_s * |v_cmd| toward higher load).
+    inner.commanded_velocities = vec![0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    inner.temperatures = vec![30.0; 7];
+    let _ = inner.safety.set_torque(true).unwrap();
+    // Seed known tracking history at q_low (within cap).
+    inner.tracking.record_issued(q_low.to_vec(), vec![0.0; 7]);
+    inner.servo_stream_active = true;
+
+    inner.tick(DT);
+
+    let frames = written.lock().unwrap();
+    assert!(!frames.is_empty(), "driver must have received a safe hold frame");
+    for (idx, frame) in frames.iter().enumerate() {
+        let a = predict_static_holding_current_a(&budget, &arm, frame).unwrap();
+        assert!(
+            a <= cap + armd::power::STATIC_LOAD_EPS_A,
+            "R2-M1: frame #{idx} emitted by joint_tracking exceeded static cap: {a:.4} A > {cap:.4} A (q={frame:?})"
+        );
+    }
+}
+
+#[test]
+fn r2_m4_macro_static_load_abort_finishes_last_action_and_core_macro_consistently() {
+    let mut cfg = ArmConfig::rebot_dm();
+    let arm = cfg.arm_model.clone();
+    let cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+    let q_low = [0.0, -0.20, 1.4, 0.0, 0.0, 0.0, 0.0];
+    let q_hi = [0.0, -0.80, 1.4, 0.0, 0.0, 0.0, 0.0];
+    let i_low = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_low).unwrap();
+    let i_hi = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_hi).unwrap();
+    assert!(i_hi > i_low + 0.3, "expected higher static load at q_hi: {i_low:.3} -> {i_hi:.3}");
+    cfg.power_budget.as_mut().unwrap().static_reserve_a = cap - 0.5 * (i_low + i_hi);
+
+    let mut inner = armed_legacy(cfg, q_low);
+    let plan_input = inner.plan_input().unwrap();
+    let stamp = inner.current_admission_stamp();
+    let adm = inner.check_admission(stamp).unwrap();
+    let macro_id = SupervisorInner::begin_macro(adm, "grasp", &plan_input, None).unwrap();
+
+    // Install a JointPath child directly under `macro_id` that climbs above `cap`.
+    let path = armd::motion::JointPath {
+        dof: 7,
+        arm_dof: 6,
+        duration: 0.1,
+        s: vec![0.0, 1.0],
+        q: vec![q_low, q_hi],
+        power_scale: 1.0,
+    };
+    inner.active_trajectory = Some(armd::motion::ActiveTrajectory::new(
+        Some(macro_id),
+        armd::motion::Reference::Path(armd::motion::PathTrajectory::new(path)),
+    ));
+
+    // Step ticks until the path step exceeds cap and triggers `abort_planned_motion_static_load_rt`.
+    for _ in 0..8 {
+        inner.tick(DT);
+        if inner.active_trajectory.is_none() {
+            break;
+        }
+    }
+    assert!(inner.active_trajectory.is_none(), "worsening macro path must be aborted");
+    assert!(inner.macro_run.is_none(), "macro_run must be retired on static-load abort");
+
+    // Both `last_action` AND `core.last_macro()` must agree on `"failed"` / `"STATIC_LOAD_LIMIT"`.
+    let la = inner.last_action.as_ref().expect("last_action present");
+    assert_eq!(la.id, macro_id);
+    assert_eq!(la.state.as_str(), "failed", "R2-M4: last_action must be failed, got {la:?}");
+    assert_eq!(
+        la.code.as_deref(),
+        Some("STATIC_LOAD_LIMIT"),
+        "R2-M4: last_action.code must be STATIC_LOAD_LIMIT, got {la:?}"
+    );
+    let mt = inner.core.last_macro().expect("core.last_macro recorded");
+    assert_eq!(mt.action.0, macro_id);
+    assert_eq!(
+        mt.outcome,
+        armd::rt_core::broker::Outcome::Failed("STATIC_LOAD_LIMIT"),
+        "R2-M4: core.last_macro must agree on Failed(STATIC_LOAD_LIMIT), got {mt:?}"
+    );
+}

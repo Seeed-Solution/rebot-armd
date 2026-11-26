@@ -658,6 +658,7 @@ fn rt_policy_lifecycle_reserve_begin_step_hold_supersede_and_terminate_zero_allo
             kind: PreparedActionKind::MoveToJoint,
             dof: dof_u8,
             start: jog_start,
+            v0: [0.0; MAX_DOF],
             target: jog_goal,
             duration_s: 0.5,
             max_velocity: jog_vmax,

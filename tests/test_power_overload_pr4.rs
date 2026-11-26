@@ -858,30 +858,44 @@ fn m11_m12_tx_seq_and_post_fb_seq_gating() {
     let mut hist = TorqueBackoffHistory::default();
     let rec = TorqueBackoffRecord::new(1, 3, 1.0, -1.0, -9.46, 6.0, -1.612, -1.612, -1.607, false);
     hist.push(rec);
+    let t0 = std::time::Instant::now();
+    let pre_tx_rx = t0;
+    let tx_at = t0 + Duration::from_millis(5);
+    let post_tx_rx = t0 + Duration::from_millis(10);
+
     // M12: cached feedback BEFORE transmitted_q is recorded must NOT increment post_trip_samples.
-    hist.record_post_trip_feedback(3, 10, 1.02, -1.610, -8.5);
+    hist.record_post_trip_feedback(3, 10, Some(pre_tx_rx), 1.02, -1.610, -8.5);
     assert_eq!(hist.latest().unwrap().post_trip_samples, 0);
 
     // M11: wire_tx_seq == 0 (no new wire commit since trip at seq 0) must NOT set transmitted_q.
-    hist.record_transmitted(3, 0, -1.607, 10);
+    hist.record_transmitted(3, 0, Some(tx_at), -1.607, 10);
     assert!(hist.latest().unwrap().transmitted_q.is_none());
 
-    // Valid new wire commit at seq 1 -> sets transmitted_q and baselines fb_seq = 10.
-    hist.record_transmitted(3, 1, -1.607, 10);
+    // Valid new wire commit at seq 1 -> sets transmitted_q, tx_at, and baselines fb_seq = 10.
+    hist.record_transmitted(3, 1, Some(tx_at), -1.607, 10);
     assert!((hist.latest().unwrap().transmitted_q.unwrap() - (-1.607)).abs() < 1e-6);
 
     // M12: same cached fb_seq=10 must NOT count as a post-trip sample!
-    hist.record_post_trip_feedback(3, 10, 1.04, -1.609, -8.1);
+    hist.record_post_trip_feedback(3, 10, Some(post_tx_rx), 1.04, -1.609, -8.1);
     assert_eq!(hist.latest().unwrap().post_trip_samples, 0);
 
-    // New fb_seq=11 counts once; repeating fb_seq=11 does NOT double-count.
-    hist.record_post_trip_feedback(3, 11, 1.06, -1.608, -7.8);
-    hist.record_post_trip_feedback(3, 11, 1.08, -1.608, -7.8);
+    // R2-Minor 1: pre-TX queued feedback decoded after TX (fb_seq=11 > 10, BUT rx_at < tx_at)
+    // must NOT be misattributed as post-TX feedback!
+    hist.record_post_trip_feedback(3, 11, Some(pre_tx_rx), 1.05, -1.611, -9.0);
+    assert_eq!(
+        hist.latest().unwrap().post_trip_samples,
+        0,
+        "pre-TX queued feedback (rx_at < tx_at) must not be counted"
+    );
+
+    // New post-TX fb_seq=12 (rx_at >= tx_at) counts once; repeating fb_seq=12 does NOT double-count.
+    hist.record_post_trip_feedback(3, 12, Some(post_tx_rx), 1.06, -1.608, -7.8);
+    hist.record_post_trip_feedback(3, 12, Some(post_tx_rx), 1.08, -1.608, -7.8);
     assert_eq!(hist.latest().unwrap().post_trip_samples, 1);
 
     // Disarm closes capture so a later rearm cannot append into the old record.
     hist.close_open_capture();
-    hist.record_post_trip_feedback(3, 12, 1.10, -1.607, -7.5);
+    hist.record_post_trip_feedback(3, 13, Some(post_tx_rx), 1.10, -1.607, -7.5);
     assert_eq!(hist.latest().unwrap().post_trip_samples, 1);
 }
 
@@ -943,6 +957,51 @@ async fn m13_rt_executor_diagnostics_power_reads_live_state_hub() {
         "M13: RT /diagnostics/power must read live StateHub torque_backoff (not detached Legacy shell), got: {pwr}"
     );
     assert_eq!(pwr["torque_backoff"]["latest"]["joint"], 3);
+
+    // R2-M5: Verify exact schema parity between Legacy and RT Executor `/api/v1/diagnostics/power`
+    // (including fast_a, raw_a, last_valid_*, peak_5s_a, peak_60s_a, max_a, max_at_s, over_rated_s,
+    // governor.{scale, limited_s, holds_total, hold}).
+    let legacy_pwr = sup.inner().read().await.power_diagnostics();
+    let rt_keys: std::collections::BTreeSet<&str> = pwr
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let legacy_keys: std::collections::BTreeSet<&str> = legacy_pwr
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        rt_keys, legacy_keys,
+        "R2-M5: RT /diagnostics/power top-level schema must match Legacy"
+    );
+    let rt_gov_keys: std::collections::BTreeSet<&str> = pwr["governor"]
+        .as_object()
+        .expect("governor object present in RT payload")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let legacy_gov_keys: std::collections::BTreeSet<&str> = legacy_pwr["governor"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        rt_gov_keys, legacy_gov_keys,
+        "R2-M5: RT /diagnostics/power governor schema must match Legacy"
+    );
+    assert!(
+        pwr["fast_a"].as_f64().unwrap_or(0.0) > 0.5 && pwr["max_a"].as_f64().unwrap_or(0.0) > 0.5,
+        "R2-M5: RT /diagnostics/power must report live fast_a and max_a: {pwr}"
+    );
+    assert!(
+        pwr["last_valid_bus_a"].as_f64().is_some() && pwr["last_valid_fast_a"].as_f64().is_some(),
+        "R2-M5: RT /diagnostics/power must report last_valid_bus_a/fast_a: {pwr}"
+    );
 
     feeder.abort();
     drop(handle);

@@ -1823,10 +1823,10 @@ pub trait ArmDriver: Send {
     /// (`CTRL_MODE` and `TIMEOUT`) causally before energizing any motor.
     fn notify_bus_loss(&mut self) {}
 
-    /// Last wire-committed target position for `joint` as `(commit_seq, user_space_rad)`,
+    /// Last wire-committed target position for `joint` as `(commit_seq, tx_at, user_space_rad)`,
     /// recorded strictly at the confirmed transmit/flush boundary for non-skipped control frames
     /// (after zero-offset conversion and wire quantization). Zero heap allocations.
-    fn last_committed_wire_position(&self, _joint: usize) -> Option<(u64, f32)> {
+    fn last_committed_wire_position(&self, _joint: usize) -> Option<(u64, Instant, f32)> {
         None
     }
     /// Prepares an exclusively owned driver on SAFE-HOLD entry: aborts any interrupted enable
@@ -7984,12 +7984,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Bitmask of joints whose `verified_modes[j]` transitioned from unverified to verified during
     /// the current enable attempt so an aborted startup/post-BusLoss attempt discards them.
     attempt_verified_modes_mask: u32,
-    /// Staged quantized wire target positions (motor-space rad) awaiting confirmed `can.flush()`.
-    staged_wire_pos: [Option<f32>; MAX_MODE_JOINTS],
+    /// Staged quantized wire target positions `(tx_at, motor_space_rad)` awaiting `can.flush()`.
+    staged_wire_pos: [Option<(Instant, f32)>; MAX_MODE_JOINTS],
     staged_wire_pos_mask: u32,
-    /// Last wire-committed target position per joint as `(commit_seq, motor_space_rad)`, recorded
-    /// strictly at confirmed transmit/flush for non-skipped PosVel/MIT control frames.
-    committed_wire_pos: [Option<(u64, f32)>; MAX_MODE_JOINTS],
+    /// Last wire-committed target position per joint as `(commit_seq, tx_at, motor_space_rad)`,
+    /// recorded strictly at confirmed transmit/flush for non-skipped PosVel/MIT control frames.
+    committed_wire_pos: [Option<(u64, Instant, f32)>; MAX_MODE_JOINTS],
     wire_pos_commit_seq: u64,
     /// Register replies seen by `read_joint_states` since the last clear.
     register_replies: Vec<damiao::RegisterReply>,
@@ -9552,13 +9552,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Record a wire-quantized target position at the confirmed delivery boundary (staged until
     /// `flush_can_and_commit()` succeeds on real-flush transports).
     #[inline]
-    fn record_wire_pos_delivered(&mut self, idx: usize, wire_q: f32) {
+    fn record_wire_pos_delivered(&mut self, idx: usize, tx_at: Instant, wire_q: f32) {
         if idx < MAX_MODE_JOINTS && wire_q.is_finite() {
             if self.can.flush_is_noop() {
                 self.wire_pos_commit_seq = self.wire_pos_commit_seq.wrapping_add(1).max(1);
-                self.committed_wire_pos[idx] = Some((self.wire_pos_commit_seq, wire_q));
+                self.committed_wire_pos[idx] = Some((self.wire_pos_commit_seq, tx_at, wire_q));
             } else {
-                self.staged_wire_pos[idx] = Some(wire_q);
+                self.staged_wire_pos[idx] = Some((tx_at, wire_q));
                 self.staged_wire_pos_mask |= 1u32 << idx;
             }
         }
@@ -9584,9 +9584,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let idx = wmask.trailing_zeros() as usize;
             wmask &= wmask - 1;
             if idx < MAX_MODE_JOINTS {
-                if let Some(q) = self.staged_wire_pos[idx].take() {
+                if let Some((tx_at, q)) = self.staged_wire_pos[idx].take() {
                     self.wire_pos_commit_seq = self.wire_pos_commit_seq.wrapping_add(1).max(1);
-                    self.committed_wire_pos[idx] = Some((self.wire_pos_commit_seq, q));
+                    self.committed_wire_pos[idx] = Some((self.wire_pos_commit_seq, tx_at, q));
                 }
             }
         }
@@ -10737,7 +10737,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 } else if let Some(idx) = self.damiao_command_motor_index(&frame) {
                     self.record_ctrl_tx_delivered(idx, tx_started_mark);
                     if let Some(wire_q) = self.extract_wire_target_pos(idx, &frame) {
-                        self.record_wire_pos_delivered(idx, wire_q);
+                        self.record_wire_pos_delivered(idx, tx_started_mark, wire_q);
                     }
                 }
                 let frame_kind = if is_cmd_enable || is_cmd_disable {
@@ -21043,7 +21043,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
-    fn last_committed_wire_position(&self, joint: usize) -> Option<(u64, f32)> {
+    fn last_committed_wire_position(&self, joint: usize) -> Option<(u64, Instant, f32)> {
         self.committed_wire_pos.get(joint).copied().flatten()
     }
 

@@ -205,6 +205,10 @@ pub struct TorqueBackoffRecord {
     /// Driver wire-commit sequence snapshot at the moment of `torque_trip` (gates `transmitted_q`).
     #[serde(skip)]
     pub(crate) tx_seq_at_trip: u64,
+    /// Pre-TX driver clock instant at the first confirmed post-trip wire commit on `joint`;
+    /// gates `record_post_trip_feedback` so pre-TX queued frames decoded after TX are ignored.
+    #[serde(skip)]
+    pub(crate) transmitted_at: Option<std::time::Instant>,
     /// Last per-axis feedback sequence counted into `post_trip_*` (prevents duplicate cached reads).
     #[serde(skip)]
     pub(crate) last_post_fb_seq: u64,
@@ -244,6 +248,7 @@ impl TorqueBackoffRecord {
             post_trip_samples: 0,
             push_in,
             tx_seq_at_trip: 0,
+            transmitted_at: None,
             last_post_fb_seq: 0,
             capture_closed: false,
         }
@@ -332,6 +337,7 @@ impl TorqueBackoffHistory {
         &mut self,
         joint: usize,
         wire_tx_seq: u64,
+        tx_at: Option<std::time::Instant>,
         transmitted_q: f32,
         post_fb_seq_baseline: u64,
     ) {
@@ -346,6 +352,7 @@ impl TorqueBackoffHistory {
                 && wire_tx_seq > rec.tx_seq_at_trip
             {
                 rec.transmitted_q = Some(transmitted_q);
+                rec.transmitted_at = tx_at;
                 rec.last_post_fb_seq = rec.last_post_fb_seq.max(post_fb_seq_baseline);
                 changed = true;
             }
@@ -357,12 +364,14 @@ impl TorqueBackoffHistory {
 
     /// Updates post-trip measured position and torque for the most recent trip up to
     /// [`TORQUE_BACKOFF_POST_SAMPLES`] distinct post-TX feedback frames within
-    /// [`TORQUE_BACKOFF_CAPTURE_WINDOW_S`]. Never counts cached feedback or pre-TX frames.
+    /// [`TORQUE_BACKOFF_CAPTURE_WINDOW_S`]. Never counts cached feedback or pre-TX frames
+    /// (`fb_rx_at < tx_at`).
     #[inline]
     pub fn record_post_trip_feedback(
         &mut self,
         joint: usize,
         fb_seq: u64,
+        fb_rx_at: Option<std::time::Instant>,
         now_s: f64,
         measured_q: f32,
         torque_nm: f32,
@@ -378,6 +387,11 @@ impl TorqueBackoffHistory {
             }
             if rec.transmitted_q.is_none() || fb_seq <= rec.last_post_fb_seq {
                 return;
+            }
+            if let Some(tx_at) = rec.transmitted_at {
+                if fb_rx_at.is_none_or(|rx| rx < tx_at) {
+                    return;
+                }
             }
             if rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES {
                 if measured_q.is_finite() {
@@ -587,12 +601,13 @@ impl SupervisorInner {
                 .map(|rec| usize::from(rec.joint))
             {
                 let fb_seq = self.core.feedback().seqs().get(j).copied().unwrap_or(0);
+                let fb_rx_at = self.core.feedback().instants().get(j).copied().flatten();
                 if let (Some(&q_meas), Some(&tau)) =
                     (self.measured_positions.get(j), self.torques.get(j))
                 {
                     self.torque_guard
                         .backoff_history
-                        .record_post_trip_feedback(j, fb_seq, now, q_meas, tau);
+                        .record_post_trip_feedback(j, fb_seq, fb_rx_at, now, q_meas, tau);
                 }
             }
         }
@@ -679,7 +694,7 @@ impl SupervisorInner {
         let tx_seq_at_trip = self
             .read_driver_for_tick()
             .and_then(|drv| drv.last_committed_wire_position(j))
-            .map_or(0, |(seq, _)| seq);
+            .map_or(0, |(seq, _, _)| seq);
         let fb_seq_at_trip = self.core.feedback().seqs().get(j).copied().unwrap_or(0);
         if let Some(h) = self.torque_guard.hold.as_mut() {
             let l = &self.config.limits[j];
@@ -705,6 +720,7 @@ impl SupervisorInner {
                 post_trip_samples: 0,
                 push_in,
                 tx_seq_at_trip,
+                transmitted_at: None,
                 last_post_fb_seq: fb_seq_at_trip,
                 capture_closed: false,
             };

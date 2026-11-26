@@ -4258,6 +4258,103 @@ fn b3_and_b8_ctrl_mode_rejection_and_torque_trip_zero_alloc() {
         inner.safety.drain_log_events_off_thread();
         inner.safety.drain_retired_state_arcs_off_thread();
     }
+
+    // R2-B1: Static-load refusal on `Stepped::Arm` (Cartesian path) must recycle `out` back into
+    // `scratch.step_out` with 0 allocs AND 0 deallocs, and a subsequent path step must also do
+    // 0 allocs AND 0 deallocs.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        let arm = cfg.arm_model.clone();
+        let cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+        let q_low_arr = [0.0f32, -0.20, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_hi_arr = [0.0f32, -0.80, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_low = q_low_arr.to_vec();
+        let q_hi = q_hi_arr.to_vec();
+        let i_low = armd::power::predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_low).unwrap();
+        let i_hi = armd::power::predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_hi).unwrap();
+        assert!(i_hi > i_low + 0.3);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = cap - 0.5 * (i_low + i_hi);
+        cfg.joint_tracking = None;
+        let torques = Arc::new(Mutex::new(vec![0.0; cfg.dof]));
+        let drv = ZeroAllocTorqueDriver::new(q_low.clone(), Arc::clone(&torques));
+        let mut inner = armd::supervisor::SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.safety.set_off_thread_reclaim(true);
+        inner.is_torqued = true;
+        inner.feedback_numeric_valid = true;
+        inner.measured_positions = q_low.clone();
+        inner.commanded_positions = q_low.clone();
+        inner.target_positions = q_low.clone();
+        inner.measured_velocities = vec![0.0; inner.config.dof];
+        inner.commanded_velocities = vec![0.0; inner.config.dof];
+        inner.temperatures = vec![30.0; inner.config.dof];
+        let _ = inner.safety.set_torque(true).unwrap();
+        inner.prewarm_rt_buffers();
+        // Pre-warm one steady tick so scratch buffers are sized.
+        inner.tick_control(0.02);
+
+        let path_bad = armd::motion::JointPath {
+            dof: 7,
+            arm_dof: 6,
+            duration: 0.04,
+            s: vec![0.0, 1.0],
+            q: vec![q_low_arr, q_hi_arr],
+            power_scale: 1.0,
+        };
+        let path_ok = armd::motion::JointPath {
+            dof: 7,
+            arm_dof: 6,
+            duration: 0.04,
+            s: vec![0.0, 1.0],
+            q: vec![q_low_arr, q_low_arr],
+            power_scale: 1.0,
+        };
+        let plan_input = inner.plan_input().unwrap();
+        let stamp = inner.current_admission_stamp();
+        let adm = inner.check_admission(stamp).unwrap();
+        let act_id = armd::supervisor::SupervisorInner::begin_macro(adm, "grasp", &plan_input, None).unwrap();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::new(
+            Some(act_id),
+            armd::motion::Reference::Path(armd::motion::PathTrajectory::new(path_bad)),
+        ));
+        let mut second_traj = Some(armd::motion::ActiveTrajectory::new(
+            None,
+            armd::motion::Reference::Path(armd::motion::PathTrajectory::new(path_ok)),
+        ));
+
+        alloc::time_this_thread();
+        let mut refusal_allocs = 0u64;
+        for _ in 0..4 {
+            let _ = alloc::take();
+            inner.tick_control(0.02);
+            refusal_allocs += alloc::take().calls;
+            if inner.active_trajectory.is_none() {
+                break;
+            }
+        }
+        assert!(inner.active_trajectory.is_none(), "R2-B1: worsening path must be refused");
+        assert_eq!(
+            refusal_allocs, 0,
+            "R2-B1: Stepped::Arm static-load refusal must recycle step_out with 0 allocs/deallocs"
+        );
+        assert_eq!(
+            inner.last_action.as_ref().and_then(|a| a.code.as_deref()),
+            Some("STATIC_LOAD_LIMIT")
+        );
+
+        // Install a second path and step it: `scratch.step_out` must still hold capacity -> 0 allocs!
+        inner.active_trajectory = second_traj.take();
+        let _ = alloc::take();
+        inner.tick_control(0.02);
+        let follow_allocs = alloc::take().calls;
+        assert_eq!(
+            follow_allocs, 0,
+            "R2-B1: subsequent Stepped::Arm tick after static refusal must do 0 allocs/deallocs"
+        );
+        inner.safety.drain_log_events_off_thread();
+        inner.safety.drain_retired_state_arcs_off_thread();
+    }
 }
 
 struct ZeroAllocTorqueDriver {

@@ -218,6 +218,7 @@ impl ArmCore {
             PublishedOwnerMeta::default(),
             RtMotionMeta::default(),
             None,
+            crate::power::PowerDiagnosticsSnapshot::default(),
         );
     }
 
@@ -239,6 +240,7 @@ impl ArmCore {
         owner: PublishedOwnerMeta,
         meta: RtMotionMeta,
         torque_backoff: Option<&crate::torque_guard::TorqueBackoffHistory>,
+        power_diag: crate::power::PowerDiagnosticsSnapshot,
     ) {
         self.buffer_out = false;
         self.publisher.restore_back_spares(buffer.1);
@@ -253,6 +255,7 @@ impl ArmCore {
             owner,
             meta,
             torque_backoff,
+            power_diag,
         };
         let displaced = self.publisher.publish_with_owner(generation, sampled_at, valid_until, buffer.0, owner_state, rt);
         // the slot was emptied by take_observation_buffer and nothing wrote it since
@@ -279,6 +282,7 @@ impl ArmCore {
             owner: PublishedOwnerMeta::default(),
             meta: RtMotionMeta::default(),
             torque_backoff: None,
+            power_diag: crate::power::PowerDiagnosticsSnapshot::default(),
         };
         Ok(self.publisher.publish(generation, sampled_at, valid_until, obs, rt))
     }
