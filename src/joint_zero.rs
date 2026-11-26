@@ -538,6 +538,7 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
     fn begin_control_release(&mut self, release_seq: u64) { self.inner.begin_control_release(release_seq) }
+    fn service_release_watchdog_fallback(&mut self) { self.inner.service_release_watchdog_fallback() }
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
         self.inner.driver_clock()
     }

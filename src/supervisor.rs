@@ -7102,6 +7102,39 @@ impl SupervisorInner {
         self.torque_shadow.flush_deferred_steps();
     }
 
+    /// Flush deferred torque shadow steps immediately when `urgent`, when the staging FIFO is
+    /// nearing half capacity, or when at least `margin` remains before `release_deadline`.
+    /// Otherwise defers the non-urgent flush to the next release so it cannot push this release
+    /// past its deadline. Returns `true` if a flush ran.
+    #[inline]
+    pub(crate) fn flush_torque_shadow_if_budget(
+        &mut self,
+        urgent: bool,
+        now: Instant,
+        release_deadline: Instant,
+        margin: Duration,
+    ) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.torque_shadow.has_pending_steps() {
+                return false;
+            }
+            if urgent
+                || self.torque_shadow.should_flush_urgently()
+                || release_deadline.saturating_duration_since(now) >= margin
+            {
+                self.torque_shadow.flush_deferred_steps();
+                return true;
+            }
+            false
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (urgent, now, release_deadline, margin);
+            false
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub(crate) fn shadow_live_intent(&self) -> crate::torque::TorqueIntent {
@@ -8532,6 +8565,13 @@ impl SupervisorInner {
         self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
         self.control_release_seq_atomic
             .store(self.control_release_seq, Ordering::Release);
+        // Notify the driver of the new control release BEFORE transition polling so Step 2
+        // transition polls, Step 2 RX recovery/refresh, Step 3 commits, and Step 5 output all
+        // share a single per-release TX budget and per-motor control-frame coalescing mask.
+        if let Some(d) = self.driver.as_mut() {
+            let seq = self.control_release_seq;
+            let _ = d.try_with_mut(|drv| drv.begin_control_release(seq));
+        }
         #[cfg(not(target_arch = "wasm32"))]
         self.torque_shadow
             .enqueue_at(
@@ -9368,6 +9408,10 @@ impl SupervisorInner {
             self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
             self.control_release_seq_atomic
                 .store(self.control_release_seq, Ordering::Release);
+            let rel_seq = self.control_release_seq;
+            if let Some(mut drv) = self.write_driver_for_tick() {
+                drv.begin_control_release(rel_seq);
+            }
             #[cfg(not(target_arch = "wasm32"))]
             self.torque_shadow
                 .enqueue_at(
@@ -11520,7 +11564,9 @@ impl SupervisorInner {
         // An E-stop or authorized stop requested during this tick: its output did not reach
         // the bus (or the batch stopped at the next frame, `ArmDriver::set_estop_gate`); apply
         // it now instead of one period later. A batch the gate stopped is not a driver failure.
+        let mut stop_inhibited_this_tick = matches!(tick_output, TickOutput::EstopInhibited { .. });
         if self.urgent_stop_unapplied() {
+            stop_inhibited_this_tick = true;
             allow_output_accepted = false;
             driverless_accepted = false;
             if self.estop_request_unapplied() {
@@ -11613,6 +11659,25 @@ impl SupervisorInner {
             );
         }
         self.j7_intent = None;
+        // Coalesced end-of-release watchdog fallback: normal control/hold output has now run;
+        // emit an urgent stationary hold ONLY for already-enabled arm joints whose normal output
+        // in this release was absent, deferred, or failed and whose watchdog deadline needs it.
+        // Restores `drv_release_cap` so an expired action deadline never suppresses watchdog safety.
+        if !self.shutdown_committed
+            && !enable_transition_owns_bus
+            && !stop_inhibited_this_tick
+            && !disconnect_fenced_mid_tick
+            && !self.urgent_stop_unapplied()
+            && !output_tx_cap_expired
+        {
+            let release_cap = self.active_tx_cutoff.map(|c| c.drv_release_cap);
+            if let Some(mut drv) = self.write_driver_for_tick() {
+                if let Some(cap) = release_cap {
+                    drv.set_tx_release_deadline(Some(cap));
+                }
+                drv.service_release_watchdog_fallback();
+            }
+        }
         let action_deadline_refused_at = match tick_output {
             TickOutput::ActionDeadlineRefused { drv_now, .. } => Some(drv_now),
             _ => None,

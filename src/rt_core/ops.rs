@@ -2782,15 +2782,20 @@ impl<O: CoreOps> ReleaseFixture<O> {
         let release_deadline = started + Duration::from_secs_f64(self.dt);
         let next_gen = self.engine.releases() + 1;
         let mut report = self.engine.step(&mut self.core, now_fn, self.dt, release_deadline, next_gen);
-        // Extra sub-release hardware services at a pending transition's wake before the next release
-        // (a transition committed in this release is first served at the next one).
-        let mut next = report.poll.wake_before(release_deadline);
+        // Extra sub-release hardware services at a pending transition's wake before `wake_cutoff`
+        // (leaving at least `OPTIONAL_WORK_RELEASE_MARGIN` before `release_deadline` so optional
+        // transition polls never push a release past its deadline, matching `RtExecutor`).
+        let period = Duration::from_secs_f64(self.dt);
+        let wake_margin = crate::driver::OPTIONAL_WORK_RELEASE_MARGIN.min(period / 2);
+        let wake_cutoff = release_deadline.checked_sub(wake_margin).unwrap_or(started);
+        let mut next = report.poll.wake_before(wake_cutoff);
         while let Some(wake) = next {
-            if report.wakes == MAX_SERVICE_WAKES { break; }
+            if report.wakes == MAX_SERVICE_WAKES || self.clock.now() >= wake_cutoff { break; }
             report.wakes += 1;
             self.clock.advance(wake.saturating_duration_since(self.clock.now()));
+            if self.clock.now() >= wake_cutoff { break; }
             self.engine.service_wake(&mut self.core, self.clock.now(), release_deadline, next_gen, &mut report);
-            next = report.poll.wake_before(release_deadline);
+            next = report.poll.wake_before(wake_cutoff);
         }
         // The next release starts one period later
         self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));

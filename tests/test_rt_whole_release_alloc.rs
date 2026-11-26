@@ -1480,6 +1480,7 @@ fn phase_marks_csw_mark_and_staged_publish_zero_alloc() {
                     ring_publish_us: 50,
                     ring_to_seal_us: 30,
                     seal_us: 20,
+                    ..Default::default()
                 },
                 40,
             );

@@ -9550,7 +9550,7 @@ fn control_thread_main_inner(
         // (sub-release wakes) and the single release-completion point, ensuring zero uncounted destruction.
         const _: () = {
             const fn assert_copy<T: Copy>() {}
-            assert_copy::<(TickSample, Option<(super::ops::ReleaseReport, Instant, u64)>)>();
+            assert_copy::<(TickSample, u64, Option<(super::ops::ReleaseReport, Instant, u64, Instant, Duration)>)>();
         };
 
         loop {
@@ -9608,7 +9608,8 @@ fn control_thread_main_inner(
                     Instant,
                     u64,
                     u64,
-                    Option<(super::ops::ReleaseReport, Instant, u64)>,
+                    u64,
+                    Option<(super::ops::ReleaseReport, Instant, u64, Instant, Duration)>,
                 )> {
                     let _guard = ReleaseGuard::enter();
                     assert!(
@@ -9855,65 +9856,103 @@ fn control_thread_main_inner(
                     // Wake dispatcher immediately after Window 1 publication/drain work (preserving
                     // pre-Window-2 service latency for observations, acks, and safety logs).
                     hub.wake();
-                    core.flush_torque_shadow();
+                    let release_period_ns = next_release_ns.saturating_sub(scheduled_ns).max(1);
+                    let optional_margin = crate::driver::OPTIONAL_WORK_RELEASE_MARGIN
+                        .min(Duration::from_nanos(release_period_ns / 2));
+                    let shadow_urgent = release_flags != 0
+                        || report.stopped
+                        || report.transition_ended.is_some()
+                        || report.poll.park_state_changed
+                        || control_stop.load(Ordering::Acquire);
+                    let shadow_t0_ns = now_ns_fn();
+                    let _ = core.flush_torque_shadow_if_budget(
+                        shadow_urgent,
+                        now_inst(),
+                        release_deadline,
+                        optional_margin,
+                    );
+                    let shadow_flush_ns = now_ns_fn().saturating_sub(shadow_t0_ns);
 
-                    let next_wake = report.poll.wake_before(release_deadline);
+                    let wake_cutoff = release_deadline
+                        .checked_sub(optional_margin)
+                        .unwrap_or(release_start);
+                    let next_wake = report.poll.wake_before(wake_cutoff);
                     drop(_guard);
                     Some((
                         sample,
                         post_t0,
                         step_return_ns,
                         post_cpu_start_ns,
-                        next_wake.map(|_| (report, release_deadline, next_release_ns)),
+                        shadow_flush_ns,
+                        next_wake.map(|_| (report, release_deadline, next_release_ns, wake_cutoff, optional_margin)),
                     ))
                 },
             ))
         };
 
-        // ---- Window 2: Disjoint sub-release transition wakes before `next_release_ns` ----
+        // ---- Window 2: Disjoint sub-release transition wakes before `wake_cutoff` ----
         let mut step_sample: Option<TickSample> = None;
         let mut step_post_t0: Option<Instant> = None;
         let mut step_return_ns: Option<u64> = None;
         let mut step_post_cpu_start_ns: Option<u64> = None;
+        let mut step_shadow_flush_ns: u64 = 0;
+        let mut step_wake_sleep_ns: u64 = 0;
+        let mut step_wake_poll_ns: u64 = 0;
         let step_res: Result<(), Box<dyn Any + Send>> = match release_res {
             Err(err) => Err(err),
             Ok(None) => Ok(()),
-            Ok(Some((sample, post_t0, ret_ns, cpu_ns, None))) => {
+            Ok(Some((sample, post_t0, ret_ns, cpu_ns, shadow_ns, None))) => {
                 step_sample = Some(sample);
                 step_post_t0 = Some(post_t0);
                 step_return_ns = Some(ret_ns);
                 step_post_cpu_start_ns = Some(cpu_ns);
+                step_shadow_flush_ns = shadow_ns;
                 Ok(())
             }
-            Ok(Some((sample, post_t0, ret_ns, cpu_ns, Some((mut report, release_deadline, next_release_ns))))) => {
+            Ok(Some((
+                sample,
+                post_t0,
+                ret_ns,
+                cpu_ns,
+                shadow_ns,
+                Some((mut report, release_deadline, next_release_ns, wake_cutoff, optional_margin)),
+            ))) => {
                 step_sample = Some(sample);
                 step_post_t0 = Some(post_t0);
                 step_return_ns = Some(ret_ns);
                 step_post_cpu_start_ns = Some(cpu_ns);
+                step_shadow_flush_ns = shadow_ns;
                 let mut wakes = 0u32;
-                let mut next_wake = report.poll.wake_before(release_deadline);
+                let mut next_wake = report.poll.wake_before(wake_cutoff);
                 let mut wake_err: Option<Box<dyn Any + Send>> = None;
                 while let Some(wake) = next_wake {
                     if wakes >= MAX_SERVICE_WAKES || control_stop.load(Ordering::Acquire) {
                         break;
                     }
                     let now = now_inst();
+                    if now >= wake_cutoff || wake > wake_cutoff {
+                        break;
+                    }
                     if wake > now {
                         let wake_ns = now_ns_fn().saturating_add(
                             wake.saturating_duration_since(now)
                                 .as_nanos()
                                 .min(u128::from(u64::MAX)) as u64,
                         );
+                        let sleep_t0_ns = now_ns_fn();
                         let _ = sleep_until(wake_ns.min(next_release_ns));
+                        step_wake_sleep_ns = step_wake_sleep_ns
+                            .saturating_add(now_ns_fn().saturating_sub(sleep_t0_ns));
                     }
-                    if control_stop.load(Ordering::Acquire) {
+                    if control_stop.load(Ordering::Acquire) || now_inst() >= wake_cutoff {
                         break;
                     }
                     wakes += 1;
+                    let poll_t0_ns = now_ns_fn();
                     let wake_res = {
                         // Declared FIRST -> drops LAST, after ALL wake locals drop!
                         let _wake_alloc_scope = WholeReleaseAllocGuard::enter(&stats, true);
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<Instant> {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (Option<Instant>, u64) {
                             stats.wakes.fetch_add(1, Ordering::Relaxed);
                             let _wake_guard = ReleaseGuard::enter();
                             assert!(
@@ -9948,14 +9987,31 @@ fn control_thread_main_inner(
                             }
                             state.emit_estop_ack_if_advanced(core);
                             state.drain_retired_states(core, now_inst());
-                            core.flush_torque_shadow();
+                            let wake_shadow_urgent = published
+                                || report.stopped
+                                || report.transition_ended.is_some()
+                                || report.poll.park_state_changed
+                                || control_stop.load(Ordering::Acquire);
+                            let ws_t0_ns = now_ns_fn();
+                            let _ = core.flush_torque_shadow_if_budget(
+                                wake_shadow_urgent,
+                                now_inst(),
+                                release_deadline,
+                                optional_margin,
+                            );
+                            let ws_ns = now_ns_fn().saturating_sub(ws_t0_ns);
                             let _wake_tail_local =
                                 state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
-                            report.poll.wake_before(release_deadline)
+                            (report.poll.wake_before(wake_cutoff), ws_ns)
                         }))
                     };
+                    step_wake_poll_ns = step_wake_poll_ns
+                        .saturating_add(now_ns_fn().saturating_sub(poll_t0_ns));
                     match wake_res {
-                        Ok(next) => next_wake = next,
+                        Ok((next, ws_ns)) => {
+                            step_shadow_flush_ns = step_shadow_flush_ns.saturating_add(ws_ns);
+                            next_wake = next;
+                        }
                         Err(err) => {
                             wake_err = Some(err);
                             break;
@@ -10076,6 +10132,9 @@ fn control_thread_main_inner(
         let pre_seal_release_ns = t3_pre_seal_ns.saturating_sub(actual_ns);
         let step_to_ring_us =
             crate::diagnostics::tick::ns_to_us_u32(t1_pre_ring_ns.saturating_sub(t0_step_return_ns));
+        let wake_sleep_us = crate::diagnostics::tick::ns_to_us_u32(step_wake_sleep_ns);
+        let wake_poll_us = crate::diagnostics::tick::ns_to_us_u32(step_wake_poll_ns);
+        let shadow_flush_us = crate::diagnostics::tick::ns_to_us_u32(step_shadow_flush_ns);
         let ring_publish_us =
             crate::diagnostics::tick::ns_to_us_u32(t2_post_ring_ns.saturating_sub(t1_pre_ring_ns));
         let ring_to_seal_us =
@@ -10095,6 +10154,9 @@ fn control_thread_main_inner(
             let pre_seal_rel_us = crate::diagnostics::tick::ns_to_us_u32(pre_seal_release_ns);
             let phases = PostOverrunPhasesUs {
                 step_to_ring_us,
+                wake_sleep_us,
+                wake_poll_us,
+                shadow_flush_us,
                 ring_publish_us,
                 ring_to_seal_us,
                 seal_us: 0,
@@ -10152,6 +10214,9 @@ fn control_thread_main_inner(
                 );
                 let phases = PostOverrunPhasesUs {
                     step_to_ring_us,
+                    wake_sleep_us,
+                    wake_poll_us,
+                    shadow_flush_us,
                     ring_publish_us,
                     ring_to_seal_us,
                     seal_us,
@@ -11007,6 +11072,7 @@ pub fn run_periodic_with_deadline_and_clock(
                         t3_pre_seal_ns.saturating_sub(t2_post_ring_ns),
                     ),
                     seal_us: 0,
+                    ..Default::default()
                 };
                 let cpu_us = crate::diagnostics::tick::ns_to_us_u32(
                     crate::diagnostics::tick::thread_cpu_ns().saturating_sub(post_cpu_start_ns),
@@ -11052,6 +11118,7 @@ pub fn run_periodic_with_deadline_and_clock(
                     seal_us: crate::diagnostics::tick::ns_to_us_u32(
                         t4_post_seal_ns.saturating_sub(t3_pre_seal_ns),
                     ),
+                    ..Default::default()
                 };
                 let cpu_us = crate::diagnostics::tick::ns_to_us_u32(
                     crate::diagnostics::tick::thread_cpu_ns().saturating_sub(post_cpu_start_ns),

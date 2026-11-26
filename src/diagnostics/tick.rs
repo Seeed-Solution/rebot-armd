@@ -178,6 +178,90 @@ pub enum TxAttemptKind {
     Error,
 }
 
+/// Functional classification of a successfully transmitted CAN frame (zero heap allocation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxFrameKind {
+    /// Normal motion/target control frame (`POS_VEL`, `MIT`, or `POS_FORCE` target).
+    Normal,
+    /// Stationary hold frame (`Hold`, `RollbackHold`, or normal `MeasuredHold`).
+    Hold,
+    /// Urgent/proactive watchdog continuity hold frame.
+    UrgentHold,
+    /// Read-only `0xCC` status refresh or register read poll.
+    Refresh0xCc,
+    /// Autonomous stale-feedback recovery frame sent during RX pass.
+    Recovery,
+    /// Enable, disable, mode write, fault clear, or handshake control frame.
+    EnableDisable,
+}
+
+/// Per-release counts of successfully transmitted CAN frames by functional kind (zero alloc).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TxFrameKindCounts {
+    pub normal: u32,
+    pub hold: u32,
+    pub urgent_hold: u32,
+    pub refresh_0xcc: u32,
+    pub recovery: u32,
+    pub enable_disable: u32,
+}
+
+impl TxFrameKindCounts {
+    pub const ZERO: Self = Self {
+        normal: 0,
+        hold: 0,
+        urgent_hold: 0,
+        refresh_0xcc: 0,
+        recovery: 0,
+        enable_disable: 0,
+    };
+
+    #[inline]
+    pub fn record(&mut self, kind: TxFrameKind) {
+        match kind {
+            TxFrameKind::Normal => self.normal = self.normal.saturating_add(1),
+            TxFrameKind::Hold => self.hold = self.hold.saturating_add(1),
+            TxFrameKind::UrgentHold => self.urgent_hold = self.urgent_hold.saturating_add(1),
+            TxFrameKind::Refresh0xCc => self.refresh_0xcc = self.refresh_0xcc.saturating_add(1),
+            TxFrameKind::Recovery => self.recovery = self.recovery.saturating_add(1),
+            TxFrameKind::EnableDisable => self.enable_disable = self.enable_disable.saturating_add(1),
+        }
+    }
+
+    #[inline]
+    pub fn total(self) -> u32 {
+        self.normal
+            .saturating_add(self.hold)
+            .saturating_add(self.urgent_hold)
+            .saturating_add(self.refresh_0xcc)
+            .saturating_add(self.recovery)
+            .saturating_add(self.enable_disable)
+    }
+}
+
+/// Cumulative counts of successfully transmitted CAN frames by functional kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TxFrameKindTotals {
+    pub normal: u64,
+    pub hold: u64,
+    pub urgent_hold: u64,
+    pub refresh_0xcc: u64,
+    pub recovery: u64,
+    pub enable_disable: u64,
+}
+
+impl TxFrameKindTotals {
+    #[inline]
+    pub fn add_counts(&mut self, c: TxFrameKindCounts) {
+        self.normal = self.normal.saturating_add(u64::from(c.normal));
+        self.hold = self.hold.saturating_add(u64::from(c.hold));
+        self.urgent_hold = self.urgent_hold.saturating_add(u64::from(c.urgent_hold));
+        self.refresh_0xcc = self.refresh_0xcc.saturating_add(u64::from(c.refresh_0xcc));
+        self.recovery = self.recovery.saturating_add(u64::from(c.recovery));
+        self.enable_disable = self.enable_disable.saturating_add(u64::from(c.enable_disable));
+    }
+}
+
 /// Per-tick CAN transmit metrics accumulated on the control thread (zero heap allocation).
 ///
 /// Timed interval: each individual `CanTransport::transmit` call (`Sent`, `WouldBlock`,
@@ -186,6 +270,8 @@ pub enum TxAttemptKind {
 pub struct TxTickMetrics {
     /// Frames successfully transmitted (`Ok(())`).
     pub frames: u32,
+    /// Per-kind breakdown of successfully transmitted frames.
+    pub by_kind: TxFrameKindCounts,
     /// `WouldBlock` (`EAGAIN` / `EWOULDBLOCK`) results on `transmit`.
     pub would_block: u32,
     /// `ENOBUFS` (`NoBufferSpace`) results on `transmit`.
@@ -211,6 +297,7 @@ pub struct TxTickMetrics {
 impl TxTickMetrics {
     pub const ZERO: Self = Self {
         frames: 0,
+        by_kind: TxFrameKindCounts::ZERO,
         would_block: 0,
         enobufs: 0,
         deferred: 0,
@@ -471,6 +558,16 @@ pub fn record_tx_attempt(kind: TxAttemptKind, wall_ns: u64, cpu_ns: u64) {
     });
 }
 
+/// Record the functional kind of a successfully transmitted CAN frame (zero allocation).
+#[inline]
+pub fn record_tx_frame_kind(kind: TxFrameKind) {
+    let _ = TX_TICK.try_with(|c| {
+        let mut m = c.get();
+        m.by_kind.record(kind);
+        c.set(m);
+    });
+}
+
 /// Record newly deferred command count and end-of-tick pending queue depth (zero allocation).
 #[inline]
 pub fn record_tx_deferred(newly_deferred: u32, pending_depth: u32) {
@@ -561,6 +658,15 @@ pub struct PostOverrunPhasesUs {
     /// Step return → start of ring publication (executor: `hub.wake`, `flush_torque_shadow`,
     /// guard drop, Window 2 wakes, pre-push tail; legacy: guard teardown, pre-publish tail).
     pub step_to_ring_us: u32,
+    /// Sub-release sleep wait inside `step_to_ring_us` (executor Window 2 `sleep_until`), µs.
+    #[serde(default)]
+    pub wake_sleep_us: u32,
+    /// Sub-release transition poll work inside `step_to_ring_us` (executor Window 2 wakes), µs.
+    #[serde(default)]
+    pub wake_poll_us: u32,
+    /// Torque shadow flush time inside `step_to_ring_us`, µs.
+    #[serde(default)]
+    pub shadow_flush_us: u32,
     /// Ring publication (`diag_tx.push` + `hub.wake` in executor;
     /// `LockFreeTickStats::record_staged_with_publish` in legacy).
     pub ring_publish_us: u32,
@@ -599,6 +705,8 @@ pub struct ThreadUsage {
     pub lock_alloc_max_us: u32,
     /// CAN frames successfully transmitted during the tick.
     pub tx_frames: u32,
+    /// Per-kind breakdown of successfully transmitted CAN frames during the tick.
+    pub tx_by_kind: TxFrameKindCounts,
     /// `WouldBlock` results during CAN TX attempts in this tick.
     pub tx_would_block: u32,
     /// `ENOBUFS` results during CAN TX attempts in this tick.
@@ -757,6 +865,7 @@ pub struct TickSample {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TxTotals {
     frames: u64,
+    by_kind: TxFrameKindTotals,
     would_block: u64,
     enobufs: u64,
     deferred: u64,
@@ -888,6 +997,8 @@ pub struct TxDiagnostics {
     pub frame_cpu_max_us: Percentiles,
     /// Event sums across the ticks in the window.
     pub frames_total: u64,
+    /// Per-kind transmitted frame sums across the ticks in the window.
+    pub by_kind_total: TxFrameKindTotals,
     pub would_block_total: u64,
     pub enobufs_total: u64,
     pub deferred_total: u64,
@@ -895,6 +1006,8 @@ pub struct TxDiagnostics {
     pub dropped_stopped_total: u64,
     /// Monotonic event sums since boot (not limited to the window).
     pub since_boot_frames: u64,
+    /// Monotonic per-kind transmitted frame sums since boot.
+    pub since_boot_by_kind: TxFrameKindTotals,
     pub since_boot_would_block: u64,
     pub since_boot_enobufs: u64,
     pub since_boot_deferred: u64,
@@ -1182,6 +1295,7 @@ pub fn thread_usage(start: &UsageMark, locked: &UsageMark, released: &UsageMark)
         lock_majflt: n(locked.majflt, released.majflt),
         lock_minflt: n(locked.minflt, released.minflt),
         tx_frames: tx.frames,
+        tx_by_kind: tx.by_kind,
         tx_would_block: tx.would_block,
         tx_enobufs: tx.enobufs,
         tx_deferred: tx.deferred,
@@ -1227,6 +1341,7 @@ impl TickStats {
         self.ticks += 1;
         if s.late { self.late_count += 1; }
         self.tx_totals.frames = self.tx_totals.frames.saturating_add(u64::from(s.usage.tx_frames));
+        self.tx_totals.by_kind.add_counts(s.usage.tx_by_kind);
         self.tx_totals.would_block = self.tx_totals.would_block.saturating_add(u64::from(s.usage.tx_would_block));
         self.tx_totals.enobufs = self.tx_totals.enobufs.saturating_add(u64::from(s.usage.tx_enobufs));
         self.tx_totals.deferred = self.tx_totals.deferred.saturating_add(u64::from(s.usage.tx_deferred));
@@ -1486,6 +1601,9 @@ struct AtomicTickSlot {
     // Overrun-only PostOverrunPhasesUs (`post_phases_us`) + `post_cpu_us`
     has_post_overrun: AtomicBool,
     post_step_to_ring_us: AtomicU32,
+    post_wake_sleep_us: AtomicU32,
+    post_wake_poll_us: AtomicU32,
+    post_shadow_flush_us: AtomicU32,
     post_ring_publish_us: AtomicU32,
     post_ring_to_seal_us: AtomicU32,
     post_seal_us: AtomicU32,
@@ -1506,6 +1624,12 @@ struct AtomicTickSlot {
     lock_alloc_us: AtomicU32,
     lock_alloc_max_us: AtomicU32,
     tx_frames: AtomicU32,
+    tx_normal: AtomicU32,
+    tx_hold: AtomicU32,
+    tx_urgent_hold: AtomicU32,
+    tx_refresh_0xcc: AtomicU32,
+    tx_recovery: AtomicU32,
+    tx_enable_disable: AtomicU32,
     tx_would_block: AtomicU32,
     tx_enobufs: AtomicU32,
     tx_deferred: AtomicU32,
@@ -1602,6 +1726,9 @@ impl AtomicTickSlot {
             (Some(pp), Some(cpu)) => {
                 self.has_post_overrun.store(true, Ordering::Relaxed);
                 self.post_step_to_ring_us.store(pp.step_to_ring_us, Ordering::Relaxed);
+                self.post_wake_sleep_us.store(pp.wake_sleep_us, Ordering::Relaxed);
+                self.post_wake_poll_us.store(pp.wake_poll_us, Ordering::Relaxed);
+                self.post_shadow_flush_us.store(pp.shadow_flush_us, Ordering::Relaxed);
                 self.post_ring_publish_us.store(pp.ring_publish_us, Ordering::Relaxed);
                 self.post_ring_to_seal_us.store(pp.ring_to_seal_us, Ordering::Relaxed);
                 self.post_seal_us.store(pp.seal_us, Ordering::Relaxed);
@@ -1610,6 +1737,9 @@ impl AtomicTickSlot {
             (Some(pp), None) => {
                 self.has_post_overrun.store(true, Ordering::Relaxed);
                 self.post_step_to_ring_us.store(pp.step_to_ring_us, Ordering::Relaxed);
+                self.post_wake_sleep_us.store(pp.wake_sleep_us, Ordering::Relaxed);
+                self.post_wake_poll_us.store(pp.wake_poll_us, Ordering::Relaxed);
+                self.post_shadow_flush_us.store(pp.shadow_flush_us, Ordering::Relaxed);
                 self.post_ring_publish_us.store(pp.ring_publish_us, Ordering::Relaxed);
                 self.post_ring_to_seal_us.store(pp.ring_to_seal_us, Ordering::Relaxed);
                 self.post_seal_us.store(pp.seal_us, Ordering::Relaxed);
@@ -1618,6 +1748,9 @@ impl AtomicTickSlot {
             (None, _) => {
                 self.has_post_overrun.store(false, Ordering::Relaxed);
                 self.post_step_to_ring_us.store(0, Ordering::Relaxed);
+                self.post_wake_sleep_us.store(0, Ordering::Relaxed);
+                self.post_wake_poll_us.store(0, Ordering::Relaxed);
+                self.post_shadow_flush_us.store(0, Ordering::Relaxed);
                 self.post_ring_publish_us.store(0, Ordering::Relaxed);
                 self.post_ring_to_seal_us.store(0, Ordering::Relaxed);
                 self.post_seal_us.store(0, Ordering::Relaxed);
@@ -1639,6 +1772,12 @@ impl AtomicTickSlot {
         self.lock_alloc_us.store(s.usage.lock_alloc_us, Ordering::Relaxed);
         self.lock_alloc_max_us.store(s.usage.lock_alloc_max_us, Ordering::Relaxed);
         self.tx_frames.store(s.usage.tx_frames, Ordering::Relaxed);
+        self.tx_normal.store(s.usage.tx_by_kind.normal, Ordering::Relaxed);
+        self.tx_hold.store(s.usage.tx_by_kind.hold, Ordering::Relaxed);
+        self.tx_urgent_hold.store(s.usage.tx_by_kind.urgent_hold, Ordering::Relaxed);
+        self.tx_refresh_0xcc.store(s.usage.tx_by_kind.refresh_0xcc, Ordering::Relaxed);
+        self.tx_recovery.store(s.usage.tx_by_kind.recovery, Ordering::Relaxed);
+        self.tx_enable_disable.store(s.usage.tx_by_kind.enable_disable, Ordering::Relaxed);
         self.tx_would_block.store(s.usage.tx_would_block, Ordering::Relaxed);
         self.tx_enobufs.store(s.usage.tx_enobufs, Ordering::Relaxed);
         self.tx_deferred.store(s.usage.tx_deferred, Ordering::Relaxed);
@@ -1714,6 +1853,9 @@ impl AtomicTickSlot {
             },
             post_phases_us: self.has_post_overrun.load(Ordering::Relaxed).then(|| PostOverrunPhasesUs {
                 step_to_ring_us: self.post_step_to_ring_us.load(Ordering::Relaxed),
+                wake_sleep_us: self.post_wake_sleep_us.load(Ordering::Relaxed),
+                wake_poll_us: self.post_wake_poll_us.load(Ordering::Relaxed),
+                shadow_flush_us: self.post_shadow_flush_us.load(Ordering::Relaxed),
                 ring_publish_us: self.post_ring_publish_us.load(Ordering::Relaxed),
                 ring_to_seal_us: self.post_ring_to_seal_us.load(Ordering::Relaxed),
                 seal_us: self.post_seal_us.load(Ordering::Relaxed),
@@ -1738,6 +1880,14 @@ impl AtomicTickSlot {
                 lock_alloc_us: self.lock_alloc_us.load(Ordering::Relaxed),
                 lock_alloc_max_us: self.lock_alloc_max_us.load(Ordering::Relaxed),
                 tx_frames: self.tx_frames.load(Ordering::Relaxed),
+                tx_by_kind: TxFrameKindCounts {
+                    normal: self.tx_normal.load(Ordering::Relaxed),
+                    hold: self.tx_hold.load(Ordering::Relaxed),
+                    urgent_hold: self.tx_urgent_hold.load(Ordering::Relaxed),
+                    refresh_0xcc: self.tx_refresh_0xcc.load(Ordering::Relaxed),
+                    recovery: self.tx_recovery.load(Ordering::Relaxed),
+                    enable_disable: self.tx_enable_disable.load(Ordering::Relaxed),
+                },
                 tx_would_block: self.tx_would_block.load(Ordering::Relaxed),
                 tx_enobufs: self.tx_enobufs.load(Ordering::Relaxed),
                 tx_deferred: self.tx_deferred.load(Ordering::Relaxed),
@@ -1842,6 +1992,12 @@ pub struct LockFreeTickStats {
     write_seq: AtomicU64,
     late_count: AtomicU64,
     tx_frames: AtomicU64,
+    tx_normal: AtomicU64,
+    tx_hold: AtomicU64,
+    tx_urgent_hold: AtomicU64,
+    tx_refresh_0xcc: AtomicU64,
+    tx_recovery: AtomicU64,
+    tx_enable_disable: AtomicU64,
     tx_would_block: AtomicU64,
     tx_enobufs: AtomicU64,
     tx_deferred: AtomicU64,
@@ -1883,6 +2039,12 @@ impl LockFreeTickStats {
             write_seq: AtomicU64::new(0),
             late_count: AtomicU64::new(0),
             tx_frames: AtomicU64::new(0),
+            tx_normal: AtomicU64::new(0),
+            tx_hold: AtomicU64::new(0),
+            tx_urgent_hold: AtomicU64::new(0),
+            tx_refresh_0xcc: AtomicU64::new(0),
+            tx_recovery: AtomicU64::new(0),
+            tx_enable_disable: AtomicU64::new(0),
             tx_would_block: AtomicU64::new(0),
             tx_enobufs: AtomicU64::new(0),
             tx_deferred: AtomicU64::new(0),
@@ -1969,6 +2131,12 @@ impl LockFreeTickStats {
             }
         };
         add_tx(&self.tx_frames, s.usage.tx_frames);
+        add_tx(&self.tx_normal, s.usage.tx_by_kind.normal);
+        add_tx(&self.tx_hold, s.usage.tx_by_kind.hold);
+        add_tx(&self.tx_urgent_hold, s.usage.tx_by_kind.urgent_hold);
+        add_tx(&self.tx_refresh_0xcc, s.usage.tx_by_kind.refresh_0xcc);
+        add_tx(&self.tx_recovery, s.usage.tx_by_kind.recovery);
+        add_tx(&self.tx_enable_disable, s.usage.tx_by_kind.enable_disable);
         add_tx(&self.tx_would_block, s.usage.tx_would_block);
         add_tx(&self.tx_enobufs, s.usage.tx_enobufs);
         add_tx(&self.tx_deferred, s.usage.tx_deferred);
@@ -2071,6 +2239,9 @@ impl LockFreeTickStats {
             }
             slot.has_post_overrun.store(true, Ordering::Relaxed);
             slot.post_step_to_ring_us.store(post_phases.step_to_ring_us, Ordering::Relaxed);
+            slot.post_wake_sleep_us.store(post_phases.wake_sleep_us, Ordering::Relaxed);
+            slot.post_wake_poll_us.store(post_phases.wake_poll_us, Ordering::Relaxed);
+            slot.post_shadow_flush_us.store(post_phases.shadow_flush_us, Ordering::Relaxed);
             slot.post_ring_publish_us.store(post_phases.ring_publish_us, Ordering::Relaxed);
             slot.post_ring_to_seal_us.store(post_phases.ring_to_seal_us, Ordering::Relaxed);
             slot.post_seal_us.store(post_phases.seal_us, Ordering::Relaxed);
@@ -2134,6 +2305,9 @@ impl LockFreeTickStats {
                     if let Some((pp, cpu_us)) = post_overrun {
                         slot.has_post_overrun.store(true, Ordering::Relaxed);
                         slot.post_step_to_ring_us.store(pp.step_to_ring_us, Ordering::Relaxed);
+                        slot.post_wake_sleep_us.store(pp.wake_sleep_us, Ordering::Relaxed);
+                        slot.post_wake_poll_us.store(pp.wake_poll_us, Ordering::Relaxed);
+                        slot.post_shadow_flush_us.store(pp.shadow_flush_us, Ordering::Relaxed);
                         slot.post_ring_publish_us.store(pp.ring_publish_us, Ordering::Relaxed);
                         slot.post_ring_to_seal_us.store(pp.ring_to_seal_us, Ordering::Relaxed);
                         slot.post_seal_us.store(pp.seal_us, Ordering::Relaxed);
@@ -2159,6 +2333,14 @@ impl LockFreeTickStats {
             let late_count = self.late_count.load(Ordering::Relaxed);
             let tx_totals = TxTotals {
                 frames: self.tx_frames.load(Ordering::Relaxed),
+                by_kind: TxFrameKindTotals {
+                    normal: self.tx_normal.load(Ordering::Relaxed),
+                    hold: self.tx_hold.load(Ordering::Relaxed),
+                    urgent_hold: self.tx_urgent_hold.load(Ordering::Relaxed),
+                    refresh_0xcc: self.tx_refresh_0xcc.load(Ordering::Relaxed),
+                    recovery: self.tx_recovery.load(Ordering::Relaxed),
+                    enable_disable: self.tx_enable_disable.load(Ordering::Relaxed),
+                },
                 would_block: self.tx_would_block.load(Ordering::Relaxed),
                 enobufs: self.tx_enobufs.load(Ordering::Relaxed),
                 deferred: self.tx_deferred.load(Ordering::Relaxed),
@@ -2376,12 +2558,21 @@ impl TickWindow {
                 frame_max_us: self.col(|r| r.usage.tx_frame_max_us),
                 frame_cpu_max_us: self.col(|r| r.usage.tx_frame_cpu_max_us),
                 frames_total: self.sum(|r| r.usage.tx_frames),
+                by_kind_total: TxFrameKindTotals {
+                    normal: self.sum(|r| r.usage.tx_by_kind.normal),
+                    hold: self.sum(|r| r.usage.tx_by_kind.hold),
+                    urgent_hold: self.sum(|r| r.usage.tx_by_kind.urgent_hold),
+                    refresh_0xcc: self.sum(|r| r.usage.tx_by_kind.refresh_0xcc),
+                    recovery: self.sum(|r| r.usage.tx_by_kind.recovery),
+                    enable_disable: self.sum(|r| r.usage.tx_by_kind.enable_disable),
+                },
                 would_block_total: self.sum(|r| r.usage.tx_would_block),
                 enobufs_total: self.sum(|r| r.usage.tx_enobufs),
                 deferred_total: self.sum(|r| r.usage.tx_deferred),
                 dropped_stale_total: self.sum(|r| r.usage.tx_dropped_stale),
                 dropped_stopped_total: self.sum(|r| r.usage.tx_dropped_stopped),
                 since_boot_frames: self.tx_totals.frames,
+                since_boot_by_kind: self.tx_totals.by_kind,
                 since_boot_would_block: self.tx_totals.would_block,
                 since_boot_enobufs: self.tx_totals.enobufs,
                 since_boot_deferred: self.tx_totals.deferred,
