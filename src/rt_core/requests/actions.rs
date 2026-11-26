@@ -160,6 +160,7 @@ pub enum PreparedActionKind {
     MoveRelativeJoint,
     MoveToPose,
     Gripper,
+    GripperZeroCheck,
     Replay,
 }
 
@@ -170,6 +171,7 @@ impl PreparedActionKind {
             Self::MoveRelativeLinear | Self::MoveRelativeJoint => "move_relative",
             Self::MoveToPose => "move_to_pose",
             Self::Gripper => "gripper",
+            Self::GripperZeroCheck => "gripper_zero_check",
             Self::Replay => "replay",
         }
     }
@@ -312,6 +314,18 @@ pub enum StagedAction {
         /// `speed_scale` checked against `commissioning_required` off-thread.
         speed_scale: Option<f64>,
     },
+    /// Prepared mechanical gripper zero check (`gripper_zero_check`) backed by PR0B
+    /// `SessionDriver` (`SessionKind::GripperZeroCheck`) and optional PR C offset store.
+    GripperZeroCheck {
+        dof: u8,
+        start: [f32; MAX_DOF],
+        store_offset: bool,
+        threshold_rad: f32,
+        tool_digest: u64,
+        operator_grant: crate::auth::OperatorGrant,
+        /// Off-RT staged `ZeroCheckPersistContext` handle (`0` when `store_offset == false`).
+        persist_ctx_id: u64,
+    },
     /// Prepared episode replay (resampled trajectory lives in `PlanSlot::path`; approach quintic
     /// to frame 0 is pre-planned, power-fitted, and workspace-swept off-thread at prepare time).
     Replay {
@@ -337,6 +351,7 @@ impl StagedAction {
             | Self::Joint { child, .. }
             | Self::Gripper { child, .. }
             | Self::Replay { child, .. } => child.as_ref(),
+            Self::GripperZeroCheck { .. } => None,
         }
     }
 
@@ -345,6 +360,7 @@ impl StagedAction {
             Self::Cartesian { dof, start, .. }
             | Self::Joint { dof, start, .. }
             | Self::Gripper { dof, start, .. }
+            | Self::GripperZeroCheck { dof, start, .. }
             | Self::Replay { dof, start, .. } => (usize::from(*dof), start),
         }
     }
@@ -789,6 +805,35 @@ impl ActionRefusal {
                 code: "TOOL_MISMATCH".into(),
                 message: "Active tool changed since preparation".into(),
             },
+            "UNSUPPORTED" => ArmError::Motion(MotionError::Unsupported(
+                "Operation is not supported for this profile or configuration".into(),
+            )),
+            "INVALID_COMMAND" => ArmError::Motion(MotionError::InvalidCommand(
+                "Invalid command parameters".into(),
+            )),
+            "NOT_ARMED" => ArmError::Safety(SafetyError::NotArmed(SafetyState::Idle)),
+            "FAULT_ACTIVE" => ArmError::Safety(SafetyError::FaultActive(
+                crate::safety::FaultReason::Other("Fault active".into()),
+            )),
+            "HANDOVER_SETTLING" => ArmError::Safety(SafetyError::HandoverSettling),
+            "COLLISION_HOLD" => ArmError::Safety(SafetyError::CollisionHold(
+                "collision hold active".into(),
+            )),
+            "OBJECT_HELD" => ArmError::Rejected {
+                status: 409,
+                code: "OBJECT_HELD".into(),
+                message: "Gripper holds an object (or its release did not finish); open the gripper fully before the zero check".into(),
+            },
+            "OPERATOR_REQUIRED" => ArmError::Rejected {
+                status: 403,
+                code: "OPERATOR_REQUIRED".into(),
+                message: "Operator session required for gripper_zero_check (store_offset=true)".into(),
+            },
+            "SESSION_BUSY" | "TRANSITION_BUSY" | "DISABLE_PENDING" => {
+                ArmError::Motion(MotionError::MotionBusy(
+                    "another motion, session, or torque transition is running".into(),
+                ))
+            }
             other => ArmError::Rejected {
                 status: 409,
                 code: other.into(),
@@ -2126,6 +2171,272 @@ pub fn prepare_gripper_request(
         max_budget_s,
         extend_pos_force_close_timeout,
     })
+}
+
+/// Off-thread prepared mechanical gripper zero check (`/api/v1/action/gripper_zero_check`),
+/// ready to stage into [`PlanSlot`] for executor PR0B session admission (0 RT heap allocs).
+#[derive(Debug, Clone)]
+pub struct PreparedGripperZeroCheck {
+    pub stamp: ActionStamp,
+    pub start: Vec<f32>,
+    pub store_offset: bool,
+    pub threshold_rad: f32,
+    pub tool_digest: u64,
+    pub operator_grant: crate::auth::OperatorGrant,
+    pub expected_duration_s: f64,
+    pub timeout_s: f64,
+}
+
+impl PreparedGripperZeroCheck {
+    pub fn to_plan_slot(&self, persist_ctx_id: u64) -> Result<PlanSlot, &'static str> {
+        let dof = self.start.len();
+        if dof == 0 || dof > MAX_DOF {
+            return Err("INVALID_COMMAND");
+        }
+        let mut start = [0.0f32; MAX_DOF];
+        start[..dof].copy_from_slice(&self.start);
+        let mut slot = PlanSlot::with_path_capacity(0);
+        slot.set(Primitive::Action(StagedAction::GripperZeroCheck {
+            dof: dof as u8,
+            start,
+            store_offset: self.store_offset,
+            threshold_rad: self.threshold_rad,
+            tool_digest: self.tool_digest,
+            operator_grant: self.operator_grant,
+            persist_ctx_id,
+        }));
+        Ok(slot)
+    }
+}
+
+/// Off-thread preparation for `/api/v1/action/gripper_zero_check` from a coherent PR0A
+/// [`ServiceSnapshot`](crate::rt_core::publish::ServiceSnapshot) and [`PublishedConfig`].
+///
+/// Mirrors `SupervisorInner::start_gripper_zero_check_with_auth_inner` validation precedence
+/// 1-to-1 and pre-allocates `Box<ZeroCheckPersistContext>` strictly off-RT when `store_offset=true`.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_gripper_zero_check(
+    svc: &crate::rt_core::publish::ServiceSnapshot,
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+    admission: AdmissionStamp,
+    deadline: Instant,
+    body: &Value,
+    operator_grant: crate::auth::OperatorGrant,
+    operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+) -> Result<(PreparedGripperZeroCheck, Option<Box<crate::supervisor::ZeroCheckPersistContext>>), ArmError> {
+    if !body.is_object() {
+        return Err(MotionError::InvalidCommand("Command body must be an object".into()).into());
+    }
+    let env = svc.prep_env.as_ref().ok_or_else(|| {
+        ArmError::Motion(MotionError::PlanStale(
+            "published planning environment unavailable".into(),
+        ))
+    })?;
+    if pub_cfg.gripper_calib_revision != svc.revisions.gripper_calib
+        || tool_digest_hash(&pub_cfg.config.active_tool.config_digest)
+            != svc.revisions.tool_digest_hash
+    {
+        return Err(ArmError::Motion(MotionError::PlanStale(
+            "published gripper calibration configuration lags RT owner revision".into(),
+        )));
+    }
+    let gripper_idx = env.config.gripper_index().ok_or_else(|| {
+        MotionError::Unsupported("Gripper zero check needs a profile with a gripper joint".into())
+    })?;
+    let Some(policy) = env.config.gripper_policy.clone() else {
+        return Err(MotionError::Unsupported(
+            "Gripper zero check needs a profile with a gripper policy".into(),
+        )
+        .into());
+    };
+    if !policy.zero_check_supported {
+        return Err(MotionError::Unsupported(
+            "Gripper zero check is not supported for this gripper policy".into(),
+        )
+        .into());
+    }
+    if admission.estop_epoch != svc.epoch_id {
+        return Err(SafetyError::EpochMismatch {
+            expected: svc.epoch_id,
+            received: admission.estop_epoch,
+        }
+        .into());
+    }
+    let owner = &svc.snapshot.rt.owner;
+    if owner.handover_settling {
+        return Err(SafetyError::HandoverSettling.into());
+    }
+    match &svc.snapshot.obs.safety_state {
+        SafetyState::EStop => return Err(SafetyError::EStopActive.into()),
+        SafetyState::Fault(r) => return Err(SafetyError::FaultActive(r.clone()).into()),
+        s if !s.is_operational() => return Err(SafetyError::NotArmed(s.clone()).into()),
+        _ => {}
+    }
+    if owner.pending_rearm || owner.pending_normal_unload {
+        return Err(SafetyError::NotArmed(svc.snapshot.obs.safety_state.clone()).into());
+    }
+    if svc.snapshot.obs.disable_pending {
+        return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
+    }
+    if owner.gravity_comp_active {
+        return Err(MotionError::MotionBusy("gravity compensation is active".into()).into());
+    }
+    if owner.collision_hold {
+        return Err(SafetyError::CollisionHold("collision hold active".into()).into());
+    }
+    if owner.config_inhibited {
+        return Err(ArmError::Rejected {
+            status: 409,
+            code: "CONFIG_BUSY".into(),
+            message: "Configuration change is in progress".into(),
+        });
+    }
+    if owner.calibration_busy {
+        return Err(MotionError::MotionBusy("a calibration apply is running".into()).into());
+    }
+    if owner.zero_check_persisting {
+        return Err(MotionError::MotionBusy("gripper calibration is being persisted".into()).into());
+    }
+    if owner.policy_busy {
+        return Err(MotionError::MotionBusy("a policy run is active".into()).into());
+    }
+    if owner.motion_active {
+        return Err(MotionError::MotionBusy("a trajectory is running".into()).into());
+    }
+    if svc
+        .snapshot
+        .rt
+        .commanded_velocities
+        .iter()
+        .any(|v| v.abs() >= 1e-3)
+    {
+        return Err(MotionError::MotionBusy("the arm is still moving".into()).into());
+    }
+    if !svc.snapshot.obs.is_torqued {
+        return Err(SafetyError::NotArmed(svc.snapshot.obs.safety_state.clone()).into());
+    }
+    if owner.held.is_some() {
+        return Err(ArmError::Rejected {
+            status: 409,
+            code: "OBJECT_HELD".into(),
+            message: "Gripper holds an object (or its release did not finish); open the gripper fully before the zero check".into(),
+        });
+    }
+    let store_offset = body
+        .get("store_offset")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let threshold_rad = body
+        .get("threshold_rad")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32)
+        .unwrap_or(0.10);
+    if !threshold_rad.is_finite() || threshold_rad <= 0.0 {
+        return Err(MotionError::InvalidCommand(
+            "threshold_rad must be positive and finite".into(),
+        )
+        .into());
+    }
+    if store_offset
+        && pub_cfg.operator_auth_enforced
+        && !operator_grant.is_valid_at(Instant::now(), true)
+    {
+        return Err(ArmError::Rejected {
+            status: 403,
+            code: "OPERATOR_REQUIRED".into(),
+            message: "Operator session required for gripper_zero_check (store_offset=true)".into(),
+        });
+    }
+    let request = GripperRequest {
+        command: GripperCommand::Seek,
+        fraction: None,
+        grasp: false,
+        speed: 0.3,
+        timeout_s: None,
+        tag: None,
+    };
+    if policy.max_close_torque_nm.is_some() && env.driver_present && !env.has_torque_feedback {
+        return Err(MotionError::Unsupported(
+            "Gripper close requires torque_feedback when max_close_torque_nm is configured".into(),
+        )
+        .into());
+    }
+    let start_g = svc
+        .snapshot
+        .rt
+        .commanded_positions
+        .get(gripper_idx)
+        .copied()
+        .unwrap_or(0.0);
+    let motion = GripperMotion::try_with_close_speed_limit(
+        request,
+        policy,
+        env.config.limits[gripper_idx].clone(),
+        start_g,
+        gripper_idx,
+        env.gripper_close_speed_limit,
+    )?
+    .with_ceiling_torque_estimate(env.gripper_ceiling_torque_estimate);
+    let expected_duration_s = motion.expected_duration();
+    let timeout_s = motion.timeout_s;
+
+    let persist_ctx = if store_offset {
+        let path = pub_cfg
+            .gripper_calib_path
+            .clone()
+            .unwrap_or_else(crate::gripper_calib::path_from_env);
+        let gripper_limit = pub_cfg
+            .config
+            .gripper_index()
+            .and_then(|idx| pub_cfg.config.limits.get(idx))
+            .cloned();
+        Some(Box::new(crate::supervisor::ZeroCheckPersistContext {
+            path,
+            jaw_opening: pub_cfg.gripper_calib_jaw_opening.clone(),
+            stale: pub_cfg.gripper_calib_stale.clone(),
+            tool_id: pub_cfg.config.active_tool.id.clone(),
+            tool_config_digest: pub_cfg.config.active_tool.config_digest.clone(),
+            active_tool_is_stock: pub_cfg.config.active_tool.is_stock,
+            base_gripper_policy: pub_cfg
+                .base_gripper_policy
+                .clone()
+                .or_else(|| pub_cfg.config.gripper_policy.clone()),
+            gripper_limit,
+            operator_auth,
+            sat_msg_buf: String::with_capacity(64),
+        }))
+    } else {
+        None
+    };
+
+    let stamp = ActionStamp {
+        arm: svc.arm,
+        boot: svc.boot,
+        admission,
+        config_revision: svc.revisions.workspace,
+        calibration_revision: Some(svc.revisions.calibration),
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: Some(svc.revisions.gripper_calib),
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline,
+    };
+
+    Ok((
+        PreparedGripperZeroCheck {
+            stamp,
+            start: svc.snapshot.rt.commanded_positions.clone(),
+            store_offset,
+            threshold_rad,
+            tool_digest: svc.revisions.tool_digest_hash,
+            operator_grant,
+            expected_duration_s,
+            timeout_s,
+        },
+        persist_ctx,
+    ))
 }
 
 /// Off-thread preparation for `/api/v1/action/move_to_pose` from a published [`ActionSnapshot`].
@@ -3605,6 +3916,205 @@ fn install_gripper_rt(
     Ok((id, duration))
 }
 
+/// Zero-allocation RT owner install for mechanical gripper zero check (`/api/v1/action/gripper_zero_check`)
+/// backed by PR0B `SessionDriver` (`SessionSlot::ExclusiveOutput`, `SessionKind::GripperZeroCheck`).
+///
+/// Explicit transactional ordering:
+/// 1. ALL fallible checks (authority, start freshness, revisions/tool digest, preconditions,
+///    `is_torqued`, `!held`, live conditional `OperatorGrant`, torque feedback, `GripperMotion`
+///    construction, `exclusive_output_conflict_for`, terminal FIFO, and operational safety state)
+///    run strictly BEFORE consuming A1 admission or mutating any action/output state.
+/// 2. `admit_session_with_proof` runs strictly BEFORE `begin_action_rt` so an admission refusal
+///    never supersedes a running action or leaves half-installed state.
+/// 3. Session `child_deadline` is strictly outside `GripperMotion::timeout_s` (+2.0 s) so normal
+///    seek timeout produces the exact legacy `GRIPPER_TIMEOUT` while still bounding TX cutoffs.
+#[allow(clippy::too_many_arguments)]
+fn install_gripper_zero_check_rt(
+    inner: &mut SupervisorInner,
+    stamp: &ActionStamp,
+    ctx: &OwnerCheckCtx,
+    dof: usize,
+    start: &[f32; MAX_DOF],
+    store_offset: bool,
+    threshold_rad: f32,
+    tool_digest: u64,
+    operator_grant: crate::auth::OperatorGrant,
+    persist_ctx_id: u64,
+) -> Result<InstalledAction, &'static str> {
+    if dof == 0 || dof > MAX_DOF || !threshold_rad.is_finite() || threshold_rad <= 0.0 {
+        return Err("INVALID_COMMAND");
+    }
+    if store_offset && persist_ctx_id == 0 {
+        return Err("INVALID_COMMAND");
+    }
+    if tool_digest_hash(&inner.config.active_tool.config_digest) != tool_digest {
+        return Err("TOOL_MISMATCH");
+    }
+    let mut post_q = [0.0f32; MAX_DOF];
+    let (post_dof, _) = inner.post_quiesce_commanded_positions(&mut post_q);
+    check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| r.code)?;
+    let gripper_idx = inner.config.gripper_index().ok_or("UNSUPPORTED")?;
+    let policy = inner
+        .config
+        .gripper_policy
+        .as_ref()
+        .ok_or("UNSUPPORTED")?
+        .clone_without_jaw_opening();
+    if !policy.zero_check_supported {
+        return Err("UNSUPPORTED");
+    }
+    if stamp.admission.estop_epoch != inner.safety.epoch_id() {
+        return Err("EPOCH_MISMATCH");
+    }
+    if inner.handover_settling_since.is_some() {
+        return Err("HANDOVER_SETTLING");
+    }
+    if inner.disable_pending || inner.torque_transition.is_some() || inner.park_continuation.is_some() {
+        return Err("MOTION_BUSY");
+    }
+    inner.action_preconditions_static()?;
+    inner.check_pos_force_gripper_fresh_static()?;
+    if !inner.is_torqued {
+        return Err("NOT_ARMED");
+    }
+    if inner.held.is_some() {
+        return Err("OBJECT_HELD");
+    }
+    if store_offset
+        && inner.operator_auth_enforced
+        && !operator_grant.is_valid_at(ctx.now, true)
+    {
+        return Err("OPERATOR_REQUIRED");
+    }
+    let request = GripperRequest {
+        command: GripperCommand::Seek,
+        fraction: None,
+        grasp: false,
+        speed: 0.3,
+        timeout_s: None,
+        tag: None,
+    };
+    if policy.max_close_torque_nm.is_some() {
+        inner.check_gripper_close_torque_feedback_rt(
+            request.command,
+            request.fraction,
+            &policy,
+            gripper_idx,
+        )?;
+    }
+    let close_cap = inner.gripper_close_speed_limit();
+    let ceiling_est = inner.gripper_ceiling_torque_estimate();
+    let lim = &inner.config.limits[gripper_idx];
+    let limit_zero_alloc = JointLimit {
+        name: String::new(),
+        min_position: lim.min_position,
+        max_position: lim.max_position,
+        max_velocity: lim.max_velocity,
+        max_acceleration: lim.max_acceleration,
+    };
+    let motion = GripperMotion::try_with_close_speed_limit_static(
+        request,
+        policy,
+        limit_zero_alloc,
+        post_q[gripper_idx],
+        gripper_idx,
+        close_cap,
+    )?
+    .with_ceiling_torque_estimate(ceiling_est);
+    let duration = motion.expected_duration();
+    let motion_timeout_s = motion.hard_timeout_s();
+    let target_g = motion.target;
+    let wire_vel_ceiling = motion.wire_velocity_ceiling();
+
+    // Check session slot exclusivity, terminal FIFO, and safety state strictly BEFORE admission/mutation.
+    if let Some(conflict) = inner.exclusive_output_conflict_for(SessionKind::GripperZeroCheck, None) {
+        return Err(conflict);
+    }
+    inner
+        .check_terminal_fifo_for_new_action()
+        .map_err(|e| static_code(e.into()))?;
+    if !matches!(inner.safety.state(), SafetyState::Armed | SafetyState::Moving) {
+        return Err("NOT_ARMED");
+    }
+
+    let admitted = consume_action_admission(inner, stamp, ctx.stop_generation).map_err(|r| r.code)?;
+    let (this, proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+
+    let predicted_id = this.peek_next_action_id();
+    let mut prepared_session = PreparedSession::exclusive(
+        SessionKind::GripperZeroCheck,
+        ClientId(proof.stamp().connection_id),
+    );
+    prepared_session.action_id = Some(ActionId(predicted_id));
+    prepared_session.request_id = None; // Single P-F1 terminal owned by ReleaseEngine::active.
+    prepared_session.child_deadline =
+        Some(ctx.now + Duration::from_secs_f64(motion_timeout_s + 2.0));
+    prepared_session.deadline = Some(
+        ctx.now
+            + Duration::from_secs_f64(motion_timeout_s + if store_offset { 10.0 } else { 3.0 }),
+    );
+    prepared_session.timeout_code = "GRIPPER_TIMEOUT";
+    prepared_session.child_timeout_code = "GRIPPER_TIMEOUT";
+    prepared_session.operator_required = store_offset;
+    prepared_session.operator_grant = Some(operator_grant);
+    prepared_session.revoke_on_stop = true;
+    prepared_session.escalate_safe_hold_on_uncertain = true;
+
+    let sid = this
+        .admit_session_with_proof(prepared_session, &proof, ctx.now)
+        .map_err(SessionAdmitError::code)?;
+    if let Err(e) = this.safety.mark_motion_started() {
+        let _ = this.sessions.cancel_slot(
+            SessionSlot::ExclusiveOutput,
+            sid,
+            SessionTerminalReason::Cancelled("NOT_ARMED"),
+            false,
+        );
+        let _ = this
+            .sessions
+            .clear_terminal_slot(SessionSlot::ExclusiveOutput, sid);
+        return Err(static_code(ArmError::Safety(e)));
+    }
+
+    // Infallible commit tail (0 heap allocations, 0 heap frees).
+    let id = this.begin_action_rt("gripper_zero_check");
+    debug_assert_eq!(id, predicted_id);
+    this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
+    this.release_servo_target();
+    this.servo_settled_ticks.fill(0);
+    this.clear_servo_ws_min_depths_rt();
+    crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
+    if gripper_idx < this.target_positions.len() {
+        this.target_positions[gripper_idx] = target_g;
+    }
+    this.last_heartbeat = ctx.now;
+    this.gripper_stalled = false;
+    this.gripper_high_torque_ticks = 0;
+    this.gripper_low_torque_ticks = 0;
+    this.gripper_stall_window.reset();
+    let base_closed_rad = this
+        .base_gripper_policy
+        .as_ref()
+        .map_or(0.0, |p| p.closed_rad);
+    let boxed = this.box_gripper_motion_rt(motion);
+    this.replace_active_trajectory(Some(ActiveTrajectory::new(
+        Some(id),
+        Reference::Gripper(boxed),
+    )));
+    this.zero_check_params = Some(crate::supervisor::ZeroCheckParams {
+        action_id: id,
+        store_offset,
+        threshold_rad,
+        base_closed_rad,
+        persist_ctx: None,
+        persist_ctx_id,
+        session_id: Some(sid),
+        connection_id: proof.stamp().connection_id,
+        operator_grant: store_offset.then_some(operator_grant),
+    });
+    Ok((id, duration))
+}
+
 /// **4. ONE owner-side install for standalone replay actions** (`replay`).
 pub fn install_replay(
     inner: &mut SupervisorInner,
@@ -4640,6 +5150,7 @@ fn install_macro_child_slot_rt(
                 is_pos_force_close: is_pf,
             })
         }
+        StagedAction::GripperZeroCheck { .. } => Err("INVALID_COMMAND"),
         StagedAction::Replay {
             start,
             episode,
@@ -4902,6 +5413,26 @@ pub fn commit_action(
                     speed,
                     timeout_s,
                     speed_scale,
+                )?,
+                StagedAction::GripperZeroCheck {
+                    dof,
+                    start,
+                    store_offset,
+                    threshold_rad,
+                    tool_digest,
+                    operator_grant,
+                    persist_ctx_id,
+                } => install_gripper_zero_check_rt(
+                    inner,
+                    &stamp,
+                    &owner_ctx,
+                    usize::from(dof),
+                    &start,
+                    store_offset,
+                    threshold_rad,
+                    tool_digest,
+                    operator_grant,
+                    persist_ctx_id,
                 )?,
                 StagedAction::Replay {
                     dof,

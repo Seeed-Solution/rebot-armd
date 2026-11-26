@@ -218,7 +218,10 @@ impl SupervisorInner {
         self.retire_motion_payloads();
         self.pending_deferred_done = None;
         self.pending_normal_unload = false;
-        self.zero_check_persisting = None;
+        if !self.rt_executor_owned {
+            self.zero_check_persisting = None;
+            self.zero_check_persisting_grant = None;
+        }
         self.end_gripper_stream();
         self.j7_admitted_stamp = None;
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
@@ -441,7 +444,9 @@ impl SupervisorInner {
         {
             let reason = match policy {
                 StopPolicy::EStopLatch => "ESTOP_ACTIVE",
-                _ => "STOPPED",
+                StopPolicy::ThermalTrip => "THERMAL_TRIP",
+                StopPolicy::BusLossFallback => "BUS_LOSS",
+                StopPolicy::NormalUnload => "STOPPED",
             };
             self.revoke_sessions_on_stop(reason);
         }

@@ -58,9 +58,9 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::Conditional(gripper_zero_check_auth_check),
         reply: ReplyPolicy::CommandImmediate,
-        ownership: RouteOwnership::LegacyOnly,
+        ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::None,
+        executor_route: ExecutorWsRoute::Action,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/action/grasp"),
@@ -518,6 +518,34 @@ async fn submit_prepared_executor_ws(
         code: "EXECUTOR_UNAVAILABLE".into(),
         message: "RT executor is not active".into(),
     })?;
+    // Ownership of `persist_ctx_id` stays with this guard ONLY until `submit_external_action`
+    // succeeds; once admitted to the broker, `BrokerDispatcher` owns refusal reclamation and
+    // `armd-control` / `armd-persist` owns post-ACK reclamation so dropping this WS future
+    // mid-await can never delete a live action's context.
+    struct ZeroCheckPreSubmitGuard {
+        handle: crate::rt_core::executor::RtExecutorHandle,
+        ctx_id: u64,
+    }
+    impl ZeroCheckPreSubmitGuard {
+        fn disarm(&mut self) {
+            self.ctx_id = 0;
+        }
+    }
+    impl Drop for ZeroCheckPreSubmitGuard {
+        fn drop(&mut self) {
+            if self.ctx_id != 0 {
+                self.handle.remove_zero_check_context(self.ctx_id);
+            }
+        }
+    }
+    let persist_ctx_id = match &prepared {
+        PreparedWsAction::GripperZeroCheck { persist_ctx_id, .. } => *persist_ctx_id,
+        _ => 0,
+    };
+    let mut zc_guard = ZeroCheckPreSubmitGuard {
+        handle: handle.clone(),
+        ctx_id: persist_ctx_id,
+    };
     let (
         slot,
         kind,
@@ -577,6 +605,25 @@ async fn submit_prepared_executor_ws(
                 g.expected_duration_s,
             )
         }
+        PreparedWsAction::GripperZeroCheck {
+            prepared: gz,
+            persist_ctx_id,
+        } => {
+            let slot = gz.to_plan_slot(persist_ctx_id).map_err(|code| {
+                ActionRefusal::new(code).into_arm_error_with_epoch(gz.stamp.admission.estop_epoch)
+            })?;
+            (
+                slot,
+                PreparedActionKind::GripperZeroCheck,
+                gz.stamp,
+                false,
+                None,
+                gz.stamp.calibration_revision,
+                gz.stamp.gripper_calib_revision,
+                gz.stamp.power_budget_revision,
+                gz.expected_duration_s,
+            )
+        }
         PreparedWsAction::Replay(r) => {
             let slot = r
                 .to_plan_slot(None)
@@ -604,7 +651,7 @@ async fn submit_prepared_executor_ws(
 
     let (_req_id, mut rx, ack_guard) = loop {
         let write = |dst: &mut PlanSlot| *dst = slot.clone();
-        match handle.submit_external_action(
+        match handle.submit_external_action_with_zero_check_ctx(
             client,
             0,
             auth,
@@ -623,8 +670,13 @@ async fn submit_prepared_executor_ws(
             ExternalDestinationPolicy::ConnectionOnly,
             true,
             Some(Arc::clone(&wire_tracker)),
+            persist_ctx_id,
         ) {
-            Ok(triple) => break triple,
+            Ok(triple) => {
+                // Ownership transferred atomically to BrokerDispatcher -> RT owner / PR C.
+                zc_guard.disarm();
+                break triple;
+            }
             Err(ExternalSubmitError::NoDestination) => {
                 return Err(ArmError::Rejected {
                     status: 503,
@@ -758,12 +810,13 @@ pub(super) async fn handle_executor_ws_action(
             | "/api/v1/action/gripper"
             | "/api/v1/action/replay"
     );
+    let is_gripper_zero_check = path == "/api/v1/action/gripper_zero_check";
     let is_macro = path == "/api/v1/action/grasp"
         || path == "/api/v1/action/place"
         || path == "/api/v1/action/run_sequence"
         || path == crate::calib_hover::PATH
         || path == crate::measure_multiview::PATH;
-    if !is_prepared && !is_macro {
+    if !is_prepared && !is_gripper_zero_check && !is_macro {
         return None;
     }
 
@@ -872,6 +925,17 @@ pub(super) async fn handle_executor_ws_action(
                 ApiError::operator_required("run_sequence (record)"),
             ));
         }
+        AuthRequirement::Conditional(_)
+            if path == "/api/v1/action/gripper_zero_check"
+                && !ws_auth.is_operator()
+                && body.get("store_offset").and_then(Value::as_bool) == Some(true) =>
+        {
+            return immediate(off_lock_action_reject(
+                &request_id_val,
+                epoch,
+                ApiError::operator_required("gripper_zero_check (store_offset=true)"),
+            ));
+        }
         _ => {}
     }
 
@@ -889,6 +953,96 @@ pub(super) async fn handle_executor_ws_action(
     ws_stamp.lease_gen = local_generation;
     ws_stamp.estop_epoch = epoch;
     let deadline = Instant::now() + crate::rt_core::requests::actions::DEFAULT_ACTION_DEADLINE;
+
+    if is_gripper_zero_check {
+        let svc = match recv_supervisor
+            .read_services(crate::rt_core::publish::ReadRequirements {
+                require_within_valid_until: false,
+                require_prep_env: true,
+                ..crate::rt_core::publish::ReadRequirements::identity()
+            })
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+        };
+        let pub_cfg = match recv_supervisor.published_config().await {
+            Ok(c) => c,
+            Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+        };
+        let operator_grant = ws_auth.operator_grant();
+        let operator_auth = Some(ws_auth.auth_and_token());
+        let (prepared, persist_ctx) = match crate::rt_core::requests::actions::prepare_gripper_zero_check(
+            &svc,
+            &pub_cfg,
+            ws_stamp,
+            deadline,
+            body,
+            operator_grant,
+            operator_auth,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+        };
+        let Some(handle) = recv_supervisor.executor_handle() else {
+            return immediate(off_lock_action_reject(
+                &request_id_val,
+                epoch,
+                ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_UNAVAILABLE".into(),
+                    message: "RT executor is not active".into(),
+                }
+                .into(),
+            ));
+        };
+        let persist_ctx_id = if let Some(ctx) = persist_ctx {
+            match handle.stage_zero_check_context(ctx) {
+                Ok(id) => id,
+                Err(e) => return immediate(off_lock_action_reject(&request_id_val, epoch, e.into())),
+            }
+        } else {
+            0
+        };
+        let cur_epoch = recv_supervisor
+            .hub()
+            .latest()
+            .map_or(epoch, |s| s.obs.epoch_id);
+        let gate = CommandReplyGateGuard::enter_with_tracker(
+            command_reply_pending,
+            recv_supervisor.hub(),
+            wire_ack_tracker,
+        );
+        match submit_prepared_executor_ws(
+            recv_supervisor,
+            recv_conn_id,
+            PreparedWsAction::GripperZeroCheck {
+                prepared,
+                persist_ctx_id,
+            },
+            Arc::clone(wire_ack_tracker),
+        )
+        .await
+        {
+            Ok((started, ack_guard)) => {
+                let reply = off_lock_action_ack(recv_supervisor, &request_id_val, Some(started), cur_epoch);
+                return Some(ExecutorActionDispatch::Reply {
+                    reply,
+                    gate: Some(gate),
+                    ack_guard: Some(ack_guard),
+                });
+            }
+            Err(error) => {
+                drop(gate);
+                let post_ep = recv_supervisor
+                    .hub()
+                    .latest()
+                    .map_or(cur_epoch, |s| s.obs.epoch_id);
+                return immediate(off_lock_action_reject(&request_id_val, post_ep, error.into()));
+            }
+        }
+    }
+
     let snap = match crate::rt_core::requests::actions::ActionSnapshot::capture(
         recv_supervisor,
         ws_stamp,
@@ -1646,6 +1800,10 @@ enum PreparedWsAction {
     Cartesian(crate::rt_core::requests::actions::PreparedCartesianAction),
     Joint(crate::rt_core::requests::actions::PreparedJointAction),
     Gripper(crate::rt_core::requests::actions::PreparedGripperAction),
+    GripperZeroCheck {
+        prepared: crate::rt_core::requests::actions::PreparedGripperZeroCheck,
+        persist_ctx_id: u64,
+    },
     Replay(crate::rt_core::requests::actions::PreparedReplayAction),
 }
 
@@ -1799,6 +1957,9 @@ pub(super) async fn complete_pending_plan(
                                         &ctx,
                                         req::GripperInstallPayload::Legacy(Box::new(g)),
                                     )
+                                }
+                                PreparedWsAction::GripperZeroCheck { .. } => {
+                                    unreachable!("legacy gripper_zero_check does not use PendingPlan")
                                 }
                                 PreparedWsAction::Replay(r) => {
                                     let s = r.stamp;

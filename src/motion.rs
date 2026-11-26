@@ -3077,6 +3077,88 @@ impl ActionStatus {
             durability_confirmed: None, durability_warning: None, policy_stats: None, measurement: None,
         }
     }
+
+    /// Zero-allocation fieldwise copy of every field except `message` and `durability_warning`,
+    /// allowing `sync_action_obs` on `armd-control` to bound those two strings to preallocated
+    /// `ObservationSpares` capacities (never allocating or reallocating on oversized diagnostics).
+    #[allow(dead_code)]
+    pub(crate) fn clone_from_without_msg_warn(&mut self, src: &Self) {
+        self.id = src.id;
+        self.kind = src.kind;
+        self.tag.clone_from(&src.tag);
+        self.state = src.state;
+        self.code = src.code;
+        self.progress = src.progress;
+        self.started_at = src.started_at;
+        self.finished_at = src.finished_at;
+        self.holding = src.holding;
+        self.gripper_gap_rad = src.gripper_gap_rad;
+        self.settled = src.settled;
+        self.task.clone_from(&src.task);
+        self.phase.clone_from(&src.phase);
+        self.iteration = src.iteration;
+        self.error_px = src.error_px;
+        self.final_offset_px = src.final_offset_px;
+        self.acquire_height_m = src.acquire_height_m;
+        self.power_scale = src.power_scale;
+        self.episode.clone_from(&src.episode);
+        self.t_s = src.t_s;
+        self.sequence_id.clone_from(&src.sequence_id);
+        self.step_index = src.step_index;
+        self.step_type.clone_from(&src.step_type);
+        self.repeat_index = src.repeat_index;
+        self.repeats = src.repeats;
+        self.failed_step = src.failed_step;
+        self.episodes.clone_from(&src.episodes);
+        self.align.clone_from(&src.align);
+        self.align_turn_rad = src.align_turn_rad;
+        self.angle_spread_deg = src.angle_spread_deg;
+        self.orientation.clone_from(&src.orientation);
+        self.grasp_width_m = src.grasp_width_m;
+        self.height_source.clone_from(&src.height_source);
+        self.height_reason.clone_from(&src.height_reason);
+        self.object_height_m = src.object_height_m;
+        self.height_estimates.clone_from(&src.height_estimates);
+        self.yaw_estimates.clone_from(&src.yaw_estimates);
+        self.width_estimates.clone_from(&src.width_estimates);
+        self.close_height_m = src.close_height_m;
+        self.probe_dz_m = src.probe_dz_m;
+        self.depth_anchor.clone_from(&src.depth_anchor);
+        self.object_depth_m = src.object_depth_m;
+        self.object_length_m = src.object_length_m;
+        self.jaw_clear = src.jaw_clear;
+        self.border.clone_from(&src.border);
+        self.border_shift_px = src.border_shift_px;
+        self.probe_mode.clone_from(&src.probe_mode);
+        self.lateral_baseline_m = src.lateral_baseline_m;
+        self.lateral_baseline_err_mm = src.lateral_baseline_err_mm;
+        self.recentre.clone_from(&src.recentre);
+        self.recentre_iterations = src.recentre_iterations;
+        self.descend_peak_residual_nm = src.descend_peak_residual_nm;
+        self.descend_peak_tracking_rad = src.descend_peak_tracking_rad;
+        self.descend_contact = src.descend_contact;
+        self.descend_contact_height_m = src.descend_contact_height_m;
+        self.post_lift.clone_from(&src.post_lift);
+        self.pre_open.clone_from(&src.pre_open);
+        self.pre_open_m = src.pre_open_m;
+        self.held_width_m = src.held_width_m;
+        self.stop_rad = src.stop_rad;
+        self.offset_rad = src.offset_rad;
+        self.pass = src.pass;
+        self.approach.clone_from(&src.approach);
+        self.approach_reason.clone_from(&src.approach_reason);
+        self.approach_signs.clone_from(&src.approach_signs);
+        self.approach_flipped.clone_from(&src.approach_flipped);
+        self.phase_ms.clone_from(&src.phase_ms);
+        self.motions.clone_from(&src.motions);
+        self.constraint_id.clone_from(&src.constraint_id);
+        self.geometry_id.clone_from(&src.geometry_id);
+        self.violation_phase.clone_from(&src.violation_phase);
+        self.reason.clone_from(&src.reason);
+        self.durability_confirmed = src.durability_confirmed;
+        self.policy_stats = src.policy_stats;
+        self.measurement.clone_from(&src.measurement);
+    }
 }
 
 /// One evaluated source, reported in `ActionStatus.height_estimates` / `yaw_estimates` /

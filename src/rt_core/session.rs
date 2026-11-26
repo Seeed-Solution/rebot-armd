@@ -58,6 +58,7 @@ impl SessionSlot {
 pub enum SessionKind {
     Commissioning,
     ModeSwitch,
+    GripperZeroCheck,
     Recorder,
     MacroBacked,
     Custom(u16),
@@ -550,6 +551,39 @@ impl SessionDriver {
         true
     }
 
+    /// Transitions a live `Running` session directly into `AwaitingWorker(ticket)` with an
+    /// optional updated `child_deadline` and returns its unique [`WorkerTicket`].
+    pub fn enter_await_worker(
+        &mut self,
+        slot: SessionSlot,
+        id: SessionId,
+        child_deadline: Option<Instant>,
+        timeout_code: &'static str,
+    ) -> Option<WorkerTicket> {
+        let active = self.slots[slot.index()].as_mut()?;
+        if active.id != id || !matches!(active.state, SessionState::Running) {
+            return None;
+        }
+        active.child_deadline = match (active.deadline, child_deadline) {
+            (Some(s), Some(c)) => Some(s.min(c)),
+            (_, c) => c,
+        };
+        if !timeout_code.is_empty() {
+            active.child_timeout_code = timeout_code;
+        }
+        active.step_seq = active.step_seq.saturating_add(1);
+        let generation = self.next_worker_gen;
+        self.next_worker_gen = generation.wrapping_add(1).max(1);
+        let ticket = WorkerTicket {
+            session: id,
+            step_seq: active.step_seq,
+            generation,
+        };
+        active.state = SessionState::AwaitingWorker(ticket);
+        active.last_worker_reply = None;
+        Some(ticket)
+    }
+
     pub fn check_live_authority(
         &self,
         slot: SessionSlot,
@@ -824,6 +858,13 @@ impl SupervisorInner {
             }
         }
         let stamp = proof.stamp();
+        let operator_required = if prepared.kind == SessionKind::GripperZeroCheck {
+            // Conditional operator policy: `store_offset=true` requires operator when enforced;
+            // `store_offset=false` remains allowed for Program clients (legacy parity).
+            prepared.operator_required && self.operator_auth_enforced
+        } else {
+            self.operator_auth_enforced || prepared.operator_required
+        };
         let authority = SessionAuthority {
             connection_id: if prepared.slot == SessionSlot::Recorder { 0 } else { stamp.connection_id },
             lease_generation: if prepared.require_lease { stamp.lease_gen } else { 0 },
@@ -833,7 +874,7 @@ impl SupervisorInner {
             operator_required: if prepared.slot == SessionSlot::Recorder {
                 prepared.operator_required
             } else {
-                self.operator_auth_enforced || prepared.operator_required
+                operator_required
             },
             operator_grant: prepared.operator_grant,
             revoke_on_stop: prepared.revoke_on_stop,
@@ -994,7 +1035,9 @@ impl SupervisorInner {
         owner_now_fn: &dyn Fn() -> Instant,
     ) {
         if let Some(active) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() {
-            if active.is_live() {
+            if active.kind == SessionKind::GripperZeroCheck {
+                self.service_gripper_zero_check_session(ctx, release_deadline, owner_now_fn);
+            } else if active.is_live() {
                 match active.kind {
                     SessionKind::Commissioning => {
                         self.service_commissioning_release(ctx, release_deadline, owner_now_fn);
@@ -1002,6 +1045,7 @@ impl SupervisorInner {
                     SessionKind::ModeSwitch => {
                         self.service_mode_switch_release(ctx, release_deadline, owner_now_fn);
                     }
+                    SessionKind::GripperZeroCheck => unreachable!(),
                     _ => {
                         let now = owner_now_fn();
                         let total_span = release_deadline.saturating_duration_since(now);
@@ -1069,6 +1113,7 @@ impl SupervisorInner {
     pub(crate) fn on_safe_hold_enter(&mut self, reason: &'static str) {
         self.cancel_active_commissioning_on_stop(reason);
         self.reconcile_mode_switch_on_revocation(reason);
+        self.cancel_active_gripper_zero_check_on_stop(reason);
         let outcomes = self.sessions.revoke_live_sessions_by_scope(
             SessionTerminalReason::Revoked(reason),
             RevocationScope::FatalOrTeardown,
@@ -1081,6 +1126,7 @@ impl SupervisorInner {
 
     pub(crate) fn revoke_sessions_on_stop(&mut self, reason: &'static str) {
         self.cancel_active_commissioning_on_stop(reason);
+        self.cancel_active_gripper_zero_check_on_stop(reason);
         let escalate = self
             .sessions
             .slot(SessionSlot::ExclusiveOutput)
@@ -1115,6 +1161,7 @@ impl SupervisorInner {
     }
 
     pub(crate) fn revoke_sessions_for_connection(&mut self, conn_id: u64, reason: &'static str) {
+        self.cancel_active_gripper_zero_check_for_connection(conn_id, reason);
         let escalate = self
             .sessions
             .slot(SessionSlot::ExclusiveOutput)

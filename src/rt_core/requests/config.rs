@@ -5993,11 +5993,37 @@ pub(crate) fn check_zero_check_authority(
         ));
     }
     if core.safety.state().is_stopped() {
-        return Err((
-            "cancelled",
-            "STOPPED",
-            "Safety stop intervened before gripper calibration persisted",
-        ));
+        return Err(match core.safety.state() {
+            crate::safety::SafetyState::EStop => (
+                "failed",
+                "ESTOP_ACTIVE",
+                "Emergency stop intervened before gripper calibration persisted",
+            ),
+            crate::safety::SafetyState::Fault(crate::safety::FaultReason::ThermalTrip { .. }) => (
+                "failed",
+                "THERMAL_TRIP",
+                "Thermal trip intervened before gripper calibration persisted",
+            ),
+            crate::safety::SafetyState::Fault(crate::safety::FaultReason::BusLoss) => (
+                "failed",
+                "BUS_LOSS",
+                "Bus loss intervened before gripper calibration persisted",
+            ),
+            _ => (
+                "cancelled",
+                "STOPPED",
+                "Safety stop intervened before gripper calibration persisted",
+            ),
+        });
+    }
+    if let Some((gid, grant)) = core.zero_check_persisting_grant {
+        if gid == action_id && !grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
+            return Err((
+                "failed",
+                "OPERATOR_REQUIRED",
+                "Operator session expired or locked before gripper calibration persisted",
+            ));
+        }
     }
     if let Err(err) = check_config_authority(core, ctx, proposal, auth, false) {
         return Err(match err {
@@ -6064,6 +6090,7 @@ pub(crate) fn zero_check_owner_reserve(
     ctx: &CommitCtx,
     action_id: u64,
     base_revision: u64,
+    connection_id: u64,
     lease_owner: Option<(HolderLabel, u64)>,
     estop_epoch: u64,
     stop_gen: u64,
@@ -6085,7 +6112,7 @@ pub(crate) fn zero_check_owner_reserve(
             arm: ctx.arm,
             boot: ctx.boot,
             request: RequestId(req_seq),
-            client: ClientId(0),
+            client: ClientId(connection_id),
             client_seq: req_seq,
             authority: Authority {
                 lease_generation: lease_gen,
@@ -6102,7 +6129,7 @@ pub(crate) fn zero_check_owner_reserve(
             stop_gen,
             estop_epoch,
             lease_gen,
-            connection_id: 0,
+            connection_id,
             request_id: req_seq,
         },
         lease_holder: lease_owner,
@@ -6118,6 +6145,9 @@ pub(crate) fn zero_check_owner_reserve(
     ) {
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = if core
             .last_action
@@ -6135,6 +6165,9 @@ pub(crate) fn zero_check_owner_reserve(
         Reserved::Refused { code, .. } => {
             if core.zero_check_persisting == Some(action_id) {
                 core.zero_check_persisting = None;
+                if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                    core.zero_check_persisting_grant = None;
+                }
             }
             let ret = core.finish_zero_check_action_in_place(
                 action_id,
@@ -6172,6 +6205,9 @@ pub(crate) fn zero_check_owner_verify_authority(
         let _ = ConfigAuthority::release(core, reservation);
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = core.finish_zero_check_action_in_place(
             action_id,
@@ -6189,6 +6225,9 @@ pub(crate) fn zero_check_owner_verify_authority(
         let _ = ConfigAuthority::release(core, reservation);
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = if core
             .last_action
@@ -6205,12 +6244,14 @@ pub(crate) fn zero_check_owner_verify_authority(
 }
 
 /// Phase 4b (owner-side, zero-alloc on `armd-control`): mark reservation persisted after
-/// `rename_only()`. On refusal, unconditionally enters `Reconciling`.
+/// `rename_only()`. On refusal, releases the hold (`Cleared`) when `official_file_untouched` is
+/// `true` (executor `.pending` staging); otherwise unconditionally enters `Reconciling`.
 pub(crate) fn zero_check_owner_persisted(
     core: &mut SupervisorInner,
     action_id: u64,
     reservation: Reservation,
     simulated_err: bool,
+    official_file_untouched: bool,
     code_buf: Option<String>,
     msg_buf: Option<String>,
 ) -> Result<(Reservation, Option<String>, Option<String>), (Option<String>, Option<String>)> {
@@ -6222,18 +6263,36 @@ pub(crate) fn zero_check_owner_persisted(
     if res.is_ok() {
         Ok((reservation, code_buf, msg_buf))
     } else {
-        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-        core.core
-            .config_mut()
-            .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+        if official_file_untouched {
+            if !matches!(
+                core.core.config_mut().release_staged_unactivated(reservation),
+                Released::Cleared
+            ) {
+                core.core
+                    .config_mut()
+                    .clear_orphaned_staged_hold(ConfigDomain::GripperCalibration);
+            }
+        } else {
+            let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+            core.core
+                .config_mut()
+                .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+        }
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
+            if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                core.zero_check_persisting_grant = None;
+            }
         }
         let ret = core.finish_zero_check_action_in_place(
             action_id,
             "failed",
             "PERSIST_FAILED",
-            "Failed to record post-rename persistence state; reconciling required",
+            if official_file_untouched {
+                "Failed to record pre-activation staging state"
+            } else {
+                "Failed to record post-rename persistence state; reconciling required"
+            },
             code_buf,
             msg_buf,
         );
@@ -6242,16 +6301,28 @@ pub(crate) fn zero_check_owner_persisted(
 }
 
 /// Phase 5-error (owner-side, zero-alloc on `armd-control`): parent-directory fsync failed after
-/// `rename_only()`. Keeps the OLD policy active, enters `HoldState::Reconciling` (motion stays
-/// inhibited), and fails the action with `PERSIST_FAILED` + durability warning.
+/// `rename_only()`. Keeps the OLD policy active and fails the action with `PERSIST_FAILED` +
+/// durability warning. When `official_file_untouched` is `true` (executor `.pending` staging),
+/// releases the hold (`Cleared`) so an untouched official file never leaves `HoldState::Reconciling`;
+/// otherwise enters `HoldState::Reconciling` (motion stays inhibited) for legacy/sync callers.
 pub(crate) fn zero_check_owner_reconcile_dir_sync_failed(
     core: &mut SupervisorInner,
     action_id: u64,
     reservation: Reservation,
     warning: String,
+    official_file_untouched: bool,
     msg_buf: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    if !matches!(
+    if official_file_untouched {
+        if !matches!(
+            core.core.config_mut().release_staged_unactivated(reservation),
+            Released::Cleared
+        ) {
+            core.core
+                .config_mut()
+                .clear_orphaned_staged_hold(ConfigDomain::GripperCalibration);
+        }
+    } else if !matches!(
         ConfigAuthority::release(core, reservation),
         Released::Reconciling
     ) {
@@ -6262,13 +6333,17 @@ pub(crate) fn zero_check_owner_reconcile_dir_sync_failed(
     }
     if core.zero_check_persisting == Some(action_id) {
         core.zero_check_persisting = None;
+        if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+            core.zero_check_persisting_grant = None;
+        }
     }
     core.fail_zero_check_dir_sync_in_place(action_id, warning, msg_buf)
 }
 
 /// Phase 6 (owner-side, zero-alloc on `armd-control`): post-dir-sync live owner authority recheck
-/// and atomic in-place activation (`Durability::Durable`). Any failure enters `Reconciling`
-/// without mutating live gripper calibration.
+/// and atomic in-place activation. When `defer_publish` is `true` (executor `.pending` flow),
+/// live policy and `ConfigAuthority::activate` complete here, while the action and session stay
+/// running until the worker reports `PersistCmd::Published`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn zero_check_owner_activate(
     core: &mut SupervisorInner,
@@ -6282,6 +6357,7 @@ pub(crate) fn zero_check_owner_activate(
     new_policy: GripperPolicy,
     new_jaw: Option<JawOpening>,
     operator_revoked: bool,
+    defer_publish: bool,
     code_buf: Option<String>,
     msg_buf: Option<String>,
 ) -> Result<
@@ -6292,7 +6368,11 @@ pub(crate) fn zero_check_owner_activate(
         Err((
             "failed",
             "OPERATOR_REQUIRED",
-            "Operator session revoked after disk rename; reconciliation required",
+            if defer_publish {
+                "Operator session revoked before activation"
+            } else {
+                "Operator session revoked after disk rename; reconciliation required"
+            },
         ))
     } else {
         check_zero_check_authority(core, ctx, proposal, auth, action_id, base_revision, None)
@@ -6311,14 +6391,31 @@ pub(crate) fn zero_check_owner_activate(
                     .config_mut()
                     .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
             }
-            if core.zero_check_persisting == Some(action_id) {
-                core.zero_check_persisting = None;
+            if !defer_publish {
+                if core.zero_check_persisting == Some(action_id) {
+                    core.zero_check_persisting = None;
+                    if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                        core.zero_check_persisting_grant = None;
+                    }
+                }
+                let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
             }
-            let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
             Ok((old_policy, old_jaw, code_buf, msg_buf))
         }
         Err((state, code, msg)) => {
-            if !matches!(
+            if defer_publish {
+                // Candidate is staged only at `.pending`; the official file on disk is intact,
+                // so activation refusal releases the hold (`Cleared`) instead of `Reconciling`.
+                if !matches!(
+                    core.core.config_mut().release_staged_unactivated(reservation),
+                    Released::Cleared
+                ) {
+                    let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                    core.core
+                        .config_mut()
+                        .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                }
+            } else if !matches!(
                 core.core.config_mut().activation_failed(reservation, code),
                 Activated::Reconciling { .. }
             ) {
@@ -6329,6 +6426,9 @@ pub(crate) fn zero_check_owner_activate(
             }
             if core.zero_check_persisting == Some(action_id) {
                 core.zero_check_persisting = None;
+                if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+                    core.zero_check_persisting_grant = None;
+                }
             }
             let (old_code, old_msg) = if core
                 .last_action
@@ -6357,6 +6457,7 @@ pub(crate) fn zero_check_owner_finish_reconcile(
     new_policy: GripperPolicy,
     new_jaw: Option<JawOpening>,
     operator_revoked: bool,
+    operator_grant: Option<crate::auth::OperatorGrant>,
 ) -> Result<(Option<GripperPolicy>, Option<JawOpening>), (&'static str, Option<GripperPolicy>, Option<JawOpening>)> {
     let is_reconciling = core
         .core
@@ -6365,7 +6466,11 @@ pub(crate) fn zero_check_owner_finish_reconcile(
     if !is_reconciling {
         return Err(("NOT_HELD", Some(new_policy), new_jaw));
     }
-    if operator_revoked {
+    // Executor: the worker's sample is advisory; the owner validates the grant carried through
+    // reconciliation at commit time. Legacy (`None`) samples and commits under one lock.
+    if operator_revoked
+        || operator_grant.is_some_and(|g| !g.is_valid_at(ctx.now, core.operator_auth_enforced))
+    {
         return Err(("OPERATOR_REQUIRED", Some(new_policy), new_jaw));
     }
     if core.safety.state().is_stopped() {
@@ -6472,6 +6577,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
             &ctx,
             self.job.action_id,
             self.job.base_revision,
+            self.job.connection_id,
             self.job.lease_owner,
             self.job.estop_epoch,
             self.job.stop_gen,
@@ -6563,6 +6669,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
             self.job.action_id,
             r,
             sim_persisted_fail,
+            false,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         ) {
@@ -6586,6 +6693,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                 self.job.action_id,
                 r,
                 warn.clone(),
+                false,
                 Some(String::with_capacity(160)),
             );
         }
@@ -6681,6 +6789,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                             pol,
                             jaw,
                             operator_revoked,
+                            None,
                         )
                     };
                     match finish_res {
@@ -6770,6 +6879,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                 policy,
                 jaw,
                 operator_revoked,
+                false,
                 Some(String::with_capacity(64)),
                 Some(String::with_capacity(160)),
             )
@@ -6817,6 +6927,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                 self.job.action_id,
                 r,
                 true,
+                false,
                 Some(String::with_capacity(64)),
                 Some(String::with_capacity(160)),
             );
@@ -6927,6 +7038,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             &commit_ctx,
             self.action_id,
             self.base_revision,
+            0,
             self.lease_owner,
             self.estop_epoch,
             self.stop_gen,
@@ -7000,6 +7112,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             self.action_id,
             r,
             false,
+            false,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         ) {
@@ -7022,6 +7135,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
                 self.action_id,
                 r,
                 warn.clone(),
+                false,
                 Some(String::with_capacity(160)),
             );
         }
@@ -7062,6 +7176,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             policy,
             jaw,
             operator_revoked,
+            false,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         );

@@ -84,6 +84,12 @@ impl SupervisorInner {
         self.begin_action_inner(kind, tag, true)
     }
 
+    /// Returns the `ActionId` that the next `begin_action` / `begin_action_rt` call will allocate.
+    #[inline]
+    pub(crate) fn peek_next_action_id(&self) -> u64 {
+        self.next_action_id + 1
+    }
+
     /// RT-safe [`Self::begin_action`]: no tag and no heap-formatted superseded message, so
     /// starting or superseding an RT action performs zero allocations and zero frees.
     pub(crate) fn begin_action_rt(&mut self, kind: &str) -> u64 {
@@ -156,6 +162,9 @@ impl SupervisorInner {
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
                     self.recycle_action_msg_spare(msg);
+                }
+                if let Some(warn) = prev.durability_warning.take() {
+                    self.recycle_action_msg_spare(warn);
                 }
             }
         }
@@ -276,10 +285,409 @@ impl SupervisorInner {
         self.retired_zero_check_ctx.pop_front()
     }
 
+    /// Queues an off-RT staged `ZeroCheckPersistContext` ID (`!= 0`) for guaranteed off-thread
+    /// discard without allocating or freeing on `armd-control`: first tries `rt_core/stream`,
+    /// falling back to the inline fixed queue drained into `OffloadReclaim::DiscardZeroCheckCtx`.
+    pub(crate) fn discard_zero_check_ctx_id_rt(&mut self, persist_ctx_id: u64) {
+        if persist_ctx_id == 0 {
+            return;
+        }
+        if let Some(tx) = self.zero_check_stream_tx.as_mut() {
+            if tx
+                .try_push(crate::supervisor::ZeroCheckStreamEvent::Discard { persist_ctx_id })
+                .is_ok()
+            {
+                self.zero_check_stream_pushed = true;
+                return;
+            }
+        }
+        if self.retired_zero_check_ctx_id_len < self.retired_zero_check_ctx_ids.len() {
+            self.retired_zero_check_ctx_ids[self.retired_zero_check_ctx_id_len] = persist_ctx_id;
+            self.retired_zero_check_ctx_id_len += 1;
+        }
+    }
+
+    pub(crate) fn pop_retired_zero_check_ctx_id(&mut self) -> Option<u64> {
+        if self.retired_zero_check_ctx_id_len == 0 {
+            return None;
+        }
+        let id = self.retired_zero_check_ctx_ids[0];
+        let new_len = self.retired_zero_check_ctx_id_len - 1;
+        self.retired_zero_check_ctx_ids.copy_within(1..=new_len, 0);
+        self.retired_zero_check_ctx_ids[new_len] = 0;
+        self.retired_zero_check_ctx_id_len = new_len;
+        Some(id)
+    }
+
+    /// Zero-allocation in-place finalization for a running `gripper_zero_check` action aborted
+    /// by PR0B session revocation or deadline expiry during motion (before persistence handoff).
+    fn finish_zero_check_session_abort_rt(
+        &mut self,
+        action_id: u64,
+        terminal_state: &str,
+        code: &str,
+        message: &str,
+    ) {
+        let now = self.now_s();
+        let mut transitioned = false;
+        if let Some(a) = self
+            .last_action
+            .as_mut()
+            .filter(|a| a.id == action_id && a.is_running())
+        {
+            a.state = crate::model::HolderLabel::new(terminal_state);
+            a.code = Some(crate::model::HolderLabel::new(code));
+            a.finished_at = Some(now);
+            transitioned = true;
+        }
+        if transitioned {
+            let mut msg_buf = self.take_action_msg_buf(action_id, message.len());
+            msg_buf.clear();
+            if msg_buf.capacity() >= message.len() {
+                msg_buf.push_str(message);
+                let old = self
+                    .last_action
+                    .as_mut()
+                    .filter(|a| a.id == action_id)
+                    .and_then(|a| a.message.replace(msg_buf));
+                if let Some(old_msg) = old {
+                    self.recycle_action_msg_spare(old_msg);
+                }
+            } else {
+                self.recycle_action_msg_spare(msg_buf);
+            }
+            self.bump_motion_generation();
+            self.record_terminal_transition_by_id(action_id);
+        }
+    }
+
+    /// Action-ID and Session-ID checked owner teardown for `SessionKind::GripperZeroCheck`.
+    /// Retires only the matching trajectory/params, delivers any optional worker reply (never
+    /// gating cleanup on reply acceptance), and clears `SessionSlot::ExclusiveOutput` even if
+    /// another path already transitioned the slot to `SessionState::Terminal`.
+    ///
+    /// When `preserve_safety_hold` is `true` (E-stop / thermal trip / bus loss), retires ONLY
+    /// the matching trajectory without overwriting `commanded_positions` or `target_positions`
+    /// so the safety stop policy's freshness-gated hold capture owns the hold target.
+    pub(crate) fn teardown_gripper_zero_check_session_rt(
+        &mut self,
+        action_id: u64,
+        sid: Option<crate::rt_core::session::SessionId>,
+        stop_motion_if_matching: bool,
+        preserve_safety_hold: bool,
+        worker_reply: Option<crate::rt_core::session::WorkerReply>,
+        reason: crate::rt_core::session::SessionTerminalReason,
+        now: Instant,
+    ) {
+        use crate::rt_core::broker::ActionId;
+        use crate::rt_core::session::{SessionKind, SessionSlot};
+
+        let matching_traj = self
+            .active_trajectory
+            .as_ref()
+            .is_some_and(|t| t.action_id == Some(action_id));
+        if matching_traj {
+            if preserve_safety_hold {
+                self.replace_active_trajectory(None);
+            } else if stop_motion_if_matching {
+                self.stop_motion();
+            }
+        }
+        if self
+            .zero_check_params
+            .as_ref()
+            .is_some_and(|p| p.action_id == action_id)
+        {
+            if let Some(params) = self.zero_check_params.take() {
+                if let Some(ctx) = params.persist_ctx {
+                    self.retire_zero_check_ctx(ctx);
+                }
+                if params.persist_ctx_id != 0 {
+                    self.discard_zero_check_ctx_id_rt(params.persist_ctx_id);
+                }
+            }
+        }
+        if self.zero_check_persisting != Some(action_id)
+            && self
+                .zero_check_persisting_grant
+                .is_some_and(|(gid, _)| gid == action_id)
+        {
+            self.zero_check_persisting_grant = None;
+        }
+        if let Some(active) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() {
+            if active.kind == SessionKind::GripperZeroCheck
+                && active.action_id == Some(ActionId(action_id))
+                && sid.is_none_or(|want| want == active.id)
+            {
+                if let Some(reply) = worker_reply {
+                    let _ = self.sessions.deliver_worker_reply(reply, now, Ok(()));
+                }
+                if active.is_live() {
+                    let _ = self
+                        .sessions
+                        .finish_slot(SessionSlot::ExclusiveOutput, active.id, reason, false);
+                }
+                let _ = self
+                    .sessions
+                    .clear_terminal_slot(SessionSlot::ExclusiveOutput, active.id);
+            }
+        }
+    }
+
+    /// Release-side PR0B session stepper for `SessionKind::GripperZeroCheck` (runs in Step 2b
+    /// before Steps 3-5, 0 allocs / 0 `SupervisorLock`).
+    ///
+    /// Ownership invariant:
+    /// - During `SessionState::Running` (motion + measurement): `SessionDriver` governs authority,
+    ///   deadlines, TX cutoff clamping, and cancellation before bus output.
+    /// - During `SessionState::AwaitingWorker` (after persistence handoff): PR C (`CommonCommitWorker`
+    ///   / `zero_check_owner_*`) owns the disk reservation, rename/fsync boundary, reconciliation,
+    ///   and action terminal; `service_gripper_zero_check_session` never prematurely aborts or
+    ///   overwrites `last_action` while `zero_check_persisting == Some(action_id)`.
+    pub(crate) fn service_gripper_zero_check_session(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        release_deadline: Instant,
+        owner_now_fn: &dyn Fn() -> Instant,
+    ) {
+        use crate::rt_core::session::{
+            PhaseStepOutcome, SessionKind, SessionSlot, SessionState, SessionStep,
+            SessionTerminalReason,
+        };
+
+        let Some(active) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() else {
+            return;
+        };
+        if active.kind != SessionKind::GripperZeroCheck {
+            return;
+        }
+        let Some(action_id) = active.action_id.map(|a| a.0) else {
+            let _ = self
+                .sessions
+                .clear_terminal_slot(SessionSlot::ExclusiveOutput, active.id);
+            return;
+        };
+        let now = owner_now_fn();
+        match active.state {
+            SessionState::Terminal(outcome) => {
+                if self.zero_check_persisting == Some(action_id) {
+                    // Persistence handoff already occurred; PR C owns settlement.
+                    return;
+                }
+                self.teardown_gripper_zero_check_session_rt(
+                    action_id,
+                    Some(active.id),
+                    true,
+                    false,
+                    None,
+                    outcome.reason,
+                    now,
+                );
+            }
+            SessionState::AwaitingWorker(_) => {
+                // PR C owns persistence settlement and the action terminal. Clear the session slot
+                // only once PR C (or safety reconciliation) has settled `zero_check_persisting`
+                // and `last_action`.
+                let still_running = self.zero_check_persisting == Some(action_id)
+                    || self
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|a| a.id == action_id && a.is_running());
+                if !still_running {
+                    self.teardown_gripper_zero_check_session_rt(
+                        action_id,
+                        Some(active.id),
+                        false,
+                        false,
+                        None,
+                        SessionTerminalReason::Completed,
+                        now,
+                    );
+                }
+            }
+            SessionState::Running => {
+                let action_running = self
+                    .last_action
+                    .as_ref()
+                    .is_some_and(|a| a.id == action_id && a.is_running());
+                if !action_running && self.zero_check_persisting != Some(action_id) {
+                    self.teardown_gripper_zero_check_session_rt(
+                        action_id,
+                        Some(active.id),
+                        false,
+                        false,
+                        None,
+                        SessionTerminalReason::Completed,
+                        now,
+                    );
+                    return;
+                }
+                let total_span = release_deadline.saturating_duration_since(now);
+                let margin = self.tx_release_publish_margin().min(total_span / 2);
+                let base_cutoff = release_deadline.checked_sub(margin).unwrap_or(now);
+                let rctx = self.build_session_release_ctx(
+                    &crate::rt_core::ops::CommitCtx { now, ..*ctx },
+                    release_deadline,
+                    base_cutoff,
+                );
+                let conn_closed = active.authority.connection_id != 0
+                    && self.is_connection_closed(active.authority.connection_id);
+                let lease_ok = !active.authority.require_lease
+                    || self.is_session_lease_valid_at(
+                        active.authority.connection_id,
+                        active.authority.lease_generation,
+                        now,
+                    );
+                let op_ok = !active.authority.operator_required
+                    || self.is_session_operator_valid_at(active.authority.operator_grant, now);
+                if let Some(SessionStep::Terminal(outcome)) = self.sessions.step_slot(
+                    SessionSlot::ExclusiveOutput,
+                    &rctx,
+                    |_| conn_closed,
+                    |_, _, _| lease_ok,
+                    |_| op_ok,
+                    |_, _| false,
+                    |_, _, _| PhaseStepOutcome::Pending,
+                ) {
+                    let (t_state, t_code, t_msg) = match outcome.reason {
+                        SessionTerminalReason::Revoked("OPERATOR_REQUIRED") => (
+                            "failed",
+                            "OPERATOR_REQUIRED",
+                            "Operator session expired or locked",
+                        ),
+                        SessionTerminalReason::Revoked("STOPPED") => {
+                            ("cancelled", "STOPPED", "Stopped")
+                        }
+                        SessionTerminalReason::Revoked("LEASE_LOST") => (
+                            "cancelled",
+                            "LEASE_LOST",
+                            "Control lease lost or released",
+                        ),
+                        SessionTerminalReason::Revoked("EPOCH_MISMATCH") => {
+                            if rctx.estop_latched {
+                                ("failed", "ESTOP_ACTIVE", "E-stop latched")
+                            } else {
+                                ("cancelled", "EPOCH_MISMATCH", "Safety epoch changed")
+                            }
+                        }
+                        SessionTerminalReason::DeadlineExpired(code) => {
+                            ("failed", code, "Gripper zero check timed out")
+                        }
+                        SessionTerminalReason::Revoked(code) => {
+                            ("failed", code, "Gripper zero check revoked")
+                        }
+                        other => ("failed", other.code(), "Gripper zero check ended"),
+                    };
+                    self.finish_zero_check_session_abort_rt(action_id, t_state, t_code, t_msg);
+                    self.teardown_gripper_zero_check_session_rt(
+                        action_id,
+                        Some(active.id),
+                        true,
+                        rctx.estop_latched,
+                        None,
+                        outcome.reason,
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
+    fn zero_check_revoke_terminal(reason: &'static str) -> (&'static str, &'static str, &'static str) {
+        match reason {
+            "STOPPED" => ("cancelled", "STOPPED", "Motion stopped"),
+            "LEASE_LOST" => ("cancelled", "LEASE_LOST", "Control lease lost or released"),
+            "DISCONNECTED" => ("cancelled", "DISCONNECTED", "Client connection closed"),
+            "ESTOP_ACTIVE" => ("failed", "ESTOP_ACTIVE", "E-stop latched"),
+            "THERMAL_TRIP" => ("failed", "THERMAL_TRIP", "Thermal trip"),
+            "BUS_LOSS" => ("failed", "BUS_LOSS", "CAN feedback lost"),
+            "INTERNAL_FAULT" => ("failed", "INTERNAL_FAULT", "Internal fault latched"),
+            "OPERATOR_REQUIRED" => ("failed", "OPERATOR_REQUIRED", "Operator session expired or locked"),
+            other => ("cancelled", other, "Gripper zero check cancelled"),
+        }
+    }
+
+    /// Immediate owner-side cleanup hook for Stop / E-stop / SAFE-HOLD / shutdown during the
+    /// motion phase of `SessionKind::GripperZeroCheck`. If persistence handoff already started
+    /// (`zero_check_persisting == Some(action_id)`), PR C owns settlement.
+    pub(crate) fn cancel_active_gripper_zero_check_on_stop(&mut self, reason: &'static str) {
+        use crate::rt_core::session::{SessionKind, SessionSlot, SessionTerminalReason};
+        let Some(active) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() else {
+            return;
+        };
+        if active.kind != SessionKind::GripperZeroCheck {
+            return;
+        }
+        let Some(action_id) = active.action_id.map(|a| a.0) else {
+            return;
+        };
+        if self.zero_check_persisting == Some(action_id) {
+            return;
+        }
+        let preserve_safety_hold = matches!(reason, "ESTOP_ACTIVE" | "THERMAL_TRIP" | "BUS_LOSS");
+        let (t_state, t_code, t_msg) = Self::zero_check_revoke_terminal(reason);
+        self.finish_zero_check_session_abort_rt(action_id, t_state, t_code, t_msg);
+        self.teardown_gripper_zero_check_session_rt(
+            action_id,
+            Some(active.id),
+            !preserve_safety_hold,
+            preserve_safety_hold,
+            None,
+            SessionTerminalReason::Revoked(reason),
+            Instant::now(),
+        );
+    }
+
+    /// Immediate owner-side cleanup hook for connection disconnect during the motion phase of
+    /// `SessionKind::GripperZeroCheck`.
+    pub(crate) fn cancel_active_gripper_zero_check_for_connection(
+        &mut self,
+        conn_id: u64,
+        reason: &'static str,
+    ) {
+        use crate::rt_core::session::{SessionKind, SessionSlot, SessionTerminalReason};
+        if conn_id == 0 {
+            return;
+        }
+        let Some(active) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() else {
+            return;
+        };
+        if active.kind != SessionKind::GripperZeroCheck
+            || active.authority.connection_id != conn_id
+        {
+            return;
+        }
+        let Some(action_id) = active.action_id.map(|a| a.0) else {
+            return;
+        };
+        if self.zero_check_persisting == Some(action_id) {
+            return;
+        }
+        let (t_state, t_code, t_msg) = Self::zero_check_revoke_terminal(reason);
+        self.finish_zero_check_session_abort_rt(action_id, t_state, t_code, t_msg);
+        self.teardown_gripper_zero_check_session_rt(
+            action_id,
+            Some(active.id),
+            true,
+            false,
+            None,
+            SessionTerminalReason::Revoked(reason),
+            Instant::now(),
+        );
+    }
+
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
-        let mut store_offset_req: Option<(f32, Box<ZeroCheckPersistContext>)> = None;
+        let mut store_offset_req: Option<(f32, u64, Box<ZeroCheckPersistContext>)> = None;
+        let mut store_offset_stream_req: Option<(
+            f32,
+            u64,
+            u64,
+            Option<crate::rt_core::session::SessionId>,
+            Option<crate::auth::OperatorGrant>,
+        )> = None;
+        let mut finish_zero_check_session: Option<(u64, Option<crate::rt_core::session::SessionId>)> = None;
         let mut retired_ctx: Option<Box<ZeroCheckPersistContext>> = None;
         let mut incoming_message = message;
         let mut displaced_message: Option<String> = None;
@@ -305,7 +713,16 @@ impl SupervisorInner {
             {
                 let params = self.zero_check_params.take().expect("checked action_id match");
                 let mut unused_ctx = params.persist_ctx;
+                let mut unused_ctx_id = params.persist_ctx_id;
+                let sess_id = params.session_id;
+                let mut handed_off_stream = false;
                 if state == "done" {
+                    // FOLLOW-UP: open contract question (kept for 1.6.1 parity with legacy on both
+                    // owners): a stall against an obstruction ends the seek as `done` and the stall
+                    // position is taken as the mechanical zero (`stop_rad`, `offset_rad`, and with
+                    // `store_offset` the stored offset). Should an obstructed seek be told apart
+                    // from the jaw stop (e.g. `CALIBRATION_OBSTRUCTED`) instead of being accepted?
+                    // Pinned by `dual_owner_zero_check_obstructed_seek_stall_accepted_parity`.
                     let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
                     let offset_rad = stop_rad - params.base_closed_rad;
                     let pass = offset_rad.abs() <= params.threshold_rad;
@@ -317,12 +734,25 @@ impl SupervisorInner {
                     if params.store_offset {
                         if offset_rad.abs() <= 0.5 {
                             if let Some(ctx) = unused_ctx.take() {
-                                store_offset_req = Some((offset_rad, ctx));
+                                store_offset_req = Some((offset_rad, params.connection_id, ctx));
+                            } else if unused_ctx_id != 0 {
+                                store_offset_stream_req = Some((
+                                    offset_rad,
+                                    params.connection_id,
+                                    unused_ctx_id,
+                                    sess_id,
+                                    params.operator_grant,
+                                ));
+                                unused_ctx_id = 0;
+                                handed_off_stream = true;
                             }
                         } else if !self.rt_executor_owned && !self.defer_zero_check_persist {
                             tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
                         }
                     }
+                }
+                if !handed_off_stream && (unused_ctx_id != 0 || sess_id.is_some()) {
+                    finish_zero_check_session = Some((unused_ctx_id, sess_id));
                 }
                 retired_ctx = unused_ctx;
             }
@@ -343,7 +773,122 @@ impl SupervisorInner {
         if let Some(ctx) = retired_ctx {
             self.retire_zero_check_ctx(ctx);
         }
-        if let Some((offset_rad, mut ctx)) = store_offset_req {
+        if let Some((unused_ctx_id, sess_id)) = finish_zero_check_session {
+            if unused_ctx_id != 0 {
+                self.discard_zero_check_ctx_id_rt(unused_ctx_id);
+            }
+            if let Some(sid) = sess_id {
+                let reason = match state {
+                    "done" => crate::rt_core::session::SessionTerminalReason::Completed,
+                    "cancelled" => crate::rt_core::session::SessionTerminalReason::Cancelled(
+                        match code {
+                            Some("STOPPED") => "STOPPED",
+                            Some("LEASE_LOST") => "LEASE_LOST",
+                            Some("EPOCH_MISMATCH") => "EPOCH_MISMATCH",
+                            _ => "CANCELLED",
+                        },
+                    ),
+                    _ => crate::rt_core::session::SessionTerminalReason::Failed(
+                        match code {
+                            Some("GRIPPER_TIMEOUT") => "GRIPPER_TIMEOUT",
+                            Some("J7_FEEDBACK_STALE") => "J7_FEEDBACK_STALE",
+                            Some("ESTOP_ACTIVE") => "ESTOP_ACTIVE",
+                            _ => "FAILED",
+                        },
+                    ),
+                };
+                self.teardown_gripper_zero_check_session_rt(
+                    id,
+                    Some(sid),
+                    false,
+                    false,
+                    None,
+                    reason,
+                    Instant::now(),
+                );
+            }
+        }
+        if let Some((offset_rad, connection_id, persist_ctx_id, sess_id, op_grant)) =
+            store_offset_stream_req
+        {
+            let stream_ready = self
+                .zero_check_stream_tx
+                .as_ref()
+                .is_some_and(|tx| !tx.is_closed())
+                && self.pending_zero_check_stream_persist.is_none();
+            if !stream_ready {
+                const MSG: &str = "Persistence channel unavailable or saturated";
+                let mut msg_buf = self.take_action_msg_buf(id, MSG.len());
+                msg_buf.clear();
+                let set_msg = if msg_buf.capacity() >= MSG.len() {
+                    msg_buf.push_str(MSG);
+                    Some(msg_buf)
+                } else {
+                    self.recycle_action_msg_spare(msg_buf);
+                    None
+                };
+                let mut replaced = None;
+                if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                    a.state = crate::model::HolderLabel::new("failed");
+                    a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
+                    if let Some(m) = set_msg {
+                        replaced = a.message.replace(m);
+                    }
+                } else if let Some(m) = set_msg {
+                    self.recycle_action_msg_spare(m);
+                }
+                if let Some(old_msg) = replaced {
+                    self.recycle_action_msg_spare(old_msg);
+                }
+                self.discard_zero_check_ctx_id_rt(persist_ctx_id);
+                if let Some(sid) = sess_id {
+                    self.teardown_gripper_zero_check_session_rt(
+                        id,
+                        Some(sid),
+                        false,
+                        false,
+                        None,
+                        crate::rt_core::session::SessionTerminalReason::Failed("PERSIST_FAILED"),
+                        Instant::now(),
+                    );
+                }
+            } else {
+                // Hold action running until PR C config worker settles the disk transaction.
+                transitioned_terminal = false;
+                if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                    a.state = crate::model::HolderLabel::new("running");
+                    a.finished_at = None;
+                }
+                self.zero_check_persisting = Some(id);
+                self.zero_check_persisting_grant = op_grant.map(|g| (id, g));
+                let worker_ticket = sess_id.and_then(|sid| {
+                    self.sessions.enter_await_worker(
+                        crate::rt_core::session::SessionSlot::ExclusiveOutput,
+                        sid,
+                        None,
+                        "",
+                    )
+                });
+                let lease_owner = self
+                    .active_lease
+                    .as_ref()
+                    .map(|l| (crate::model::HolderLabel::new(&l.client_id), l.generation));
+                self.pending_zero_check_stream_persist =
+                    Some(crate::supervisor::ZeroCheckStreamEvent::Persist {
+                        action_id: id,
+                        offset_rad,
+                        base_revision: self.gripper_calib_revision,
+                        connection_id,
+                        lease_owner,
+                        estop_epoch: self.safety.epoch_id(),
+                        stop_gen: self.current_stop_gen(),
+                        deadline: Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
+                        persist_ctx_id,
+                        worker_ticket,
+                    });
+            }
+        }
+        if let Some((offset_rad, connection_id, mut ctx)) = store_offset_req {
             if self.defer_zero_check_persist {
                 // Zero-allocation RT path: candidate validation and JSON serialization run
                 // completely off `armd-control` (on `armd-persist` or the legacy async worker).
@@ -375,6 +920,7 @@ impl SupervisorInner {
                         action_id: id,
                         offset_rad,
                         base_revision: self.gripper_calib_revision,
+                        connection_id,
                         lease_owner,
                         estop_epoch: self.safety.epoch_id(),
                         stop_gen: self.current_stop_gen(),
@@ -1789,6 +2335,10 @@ impl SupervisorInner {
             threshold_rad,
             base_closed_rad,
             persist_ctx,
+            persist_ctx_id: 0,
+            session_id: None,
+            connection_id: 0,
+            operator_grant: None,
         });
         Ok((id, duration))
     }
@@ -1885,7 +2435,27 @@ impl SupervisorInner {
                 self.notify_park_continuation();
             }
             self.pending_deferred_done = None;
-            if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
+            if self.rt_executor_owned && self.zero_check_persisting == Some(id) {
+                // On `OWNER_EXECUTOR`, PR C owns post-handoff persistence settlement, authority
+                // recheck, and `SessionSlot::ExclusiveOutput` teardown (hardware safety stop/E-stop
+                // has already taken effect); do not overwrite `last_action` or drop the grant early.
+                return;
+            }
+            if self.zero_check_persisting == Some(id) {
+                self.zero_check_persisting = None;
+                if self.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == id) {
+                    self.zero_check_persisting_grant = None;
+                }
+            }
+            self.teardown_gripper_zero_check_session_rt(
+                id,
+                None,
+                false,
+                false,
+                None,
+                crate::rt_core::session::SessionTerminalReason::Revoked(code),
+                now,
+            );
             let mut message = self.take_action_msg_buf(id, 256);
             message.clear();
             match cause {

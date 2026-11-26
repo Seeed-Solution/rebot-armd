@@ -453,10 +453,37 @@ fn load_baseline(inner: &mut SupervisorInner, path: &Path) {
     }
 }
 
+/// Sibling staging path of an executor `gripper_zero_check(store_offset=true)` candidate. The
+/// candidate is written and fsynced here, and renamed over `path` only after the owner activated
+/// it; a refused candidate therefore never reaches `path`.
+pub fn pending_path_for(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".pending");
+    path.with_file_name(name)
+}
+
+/// Remove any staged gripper calibration temp files (`.<name>.tmp-*`, `.<name>.pending.tmp-*`)
+/// and any stale unactivated `<name>.pending` candidate at startup.
+///
+/// Safe to call even when startup is quarantined by a pending joint-calibration commit marker,
+/// because none of these staged artifacts are the official calibration file.
+pub fn cleanup_staged_artifacts(path: &Path) {
+    persist::remove_staged_leftovers(path);
+    let pending = pending_path_for(path);
+    persist::remove_staged_leftovers(&pending);
+    match std::fs::remove_file(&pending) {
+        Ok(()) => tracing::warn!("Removed unactivated gripper calibration candidate {}", pending.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("Cannot remove gripper calibration candidate {}: {e}", pending.display()),
+    }
+}
+
 /// Load the persisted gripper calibration at startup (logs outcome).
+/// A stale `<path>.pending` (crash after activation, before the rename) is removed and ignored:
+/// the restart comes up with the previous calibration, the accepted safe direction.
 /// Invalid/corrupt file -> log a warning, ignore it, report observation.gripper_zero.state "calib_invalid".
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
-    persist::remove_staged_leftovers(path);
+    cleanup_staged_artifacts(path);
     let mut inner = supervisor.inner().write().await;
     inner.gripper_calib_path = Some(path.to_path_buf());
     if let Some(bp) = baseline_path_for(path, inner.follower.as_deref()) { load_baseline(&mut inner, &bp); }
@@ -702,4 +729,30 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
     }
     scratch.ts = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
     Ok(scratch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_staged_artifacts_sweeps_pending_and_tmp_leftovers_without_touching_official() {
+        let dir = tempfile::tempdir().unwrap();
+        let official = dir.path().join("gripper_calib.json");
+        let pending = pending_path_for(&official);
+        let official_tmp = dir.path().join(".gripper_calib.json.tmp-123-1");
+        let pending_tmp = dir.path().join(".gripper_calib.json.pending.tmp-123-2");
+
+        std::fs::write(&official, "{\"offset_rad\":0.02}").unwrap();
+        std::fs::write(&pending, "{\"offset_rad\":0.05}").unwrap();
+        std::fs::write(&official_tmp, "stale-official-tmp").unwrap();
+        std::fs::write(&pending_tmp, "stale-pending-tmp").unwrap();
+
+        cleanup_staged_artifacts(&official);
+
+        assert_eq!(std::fs::read_to_string(&official).unwrap(), "{\"offset_rad\":0.02}");
+        assert!(!pending.exists(), "stale .pending candidate must be removed");
+        assert!(!official_tmp.exists(), "stale .<name>.tmp-* leftover must be removed");
+        assert!(!pending_tmp.exists(), "stale .<name>.pending.tmp-* leftover must be removed");
+    }
 }

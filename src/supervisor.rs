@@ -1433,8 +1433,24 @@ pub struct SupervisorInner {
     tick_phases_us: [u32; 5],
     /// Action id whose zero_check(store_offset=true) disk persist is currently in flight.
     pub zero_check_persisting: Option<u64>,
+    /// Live lock-free operator grant captured for an in-flight executor `zero_check(store_offset=true)`
+    /// persistence transaction so PR C owner gates verify operator revocation on `armd-control` with 0 alloc.
+    pub(crate) zero_check_persisting_grant: Option<(u64, crate::auth::OperatorGrant)>,
     /// Pending disk persist + commit payload produced by finish_action during ArmSupervisor::tick.
     pub pending_zero_check_persist: Option<PendingZeroCheckPersist>,
+    /// Preallocated lock-free RT->off-RT stream producer for executor `gripper_zero_check`
+    /// persistence handoff and context discard (uses `rt_core/stream`, 0 RT heap allocs/frees).
+    pub(crate) zero_check_stream_tx: Option<crate::rt_core::stream::StreamProducer<ZeroCheckStreamEvent>>,
+    /// Pending `Copy` persistence handoff queued by `finish_action` and flushed at release tail
+    /// (stamped with live `stop_gen`) onto `zero_check_stream_tx`.
+    pub(crate) pending_zero_check_stream_persist: Option<ZeroCheckStreamEvent>,
+    /// True when `discard_zero_check_ctx_id_rt` pushed a `Discard` onto `zero_check_stream_tx`
+    /// so `armd-control` wakes `armd-persist` immediately.
+    pub(crate) zero_check_stream_pushed: bool,
+    /// Inline fixed-capacity fallback queue of staged `persist_ctx_id`s to discard off-thread via
+    /// `OffloadReclaim::DiscardZeroCheckCtx` whenever `zero_check_stream_tx` is full or closed.
+    pub(crate) retired_zero_check_ctx_ids: [u64; 16],
+    pub(crate) retired_zero_check_ctx_id_len: usize,
     /// Retired `ZeroCheckPersistContext` payloads waiting for off-thread drop (never dropped on RT).
     pub(crate) retired_zero_check_ctx: std::collections::VecDeque<Box<ZeroCheckPersistContext>>,
     /// Whether operator auth is enforced (exposed in GET /api/v1/safety/describe).
@@ -1672,44 +1688,108 @@ pub(crate) struct J7PosForceGate {
 fn sync_action_obs(
     dst: &mut Option<ActionStatus>,
     src: Option<&ActionStatus>,
-    spare: Option<&mut String>,
+    spare: Option<(&mut String, &mut String)>,
 ) {
+    let swap_opt_str = |src_present: bool, dst_field: &mut Option<String>, sp: &mut String| {
+        match (src_present, dst_field.is_some()) {
+            (true, false) if sp.capacity() > 0 => {
+                *dst_field = Some(std::mem::take(sp));
+            }
+            (false, true) => {
+                if let Some(old) = dst_field.take() {
+                    if sp.capacity() == 0 {
+                        *sp = old;
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+    let copy_bounded_no_alloc = |dst_str: &mut String, src_str: &str| {
+        dst_str.clear();
+        if src_str.len() <= dst_str.capacity() {
+            dst_str.push_str(src_str);
+        } else {
+            let mut end = dst_str.capacity();
+            while end > 0 && !src_str.is_char_boundary(end) {
+                end -= 1;
+            }
+            dst_str.push_str(&src_str[..end]);
+        }
+    };
     match (src, dst.as_mut()) {
         (Some(s), Some(d)) => {
-            if let Some(sp) = spare {
-                match (s.message.is_some(), d.message.is_some()) {
-                    (true, false) if sp.capacity() > 0 => {
-                        d.message = Some(std::mem::take(sp));
+            if let Some((sp_msg, sp_warn)) = spare {
+                swap_opt_str(s.message.is_some(), &mut d.message, sp_msg);
+                swap_opt_str(
+                    s.durability_warning.is_some(),
+                    &mut d.durability_warning,
+                    sp_warn,
+                );
+                let msg_overflow = s
+                    .message
+                    .as_deref()
+                    .zip(d.message.as_ref())
+                    .is_some_and(|(src_m, dst_m)| src_m.len() > dst_m.capacity());
+                let warn_overflow = s
+                    .durability_warning
+                    .as_deref()
+                    .zip(d.durability_warning.as_ref())
+                    .is_some_and(|(src_w, dst_w)| src_w.len() > dst_w.capacity());
+                if msg_overflow || warn_overflow {
+                    let mut saved_msg = d.message.take();
+                    let mut saved_warn = d.durability_warning.take();
+                    let s_msg = s.message.as_deref();
+                    let s_warn = s.durability_warning.as_deref();
+                    // Clone scalar/bounded fields without letting `clone_from` reallocate `message`
+                    // or `durability_warning` on `armd-control`; full text lives in `terminal_capture`.
+                    d.clone_from_without_msg_warn(s);
+                    if let (Some(dst_m), Some(src_m)) = (saved_msg.as_mut(), s_msg) {
+                        copy_bounded_no_alloc(dst_m, src_m);
                     }
-                    (false, true) => {
-                        if let Some(old) = d.message.take() {
-                            if old.capacity() > sp.capacity() {
-                                *sp = old;
-                            }
-                        }
+                    if let (Some(dst_w), Some(src_w)) = (saved_warn.as_mut(), s_warn) {
+                        copy_bounded_no_alloc(dst_w, src_w);
                     }
-                    _ => {}
+                    d.message = saved_msg;
+                    d.durability_warning = saved_warn;
+                    return;
                 }
             }
             d.clone_from(s);
         }
         (Some(s), None) => {
-            if let (Some(src_msg), Some(sp)) = (s.message.as_deref(), spare) {
-                if sp.capacity() >= src_msg.len() {
-                    let mut blank = ActionStatus::blank();
-                    blank.message = Some(std::mem::take(sp));
-                    blank.clone_from(s);
-                    *dst = Some(blank);
-                    return;
+            if let Some((sp_msg, sp_warn)) = spare {
+                let mut blank = ActionStatus::blank();
+                if let Some(src_m) = s.message.as_deref() {
+                    if sp_msg.capacity() > 0 {
+                        let mut buf = std::mem::take(sp_msg);
+                        copy_bounded_no_alloc(&mut buf, src_m);
+                        blank.message = Some(buf);
+                    }
                 }
+                if let Some(src_w) = s.durability_warning.as_deref() {
+                    if sp_warn.capacity() > 0 {
+                        let mut buf = std::mem::take(sp_warn);
+                        copy_bounded_no_alloc(&mut buf, src_w);
+                        blank.durability_warning = Some(buf);
+                    }
+                }
+                blank.clone_from_without_msg_warn(s);
+                *dst = Some(blank);
+                return;
             }
             *dst = Some(s.clone());
         }
         (None, Some(d)) => {
-            if let Some(sp) = spare {
+            if let Some((sp_msg, sp_warn)) = spare {
                 if let Some(old) = d.message.take() {
-                    if old.capacity() > sp.capacity() {
-                        *sp = old;
+                    if sp_msg.capacity() == 0 {
+                        *sp_msg = old;
+                    }
+                }
+                if let Some(old) = d.durability_warning.take() {
+                    if sp_warn.capacity() == 0 {
+                        *sp_warn = old;
                     }
                 }
             }
@@ -1942,6 +2022,37 @@ pub struct ZeroCheckParams {
     pub threshold_rad: f32,
     pub base_closed_rad: f32,
     pub persist_ctx: Option<Box<ZeroCheckPersistContext>>,
+    /// Off-RT staged `ZeroCheckPersistContext` handle for executor-admitted sessions (`0` on legacy
+    /// or when `store_offset == false`), avoiding any heap allocation or free on `armd-control`.
+    pub persist_ctx_id: u64,
+    /// Bound PR0B `SessionId` when driven by `SessionDriver` (`SessionKind::GripperZeroCheck`).
+    pub session_id: Option<crate::rt_core::session::SessionId>,
+    /// Owning WS connection ID (`0` when submitted outside a tracked connection).
+    pub connection_id: u64,
+    /// Live lock-free operator grant bound at executor admission (when `store_offset == true`).
+    pub operator_grant: Option<crate::auth::OperatorGrant>,
+}
+
+/// `Copy` off-RT handoff event emitted over `rt_core::stream` from `armd-control` to `armd-persist`
+/// for executor-admitted `gripper_zero_check` sessions (0 RT heap allocs/frees).
+#[allow(clippy::large_enum_variant)] // inline Copy event on lock-free SPSC stream; boxing would allocate on RT
+#[derive(Debug, Clone, Copy)]
+pub enum ZeroCheckStreamEvent {
+    Persist {
+        action_id: u64,
+        offset_rad: f32,
+        base_revision: u64,
+        connection_id: u64,
+        lease_owner: Option<(crate::model::HolderLabel, u64)>,
+        estop_epoch: u64,
+        stop_gen: u64,
+        deadline: Instant,
+        persist_ctx_id: u64,
+        worker_ticket: Option<crate::rt_core::session::WorkerTicket>,
+    },
+    Discard {
+        persist_ctx_id: u64,
+    },
 }
 
 /// Deferred atomic persist-before-commit job for `gripper_zero_check(store_offset=true)`.
@@ -1950,6 +2061,7 @@ pub struct PendingZeroCheckPersist {
     pub action_id: u64,
     pub offset_rad: f32,
     pub base_revision: u64,
+    pub connection_id: u64,
     pub lease_owner: Option<(crate::model::HolderLabel, u64)>,
     pub estop_epoch: u64,
     pub stop_gen: u64,
@@ -2652,7 +2764,13 @@ impl SupervisorInner {
             tick_phase_mark: None,
             tick_phases_us: [0; 5],
             zero_check_persisting: None,
+            zero_check_persisting_grant: None,
             pending_zero_check_persist: None,
+            zero_check_stream_tx: None,
+            pending_zero_check_stream_persist: None,
+            zero_check_stream_pushed: false,
+            retired_zero_check_ctx_ids: [0; 16],
+            retired_zero_check_ctx_id_len: 0,
             retired_zero_check_ctx: std::collections::VecDeque::with_capacity(4),
             operator_auth_enforced: false,
             tool_commissioning_path: None,
@@ -2715,8 +2833,8 @@ impl SupervisorInner {
             action_msg_spares: [
                 Some(String::with_capacity(256)),
                 Some(String::with_capacity(256)),
-                None,
-                None,
+                Some(String::with_capacity(256)),
+                Some(String::with_capacity(256)),
             ],
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             retired_macro_runs: std::collections::VecDeque::with_capacity(8),
@@ -4827,6 +4945,13 @@ impl SupervisorInner {
             obs.ensure_rt_safety_text_spare();
             obs.gravity_torques.reserve(arm_dof);
             obs.motor_errors.reserve(dof);
+            if let Some(gz) = obs.gripper_zero.as_mut() {
+                // Pre-size for longest state ("calib_invalid", 13 bytes) so state transitions
+                // ("ok" -> "checked" / "out_of_range" / "calib_invalid") never realloc on RT.
+                if gz.state.capacity() < 16 {
+                    gz.state.reserve(16 - gz.state.len());
+                }
+            }
             obs
         };
         (Box::new(make_one()), make_one(), make_one(), make_one())
@@ -4928,7 +5053,10 @@ impl SupervisorInner {
         out.feedback_valid = self.hardware_feedback_fresh(Duration::from_millis(250));
         out.commanded_positions.clone_from(&self.commanded_positions);
         let (action_spare, prev_action_spare) = match spares.as_mut() {
-            Some(s) => (Some(&mut s.action_msg), Some(&mut s.prev_action_msg)),
+            Some(s) => (
+                Some((&mut s.action_msg, &mut s.action_durability_warning)),
+                Some((&mut s.prev_action_msg, &mut s.prev_action_durability_warning)),
+            ),
             None => (None, None),
         };
         sync_action_obs(&mut out.action, self.last_action.as_ref(), action_spare);

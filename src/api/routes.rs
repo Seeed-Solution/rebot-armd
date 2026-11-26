@@ -332,7 +332,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(POST   "/api/v1/action/move_to",            rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/action/move_relative",      rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/action/gripper",            rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
-    rr!(POST   "/api/v1/action/gripper_zero_check", rest::action_requires_lease,  LegacyOnly,      InHandler, RestNoActiveLease, Fenced),
+    rr!(POST   "/api/v1/action/gripper_zero_check", rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/action/grasp",              rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/action/move_to_pose",       rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
     rr!(POST   "/api/v1/action/place",              rest::action_requires_lease,  ExecutorRequest, InHandler, RestNoActiveLease, Fenced),
@@ -770,6 +770,18 @@ mod tests {
         );
         assert_eq!(
             lookup(RouteKey::ws_command("/api/v1/mode/gravity_comp")).unwrap().ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::rest(RestMethod::Post, "/api/v1/action/gripper_zero_check"))
+                .unwrap()
+                .ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert_eq!(
+            lookup(RouteKey::ws_command("/api/v1/action/gripper_zero_check"))
+                .unwrap()
+                .ownership,
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(

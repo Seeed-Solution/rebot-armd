@@ -1570,14 +1570,20 @@ fn resolve_full_action(
                         merge_sequence_rich_fields(&mut matched, cached);
                     }
                 }
-                if rec.has_message && rec.message.is_truncated() {
+                if rec.has_message {
                     if let Some(full_msg) = sc.message {
-                        matched.message = Some(full_msg);
+                        if rec.message.is_truncated() || full_msg.len() > rec.message.as_str().len() {
+                            matched.message = Some(full_msg);
+                        }
                     }
                 }
-                if rec.has_durability_warning && rec.durability_warning.is_truncated() {
+                if rec.has_durability_warning {
                     if let Some(full_warn) = sc.durability_warning {
-                        matched.durability_warning = Some(full_warn);
+                        if rec.durability_warning.is_truncated()
+                            || full_warn.len() > rec.durability_warning.as_str().len()
+                        {
+                            matched.durability_warning = Some(full_warn);
+                        }
                     }
                 }
             }
@@ -1597,14 +1603,20 @@ fn resolve_full_action(
                 }
                 None => rec.build_action_status(),
             };
-            if rec.has_message && rec.message.is_truncated() {
+            if rec.has_message {
                 if let Some(full_msg) = sc.message {
-                    out.message = Some(full_msg);
+                    if rec.message.is_truncated() || full_msg.len() > rec.message.as_str().len() {
+                        out.message = Some(full_msg);
+                    }
                 }
             }
-            if rec.has_durability_warning && rec.durability_warning.is_truncated() {
+            if rec.has_durability_warning {
                 if let Some(full_warn) = sc.durability_warning {
-                    out.durability_warning = Some(full_warn);
+                    if rec.durability_warning.is_truncated()
+                        || full_warn.len() > rec.durability_warning.as_str().len()
+                    {
+                        out.durability_warning = Some(full_warn);
+                    }
                 }
             }
             out

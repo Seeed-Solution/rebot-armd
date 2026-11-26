@@ -354,6 +354,34 @@ impl ConfigHold {
         }
     }
 
+    /// Releases a reservation whose candidate was staged only at a `.pending` path (the official
+    /// file on disk is still intact), clearing the hold even after `persisted()`.
+    pub fn release_staged_unactivated(&mut self, r: Reservation) -> Released {
+        let Some(state) = self.mine(&r).map(|h| h.state) else { return Released::NotHeld; };
+        self.marker_bound_grant = None;
+        match state {
+            HoldState::Reserved | HoldState::PersistedAwaitingActivation { .. } => {
+                self.held = None;
+                Released::Cleared
+            }
+            HoldState::Reconciling => Released::Reconciling,
+        }
+    }
+
+    /// Clears an active hold (`Reserved`, `PersistedAwaitingActivation`, or `Reconciling`) for
+    /// `domain` when the caller has proven the official file on disk is still untouched (e.g.
+    /// executor `.pending` staging failed before activation, worker abandoned before the official
+    /// rename started, or handback stopped the persistence worker before the official rename
+    /// started). Never clears another domain.
+    pub fn clear_orphaned_staged_hold(&mut self, domain: ConfigDomain) -> bool {
+        if self.held.is_some_and(|h| h.domain == domain) {
+            self.held = None;
+            self.marker_bound_grant = None;
+            return true;
+        }
+        false
+    }
+
     /// Start-up reconciliation of `domain` (replaces nothing: false when another hold exists).
     pub fn begin_reconcile(&mut self, domain: ConfigDomain, active: u64) -> bool {
         match &mut self.held {
