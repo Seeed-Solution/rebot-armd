@@ -1165,6 +1165,30 @@ impl<T: Copy, const N: usize> std::ops::Deref for SmallBuf<T, N> {
 /// (`2 * MAX_KEEPOUT_EVALS_PER_TICK + 4` with `MAX_KEEPOUT_EVALS_PER_TICK = 64`).
 pub const RT_SWEEP_POOL_SLOTS: usize = 2 * 64 + 4;
 
+/// Maximum DFS depth for adaptive linear-step subdivision (`2^-30 < 1e-9`, so depth <= 30;
+/// 32 gives margin while keeping fixed capacity strictly bounded).
+pub const RT_SWEEP_MAX_DEPTH: usize = 32;
+
+/// Preallocated fixed-capacity DFS subdivision stack for zero-allocation RT linear-step
+/// workspace sweeps (`<= k::MAX_STACK_WORKSPACE_SLOTS` slots).
+///
+/// Stores each pending right interval `(t0, t1)` together with its already-evaluated
+/// right-endpoint clearance `c1` so popping never recomputes FK or exceeds `remaining_budget`.
+#[derive(Debug)]
+pub struct RtSweepStack {
+    t: [(f64, f64); RT_SWEEP_MAX_DEPTH],
+    c1: [[f64; k::MAX_STACK_WORKSPACE_SLOTS]; RT_SWEEP_MAX_DEPTH],
+}
+
+impl Default for RtSweepStack {
+    fn default() -> Self {
+        Self {
+            t: [(0.0, 0.0); RT_SWEEP_MAX_DEPTH],
+            c1: [[0.0; k::MAX_STACK_WORKSPACE_SLOTS]; RT_SWEEP_MAX_DEPTH],
+        }
+    }
+}
+
 /// Zero-allocation workspace refusal payload for `armd-control` (static codes & indices;
 /// formatted into preallocated [`k::WorkspaceViolationDetail`] text without touching the heap).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1311,13 +1335,15 @@ pub struct WorkspaceEvaluator<'a> {
     floor: f64,
     box_lo: [f64; 3],
     box_hi: [f64; 3],
-    keepouts: SmallBuf<([f64; 3], [f64; 3]), 16>,
-    end_locals: SmallBuf<[f64; 3], 16>,
+    keepouts: SmallBuf<([f64; 3], [f64; 3]), { crate::model::MAX_KEEPOUT_BOXES }>,
+    /// Inline capacity 34 = 1 end_origin + 32 max `check_points_end_m` + 1 camera offset, so no
+    /// valid profile ever spills `end_locals` to the heap during RT evaluator construction.
+    end_locals: SmallBuf<[f64; 3], 34>,
     tcp_offset: [f64; 3],
     has_tcp_reach: bool,
     has_cam: bool,
     capsules: SmallBuf<(Option<FrameRef>, [f64; 3], [f64; 3], f64), { crate::model::MAX_LINK_CAPSULES }>,
-    self_pairs: SmallBuf<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>, 32>,
+    self_pairs: SmallBuf<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>, { crate::model::MAX_SELF_COLLISION_PAIRS }>,
     self_collision_min_clearance: f64,
     pub end_reach: [f64; MAX_CHAIN_JOINTS],
     cap_reaches: SmallBuf<[f64; MAX_CHAIN_JOINTS], { crate::model::MAX_LINK_CAPSULES }>,
@@ -2541,13 +2567,13 @@ impl<'a> WorkspaceEvaluator<'a> {
     }
 
     /// Zero-allocation RT counterpart to [`Self::sweep_linear_step`] using a fixed-capacity
-    /// subdivision stack and `Copy` [`WorkspaceFailureRt`] rejection details.
+    /// subdivision stack ([`RtSweepStack`]) and `Copy` [`WorkspaceFailureRt`] rejection details.
     ///
-    /// Preserves exact chronological DFS subdivision order and budget accounting of
-    /// [`Self::sweep_linear_step`] with zero heap allocations for any `< 256`-slot workspace
-    /// (`total_slots <= k::MAX_STACK_WORKSPACE_SLOTS`, `num_geoms <= 64`,
-    /// `capsules.len() <= MAX_LINK_CAPSULES`), on both passing (including adaptive subdivision)
-    /// and failing paths.
+    /// Preserves exact chronological DFS subdivision order, exact FK evaluation count (popping a
+    /// pending right interval restores its cached clearance with zero extra FK evaluations), and
+    /// exact budget accounting of [`Self::sweep_linear_step`] with zero heap allocations for any
+    /// `<= k::MAX_STACK_WORKSPACE_SLOTS` workspace (`num_geoms <= 64`,
+    /// `capsules.len() <= MAX_LINK_CAPSULES`), on both passing and failing paths.
     #[allow(clippy::too_many_arguments)]
     pub fn sweep_linear_step_slotbuf_rt(
         &self,
@@ -2559,9 +2585,20 @@ impl<'a> WorkspaceEvaluator<'a> {
         max_budget: usize,
         endpoint_phase: &'static str,
         sweep_phase: &'static str,
+        stack: &mut RtSweepStack,
     ) -> Result<k::SlotBuf, (f64, WorkspaceFailureRt)> {
-        const MAX_DEPTH: usize = 64;
         const MAX_INLINE_GEOMS: usize = 64;
+
+        let n = self.total_slots;
+        if n > k::MAX_STACK_WORKSPACE_SLOTS {
+            return Err((
+                0.0,
+                WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::Invalid("workspace exceeds inline RT slot capacity"),
+                    phase: sweep_phase,
+                },
+            ));
+        }
 
         let mut c_b = self.alloc_buf();
         let mut empty_caps = Vec::new();
@@ -2595,7 +2632,6 @@ impl<'a> WorkspaceEvaluator<'a> {
             return Ok(c_b);
         }
 
-        let mut pending = [(0.0f64, 0.0f64); MAX_DEPTH];
         let mut sp = 0usize;
         let mut cur_t0 = 0.0f64;
         let mut cur_t1 = 1.0f64;
@@ -2633,24 +2669,10 @@ impl<'a> WorkspaceEvaluator<'a> {
                 }
                 std::mem::swap(&mut c_prev, &mut c_next);
                 sp -= 1;
-                let (nt0, nt1) = pending[sp];
+                let (nt0, nt1) = stack.t[sp];
                 cur_t0 = nt0;
                 cur_t1 = nt1;
-                if (cur_t1 - 1.0).abs() < 1e-12 {
-                    c_next.as_mut_slice().copy_from_slice(c_b.as_slice());
-                } else {
-                    let t1_32 = cur_t1 as f32;
-                    for j in 0..dof {
-                        qm_buf[j] = a[j] + t1_32 * (b[j] - a[j]);
-                    }
-                    self.eval_into_slice_rt(
-                        &qm_buf[..dof],
-                        c_next.as_mut_slice(),
-                        &mut empty_caps,
-                        sweep_phase,
-                    )
-                    .map_err(|e| (cur_t1, e))?;
-                }
+                c_next.as_mut_slice()[..n].copy_from_slice(&stack.c1[sp][..n]);
                 continue;
             };
             if dt <= 1e-9 {
@@ -2666,7 +2688,7 @@ impl<'a> WorkspaceEvaluator<'a> {
                     },
                 ));
             }
-            if *remaining_budget == 0 || sp >= MAX_DEPTH {
+            if *remaining_budget == 0 || sp >= RT_SWEEP_MAX_DEPTH {
                 return Err((
                     cur_t0,
                     WorkspaceFailureRt {
@@ -2690,7 +2712,8 @@ impl<'a> WorkspaceEvaluator<'a> {
             .map_err(|e| (tm, e))?;
             self.check_readonly_slice_rt(c_mid.as_slice(), min_depths.as_slice(), sweep_phase)
                 .map_err(|e| (tm, e))?;
-            pending[sp] = (tm, cur_t1);
+            stack.t[sp] = (tm, cur_t1);
+            stack.c1[sp][..n].copy_from_slice(&c_next.as_slice()[..n]);
             sp += 1;
             cur_t1 = tm;
             std::mem::swap(&mut c_next, &mut c_mid);
@@ -2920,16 +2943,51 @@ mod tests {
         let mut min_d_rt = eval.init_min_depths(&c_a_rt);
         let mut budget_leg = 64usize;
         let mut budget_rt = 64usize;
+        let mut rt_stack = Box::new(RtSweepStack::default());
         let leg_cb = eval
             .sweep_linear_step(&a, &b, &c_a, &mut min_d_leg, &mut budget_leg, 64, "end", "sweep")
             .expect("legacy sweep with subdivision passes");
         let rt_cb = eval
-            .sweep_linear_step_slotbuf_rt(&a, &b, &c_a_rt, &mut min_d_rt, &mut budget_rt, 64, "end", "sweep")
+            .sweep_linear_step_slotbuf_rt(
+                &a,
+                &b,
+                &c_a_rt,
+                &mut min_d_rt,
+                &mut budget_rt,
+                64,
+                "end",
+                "sweep",
+                &mut rt_stack,
+            )
             .expect("RT sweep with subdivision passes");
         assert!(budget_leg < 64, "test must trigger subdivision");
         assert_eq!(budget_rt, budget_leg, "subdivision budget accounting must match");
         assert_eq!(rt_cb.as_slice(), leg_cb.as_slice());
         assert_eq!(min_d_rt.as_slice(), min_d_leg.as_slice());
+
+        // Exact tight-budget parity (when budget hits 0 right before popping a cached right endpoint)
+        let exact_splits = 64 - budget_leg;
+        let mut md_exact_leg = eval.init_min_depths(&c_a);
+        let mut md_exact_rt = eval.init_min_depths(&c_a_rt);
+        let mut b_exact_leg = exact_splits;
+        let mut b_exact_rt = exact_splits;
+        eval.sweep_linear_step(&a, &b, &c_a, &mut md_exact_leg, &mut b_exact_leg, exact_splits, "end", "sweep")
+            .expect("legacy exact-budget sweep passes");
+        eval.sweep_linear_step_slotbuf_rt(
+            &a,
+            &b,
+            &c_a_rt,
+            &mut md_exact_rt,
+            &mut b_exact_rt,
+            exact_splits,
+            "end",
+            "sweep",
+            &mut rt_stack,
+        )
+        .expect("RT exact-budget sweep passes with zero extra FK calls");
+        assert_eq!(b_exact_rt, 0);
+        assert_eq!(b_exact_rt, b_exact_leg);
+        assert_eq!(md_exact_rt.as_slice(), md_exact_leg.as_slice());
 
         // Midpoint keepout rejection parity
         let mid_q: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
@@ -2951,7 +3009,17 @@ mod tests {
             .sweep_linear_step(&a, &b, &c_a_bad, &mut md_leg, &mut b_leg, 64, "end", "sweep")
             .expect_err("legacy sweep rejects midpoint keepout");
         let err_rt = eval_bad
-            .sweep_linear_step_slotbuf_rt(&a, &b, &c_a_bad, &mut md_rt, &mut b_rt, 64, "end", "sweep")
+            .sweep_linear_step_slotbuf_rt(
+                &a,
+                &b,
+                &c_a_bad,
+                &mut md_rt,
+                &mut b_rt,
+                64,
+                "end",
+                "sweep",
+                &mut rt_stack,
+            )
             .expect_err("RT sweep rejects midpoint keepout");
         assert_eq!(b_rt, b_leg);
         assert!((err_rt.0 - err_leg.0).abs() < 1e-12);

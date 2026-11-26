@@ -3008,8 +3008,9 @@ async fn rt_gate_tracking_fallback_full_workspace_sweep_and_rejection_zero_alloc
         TrackingStrategy,
     };
 
-    // Part A: Full workspace (< 256 slots) where braking steps stay valid while passing within
-    // ~0.5 mm of the floor boundary, forcing adaptive subdivision in the RT tracking fallback sweep.
+    // Part A: Full workspace (16 configured checkpoints + origin = 17 points = 119 slots < 256,
+    // exercising inline `end_locals` capacity > 16) where braking steps stay valid while passing
+    // within ~0.8 mm of the floor boundary, forcing adaptive subdivision in the RT fallback sweep.
     {
         let clock = ScriptedClock::new();
         let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
@@ -3024,14 +3025,18 @@ async fn rt_gate_tracking_fallback_full_workspace_sweep_and_rejection_zero_alloc
         let p_start = cfg.arm_model.frames_f32(&q_start).unwrap().end.p;
         let p_hold = cfg.arm_model.frames_f32(&q_hold).unwrap().end.p;
         let min_z = p_start[2].min(p_hold[2]) as f32;
+        // 16 configured check points + end_origin = 17 points (17 * 7 = 119 slots < 256).
+        let check_points: Vec<[f32; 3]> = (0..16)
+            .map(|i| [0.001 * i as f32, 0.0, 0.0])
+            .collect();
         cfg.workspace = Some(WorkspacePolicy {
             // 0.8 mm below the arm's end-effector Z so endpoints are valid while travel bound
             // exceeds endpoint clearances and forces adaptive subdivision within the 64-eval budget.
             floor_z_m: min_z - 0.0008,
             box_min_m: [-1.5, -1.5, min_z - 0.5],
             box_max_m: [1.5, 1.5, 1.5],
-            max_reach_m: Some(1.5),
-            check_points_end_m: vec![[0.0, 0.0, 0.0]],
+            max_reach_m: None,
+            check_points_end_m: check_points,
             keepout_boxes: vec![],
             link_capsules: vec![],
             self_collision_enabled: false,
@@ -3082,15 +3087,19 @@ async fn rt_gate_tracking_fallback_full_workspace_sweep_and_rejection_zero_alloc
             .unwrap();
 
         let gate = RtReleaseGate::new(&sup, &handle);
-        let ((saw_step, settled_at_hold, safety_state), delta) =
+        let ((saw_step, first_step_q, settled_at_hold, safety_state), delta) =
             gate.run_phase("tracking_fallback_full_ws_subdivision", || {
                 let mut saw_step = false;
+                let mut first_step_q: Option<Vec<f32>> = None;
                 let mut prev_q0 = q_start[0];
                 for _ in 0..40 {
                     clock.run_steps(period_ns, 1);
                     if let Some(s) = sup.hub().latest() {
                         if (s.rt.commanded_positions[0] - prev_q0).abs() > 1e-4 {
                             saw_step = true;
+                            if first_step_q.is_none() {
+                                first_step_q = Some(s.rt.commanded_positions.clone());
+                            }
                         }
                         prev_q0 = s.rt.commanded_positions[0];
                     }
@@ -3098,7 +3107,10 @@ async fn rt_gate_tracking_fallback_full_workspace_sweep_and_rejection_zero_alloc
                 let s_end = sup.hub().latest().unwrap();
                 let settled_at_hold = s_end.rt.commanded_positions[0].abs() < 0.02;
                 let safety_state = s_end.obs.safety_state.clone();
-                ((saw_step, settled_at_hold, safety_state), saw_step && settled_at_hold)
+                (
+                    (saw_step, first_step_q, settled_at_hold, safety_state),
+                    saw_step && settled_at_hold,
+                )
             });
         assert!(
             saw_step && settled_at_hold,
@@ -3110,7 +3122,37 @@ async fn rt_gate_tracking_fallback_full_workspace_sweep_and_rejection_zero_alloc
         );
         assert!(
             delta.is_clean(),
-            "full-workspace tracking fallback subdivision must be zero-alloc/zero-lock: {delta:?}"
+            "full-workspace 119-slot tracking fallback subdivision must be zero-alloc/zero-lock: {delta:?}"
+        );
+        // Independently verify on the exact captured first RT step that adaptive subdivision
+        // consumed sweep budget (proving the subdivision loop executed during the gated phase).
+        let q1 = first_step_q.expect("captured first braking step");
+        let eval = armd::chain::WorkspaceEvaluator::new(
+            &cfg.arm_model,
+            cfg.workspace.as_ref().unwrap(),
+            &cfg.camera_mount,
+        );
+        assert_eq!(eval.total_slots, 119);
+        let mut c0 = eval.alloc_buf();
+        eval.eval_into_slotbuf_rt(&q_start, &mut c0, "verify").unwrap();
+        let mut min_d = eval.init_min_depths(&c0);
+        let mut budget = armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+        let mut stack = Box::new(armd::chain::RtSweepStack::default());
+        eval.sweep_linear_step_slotbuf_rt(
+            &q_start,
+            &q1,
+            &c0,
+            &mut min_d,
+            &mut budget,
+            armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK,
+            "verify",
+            "verify",
+            &mut stack,
+        )
+        .expect("captured RT step passes workspace sweep");
+        assert!(
+            budget < armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK,
+            "Part A captured RT step must trigger adaptive subdivision (remaining budget={budget})"
         );
 
         tokio::task::spawn_blocking(move || handle.stop_and_join())

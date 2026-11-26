@@ -2190,6 +2190,7 @@ impl crate::supervisor::SupervisorInner {
                 keepout_only,
                 true,
                 budget,
+                scratch.sweep_stack.as_deref_mut(),
             )?;
             copy_into(&mut scratch.out_positions, q_hold);
             fill_n(&mut scratch.out_velocities, 0.0_f32, dof);
@@ -2258,6 +2259,7 @@ impl crate::supervisor::SupervisorInner {
                 keepout_only,
                 check_meas,
                 budget,
+                scratch.sweep_stack.as_deref_mut(),
             ) {
                 Ok(ws) => {
                     scratch.out_velocities.clear();
@@ -2353,6 +2355,11 @@ impl crate::supervisor::SupervisorInner {
     }
 
     /// Zero-allocation error-reporting RT counterpart to [`Self::fallback_workspace_check`].
+    ///
+    /// Uses the zero-allocation fixed-capacity RT sweep for full workspaces within inline slot
+    /// capacity (`!keepout_only && total_slots <= MAX_STACK_WORKSPACE_SLOTS`); `keepout_only` and
+    /// `>256`-slot workspaces remain on the legacy sweep path (coordinated with `armd-g3` / `f0896146`).
+    #[allow(clippy::too_many_arguments)]
     fn fallback_workspace_check_rt(
         &self,
         prev: Option<&[f32]>,
@@ -2361,8 +2368,9 @@ impl crate::supervisor::SupervisorInner {
         keepout_only: bool,
         fresh_meas: bool,
         budget: &mut usize,
+        mut sweep_stack: Option<&mut crate::chain::RtSweepStack>,
     ) -> Result<Option<(u64, crate::kinematics::SlotBuf)>, FallbackStepErr> {
-        use crate::chain::WorkspaceEvaluator;
+        use crate::chain::{WorkspaceEvaluator, WorkspaceFailureKindRt, WorkspaceFailureRt};
         use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
         let Some((ws_full, cam)) = self.workspace_policy() else { return Ok(None) };
         let keepout_ws = keepout_only.then(|| ws_full.keepout_only());
@@ -2371,46 +2379,93 @@ impl crate::supervisor::SupervisorInner {
             return Ok(prev_depths.cloned());
         }
         let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+        let use_rt_sweep = !keepout_only
+            && eval.total_slots <= crate::kinematics::MAX_STACK_WORKSPACE_SLOTS
+            && sweep_stack.is_some();
+        let legacy_err = || WorkspaceFailureRt {
+            kind: WorkspaceFailureKindRt::Invalid("legacy workspace sweep rejected"),
+            phase: "tracking_fallback",
+        };
         let mut committed = None;
         if let Some(pq) = prev {
             let mut c_prev = eval.alloc_buf();
-            eval.eval_into_slotbuf_rt(pq, &mut c_prev, "tracking_fallback")
-                .map_err(FallbackStepErr::WorkspaceStartViolation)?;
+            if use_rt_sweep {
+                eval.eval_into_slotbuf_rt(pq, &mut c_prev, "tracking_fallback")
+                    .map_err(FallbackStepErr::WorkspaceStartViolation)?;
+            } else {
+                eval.eval_into(pq, &mut c_prev, "tracking_fallback")
+                    .map_err(|_| FallbackStepErr::WorkspaceStartViolation(legacy_err()))?;
+            }
             let mut min_d = match prev_depths {
                 Some((rev, md)) if *rev == self.workspace_revision && md.as_slice().len() == eval.total_slots => md.clone(),
                 _ => eval.init_min_depths(&c_prev),
             };
-            eval.sweep_linear_step_slotbuf_rt(
-                pq,
-                q,
-                &c_prev,
-                &mut min_d,
-                budget,
-                MAX_KEEPOUT_EVALS_PER_TICK,
-                "tracking_fallback",
-                "tracking_fallback",
-            )
-            .map_err(|(_, err)| FallbackStepErr::WorkspaceStepViolation(err))?;
+            if let (true, Some(stack)) = (use_rt_sweep, sweep_stack.as_deref_mut()) {
+                eval.sweep_linear_step_slotbuf_rt(
+                    pq,
+                    q,
+                    &c_prev,
+                    &mut min_d,
+                    budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    "tracking_fallback",
+                    "tracking_fallback",
+                    stack,
+                )
+                .map_err(|(_, err)| FallbackStepErr::WorkspaceStepViolation(err))?;
+            } else {
+                eval.sweep_linear_step(
+                    pq,
+                    q,
+                    &c_prev,
+                    &mut min_d,
+                    budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    "tracking_fallback",
+                    "tracking_fallback",
+                )
+                .map_err(|_| FallbackStepErr::WorkspaceStepViolation(legacy_err()))?;
+            }
             committed = Some((self.workspace_revision, min_d));
         }
         if !fresh_meas {
             return Ok(committed);
         }
         let mut c_meas = eval.alloc_buf();
-        eval.eval_into_slotbuf_rt(&self.measured_positions, &mut c_meas, "tracking_fallback")
-            .map_err(FallbackStepErr::WorkspaceMeasuredViolation)?;
+        if use_rt_sweep {
+            eval.eval_into_slotbuf_rt(&self.measured_positions, &mut c_meas, "tracking_fallback")
+                .map_err(FallbackStepErr::WorkspaceMeasuredViolation)?;
+        } else {
+            eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_fallback")
+                .map_err(|_| FallbackStepErr::WorkspaceMeasuredViolation(legacy_err()))?;
+        }
         let mut min_d_meas = eval.init_min_depths(&c_meas);
-        eval.sweep_linear_step_slotbuf_rt(
-            &self.measured_positions,
-            q,
-            &c_meas,
-            &mut min_d_meas,
-            budget,
-            MAX_KEEPOUT_EVALS_PER_TICK,
-            "tracking_fallback",
-            "tracking_fallback",
-        )
-        .map_err(|(_, err)| FallbackStepErr::WorkspaceMeasuredSweepViolation(err))?;
+        if let (true, Some(stack)) = (use_rt_sweep, sweep_stack.as_deref_mut()) {
+            eval.sweep_linear_step_slotbuf_rt(
+                &self.measured_positions,
+                q,
+                &c_meas,
+                &mut min_d_meas,
+                budget,
+                MAX_KEEPOUT_EVALS_PER_TICK,
+                "tracking_fallback",
+                "tracking_fallback",
+                stack,
+            )
+            .map_err(|(_, err)| FallbackStepErr::WorkspaceMeasuredSweepViolation(err))?;
+        } else {
+            eval.sweep_linear_step(
+                &self.measured_positions,
+                q,
+                &c_meas,
+                &mut min_d_meas,
+                budget,
+                MAX_KEEPOUT_EVALS_PER_TICK,
+                "tracking_fallback",
+                "tracking_fallback",
+            )
+            .map_err(|_| FallbackStepErr::WorkspaceMeasuredSweepViolation(legacy_err()))?;
+        }
         Ok(committed.or(Some((self.workspace_revision, min_d_meas))))
     }
 

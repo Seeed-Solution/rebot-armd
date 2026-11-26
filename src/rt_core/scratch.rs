@@ -98,6 +98,10 @@ pub struct TrackingScratch {
     pub cand_zero: Vec<f32>,
     pub out_positions: Vec<f32>,
     pub out_velocities: Vec<f32>,
+    /// Preallocated fixed-capacity DFS subdivision stack for RT tracking fallback sweeps
+    /// (`Some` when constructed via [`Self::with_dof`] off-thread; `None` in `Default` so
+    /// `std::mem::take(&mut self.scratch.tracking)` on `armd-control` performs 0 heap allocations).
+    pub sweep_stack: Option<Box<crate::chain::RtSweepStack>>,
 }
 
 impl TrackingScratch {
@@ -120,6 +124,7 @@ impl TrackingScratch {
             cand_zero: Vec::with_capacity(n),
             out_positions: Vec::with_capacity(n),
             out_velocities: Vec::with_capacity(n),
+            sweep_stack: Some(Box::new(crate::chain::RtSweepStack::default())),
         }
     }
 }

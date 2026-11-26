@@ -1690,23 +1690,13 @@ fn j7_continuity_bypass_never_leaks_to_motion_target_after_arm_batch_cutoff() {
     use std::sync::Arc;
 
     // Part A: Standalone armed MIT (`external_pos_force_emitter == false`).
-    // Arm batch (J1..J6) completes before `tx_release_deadline`; cutoff expires immediately
-    // after J6 submits (before J7 emission). The standalone path MUST NOT leak continuity
-    // bypass flags to the J7 motion `Target`: NO J7 `Target` (`vel_raw > 0`) may be sent;
-    // only a stationary `Hold` (`vel_raw == 0`) may be sent.
+    // Arm batch (J1..J6) completes strictly BEFORE `tx_release_deadline`; cutoff expires via
+    // `FakeBus::on_tx` immediately AFTER the 6th arm frame has been transmitted and timestamped.
+    // The standalone path MUST NOT leak continuity bypass flags to the J7 motion `Target`:
+    // NO J7 `Target` (`vel_raw > 0`) may be sent; only a stationary `Hold` (`vel_raw == 0`) may.
     {
         let clock = MockClock::new();
-        let (bus, drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
-        let armed_expire = Arc::new(AtomicBool::new(false));
-        let hook_expire = armed_expire.clone();
-        let hook_clock = clock.clone();
-        let mut drv = drv.with_before_final_tx_gate_hook(Arc::new(move |frame| {
-            // Expire the release cutoff right as the 6th arm frame submits (arm batch completes,
-            // cutoff is expired before J7 Target is emitted).
-            if frame.id == 6 && hook_expire.swap(false, Ordering::SeqCst) {
-                hook_clock.advance(Duration::from_millis(12));
-            }
-        }));
+        let (bus, mut drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
         bus.with(|s| {
             for m in s.motors.iter_mut().take(6) {
                 m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
@@ -1735,10 +1725,20 @@ fn j7_continuity_bypass_never_leaks_to_motion_target_after_arm_batch_cutoff() {
         drv.set_external_pos_force_emitter(false);
 
         clock.advance(Duration::from_millis(20));
+        let arm_tx_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let on_tx_seen = arm_tx_seen.clone();
+        let on_tx_clock = clock.clone();
         bus.with(|s| {
             s.tx_log.clear();
             s.tx_times.clear();
             s.push_all_feedback();
+            // Fires strictly AFTER each transmitted frame has been recorded in `tx_log`/`tx_times`:
+            // once all 6 arm frames (J1..J6) have completed before deadline, expire the cutoff.
+            s.on_tx = Some(Arc::new(move || {
+                if on_tx_seen.fetch_add(1, Ordering::SeqCst) + 1 == 6 {
+                    on_tx_clock.advance(Duration::from_millis(12));
+                }
+            }));
         });
         let _ = drv.read_joint_states();
 
@@ -1747,26 +1747,46 @@ fn j7_continuity_bypass_never_leaks_to_motion_target_after_arm_batch_cutoff() {
         motion_targets[6].velocity = Some(1.0);
 
         let t0 = clock.now();
+        let release_deadline = t0 + Duration::from_millis(10);
         drv.begin_control_release(1);
-        drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(10)));
+        drv.set_tx_release_deadline(Some(release_deadline));
         drv.sync_release_budget_limits(64, 16);
-        armed_expire.store(true, Ordering::SeqCst);
 
-        let _ = drv
+        let out = drv
             .write_joint_targets_bounded(&motion_targets)
             .expect("standalone armed MIT write must not trip fence when J7 degrades to Hold");
         drv.set_tx_release_deadline(None);
+        bus.with(|s| s.on_tx = None);
+        assert!(
+            matches!(out, TxBatchOutcome::Deferred { pending: 1 }),
+            "standalone armed MIT with J7 Hold fallback must report Deferred {{ pending: 1 }}, got {out:?}"
+        );
         assert!(
             drv.mit_fence_trip().is_none(),
             "degrading J7 Target to stationary Hold past cutoff must not trip armed MIT fence"
         );
 
-        let tx_frames = bus.with(|s| s.tx_log.clone());
-        let arm_count = tx_frames.iter().filter(|f| (1..=6).contains(&f.id)).count();
-        assert_eq!(arm_count, 6, "arm batch J1..J6 must have completed before cutoff");
-        let j7_frames: Vec<_> = tx_frames.iter().filter(|f| f.id == 0x307).collect();
-        assert_eq!(j7_frames.len(), 1, "exactly one J7 0x307 frame must be emitted");
-        let vel_raw = u16::from_le_bytes([j7_frames[0].data[4], j7_frames[0].data[5]]);
+        let (tx_frames, tx_times) = bus.with(|s| (s.tx_log.clone(), s.tx_times.clone()));
+        assert_eq!(tx_frames.len(), 7, "expected 6 arm frames + 1 J7 frame");
+        assert_eq!(tx_times.len(), 7);
+        for idx in 0..6 {
+            assert!(
+                (1..=6).contains(&tx_frames[idx].id),
+                "frame {idx} must be an arm MIT frame, got id=0x{:x}",
+                tx_frames[idx].id
+            );
+            assert!(
+                tx_times[idx].expect("mock clock tx timestamp") < release_deadline,
+                "arm frame {idx} (id=0x{:x}) must complete strictly before release_deadline",
+                tx_frames[idx].id
+            );
+        }
+        assert_eq!(tx_frames[6].id, 0x307, "7th frame must be J7 0x307");
+        assert!(
+            tx_times[6].expect("mock clock j7 tx timestamp") >= release_deadline,
+            "J7 frame must be emitted strictly after release_deadline expired"
+        );
+        let vel_raw = u16::from_le_bytes([tx_frames[6].data[4], tx_frames[6].data[5]]);
         assert_eq!(
             vel_raw, 0,
             "standalone J7 motion Target past cutoff must NOT be sent; only Hold (vel_raw=0) allowed, got vel_raw={vel_raw}"
