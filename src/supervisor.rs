@@ -1253,6 +1253,10 @@ pub struct SupervisorInner {
     /// output and the J7 tick epilogue never emit duplicate frames after ModeSwitch finishes).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) mode_switch_ran_release_seq: u64,
+    /// Owner-recorded proof of applied general stops: incremented only on the owner thread inside
+    /// [`Self::authorized_stop`] after motion is halted (never by a policy-only STOP and never by
+    /// the request side), so a stop-generation race cannot fabricate stop proof.
+    pub(crate) applied_general_stop_seq: u64,
     /// True when startup found an incomplete or unreadable pending calibration commit marker.
     pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
@@ -2550,6 +2554,7 @@ impl SupervisorInner {
             mode_switch: ModeSwitchRunner::new(),
             #[cfg(not(target_arch = "wasm32"))]
             mode_switch_ran_release_seq: 0,
+            applied_general_stop_seq: 0,
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
@@ -12298,6 +12303,8 @@ pub(crate) struct ModeSwitchRunner {
     retained_len: usize,
     recent_terminals: [Option<crate::motor_mode::ModeSwitchSnapshot>; 4],
     recent_terminal_cursor: usize,
+    /// `SupervisorInner::applied_general_stop_seq` captured when the active session was admitted.
+    admitted_general_stop_seq: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -12311,6 +12318,7 @@ impl ModeSwitchRunner {
             retained_len: 0,
             recent_terminals: [None; 4],
             recent_terminal_cursor: 0,
+            admitted_general_stop_seq: 0,
         }
     }
 
@@ -12577,6 +12585,7 @@ impl SupervisorInner {
             let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(plan_mask));
         }
         self.mode_switch.active_session = Some(sid);
+        self.mode_switch.admitted_general_stop_seq = self.applied_general_stop_seq;
         self.mode_switch.machine = Some(crate::motor_mode::ModeSwitch::new(req.plan));
         Ok(sid.0)
     }
@@ -12602,24 +12611,17 @@ impl SupervisorInner {
 
     /// Owner proof that a stop has been APPLIED, as opposed to an urgent stop that is only
     /// pending. Shared by in-step gate revocation and external revocation. True when the safety
-    /// state is stopped (E-stop, fault), or when an ordinary STOP advanced the stop generation
-    /// past the active `ModeSwitch` session's admission generation and no requested stop is
-    /// still unapplied by the owner.
+    /// state is stopped (E-stop, fault), or when the owner applied a general stop (recorded in
+    /// `applied_general_stop_seq` by `authorized_stop`) after the active session was admitted.
+    /// The shared stop generation is deliberately not used: a policy-only STOP or a concurrent
+    /// request can advance it without the owner halting motion.
     #[inline]
     pub(crate) fn mode_switch_stop_applied(&self) -> bool {
-        use crate::rt_core::session::{SessionKind, SessionSlot};
         if self.safety.state().is_stopped() {
             return true;
         }
-        let Some(admitted_gen) = self
-            .sessions
-            .slot(SessionSlot::ExclusiveOutput)
-            .filter(|s| s.kind == SessionKind::ModeSwitch)
-            .map(|s| s.authority.stop_generation)
-        else {
-            return false;
-        };
-        !self.urgent_stop_unapplied() && self.current_stop_gen() > admitted_gen
+        self.mode_switch.active_session.is_some()
+            && self.applied_general_stop_seq > self.mode_switch.admitted_general_stop_seq
     }
 
     /// Reconciles active `ModeSwitch` state and driver `mode_write_uncertain_mask` /

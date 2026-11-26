@@ -2514,3 +2514,169 @@ fn safe_hold_keeps_holding_unconfirmed_after_hold_tx_failure() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 8. Review round 7 regressions (owner-recorded applied-stop proof)
+// ---------------------------------------------------------------------------
+
+/// Builds a manually ticked Legacy supervisor with J1 switched forward to Impedance and held in
+/// post-confirm feedback (no feedback after the mode ACK), returning `(sup, bus, sid)`.
+async fn legacy_mid_switch(lease: bool) -> (ArmSupervisor, FakeBus, u64) {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.control_frequency_hz = 50;
+    let bus = configure_damiao_bus(None, Duration::ZERO, true, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 16);
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let _ = drv.check_mapping_ranges();
+    let _ = drv.read_joint_states();
+    let sup = ArmSupervisor::new(cfg).with_driver(Box::new(drv));
+    sup.set_lease_enabled(lease).await;
+    if lease {
+        sup.acquire_lease("client-1").await.unwrap();
+    }
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+    bus.with(|s| {
+        s.immediate_replies = false;
+        s.push_all_feedback();
+    });
+    let _ = sup.tick(0.02).await;
+    bus.with(|s| s.motors[0].mute_feedback_after_mode_ack = true);
+    let mut plan =
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+            .unwrap();
+    plan.per_axis_timeout = Duration::from_secs(2);
+    let sid = sup
+        .start_mode_switch_session(ModeSwitchStartRequest {
+            plan,
+            admission: sup.capture_admission_stamp(),
+            operator_required: false,
+            operator_grant: OperatorGrant::unenforced(),
+            deadline: Instant::now() + Duration::from_secs(4),
+            client: ClientId(31),
+        })
+        .await
+        .unwrap();
+    let mut acked = 0;
+    for _ in 0..30 {
+        bus.with(|s| s.push_all_feedback());
+        let _ = sup.tick(0.02).await;
+        assert!(sup.poll_mode_switch_session(sid).await.unwrap().unwrap().running);
+        if bus.with(|s| s.motors[0].ctrl_mode()) == damiao::CTRL_MODE_MIT {
+            acked += 1;
+            if acked >= 3 {
+                break;
+            }
+        }
+    }
+    assert!(acked >= 3, "J1 must have switched forward");
+    (sup, bus, sid)
+}
+
+async fn legacy_tick_until_terminal(sup: &ArmSupervisor, bus: &FakeBus, sid: u64) -> Option<ModeProgress> {
+    for _ in 0..10 {
+        bus.with(|s| s.push_all_feedback());
+        let _ = sup.tick(0.02).await;
+        if let Some(s) = sup.poll_mode_switch_session(sid).await.unwrap() {
+            if !s.running {
+                return Some(s.progress);
+            }
+        }
+    }
+    None
+}
+
+/// Round 7: a stop generation that reads as requested AND applied but was never applied by the
+/// owner (the request landed after the pending check) is no proof: the energized partial switch
+/// takes the SAFE-HOLD path. `StopRequests` is the deterministic hook for that interleaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_generation_not_applied_by_owner_is_not_stop_proof() {
+    let (sup, bus, sid) = legacy_mid_switch(false).await;
+    {
+        let mut inner = sup.inner().write().await;
+        let stops = armd::rt_core::urgent::StopRequests::new();
+        inner.attach_stop_requests(stops.clone());
+        let g = stops.request();
+        // The generation advances and reads as applied, but the owner never halted motion.
+        stops.mark_applied(g);
+    }
+    let done = legacy_tick_until_terminal(&sup, &bus, sid).await;
+    assert!(
+        matches!(done, Some(ModeProgress::Ambiguous { .. })),
+        "a generation the owner did not apply must not prove a stop, got {done:?}"
+    );
+}
+
+/// Round 7: a policy-only STOP (no policy running) advances and acknowledges the stop generation
+/// without a general stop; mid-switch it must take the SAFE-HOLD path, not `StoppedRecovered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_only_stop_mid_switch_is_not_stop_proof() {
+    use armd::rt_core::broker::{Authority, Reply};
+    use armd::rt_core::requests::lease::ConnectionHandle;
+    use armd::rt_core::requests::policy::{EndPolicySpec, PolicyCommand};
+    let h = OwnerHarness::start(OwnerKind::Executor, true, TIMEOUT_2000_COUNTS, true, true).await;
+    let exec = h.exec.clone().unwrap();
+    h.bus.with(|s| s.motors[0].mute_feedback_after_mode_ack = true);
+    let mut plan =
+        ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
+            .unwrap();
+    plan.per_axis_timeout = Duration::from_secs(2);
+    let sid = h
+        .sup
+        .start_mode_switch_session(ModeSwitchStartRequest {
+            plan,
+            admission: h.sup.capture_admission_stamp(),
+            operator_required: false,
+            operator_grant: OperatorGrant::unenforced(),
+            deadline: Instant::now() + Duration::from_secs(4),
+            client: ClientId(33),
+        })
+        .await
+        .unwrap();
+    let dl = Instant::now() + Duration::from_secs(2);
+    while h.bus.with(|s| s.motors[0].ctrl_mode()) != damiao::CTRL_MODE_MIT {
+        assert!(Instant::now() < dl, "J1 must switch forward");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(h.sup.poll_mode_switch_session(sid).await.unwrap().unwrap().running);
+
+    let lg = h.sup.lease_generation();
+    let conn = ConnectionHandle::try_new(1, "mode-switch-test-client").unwrap();
+    exec.open_connection_sync(41).unwrap().unwrap();
+    let reply = exec
+        .submit_policy_command_async(
+            ClientId(41),
+            1,
+            Authority {
+                lease_generation: lg,
+                epoch: h.sup.estop_epoch(),
+                stop_generation: h.sup.current_stop_gen(),
+                config_revision: 0,
+                parent_generation: 0,
+            },
+            Instant::now() + Duration::from_secs(2),
+            PolicyCommand::EndPolicy(EndPolicySpec::Stop { connection: conn, lease_generation: lg }),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Ack { .. }), "policy stop must be accepted: {reply:?}");
+    let dl = Instant::now() + Duration::from_secs(2);
+    let done = loop {
+        if let Some(s) = h.sup.poll_mode_switch_session(sid).await.unwrap() {
+            if !s.running {
+                break s.progress;
+            }
+        }
+        assert!(Instant::now() < dl, "switch must end after the policy stop");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(
+        matches!(done, ModeProgress::Ambiguous { .. }),
+        "a policy-only STOP must not prove a general stop, got {done:?}"
+    );
+    h.shutdown(true).await;
+}
