@@ -343,7 +343,7 @@ pub fn resolve_arm_profile(profile: &str, base_dir: Option<&Path>) -> Result<(Ar
 /// Network host participating in a cell (PC coordinator or arm host).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostConfig {
-    #[serde(skip_serializing)]
+    #[serde(default, skip_serializing)]
     pub id: String,
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,9 +449,12 @@ impl CellConfig {
         Value::Object(root)
     }
 
-    /// Deterministic SHA-256 hex digest byte-identical to `rebot_companion.cell.CellConfig.digest()`.
+    /// Deterministic SHA-256 hex digest byte-identical to `rebot_companion.cell.CellConfig.digest()`
+    /// (Python `json.dumps(to_dict(), sort_keys=True, separators=(",", ":"))`, including ASCII
+    /// `\uXXXX` escaping and Python float exponent formatting).
     pub fn digest(&self) -> String {
-        let canonical = serde_json::to_string(&self.to_canonical_value()).expect("canonical cell JSON");
+        let mut canonical = String::new();
+        write_python_canonical_json(&self.to_canonical_value(), &mut canonical);
         crate::gravity::compute_sha256(canonical.as_bytes())
     }
 
@@ -623,6 +626,140 @@ fn undirected_pair(a: &str, b: &str) -> (String, String) {
     if a < b { (a.into(), b.into()) } else { (b.into(), a.into()) }
 }
 
+fn write_python_json_string(s: &str, out: &mut String) {
+    use std::fmt::Write;
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c if c.is_ascii() => out.push(c),
+            c => {
+                let mut units = [0u16; 2];
+                for u in c.encode_utf16(&mut units) {
+                    let _ = write!(out, "\\u{:04x}", u);
+                }
+            }
+        }
+    }
+    out.push('"');
+}
+
+fn write_python_json_f64(val: f64, out: &mut String) {
+    use std::fmt::Write;
+    if val == 0.0 {
+        if val.is_sign_negative() { out.push_str("-0.0"); } else { out.push_str("0.0"); }
+        return;
+    }
+    let raw = serde_json::to_string(&val).expect("finite f64");
+    let (neg, rest) = match raw.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, raw.as_str()),
+    };
+    let (mantissa, exp_part) = match rest.find(['e', 'E']) {
+        Some(idx) => (&rest[..idx], rest[idx + 1..].parse::<i32>().unwrap_or(0)),
+        None => (rest, 0),
+    };
+    let mut digits = String::with_capacity(mantissa.len());
+    let mut frac_len = 0i32;
+    let mut seen_dot = false;
+    for ch in mantissa.chars() {
+        if ch == '.' {
+            seen_dot = true;
+        } else {
+            digits.push(ch);
+            if seen_dot { frac_len += 1; }
+        }
+    }
+    let trimmed_lead = digits.trim_start_matches('0');
+    let leading_zeros = (digits.len() - trimmed_lead.len()) as i32;
+    let sig = trimmed_lead.trim_end_matches('0');
+    let exp10 = exp_part + (digits.len() as i32 - frac_len - leading_zeros - 1);
+
+    if neg { out.push('-'); }
+    if (-4..16).contains(&exp10) {
+        if exp10 >= 0 {
+            let int_digits = (exp10 + 1) as usize;
+            if sig.len() <= int_digits {
+                out.push_str(sig);
+                for _ in 0..(int_digits - sig.len()) { out.push('0'); }
+                out.push_str(".0");
+            } else {
+                out.push_str(&sig[..int_digits]);
+                out.push('.');
+                out.push_str(&sig[int_digits..]);
+            }
+        } else {
+            out.push_str("0.");
+            for _ in 0..((-exp10 - 1) as usize) { out.push('0'); }
+            out.push_str(sig);
+        }
+    } else {
+        out.push_str(&sig[..1]);
+        if sig.len() > 1 {
+            out.push('.');
+            out.push_str(&sig[1..]);
+        }
+        let sign = if exp10 < 0 { '-' } else { '+' };
+        let _ = write!(out, "e{sign}{:02}", exp10.unsigned_abs());
+    }
+}
+
+fn write_python_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                out.push_str(&i.to_string());
+            } else if let Some(u) = n.as_u64() {
+                out.push_str(&u.to_string());
+            } else if let Some(f) = n.as_f64() {
+                write_python_json_f64(f, out);
+            }
+        }
+        Value::String(s) => write_python_json_string(s, out),
+        Value::Array(arr) => {
+            out.push('[');
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 { out.push(','); }
+                write_python_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (idx, (k, v)) in map.iter().enumerate() {
+                if idx > 0 { out.push(','); }
+                write_python_json_string(k, out);
+                out.push(':');
+                write_python_canonical_json(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn address_matches_local(host_addr: &str, local_ips: &[String], hostname: Option<&str>) -> bool {
+    if hostname.is_some_and(|h| h == host_addr) {
+        return true;
+    }
+    if let Ok(parsed_host) = host_addr.parse::<std::net::IpAddr>() {
+        return local_ips
+            .iter()
+            .any(|ip| ip.parse::<std::net::IpAddr>().is_ok_and(|p| p == parsed_host));
+    }
+    local_ips.iter().any(|ip| ip == host_addr)
+}
+
 /// Pure host-identification resolver (explicit host override, then local hostname, then local IP
 /// addresses + port). Fails closed when zero or multiple hosts match.
 pub fn resolve_local_host(
@@ -654,9 +791,7 @@ pub fn resolve_local_host(
     let mut exact_port = Vec::new();
     let mut wildcard_port = Vec::new();
     for (host_id, host) in &cell.hosts {
-        let addr_matches = local_ips.iter().any(|ip| ip == &host.address)
-            || hostname_trimmed.is_some_and(|h| h == host.address);
-        if !addr_matches { continue; }
+        if !address_matches_local(&host.address, local_ips, hostname_trimmed) { continue; }
         match (host.port, local_port) {
             (Some(hp), Some(lp)) if hp == lp => exact_port.push(host_id.as_str()),
             (Some(_), Some(_)) => {}
@@ -673,10 +808,11 @@ pub fn resolve_local_host(
     }
 }
 
-/// Validates that a local `ArmConfig` (and optional hardware bus/serial device) matches `arm`.
+/// Validates that a local `ArmConfig`, hardware follower model, and bus/serial device match `arm`.
 pub fn validate_local_arm_config(
     arm: &ArmSpec,
     config: &ArmConfig,
+    follower: Option<&str>,
     resolved_hw_device: Option<&str>,
 ) -> Result<(), String> {
     if config.dof != arm.dof() {
@@ -693,6 +829,16 @@ pub fn validate_local_arm_config(
             if canonical_robot_id(pid).as_deref() != Some(arm.profile_info.robot.as_str()) {
                 return Err(format!("Cell arm {:?} expects robot {:?} (profile {:?}), but loaded ArmConfig has profile_id {:?}", arm.id, arm.profile_info.robot, arm.profile, pid));
             }
+        }
+    }
+    if let Some(hw_follower) = follower.filter(|f| !matches!(*f, "mock" | "sim")) {
+        let follower_robot = canonical_robot_id(hw_follower);
+        let arm_robot = canonical_robot_id(&arm.arm_type);
+        if follower_robot != arm_robot {
+            return Err(format!(
+                "Cell arm {:?} (host {:?}) declares type {:?}, which does not match hardware follower {:?}",
+                arm.id, arm.host, arm.arm_type, hw_follower
+            ));
         }
     }
     if let Some(hw_dev) = resolved_hw_device {
@@ -721,6 +867,7 @@ impl CellContext {
         local_ips: &[String],
         local_port: Option<u16>,
         arm_config: &ArmConfig,
+        follower: Option<&str>,
         resolved_hw_device: Option<&str>,
     ) -> Result<Self, String> {
         let local_host_id = resolve_local_host(&config, explicit_host, local_hostname, local_ips, local_port)?;
@@ -730,7 +877,12 @@ impl CellContext {
             return Err(format!("Host {local_host_id:?} is neither an arm host nor the coordinator ({:?}) in cell {:?}", config.coordinator, config.cell_id));
         }
         if let Some(arm) = local_arm {
-            validate_local_arm_config(arm, arm_config, resolved_hw_device)?;
+            validate_local_arm_config(arm, arm_config, follower, resolved_hw_device)?;
+        } else if let Some(hw_follower) = follower.filter(|f| !matches!(*f, "mock" | "sim")) {
+            return Err(format!(
+                "Coordinator-only host {local_host_id:?} has no arm entry in cell {:?}; refusing to mount hardware follower {hw_follower:?}",
+                config.cell_id
+            ));
         }
         let local_arm_id = local_arm.map(|a| a.id.clone());
         let config_digest = config.digest();
@@ -743,11 +895,12 @@ impl CellContext {
         explicit_host: Option<&str>,
         local_port: Option<u16>,
         arm_config: &ArmConfig,
+        follower: Option<&str>,
         resolved_hw_device: Option<&str>,
     ) -> Result<Self, String> {
         let hostname = probe_local_hostname();
         let ips = probe_local_ips();
-        Self::resolve(config, explicit_host, hostname.as_deref(), &ips, local_port, arm_config, resolved_hw_device)
+        Self::resolve(config, explicit_host, hostname.as_deref(), &ips, local_port, arm_config, follower, resolved_hw_device)
     }
 
     pub fn local_arm(&self) -> Option<&ArmSpec> {
@@ -1125,17 +1278,46 @@ mod tests {
         let ambig = CellConfig::from_value(&local, None).unwrap();
         assert!(resolve_local_host(&ambig, None, Some("dev"), &["127.0.0.1".into()], Some(19101)).unwrap_err().contains("Ambiguous"));
 
-        // Non-participant, DOF mismatch, and hardware device mismatch all fail closed
-        assert!(CellContext::resolve(cell.clone(), Some("observer_box"), None, &[], None, &so101, None).unwrap_err().contains("neither an arm host nor the coordinator"));
-        assert!(CellContext::resolve(cell.clone(), Some("recamera_left"), None, &[], None, &ArmConfig::rebot_dm(), None).unwrap_err().contains("requires DOF 6"));
-        assert!(CellContext::resolve(cell.clone(), Some("recamera_left"), None, &[], None, &so101, Some("/dev/ttyUSB9")).unwrap_err().contains("expects device"));
+        // Non-participant, DOF mismatch, follower model mismatch, coordinator-only HW, and device mismatch all fail closed
+        assert!(CellContext::resolve(cell.clone(), Some("observer_box"), None, &[], None, &so101, Some("mock"), None).unwrap_err().contains("neither an arm host nor the coordinator"));
+        assert!(CellContext::resolve(cell.clone(), Some("recamera_left"), None, &[], None, &ArmConfig::rebot_dm(), Some("mock"), None).unwrap_err().contains("requires DOF 6"));
+        assert!(CellContext::resolve(cell.clone(), Some("recamera_left"), None, &[], None, &so101, Some("so-arm100"), Some("/dev/ttySC0")).unwrap_err().contains("does not match hardware follower"));
+        assert!(CellContext::resolve(cell.clone(), Some("pc_coord"), None, &[], None, &so101, Some("so-arm101"), Some("/dev/ttySC0")).unwrap_err().contains("Coordinator-only host"));
+        assert!(CellContext::resolve(cell.clone(), Some("recamera_left"), None, &[], None, &so101, Some("so-arm101"), Some("/dev/ttyUSB9")).unwrap_err().contains("expects device"));
 
-        let ctx = CellContext::resolve(cell.clone(), Some("recamera_left"), None, &[], None, &so101, Some("/dev/ttySC0")).unwrap();
+        let ctx = CellContext::resolve(cell.clone(), Some("recamera_left"), None, &[], None, &so101, Some("so-arm101"), Some("/dev/ttySC0")).unwrap();
         assert_eq!((ctx.local_host_id.as_str(), ctx.local_arm_id.as_deref(), ctx.is_coordinator, ctx.local_role()), ("recamera_left", Some("left"), false, "arm_host"));
+        // Enabled CellStatusResponse round-trips through serde JSON cleanly.
+        let status_json = serde_json::to_value(ctx.status_response()).unwrap();
+        let decoded: CellStatusResponse = serde_json::from_value(status_json).unwrap();
+        assert!(decoded.enabled && decoded.local_host.as_deref() == Some("recamera_left"));
 
-        let coord = CellContext::resolve(cell, Some("pc_coord"), None, &[], None, &so101, None).unwrap();
+        // Equivalent IPv6 spellings (0:0:0:0:0:0:0:1 vs ::1) match by parsed IpAddr.
+        let mut v6 = two_so101_json();
+        v6["hosts"]["recamera_left"]["address"] = json!("0:0:0:0:0:0:0:1");
+        let v6_cell = CellConfig::from_value(&v6, None).unwrap();
+        assert_eq!(resolve_local_host(&v6_cell, None, Some("dev"), &["::1".into()], Some(8765)).unwrap(), "recamera_left");
+
+        let coord = CellContext::resolve(cell, Some("pc_coord"), None, &[], None, &so101, Some("mock"), None).unwrap();
         assert_eq!((coord.local_host_id.as_str(), coord.local_arm_id.as_deref(), coord.is_coordinator, coord.local_role()), ("pc_coord", None, true, "coordinator"));
         assert_eq!(serde_json::to_value(CellStatusResponse::disabled()).unwrap(), json!({ "enabled": false }));
+    }
+
+    #[test]
+    fn python_canonical_json_matches_unicode_and_scientific_floats() {
+        let mut s1 = String::new();
+        write_python_canonical_json(&json!({"s": "相机", "e": "🤖", "ctrl": "\u{0000}\u{001f}\u{0008}\u{000c}\n\r\t\"\\"}), &mut s1);
+        assert_eq!(crate::gravity::compute_sha256(s1.as_bytes()), "234f42bb7dd0467458714410f19e60f82cb42effd463a2ebd00e03f898299e83");
+
+        let mut s2 = String::new();
+        let floats = Value::Array(
+            [0.0, -0.0, 1.0, -0.25, 1e-4, 1e-5, 1e-7, 1.5e-5, 1.23456789e-10, 1e15, 1e16, 1.5e16, 1e100, -1e-7]
+                .into_iter().map(Value::from).collect()
+        );
+        let mut map = Map::new();
+        map.insert("f".into(), floats);
+        write_python_canonical_json(&Value::Object(map), &mut s2);
+        assert_eq!(crate::gravity::compute_sha256(s2.as_bytes()), "4bc16961415095013b8f1b0a712c931364e086c2284c37c41d1b31b1286ff0f1");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

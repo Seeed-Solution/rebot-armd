@@ -174,7 +174,7 @@ async fn cell_capabilities_and_status_reflect_arm_host_and_switchable_coordinato
     // 1. PC coordinator, local host = recamera_left (arm_host)
     let pc_cell = CellConfig::from_value(&two_so101_cell(), None).unwrap();
     let pc_ctx = Arc::new(
-        CellContext::resolve(pc_cell, Some("recamera_left"), None, &[], None, &so101, None)
+        CellContext::resolve(pc_cell, Some("recamera_left"), None, &[], None, &so101, Some("mock"), None)
             .unwrap(),
     );
     let sup = Arc::new(ArmSupervisor::new(so101.clone()));
@@ -214,6 +214,9 @@ async fn cell_capabilities_and_status_reflect_arm_host_and_switchable_coordinato
         .json()
         .await
         .unwrap();
+    // Verify wire response decodes cleanly into the exported Rust type.
+    let typed_status: armd::CellStatusResponse = serde_json::from_value(status.clone()).unwrap();
+    assert!(typed_status.enabled && typed_status.local_host.as_deref() == Some("recamera_left"));
     assert_eq!(status["enabled"], true);
     assert_eq!(status["format"], CELL_CONFIG_FORMAT);
     assert_eq!(status["cell_id"], "two_so101");
@@ -254,6 +257,7 @@ async fn cell_capabilities_and_status_reflect_arm_host_and_switchable_coordinato
             &[],
             None,
             &so101,
+            Some("mock"),
             None,
         )
         .unwrap(),
@@ -280,7 +284,7 @@ async fn cell_capabilities_and_status_reflect_arm_host_and_switchable_coordinato
     // 3. Coordinator-only PC host (same code path, no local arm)
     let coord_cell = CellConfig::from_value(&two_so101_cell(), None).unwrap();
     let coord_ctx = Arc::new(
-        CellContext::resolve(coord_cell, Some("pc_coord"), None, &[], None, &so101, None).unwrap(),
+        CellContext::resolve(coord_cell, Some("pc_coord"), None, &[], None, &so101, Some("mock"), None).unwrap(),
     );
     let sup3 = Arc::new(ArmSupervisor::new(so101));
     sup3.set_cell(Some(coord_ctx)).await.unwrap();
@@ -309,7 +313,7 @@ async fn executor_owner_serves_cell_capabilities_and_status_and_fences_post_tran
     let cfg = ArmConfig::rebot_dm();
     let het_cell = CellConfig::from_value(&b601_plus_so101_cell(), None).unwrap();
     let ctx = Arc::new(
-        CellContext::resolve(het_cell, Some("recamera_b601"), None, &[], None, &cfg, None).unwrap(),
+        CellContext::resolve(het_cell, Some("recamera_b601"), None, &[], None, &cfg, Some("mock"), None).unwrap(),
     );
     let sup = Arc::new(ArmSupervisor::new(cfg));
     sup.start_dispatcher().unwrap();
@@ -495,88 +499,81 @@ async fn armd_cli_cell_flag_and_config_key_and_rejections() {
     assert_eq!(status2["local_host"], "recamera_right");
     assert_eq!(status2["local_arm_id"], "right");
 
+    let clean_cmd = || {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_armd"));
+        for key in ["PORT", "ARMD_RT_OWNER", "ARMD_CELL", "ARMD_CELL_HOST", "ARMD_TOOL"] {
+            cmd.env_remove(key);
+        }
+        cmd
+    };
+
     // 3. Invalid cell JSON fails fast before binding/starting
     let bad_cell_path = dir.path().join("bad_cell.json");
     let mut bad = two_so101_cell();
     bad["arms"][1]["host"] = json!("recamera_left"); // violates one arm per host
     std::fs::write(&bad_cell_path, serde_json::to_string(&bad).unwrap()).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_armd"))
+    let out = clean_cmd()
         .args([
-            "--follower",
-            "mock",
-            "--port",
-            &free_port().to_string(),
-            "--config",
-            so101_path,
-            "--cell",
-            bad_cell_path.to_str().unwrap(),
-            "--cell-host",
-            "recamera_left",
-            "--log-dir",
-            "off",
-            "--blackbox-dir",
-            "off",
-            "--episodes-dir",
-            "off",
+            "--follower", "mock", "--port", &free_port().to_string(),
+            "--config", so101_path, "--cell", bad_cell_path.to_str().unwrap(),
+            "--cell-host", "recamera_left", "--log-dir", "off", "--blackbox-dir", "off", "--episodes-dir", "off",
         ])
-        .env_remove("PORT")
         .output()
         .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "invalid cell must fail startup");
+    assert!(stderr.contains("one arm per host") || stderr.contains("Duplicate device binding"), "unexpected stderr: {stderr}");
 
     // 4. Mismatched local profile (SO-101 config vs B601 arm entry) fails fast
     let het_path = dir.path().join("b601_plus_so101.json");
     std::fs::write(&het_path, serde_json::to_string(&b601_plus_so101_cell()).unwrap()).unwrap();
-    let out_mismatch = std::process::Command::new(env!("CARGO_BIN_EXE_armd"))
+    let out_mismatch = clean_cmd()
         .args([
-            "--follower",
-            "mock",
-            "--port",
-            &free_port().to_string(),
-            "--config",
-            so101_path,
-            "--cell",
-            het_path.to_str().unwrap(),
-            "--cell-host",
-            "recamera_b601",
-            "--log-dir",
-            "off",
-            "--blackbox-dir",
-            "off",
-            "--episodes-dir",
-            "off",
+            "--follower", "mock", "--port", &free_port().to_string(),
+            "--config", so101_path, "--cell", het_path.to_str().unwrap(),
+            "--cell-host", "recamera_b601", "--log-dir", "off", "--blackbox-dir", "off", "--episodes-dir", "off",
         ])
-        .env_remove("PORT")
         .output()
         .unwrap();
-    assert!(
-        !out_mismatch.status.success(),
-        "mismatched profile DOF must fail startup"
-    );
+    let stderr_mismatch = String::from_utf8_lossy(&out_mismatch.stderr);
+    assert!(!out_mismatch.status.success(), "mismatched profile DOF must fail startup");
+    assert!(stderr_mismatch.contains("requires DOF 7"), "unexpected stderr: {stderr_mismatch}");
 
     // 5. --cell-host without --cell fails fast
-    let out_orphan = std::process::Command::new(env!("CARGO_BIN_EXE_armd"))
+    let out_orphan = clean_cmd()
         .args([
-            "--follower",
-            "mock",
-            "--port",
-            &free_port().to_string(),
-            "--cell-host",
-            "recamera_left",
-            "--log-dir",
-            "off",
-            "--blackbox-dir",
-            "off",
-            "--episodes-dir",
-            "off",
+            "--follower", "mock", "--port", &free_port().to_string(),
+            "--cell-host", "recamera_left", "--log-dir", "off", "--blackbox-dir", "off", "--episodes-dir", "off",
         ])
-        .env_remove("PORT")
-        .env_remove("ARMD_CELL")
-        .env_remove("ARMD_CELL_HOST")
         .output()
         .unwrap();
-    assert!(
-        !out_orphan.status.success(),
-        "--cell-host without cell config must fail startup"
-    );
+    let stderr_orphan = String::from_utf8_lossy(&out_orphan.stderr);
+    assert!(!out_orphan.status.success(), "--cell-host without cell config must fail startup");
+    assert!(stderr_orphan.contains("requires a cell config"), "unexpected stderr: {stderr_orphan}");
+
+    // 6. Hardware follower mismatch (so-arm100 vs so-arm101 cell arm) fails before mounting hardware
+    let out_hw_mismatch = clean_cmd()
+        .args([
+            "--follower", "so-arm100", "--follower-port", "/dev/ttySC0", "--port", &free_port().to_string(),
+            "--config", so101_path, "--cell", cell_path.to_str().unwrap(),
+            "--cell-host", "recamera_left", "--log-dir", "off", "--blackbox-dir", "off", "--episodes-dir", "off",
+        ])
+        .output()
+        .unwrap();
+    let stderr_hw = String::from_utf8_lossy(&out_hw_mismatch.stderr);
+    assert!(!out_hw_mismatch.status.success(), "mismatched hardware follower must fail startup");
+    assert!(stderr_hw.contains("does not match hardware follower"), "unexpected stderr: {stderr_hw}");
+
+    // 7. Coordinator-only host refuses real hardware follower
+    let out_coord_hw = clean_cmd()
+        .args([
+            "--follower", "so-arm101", "--follower-port", "/dev/ttySC0", "--port", &free_port().to_string(),
+            "--config", so101_path, "--cell", cell_path.to_str().unwrap(),
+            "--cell-host", "pc_coord", "--log-dir", "off", "--blackbox-dir", "off", "--episodes-dir", "off",
+        ])
+        .output()
+        .unwrap();
+    let stderr_coord_hw = String::from_utf8_lossy(&out_coord_hw.stderr);
+    assert!(!out_coord_hw.status.success(), "coordinator-only host must refuse real hardware follower");
+    assert!(stderr_coord_hw.contains("Coordinator-only host"), "unexpected stderr: {stderr_coord_hw}");
 }

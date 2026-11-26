@@ -338,11 +338,22 @@ fn run_tool_info(path: &str, robot: Option<&str>) -> Result<String, String> {
     serde_json::to_string(&summary).map_err(|e| format!("serialize tool info: {e}"))
 }
 
+fn resolve_hardware_follower_device(follower: &str, requested: Option<&str>) -> Option<String> {
+    match follower {
+        "rebot-rs" | "rebot-dm" => Some(requested.unwrap_or("can0").to_string()),
+        "so-arm101" | "so-arm100" => Some(resolve_serial_port(requested)),
+        "fashionstar" | "star-arm102" => Some(requested.unwrap_or("/dev/ttyUSB0").to_string()),
+        "mock" | "sim" => None,
+        _ => None,
+    }
+}
+
 fn resolve_cell_context(
     cli: &CliArgs,
     config: &ArmConfig,
     loaded_profile_path: Option<&std::path::Path>,
     follower: &str,
+    resolved_hw_device: Option<&str>,
     port: u16,
 ) -> Result<Option<Arc<armd::cell::CellContext>>, String> {
     let env_cell = std::env::var("ARMD_CELL")
@@ -358,6 +369,7 @@ fn resolve_cell_context(
         config,
         loaded_profile_path,
         follower,
+        resolved_hw_device,
         port,
         env_cell.as_deref(),
         env_cell_host.as_deref(),
@@ -369,6 +381,7 @@ fn resolve_cell_context_with_env(
     config: &ArmConfig,
     loaded_profile_path: Option<&std::path::Path>,
     follower: &str,
+    resolved_hw_device: Option<&str>,
     port: u16,
     env_cell: Option<&str>,
     env_cell_host: Option<&str>,
@@ -409,22 +422,14 @@ fn resolve_cell_context_with_env(
     };
 
     let cell_cfg = armd::cell::CellConfig::from_json_file(&path)?;
-    let resolved_hw_device = match follower {
-        "rebot-rs" | "rebot-dm" => Some(cli.follower_port.as_deref().unwrap_or("can0").to_string()),
-        "so-arm101" | "so-arm100" => Some(resolve_serial_port(cli.follower_port.as_deref())),
-        "fashionstar" | "star-arm102" => {
-            Some(cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0").to_string())
-        }
-        "mock" | "sim" => None,
-        _ => None,
-    };
     let local_port = (port != 0).then_some(port);
     let ctx = armd::cell::CellContext::resolve_local(
         cell_cfg,
         cell_host,
         local_port,
         config,
-        resolved_hw_device.as_deref(),
+        Some(follower),
+        resolved_hw_device,
     )?;
     info!(
         "Loaded cell '{}' from {} (host={}, role={}, arm={:?}, coordinator={}, digest={})",
@@ -884,8 +889,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(_) => 8765,
         },
     };
+    // Resolve hardware device path once so cell validation and driver mounting use the exact same device.
+    let resolved_hw_device = resolve_hardware_follower_device(follower, cli.follower_port.as_deref());
     // Validate optional multi-arm cell config before binding ports or mounting hardware.
-    let cell_context = resolve_cell_context(&cli, &config, loaded_profile_path.as_deref(), follower, port)?;
+    let cell_context = resolve_cell_context(
+        &cli,
+        &config,
+        loaded_profile_path.as_deref(),
+        follower,
+        resolved_hw_device.as_deref(),
+        port,
+    )?;
     // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
     let bind_ip: std::net::IpAddr = match std::env::var("ARMD_BIND_HOST") {
         Ok(s) if !s.trim().is_empty() => s
@@ -968,7 +982,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rebot-rs" | "rebot-dm" => {
             #[cfg(target_os = "linux")]
             {
-                let port = cli.follower_port.as_deref().unwrap_or("can0");
+                let port = resolved_hw_device.as_deref().unwrap_or("can0");
                 let can = armd::transport::SocketCanTransport::open(port)?;
                 if follower == "rebot-dm" {
                     let mut driver = armd::driver::DamiaoArmDriver::new(can, (1..=7).collect())
@@ -997,7 +1011,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(cfg) = feetech_config else {
                 return Err(format!("{follower} requires feetech configuration in profile").into());
             };
-            let port = resolve_serial_port(cli.follower_port.as_deref());
+            let port = resolved_hw_device
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| resolve_serial_port(cli.follower_port.as_deref()));
             let baud = 1_000_000;
             let transport = armd::transport::SerialTransport::open_default(&port, baud)?;
             let mut driver = armd::driver::FeetechArmDriver::new(transport, (1..=6).collect())
@@ -1009,7 +1026,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Mounted {} on {}", follower, port);
         }
         "fashionstar" | "star-arm102" => {
-            let port = cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0");
+            let port = resolved_hw_device.as_deref().unwrap_or("/dev/ttyUSB0");
             let transport = armd::transport::SerialTransport::open_default(port, 115_200)?;
             supervisor
                 .set_driver(Box::new(armd::driver::FashionStarArmDriver::new(
@@ -1906,7 +1923,7 @@ mod shutdown_tests {
 
         // Without any cell config, returns Ok(None) (zero overhead default).
         let cfg = ArmConfig::rebot_dm();
-        assert!(resolve_cell_context_with_env(&CliArgs::default(), &cfg, None, "mock", 8765, None, None)
+        assert!(resolve_cell_context_with_env(&CliArgs::default(), &cfg, None, "mock", None, 8765, None, None)
             .unwrap()
             .is_none());
 
@@ -1919,6 +1936,7 @@ mod shutdown_tests {
             &cfg,
             None,
             "mock",
+            None,
             8765,
             None,
             None
