@@ -1686,13 +1686,17 @@ impl StateHub {
             && !snap.rt.owner.gravity_comp_active
             && !snap.rt.owner.policy_busy
             && !snap.rt.owner.pending_normal_unload
+            && !snap.rt.owner.handover_settling
             && !snap.owner.torque_transition_pending
             && !snap.rt.owner.calibration_busy;
         if req.require_motion_idle && !motion_idle {
             return Err(ServiceReadError::MotionActive);
         }
         if let Some(max_speed) = req.max_arm_joint_speed {
-            for (joint, &v) in snap.rt.velocities.iter().take(arm_dof).enumerate() {
+            if !max_speed.is_finite() || max_speed < 0.0 || arm_dof == 0 || snap.rt.velocities.len() < arm_dof {
+                return Err(ServiceReadError::JointMoving { joint: 0 });
+            }
+            for (joint, &v) in snap.rt.velocities[..arm_dof].iter().enumerate() {
                 if !v.is_finite() || v.abs() > max_speed {
                     return Err(ServiceReadError::JointMoving { joint });
                 }
@@ -2186,6 +2190,31 @@ mod tests {
             hub.read_services(ReadRequirements::measure(Duration::from_secs(1), 0.02)).unwrap_err(),
             ServiceReadError::JointMoving { joint: 1 }
         );
+        // Non-finite speed limit fails closed; handover_settling blocks motion_idle.
+        let mut req_nan = ReadRequirements::default();
+        req_nan.max_arm_joint_speed = Some(f32::NAN);
+        assert_eq!(
+            hub.read_services(req_nan).unwrap_err(),
+            ServiceReadError::JointMoving { joint: 0 }
+        );
+        let mut hs_owner = owner_meta;
+        hs_owner.handover_settling = true;
+        let rt_hs = RtInputs {
+            positions: &p,
+            velocities: &v_still,
+            commanded_positions: &p,
+            commanded_velocities: &p,
+            feedback_instants: &fresh_i,
+            feedback_seqs: &s,
+            feedback_queue_bounds: &[],
+            owner: hs_owner,
+            meta: rt_meta,
+        };
+        publisher.publish_with_owner(24, now, now + Duration::from_secs(5), obs(4.5), owner_state, rt_hs);
+        assert_eq!(
+            hub.read_services(ReadRequirements::measure(Duration::from_secs(1), 0.02)).unwrap_err(),
+            ServiceReadError::MotionActive
+        );
 
         // Expired valid_until fails closed when require_within_valid_until is true, allowed by identity().
         let past = now - Duration::from_secs(1);
@@ -2200,12 +2229,12 @@ mod tests {
             owner: owner_meta,
             meta: rt_meta,
         };
-        publisher.publish_with_owner(24, past, past, obs(5.0), owner_state, rt_expired);
+        publisher.publish_with_owner(25, past, past, obs(5.0), owner_state, rt_expired);
         assert_eq!(
             hub.read_services(ReadRequirements::default()).unwrap_err(),
             ServiceReadError::SnapshotExpired
         );
-        assert_eq!(hub.read_services(ReadRequirements::identity()).unwrap().publish_seq, 5);
+        assert_eq!(hub.read_services(ReadRequirements::identity()).unwrap().publish_seq, 6);
     }
 
     #[tokio::test]

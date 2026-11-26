@@ -5659,6 +5659,7 @@ fn sync_prep_env_from_published(sup: &ArmSupervisor, motion_config_rev: Option<u
         next.poses = pub_cfg.poses.list.clone();
         next.sequences = pub_cfg.sequences.clone();
         next.grasp_setup = pub_cfg.config.grasp.clone();
+        next.camera_calibrated = pub_cfg.camera_calibrated();
         next.joint_zero_offsets = pub_cfg.joint_zero_offsets.clone();
         next.workspace_revision = pub_cfg.workspace_revision;
         next.calibration_revision = pub_cfg.calibration_revision;

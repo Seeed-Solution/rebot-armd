@@ -492,9 +492,11 @@ pub fn lookup(key: RouteKey) -> Option<&'static RouteSpec> {
 
 /// Zero-allocation runtime lookup for a WS frame kind and optional command path.
 pub fn lookup_ws(kind: FrameKind, command: Option<&str>) -> Option<&'static RouteSpec> {
-    match kind {
-        FrameKind::Command => REGISTRY.ws_commands.get(command?),
-        other => REGISTRY.ws_frames.get(&other),
+    match (kind, command) {
+        (FrameKind::Command, Some(cmd)) => REGISTRY.ws_commands.get(cmd),
+        (FrameKind::Command, None) => None,
+        (other, None) => REGISTRY.ws_frames.get(&other),
+        (_, Some(_)) => None,
     }
 }
 
@@ -718,6 +720,7 @@ mod tests {
         // 3. Unknown keys and unsupported methods fail closed (None).
         assert!(lookup(RouteKey::ws_frame(FrameKind::Unknown)).is_none());
         assert!(lookup_ws(FrameKind::Unknown, None).is_none());
+        assert!(lookup_ws(FrameKind::Auth, Some("unknown")).is_none());
         assert!(lookup(RouteKey::ws_command("/api/v1/does_not_exist")).is_none());
         assert!(lookup_ws(FrameKind::Command, Some("/api/v1/does_not_exist")).is_none());
         assert!(lookup(RouteKey::rest(RestMethod::Get, "/api/v1/does_not_exist")).is_none());

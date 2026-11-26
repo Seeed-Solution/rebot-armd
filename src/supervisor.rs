@@ -14147,6 +14147,13 @@ impl ArmSupervisor {
 
         let initial_gen = self.inner.generation();
         let candidate_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&guard);
+        let staged_service_identity = Arc::new(
+            crate::rt_core::publish::ServiceIdentity::from_published_config(
+                guard.core.id(),
+                cfg.boot,
+                &candidate_pub_cfg,
+            ),
+        );
         let shell = SupervisorInner::detached_shell(
             &guard.config,
             self.estop_state.clone(),
@@ -14277,7 +14284,7 @@ impl ArmSupervisor {
                 handle.seed_connection_reply_sinks(seeded_ws_sinks);
                 self.hub.set_motion_config(ready_payload.staged_motion_cfg);
                 self.hub.update_prep_env(ready_payload.staged_prep_env);
-                self.hub.set_service_identity(ready_payload.staged_service_identity);
+                self.hub.set_service_identity(staged_service_identity);
                 self.hub.install_prewarm_template_and_front(
                     ready_payload.staged_obs_template,
                     ready_payload.staged_front_obs,
@@ -15671,10 +15678,22 @@ impl ArmSupervisor {
                 self.hub.read_services(req).map_err(ArmError::from)
             }
             OWNER_LEGACY => {
-                if let Ok(svc) = self.hub.read_services(req) {
-                    return Ok(svc);
+                let legacy_gen = self.inner.generation();
+                let mut cached_req = req;
+                cached_req.min_generation = Some(
+                    cached_req
+                        .min_generation
+                        .map_or(legacy_gen, |g| g.max(legacy_gen)),
+                );
+                if let Ok(svc) = self.hub.read_services(cached_req) {
+                    if self.owner_mode() == OWNER_LEGACY {
+                        return Ok(svc);
+                    }
                 }
-                let inner = self.inner.read().await;
+                let lock_deadline = tokio::time::Instant::now() + OBS_LOCK_WAIT;
+                let inner = tokio::time::timeout_at(lock_deadline, self.inner.read())
+                    .await
+                    .map_err(|_| observation_unavailable())?;
                 self.check_legacy_under_guard(&inner)?;
                 let gen = self.inner.generation();
                 let snap = Arc::new(inner.synthesize_legacy_snapshot(gen));
@@ -15808,6 +15827,9 @@ impl ArmSupervisor {
         let mut inner = self.inner.write().await;
         if self.check_legacy_under_guard(&inner).is_ok() {
             inner.follower = Some(name.to_string());
+            self.hub.set_service_identity(Arc::new(
+                crate::rt_core::publish::ServiceIdentity::from_inner(&inner),
+            ));
         }
     }
 

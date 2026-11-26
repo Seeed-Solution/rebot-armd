@@ -5746,7 +5746,6 @@ pub(crate) struct StartupReadyPayload {
     pub(crate) tid: ThreadId,
     pub(crate) staged_motion_cfg: Arc<super::requests::motion::MotionConfigSnapshot>,
     pub(crate) staged_prep_env: Arc<super::requests::actions::ActionPrepEnv>,
-    pub(crate) staged_service_identity: Arc<super::publish::ServiceIdentity>,
     pub(crate) staged_obs_template: Box<ArmObservation>,
     pub(crate) staged_front_obs: ArmObservation,
     pub(crate) staged_sched: crate::diagnostics::tick::ControlThreadSched,
@@ -9228,7 +9227,6 @@ fn control_thread_main_inner(
         core.attach_stop_requests(stop_requests_init);
         core.attach_closed_bitset(closed_bitset_init);
         let staged_prep_env = Arc::new(super::requests::actions::ActionPrepEnv::from_inner(core));
-        let staged_service_identity = Arc::new(super::publish::ServiceIdentity::from_inner(core));
         core.rt_executor_owned = true;
         core.before_publish_hook = hooks.before_publish.clone();
         core.safety.set_off_thread_reclaim(true);
@@ -9276,7 +9274,6 @@ fn control_thread_main_inner(
                 tid: thread::current().id(),
                 staged_motion_cfg,
                 staged_prep_env,
-                staged_service_identity,
                 staged_obs_template,
                 staged_front_obs,
                 staged_sched,

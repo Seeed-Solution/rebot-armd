@@ -2248,6 +2248,15 @@ pub(crate) async fn run_motor_executor_with_guard(
                                             cfg.calibration = pub_c;
                                             cfg.calibration_revision = new_rev;
                                         });
+                                        if let Some(cfg) = sup_w.published_config_hub().latest() {
+                                            sup_w.hub().update_service_identity_from_config(&cfg);
+                                            if let Some(cur) = sup_w.hub().prep_env() {
+                                                let mut next = (*cur).clone();
+                                                next.camera_calibrated = cfg.camera_calibrated();
+                                                next.calibration_revision = cfg.calibration_revision;
+                                                sup_w.hub().update_prep_env(Arc::new(next));
+                                            }
+                                        }
                                         res_guard = ReservationGuard::new(Arc::clone(&sup_w), new_r);
                                     }
                                     Ok(ConfigReply::IntermediateCalibrationCommitted(Err(e))) => {
