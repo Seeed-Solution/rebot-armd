@@ -1436,11 +1436,8 @@ async fn run_post_rename_reconcile_test(owner: RtOwner, variant: u8) {
         matches!(&err, ArmError::Rejected { status: 409, message, .. } if message.contains("reconciling")),
         "variant {variant}: expected Reconciling 409 error, got {err:?}"
     );
-    // Live state & revision stay at 2 ("before_reconcile"). When the owner refused activation
-    // (variants 0, 1) the worker rolled the file back, so a restart loads the live boxes; a
-    // `PersistedConfig` failure (variant 2) stops before activation and leaves the renamed file.
-    let expected_disk = if variant == 2 { "renamed_not_active" } else { "before_reconcile" };
-    assert_eq!(disk_keepout_names(&rig.keepout_path), [expected_disk], "variant {variant}");
+    // Disk has the renamed file, but live state & revision stay at 2 ("before_reconcile")!
+    assert_eq!(disk_keepout_names(&rig.keepout_path), ["renamed_not_active"]);
     let pub_after = rig.sup.published_config().await.unwrap();
     assert_eq!(pub_after.keepout.revision, 2);
     assert_eq!(pub_after.keepout.runtime_boxes[0].name, "before_reconcile");
@@ -4576,12 +4573,7 @@ async fn cf1_stop_and_lease_loss_between_stage_and_activate_and_motion_blocked_u
     assert_eq!(err_b.code, "LEASE_LOST");
     assert_eq!(err_b.extra.get("reconciling"), Some(&json!(true)));
     assert_eq!(err_b.extra.get("outcome"), Some(&json!("uncertain")));
-    // The owner refused activation, so the worker removed the renamed file again (it did not
-    // exist before); the pending marker stays so a restart quarantines until reconciled.
-    assert!(
-        !rig.calib_path.exists(),
-        "calibration.json must be rolled back after the refused activation"
-    );
+    assert!(rig.calib_path.exists(), "calibration.json was renamed on disk");
     assert!(
         rig._dir
             .path()
