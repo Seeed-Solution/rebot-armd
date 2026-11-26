@@ -185,7 +185,7 @@ pub struct SampleMeta {
 }
 
 /// Scalar motion/authority metadata published alongside [`RtSample`] (Copy, 0 alloc on RT).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtMotionMeta {
     pub boot_id: super::broker::BootId,
     pub clock_now: Option<Instant>,
@@ -198,7 +198,6 @@ pub struct RtMotionMeta {
     pub holding_after_clear: bool,
     pub watchdog_park_pending_gen: u64,
     pub watchdog_park_pending_attempt: u8,
-    pub torque_backoff: crate::torque_guard::TorqueBackoffHistory,
 }
 
 impl Default for RtMotionMeta {
@@ -215,7 +214,6 @@ impl Default for RtMotionMeta {
             holding_after_clear: false,
             watchdog_park_pending_gen: 0,
             watchdog_park_pending_attempt: 0,
-            torque_backoff: crate::torque_guard::TorqueBackoffHistory::default(),
         }
     }
 }
@@ -1073,6 +1071,7 @@ pub struct RtInputs<'a> {
     pub feedback_queue_bounds: &'a [Option<Instant>],
     pub owner: PublishedOwnerMeta,
     pub meta: RtMotionMeta,
+    pub torque_backoff: Option<&'a crate::torque_guard::TorqueBackoffHistory>,
 }
 
 impl StatePublisher {
@@ -1125,7 +1124,11 @@ impl StatePublisher {
         slot.rt.holding_after_clear = rt.meta.holding_after_clear;
         slot.rt.watchdog_park_pending_gen = rt.meta.watchdog_park_pending_gen;
         slot.rt.watchdog_park_pending_attempt = rt.meta.watchdog_park_pending_attempt;
-        slot.rt.torque_backoff = rt.meta.torque_backoff;
+        if let Some(tb) = rt.torque_backoff {
+            if slot.rt.torque_backoff.revision != tb.revision {
+                slot.rt.torque_backoff = *tb;
+            }
+        }
         let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();
@@ -2320,6 +2323,7 @@ mod tests {
             feedback_queue_bounds: &[],
             owner: PublishedOwnerMeta::default(),
             meta: RtMotionMeta::default(),
+            torque_backoff: None,
         }
     }
 
@@ -2376,6 +2380,7 @@ mod tests {
             feedback_instants: &[Some(now), None, Some(now)], feedback_seqs: &[5, 6, 7],
             feedback_queue_bounds: &[], owner: PublishedOwnerMeta::default(),
             meta: RtMotionMeta::default(),
+            torque_backoff: None,
         });
         let (p, v, i, s) = hub.latest().unwrap().rt.arm_feedback(&[0, 2]);
         assert_eq!((p, v, i, s), (vec![1.0, 2.0, 3.0], vec![0.1, 0.3], vec![Some(now), Some(now)], vec![5, 7]));
@@ -2484,6 +2489,7 @@ mod tests {
             feedback_queue_bounds: &[],
             owner: owner_meta,
             meta: rt_meta,
+            torque_backoff: None,
         };
         publisher.publish_with_owner(20, now, now + Duration::from_secs(5), obs(1.0), owner_state, rt);
 
@@ -2608,6 +2614,7 @@ mod tests {
             feedback_queue_bounds: &[],
             owner: owner_meta,
             meta: rt_meta,
+            torque_backoff: None,
         };
         publisher.publish_with_owner(21, now, now + Duration::from_secs(5), obs(2.0), owner_state, rt_missing);
         assert_eq!(
@@ -2628,6 +2635,7 @@ mod tests {
             feedback_queue_bounds: &[],
             owner: gc_owner,
             meta: rt_meta,
+            torque_backoff: None,
         };
         publisher.publish_with_owner(22, now, now + Duration::from_secs(5), obs(3.0), owner_state, rt_gc);
         assert_eq!(
@@ -2645,6 +2653,7 @@ mod tests {
             feedback_queue_bounds: &[],
             owner: owner_meta,
             meta: rt_meta,
+            torque_backoff: None,
         };
         publisher.publish_with_owner(23, now, now + Duration::from_secs(5), obs(4.0), owner_state, rt_moving);
         assert_eq!(
@@ -2670,6 +2679,7 @@ mod tests {
             feedback_queue_bounds: &[],
             owner: hs_owner,
             meta: rt_meta,
+            torque_backoff: None,
         };
         publisher.publish_with_owner(24, now, now + Duration::from_secs(5), obs(4.5), owner_state, rt_hs);
         assert_eq!(
@@ -2689,6 +2699,7 @@ mod tests {
             feedback_queue_bounds: &[],
             owner: owner_meta,
             meta: rt_meta,
+            torque_backoff: None,
         };
         publisher.publish_with_owner(25, past, past, obs(5.0), owner_state, rt_expired);
         assert_eq!(

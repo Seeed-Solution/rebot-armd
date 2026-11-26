@@ -204,6 +204,9 @@ pub struct TorqueBackoffHistory {
     head: usize,
     len: usize,
     pub trips_total: u64,
+    /// Monotonic revision bumped whenever a trip or post-trip sample mutates the history,
+    /// allowing `StateHub` publication to skip copying when unchanged (0 bytes copied on steady ticks).
+    pub revision: u64,
 }
 
 impl Default for TorqueBackoffHistory {
@@ -213,6 +216,7 @@ impl Default for TorqueBackoffHistory {
             head: 0,
             len: 0,
             trips_total: 0,
+            revision: 0,
         }
     }
 }
@@ -226,6 +230,7 @@ impl TorqueBackoffHistory {
             self.len += 1;
         }
         self.trips_total = record.trip_seq;
+        self.revision = self.revision.wrapping_add(1).max(1);
     }
 
     #[inline]
@@ -262,10 +267,15 @@ impl TorqueBackoffHistory {
         if !transmitted_q.is_finite() {
             return;
         }
+        let mut changed = false;
         if let Some(rec) = self.latest_mut() {
             if usize::from(rec.joint) == joint && rec.transmitted_q.is_none() {
                 rec.transmitted_q = Some(transmitted_q);
+                changed = true;
             }
+        }
+        if changed {
+            self.revision = self.revision.wrapping_add(1).max(1);
         }
     }
 
@@ -273,6 +283,7 @@ impl TorqueBackoffHistory {
     /// [`TORQUE_BACKOFF_POST_SAMPLES`] fresh feedback ticks.
     #[inline]
     pub fn record_post_trip_feedback(&mut self, joint: usize, measured_q: f32, torque_nm: f32) {
+        let mut changed = false;
         if let Some(rec) = self.latest_mut() {
             if usize::from(rec.joint) == joint
                 && rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES
@@ -284,7 +295,11 @@ impl TorqueBackoffHistory {
                     rec.post_trip_torque_nm = Some(torque_nm);
                 }
                 rec.post_trip_samples = rec.post_trip_samples.saturating_add(1);
+                changed = true;
             }
+        }
+        if changed {
+            self.revision = self.revision.wrapping_add(1).max(1);
         }
     }
 

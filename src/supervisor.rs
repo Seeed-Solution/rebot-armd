@@ -4673,7 +4673,6 @@ impl SupervisorInner {
             holding_after_clear: self.holding_after_clear(),
             watchdog_park_pending_gen: wd_gen,
             watchdog_park_pending_attempt: wd_attempt,
-            torque_backoff: self.torque_guard.backoff_history,
         };
         self.sync_motion_generation_for_publish();
         let owner = self.published_owner_meta();
@@ -4694,6 +4693,7 @@ impl SupervisorInner {
             commanded_positions,
             commanded_velocities,
             joint_feedback_queue_bounds,
+            torque_guard,
             ..
         } = self;
         core.publish_with_rt_meta(
@@ -4709,6 +4709,7 @@ impl SupervisorInner {
             joint_feedback_queue_bounds,
             owner,
             meta,
+            Some(&torque_guard.backoff_history),
         );
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.flush_published_session_terminals();

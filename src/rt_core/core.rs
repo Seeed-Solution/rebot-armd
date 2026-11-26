@@ -217,6 +217,7 @@ impl ArmCore {
             &[],
             PublishedOwnerMeta::default(),
             RtMotionMeta::default(),
+            None,
         );
     }
 
@@ -237,6 +238,7 @@ impl ArmCore {
         feedback_queue_bounds: &[Option<Instant>],
         owner: PublishedOwnerMeta,
         meta: RtMotionMeta,
+        torque_backoff: Option<&crate::torque_guard::TorqueBackoffHistory>,
     ) {
         self.buffer_out = false;
         self.publisher.restore_back_spares(buffer.1);
@@ -250,6 +252,7 @@ impl ArmCore {
             feedback_queue_bounds,
             owner,
             meta,
+            torque_backoff,
         };
         let displaced = self.publisher.publish_with_owner(generation, sampled_at, valid_until, buffer.0, owner_state, rt);
         // the slot was emptied by take_observation_buffer and nothing wrote it since
@@ -275,6 +278,7 @@ impl ArmCore {
             feedback_queue_bounds: &[],
             owner: PublishedOwnerMeta::default(),
             meta: RtMotionMeta::default(),
+            torque_backoff: None,
         };
         Ok(self.publisher.publish(generation, sampled_at, valid_until, obs, rt))
     }
