@@ -254,13 +254,13 @@ async fn stale_and_foreign_callers_rest_restrictions_and_legacy_semantics() {
 
     // REST `/api/v1/torque` and `/api/v1/motion/jog` serve the connection-lease conflict from
     // StateHub (409 LEASE_ACTIVE while ws_owner holds the lease); unmigrated REST
-    // `/api/v1/dataset/record/start` still returns 503 EXECUTOR_ROUTING_PENDING.
+    // `/api/v1/action/gripper_zero_check` still returns 503 EXECUTOR_ROUTING_PENDING.
     let r_rest = http.post(format!("http://{addr}/api/v1/torque")).json(&json!({"enable": true})).send().await.unwrap();
     assert_eq!((r_rest.status(), r_rest.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::CONFLICT, Some("LEASE_ACTIVE")));
     let r_jog = http.post(format!("http://{addr}/api/v1/motion/jog")).json(&json!({"target_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]})).send().await.unwrap();
     assert_eq!((r_jog.status(), r_jog.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::CONFLICT, Some("LEASE_ACTIVE")));
-    let r_rec = http.post(format!("http://{addr}/api/v1/dataset/record/start")).json(&json!({})).send().await.unwrap();
-    assert_eq!((r_rec.status(), r_rec.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("EXECUTOR_ROUTING_PENDING")));
+    let r_legacy = http.post(format!("http://{addr}/api/v1/action/gripper_zero_check")).json(&json!({})).send().await.unwrap();
+    assert_eq!((r_legacy.status(), r_legacy.json::<serde_json::Value>().await.unwrap()["code"].as_str()), (reqwest::StatusCode::SERVICE_UNAVAILABLE, Some("EXECUTOR_ROUTING_PENDING")));
 
     let (mut ws_foreign, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
     // PR L1 routes `acquire_lease` through the RT executor: foreign acquire sees `controller_busy`
