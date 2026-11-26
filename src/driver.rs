@@ -7943,8 +7943,13 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     watchdog_continuity_bypass: bool,
     /// While `true` (completing uncovered axes of an already-started armed MIT batch in an active
     /// control release), continuity holds bypass `tx_release_deadline` while still enforcing
-    /// `fence_check()`, stop gates, and `self.tx_budget.max_frames`.
+    /// `fence_check()`, stop gates, and bounded recovery capacity.
     watchdog_continuity_complete_partial: bool,
+    /// Bounded extra recovery attempt slots (at most 1 per failed axis, capped at arm DOF, reset
+    /// each release) granted exclusively during `watchdog_continuity_complete_partial` so an
+    /// exact-cap (`tx_budget.max_frames == batch_size`) mid-batch transient transport error does
+    /// not starve the final uncovered axis.
+    watchdog_continuity_recovery_budget: usize,
     /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
     last_feedback_decode_offset_ns: Vec<Option<i128>>,
     /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary
@@ -9294,6 +9299,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             release_tx_limit: None,
             watchdog_continuity_bypass: false,
             watchdog_continuity_complete_partial: false,
+            watchdog_continuity_recovery_budget: 0,
             last_feedback_decode_offset_ns: vec![None; dof],
             uncertain_readback_probe: [None; MAX_MODE_JOINTS],
             mit_limits_verified: vec![false; dof],
@@ -9446,6 +9452,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return;
         }
         self.tick_tx = None;
+        self.watchdog_continuity_recovery_budget = 0;
         self.refresh_scheduler.begin_tick();
         self.release_ctrl_tx_mask = 0;
         self.discard_staged_ctrl_tx();
@@ -9743,7 +9750,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     #[inline]
     fn effective_tx_max_frames(&self) -> usize {
         if !self.in_active_control_release() || self.watchdog_continuity_bypass {
-            return self.tx_budget.max_frames;
+            return if self.watchdog_continuity_complete_partial {
+                self.tx_budget
+                    .max_frames
+                    .saturating_add(self.watchdog_continuity_recovery_budget)
+            } else {
+                self.tx_budget.max_frames
+            };
         }
         match self.release_tx_limit {
             Some(lim) => self.tx_budget.max_frames.min(usize::from(lim)),
@@ -17660,20 +17673,40 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if started[i].is_none() {
                     started[i] = Some(self.now());
                 }
-                match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
-                    d.build_verified_hold_frame(i, &hold_target)
-                }) {
-                    Ok(sent_frame) => {
-                        let mit_params = self.resolved_mit_params(&hold_target);
-                        self.record_sent_target(i, sent_frame, Some(mit_params));
-                        *sent_any = true;
-                        *sent_mask |= bit_i;
-                        let bit = i.saturating_mul(2);
-                        if bit < 64 {
-                            *sent_slot_mask |= 1u64 << bit;
+                let mut retried_transport = false;
+                loop {
+                    match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
+                        d.build_verified_hold_frame(i, &hold_target)
+                    }) {
+                        Ok(sent_frame) => {
+                            let mit_params = self.resolved_mit_params(&hold_target);
+                            self.record_sent_target(i, sent_frame, Some(mit_params));
+                            *sent_any = true;
+                            *sent_mask |= bit_i;
+                            let bit = i.saturating_mul(2);
+                            if bit < 64 {
+                                *sent_slot_mask |= 1u64 << bit;
+                            }
+                            break;
                         }
+                        Err(TxRefusal::Transport(e))
+                            if complete_partial && !retried_transport && e.is_tx_backpressure() =>
+                        {
+                            if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                return Err((i, TxRefusal::StopInhibited));
+                            }
+                            if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
+                                return Err((i, TxRefusal::MitFenceTripped(reason)));
+                            }
+                            retried_transport = true;
+                            self.watchdog_continuity_recovery_budget =
+                                self.watchdog_continuity_recovery_budget.saturating_add(1).min(n);
+                            if let Some(pass) = self.tick_tx.as_mut() {
+                                pass.backpressured = false;
+                            }
+                        }
+                        Err(r) => return Err((i, r)),
                     }
-                    Err(r) => return Err((i, r)),
                 }
             }
             Ok(())
@@ -17743,13 +17776,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let mut sent_mask = 0u64;
             let mut sent_slot_mask = 0u64;
             self.in_urgent_watchdog_hold = true;
+            let complete_partial = self.in_active_control_release();
             let send_res = self.send_mit_continuity_holds_for_uncovered(
                 active_mask,
                 0,
                 None,
                 hold_targets,
                 start_stamp,
-                false,
+                complete_partial,
                 &mut started,
                 &mut sent_any,
                 &mut sent_mask,
@@ -17762,6 +17796,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 || self.flush_can_and_commit().is_err()
                 || self.fence_check().is_err()
             {
+                // On noop-flush transports (e.g. SocketCAN), any frame whose `send_plain` already
+                // succeeded reached the wire: keep `mit_fence_last_cmd` and `record_flushed_joint_tx`
+                // reconciled with actually transmitted frames while discarding any uncommitted staging.
+                if self.can.flush_is_noop() && sent_mask != 0 {
+                    for (i, t) in started.into_iter().enumerate().take(n) {
+                        if t.is_some() && (sent_mask & (1u64 << i)) != 0 {
+                            self.mit_fence_last_cmd[i] = t;
+                            self.record_flushed_joint_tx(i, 0, false);
+                        }
+                    }
+                }
                 self.discard_staged_ctrl_tx();
                 return Ok(false);
             }
@@ -21691,6 +21736,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                         }
                                         if self.fence_check().is_ok() {
                                             let covered = sent_mask;
+                                            let n_cap = self.motor_ids.len().min(MAX_MODE_JOINTS);
+                                            self.watchdog_continuity_recovery_budget = self
+                                                .watchdog_continuity_recovery_budget
+                                                .saturating_add(1)
+                                                .min(n_cap);
                                             if self
                                                 .send_mit_continuity_holds_for_uncovered(
                                                     active_mask,
@@ -22231,11 +22281,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         let prev_bypass = self.watchdog_continuity_bypass;
+        let prev_partial = self.watchdog_continuity_complete_partial;
         if self.mit_fence.is_some() && self.mit_fence_trip.is_none() {
             self.watchdog_continuity_bypass = true;
+            if self.in_active_control_release() {
+                self.watchdog_continuity_complete_partial = true;
+            }
         }
         let res = pos_force_emitter::emit_tick(self, intent, current);
         self.watchdog_continuity_bypass = prev_bypass;
+        self.watchdog_continuity_complete_partial = prev_partial;
         if let Ok(PosForceEmitOutcome::Sent { joint, .. }) = res {
             if self.mit_fence.is_some() && joint < self.mit_fence_last_cmd.len() {
                 self.mit_fence_last_cmd[joint] = Some(self.now());
@@ -22576,6 +22631,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                     }
                                     if self.fence_check().is_ok() {
                                         let covered = sent_mask;
+                                        let n_cap = self.motor_ids.len().min(MAX_MODE_JOINTS);
+                                        self.watchdog_continuity_recovery_budget = self
+                                            .watchdog_continuity_recovery_budget
+                                            .saturating_add(1)
+                                            .min(n_cap);
                                         if self
                                             .send_mit_continuity_holds_for_uncovered(
                                                 active_mask,
@@ -23509,6 +23569,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                         let uncovered = (active_mask & !covered).count_ones() as usize;
                                         let mut dummy_any = false;
                                         let mut dummy_slot = 0u64;
+                                        let n_cap = self.motor_ids.len().min(MAX_MODE_JOINTS);
+                                        self.watchdog_continuity_recovery_budget = self
+                                            .watchdog_continuity_recovery_budget
+                                            .saturating_add(1)
+                                            .min(n_cap);
                                         if self
                                             .send_mit_continuity_holds_for_uncovered(
                                                 active_mask,

@@ -247,6 +247,7 @@ fn tx_exhaustion_caps_attempts_per_release_and_resumes_cleanly() {
 
     bus.with(|s| {
         s.tx_log.clear();
+        s.tx_times.clear();
         s.push_all_feedback();
     });
     clock.advance(Duration::from_millis(10));
@@ -643,39 +644,49 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     // a 40 ms nominal gap + TX jitter and trips the fence; consecutive skipped releases ALWAYS trip.
     drv.set_mit_deadline_fence(Some(Duration::from_millis(41)), Duration::from_millis(300));
 
+    // Capture ACTUAL per-axis TX timestamps from `FakeBusState::tx_times` (recorded on every
+    // transmitted arm frame `id` 1..=6) rather than measuring release-start timestamps.
     let mut last_axis_tx: [Option<Instant>; 6] = [None; 6];
     let mut max_axis_gap: [Duration; 6] = [Duration::ZERO; 6];
     let record_release_frames = |release_id: u64,
-                                 at: Instant,
                                  last: &mut [Option<Instant>; 6],
                                  max_gap: &mut [Duration; 6]| {
-        let seen_mask = bus.with(|s| {
-            let mut mask = 0u8;
-            for f in &s.tx_log {
+        let mut seen_mask = 0u8;
+        let mut release_axis_ts: [Option<Instant>; 6] = [None; 6];
+        bus.with(|s| {
+            for (f, ts) in s.tx_log.iter().zip(s.tx_times.iter()) {
                 if (1..=6).contains(&f.id) {
-                    mask |= 1u8 << (f.id - 1);
+                    let axis = (f.id - 1) as usize;
+                    seen_mask |= 1u8 << axis;
+                    if let Some(t) = *ts {
+                        // Use the latest (successful) transmit timestamp for this axis in this release.
+                        release_axis_ts[axis] = Some(t);
+                    }
                 }
             }
-            mask
+            s.tx_log.clear();
+            s.tx_times.clear();
         });
         assert_eq!(
             seen_mask, 0x3F,
             "release {release_id}: every armed MIT axis (J1..J6) must receive a continuity frame (mask=0x{seen_mask:02x})"
         );
         for axis in 0..6 {
+            let ts = release_axis_ts[axis]
+                .unwrap_or_else(|| panic!("release {release_id}: missing TX timestamp for axis {}", axis + 1));
             if let Some(prev) = last[axis] {
-                let gap = at.saturating_duration_since(prev);
+                let gap = ts.saturating_duration_since(prev);
                 if gap > max_gap[axis] {
                     max_gap[axis] = gap;
                 }
             }
-            last[axis] = Some(at);
+            last[axis] = Some(ts);
         }
     };
 
     // Release 1 (t = 0 ms): full cap establishes initial armed MIT batch.
+    bus.clear_log();
     bus.with(|s| {
-        s.tx_log.clear();
         s.push_all_feedback();
     });
     let t1 = clock.now();
@@ -688,12 +699,12 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     );
     drv.set_tx_release_deadline(None);
     assert!(drv.mit_fence_trip().is_none());
-    record_release_frames(1, t1, &mut last_axis_tx, &mut max_axis_gap);
+    record_release_frames(1, &mut last_axis_tx, &mut max_axis_gap);
 
     // Consecutive 50 Hz releases (release_id = 2, 3, 4) with tightened ledger caps (3, 0, 2):
     // watchdog-continuity frames are NEVER deferrable by the ledger. Each release must send
     // valid holds for all 6 armed axes (plus J7) without tripping the fence, keeping every
-    // per-axis gap <= 40 ms.
+    // actual per-axis TX gap <= 40 ms.
     for (release_id, tight_cap) in [(2u64, 3u16), (3, 0), (4, 2)] {
         clock.advance(Duration::from_millis(20));
         bus.with(|s| {
@@ -717,7 +728,7 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
             drv.mit_fence_trip()
         );
         drv.set_tx_release_deadline(None);
-        record_release_frames(release_id, tr, &mut last_axis_tx, &mut max_axis_gap);
+        record_release_frames(release_id, &mut last_axis_tx, &mut max_axis_gap);
     }
 
     // Release 5 (t = 80 ms): stopped-hold and measured-hold paths under tightened cap also send
@@ -725,6 +736,7 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     clock.advance(Duration::from_millis(20));
     bus.with(|s| {
         s.tx_log.clear();
+        s.tx_times.clear();
         s.push_all_feedback();
     });
     let _ = drv.read_joint_states();
@@ -737,32 +749,39 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     assert!(r_mhold.sent_any);
     assert!(drv.mit_fence_trip().is_none());
     drv.set_tx_release_deadline(None);
-    record_release_frames(5, t5, &mut last_axis_tx, &mut max_axis_gap);
+    record_release_frames(5, &mut last_axis_tx, &mut max_axis_gap);
 
-    // Release 6 (t = 100 ms): Step 5 skipped -> `service_release_watchdog_fallback` must cover
-    // armed MIT axes in the same release rather than declining while fenced.
+    // Release 6 (t = 100 ms): Step 5 skipped -> `service_release_watchdog_fallback` with a tight
+    // 2.5 ms release cutoff and 1 ms/frame TX step (mid-batch cutoff expiry + one-shot WouldBlock)
+    // must still complete ALL 6 armed MIT axes and update fence timestamps without tripping.
     clock.advance(Duration::from_millis(20));
     bus.with(|s| {
         s.tx_log.clear();
         s.push_all_feedback();
+        s.tx_step = Duration::from_millis(1);
+        s.fail_tx_once_after = Some(2);
     });
     let _ = drv.read_joint_states();
     let t6 = clock.now();
     drv.begin_control_release(6);
-    drv.set_tx_release_deadline(Some(t6 + Duration::from_millis(10)));
+    drv.set_tx_release_deadline(Some(t6 + Duration::from_micros(2_500)));
     drv.sync_release_budget_limits(64, 0);
     drv.service_release_watchdog_fallback(0x3F, None);
     let _ = drv.emit_pos_force_j7(
         armd::driver::PosForceIntent::hold(armd::driver::PosForceIntentStamp::default()),
         armd::driver::PosForceIntentStamp::default(),
     );
-    assert!(drv.mit_fence_trip().is_none());
+    assert!(
+        drv.mit_fence_trip().is_none(),
+        "generic watchdog fallback under mid-batch cutoff expiry + one-shot WouldBlock must not trip fence: {:?}",
+        drv.mit_fence_trip()
+    );
     drv.set_tx_release_deadline(None);
-    record_release_frames(6, t6, &mut last_axis_tx, &mut max_axis_gap);
+    record_release_frames(6, &mut last_axis_tx, &mut max_axis_gap);
 
     // Release 7 (t = 120 ms): partial batch mid-send deadline expiry (release deadline expires
     // after 2 frames) must fall back to holds for the uncovered axes without tripping the fence.
-    clock.advance(Duration::from_millis(20));
+    clock.advance(Duration::from_millis(15));
     bus.with(|s| {
         s.tx_log.clear();
         s.push_all_feedback();
@@ -785,13 +804,18 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
         drv.mit_fence_trip()
     );
     drv.set_tx_release_deadline(None);
-    record_release_frames(7, t7, &mut last_axis_tx, &mut max_axis_gap);
+    record_release_frames(7, &mut last_axis_tx, &mut max_axis_gap);
 
-    // Release 8 (t = 140 ms): transient transport error after first send (axis 3 fails once)
-    // must fall back to holds for uncovered axes without tripping the fence.
-    clock.advance(Duration::from_millis(20));
+    // Release 8 (t = 140 ms): exact physical cap (`tx_budget.max_frames == 7`, matching the
+    // 7-frame batch size) with a transient one-shot transport error after 2 sends must still
+    // recover via bounded recovery capacity and cover all axes without tripping the fence.
+    let mut exact_cap_budget = TxBudget::default();
+    exact_cap_budget.max_frames = 7;
+    drv.set_tx_budget(exact_cap_budget);
+    clock.advance(Duration::from_millis(15));
     bus.with(|s| {
         s.tx_log.clear();
+        s.tx_times.clear();
         s.push_all_feedback();
         s.tx_step = Duration::from_micros(200);
         s.fail_tx_once_after = Some(2);
@@ -800,24 +824,28 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     let t8 = clock.now();
     drv.begin_control_release(8);
     drv.set_tx_release_deadline(Some(t8 + Duration::from_millis(10)));
-    drv.sync_release_budget_limits(64, 16);
+    drv.sync_release_budget_limits(64, 7);
     let r_partial_tx = drv.write_joint_targets_bounded(&targets).unwrap();
     assert!(
         matches!(r_partial_tx, TxBatchOutcome::Deferred { .. }),
-        "partial transport fallback should report deferred targets while covering all axes: {r_partial_tx:?}"
+        "exact-cap partial transport fallback should report deferred targets while covering all axes: {r_partial_tx:?}"
     );
     assert!(
         drv.mit_fence_trip().is_none(),
-        "mid-batch transient transport error must fall back to holds without tripping fence: {:?}",
+        "exact-cap mid-batch transient transport error must fall back to holds without tripping fence: {:?}",
         drv.mit_fence_trip()
     );
     drv.set_tx_release_deadline(None);
-    record_release_frames(8, t8, &mut last_axis_tx, &mut max_axis_gap);
+    record_release_frames(8, &mut last_axis_tx, &mut max_axis_gap);
 
     // Release 9 (t = 160 ms): full cap resumes full MIT target batch cleanly.
+    let mut restored_budget = TxBudget::default();
+    restored_budget.max_frames = 16;
+    drv.set_tx_budget(restored_budget);
     clock.advance(Duration::from_millis(20));
     bus.with(|s| {
         s.tx_log.clear();
+        s.tx_times.clear();
         s.push_all_feedback();
     });
     let _ = drv.read_joint_states();
@@ -832,12 +860,13 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     );
     drv.set_tx_release_deadline(None);
     assert!(drv.mit_fence_trip().is_none());
-    record_release_frames(9, t9, &mut last_axis_tx, &mut max_axis_gap);
+    record_release_frames(9, &mut last_axis_tx, &mut max_axis_gap);
 
+    bus.with(|s| s.on_tx = None);
     for (axis, gap) in max_axis_gap.iter().enumerate() {
         assert!(
             *gap <= Duration::from_millis(40),
-            "axis {} exceeded 40 ms watchdog gap: {:?}",
+            "axis {} exceeded 40 ms actual TX gap: {:?}",
             axis + 1,
             gap
         );
@@ -877,6 +906,7 @@ fn tightened_zero_tx_release_does_not_leak_to_standalone_driver_tx() {
     clock.advance(Duration::from_millis(20));
     bus.with(|s| {
         s.tx_log.clear();
+        s.tx_times.clear();
         s.push_all_feedback();
     });
     let _ = drv.read_joint_states().unwrap();
@@ -911,6 +941,7 @@ fn clear_fault_maintenance_shares_release_ledger_and_begin_tx_tick_preserves_spe
     let targets = vec![JointTarget::position(0.0); 7];
     bus.with(|s| {
         s.tx_log.clear();
+        s.tx_times.clear();
         s.push_all_feedback();
     });
     // Spend all 4 TX slots of the release on partial output (4 frames sent, 3 deferred).
