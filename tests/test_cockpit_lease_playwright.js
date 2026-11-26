@@ -1248,7 +1248,7 @@ async function main() {
         log('--- Scenario 5(e): Real pointer drag & ArrowRight repeat on #grip-range ---');
         if (await page.evaluate(() => S.ui !== 'expert')) await page.click('#btn-ui');
         await page.click('#mode-seg button[data-mode="cart"]');
-        const gripBox = await (await page.waitForSelector('#grip-range', { state: 'visible', timeout: 3000 })).boundingBox();
+        await page.waitForSelector('#grip-range', { state: 'visible', timeout: 3000 });
         await page.evaluate(() => { S.ws.close(); });
         await waitForCockpitLive(page, 6000);
         await ensureArmedUnleased(PORT_INTERACT, page);
@@ -1256,8 +1256,11 @@ async function main() {
         await page.click('#input-seg button[data-input="stick"]');
         await assertControlInputsState(page, 'unavailable', 'Scenario 5(e) expert stick unleased');
         await page.click('#input-seg button[data-input="btn"]');
+        const gripLoc = page.locator('#grip-range');
+        await gripLoc.scrollIntoViewIfNeeded();
+        const gripBoxUnleased = await gripLoc.boundingBox();
         const m5eOpen = wsRoute.mark();
-        await dragSlider(page, gripBox, 0.2, 0.65);
+        await dragSlider(page, gripBoxUnleased, 0.2, 0.65);
         await waitShown(page, '#take-modal');
         assert.equal(wsRoute.byType('acquire_lease', m5eOpen).length, 0);
         assert.equal(wsRoute.motionFrames(m5eOpen).length, 0);
@@ -1277,8 +1280,10 @@ async function main() {
         await page.waitForTimeout(350);
         assert.equal(wsRoute.motionFrames(m5e).length, 0, '5(e): held ArrowRight repeat across confirm emitted motion!');
 
+        await gripLoc.scrollIntoViewIfNeeded();
+        const gripBoxLeased = await gripLoc.boundingBox();
         const m5eFresh = wsRoute.mark();
-        await dragSlider(page, gripBox, 0.25, 0.85);
+        await dragSlider(page, gripBoxLeased, 0.25, 0.85);
         const servo5e = await waitFor(() => wsRoute.motionFrames(m5eFresh).find((f) => Array.isArray(f.json?.positions) && f.json.positions[6] < -0.5),
           { timeoutMs: 2000, label: '5(e) fresh real mouse drag gripper servo' });
         assert(servo5e.json.positions[6] < -0.5, `5(e): unexpected gripper target ${servo5e.json.positions[6]}`);
@@ -1605,8 +1610,98 @@ async function main() {
         await ctx.close();
       }
     }
+    await killArmd(armdAuth); armdAuth = null;
 
-    log('ALL 7 COCKPIT LEASE PLAYWRIGHT E2E SCENARIOS PASSED!');
+    /* =====================================================================
+       SCENARIO 8: Phone/tablet header fit, favicon 404 check & park-off release-control state
+       ===================================================================== */
+    log(`=== Scenario 8: Phone/tablet header fit, favicon & park-off #tools-release (port ${PORT_AUTH}) ===`);
+    armdAuth = await spawnArmd(PORT_AUTH, ['--config', B601_CONFIG, '--operator-pin', '123456']);
+    {
+      const favRes = await fetch(`http://127.0.0.1:${PORT_AUTH}/favicon.ico`, { cache: 'no-store' });
+      assert.notEqual(favRes.status, 404, `GET /favicon.ico must not 404 (got ${favRes.status})`);
+
+      const viewports = [
+        { width: 360, height: 780, label: '360x780' },
+        { width: 390, height: 844, label: '390x844' },
+        { width: 1024, height: 768, label: '1024x768' },
+      ];
+      for (const vp of viewports) {
+        for (const lang of ['en', 'zh']) {
+          const { ctx, page, guards } = await newCockpit(browser, PORT_AUTH, {
+            width: vp.width, height: vp.height, locale: lang === 'zh' ? 'zh-CN' : 'en-US',
+          });
+          const http404 = [];
+          page.on('response', (res) => { if (res.status() === 404) http404.push(res.url()); });
+          try {
+            await page.goto(`http://127.0.0.1:${PORT_AUTH}/`, { waitUntil: 'domcontentloaded' });
+            await waitForCockpitLive(page);
+            await waitFn(page, () => S.auth?.enforced === true && !document.getElementById('btn-op')?.hidden, null, 5000);
+            for (const mode of ['simple', 'expert']) {
+              await page.evaluate((m) => setUi(m), mode);
+              await page.waitForTimeout(180);
+              const metrics = await page.evaluate(() => {
+                const tb = document.querySelector('.topbar');
+                const lb = document.getElementById('btn-lang');
+                const r = lb ? lb.getBoundingClientRect() : null;
+                const clipped = [...tb.querySelectorAll(':scope > *, .head-stats > *')].filter((el) => {
+                  const cs = getComputedStyle(el);
+                  if (cs.display === 'none' || el.hidden) return false;
+                  const b = el.getBoundingClientRect();
+                  return b.width > 0 && (b.left < 0 || b.right > window.innerWidth + 0.5);
+                }).map((el) => el.id || el.className);
+                return {
+                  innerWidth: window.innerWidth,
+                  scrollWidth: document.documentElement.scrollWidth,
+                  langRect: r ? { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height } : null,
+                  clipped,
+                };
+              });
+              const tag = `Scenario 8 ${vp.label} ${lang} ${mode}`;
+              assert.equal(metrics.scrollWidth, metrics.innerWidth, `${tag}: scrollWidth ${metrics.scrollWidth} !== innerWidth ${metrics.innerWidth}`);
+              assert.equal(metrics.clipped.length, 0, `${tag}: clipped header items: ${JSON.stringify(metrics.clipped)}`);
+              assert(metrics.langRect && metrics.langRect.left >= 0 && metrics.langRect.right <= metrics.innerWidth
+                && metrics.langRect.top >= 0 && metrics.langRect.bottom <= vp.height,
+                `${tag}: #btn-lang outside viewport: ${JSON.stringify(metrics.langRect)}`);
+              await assertReachable(page, '#btn-lang', tag);
+            }
+            assert.equal(http404.length, 0, `Scenario 8 ${vp.label} ${lang}: unexpected 404s: ${JSON.stringify(http404)}`);
+            guards.assertClean(`Scenario 8 ${vp.label} ${lang}`);
+          } finally { await ctx.close(); }
+        }
+      }
+
+      // Park-off -> #tools-release hint while parking and immediate enablement once done
+      const { ctx, page, guards } = await newCockpit(browser, PORT_AUTH, { width: 1024, height: 768, locale: 'zh-CN' });
+      try {
+        await page.goto(`http://127.0.0.1:${PORT_AUTH}/`, { waitUntil: 'domcontentloaded' });
+        await waitForCockpitLive(page);
+        await holdButton(page, '#btn-enable', 750);
+        await waitFn(page, () => S.state === 'Armed' && S.obs?.is_torqued === true && S.leaseGeneration != null, null, 6000);
+        await page.waitForTimeout(400);
+
+        await holdButton(page, '#btn-enable', 750);
+        await page.click('#btn-sset');
+        await page.waitForSelector('#tools-release', { state: 'visible', timeout: 3000 });
+
+        await waitFn(page, () => {
+          const btn = document.getElementById('tools-release');
+          const hint = document.getElementById('tools-release-hint')?.textContent?.trim() || '';
+          return btn?.disabled === true && /正在停靠并卸力/.test(hint);
+        }, null, 3000);
+
+        await waitFn(page, () => S.obs?.is_torqued === false && S.state === 'Idle'
+          && !document.getElementById('tools-release')?.disabled
+          && /扭矩关/.test(document.getElementById('lease-status-txt')?.textContent || ''), null, 8000);
+
+        await page.click('#tools-release');
+        await waitFn(page, () => S.leaseGeneration === null && document.getElementById('lease-status').className.includes('is-readonly'), null, 5000);
+        guards.assertClean('Scenario 8 park-off release');
+        log('PASS Scenario 8: header fits 360x780/390x844/1024x768 (en/zh, simple/expert), favicon ok, #tools-release explains parking and enables once done.');
+      } finally { await ctx.close(); }
+    }
+
+    log('ALL 8 COCKPIT LEASE PLAYWRIGHT E2E SCENARIOS PASSED!');
   } finally {
     await cleanup();
   }

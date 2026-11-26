@@ -328,6 +328,9 @@ async fn executor_owner_serves_cell_capabilities_and_status_and_fences_post_tran
         alloc_timing: false,
         panic_policy: armd::rt_core::executor::PanicPolicy::AbortProcess,
         apply_rt_sched: false,
+        sub_release_margin: armd::rt_core::ops::SubReleaseBudget::default_margin_for_period(
+            Duration::from_millis(20),
+        ),
     };
     let handle = sup
         .start_executor_with_hooks(exec_cfg, armd::rt_core::executor::PersistTestHooks::default())

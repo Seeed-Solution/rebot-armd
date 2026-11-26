@@ -9213,11 +9213,6 @@ const WATCHDOG_HOLD_WAKE_INTERVAL: Duration = Duration::from_millis(22);
 /// background `0xCC` status polls or autonomous recovery frames without pushing a release past
 /// its deadline.
 pub(crate) const OPTIONAL_WORK_RELEASE_MARGIN: Duration = Duration::from_millis(6);
-/// Remaining release budget margin required to admit an optional Window 2 sub-release transition
-/// poll (capped at `period / 2` for shorter periods). A Window 2 poll on SG2002 costs ~3–4 ms, so
-/// deferring optional wakes past `period - 9 ms` keeps worst-case 50 Hz releases under 15 ms while
-/// urgent watchdog/stop wakes remain eligible up to `release_deadline - DAMIAO_TX_RELEASE_PUBLISH_MARGIN`.
-pub(crate) const OPTIONAL_WAKE_RELEASE_MARGIN: Duration = Duration::from_millis(9);
 /// Maximum autonomous stale-feedback recovery TX frames transmitted inside `receive_feedback`
 /// during a single managed/release-bounded control release (round-robin across joints).
 const DAMIAO_MAX_RECOVERY_PER_RELEASE: u8 = 2;
@@ -16437,9 +16432,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if probe_count == 0 || self.remaining_rx_frame_limit() <= probe_count {
             return false;
         }
-        let dl = expiry.map(|at| Deadline { at });
+        let dl = self.disable_step_deadline(expiry);
+        if dl.is_some_and(|d| d.passed(self.now())) {
+            return false;
+        }
         let mut probed_any = false;
-        for i in handshake::mask_joints(probe_mask) {
+        let dof = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
+        let start = if dof > 0 {
+            (self.control_release_id as usize) % dof
+        } else {
+            0
+        };
+        for offset in 0..dof {
+            let i = (start + offset) % dof;
+            if (probe_mask & (1u32 << i)) == 0 {
+                continue;
+            }
+            if dl.is_some_and(|d| d.passed(self.now())) {
+                break;
+            }
             let Some(&id) = self.motor_ids.get(i) else { continue };
             match self.send_plain(TxKind::DisableProbe, None, dl, false, |_| {
                 Some(damiao::build_refresh_frame(id))
@@ -17674,9 +17685,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             true,
                         ) {
                             Ok(_) => {
-                                let tightened = self
-                                    .next_watchdog_hold_wake()
-                                    .map_or(wake, |w| wake.min(w));
+                                // During Window 1 Step 2 (before Step 5 output), do NOT pull the
+                                // optional transition wake down to pre-Step-5 `next_watchdog_hold_wake`:
+                                // `ReleaseEngine::step` refreshes `urgent_wake` live AFTER Step 5.
+                                let tightened = if self.output_step_pending_in_release
+                                    && self.in_active_control_release()
+                                {
+                                    wake
+                                } else {
+                                    self.next_watchdog_hold_wake()
+                                        .map_or(wake, |w| wake.min(w))
+                                };
                                 r = Ok(TorqueProgress::Pending { wake: tightened });
                             }
                             Err(e) => {
@@ -17711,9 +17730,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         0,
                         false,
                     );
-                    let tightened = self
-                        .next_watchdog_hold_wake()
-                        .map_or(wake, |w| wake.min(w));
+                    let tightened = if self.output_step_pending_in_release
+                        && self.in_active_control_release()
+                    {
+                        wake
+                    } else {
+                        self.next_watchdog_hold_wake()
+                            .map_or(wake, |w| wake.min(w))
+                    };
                     r = Ok(TorqueProgress::Pending { wake: tightened });
                 }
             }
@@ -18253,13 +18277,34 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             || self.motor_energized_mask == 0
             || self.is_enabling
             || self.mit_fence.is_some()
+            || self.tick_tx.is_some_and(|p| p.backpressured)
         {
             return;
         }
         let exclude_mask = !(authorized_mask as u32);
+        // During an active torque transition (where Window 2 may defer sub-release watchdog wakes),
+        // use `Duration::ZERO` so any authorized energized arm joint missed in Step 5 — even with
+        // a phase-offset age < 18 ms (e.g. last refreshed at t=10 ms, fallback at t=27 ms) — is
+        // refreshed inside Window 1 before `tx_release_deadline` (`release_ctrl_tx_mask` excludes
+        // joints already refreshed in this release, so normal ticks emit 0 extra frames). Outside
+        // torque transitions, preserve `WATCHDOG_DISABLE_FALLBACK_INTERVAL` (30 ms) so single-tick
+        // recovery/invalid-target suppression contracts emit 0 unexpected arm holds.
+        let min_age = if self.torque_hs.is_some() {
+            Duration::ZERO
+        } else {
+            WATCHDOG_DISABLE_FALLBACK_INTERVAL
+        };
+        let deadline = self.tx_release_deadline.map(|at| Deadline { at });
+        if self.torque_hs.is_some() {
+            if let (Some(pass), Some(cap)) = (self.tick_tx.as_mut(), self.tx_release_deadline) {
+                if pass.deadline < cap {
+                    pass.deadline = cap;
+                }
+            }
+        }
         let _ = self.service_energized_watchdog_holds_with_targets(
-            WATCHDOG_DISABLE_FALLBACK_INTERVAL,
-            None,
+            min_age,
+            deadline,
             exclude_mask,
             hold_targets,
             false,

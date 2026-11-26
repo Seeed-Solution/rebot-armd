@@ -323,6 +323,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(DELETE "/api/v1/calibration/sessions/{id}", crate::calibration_sessions::delete_session, OwnerAgnostic, Required, None, Fenced),
     // Cockpit / static assets
     rr!(GET    "/",                       super::serve_index,        OwnerAgnostic, None, None, Allowed),
+    rr!(GET    "/favicon.ico",            super::serve_favicon,      OwnerAgnostic, None, None, Allowed),
     rr!(GET    "/assets/jmuxer.min.js",   super::serve_jmuxer,       OwnerAgnostic, None, None, Allowed),
     rr!(GET    "/assets/calib_wizard.js", super::serve_calib_wizard, OwnerAgnostic, None, None, Allowed),
     rr!(GET    "/assets/three-urdf.min.js", super::assets::serve_three, OwnerAgnostic, None, None, Allowed),

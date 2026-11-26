@@ -5713,15 +5713,25 @@ fn sync_prep_env_from_published(sup: &ArmSupervisor, motion_config_rev: Option<u
         sup.hub().update_prep_env(Arc::new(next));
     }
     sup.hub().update_service_identity_from_config(&pub_cfg);
-    if let Some(cur_mc) = sup.hub().motion_config() {
-        let mut next_mc = (*cur_mc).clone();
+    let apply_mc = |cur_mc: &crate::rt_core::requests::motion::MotionConfigSnapshot| {
+        let mut next_mc = cur_mc.clone();
         next_mc.config = pub_cfg.config.clone();
         next_mc.workspace = pub_cfg.workspace_policy().map(|(ws, _)| ws.clone());
+        // Mirror `SupervisorInner::power_budget()`: disabled budgets filter to `None` (hash = 0).
+        next_mc.power_budget = pub_cfg.config.power_budget.as_ref().filter(|p| p.enabled).cloned();
+        next_mc.power_budget_hash =
+            crate::rt_core::requests::motion::power_budget_fingerprint(next_mc.power_budget.as_ref());
         next_mc.workspace_revision = pub_cfg.workspace_revision;
         if let Some(rev) = motion_config_rev {
             next_mc.motion_config_revision = rev;
         }
-        sup.hub().set_motion_config(Arc::new(next_mc));
+        Arc::new(next_mc)
+    };
+    if let Some(cur_mc) = sup.hub().motion_config() {
+        sup.hub().set_motion_config(apply_mc(&cur_mc));
+    }
+    if let Some(cur_legacy_mc) = sup.hub().legacy_motion_config() {
+        sup.hub().set_legacy_motion_config_if_newer(apply_mc(&cur_legacy_mc));
     }
 }
 

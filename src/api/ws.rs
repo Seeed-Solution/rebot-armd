@@ -3271,6 +3271,23 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let command_label: &'static str = entry
                 .and_then(|e| e.key.path)
                 .unwrap_or_else(|| frame_kind.as_static_str());
+            // Fetch cached legacy motion config (refreshing limits off-lock if a runtime limit
+            // commit bumped `motion_config_revision`) and pre-parse motion/preset requests strictly
+            // off `SupervisorLock` so Lock #1 performs zero `ArmConfig` clones and zero JSON parsing.
+            let cached_motion_cfg = if matches!(frame_kind, FrameKind::Preset)
+                || matches!(
+                    entry.and_then(|e| e.key.path),
+                    Some("/api/v1/motion/jog" | "/api/v1/motion/home" | "/api/v1/motion/unload")
+                ) {
+                recv_supervisor.get_fresh_legacy_motion_config().await
+            } else {
+                None
+            };
+            let mut preparsed_motion = motion::preparse_motion_frame(
+                frame_kind,
+                entry.and_then(|e| e.key.path),
+                &value,
+            );
             let mut reply_gate_guard;
             let lock1_reply: Option<dispatch::OwnerReply> = {
                 let mut inner = recv_supervisor.inner().write().await;
@@ -3304,6 +3321,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             last_sequence: &mut last_sequence,
                             action_pending: &mut action_pending,
                             pending_motion: &mut pending_motion,
+                            cached_motion_cfg: cached_motion_cfg.as_ref(),
+                            preparsed_motion: &mut preparsed_motion,
                             pending_config_write: &mut pending_config_write,
                             pending_calibration: &mut pending_calibration,
                         };

@@ -1297,8 +1297,11 @@ pub struct StateHub {
     /// Pre-sized observation template recorded atomically at executor startup activation so a
     /// reader warms its own `front` slot off-thread before handing it back to the RT producer.
     prewarm_template: std::sync::RwLock<Option<Box<ArmObservation>>>,
-    /// Immutable motion planning config snapshot updated off-tick for zero-lock workers.
+    /// Immutable motion planning config snapshot updated off-tick for executor zero-lock workers.
     motion_config: std::sync::RwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
+    /// Separate motion planning config cache owned exclusively by legacy-mode paths so delayed
+    /// legacy writebacks can never overwrite the executor's authoritative `motion_config`.
+    legacy_motion_config: std::sync::RwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
     /// Off-thread schema cache paired with [`OwnerStateSnapshot::schema_revision`]. Never locked
     /// on the RT control thread.
     schema_cache: Mutex<Option<(u64, Arc<ObservationSchema>)>>,
@@ -1374,6 +1377,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         tick_frees: AtomicU64::new(0),
         prewarm_template: std::sync::RwLock::new(None),
         motion_config: std::sync::RwLock::new(None),
+        legacy_motion_config: std::sync::RwLock::new(None),
         schema_cache: Mutex::new(None),
         prep_env: Mutex::new(None),
         service_identity: std::sync::RwLock::new(None),
@@ -1948,14 +1952,39 @@ impl StateHub {
             .is_some()
     }
 
-    /// Publishes an immutable motion planning config snapshot off the RT tick.
+    /// Publishes an immutable motion planning config snapshot off the RT tick (executor owner).
     pub fn set_motion_config(&self, cfg: Arc<super::requests::motion::MotionConfigSnapshot>) {
         *self.motion_config.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
     }
 
-    /// Reads the latest immutable motion planning config snapshot without touching the owner lock.
+    /// Reads the latest immutable motion planning config snapshot without touching the owner lock
+    /// (executor owner).
     pub fn motion_config(&self) -> Option<Arc<super::requests::motion::MotionConfigSnapshot>> {
         self.motion_config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Publishes the legacy owner's cached motion planning config snapshot (startup / driver init).
+    pub fn set_legacy_motion_config(&self, cfg: Arc<super::requests::motion::MotionConfigSnapshot>) {
+        *self.legacy_motion_config.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
+    }
+
+    /// Publishes a legacy cached motion planning config snapshot only when its monotonic
+    /// `(workspace_revision, motion_config_revision)` is at least as new as the cached entry.
+    /// Never touches the executor's `motion_config`.
+    pub fn set_legacy_motion_config_if_newer(&self, cfg: Arc<super::requests::motion::MotionConfigSnapshot>) {
+        let mut slot = self.legacy_motion_config.write().unwrap_or_else(|e| e.into_inner());
+        let newer = slot.as_ref().is_none_or(|cur| {
+            cfg.workspace_revision >= cur.workspace_revision
+                && cfg.motion_config_revision >= cur.motion_config_revision
+        });
+        if newer {
+            *slot = Some(cfg);
+        }
+    }
+
+    /// Reads the legacy owner's cached motion planning config snapshot without touching `SupervisorLock`.
+    pub fn legacy_motion_config(&self) -> Option<Arc<super::requests::motion::MotionConfigSnapshot>> {
+        self.legacy_motion_config.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Records the off-thread [`ObservationSchema`] corresponding to `revision`.

@@ -622,7 +622,9 @@ pub async fn load_into_with_marker_state(
         inner.calibration_load_error = Some(msg);
         return Ok(());
     }
-    load_into_inner(supervisor, path, setup_path).await
+    let res = load_into_inner(supervisor, path, setup_path).await;
+    supervisor.refresh_motion_config_cache().await;
+    res
 }
 
 async fn load_into_inner(supervisor: &ArmSupervisor, path: &Path, setup_path: Option<&Path>) -> Result<(), String> {

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#f7fbf0">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%235B7D15'/%3E%3Cg fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 20h8'/%3E%3Cpath d='M8 20v-4'/%3E%3Cpath d='M8 16l5-6'/%3E%3Cpath d='M13 10l5 2'/%3E%3Cpath d='M18 12l2-2M18 12l2 2'/%3E%3C/g%3E%3C/svg%3E">
 <title>reBot Teleop · 机械臂遥控</title>
 <style>
 /* ---------------------------------------------------------------
@@ -1576,7 +1577,7 @@ body::before {
 
   /* top: floating status island instead of a header bar */
   body.ui-simple .topbar {
-    position: fixed; z-index: 200; top: 8px; left: 50%; transform: translateX(-50%); width: auto; height: 34px;
+    position: fixed; z-index: 200; top: 8px; left: 50%; transform: translateX(-50%); width: auto; max-width: calc(100vw - 16px); height: 34px;
     padding-left: 6px; padding-right: 6px;
     padding: 0 6px; gap: 8px; border-radius: 17px;
     background: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.45); box-shadow: 0 4px 16px rgba(0,0,0,0.15);
@@ -1880,6 +1881,40 @@ body.controls-unavailable .grip-slider input[type=range]::-moz-range-thumb { bor
 .ui-mode-btn svg { width: 16px; height: 16px; flex: none; }
 .ui-mode-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 body.ui-simple .ui-mode-btn { margin: 0; }
+@media (max-width: 639px) {
+  .ui-mode-btn { margin: 0; }
+}
+/* phones (360-479 px): compact the mode button, icon controls and operator pill so the header fits inside the viewport
+   in en/zh and simple/expert without pushing #btn-lang off-screen; wrap only as a safety net for extra badges */
+@media (max-width: 479px) {
+  body:not(.is-fs):not(.is-hud) .topbar {
+    gap: 4px; row-gap: 4px; padding: 6px 8px;
+    padding-left: max(8px, env(safe-area-inset-left));
+    padding-right: max(8px, env(safe-area-inset-right));
+    height: auto; min-height: var(--head-h); flex-wrap: wrap;
+  }
+  .ui-mode-btn { height: 32px; padding: 0 9px; gap: 4px; font-size: 12px; }
+  .ui-mode-btn svg { width: 15px; height: 15px; }
+  .speed-pill { width: 46px; height: 26px; font-size: 11px; }
+  .fs-btn, .hd-btn { width: 30px; height: 32px; }
+  .fs-btn svg, .hd-btn svg { width: 16px; height: 16px; }
+  .op-btn { height: 30px; min-width: 30px; padding: 0; gap: 0; justify-content: center; }
+  .op-btn .op-lbl { display: none; }
+  .lang-btn { height: 32px; min-width: 30px; padding: 0 6px; font-size: 11px; }
+}
+@media (max-width: 379px) {
+  body:not(.is-fs):not(.is-hud) .topbar {
+    gap: 3px; row-gap: 4px; padding: 6px;
+    padding-left: max(6px, env(safe-area-inset-left));
+    padding-right: max(6px, env(safe-area-inset-right));
+  }
+  .ui-mode-btn { height: 30px; padding: 0 8px; font-size: 11px; }
+  .ui-mode-btn svg { width: 14px; height: 14px; }
+  .speed-pill { width: 44px; height: 26px; font-size: 11px; }
+  .fs-btn, .hd-btn { width: 28px; height: 30px; }
+  .op-btn { height: 28px; min-width: 28px; }
+  .lang-btn { height: 30px; min-width: 28px; padding: 0 5px; font-size: 11px; }
+}
 body.ui-simple #det-ctl, body.ui-simple.vis-open #det-ctl:not([hidden]) { display: none !important; }
 body.ui-simple #det-chip { display: none !important; }
 body.ui-simple #cam-chip.is-ok { display: none; }
@@ -3300,8 +3335,8 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
       <div class="tools-warn" id="tools-stale" role="status" hidden></div>
       <div class="tools-warn" id="tools-stale2" role="status" hidden></div>
       <div class="tools-list" id="tools-list"></div>
-      <button class="btn" id="tools-release" type="button" data-i18n="tools.release">释放控制权（交给其他程序）</button>
-      <small id="tools-release-hint"></small>
+      <button class="btn" id="tools-release" type="button" aria-describedby="tools-release-hint" data-i18n="tools.release">释放控制权（交给其他程序）</button>
+      <small id="tools-release-hint" role="status" aria-live="polite"></small>
     </div>
     <div class="gset-row" id="col-set">
       <div class="gset-k"><span data-i18n="col.set.title">碰撞保护</span><label class="tgl" data-op="/api/v1/safety/collision"><input type="checkbox" id="col-en" role="switch" data-i18n-aria="col.set.title" aria-label="碰撞保护"><i></i></label></div>
@@ -4052,7 +4087,8 @@ Object.assign(I18N.zh, {
   'tools.cam': '相机标定', 'tools.cam.desc': '用标定板求解相机内参、相机安装和桌面高度（约 20 个位姿）。',
   'tools.kin': '精校（相机 + 机械臂几何）', 'tools.kin.desc': '标定板两个位置，同时求解相机和 J2–J5 的几何修正（约 12 分钟）。',
   'tools.grip': '夹爪标定', 'tools.grip.desc': '检查夹爪闭合时的机械零位，可保存偏差。',
-  'tools.release': '释放控制权', 'tools.rel.none': '本页没有控制权。', 'tools.rel.torqued': '先「停靠并卸力」（长按使能开关），再释放控制权。',
+  'tools.release': '释放控制权', 'tools.rel.none': '本页没有控制权。', 'tools.rel.busy': '正在更新控制权状态，请稍候。',
+  'tools.rel.parking': '正在停靠并卸力，完成后即可释放控制权。', 'tools.rel.torqued': '先「停靠并卸力」（长按使能开关），再释放控制权。',
   'tools.rel.moving': '机械臂在动或有动作在执行，停下后再释放。', 'tools.rel.ok': '释放后其他设备（如 MCP、脚本）可以取得控制权。释放控制权不改变电机使能；要卸力，用「停靠并卸力」。',
   'tools.stale': '相机标定已过期：{at} 改过零位。抓取仍按旧标定运行，请重新做相机标定或精校。', 'tools.stale.chip': '⚠ 相机标定需重做（零位已改）',
   'gt.title': '夹爪标定', 'gt.lead': '夹爪零位 = 完全闭合。零位检查让夹爪慢慢闭合到机械限位，测出与配置的闭合角之差。',
@@ -4073,7 +4109,8 @@ Object.assign(I18N.en, {
   'tools.cam': 'Camera calibration', 'tools.cam.desc': 'Camera intrinsics, camera mount and table height from a printed board (about 20 poses).',
   'tools.kin': 'Fine calibration (camera + arm geometry)', 'tools.kin.desc': 'Two board placements: the camera plus a geometric correction of J2–J5 (about 12 minutes).',
   'tools.grip': 'Gripper calibration', 'tools.grip.desc': 'Checks the gripper\'s mechanical zero when closed; can store the offset.',
-  'tools.release': 'Release control', 'tools.rel.none': 'This page does not hold control.', 'tools.rel.torqued': 'Park and turn torque off first (hold the Enable switch), then release control.',
+  'tools.release': 'Release control', 'tools.rel.none': 'This page does not hold control.', 'tools.rel.busy': 'Updating control lease, please wait.',
+  'tools.rel.parking': 'Parking and turning torque off; release control will be enabled once finished.', 'tools.rel.torqued': 'Park and turn torque off first (hold the Enable switch), then release control.',
   'tools.rel.moving': 'The arm is moving or an action runs; release once it stops.', 'tools.rel.ok': 'After the release another client (MCP, a script) can take control. Releasing control does not change torque; to turn torque off use "Park and turn torque off".',
   'tools.stale': 'The camera calibration is stale: the joint zero changed at {at}. Grasp still uses the old calibration; redo the camera or fine calibration.', 'tools.stale.chip': '⚠ Redo the camera calibration (zero changed)',
   'gt.title': 'Gripper calibration', 'gt.lead': 'Gripper zero = fully closed. The zero check closes the gripper slowly onto its mechanical stop and measures the difference to the configured closed angle.',
@@ -10933,20 +10970,25 @@ let unloading = false;
 async function controlledUnload() {
   if (unloading) return;
   unloading = true;
+  if (typeof toolsRenderRelease === 'function' && !$('sset').hidden) toolsRenderRelease();
   try {
     await api('/api/v1/motion/unload', undefined, { quiet: true });
-    // Wait for the backend to finish or for the pose to be stable for ~1 s
+    // Wait for the backend to finish parking and turn torque off, or for the pose to settle
     const t0 = Date.now();
     let last = null, stableSince = 0;
     while (Date.now() - t0 < 20000) {
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 100));
       if (!S.obs || isStopped()) return;
-      const pos = S.obs.positions;
+      const o = S.obs;
+      const parkActive = !!o.disable_pending || (o.action?.kind === 'park' && o.action?.state === 'running');
+      if (!o.is_torqued && !parkActive && o.enable_state !== 'Enabled'
+        && o.action?.state !== 'running' && S.state !== 'Moving') break;
+      const pos = o.positions;
       const moved = last ? Math.max(...pos.slice(0, S.dof).map((x, i) => Math.abs(x - last[i]))) : 1;
       last = pos.slice();
-      if (moved < 0.005) {
+      if (!parkActive && moved < 0.005) {
         if (!stableSince) stableSince = Date.now();
-        else if (!S.obs.is_torqued || Date.now() - stableSince > 2000) break;
+        else if (!o.is_torqued || Date.now() - stableSince > 2000) break;
       } else {
         stableSince = 0;
       }
@@ -10959,7 +11001,10 @@ async function controlledUnload() {
   } catch (e) {
     if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return;
     toast(t('toast.stow_failed') + (e.message || t('toast.stow_unconfirmed')), 'err', e.code);
-  } finally { unloading = false; }
+  } finally {
+    unloading = false;
+    if (typeof toolsRenderRelease === 'function' && !$('sset').hidden) toolsRenderRelease();
+  }
 }
 
 let torqueOffInflight = false;
@@ -14109,9 +14154,11 @@ function toolsRender() {
 // release_lease: only with torque off and nothing moving (armd parks a torqued arm on release)
 function toolsReleaseState() {
   const o = S.obs || {};
-  if (leaseOp || S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1) return 'none';
-  if (o.is_torqued || o.disable_pending || o.enable_state === 'Enabled') return 'torqued';
-  if (o.action?.state === 'running' || S.state === 'Moving' || S.presetRunning || S.streamActive || unloading || pendingCommands.size
+  if (S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1) return 'none';
+  if (leaseOp) return 'busy';
+  if (unloading || o.disable_pending || (o.action?.kind === 'park' && o.action?.state === 'running')) return 'parking';
+  if (o.is_torqued || o.enable_state === 'Enabled') return 'torqued';
+  if (o.action?.state === 'running' || S.state === 'Moving' || S.presetRunning || S.streamActive || pendingCommands.size
     || (Array.isArray(o.velocities) && o.velocities.some((v) => !(Math.abs(v) < 0.05)))) return 'moving';
   return 'ok';
 }
@@ -16491,6 +16538,7 @@ function frame(ts) {
       : ['is-readonly', t('lease.readonly')];
     setCls(ls, 'lease-status ' + cls); setText($('lease-status-txt'), txt);
   }
+  if (typeof toolsRenderRelease === 'function' && !$('sset').hidden) toolsRenderRelease();
   const showReleased = fresh && !leaseOp && S.leaseGeneration == null && S.leaseReleased != null;
   $('lease-released').hidden = !showReleased;
   if (showReleased) {
