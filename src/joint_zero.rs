@@ -692,6 +692,157 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Some(fb)
     }
+    fn supports_nonblocking_mode_switch(&self) -> bool {
+        self.inner.supports_nonblocking_mode_switch()
+    }
+    fn driver_vendor_binding(&self) -> Option<crate::motor_mode::VendorBinding> {
+        self.inner.driver_vendor_binding()
+    }
+    fn mode_switch_dof(&self) -> usize {
+        self.inner.mode_switch_dof()
+    }
+    fn axis_is_energized(&self, joint: usize) -> bool {
+        self.inner.axis_is_energized(joint)
+    }
+    fn any_axis_energized(&self) -> bool {
+        self.inner.any_axis_energized()
+    }
+    fn axis_has_watchdog(&self, joint: usize) -> bool {
+        self.inner.axis_has_watchdog(joint)
+    }
+    fn axis_confirmed_mode(&self, joint: usize) -> Option<crate::motor_mode::ControlMode> {
+        self.inner.axis_confirmed_mode(joint)
+    }
+    fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<crate::motor_mode::ControlMode>) {
+        self.inner.set_axis_confirmed_mode(joint, mode);
+    }
+    fn mode_write_uncertain_mask(&self) -> u32 {
+        self.inner.mode_write_uncertain_mask()
+    }
+    fn set_mode_switch_active_mask(&mut self, mask: u32) {
+        self.inner.set_mode_switch_active_mask(mask);
+    }
+    fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> {
+        self.inner.axis_last_ctrl_tx(joint)
+    }
+    fn axis_impedance_ranges_verified(&self, joint: usize) -> bool {
+        self.inner.axis_impedance_ranges_verified(joint)
+    }
+    fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]> {
+        self.inner.axis_configured_impedance_ranges(joint)
+    }
+    fn set_axis_impedance_ranges_verified(&mut self, joint: usize, verified: bool) {
+        self.inner.set_axis_impedance_ranges_verified(joint, verified);
+    }
+    fn mode_switch_rx_drained(&self) -> bool {
+        self.inner.mode_switch_rx_drained()
+    }
+    fn mode_switch_service_watchdog_holds(
+        &mut self,
+        min_age: Duration,
+        exclude_mask: u32,
+        force_mask: u32,
+        deadline: Instant,
+        max_frames: u8,
+    ) -> Result<crate::motor_mode::WatchdogHoldResult, crate::motor_mode::ModeSwitchFailure> {
+        self.inner.mode_switch_service_watchdog_holds(
+            min_age,
+            exclude_mask,
+            force_mask,
+            deadline,
+            max_frames,
+        )
+    }
+    fn mode_switch_try_send_ctrl_mode_read(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        self.inner.mode_switch_try_send_ctrl_mode_read(joint, deadline, pre_tx_gate)
+    }
+    fn mode_switch_try_send_ctrl_mode_write(
+        &mut self,
+        joint: usize,
+        mode: crate::motor_mode::ControlMode,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        self.inner.mode_switch_try_send_ctrl_mode_write(joint, mode, deadline, pre_tx_gate)
+    }
+    fn mode_switch_try_send_range_read(
+        &mut self,
+        joint: usize,
+        rid_idx: u8,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        self.inner.mode_switch_try_send_range_read(joint, rid_idx, deadline, pre_tx_gate)
+    }
+    fn mode_switch_try_send_status_refresh(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        self.inner.mode_switch_try_send_status_refresh(joint, deadline, pre_tx_gate)
+    }
+    fn mode_switch_find_ctrl_mode_reply(
+        &self,
+        joint: usize,
+        write: bool,
+        after_seq: u64,
+        min_rx_at: Instant,
+        max_rx_at: Instant,
+        tx_offset_ns: Option<i128>,
+        require_expected_id: bool,
+    ) -> crate::motor_mode::ModeRegMatch {
+        self.inner.mode_switch_find_ctrl_mode_reply(
+            joint,
+            write,
+            after_seq,
+            min_rx_at,
+            max_rx_at,
+            tx_offset_ns,
+            require_expected_id,
+        )
+    }
+    fn mode_switch_find_range_reply(
+        &self,
+        joint: usize,
+        rid_idx: u8,
+        after_seq: u64,
+        min_rx_at: Instant,
+        max_rx_at: Instant,
+        tx_offset_ns: Option<i128>,
+    ) -> crate::motor_mode::ModeRangeMatch {
+        self.inner.mode_switch_find_range_reply(
+            joint,
+            rid_idx,
+            after_seq,
+            min_rx_at,
+            max_rx_at,
+            tx_offset_ns,
+        )
+    }
+    fn mode_switch_post_confirm_feedback(
+        &self,
+        joint: usize,
+        mode: crate::motor_mode::ControlMode,
+        after_seq: u64,
+        after_at: Instant,
+        now: Instant,
+        require_disarmed_stationary: bool,
+    ) -> crate::motor_mode::ModeFeedbackMatch {
+        self.inner.mode_switch_post_confirm_feedback(
+            joint,
+            mode,
+            after_seq,
+            after_at,
+            now,
+            require_disarmed_stationary,
+        )
+    }
 }
 
 /// Result of the zero check against the reference pose (`zero_convention`).

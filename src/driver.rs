@@ -2261,6 +2261,162 @@ pub trait ArmDriver: Send {
     fn commissioning_raw_feedback(&self, _joint: usize) -> Option<crate::mit::CommissioningFeedback> {
         None
     }
+
+    // ---- PR0C: Non-blocking ModeSwitch driver primitives (0 RT heap allocs) ----
+
+    /// True when the driver supports non-blocking tick-driven mode switching / confirmation.
+    fn supports_nonblocking_mode_switch(&self) -> bool { false }
+
+    /// Static hardware vendor binding of this driver (`None` for virtual/mock/sim drivers).
+    fn driver_vendor_binding(&self) -> Option<crate::motor_mode::VendorBinding> { None }
+
+    /// Joint count exposed to `ModeSwitch`.
+    fn mode_switch_dof(&self) -> usize { 0 }
+
+    /// True when `joint` is currently energized or has an energized/unknown torque state.
+    fn axis_is_energized(&self, _joint: usize) -> bool { false }
+
+    /// True when any joint on this driver is currently energized.
+    fn any_axis_energized(&self) -> bool { false }
+
+    /// True when `joint` carries a hardware control-frame watchdog (e.g. Damiao J1–J6; false for J7 `TIMEOUT=0`).
+    fn axis_has_watchdog(&self, _joint: usize) -> bool { false }
+
+    /// Last causally confirmed control mode for `joint` (`None` if unverified or uncertain).
+    fn axis_confirmed_mode(&self, _joint: usize) -> Option<crate::motor_mode::ControlMode> { None }
+
+    /// Sets or clears the causally confirmed control mode for `joint` (also clears/sets driver
+    /// uncertainty flags and `pos_force_verified` where applicable).
+    fn set_axis_confirmed_mode(&mut self, _joint: usize, _mode: Option<crate::motor_mode::ControlMode>) {}
+
+    /// Bitmask of joints with an unconfirmed mode-changing write that may have reached the wire.
+    fn mode_write_uncertain_mask(&self) -> u32 { 0 }
+
+    /// Marks the active `ModeSwitch` joint mask so legacy `mode_readback_boundary` auto-updates
+    /// never race with an active `ModeSwitch` transaction.
+    fn set_mode_switch_active_mask(&mut self, _mask: u32) {}
+
+    /// Confirmed delivery timestamp of the most recent control frame sent to `joint`.
+    fn axis_last_ctrl_tx(&self, _joint: usize) -> Option<Instant> { None }
+
+    /// True when `PMAX`/`VMAX`/`TMAX` wire mapping ranges have been causally verified for `joint`.
+    fn axis_impedance_ranges_verified(&self, _joint: usize) -> bool { false }
+
+    /// Configured `[p_max, v_max, t_max]` wire mapping ranges for `joint`.
+    fn axis_configured_impedance_ranges(&self, _joint: usize) -> Option<[f32; 3]> { None }
+
+    /// Updates the cached wire-range verification status for `joint`.
+    fn set_axis_impedance_ranges_verified(&mut self, _joint: usize, _verified: bool) {}
+
+    /// True iff the most recent RX drain observed an empty transport receive queue.
+    fn mode_switch_rx_drained(&self) -> bool { false }
+
+    /// Watchdog-budget-first hold pass for `ModeSwitch`: services due energized verified axes
+    /// (oldest-unfed-first, plus `force_mask`) in their last confirmed mode, plus any enabled
+    /// verified `PosForce` gripper via `pos_force_emitter`, within `deadline` and `max_frames`.
+    fn mode_switch_service_watchdog_holds(
+        &mut self,
+        _min_age: Duration,
+        _exclude_mask: u32,
+        _force_mask: u32,
+        _deadline: Instant,
+        _max_frames: u8,
+    ) -> Result<crate::motor_mode::WatchdogHoldResult, crate::motor_mode::ModeSwitchFailure> {
+        Ok(crate::motor_mode::WatchdogHoldResult {
+            frames_sent: 0,
+            refreshed_mask: 0,
+            all_due_serviced: true,
+            max_energized_age: Duration::ZERO,
+            oldest_joint: None,
+        })
+    }
+
+    /// Single non-blocking `REG_READ(RID_CTRL_MODE)` TX under `deadline` with `pre_tx_gate`.
+    fn mode_switch_try_send_ctrl_mode_read(
+        &mut self,
+        _joint: usize,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        crate::motor_mode::ModeTxResult::Refused("non-blocking mode switch unsupported")
+    }
+
+    /// Single non-blocking `REG_WRITE(RID_CTRL_MODE)` RAM TX under `deadline` with `pre_tx_gate`.
+    /// Must immediately clear `verified_modes[joint]` / `joint_modes[joint]` / `pos_force_verified`
+    /// and set `mode_write_uncertain_mask` at the transmit boundary (including on failed flush).
+    fn mode_switch_try_send_ctrl_mode_write(
+        &mut self,
+        _joint: usize,
+        _mode: crate::motor_mode::ControlMode,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        crate::motor_mode::ModeTxResult::Refused("non-blocking mode switch unsupported")
+    }
+
+    /// Single non-blocking read of `RID_PMAX` (`0`), `RID_VMAX` (`1`), or `RID_TMAX` (`2`).
+    fn mode_switch_try_send_range_read(
+        &mut self,
+        _joint: usize,
+        _rid_idx: u8,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        crate::motor_mode::ModeTxResult::Refused("non-blocking mode switch unsupported")
+    }
+
+    /// Single non-blocking read-only status refresh (`0xCC`) for post-confirmation feedback.
+    fn mode_switch_try_send_status_refresh(
+        &mut self,
+        _joint: usize,
+        _deadline: Instant,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        crate::motor_mode::ModeTxResult::Refused("non-blocking mode switch unsupported")
+    }
+
+    /// Scans the preallocated register-reply buffer for a causal `RID_CTRL_MODE` reply after an
+    /// observed empty RX queue (`last_read_drained`), rejecting duplicates, overflow, drift,
+    /// late replies (`rx_at >= max_rx_at`), and mismatched reply CAN IDs when required.
+    #[allow(clippy::too_many_arguments)]
+    fn mode_switch_find_ctrl_mode_reply(
+        &self,
+        _joint: usize,
+        _write: bool,
+        _after_seq: u64,
+        _min_rx_at: Instant,
+        _max_rx_at: Instant,
+        _tx_offset_ns: Option<i128>,
+        _require_expected_id: bool,
+    ) -> crate::motor_mode::ModeRegMatch {
+        crate::motor_mode::ModeRegMatch::Pending
+    }
+
+    /// Scans the preallocated register-reply buffer for a causal `PMAX`/`VMAX`/`TMAX` reply.
+    fn mode_switch_find_range_reply(
+        &self,
+        _joint: usize,
+        _rid_idx: u8,
+        _after_seq: u64,
+        _min_rx_at: Instant,
+        _max_rx_at: Instant,
+        _tx_offset_ns: Option<i128>,
+    ) -> crate::motor_mode::ModeRangeMatch {
+        crate::motor_mode::ModeRangeMatch::Pending
+    }
+
+    /// Checks whether causal post-confirmation feedback has arrived for `joint`.
+    fn mode_switch_post_confirm_feedback(
+        &self,
+        _joint: usize,
+        _mode: crate::motor_mode::ControlMode,
+        _after_seq: u64,
+        _after_at: Instant,
+        _now: Instant,
+        _require_disarmed_stationary: bool,
+    ) -> crate::motor_mode::ModeFeedbackMatch {
+        crate::motor_mode::ModeFeedbackMatch::Pending
+    }
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.
@@ -7702,6 +7858,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Only causal post-boundary, post-settle `REG_READ(RID_CTRL_MODE)` replies advance
     /// `verified_modes[i]`.
     mode_readback_boundary: Vec<Option<u64>>,
+    /// Bitmask of joints with an unconfirmed mode-changing `REG_WRITE(RID_CTRL_MODE)` that may
+    /// have reached the wire (including failed flush). Cleared only on causal confirmation.
+    mode_write_uncertain_mask: u32,
+    /// Bitmask of joints currently owned by an active `ModeSwitch` transaction (suppresses
+    /// legacy `mode_readback_boundary` auto-verification in `process_rx_frame`).
+    mode_switch_active_mask: u32,
     /// PMAX / VMAX / TMAX read back from the motor and equal to `limits[i]`.
     mit_limits_verified: Vec<bool>,
     /// Register replies seen by `read_joint_states` since the last clear.
@@ -8115,6 +8277,17 @@ fn damiao_mode_to_shadow_control_mode(mode: DamiaoControlMode) -> crate::motor_m
         DamiaoControlMode::Mit => crate::motor_mode::ControlMode::Impedance,
         DamiaoControlMode::PosVel => crate::motor_mode::ControlMode::PositionVelocity,
         DamiaoControlMode::PosForce => crate::motor_mode::ControlMode::PositionForce,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn control_mode_to_damiao(mode: crate::motor_mode::ControlMode) -> Option<DamiaoControlMode> {
+    match mode {
+        crate::motor_mode::ControlMode::Impedance => Some(DamiaoControlMode::Mit),
+        crate::motor_mode::ControlMode::PositionVelocity => Some(DamiaoControlMode::PosVel),
+        crate::motor_mode::ControlMode::PositionForce => Some(DamiaoControlMode::PosForce),
+        crate::motor_mode::ControlMode::Position => None,
     }
 }
 
@@ -9010,6 +9183,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             joint_modes: vec![Some(DamiaoControlMode::PosVel); dof],
             verified_modes: vec![None; dof],
             mode_readback_boundary: vec![None; dof],
+            mode_write_uncertain_mask: 0,
+            mode_switch_active_mask: 0,
             mit_limits_verified: vec![false; dof],
             register_replies: Vec::with_capacity(64),
             range_check: None,
@@ -10839,7 +11014,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     #[inline]
     fn active_pos_force_joint(&self) -> Option<usize> {
         let pf = self.pos_force.as_ref()?;
+        let uncertain = pf.joint < 32 && (self.mode_write_uncertain_mask & (1u32 << pf.joint)) != 0;
         (self.pos_force_verified
+            && !uncertain
             && self.joint_modes.get(pf.joint).copied().flatten() == Some(DamiaoControlMode::PosForce))
             .then_some(pf.joint)
     }
@@ -11973,6 +12150,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             {
                 self.joint_modes[i] = Some(w.modes[i]);
                 self.verified_modes[i] = Some(w.modes[i]);
+                if i < 32 {
+                    self.mode_write_uncertain_mask &= !(1u32 << i);
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 self.stage_damiao_mode_verified(i, w.modes[i]);
             } else {
@@ -14467,6 +14647,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.verified_modes[j] = Some(base_mode);
                         self.joint_modes[j] = Some(base_mode);
                         self.mode_readback_boundary[j] = None;
+                        if j < 32 {
+                            self.mode_write_uncertain_mask &= !(1u32 << j);
+                        }
                         #[cfg(not(target_arch = "wasm32"))]
                         self.stage_damiao_mode_verified(j, base_mode);
                         r.remaining_mask &= !(1u32 << j);
@@ -14616,6 +14799,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.joint_modes[joint] = Some(DamiaoControlMode::PosForce);
         self.verified_modes[joint] = Some(DamiaoControlMode::PosForce);
         self.pos_force_verified = true;
+        if joint < 32 {
+            self.mode_write_uncertain_mask &= !(1u32 << joint);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         self.stage_damiao_mode_verified(joint, DamiaoControlMode::PosForce);
         tracing::info!("Damiao joint {} confirmed in position-force mode (CTRL_MODE 4); pre-enable hold sent at {:.4} rad", joint + 1, hold_pos);
@@ -15035,6 +15221,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// a causally verified hold mode flag (L2). Never assumes `PosVel` (E4).
     fn verified_hold_mode(&self, i: usize) -> Option<DamiaoControlMode> {
         if i >= self.motor_ids.len() {
+            return None;
+        }
+        if i < 32 && (self.mode_write_uncertain_mask & (1u32 << i)) != 0 {
             return None;
         }
         let verified = self.verified_modes.get(i).copied().flatten()?;
@@ -18785,6 +18974,645 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         })
     }
 
+    fn supports_nonblocking_mode_switch(&self) -> bool {
+        self.can.supports_nonblocking_rt() && self.can.supports_bounded_flush()
+    }
+
+    fn driver_vendor_binding(&self) -> Option<crate::motor_mode::VendorBinding> {
+        Some(crate::motor_mode::VendorBinding::Damiao)
+    }
+
+    fn mode_switch_dof(&self) -> usize {
+        self.motor_ids.len()
+    }
+
+    fn axis_is_energized(&self, joint: usize) -> bool {
+        if joint >= self.motor_ids.len() {
+            return false;
+        }
+        let bit_on = joint < 32 && (self.motor_energized_mask & (1u32 << joint)) != 0;
+        let status_on = self.motor_status.get(joint).copied() == Some(1);
+        bit_on || status_on || (self.is_enabled && self.motor_status.get(joint).copied() != Some(0))
+    }
+
+    fn any_axis_energized(&self) -> bool {
+        self.motor_energized_mask != 0
+            || self.is_enabled
+            || self.motor_status.contains(&1)
+    }
+
+    fn axis_has_watchdog(&self, joint: usize) -> bool {
+        if joint >= self.motor_ids.len() {
+            return false;
+        }
+        // Damiao J7 PosForce keeps TIMEOUT = 0 by design; arm joints carry TIMEOUT = 2000 (100 ms).
+        self.base_mode(joint) != DamiaoControlMode::PosForce
+            && self.pos_force.as_ref().is_none_or(|pf| pf.joint != joint)
+    }
+
+    fn axis_confirmed_mode(&self, joint: usize) -> Option<crate::motor_mode::ControlMode> {
+        self.verified_hold_mode(joint)
+            .map(damiao_mode_to_shadow_control_mode)
+    }
+
+    fn set_axis_confirmed_mode(
+        &mut self,
+        joint: usize,
+        mode: Option<crate::motor_mode::ControlMode>,
+    ) {
+        if joint >= self.motor_ids.len() {
+            return;
+        }
+        match mode.and_then(control_mode_to_damiao) {
+            Some(dm) => {
+                self.verified_modes[joint] = Some(dm);
+                self.joint_modes[joint] = Some(dm);
+                self.mode_readback_boundary[joint] = None;
+                if joint < 32 {
+                    self.mode_write_uncertain_mask &= !(1u32 << joint);
+                }
+                if let Some(pf) = self.pos_force.as_ref() {
+                    if pf.joint == joint {
+                        self.pos_force_verified = dm == DamiaoControlMode::PosForce;
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                self.stage_damiao_mode_verified(joint, dm);
+            }
+            None => {
+                self.verified_modes[joint] = None;
+                self.joint_modes[joint] = None;
+                self.mode_readback_boundary[joint] = None;
+                if let Some(pf) = self.pos_force.as_ref() {
+                    if pf.joint == joint {
+                        self.pos_force_verified = false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn mode_write_uncertain_mask(&self) -> u32 {
+        self.mode_write_uncertain_mask
+    }
+
+    fn set_mode_switch_active_mask(&mut self, mask: u32) {
+        self.mode_switch_active_mask = mask;
+    }
+
+    fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> {
+        self.motor_last_ctrl_tx.get(joint).copied().flatten()
+    }
+
+    fn axis_impedance_ranges_verified(&self, joint: usize) -> bool {
+        self.mit_limits_verified.get(joint).copied().unwrap_or(false)
+    }
+
+    fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]> {
+        let l = self.limits.get(joint)?;
+        Some([l.p_max, l.v_max, l.t_max])
+    }
+
+    fn set_axis_impedance_ranges_verified(&mut self, joint: usize, verified: bool) {
+        if let Some(slot) = self.mit_limits_verified.get_mut(joint) {
+            *slot = verified;
+        }
+    }
+
+    fn mode_switch_rx_drained(&self) -> bool {
+        self.last_read_drained
+    }
+
+    fn mode_switch_service_watchdog_holds(
+        &mut self,
+        min_age: Duration,
+        exclude_mask: u32,
+        force_mask: u32,
+        deadline: Instant,
+        max_frames: u8,
+    ) -> Result<crate::motor_mode::WatchdogHoldResult, crate::motor_mode::ModeSwitchFailure> {
+        let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
+        let pf_joint = self.pos_force.as_ref().map(|p| p.joint);
+        let effective_exclude = exclude_mask | self.mode_write_uncertain_mask;
+        let now = self.now();
+
+        // Collect due energized watchdog-bearing verified axes (oldest-unfed first), plus any
+        // `force_mask` axis (refreshed in its last confirmed mode right before `REG_WRITE`).
+        let mut due = [(0usize, Duration::ZERO, false); MAX_MODE_JOINTS];
+        let mut due_len = 0usize;
+        for i in 0..n {
+            if !self.axis_is_energized(i) || (effective_exclude & (1u32 << i)) != 0 {
+                continue;
+            }
+            if i < 64 && (self.disable_dispatched_mask & (1u64 << i)) != 0 {
+                continue;
+            }
+            if pf_joint == Some(i) || self.base_mode(i) == DamiaoControlMode::PosForce {
+                continue;
+            }
+            if self.verified_hold_mode(i).is_none() {
+                continue;
+            }
+            let age = self.motor_last_ctrl_tx[i]
+                .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+            let forced = (force_mask & (1u32 << i)) != 0;
+            let already_this_release = (self.release_ctrl_tx_mask & (1u32 << i)) != 0;
+            if (age >= min_age && !already_this_release) || (forced && !already_this_release) {
+                due[due_len] = (i, age, forced);
+                due_len += 1;
+            }
+        }
+        // Insertion sort: oldest-unfed first (largest age first; ties prefer non-forced urgent).
+        for idx in 1..due_len {
+            let key = due[idx];
+            let mut j = idx;
+            while j > 0 && due[j - 1].1 < key.1 {
+                due[j] = due[j - 1];
+                j -= 1;
+            }
+            due[j] = key;
+        }
+
+        let start_stamp = self.current_stop_stamp();
+        self.discard_staged_ctrl_tx();
+        let mut frames_sent: u8 = 0;
+        let mut sent_mask: u32 = 0;
+        let mut aborted_flush = false;
+        let mut hit_stop = false;
+        self.in_urgent_watchdog_hold = true;
+        for &(i, _, _) in &due[..due_len] {
+            if frames_sent >= max_frames || self.now() >= deadline {
+                break;
+            }
+            let Some(pos) = self.motor_keepalive_hold_pos[i].or_else(|| {
+                self.cached_states
+                    .get(i)
+                    .map(|s| s.position)
+                    .filter(|p| p.is_finite())
+            }) else {
+                continue;
+            };
+            let target = JointTarget::position(pos);
+            match self.send_plain(
+                TxKind::MeasuredHold(i),
+                Some(start_stamp),
+                Some(Deadline { at: deadline }),
+                false,
+                |d| d.build_verified_hold_frame(i, &target),
+            ) {
+                Ok(_) => {
+                    sent_mask |= 1u32 << i;
+                    frames_sent = frames_sent.saturating_add(1);
+                }
+                Err(TxRefusal::DeadlinePassed | TxRefusal::Deferred) => break,
+                Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
+                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                    aborted_flush = true;
+                    hit_stop = true;
+                    break;
+                }
+                Err(TxRefusal::Transport(_)) => {
+                    self.mark_tx_pass_backpressured();
+                    aborted_flush = true;
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        self.in_urgent_watchdog_hold = false;
+        let mut refreshed_mask: u32 = 0;
+        if sent_mask != 0 {
+            if aborted_flush
+                || self.pending_stop_check(Some(start_stamp)).is_err()
+                || self.flush_cutoff_exceeded()
+            {
+                self.discard_staged_ctrl_tx();
+                if hit_stop {
+                    return Err(crate::motor_mode::ModeSwitchFailure::Stopped);
+                }
+            } else if self.flush_can_and_commit().is_ok() {
+                refreshed_mask = sent_mask;
+            }
+        } else {
+            self.discard_staged_ctrl_tx();
+            if hit_stop {
+                return Err(crate::motor_mode::ModeSwitchFailure::Stopped);
+            }
+        }
+
+        // Also service an enabled, verified PosForce J7 joint via the single J7 emitter when
+        // budget remains and J7 is not excluded/uncertain.
+        if frames_sent < max_frames && self.now() < deadline {
+            if let Some(pf_j) = self.active_pos_force_joint() {
+                if self.axis_is_energized(pf_j)
+                    && (effective_exclude & (1u32 << pf_j)) == 0
+                    && (self.release_ctrl_tx_mask & (1u32 << pf_j)) == 0
+                {
+                    let stamp = self.current_j7_intent_stamp();
+                    if let Ok(PosForceEmitOutcome::Sent { .. }) =
+                        pos_force_emitter::emit_tick(self, PosForceIntent::hold(stamp), stamp)
+                    {
+                        frames_sent = frames_sent.saturating_add(1);
+                        if pf_j < 32 {
+                            refreshed_mask |= 1u32 << pf_j;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute remaining max age across all energized watchdog-bearing confirmed axes and
+        // check whether every due axis was refreshed.
+        let after = self.now();
+        let mut all_due_serviced = true;
+        for &(i, _, _) in &due[..due_len] {
+            if (refreshed_mask & (1u32 << i)) == 0 {
+                all_due_serviced = false;
+            }
+        }
+        let mut max_energized_age = Duration::ZERO;
+        let mut oldest_joint: Option<u8> = None;
+        for i in 0..n {
+            if !self.axis_is_energized(i)
+                || (effective_exclude & (1u32 << i)) != 0
+                || !self.axis_has_watchdog(i)
+                || self.verified_hold_mode(i).is_none()
+            {
+                continue;
+            }
+            let age = self.motor_last_ctrl_tx[i]
+                .map_or(Duration::ZERO, |t| after.saturating_duration_since(t));
+            if oldest_joint.is_none() || age > max_energized_age {
+                max_energized_age = age;
+                oldest_joint = Some(i as u8);
+            }
+        }
+
+        Ok(crate::motor_mode::WatchdogHoldResult {
+            frames_sent,
+            refreshed_mask,
+            all_due_serviced,
+            max_energized_age,
+            oldest_joint,
+        })
+    }
+
+    fn mode_switch_try_send_ctrl_mode_read(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        if joint < self.mode_readback_boundary.len() {
+            self.mode_readback_boundary[joint] = None;
+        }
+        match self.commissioning_try_send_register_read(
+            joint,
+            damiao::RID_CTRL_MODE,
+            deadline,
+            pre_tx_gate,
+        ) {
+            crate::mit::CommissioningTxStatus::Sent {
+                tx_seq,
+                tx_started,
+                tx_offset_ns,
+            } => crate::motor_mode::ModeTxResult::Sent {
+                boundary_seq: tx_seq,
+                tx_at: tx_started,
+                tx_offset_ns,
+            },
+            crate::mit::CommissioningTxStatus::SentFlushFailed {
+                tx_seq,
+                tx_started,
+                tx_offset_ns,
+            } => crate::motor_mode::ModeTxResult::SentFlushFailed {
+                boundary_seq: tx_seq,
+                tx_at: tx_started,
+                tx_offset_ns,
+            },
+            crate::mit::CommissioningTxStatus::Backpressure => {
+                crate::motor_mode::ModeTxResult::Backpressure
+            }
+            crate::mit::CommissioningTxStatus::Revoked(c) => {
+                crate::motor_mode::ModeTxResult::Revoked(c)
+            }
+            crate::mit::CommissioningTxStatus::Refused(c) => {
+                crate::motor_mode::ModeTxResult::Refused(c)
+            }
+        }
+    }
+
+    fn mode_switch_try_send_ctrl_mode_write(
+        &mut self,
+        joint: usize,
+        mode: crate::motor_mode::ControlMode,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::motor_mode::ModeTxResult::Refused("joint out of range");
+        };
+        let Some(dm) = control_mode_to_damiao(mode) else {
+            return crate::motor_mode::ModeTxResult::Refused("unsupported Damiao control mode");
+        };
+        // Unconditional wire-range verification gate before Impedance write.
+        if dm == DamiaoControlMode::Mit
+            && !self.mit_limits_verified.get(joint).copied().unwrap_or(false)
+        {
+            return crate::motor_mode::ModeTxResult::Refused("MIT wire ranges unverified");
+        }
+        let start_stamp = self.current_stop_stamp();
+        let mode_val = Self::mode_value(dm);
+        // RAM write opcode 0x55 only (NEVER flash store 0xAA).
+        match self.send_with_commissioning_gate(
+            TxKind::ModeWrite,
+            Some(start_stamp),
+            Some(Deadline { at: deadline }),
+            pre_tx_gate,
+            |_| Some(damiao::build_set_control_mode_frame(id, mode_val)),
+        ) {
+            Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
+                // Blocker 2: Frame was accepted by transport — IMMEDIATELY invalidate cached
+                // verified mode and mark `mode_write_uncertain_mask` BEFORE flush so even a
+                // failed flush or immediate revocation can NEVER emit holds in a stale mode.
+                self.verified_modes[joint] = None;
+                self.joint_modes[joint] = None;
+                self.mode_readback_boundary[joint] = None;
+                if let Some(pf) = self.pos_force.as_ref() {
+                    if pf.joint == joint {
+                        self.pos_force_verified = false;
+                    }
+                }
+                if joint < 32 {
+                    self.mode_write_uncertain_mask |= 1u32 << joint;
+                }
+                if !self.can.flush_is_noop() {
+                    if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                        return crate::motor_mode::ModeTxResult::SentFlushFailed {
+                            boundary_seq: tx_seq,
+                            tx_at: tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                    if self.flush_can_and_commit().is_err() {
+                        return crate::motor_mode::ModeTxResult::SentFlushFailed {
+                            boundary_seq: tx_seq,
+                            tx_at: tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                }
+                crate::motor_mode::ModeTxResult::Sent {
+                    boundary_seq: tx_seq,
+                    tx_at: tx_started,
+                    tx_offset_ns,
+                }
+            }
+            Err(Ok(code)) => crate::motor_mode::ModeTxResult::Revoked(code),
+            Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                crate::motor_mode::ModeTxResult::Backpressure
+            }
+            Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                crate::motor_mode::ModeTxResult::Backpressure
+            }
+            Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                crate::motor_mode::ModeTxResult::Revoked("STOPPED")
+            }
+            Err(Err(_)) => crate::motor_mode::ModeTxResult::Refused("CTRL_MODE write transmit failed"),
+        }
+    }
+
+    fn mode_switch_try_send_range_read(
+        &mut self,
+        joint: usize,
+        rid_idx: u8,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        let rid = match rid_idx {
+            0 => damiao::RID_PMAX,
+            1 => damiao::RID_VMAX,
+            2 => damiao::RID_TMAX,
+            _ => return crate::motor_mode::ModeTxResult::Refused("invalid range register index"),
+        };
+        match self.commissioning_try_send_register_read(joint, rid, deadline, pre_tx_gate) {
+            crate::mit::CommissioningTxStatus::Sent {
+                tx_seq,
+                tx_started,
+                tx_offset_ns,
+            } => crate::motor_mode::ModeTxResult::Sent {
+                boundary_seq: tx_seq,
+                tx_at: tx_started,
+                tx_offset_ns,
+            },
+            crate::mit::CommissioningTxStatus::SentFlushFailed {
+                tx_seq,
+                tx_started,
+                tx_offset_ns,
+            } => crate::motor_mode::ModeTxResult::SentFlushFailed {
+                boundary_seq: tx_seq,
+                tx_at: tx_started,
+                tx_offset_ns,
+            },
+            crate::mit::CommissioningTxStatus::Backpressure => {
+                crate::motor_mode::ModeTxResult::Backpressure
+            }
+            crate::mit::CommissioningTxStatus::Revoked(c) => {
+                crate::motor_mode::ModeTxResult::Revoked(c)
+            }
+            crate::mit::CommissioningTxStatus::Refused(c) => {
+                crate::motor_mode::ModeTxResult::Refused(c)
+            }
+        }
+    }
+
+    fn mode_switch_try_send_status_refresh(
+        &mut self,
+        joint: usize,
+        deadline: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> crate::motor_mode::ModeTxResult {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::motor_mode::ModeTxResult::Refused("joint out of range");
+        };
+        let start_stamp = self.current_stop_stamp();
+        match self.send_with_commissioning_gate(
+            TxKind::Refresh,
+            Some(start_stamp),
+            Some(Deadline { at: deadline }),
+            pre_tx_gate,
+            |_| Some(damiao::build_refresh_frame(id)),
+        ) {
+            Ok((_, tx_seq, tx_started, tx_offset_ns)) => {
+                if !self.can.flush_is_noop() {
+                    if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                        return crate::motor_mode::ModeTxResult::SentFlushFailed {
+                            boundary_seq: tx_seq,
+                            tx_at: tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                    if self.flush_can_and_commit().is_err() {
+                        return crate::motor_mode::ModeTxResult::SentFlushFailed {
+                            boundary_seq: tx_seq,
+                            tx_at: tx_started,
+                            tx_offset_ns,
+                        };
+                    }
+                }
+                crate::motor_mode::ModeTxResult::Sent {
+                    boundary_seq: tx_seq,
+                    tx_at: tx_started,
+                    tx_offset_ns,
+                }
+            }
+            Err(Ok(code)) => crate::motor_mode::ModeTxResult::Revoked(code),
+            Err(Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)) => {
+                crate::motor_mode::ModeTxResult::Backpressure
+            }
+            Err(Err(TxRefusal::Transport(e))) if e.is_tx_backpressure() => {
+                crate::motor_mode::ModeTxResult::Backpressure
+            }
+            Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                crate::motor_mode::ModeTxResult::Revoked("STOPPED")
+            }
+            Err(Err(_)) => crate::motor_mode::ModeTxResult::Refused("status refresh transmit failed"),
+        }
+    }
+
+    fn mode_switch_find_ctrl_mode_reply(
+        &self,
+        joint: usize,
+        write: bool,
+        after_seq: u64,
+        min_rx_at: Instant,
+        max_rx_at: Instant,
+        tx_offset_ns: Option<i128>,
+        require_expected_id: bool,
+    ) -> crate::motor_mode::ModeRegMatch {
+        // Major 1 confirmation closure: only conclude a reply match once RX has been observed
+        // empty in the current pass so any duplicate reply in the same burst is also captured.
+        if !self.last_read_drained {
+            return crate::motor_mode::ModeRegMatch::Pending;
+        }
+        match self.commissioning_find_register_reply(
+            joint,
+            write,
+            damiao::RID_CTRL_MODE,
+            after_seq,
+            min_rx_at,
+            Some(max_rx_at),
+            tx_offset_ns,
+        ) {
+            crate::mit::CommissioningRegMatch::Pending => crate::motor_mode::ModeRegMatch::Pending,
+            crate::mit::CommissioningRegMatch::Ambiguous => {
+                crate::motor_mode::ModeRegMatch::Ambiguous
+            }
+            crate::mit::CommissioningRegMatch::Matched(rep) => {
+                if require_expected_id && rep.reply_id != self.expected_reply_id(joint) {
+                    return crate::motor_mode::ModeRegMatch::Ambiguous;
+                }
+                let raw = u32::from_le_bytes(rep.value);
+                let mode = Self::mode_from_u32(raw).map(damiao_mode_to_shadow_control_mode);
+                crate::motor_mode::ModeRegMatch::Matched {
+                    mode,
+                    raw_value: raw,
+                    rx_seq: rep.rx_seq,
+                    rx_at: rep.rx_at,
+                }
+            }
+        }
+    }
+
+    fn mode_switch_find_range_reply(
+        &self,
+        joint: usize,
+        rid_idx: u8,
+        after_seq: u64,
+        min_rx_at: Instant,
+        max_rx_at: Instant,
+        tx_offset_ns: Option<i128>,
+    ) -> crate::motor_mode::ModeRangeMatch {
+        if !self.last_read_drained {
+            return crate::motor_mode::ModeRangeMatch::Pending;
+        }
+        let rid = match rid_idx {
+            0 => damiao::RID_PMAX,
+            1 => damiao::RID_VMAX,
+            2 => damiao::RID_TMAX,
+            _ => return crate::motor_mode::ModeRangeMatch::Ambiguous,
+        };
+        match self.commissioning_find_register_reply(
+            joint,
+            false,
+            rid,
+            after_seq,
+            min_rx_at,
+            Some(max_rx_at),
+            tx_offset_ns,
+        ) {
+            crate::mit::CommissioningRegMatch::Pending => {
+                crate::motor_mode::ModeRangeMatch::Pending
+            }
+            crate::mit::CommissioningRegMatch::Ambiguous => {
+                crate::motor_mode::ModeRangeMatch::Ambiguous
+            }
+            crate::mit::CommissioningRegMatch::Matched(rep) => {
+                crate::motor_mode::ModeRangeMatch::Matched(f32::from_le_bytes(rep.value))
+            }
+        }
+    }
+
+    fn mode_switch_post_confirm_feedback(
+        &self,
+        joint: usize,
+        mode: crate::motor_mode::ControlMode,
+        after_seq: u64,
+        after_at: Instant,
+        now: Instant,
+        require_disarmed_stationary: bool,
+    ) -> crate::motor_mode::ModeFeedbackMatch {
+        if !self.last_read_drained || joint >= self.motor_ids.len() {
+            return crate::motor_mode::ModeFeedbackMatch::Pending;
+        }
+        let seq = self.last_feedback_seq.get(joint).copied().unwrap_or(0);
+        if seq <= after_seq {
+            return crate::motor_mode::ModeFeedbackMatch::Pending;
+        }
+        let Some(rx_at) = self.last_feedback_instant.get(joint).copied().flatten() else {
+            return crate::motor_mode::ModeFeedbackMatch::Pending;
+        };
+        if rx_at < after_at {
+            return crate::motor_mode::ModeFeedbackMatch::Pending;
+        }
+        let max_age = if mode == crate::motor_mode::ControlMode::PositionForce {
+            POS_FORCE_FEEDBACK_MAX_AGE
+        } else {
+            DAMIAO_FEEDBACK_VALID_WINDOW
+        };
+        let Some(pos) = self.fresh_measured_position_at(joint, max_age, now) else {
+            return crate::motor_mode::ModeFeedbackMatch::Pending;
+        };
+        if !pos.is_finite() {
+            return crate::motor_mode::ModeFeedbackMatch::Unsafe;
+        }
+        let status = self.motor_status.get(joint).copied().unwrap_or(0xFF);
+        if damiao_fault_name(status).is_some() {
+            return crate::motor_mode::ModeFeedbackMatch::Unsafe;
+        }
+        if require_disarmed_stationary {
+            let vel = self
+                .cached_states
+                .get(joint)
+                .map_or(f32::NAN, |s| s.velocity);
+            let still = vel.is_finite() && vel.abs() <= 0.05;
+            if !still || status != 0 {
+                return crate::motor_mode::ModeFeedbackMatch::Unsafe;
+            }
+        }
+        crate::motor_mode::ModeFeedbackMatch::FreshConfirmed
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -21839,9 +22667,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             // ordinary `read_joint_states` (`record_register_replies == false`).
             if !reply.write && reply.rid == damiao::RID_CTRL_MODE {
                 if let Some(idx) = motor_idx {
+                    let owned_by_mode_switch =
+                        idx < 32 && (self.mode_switch_active_mask & (1u32 << idx)) != 0;
                     let expected_id = self.expected_reply_id(idx);
-                    let id_ok = self.base_mode(idx) != DamiaoControlMode::PosForce
-                        || frame.id == expected_id;
+                    let id_ok = !owned_by_mode_switch
+                        && (self.base_mode(idx) != DamiaoControlMode::PosForce
+                            || frame.id == expected_id);
                     if id_ok
                         && self
                             .mode_readback_boundary

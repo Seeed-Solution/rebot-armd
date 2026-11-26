@@ -961,3 +961,1929 @@ pub const VENDOR_CAPABILITIES: [VendorCapability; 4] = [
     ROBSTRIDE_CAPABILITY,
     FASHIONSTAR_CAPABILITY,
 ];
+
+// =========================================================================
+// PR0C: Tick-driven ModeSwitch service (executor services layer, spec item 6)
+// =========================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod switch {
+    use std::time::{Duration, Instant};
+
+    use super::{ControlMode, VendorBinding};
+
+    /// Maximum axes tracked inline by one [`ModeSwitch`] transaction (matches `MAX_MODE_JOINTS`).
+    pub const MAX_MODE_SWITCH_AXES: usize = 16;
+
+    /// Default maximum control-frame watchdog gap tolerated on energized watchdog-bearing axes.
+    pub const DEFAULT_MAX_WATCHDOG_GAP: Duration = Duration::from_millis(40);
+
+    /// Default proactive watchdog hold interval matching Damiao `WATCHDOG_HOLD_PROACTIVE_INTERVAL`.
+    pub const DEFAULT_WATCHDOG_PROACTIVE_INTERVAL: Duration = Duration::from_millis(15);
+
+    /// Conservative worst-case allowance for RX drain + hold TX flush + scheduling jitter on the
+    /// next release when checking whether waiting another tick would breach `max_watchdog_gap`.
+    pub const DEFAULT_HOLD_DELIVERY_MARGIN: Duration = Duration::from_millis(5);
+
+    /// Default per-axis confirmation timeout for disarmed or non-watchdog axes (e.g. J7 PosForce).
+    pub const DEFAULT_PER_AXIS_TIMEOUT: Duration = Duration::from_millis(50);
+
+    /// Per-release execution budget passed into [`ModeSwitch::step`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReleaseBudget {
+        pub now: Instant,
+        pub cutoff: Instant,
+        pub period: Duration,
+        pub max_tx_frames: u8,
+        pub max_rx_frames: u16,
+        pub watchdog_proactive_interval: Duration,
+        pub max_watchdog_gap: Duration,
+        pub hold_delivery_margin: Duration,
+    }
+
+    impl ReleaseBudget {
+        pub fn new(now: Instant, cutoff: Instant, period: Duration, max_tx_frames: u8) -> Self {
+            Self {
+                now,
+                cutoff,
+                period,
+                max_tx_frames,
+                max_rx_frames: 64,
+                watchdog_proactive_interval: DEFAULT_WATCHDOG_PROACTIVE_INTERVAL,
+                max_watchdog_gap: DEFAULT_MAX_WATCHDOG_GAP,
+                hold_delivery_margin: DEFAULT_HOLD_DELIVERY_MARGIN,
+            }
+        }
+    }
+
+    /// Operation intent of a [`ModeSwitchPlan`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeSwitchIntent {
+        /// Read-only causal confirmation (`REG_READ(RID_CTRL_MODE)`) that every target axis is in
+        /// its requested mode (never emits `REG_WRITE`).
+        ConfirmOnly,
+        /// Switch each target axis whose verified mode differs from `target_mode` via mandatory
+        /// wire-range verification (for `Impedance`), causal `REG_WRITE`, ACK, optional separate
+        /// readback, and optional post-confirm causal feedback.
+        Switch,
+    }
+
+    /// Recovery policy when a forward switch fails cleanly before any axis becomes ambiguous.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeSwitchRecovery {
+        /// While session authority remains live (not stopped/E-stopped), roll back any
+        /// already-switched axes to their pre-switch confirmed modes via the same tick-driven
+        /// watchdog-first causal confirmation path.
+        RollbackToPrevious,
+        /// Do not issue rollback writes; terminate immediately.
+        FailClosed,
+    }
+
+    /// Typed static failure/abort reason for [`ModeSwitch`] (zero heap allocation on RT).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeSwitchFailure {
+        InvalidPlan,
+        UnsupportedMode,
+        RangeMismatch,
+        RangeCheckTimeout,
+        ReadbackMismatch,
+        ReadbackTimeout,
+        WriteAckMismatch,
+        WriteAckTimeout,
+        FeedbackTimeout,
+        FeedbackUnsafe,
+        AmbiguousReply,
+        TxFailed,
+        WatchdogBudgetBreached,
+        Stopped,
+        Revoked,
+        DeadlineExpired,
+        NoConfirmedMode,
+    }
+
+    impl ModeSwitchFailure {
+        pub const fn code(self) -> &'static str {
+            match self {
+                Self::InvalidPlan => "INVALID_COMMAND",
+                Self::UnsupportedMode => "UNSUPPORTED_MODE",
+                Self::RangeMismatch => "RANGE_MISMATCH",
+                Self::RangeCheckTimeout => "RANGE_CHECK_TIMEOUT",
+                Self::ReadbackMismatch => "MODE_READBACK_MISMATCH",
+                Self::ReadbackTimeout => "MODE_READBACK_TIMEOUT",
+                Self::WriteAckMismatch => "MODE_WRITE_MISMATCH",
+                Self::WriteAckTimeout => "MODE_WRITE_TIMEOUT",
+                Self::FeedbackTimeout => "MODE_FEEDBACK_TIMEOUT",
+                Self::FeedbackUnsafe => "MODE_FEEDBACK_UNSAFE",
+                Self::AmbiguousReply => "MODE_REPLY_AMBIGUOUS",
+                Self::TxFailed => "MODE_TX_FAILED",
+                Self::WatchdogBudgetBreached => "WATCHDOG_CONTINUITY_ABORT",
+                Self::Stopped => "STOPPED",
+                Self::Revoked => "REVOKED",
+                Self::DeadlineExpired => "TIMEOUT",
+                Self::NoConfirmedMode => "MODE_UNVERIFIED",
+            }
+        }
+
+        pub fn from_revoke_code(code: &'static str) -> Self {
+            match code {
+                "STOPPED" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH" => Self::Stopped,
+                "TIMEOUT" | "DEADLINE_EXPIRED" => Self::DeadlineExpired,
+                _ => Self::Revoked,
+            }
+        }
+    }
+
+    /// Target mode and confirmation requirements for one joint axis.
+    ///
+    /// Wire-range verification (`PMAX`/`VMAX`/`TMAX`) is unconditionally mandatory before ANY
+    /// transition into [`ControlMode::Impedance`] (both forward and rollback) and cannot be
+    /// opted out of here.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AxisTarget {
+        pub joint: u8,
+        pub target_mode: ControlMode,
+        /// Require a separate `REG_READ(RID_CTRL_MODE)` after `REG_WRITE` ACK before considering
+        /// the new mode confirmed. On energized watchdog-bearing axes this is admitted ONLY when
+        /// `2 * period + hold_delivery_margin <= max_watchdog_gap`.
+        pub require_post_write_readback: bool,
+        /// Require fresh causal feedback (`feedback_seq > confirm_seq`, `rx_at >= confirm_at`)
+        /// after mode confirmation.
+        pub require_post_confirm_feedback: bool,
+        /// Require the register reply's CAN ID to match the motor's expected master reply CAN ID
+        /// (always enforced for `PositionForce` J7).
+        pub require_expected_reply_id: bool,
+        /// When confirming/switching disarmed `PositionForce`, require stationary (`|v| <= 0.05`)
+        /// and disabled (`state == 0`) fresh (`<= 100 ms`) feedback.
+        pub require_disarmed_stationary: bool,
+    }
+
+    impl AxisTarget {
+        pub const fn new(joint: u8, target_mode: ControlMode) -> Self {
+            let is_pf = matches!(target_mode, ControlMode::PositionForce);
+            Self {
+                joint,
+                target_mode,
+                require_post_write_readback: false,
+                require_post_confirm_feedback: true,
+                require_expected_reply_id: is_pf,
+                require_disarmed_stationary: is_pf,
+            }
+        }
+    }
+
+    /// Fixed-capacity `Copy` plan submitted to [`ModeSwitch`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ModeSwitchPlan {
+        pub axes: [AxisTarget; MAX_MODE_SWITCH_AXES],
+        pub len: u8,
+        pub intent: ModeSwitchIntent,
+        pub recovery: ModeSwitchRecovery,
+        pub per_axis_timeout: Duration,
+        pub max_watchdog_gap: Duration,
+    }
+
+    impl ModeSwitchPlan {
+        pub fn empty(intent: ModeSwitchIntent) -> Self {
+            Self {
+                axes: [AxisTarget::new(0, ControlMode::PositionVelocity); MAX_MODE_SWITCH_AXES],
+                len: 0,
+                intent,
+                recovery: ModeSwitchRecovery::RollbackToPrevious,
+                per_axis_timeout: DEFAULT_PER_AXIS_TIMEOUT,
+                max_watchdog_gap: DEFAULT_MAX_WATCHDOG_GAP,
+            }
+        }
+
+        /// Reference adapter plan: read-only causal J7 gripper mode confirmation (`PositionVelocity`
+        /// or `PositionForce`).
+        pub fn confirm_gripper(joint: usize, mode: ControlMode) -> Self {
+            let mut plan = Self::empty(ModeSwitchIntent::ConfirmOnly);
+            plan.recovery = ModeSwitchRecovery::FailClosed;
+            if joint < MAX_MODE_SWITCH_AXES {
+                let mut t = AxisTarget::new(joint as u8, mode);
+                t.require_post_confirm_feedback = matches!(mode, ControlMode::PositionForce);
+                t.require_expected_reply_id = matches!(mode, ControlMode::PositionForce);
+                t.require_disarmed_stationary = matches!(mode, ControlMode::PositionForce);
+                plan.axes[0] = t;
+                plan.len = 1;
+            }
+            plan
+        }
+
+        /// Builds a switch plan over `targets` (up to [`MAX_MODE_SWITCH_AXES`]).
+        pub fn switch_axes(
+            targets: &[(usize, ControlMode)],
+            recovery: ModeSwitchRecovery,
+        ) -> Self {
+            let mut plan = Self::empty(ModeSwitchIntent::Switch);
+            plan.recovery = recovery;
+            for &(joint, mode) in targets.iter().take(MAX_MODE_SWITCH_AXES) {
+                if joint < MAX_MODE_SWITCH_AXES {
+                    plan.axes[usize::from(plan.len)] = AxisTarget::new(joint as u8, mode);
+                    plan.len += 1;
+                }
+            }
+            plan
+        }
+
+        pub fn axis_slice(&self) -> &[AxisTarget] {
+            &self.axes[..usize::from(self.len).min(MAX_MODE_SWITCH_AXES)]
+        }
+    }
+
+    /// Result of one tick-driven [`ModeSwitch::step`] call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeProgress {
+        /// Still advancing across releases; caller keeps stepping on subsequent ticks.
+        Pending { wake: Option<Instant> },
+        /// Every requested axis is causally confirmed in its target mode.
+        Confirmed,
+        /// Forward switch failed cleanly before ambiguity and every previously switched axis was
+        /// causally restored to its pre-switch confirmed mode (`uncertain_hw_state == false`).
+        RolledBack {
+            failed_joint: u8,
+            reason: ModeSwitchFailure,
+        },
+        /// Stopped/cancelled/revoked while every axis still holds a causally confirmed mode
+        /// (`mode_write_uncertain_mask == 0`, `uncertain_hw_state == false`); stopped holds keep
+        /// holding each axis in its last confirmed mode without issuing further `REG_WRITE`s.
+        StoppedRecovered { reason: ModeSwitchFailure },
+        /// Clean failure with no hardware ambiguity and no rollback needed
+        /// (`uncertain_hw_state == false`).
+        FailedClean {
+            failed_joint: u8,
+            reason: ModeSwitchFailure,
+        },
+        /// Hardware mode is ambiguous (unconfirmed write, failed flush after write, duplicate or
+        /// drifted reply, contradicted energized `ConfirmOnly` cache, failed rollback, or
+        /// energized watchdog continuity breach). Callers MUST escalate energized arms to
+        /// SAFE-HOLD (`SafeHoldReason::SessionUncertainState`, 0 `CMD_DISABLE` frames).
+        Ambiguous {
+            failed_joint: u8,
+            reason: ModeSwitchFailure,
+        },
+    }
+
+    impl ModeProgress {
+        #[inline]
+        pub const fn is_terminal(self) -> bool {
+            !matches!(self, Self::Pending { .. })
+        }
+
+        #[inline]
+        pub const fn is_ambiguous(self) -> bool {
+            matches!(self, Self::Ambiguous { .. })
+        }
+
+        #[inline]
+        pub const fn is_confirmed(self) -> bool {
+            matches!(self, Self::Confirmed)
+        }
+
+        pub const fn failure_reason(self) -> Option<ModeSwitchFailure> {
+            match self {
+                Self::Pending { .. } | Self::Confirmed => None,
+                Self::RolledBack { reason, .. }
+                | Self::StoppedRecovered { reason }
+                | Self::FailedClean { reason, .. }
+                | Self::Ambiguous { reason, .. } => Some(reason),
+            }
+        }
+    }
+
+    /// Outcome of servicing energized watchdog holds before mode-switch register TX.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct WatchdogHoldResult {
+        /// Number of CAN frames transmitted (including J7 `PosForce` hold/freeze if sent).
+        pub frames_sent: u8,
+        /// Bitmask of axes whose control frame was delivered & committed in this pass.
+        pub refreshed_mask: u32,
+        /// True iff every due energized confirmed axis (outside `exclude_mask`) was refreshed.
+        pub all_due_serviced: bool,
+        /// Largest remaining elapsed control-frame age across all energized watchdog-bearing
+        /// confirmed axes after this pass.
+        pub max_energized_age: Duration,
+        /// Joint index achieving `max_energized_age`, if any energized watchdog-bearing axis exists.
+        pub oldest_joint: Option<u8>,
+    }
+
+    /// Outcome of one non-blocking register or refresh TX attempt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeTxResult {
+        /// Frame transmitted and flushed; causal reply window opens strictly after `(boundary_seq, tx_at)`.
+        Sent {
+            boundary_seq: u64,
+            tx_at: Instant,
+            tx_offset_ns: Option<i128>,
+        },
+        /// Frame was handed to transport `transmit()`, then flush failed or cutoff elapsed.
+        /// For `REG_WRITE(RID_CTRL_MODE)`, hardware state is immediately ambiguous.
+        SentFlushFailed {
+            boundary_seq: u64,
+            tx_at: Instant,
+            tx_offset_ns: Option<i128>,
+        },
+        /// Deferred due to TX budget, cutoff, or transport backpressure (frame never left).
+        Backpressure,
+        /// Pre-TX authority / stop gate revoked before transmitting (frame never left).
+        Revoked(&'static str),
+        /// Hard refusal before transmitting (frame never left).
+        Refused(&'static str),
+    }
+
+    /// Causal match result for a `RID_CTRL_MODE` register reply.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeRegMatch {
+        /// No complete causal reply observed yet (or RX queue not yet drained empty).
+        Pending,
+        /// Single causal post-boundary reply observed through an empty RX queue.
+        Matched {
+            mode: Option<ControlMode>,
+            raw_value: u32,
+            rx_seq: u64,
+            rx_at: Instant,
+        },
+        /// Multiple replies, buffer overflow, pre-TX timestamp, or clock-offset drift detected.
+        Ambiguous,
+    }
+
+    /// Causal match result for a `PMAX`/`VMAX`/`TMAX` range register read reply.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum ModeRangeMatch {
+        Pending,
+        Matched(f32),
+        Ambiguous,
+    }
+
+    /// Causal post-confirmation feedback evaluation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeFeedbackMatch {
+        Pending,
+        FreshConfirmed,
+        Unsafe,
+    }
+
+    /// Compact `Copy` diagnostic/observability event pushed over `rt_core/stream` off-RT.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ModeSwitchEvent {
+        pub session_id: u64,
+        pub kind: ModeSwitchEventKind,
+        pub joint: u8,
+        pub mode: Option<ControlMode>,
+        pub reason: Option<ModeSwitchFailure>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModeSwitchEventKind {
+        Started,
+        AxisConfirmed,
+        RollbackStarted,
+        TerminalConfirmed,
+        TerminalRolledBack,
+        TerminalStoppedRecovered,
+        TerminalFailedClean,
+        TerminalAmbiguous,
+    }
+
+    /// Authoritative `Copy` snapshot returned by `PollModeSwitch` (unaffected by stream drops).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ModeSwitchSnapshot {
+        pub session_id: u64,
+        pub intent: ModeSwitchIntent,
+        pub running: bool,
+        pub recovering: bool,
+        pub progress: ModeProgress,
+        pub axis_count: u8,
+        pub confirmed_mask: u32,
+        pub uncertain_mask: u32,
+        pub steps: u32,
+    }
+
+    /// Narrow zero-allocation driver abstraction consumed by [`ModeSwitch::step_driver`].
+    pub trait ModeSwitchDriver {
+        fn clock_now(&self) -> Instant;
+        fn dof(&self) -> usize;
+        fn vendor(&self) -> Option<VendorBinding>;
+        fn supports_nonblocking_mode_switch(&self) -> bool;
+        fn axis_is_energized(&self, joint: usize) -> bool;
+        fn any_axis_energized(&self) -> bool;
+        /// True when `joint` carries a hardware control-frame watchdog (e.g. Damiao J1–J6;
+        /// false for J7 `PosForce` which keeps `TIMEOUT = 0`).
+        fn axis_has_watchdog(&self, joint: usize) -> bool;
+        fn axis_confirmed_mode(&self, joint: usize) -> Option<ControlMode>;
+        fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<ControlMode>);
+        fn mode_write_uncertain_mask(&self) -> u32;
+        fn set_mode_switch_active_mask(&mut self, mask: u32);
+        fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant>;
+        fn axis_impedance_ranges_verified(&self, joint: usize) -> bool;
+        fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]>;
+        fn set_axis_impedance_ranges_verified(&mut self, joint: usize, verified: bool);
+        fn rx_drained(&self) -> bool;
+        fn drain_rx_step(&mut self, max_frames: u16, deadline: Instant) -> Result<(u16, bool), ModeSwitchFailure>;
+        fn clear_register_reply_log(&mut self);
+        fn service_watchdog_holds(
+            &mut self,
+            min_age: Duration,
+            exclude_mask: u32,
+            force_mask: u32,
+            deadline: Instant,
+            max_frames: u8,
+        ) -> Result<WatchdogHoldResult, ModeSwitchFailure>;
+        fn try_send_ctrl_mode_read(&mut self, joint: usize, deadline: Instant) -> ModeTxResult;
+        fn try_send_ctrl_mode_write(
+            &mut self,
+            joint: usize,
+            mode: ControlMode,
+            deadline: Instant,
+        ) -> ModeTxResult;
+        fn try_send_range_read(
+            &mut self,
+            joint: usize,
+            rid_idx: u8,
+            deadline: Instant,
+        ) -> ModeTxResult;
+        fn try_send_status_refresh(&mut self, joint: usize, deadline: Instant) -> ModeTxResult;
+        #[allow(clippy::too_many_arguments)]
+        fn find_ctrl_mode_reply(
+            &self,
+            joint: usize,
+            write: bool,
+            after_seq: u64,
+            min_rx_at: Instant,
+            max_rx_at: Instant,
+            tx_offset_ns: Option<i128>,
+            require_expected_id: bool,
+        ) -> ModeRegMatch;
+        fn find_range_reply(
+            &self,
+            joint: usize,
+            rid_idx: u8,
+            after_seq: u64,
+            min_rx_at: Instant,
+            max_rx_at: Instant,
+            tx_offset_ns: Option<i128>,
+        ) -> ModeRangeMatch;
+        fn post_confirm_feedback(
+            &self,
+            joint: usize,
+            mode: ControlMode,
+            after_seq: u64,
+            after_at: Instant,
+            now: Instant,
+            require_disarmed_stationary: bool,
+        ) -> ModeFeedbackMatch;
+    }
+
+    /// Lightweight zero-alloc adapter binding `&mut dyn ArmDriver` and a live pre-TX gate to
+    /// [`ModeSwitchDriver`].
+    pub struct ArmDriverModeAdapter<'a> {
+        drv: &'a mut dyn crate::driver::ArmDriver,
+        pre_tx_gate: &'a mut dyn FnMut() -> Result<(), &'static str>,
+    }
+
+    impl<'a> ArmDriverModeAdapter<'a> {
+        pub fn new(
+            drv: &'a mut dyn crate::driver::ArmDriver,
+            pre_tx_gate: &'a mut dyn FnMut() -> Result<(), &'static str>,
+        ) -> Self {
+            Self { drv, pre_tx_gate }
+        }
+    }
+
+    impl ModeSwitchDriver for ArmDriverModeAdapter<'_> {
+        fn clock_now(&self) -> Instant { self.drv.clock_now() }
+        fn dof(&self) -> usize { self.drv.mode_switch_dof() }
+        fn vendor(&self) -> Option<VendorBinding> { self.drv.driver_vendor_binding() }
+        fn supports_nonblocking_mode_switch(&self) -> bool { self.drv.supports_nonblocking_mode_switch() }
+        fn axis_is_energized(&self, joint: usize) -> bool { self.drv.axis_is_energized(joint) }
+        fn any_axis_energized(&self) -> bool { self.drv.any_axis_energized() }
+        fn axis_has_watchdog(&self, joint: usize) -> bool { self.drv.axis_has_watchdog(joint) }
+        fn axis_confirmed_mode(&self, joint: usize) -> Option<ControlMode> { self.drv.axis_confirmed_mode(joint) }
+        fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<ControlMode>) {
+            self.drv.set_axis_confirmed_mode(joint, mode);
+        }
+        fn mode_write_uncertain_mask(&self) -> u32 { self.drv.mode_write_uncertain_mask() }
+        fn set_mode_switch_active_mask(&mut self, mask: u32) { self.drv.set_mode_switch_active_mask(mask); }
+        fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> { self.drv.axis_last_ctrl_tx(joint) }
+        fn axis_impedance_ranges_verified(&self, joint: usize) -> bool { self.drv.axis_impedance_ranges_verified(joint) }
+        fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]> { self.drv.axis_configured_impedance_ranges(joint) }
+        fn set_axis_impedance_ranges_verified(&mut self, joint: usize, verified: bool) {
+            self.drv.set_axis_impedance_ranges_verified(joint, verified);
+        }
+        fn rx_drained(&self) -> bool { self.drv.mode_switch_rx_drained() }
+        fn drain_rx_step(&mut self, max_frames: u16, deadline: Instant) -> Result<(u16, bool), ModeSwitchFailure> {
+            self.drv
+                .commissioning_drain_rx_step(max_frames, deadline)
+                .map_err(|_| ModeSwitchFailure::TxFailed)
+        }
+        fn clear_register_reply_log(&mut self) { self.drv.commissioning_clear_register_log(); }
+        fn service_watchdog_holds(
+            &mut self,
+            min_age: Duration,
+            exclude_mask: u32,
+            force_mask: u32,
+            deadline: Instant,
+            max_frames: u8,
+        ) -> Result<WatchdogHoldResult, ModeSwitchFailure> {
+            self.drv.mode_switch_service_watchdog_holds(
+                min_age,
+                exclude_mask,
+                force_mask,
+                deadline,
+                max_frames,
+            )
+        }
+        fn try_send_ctrl_mode_read(&mut self, joint: usize, deadline: Instant) -> ModeTxResult {
+            self.drv.mode_switch_try_send_ctrl_mode_read(joint, deadline, self.pre_tx_gate)
+        }
+        fn try_send_ctrl_mode_write(
+            &mut self,
+            joint: usize,
+            mode: ControlMode,
+            deadline: Instant,
+        ) -> ModeTxResult {
+            self.drv.mode_switch_try_send_ctrl_mode_write(joint, mode, deadline, self.pre_tx_gate)
+        }
+        fn try_send_range_read(&mut self, joint: usize, rid_idx: u8, deadline: Instant) -> ModeTxResult {
+            self.drv.mode_switch_try_send_range_read(joint, rid_idx, deadline, self.pre_tx_gate)
+        }
+        fn try_send_status_refresh(&mut self, joint: usize, deadline: Instant) -> ModeTxResult {
+            self.drv.mode_switch_try_send_status_refresh(joint, deadline, self.pre_tx_gate)
+        }
+        fn find_ctrl_mode_reply(
+            &self,
+            joint: usize,
+            write: bool,
+            after_seq: u64,
+            min_rx_at: Instant,
+            max_rx_at: Instant,
+            tx_offset_ns: Option<i128>,
+            require_expected_id: bool,
+        ) -> ModeRegMatch {
+            self.drv.mode_switch_find_ctrl_mode_reply(
+                joint,
+                write,
+                after_seq,
+                min_rx_at,
+                max_rx_at,
+                tx_offset_ns,
+                require_expected_id,
+            )
+        }
+        fn find_range_reply(
+            &self,
+            joint: usize,
+            rid_idx: u8,
+            after_seq: u64,
+            min_rx_at: Instant,
+            max_rx_at: Instant,
+            tx_offset_ns: Option<i128>,
+        ) -> ModeRangeMatch {
+            self.drv.mode_switch_find_range_reply(
+                joint,
+                rid_idx,
+                after_seq,
+                min_rx_at,
+                max_rx_at,
+                tx_offset_ns,
+            )
+        }
+        fn post_confirm_feedback(
+            &self,
+            joint: usize,
+            mode: ControlMode,
+            after_seq: u64,
+            after_at: Instant,
+            now: Instant,
+            require_disarmed_stationary: bool,
+        ) -> ModeFeedbackMatch {
+            self.drv.mode_switch_post_confirm_feedback(
+                joint,
+                mode,
+                after_seq,
+                after_at,
+                now,
+                require_disarmed_stationary,
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum AxisPhase {
+        Pending,
+        RangeReadNeed {
+            rid_idx: u8,
+            got: [Option<f32>; 3],
+        },
+        RangeReadAwait {
+            rid_idx: u8,
+            boundary_seq: u64,
+            tx_at: Instant,
+            tx_offset_ns: Option<i128>,
+            deadline: Instant,
+            got: [Option<f32>; 3],
+        },
+        NeedWrite,
+        AwaitingWriteAck {
+            boundary_seq: u64,
+            tx_at: Instant,
+            tx_offset_ns: Option<i128>,
+            deadline: Instant,
+            last_ctrl_at: Option<Instant>,
+            written_mode: ControlMode,
+        },
+        NeedReadback {
+            expected_mode: ControlMode,
+            from_write: bool,
+            last_ctrl_at: Option<Instant>,
+        },
+        AwaitingReadback {
+            boundary_seq: u64,
+            tx_at: Instant,
+            tx_offset_ns: Option<i128>,
+            deadline: Instant,
+            expected_mode: ControlMode,
+            from_write: bool,
+            last_ctrl_at: Option<Instant>,
+        },
+        AwaitingFeedback {
+            after_seq: u64,
+            after_at: Instant,
+            deadline: Instant,
+            confirmed_mode: ControlMode,
+            refresh_sent: bool,
+        },
+        Confirmed {
+            mode: ControlMode,
+        },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RunnerPhase {
+        Init,
+        Forward,
+        Recovering {
+            failed_joint: u8,
+            reason: ModeSwitchFailure,
+        },
+        Done(ModeProgress),
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct AxisSlot {
+        target: AxisTarget,
+        active_goal: ControlMode,
+        previous_mode: Option<ControlMode>,
+        switched_forward: bool,
+        phase: AxisPhase,
+    }
+
+    impl AxisSlot {
+        const fn empty() -> Self {
+            Self {
+                target: AxisTarget::new(0, ControlMode::PositionVelocity),
+                active_goal: ControlMode::PositionVelocity,
+                previous_mode: None,
+                switched_forward: false,
+                phase: AxisPhase::Pending,
+            }
+        }
+    }
+
+    /// Tick-driven, zero-allocation motor control-mode switch & confirmation state machine.
+    ///
+    /// Guarantees:
+    /// - Holds all energized confirmed axes in their **last confirmed mode** first on every tick.
+    /// - Enforces watchdog budget first (`<= max_watchdog_gap`, default 40 ms) via predictive
+    ///   write admission and confirmation deadline clamping against the confirmed control-TX
+    ///   delivery timestamp.
+    /// - Unconditionally verifies `PMAX`/`VMAX`/`TMAX` wire ranges before any `Impedance` write
+    ///   (forward or rollback).
+    /// - Requires causal empty-queue RX boundaries, post-boundary timestamps, no duplicates or
+    ///   clock-offset drift, and expected master CAN IDs for `PositionForce`.
+    /// - Returns clean recovery (`RolledBack` / `StoppedRecovered` / `FailedClean`) when zero axes
+    ///   are mode-ambiguous, and `Ambiguous` (`uncertain_hw_state == true`) whenever a write may
+    ///   have reached the wire without causal confirmation or an energized cache is contradicted.
+    pub struct ModeSwitch {
+        plan: ModeSwitchPlan,
+        phase: RunnerPhase,
+        slots: [AxisSlot; MAX_MODE_SWITCH_AXES],
+        active_idx: usize,
+        active_mask: u32,
+        confirmed_mask: u32,
+        ambiguous_mask: u32,
+        steps: u32,
+        /// Inline staging ring of recent events for the caller to drain into `rt_core/stream`.
+        pending_events: [Option<ModeSwitchEvent>; 8],
+        pending_event_len: usize,
+    }
+
+    impl ModeSwitch {
+        pub fn new(plan: ModeSwitchPlan) -> Self {
+            let mut slots = [AxisSlot::empty(); MAX_MODE_SWITCH_AXES];
+            let len = usize::from(plan.len).min(MAX_MODE_SWITCH_AXES);
+            let mut active_mask = 0u32;
+            for i in 0..len {
+                let target = plan.axes[i];
+                if usize::from(target.joint) < MAX_MODE_SWITCH_AXES {
+                    active_mask |= 1u32 << target.joint;
+                }
+                slots[i] = AxisSlot {
+                    target,
+                    active_goal: target.target_mode,
+                    previous_mode: None,
+                    switched_forward: false,
+                    phase: AxisPhase::Pending,
+                };
+            }
+            Self {
+                plan,
+                phase: RunnerPhase::Init,
+                slots,
+                active_idx: 0,
+                active_mask,
+                confirmed_mask: 0,
+                ambiguous_mask: 0,
+                steps: 0,
+                pending_events: [None; 8],
+                pending_event_len: 0,
+            }
+        }
+
+        #[inline]
+        pub fn plan(&self) -> &ModeSwitchPlan { &self.plan }
+
+        #[inline]
+        pub fn is_running(&self) -> bool { !matches!(self.phase, RunnerPhase::Done(_)) }
+
+        #[inline]
+        pub fn progress(&self) -> ModeProgress {
+            match self.phase {
+                RunnerPhase::Done(p) => p,
+                _ => ModeProgress::Pending { wake: None },
+            }
+        }
+
+        #[inline]
+        pub fn has_ambiguous_axis(&self) -> bool {
+            self.ambiguous_mask != 0
+                || matches!(self.phase, RunnerPhase::Done(ModeProgress::Ambiguous { .. }))
+        }
+
+        pub fn snapshot(&self, session_id: u64, driver_uncertain_mask: u32) -> ModeSwitchSnapshot {
+            ModeSwitchSnapshot {
+                session_id,
+                intent: self.plan.intent,
+                running: self.is_running(),
+                recovering: matches!(self.phase, RunnerPhase::Recovering { .. }),
+                progress: self.progress(),
+                axis_count: self.plan.len,
+                confirmed_mask: self.confirmed_mask,
+                uncertain_mask: self.ambiguous_mask | (driver_uncertain_mask & self.active_mask),
+                steps: self.steps,
+            }
+        }
+
+        /// Drains inline staged events (zero heap alloc) into a caller closure (e.g. `StreamProducer::try_push`).
+        pub fn drain_events(&mut self, session_id: u64, mut sink: impl FnMut(ModeSwitchEvent)) {
+            let n = self.pending_event_len;
+            for slot in &mut self.pending_events[..n] {
+                if let Some(mut ev) = slot.take() {
+                    ev.session_id = session_id;
+                    sink(ev);
+                }
+            }
+            self.pending_event_len = 0;
+        }
+
+        fn push_event(
+            &mut self,
+            kind: ModeSwitchEventKind,
+            joint: u8,
+            mode: Option<ControlMode>,
+            reason: Option<ModeSwitchFailure>,
+        ) {
+            if self.pending_event_len < self.pending_events.len() {
+                self.pending_events[self.pending_event_len] = Some(ModeSwitchEvent {
+                    session_id: 0,
+                    kind,
+                    joint,
+                    mode,
+                    reason,
+                });
+                self.pending_event_len += 1;
+            }
+        }
+
+        /// Reconciles an external revocation (stop, cancel, disconnect, deadline expiry, epoch or
+        /// operator revocation, fault, SAFE-HOLD, handback) even if `step` does not run again.
+        ///
+        /// Checks both runner state and the driver's authoritative `mode_write_uncertain_mask`
+        /// (which is set at the exact `REG_WRITE` transmit boundary, including failed flush).
+        pub fn reconcile_external_revocation(
+            &mut self,
+            drv: Option<&mut dyn crate::driver::ArmDriver>,
+            reason: ModeSwitchFailure,
+        ) -> ModeProgress {
+            if let RunnerPhase::Done(p) = self.phase {
+                if let Some(d) = drv {
+                    d.set_mode_switch_active_mask(0);
+                }
+                return p;
+            }
+            let drv_uncertain = if let Some(d) = drv {
+                d.set_mode_switch_active_mask(0);
+                d.mode_write_uncertain_mask()
+            } else {
+                0
+            };
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            let mut in_flight_write_joint: Option<u8> = None;
+            for i in 0..len {
+                match self.slots[i].phase {
+                    AxisPhase::AwaitingWriteAck { .. }
+                    | AxisPhase::NeedReadback { from_write: true, .. }
+                    | AxisPhase::AwaitingReadback { from_write: true, .. } => {
+                        let j = self.slots[i].target.joint;
+                        self.ambiguous_mask |= 1u32 << j;
+                        in_flight_write_joint.get_or_insert(j);
+                    }
+                    _ => {}
+                }
+            }
+            self.ambiguous_mask |= drv_uncertain & self.active_mask;
+            let outcome = if self.ambiguous_mask != 0 {
+                let fj = in_flight_write_joint
+                    .unwrap_or_else(|| self.ambiguous_mask.trailing_zeros() as u8);
+                self.push_event(
+                    ModeSwitchEventKind::TerminalAmbiguous,
+                    fj,
+                    None,
+                    Some(reason),
+                );
+                ModeProgress::Ambiguous {
+                    failed_joint: fj,
+                    reason,
+                }
+            } else {
+                self.push_event(
+                    ModeSwitchEventKind::TerminalStoppedRecovered,
+                    0,
+                    None,
+                    Some(reason),
+                );
+                ModeProgress::StoppedRecovered { reason }
+            };
+            self.phase = RunnerPhase::Done(outcome);
+            outcome
+        }
+
+        /// Spec entry point: advances the mode switch by one bounded release tick on an
+        /// [`ExclusiveDriver`](crate::supervisor_lock::ExclusiveDriver).
+        pub fn step(
+            &mut self,
+            drv: &mut crate::supervisor_lock::ExclusiveDriver,
+            budget: ReleaseBudget,
+        ) -> ModeProgress {
+            let mut allow = || Ok(());
+            self.step_with_gate(drv.get_mut().as_mut(), &mut allow, budget)
+        }
+
+        /// Advances the mode switch by one bounded release tick on `&mut dyn ArmDriver` with a
+        /// live pre-TX authority gate (e.g. `SupervisorInner::check_session_pre_tx`).
+        pub fn step_with_gate(
+            &mut self,
+            drv: &mut dyn crate::driver::ArmDriver,
+            pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+            budget: ReleaseBudget,
+        ) -> ModeProgress {
+            let mut adapter = ArmDriverModeAdapter::new(drv, pre_tx_gate);
+            self.step_driver(&mut adapter, budget)
+        }
+
+        /// Advances the mode switch by one bounded release tick against any [`ModeSwitchDriver`].
+        pub fn step_driver(
+            &mut self,
+            drv: &mut dyn ModeSwitchDriver,
+            budget: ReleaseBudget,
+        ) -> ModeProgress {
+            if let RunnerPhase::Done(done) = self.phase {
+                return done;
+            }
+            self.steps = self.steps.saturating_add(1);
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            if len == 0 {
+                return self.finish(drv, ModeProgress::Confirmed);
+            }
+
+            // 0. One-time preflight & vendor capability validation before any hardware TX.
+            if matches!(self.phase, RunnerPhase::Init) {
+                if let Err(prog) = self.initialize(drv, budget) {
+                    return self.finish(drv, prog);
+                }
+                drv.set_mode_switch_active_mask(self.active_mask);
+                self.push_event(ModeSwitchEventKind::Started, self.slots[0].target.joint, None, None);
+                self.phase = RunnerPhase::Forward;
+                self.advance_completed_slots(drv);
+                if self.active_idx >= len {
+                    return self.finish(drv, ModeProgress::Confirmed);
+                }
+            }
+
+            // 1. Ensure RX has been drained in this release so causal replies & confirmation
+            //    closure (`last_read_drained`) see all arrived frames before evaluation.
+            if !drv.rx_drained() && drv.clock_now() < budget.cutoff {
+                if let Err(reason) = drv.drain_rx_step(budget.max_rx_frames, budget.cutoff) {
+                    return self.handle_axis_failure(drv, self.current_joint(), reason, false);
+                }
+            }
+
+            // 2. Evaluate causal replies for the active in-flight axis BEFORE watchdog holds, so
+            //    a newly confirmed axis immediately receives its first hold in its new mode on
+            //    THIS tick (keeping watchdog gap <= 1 period = 20 ms at 50 Hz).
+            if let Some(term) = self.poll_active_inflight(drv, budget) {
+                return term;
+            }
+            if matches!(self.phase, RunnerPhase::Done(_)) {
+                return self.progress();
+            }
+
+            // 3. WATCHDOG BUDGET FIRST: service all due energized confirmed axes before spending
+            //    any TX budget on mode-switch register frames. If the active axis is about to
+            //    transmit `REG_WRITE` while energized with a watchdog, proactively refresh it in
+            //    its last confirmed mode (`force_mask`) so its watchdog window starts fresh.
+            let mut remaining_tx = budget.max_tx_frames;
+            if drv.any_axis_energized() {
+                let exclude_mask = drv.mode_write_uncertain_mask();
+                let force_mask = self.next_write_force_refresh_mask(drv, remaining_tx);
+                let wd = match drv.service_watchdog_holds(
+                    budget.watchdog_proactive_interval,
+                    exclude_mask,
+                    force_mask,
+                    budget.cutoff,
+                    remaining_tx,
+                ) {
+                    Ok(res) => res,
+                    Err(reason) => {
+                        let fj = self.current_joint();
+                        let uncertain = drv.mode_write_uncertain_mask() != 0;
+                        return self.handle_axis_failure(drv, fj, reason, uncertain);
+                    }
+                };
+                remaining_tx = remaining_tx.saturating_sub(wd.frames_sent);
+                // Predictive starvation guard: if any energized watchdog-bearing confirmed axis
+                // was NOT refreshed and waiting until the next release would breach `max_watchdog_gap`,
+                // abort fail-closed BEFORE the 40 ms window closes.
+                let effective_gap = self.effective_max_watchdog_gap(budget);
+                if !wd.all_due_serviced
+                    && wd.max_energized_age.saturating_add(budget.period).saturating_add(budget.hold_delivery_margin)
+                        > effective_gap
+                {
+                    let fj = wd.oldest_joint.unwrap_or_else(|| self.current_joint());
+                    return self.handle_axis_failure(
+                        drv,
+                        fj,
+                        ModeSwitchFailure::WatchdogBudgetBreached,
+                        true,
+                    );
+                }
+                if !wd.all_due_serviced || remaining_tx == 0 || drv.clock_now() >= budget.cutoff {
+                    return ModeProgress::Pending { wake: None };
+                }
+            }
+
+            if remaining_tx == 0 || drv.clock_now() >= budget.cutoff {
+                return ModeProgress::Pending { wake: None };
+            }
+
+            // 4. Advance the active axis's register/refresh TX using remaining budget.
+            self.step_active_tx(drv, budget, remaining_tx)
+        }
+
+        fn effective_max_watchdog_gap(&self, budget: ReleaseBudget) -> Duration {
+            self.plan.max_watchdog_gap.min(budget.max_watchdog_gap)
+        }
+
+        fn current_joint(&self) -> u8 {
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            if self.active_idx < len {
+                self.slots[self.active_idx].target.joint
+            } else {
+                0
+            }
+        }
+
+        fn initialize(
+            &mut self,
+            drv: &dyn ModeSwitchDriver,
+            budget: ReleaseBudget,
+        ) -> Result<(), ModeProgress> {
+            if !drv.supports_nonblocking_mode_switch() {
+                return Err(ModeProgress::FailedClean {
+                    failed_joint: self.slots[0].target.joint,
+                    reason: ModeSwitchFailure::UnsupportedMode,
+                });
+            }
+            let dof = drv.dof();
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            let vendor = drv.vendor();
+            let mut seen_mask = 0u32;
+            let effective_gap = self.effective_max_watchdog_gap(budget);
+
+            for i in 0..len {
+                let target = self.slots[i].target;
+                let j = usize::from(target.joint);
+                if j >= dof || j >= MAX_MODE_SWITCH_AXES || (seen_mask & (1u32 << j)) != 0 {
+                    return Err(ModeProgress::FailedClean {
+                        failed_joint: target.joint,
+                        reason: ModeSwitchFailure::InvalidPlan,
+                    });
+                }
+                seen_mask |= 1u32 << j;
+                if let Some(v) = vendor {
+                    if !v.supports_mode(target.target_mode) {
+                        return Err(ModeProgress::FailedClean {
+                            failed_joint: target.joint,
+                            reason: ModeSwitchFailure::UnsupportedMode,
+                        });
+                    }
+                }
+                let prev = drv.axis_confirmed_mode(j);
+                let energized = drv.axis_is_energized(j);
+                self.slots[i].previous_mode = prev;
+                self.slots[i].active_goal = target.target_mode;
+                self.slots[i].switched_forward = false;
+
+                match self.plan.intent {
+                    ModeSwitchIntent::ConfirmOnly => {
+                        self.slots[i].phase = AxisPhase::NeedReadback {
+                            expected_mode: target.target_mode,
+                            from_write: false,
+                            last_ctrl_at: None,
+                        };
+                    }
+                    ModeSwitchIntent::Switch => {
+                        if prev == Some(target.target_mode) {
+                            self.slots[i].phase = AxisPhase::Confirmed {
+                                mode: target.target_mode,
+                            };
+                            self.confirmed_mask |= 1u32 << j;
+                            continue;
+                        }
+                        if energized {
+                            let Some(from_mode) = prev else {
+                                return Err(ModeProgress::FailedClean {
+                                    failed_joint: target.joint,
+                                    reason: ModeSwitchFailure::NoConfirmedMode,
+                                });
+                            };
+                            if let Some(v) = vendor {
+                                if !v.supports_runtime_switch(from_mode, target.target_mode) {
+                                    return Err(ModeProgress::FailedClean {
+                                        failed_joint: target.joint,
+                                        reason: ModeSwitchFailure::UnsupportedMode,
+                                    });
+                                }
+                            }
+                            // Predictive admission check: verify the release period can fit a
+                            // full write -> causal confirmation -> next hold delivery inside
+                            // `effective_gap` for watchdog-bearing axes BEFORE touching hardware.
+                            if drv.axis_has_watchdog(j) {
+                                let ticks_needed: u32 = if target.require_post_write_readback { 2 } else { 1 };
+                                let min_needed = budget
+                                    .period
+                                    .saturating_mul(ticks_needed)
+                                    .saturating_add(budget.hold_delivery_margin);
+                                if min_needed > effective_gap {
+                                    return Err(ModeProgress::FailedClean {
+                                        failed_joint: target.joint,
+                                        reason: ModeSwitchFailure::WatchdogBudgetBreached,
+                                    });
+                                }
+                            }
+                        }
+                        // Unconditional wire-range verification before ANY Impedance write.
+                        if target.target_mode == ControlMode::Impedance
+                            && !drv.axis_impedance_ranges_verified(j)
+                        {
+                            self.slots[i].phase = AxisPhase::RangeReadNeed {
+                                rid_idx: 0,
+                                got: [None; 3],
+                            };
+                        } else {
+                            self.slots[i].phase = AxisPhase::NeedWrite;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn next_write_force_refresh_mask(&self, drv: &dyn ModeSwitchDriver, remaining_tx: u8) -> u32 {
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            if self.active_idx >= len || remaining_tx == 0 {
+                return 0;
+            }
+            let slot = &self.slots[self.active_idx];
+            if matches!(slot.phase, AxisPhase::NeedWrite) {
+                let j = usize::from(slot.target.joint);
+                if drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
+                    return 1u32 << j;
+                }
+            }
+            0
+        }
+
+        fn advance_completed_slots(&mut self, drv: &dyn ModeSwitchDriver) {
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            let _ = drv;
+            while self.active_idx < len {
+                if matches!(self.slots[self.active_idx].phase, AxisPhase::Confirmed { .. }) {
+                    self.active_idx += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        fn poll_active_inflight(
+            &mut self,
+            drv: &mut dyn ModeSwitchDriver,
+            budget: ReleaseBudget,
+        ) -> Option<ModeProgress> {
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            if self.active_idx >= len {
+                return None;
+            }
+            let idx = self.active_idx;
+            let slot = self.slots[idx];
+            let j = usize::from(slot.target.joint);
+            let now = drv.clock_now();
+            let effective_gap = self.effective_max_watchdog_gap(budget);
+
+            match slot.phase {
+                AxisPhase::RangeReadAwait {
+                    rid_idx,
+                    boundary_seq,
+                    tx_at,
+                    tx_offset_ns,
+                    deadline,
+                    mut got,
+                } => match drv.find_range_reply(j, rid_idx, boundary_seq, tx_at, deadline, tx_offset_ns) {
+                    ModeRangeMatch::Matched(val) => {
+                        got[usize::from(rid_idx)] = Some(val);
+                        let Some(want) = drv.axis_configured_impedance_ranges(j) else {
+                            return Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::RangeMismatch,
+                                false,
+                            ));
+                        };
+                        let w = want[usize::from(rid_idx)];
+                        if !val.is_finite() || (val - w).abs() > 0.01 + w.abs() * 1e-3 {
+                            return Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::RangeMismatch,
+                                false,
+                            ));
+                        }
+                        if rid_idx + 1 < 3 {
+                            self.slots[idx].phase = AxisPhase::RangeReadNeed {
+                                rid_idx: rid_idx + 1,
+                                got,
+                            };
+                        } else {
+                            drv.set_axis_impedance_ranges_verified(j, true);
+                            self.slots[idx].phase = AxisPhase::NeedWrite;
+                        }
+                        None
+                    }
+                    ModeRangeMatch::Ambiguous => Some(self.handle_axis_failure(
+                        drv,
+                        slot.target.joint,
+                        ModeSwitchFailure::AmbiguousReply,
+                        false,
+                    )),
+                    ModeRangeMatch::Pending => {
+                        if now >= deadline {
+                            return Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::RangeCheckTimeout,
+                                false,
+                            ));
+                        }
+                        None
+                    }
+                },
+                AxisPhase::AwaitingWriteAck {
+                    boundary_seq,
+                    tx_at,
+                    tx_offset_ns,
+                    deadline,
+                    last_ctrl_at,
+                    written_mode,
+                } => {
+                    let req_id = slot.target.require_expected_reply_id
+                        || written_mode == ControlMode::PositionForce;
+                    match drv.find_ctrl_mode_reply(
+                        j,
+                        true,
+                        boundary_seq,
+                        tx_at,
+                        deadline,
+                        tx_offset_ns,
+                        req_id,
+                    ) {
+                        ModeRegMatch::Matched {
+                            mode: Some(got),
+                            rx_seq,
+                            rx_at,
+                            ..
+                        } if got == written_mode => {
+                            if slot.target.require_post_write_readback
+                                && matches!(self.phase, RunnerPhase::Forward)
+                            {
+                                self.slots[idx].phase = AxisPhase::NeedReadback {
+                                    expected_mode: written_mode,
+                                    from_write: true,
+                                    last_ctrl_at,
+                                };
+                            } else {
+                                drv.set_axis_confirmed_mode(j, Some(written_mode));
+                                if matches!(self.phase, RunnerPhase::Forward) {
+                                    self.slots[idx].switched_forward = true;
+                                }
+                                if slot.target.require_post_confirm_feedback {
+                                    self.slots[idx].phase = AxisPhase::AwaitingFeedback {
+                                        after_seq: rx_seq,
+                                        after_at: rx_at,
+                                        deadline: now + self.plan.per_axis_timeout,
+                                        confirmed_mode: written_mode,
+                                        refresh_sent: false,
+                                    };
+                                } else {
+                                    return self.mark_slot_confirmed(drv, idx, written_mode);
+                                }
+                            }
+                            None
+                        }
+                        ModeRegMatch::Matched { .. } => {
+                            // Causal write ACK reported a different/unknown mode -> ambiguous!
+                            drv.set_axis_confirmed_mode(j, None);
+                            Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::WriteAckMismatch,
+                                true,
+                            ))
+                        }
+                        ModeRegMatch::Ambiguous => {
+                            drv.set_axis_confirmed_mode(j, None);
+                            Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::AmbiguousReply,
+                                true,
+                            ))
+                        }
+                        ModeRegMatch::Pending => {
+                            // Predictive watchdog bound check: if waiting until next release
+                            // would breach `effective_gap` from `last_ctrl_at`, fail closed NOW
+                            // (on this release) instead of letting the gap exceed 40 ms!
+                            let wd_expired = drv.axis_is_energized(j)
+                                && drv.axis_has_watchdog(j)
+                                && last_ctrl_at.is_some_and(|t0| {
+                                    now.saturating_duration_since(t0)
+                                        .saturating_add(budget.period)
+                                        .saturating_add(budget.hold_delivery_margin)
+                                        > effective_gap
+                                });
+                            if now >= deadline || wd_expired {
+                                drv.set_axis_confirmed_mode(j, None);
+                                return Some(self.handle_axis_failure(
+                                    drv,
+                                    slot.target.joint,
+                                    ModeSwitchFailure::WriteAckTimeout,
+                                    true,
+                                ));
+                            }
+                            None
+                        }
+                    }
+                }
+                AxisPhase::AwaitingReadback {
+                    boundary_seq,
+                    tx_at,
+                    tx_offset_ns,
+                    deadline,
+                    expected_mode,
+                    from_write,
+                    last_ctrl_at,
+                } => {
+                    let req_id = slot.target.require_expected_reply_id
+                        || expected_mode == ControlMode::PositionForce;
+                    match drv.find_ctrl_mode_reply(
+                        j,
+                        false,
+                        boundary_seq,
+                        tx_at,
+                        deadline,
+                        tx_offset_ns,
+                        req_id,
+                    ) {
+                        ModeRegMatch::Matched {
+                            mode: Some(got),
+                            rx_seq,
+                            rx_at,
+                            ..
+                        } if got == expected_mode => {
+                            drv.set_axis_confirmed_mode(j, Some(expected_mode));
+                            if from_write && matches!(self.phase, RunnerPhase::Forward) {
+                                self.slots[idx].switched_forward = true;
+                            }
+                            if slot.target.require_post_confirm_feedback {
+                                self.slots[idx].phase = AxisPhase::AwaitingFeedback {
+                                    after_seq: rx_seq,
+                                    after_at: rx_at,
+                                    deadline: now + self.plan.per_axis_timeout,
+                                    confirmed_mode: expected_mode,
+                                    refresh_sent: false,
+                                };
+                                None
+                            } else {
+                                self.mark_slot_confirmed(drv, idx, expected_mode)
+                            }
+                        }
+                        ModeRegMatch::Matched { mode: got_mode, .. } => {
+                            if from_write {
+                                drv.set_axis_confirmed_mode(j, None);
+                                return Some(self.handle_axis_failure(
+                                    drv,
+                                    slot.target.joint,
+                                    ModeSwitchFailure::ReadbackMismatch,
+                                    true,
+                                ));
+                            }
+                            // Blocker 3: Distinguish ConfirmOnly mismatch that agrees with cached
+                            // verified state vs one that CONTRADICTS cached verified state!
+                            let cached = drv.axis_confirmed_mode(j);
+                            let contradicts_cached = match (cached, got_mode) {
+                                (Some(c), Some(g)) => c != g,
+                                (Some(_), None) => true,
+                                (None, _) => false,
+                            };
+                            if contradicts_cached {
+                                drv.set_axis_confirmed_mode(j, None);
+                                let ambiguous = drv.axis_is_energized(j);
+                                return Some(self.handle_axis_failure(
+                                    drv,
+                                    slot.target.joint,
+                                    ModeSwitchFailure::ReadbackMismatch,
+                                    ambiguous,
+                                ));
+                            }
+                            Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::ReadbackMismatch,
+                                false,
+                            ))
+                        }
+                        ModeRegMatch::Ambiguous => {
+                            if from_write {
+                                drv.set_axis_confirmed_mode(j, None);
+                                return Some(self.handle_axis_failure(
+                                    drv,
+                                    slot.target.joint,
+                                    ModeSwitchFailure::AmbiguousReply,
+                                    true,
+                                ));
+                            }
+                            Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::AmbiguousReply,
+                                false,
+                            ))
+                        }
+                        ModeRegMatch::Pending => {
+                            let wd_expired = from_write
+                                && drv.axis_is_energized(j)
+                                && drv.axis_has_watchdog(j)
+                                && last_ctrl_at.is_some_and(|t0| {
+                                    now.saturating_duration_since(t0)
+                                        .saturating_add(budget.period)
+                                        .saturating_add(budget.hold_delivery_margin)
+                                        > effective_gap
+                                });
+                            if now >= deadline || wd_expired {
+                                if from_write {
+                                    drv.set_axis_confirmed_mode(j, None);
+                                }
+                                return Some(self.handle_axis_failure(
+                                    drv,
+                                    slot.target.joint,
+                                    ModeSwitchFailure::ReadbackTimeout,
+                                    from_write,
+                                ));
+                            }
+                            None
+                        }
+                    }
+                }
+                AxisPhase::AwaitingFeedback {
+                    after_seq,
+                    after_at,
+                    deadline,
+                    confirmed_mode,
+                    ..
+                } => {
+                    let disarmed_stat =
+                        slot.target.require_disarmed_stationary && !drv.axis_is_energized(j);
+                    match drv.post_confirm_feedback(
+                        j,
+                        confirmed_mode,
+                        after_seq,
+                        after_at,
+                        now,
+                        disarmed_stat,
+                    ) {
+                        ModeFeedbackMatch::FreshConfirmed => {
+                            self.mark_slot_confirmed(drv, idx, confirmed_mode)
+                        }
+                        ModeFeedbackMatch::Unsafe => {
+                            if confirmed_mode == ControlMode::PositionForce {
+                                drv.set_axis_confirmed_mode(j, None);
+                            }
+                            let energized = drv.axis_is_energized(j);
+                            Some(self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::FeedbackUnsafe,
+                                energized,
+                            ))
+                        }
+                        ModeFeedbackMatch::Pending => {
+                            if now >= deadline {
+                                if matches!(self.plan.intent, ModeSwitchIntent::ConfirmOnly)
+                                    && confirmed_mode == ControlMode::PositionForce
+                                    && !drv.axis_is_energized(j)
+                                {
+                                    drv.set_axis_confirmed_mode(j, None);
+                                }
+                                return Some(self.handle_axis_failure(
+                                    drv,
+                                    slot.target.joint,
+                                    ModeSwitchFailure::FeedbackTimeout,
+                                    false,
+                                ));
+                            }
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        fn step_active_tx(
+            &mut self,
+            drv: &mut dyn ModeSwitchDriver,
+            budget: ReleaseBudget,
+            remaining_tx: u8,
+        ) -> ModeProgress {
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            if self.active_idx >= len || remaining_tx == 0 {
+                return ModeProgress::Pending { wake: None };
+            }
+            let idx = self.active_idx;
+            let slot = self.slots[idx];
+            let j = usize::from(slot.target.joint);
+            let now = drv.clock_now();
+            let effective_gap = self.effective_max_watchdog_gap(budget);
+
+            match slot.phase {
+                AxisPhase::RangeReadNeed { rid_idx, got } => {
+                    if !drv.rx_drained() {
+                        return ModeProgress::Pending { wake: None };
+                    }
+                    drv.clear_register_reply_log();
+                    match drv.try_send_range_read(j, rid_idx, budget.cutoff) {
+                        ModeTxResult::Sent {
+                            boundary_seq,
+                            tx_at,
+                            tx_offset_ns,
+                        } => {
+                            let deadline = tx_at + self.plan.per_axis_timeout;
+                            self.slots[idx].phase = AxisPhase::RangeReadAwait {
+                                rid_idx,
+                                boundary_seq,
+                                tx_at,
+                                tx_offset_ns,
+                                deadline,
+                                got,
+                            };
+                            ModeProgress::Pending { wake: Some(deadline) }
+                        }
+                        ModeTxResult::Backpressure => ModeProgress::Pending { wake: None },
+                        ModeTxResult::Revoked(code) => self.handle_revocation(drv, code),
+                        ModeTxResult::SentFlushFailed { .. } | ModeTxResult::Refused(_) => {
+                            self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::TxFailed,
+                                false,
+                            )
+                        }
+                    }
+                }
+                AxisPhase::NeedWrite => {
+                    // For energized watchdog-bearing axes, ensure `last_ctrl_tx` was freshly
+                    // delivered so `now + needed_periods + hold_delivery_margin <= last_ctrl_at + effective_gap`.
+                    let last_ctrl_at = drv.axis_last_ctrl_tx(j);
+                    let energized_wd = drv.axis_is_energized(j) && drv.axis_has_watchdog(j);
+                    if energized_wd {
+                        let ticks_needed: u32 = if slot.target.require_post_write_readback
+                            && matches!(self.phase, RunnerPhase::Forward)
+                        {
+                            2
+                        } else {
+                            1
+                        };
+                        let needed = budget
+                            .period
+                            .saturating_mul(ticks_needed)
+                            .saturating_add(budget.hold_delivery_margin);
+                        if needed > effective_gap {
+                            return self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::WatchdogBudgetBreached,
+                                false,
+                            );
+                        }
+                        let Some(t0) = last_ctrl_at else {
+                            return ModeProgress::Pending { wake: None };
+                        };
+                        if now.saturating_duration_since(t0).saturating_add(needed) > effective_gap {
+                            // Wait for next tick's watchdog-first pass to refresh this axis first.
+                            return ModeProgress::Pending { wake: None };
+                        }
+                    }
+                    if !drv.rx_drained() {
+                        return ModeProgress::Pending { wake: None };
+                    }
+                    drv.clear_register_reply_log();
+                    let goal = slot.active_goal;
+                    match drv.try_send_ctrl_mode_write(j, goal, budget.cutoff) {
+                        ModeTxResult::Sent {
+                            boundary_seq,
+                            tx_at,
+                            tx_offset_ns,
+                        } => {
+                            let mut deadline = tx_at + self.plan.per_axis_timeout;
+                            if energized_wd {
+                                if let Some(t0) = last_ctrl_at {
+                                    let allowed = effective_gap
+                                        .saturating_sub(budget.hold_delivery_margin);
+                                    let wd_dl = t0.checked_add(allowed).unwrap_or(deadline);
+                                    deadline = deadline.min(wd_dl);
+                                }
+                            }
+                            self.slots[idx].phase = AxisPhase::AwaitingWriteAck {
+                                boundary_seq,
+                                tx_at,
+                                tx_offset_ns,
+                                deadline,
+                                last_ctrl_at,
+                                written_mode: goal,
+                            };
+                            ModeProgress::Pending { wake: Some(deadline) }
+                        }
+                        ModeTxResult::SentFlushFailed { .. } => {
+                            // Blocker 2: Frame was handed to transport before flush failed ->
+                            // driver already marked `mode_write_uncertain_mask`; fail closed as Ambiguous!
+                            self.ambiguous_mask |= 1u32 << j;
+                            self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::TxFailed,
+                                true,
+                            )
+                        }
+                        ModeTxResult::Backpressure => ModeProgress::Pending { wake: None },
+                        ModeTxResult::Revoked(code) => self.handle_revocation(drv, code),
+                        ModeTxResult::Refused(_) => self.handle_axis_failure(
+                            drv,
+                            slot.target.joint,
+                            ModeSwitchFailure::TxFailed,
+                            false,
+                        ),
+                    }
+                }
+                AxisPhase::NeedReadback {
+                    expected_mode,
+                    from_write,
+                    last_ctrl_at,
+                } => {
+                    if !drv.rx_drained() {
+                        return ModeProgress::Pending { wake: None };
+                    }
+                    drv.clear_register_reply_log();
+                    match drv.try_send_ctrl_mode_read(j, budget.cutoff) {
+                        ModeTxResult::Sent {
+                            boundary_seq,
+                            tx_at,
+                            tx_offset_ns,
+                        } => {
+                            let mut deadline = tx_at + self.plan.per_axis_timeout;
+                            if from_write && drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
+                                if let Some(t0) = last_ctrl_at {
+                                    let allowed = effective_gap
+                                        .saturating_sub(budget.hold_delivery_margin);
+                                    let wd_dl = t0.checked_add(allowed).unwrap_or(deadline);
+                                    deadline = deadline.min(wd_dl);
+                                }
+                            }
+                            self.slots[idx].phase = AxisPhase::AwaitingReadback {
+                                boundary_seq,
+                                tx_at,
+                                tx_offset_ns,
+                                deadline,
+                                expected_mode,
+                                from_write,
+                                last_ctrl_at,
+                            };
+                            ModeProgress::Pending { wake: Some(deadline) }
+                        }
+                        ModeTxResult::Backpressure => ModeProgress::Pending { wake: None },
+                        ModeTxResult::Revoked(code) => self.handle_revocation(drv, code),
+                        ModeTxResult::SentFlushFailed { .. } | ModeTxResult::Refused(_) => {
+                            self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::TxFailed,
+                                from_write,
+                            )
+                        }
+                    }
+                }
+                AxisPhase::AwaitingFeedback {
+                    after_seq,
+                    after_at,
+                    deadline,
+                    confirmed_mode,
+                    refresh_sent,
+                } => {
+                    // For disarmed or PosForce joints that don't receive an arm watchdog hold,
+                    // send one bounded read-only `0xCC` status refresh so feedback arrives causally.
+                    if !refresh_sent
+                        && (!drv.axis_is_energized(j) || confirmed_mode == ControlMode::PositionForce)
+                    {
+                        match drv.try_send_status_refresh(j, budget.cutoff) {
+                            ModeTxResult::Sent { .. } => {
+                                self.slots[idx].phase = AxisPhase::AwaitingFeedback {
+                                    after_seq,
+                                    after_at,
+                                    deadline,
+                                    confirmed_mode,
+                                    refresh_sent: true,
+                                };
+                            }
+                            ModeTxResult::Revoked(code) => return self.handle_revocation(drv, code),
+                            _ => {}
+                        }
+                    }
+                    ModeProgress::Pending { wake: Some(deadline) }
+                }
+                AxisPhase::RangeReadAwait { deadline, .. }
+                | AxisPhase::AwaitingWriteAck { deadline, .. }
+                | AxisPhase::AwaitingReadback { deadline, .. } => {
+                    ModeProgress::Pending { wake: Some(deadline) }
+                }
+                AxisPhase::Pending | AxisPhase::Confirmed { .. } => {
+                    ModeProgress::Pending { wake: None }
+                }
+            }
+        }
+
+        fn mark_slot_confirmed(
+            &mut self,
+            drv: &mut dyn ModeSwitchDriver,
+            idx: usize,
+            mode: ControlMode,
+        ) -> Option<ModeProgress> {
+            let j = self.slots[idx].target.joint;
+            self.slots[idx].phase = AxisPhase::Confirmed { mode };
+            self.confirmed_mask |= 1u32 << j;
+            self.push_event(ModeSwitchEventKind::AxisConfirmed, j, Some(mode), None);
+            self.advance_completed_slots(drv);
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            if self.active_idx >= len {
+                let term = match self.phase {
+                    RunnerPhase::Recovering {
+                        failed_joint,
+                        reason,
+                    } => ModeProgress::RolledBack {
+                        failed_joint,
+                        reason,
+                    },
+                    _ => ModeProgress::Confirmed,
+                };
+                return Some(self.finish(drv, term));
+            }
+            None
+        }
+
+        fn handle_revocation(
+            &mut self,
+            drv: &mut dyn ModeSwitchDriver,
+            code: &'static str,
+        ) -> ModeProgress {
+            let reason = ModeSwitchFailure::from_revoke_code(code);
+            let drv_uncertain = drv.mode_write_uncertain_mask() & self.active_mask;
+            self.ambiguous_mask |= drv_uncertain;
+            if self.ambiguous_mask != 0 {
+                let fj = self.ambiguous_mask.trailing_zeros() as u8;
+                self.finish(
+                    drv,
+                    ModeProgress::Ambiguous {
+                        failed_joint: fj,
+                        reason,
+                    },
+                )
+            } else {
+                self.finish(drv, ModeProgress::StoppedRecovered { reason })
+            }
+        }
+
+        fn handle_axis_failure(
+            &mut self,
+            drv: &mut dyn ModeSwitchDriver,
+            failed_joint: u8,
+            reason: ModeSwitchFailure,
+            ambiguous: bool,
+        ) -> ModeProgress {
+            let drv_uncertain = drv.mode_write_uncertain_mask() & self.active_mask;
+            if ambiguous || drv_uncertain != 0 {
+                if ambiguous {
+                    self.ambiguous_mask |= 1u32 << failed_joint;
+                }
+                self.ambiguous_mask |= drv_uncertain;
+                return self.finish(
+                    drv,
+                    ModeProgress::Ambiguous {
+                        failed_joint,
+                        reason,
+                    },
+                );
+            }
+
+            // Clean failure with zero ambiguous axes: if we are in Forward with
+            // `RollbackToPrevious` and at least one prior axis switched, enter `Recovering`.
+            if matches!(self.phase, RunnerPhase::Forward)
+                && self.plan.recovery == ModeSwitchRecovery::RollbackToPrevious
+            {
+                let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+                let mut any_to_rollback = false;
+                for i in 0..len {
+                    if self.slots[i].switched_forward {
+                        let Some(prev) = self.slots[i].previous_mode else {
+                            self.ambiguous_mask |= 1u32 << self.slots[i].target.joint;
+                            return self.finish(
+                                drv,
+                                ModeProgress::Ambiguous {
+                                    failed_joint: self.slots[i].target.joint,
+                                    reason,
+                                },
+                            );
+                        };
+                        let j = usize::from(self.slots[i].target.joint);
+                        self.slots[i].active_goal = prev;
+                        self.confirmed_mask &= !(1u32 << j);
+                        // Unconditional wire-range check even on rollback into Impedance!
+                        if prev == ControlMode::Impedance && !drv.axis_impedance_ranges_verified(j) {
+                            self.slots[i].phase = AxisPhase::RangeReadNeed {
+                                rid_idx: 0,
+                                got: [None; 3],
+                            };
+                        } else {
+                            self.slots[i].phase = AxisPhase::NeedWrite;
+                        }
+                        any_to_rollback = true;
+                    } else {
+                        let mode = self.slots[i]
+                            .previous_mode
+                            .unwrap_or(self.slots[i].target.target_mode);
+                        self.slots[i].phase = AxisPhase::Confirmed { mode };
+                    }
+                }
+                if any_to_rollback {
+                    self.phase = RunnerPhase::Recovering {
+                        failed_joint,
+                        reason,
+                    };
+                    self.active_idx = 0;
+                    self.advance_completed_slots(drv);
+                    self.push_event(
+                        ModeSwitchEventKind::RollbackStarted,
+                        failed_joint,
+                        None,
+                        Some(reason),
+                    );
+                    return ModeProgress::Pending { wake: None };
+                }
+            }
+
+            // If we failed cleanly while already in `Recovering` (e.g. range check or refused
+            // write before sending), axes remain in mixed/unrestored state; if any write failed
+            // or rollback couldn't finish on an energized axis, mark Ambiguous.
+            if matches!(self.phase, RunnerPhase::Recovering { .. }) {
+                if drv.any_axis_energized() {
+                    self.ambiguous_mask |= 1u32 << failed_joint;
+                    return self.finish(
+                        drv,
+                        ModeProgress::Ambiguous {
+                            failed_joint,
+                            reason,
+                        },
+                    );
+                }
+            }
+
+            self.finish(
+                drv,
+                ModeProgress::FailedClean {
+                    failed_joint,
+                    reason,
+                },
+            )
+        }
+
+        fn finish(&mut self, drv: &mut dyn ModeSwitchDriver, progress: ModeProgress) -> ModeProgress {
+            drv.set_mode_switch_active_mask(0);
+            self.phase = RunnerPhase::Done(progress);
+            match progress {
+                ModeProgress::Confirmed => {
+                    self.push_event(ModeSwitchEventKind::TerminalConfirmed, 0, None, None);
+                }
+                ModeProgress::RolledBack {
+                    failed_joint,
+                    reason,
+                } => {
+                    self.push_event(
+                        ModeSwitchEventKind::TerminalRolledBack,
+                        failed_joint,
+                        None,
+                        Some(reason),
+                    );
+                }
+                ModeProgress::StoppedRecovered { reason } => {
+                    self.push_event(
+                        ModeSwitchEventKind::TerminalStoppedRecovered,
+                        0,
+                        None,
+                        Some(reason),
+                    );
+                }
+                ModeProgress::FailedClean {
+                    failed_joint,
+                    reason,
+                } => {
+                    self.push_event(
+                        ModeSwitchEventKind::TerminalFailedClean,
+                        failed_joint,
+                        None,
+                        Some(reason),
+                    );
+                }
+                ModeProgress::Ambiguous {
+                    failed_joint,
+                    reason,
+                } => {
+                    self.push_event(
+                        ModeSwitchEventKind::TerminalAmbiguous,
+                        failed_joint,
+                        None,
+                        Some(reason),
+                    );
+                }
+                ModeProgress::Pending { .. } => {}
+            }
+            progress
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use switch::{
+    ArmDriverModeAdapter, AxisTarget, ModeFeedbackMatch, ModeProgress, ModeRangeMatch,
+    ModeRegMatch, ModeSwitch, ModeSwitchDriver, ModeSwitchEvent, ModeSwitchEventKind,
+    ModeSwitchFailure, ModeSwitchIntent, ModeSwitchPlan, ModeSwitchRecovery, ModeSwitchSnapshot,
+    ModeTxResult, ReleaseBudget, WatchdogHoldResult, DEFAULT_HOLD_DELIVERY_MARGIN,
+    DEFAULT_MAX_WATCHDOG_GAP, DEFAULT_PER_AXIS_TIMEOUT, DEFAULT_WATCHDOG_PROACTIVE_INTERVAL,
+    MAX_MODE_SWITCH_AXES,
+};
