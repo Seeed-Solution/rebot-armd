@@ -873,12 +873,49 @@ impl TrackingRuntime {
     }
 }
 
+/// Zero-allocation joint-limit / dynamics rejection detail for RT tracking candidate search.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JointLimitRejectRt {
+    OutsideLimits { joint: u8, q: f32, min: f32, max: f32 },
+    StreamingMeasuredLead { joint: u8, q: f32, meas: f32 },
+    TorqueHold { joint: u8, q: f32, hold_q: f32 },
+    OutputVelocity { joint: u8, v: f64, limit: f64 },
+    OutputAcceleration { joint: u8, a: f64, limit: f64 },
+    NoValidCandidate,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl core::fmt::Display for JointLimitRejectRt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::OutsideLimits { joint, q, min, max } => {
+                write!(f, "joint {joint} candidate {q:.4} rad outside [{min:.4}, {max:.4}]")
+            }
+            Self::StreamingMeasuredLead { joint, q, meas } => {
+                write!(f, "joint {joint} candidate {q:.4} rad exceeds streaming measured-lead allowance around {meas:.4}")
+            }
+            Self::TorqueHold { joint, q, hold_q } => {
+                write!(f, "joint {joint} candidate {q:.4} rad advances into torque hold at {hold_q:.4}")
+            }
+            Self::OutputVelocity { joint, v, limit } => {
+                write!(f, "joint {joint} output velocity {v:.3} rad/s exceeds limit {limit:.3}")
+            }
+            Self::OutputAcceleration { joint, a, limit } => {
+                write!(f, "joint {joint} output acceleration {a:.3} rad/s^2 exceeds limit {limit:.3}")
+            }
+            Self::NoValidCandidate => f.write_str("no valid tracking candidate"),
+        }
+    }
+}
+
 /// Why no position-lead candidate passed combined-vector validation.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub enum TrackingReject {
     Workspace(crate::safety::SafetyError),
     WorkspaceRt(crate::chain::WorkspaceFailureRt),
+    JointLimitRt(JointLimitRejectRt),
     JointLimit(String),
 }
 
@@ -1540,8 +1577,8 @@ impl crate::supervisor::SupervisorInner {
             &mut scratch.cand_zero,
         );
 
+        let rt_errors = scratch.sweep_stack.is_some();
         let mut last_err: Option<TrackingReject> = None;
-        let mut last_ws_rt: Option<crate::chain::WorkspaceFailureRt> = None;
         let budget_start = *budget;
         let lead_tried = has_desired_lead;
         let num_cands = if has_desired_lead { 2 } else { 1 };
@@ -1556,12 +1593,21 @@ impl crate::supervisor::SupervisorInner {
                 let lim = &active_limits[j];
                 let q = q_cand[j];
                 if !q.is_finite() || q < lim.min_position - 1e-5 || q > lim.max_position + 1e-5 {
-                    last_err = Some(TrackingReject::JointLimit(format!(
-                        "joint {} candidate {q:.4} rad outside [{:.4}, {:.4}]",
-                        j + 1,
-                        lim.min_position,
-                        lim.max_position
-                    )));
+                    last_err = Some(if rt_errors {
+                        TrackingReject::JointLimitRt(JointLimitRejectRt::OutsideLimits {
+                            joint: (j + 1) as u8,
+                            q,
+                            min: lim.min_position,
+                            max: lim.max_position,
+                        })
+                    } else {
+                        TrackingReject::JointLimit(format!(
+                            "joint {} candidate {q:.4} rad outside [{:.4}, {:.4}]",
+                            j + 1,
+                            lim.min_position,
+                            lim.max_position
+                        ))
+                    });
                     continue 'cand;
                 }
                 if in_streaming && fresh_meas {
@@ -1573,10 +1619,18 @@ impl crate::supervisor::SupervisorInner {
                     if (advancing_pos && q > meas + stream_lead + 1e-5)
                         || (advancing_neg && q < meas - stream_lead - 1e-5)
                     {
-                        last_err = Some(TrackingReject::JointLimit(format!(
-                            "joint {} candidate {q:.4} rad exceeds streaming measured-lead allowance around {meas:.4}",
-                            j + 1
-                        )));
+                        last_err = Some(if rt_errors {
+                            TrackingReject::JointLimitRt(JointLimitRejectRt::StreamingMeasuredLead {
+                                joint: (j + 1) as u8,
+                                q,
+                                meas,
+                            })
+                        } else {
+                            TrackingReject::JointLimit(format!(
+                                "joint {} candidate {q:.4} rad exceeds streaming measured-lead allowance around {meas:.4}",
+                                j + 1
+                            ))
+                        });
                         continue 'cand;
                     }
                 }
@@ -1586,11 +1640,19 @@ impl crate::supervisor::SupervisorInner {
                         if (q - qd) * h.sign > 1e-6
                             || ((qd - h.hold_q) * h.sign <= 1e-6 && (q - h.hold_q) * h.sign > 1e-5)
                         {
-                            last_err = Some(TrackingReject::JointLimit(format!(
-                                "joint {} candidate {q:.4} rad advances into torque hold at {:.4}",
-                                j + 1,
-                                h.hold_q
-                            )));
+                            last_err = Some(if rt_errors {
+                                TrackingReject::JointLimitRt(JointLimitRejectRt::TorqueHold {
+                                    joint: (j + 1) as u8,
+                                    q,
+                                    hold_q: h.hold_q,
+                                })
+                            } else {
+                                TrackingReject::JointLimit(format!(
+                                    "joint {} candidate {q:.4} rad advances into torque hold at {:.4}",
+                                    j + 1,
+                                    h.hold_q
+                                ))
+                            });
                             continue 'cand;
                         }
                     }
@@ -1600,17 +1662,33 @@ impl crate::supervisor::SupervisorInner {
                 let v_prev_j = prev_v.map_or(0.0, |pv| f64::from(pv[j]));
                 let a_cand = (v_cand - v_prev_j) / dt;
                 if !v_cand.is_finite() || v_cand.abs() > v_lim_out + 1e-4 {
-                    last_err = Some(TrackingReject::JointLimit(format!(
-                        "joint {} output velocity {v_cand:.3} rad/s exceeds limit {v_lim_out:.3}",
-                        j + 1
-                    )));
+                    last_err = Some(if rt_errors {
+                        TrackingReject::JointLimitRt(JointLimitRejectRt::OutputVelocity {
+                            joint: (j + 1) as u8,
+                            v: v_cand,
+                            limit: v_lim_out,
+                        })
+                    } else {
+                        TrackingReject::JointLimit(format!(
+                            "joint {} output velocity {v_cand:.3} rad/s exceeds limit {v_lim_out:.3}",
+                            j + 1
+                        ))
+                    });
                     continue 'cand;
                 }
                 if !a_cand.is_finite() || a_cand.abs() > a_lim_out + 1e-3 {
-                    last_err = Some(TrackingReject::JointLimit(format!(
-                        "joint {} output acceleration {a_cand:.3} rad/s^2 exceeds limit {a_lim_out:.3}",
-                        j + 1
-                    )));
+                    last_err = Some(if rt_errors {
+                        TrackingReject::JointLimitRt(JointLimitRejectRt::OutputAcceleration {
+                            joint: (j + 1) as u8,
+                            a: a_cand,
+                            limit: a_lim_out,
+                        })
+                    } else {
+                        TrackingReject::JointLimit(format!(
+                            "joint {} output acceleration {a_cand:.3} rad/s^2 exceeds limit {a_lim_out:.3}",
+                            j + 1
+                        ))
+                    });
                     continue 'cand;
                 }
             }
@@ -1631,8 +1709,7 @@ impl crate::supervisor::SupervisorInner {
                         "tracking_lead",
                         stack,
                     ) {
-                        last_ws_rt = Some(f);
-                        last_err = None;
+                        last_err = Some(TrackingReject::WorkspaceRt(f));
                         continue 'cand;
                     }
                 } else if let Err((_, f)) = eval.sweep_linear_step(
@@ -1645,7 +1722,6 @@ impl crate::supervisor::SupervisorInner {
                     "tracking_lead",
                     "tracking_lead",
                 ) {
-                    last_ws_rt = None;
                     last_err = Some(TrackingReject::Workspace(SafetyError::from_workspace(f)));
                     continue 'cand;
                 }
@@ -1663,8 +1739,7 @@ impl crate::supervisor::SupervisorInner {
                             "tracking_lead",
                             stack,
                         ) {
-                            last_ws_rt = Some(f);
-                            last_err = None;
+                            last_err = Some(TrackingReject::WorkspaceRt(f));
                             continue 'cand;
                         }
                     } else if let Err((_, f)) = eval.sweep_linear_step(
@@ -1677,7 +1752,6 @@ impl crate::supervisor::SupervisorInner {
                         "tracking_lead",
                         "tracking_lead",
                     ) {
-                        last_ws_rt = None;
                         last_err = Some(TrackingReject::Workspace(SafetyError::from_workspace(f)));
                         continue 'cand;
                     }
@@ -1701,10 +1775,13 @@ impl crate::supervisor::SupervisorInner {
             });
         }
 
-        if let Some(f) = last_ws_rt {
-            return Err(TrackingReject::WorkspaceRt(f));
-        }
-        Err(last_err.unwrap_or_else(|| TrackingReject::JointLimit("no valid tracking candidate".into())))
+        Err(last_err.unwrap_or_else(|| {
+            if rt_errors {
+                TrackingReject::JointLimitRt(JointLimitRejectRt::NoValidCandidate)
+            } else {
+                TrackingReject::JointLimit("no valid tracking candidate".into())
+            }
+        }))
     }
 
     /// Ramp residual tracking lead smoothly from `last_issued_positions` to nominal

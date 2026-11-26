@@ -1138,7 +1138,10 @@ impl SupervisorInner {
         let crate::tracking::PendingFallbackScratch { step, ramp, other_depths } = pending;
         match step {
             Ok(fb) => {
-                if self.check_static_load_tracking_output(&scratch.out_positions, true).is_err() {
+                if self
+                    .check_static_load_tracking_output_with_fallback(&scratch.out_positions, true, true)
+                    .is_err()
+                {
                     if self.tracking.spare_fallback_ramp.is_none() {
                         self.tracking.spare_fallback_ramp = Some(ramp);
                     }

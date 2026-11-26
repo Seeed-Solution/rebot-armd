@@ -1338,6 +1338,20 @@ impl SupervisorInner {
         candidate: &[f32],
         commit_ceiling: bool,
     ) -> Result<(), StaticLoadRefusal> {
+        self.check_static_load_tracking_output_with_fallback(candidate, commit_ceiling, false)
+    }
+
+    /// Zero-allocation static-load admission check for shaped `joint_tracking` output with an
+    /// option to anchor the baseline on `scratch.fallback_prev_confirmed` (used by
+    /// `apply_tracking_fallback_step_into` so immediate tracking rejections compare against the
+    /// exact captured issued pose even after the rejection handler invalidates `tracking` and
+    /// replaces `commanded_positions` with `measured_positions`).
+    pub(crate) fn check_static_load_tracking_output_with_fallback(
+        &mut self,
+        candidate: &[f32],
+        commit_ceiling: bool,
+        use_fallback_prev: bool,
+    ) -> Result<(), StaticLoadRefusal> {
         let Some(budget) = self.config.power_budget.as_ref().filter(|p| p.enabled) else {
             return Ok(());
         };
@@ -1348,7 +1362,16 @@ impl SupervisorInner {
             None => return Ok(()),
         };
         let arm_n = self.config.arm_model.arm_dof().min(crate::chain::MAX_CHAIN_JOINTS);
-        let base_a = if let Some(prev_issued) = self
+        let base_a = if use_fallback_prev
+            && self.scratch.fallback_prev_confirmed_valid
+            && self.scratch.fallback_prev_confirmed.len() >= arm_n
+        {
+            self.static_load_tracking_cache.baseline_a(
+                budget,
+                &self.config.arm_model,
+                &self.scratch.fallback_prev_confirmed,
+            )
+        } else if let Some(prev_issued) = self
             .tracking
             .last_issued_positions
             .as_deref()

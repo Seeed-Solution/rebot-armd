@@ -3956,29 +3956,38 @@ async fn rt_gate_power_static_load_tracking_paths_zero_alloc_zero_lock() {
     }
 
     // Part E: Position-lead candidate 0 rejected by `sweep_linear_step_slotbuf_rt` while
-    // candidate 1 (`m = 0.0`, withdrawn) passes — verifies zero RT heap allocations/deallocations
-    // across candidate search when the lead candidate violates a workspace wall.
+    // candidate 1 (`m = 0.0`, withdrawn) passes — uses a 2-tick `JointPath` whose tick 1 is at
+    // peak velocity (u = 0.5, NOT decelerating, `desired_lead = +0.030 rad`), proving zero lead
+    // (`|wire - cmd| < 1e-4`) came strictly from candidate-0 wall rejection + withdrawal with
+    // zero RT heap allocations/deallocations.
     {
         use armd::model::WorkspacePolicy;
-        use armd::rt_core::requests::motion::{
-            prepare_motion, stage_jog, MotionConfigSnapshot, MotionPlanSnapshot, MotionRequest,
-        };
 
-        let q_start = [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let q_end = [0.20f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let q_over = [0.202f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let mut cfg = ArmConfig::rebot_dm();
         cfg.control_frequency_hz = 50;
         cfg.camera_mount.offset_m = None;
         cfg.power_budget.as_mut().unwrap().planning.enabled = false;
+        let a_max_j0 = cfg.limits[0].max_acceleration;
+        let dt_f32 = 0.02f32;
+        // Choose `d = q_end - q_start` small enough that on tick 1 (`u = 0.5`, `q_mid = q_start + d/2`,
+        // peak velocity), the acceleration-bounded lead candidate (`q_mid + a_max * dt^2`)
+        // strictly exceeds `q_end` while `q_end` stays safely inside the workspace wall.
+        let d = (a_max_j0 * dt_f32 * dt_f32 * 0.8).min(0.004);
+        let q_start = [0.150f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let q_mid = [0.150 + 0.5 * d, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let q_end = [0.150 + d, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let cand0_j0 = q_mid[0] + a_max_j0 * dt_f32 * dt_f32;
+        assert!(cand0_j0 > q_end[0] + 2e-4, "cand0 ({cand0_j0:.5}) must overshoot q_end ({:.5})", q_end[0]);
+        let q_wall = [0.5 * (q_end[0] + cand0_j0), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v_seed = [0.5 * d / dt_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let p_end = cfg.arm_model.frames_f32(&q_end).unwrap().end.p;
-        let p_over = cfg.arm_model.frames_f32(&q_over).unwrap().end.p;
+        let p_wall = cfg.arm_model.frames_f32(&q_wall).unwrap().end.p;
         let mut box_min = [-1.5f32, -1.5, -1.5];
         let mut box_max = [1.5f32, 1.5, 1.5];
-        if p_over[1] > p_end[1] {
-            box_max[1] = (0.5 * (p_end[1] + p_over[1])) as f32;
+        if p_wall[1] > p_end[1] {
+            box_max[1] = p_wall[1] as f32;
         } else {
-            box_min[1] = (0.5 * (p_end[1] + p_over[1])) as f32;
+            box_min[1] = p_wall[1] as f32;
         }
         cfg.workspace = Some(WorkspacePolicy {
             floor_z_m: -1.5,
@@ -4007,15 +4016,37 @@ async fn rt_gate_power_static_load_tracking_paths_zero_alloc_zero_lock() {
         let clock = ScriptedClock::new();
         let wire_log = WireWriteLog::new();
         let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.enabled = true;
         drv.q[..7].copy_from_slice(&q_start);
         let drv = drv.with_wire_log(Arc::clone(&wire_log));
-        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
-        sup.register_ws_connection(1).await.unwrap();
-        let motion_cfg = {
-            let inner = sup.inner().read().await;
-            Arc::new(MotionConfigSnapshot::from_supervisor(&inner))
-        };
+        {
+            let mut inner = sup.inner().write().await;
+            inner.is_torqued = true;
+            inner.torque_intent = armd::supervisor::TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            inner.measured_positions = q_start.to_vec();
+            inner.commanded_positions = q_start.to_vec();
+            inner.target_positions = q_start.to_vec();
+            inner.commanded_velocities = v_seed.to_vec();
+            inner.tracking.record_issued_in_place(&q_start, &v_seed, None, None);
+            inner.tracking.last_nominal = Some((q_start.to_vec(), v_seed.to_vec()));
+            inner.tracking.history_state = TrackingHistoryState::Issued;
+            let path = armd::motion::JointPath {
+                dof: 7,
+                arm_dof: 6,
+                duration: 0.04,
+                s: vec![0.0, 1.0],
+                q: vec![q_start, q_end],
+                power_scale: 1.0,
+            };
+            inner.active_trajectory = Some(armd::motion::ActiveTrajectory::new(
+                None,
+                armd::motion::Reference::Path(armd::motion::PathTrajectory::new(path)),
+            ));
+            inner.prewarm_rt_buffers();
+        }
         let period_ns = 20_000_000u64;
         let handle = sup
             .start_executor_with_hooks(
@@ -4028,101 +4059,374 @@ async fn rt_gate_power_static_load_tracking_paths_zero_alloc_zero_lock() {
             .await
             .unwrap();
 
-        clock.run_steps(period_ns, 2);
-        wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
-        let s0 = sup.hub().latest().unwrap();
-        let req_en = handle
-            .broker()
-            .lock()
-            .unwrap()
-            .submit(
-                ClientId(1),
-                1,
-                Authority {
-                    lease_generation: 0,
-                    epoch: s0.obs.epoch_id,
-                    stop_generation: handle.stop_requests().current(),
-                    config_revision: 0,
-                    parent_generation: 0,
-                },
-                clock.now() + Duration::from_secs(5),
-                Submit::Transition(TransitionOp::TorqueOn),
-            )
-            .unwrap();
-        for _ in 0..20 {
-            clock.run_steps(period_ns, 1);
-            if drain_broker(&handle).iter().any(|r| {
-                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == req_en)
-            }) {
-                break;
-            }
-        }
-        assert!(sup.hub().latest().unwrap().obs.is_torqued);
-
-        let snap = sup.hub().latest().unwrap();
-        let msnap = MotionPlanSnapshot::from_published(&snap, Arc::clone(&motion_cfg)).unwrap();
-        let prepared = prepare_motion(
-            &msnap,
-            &MotionRequest::jog(q_end.to_vec(), Some(1.0), None),
-        )
-        .unwrap();
-        wire_log.reset();
-
         let gate = RtReleaseGate::new(&sup, &handle);
-        let ((completed, saw_lead, saw_wall_withdraw), delta) =
+        let ((tick1_cmd, tick1_wire, reached_end), delta) =
             gate.run_phase("tracking_candidate0_ws_reject_withdraw_zero_alloc", || {
-                let s_now = sup.hub().latest().unwrap();
-                let req = handle
-                    .broker()
-                    .lock()
-                    .unwrap()
-                    .submit(
-                        ClientId(1),
-                        2,
-                        Authority {
-                            lease_generation: 0,
-                            epoch: s_now.obs.epoch_id,
-                            stop_generation: handle.stop_requests().current(),
-                            config_revision: 0,
-                            parent_generation: 0,
-                        },
-                        clock.now() + Duration::from_secs(5),
-                        Submit::Install(&|s: &mut PlanSlot| stage_jog(s, &prepared.slot)),
-                    )
-                    .unwrap();
-                let mut done = false;
-                let mut saw_lead = false;
-                let mut saw_wall_withdraw = false;
-                let mut prev_lead = 0.0f32;
-                for _ in 0..120 {
-                    clock.run_steps(period_ns, 1);
-                    if let (Some(s), Some(last_w)) = (sup.hub().latest(), wire_log.frames().last().copied()) {
-                        let lead = last_w[0] - s.rt.commanded_positions[0];
-                        if lead > 5e-3 {
-                            saw_lead = true;
-                        }
-                        if saw_lead && s.rt.commanded_positions[0] > 0.16 && lead + 2e-3 < prev_lead && last_w[0] < q_over[0] {
-                            saw_wall_withdraw = true;
-                        }
-                        prev_lead = lead;
-                    }
-                    if drain_broker(&handle).iter().any(|r| {
-                        matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == req)
-                    }) {
-                        done = true;
-                        break;
-                    }
-                }
-                ((done, saw_lead, saw_wall_withdraw), done && saw_lead && saw_wall_withdraw)
+                // Release 1: midpoint u = 0.5 (`cmd_j0 == q_mid[0]`, peak velocity, candidate 0
+                // hits wall at `q_wall[0]` -> candidate 1 withdraws to `q_mid[0]`).
+                clock.run_steps(period_ns, 1);
+                let s1 = sup.hub().latest().unwrap();
+                let mut tick1_cmd = [0.0f32; 7];
+                tick1_cmd.copy_from_slice(&s1.rt.commanded_positions[..7]);
+                let tick1_wire = wire_log.frames()[0];
+                // Finish the path cleanly on subsequent releases.
+                clock.run_steps(period_ns, 3);
+                let s_end = sup.hub().latest().unwrap();
+                let withdrew_on_tick1 = (tick1_cmd[0] - q_mid[0]).abs() < 1e-4
+                    && (tick1_wire[0] - tick1_cmd[0]).abs() < 1e-4;
+                let reached = (s_end.rt.commanded_positions[0] - q_end[0]).abs() < 1e-4
+                    && !matches!(s_end.obs.safety_state, armd::safety::SafetyState::Fault(_));
+                ((tick1_cmd, tick1_wire, reached), withdrew_on_tick1 && reached)
             });
         assert!(
             delta.is_clean(),
             "candidate-0 workspace rejection falling back to withdrawal must be zero-alloc/zero-lock: {delta:?}"
         );
-        assert!(
-            completed && saw_lead && saw_wall_withdraw,
-            "Part E jog must exercise active lead + candidate-0 wall withdrawal (completed={completed}, saw_lead={saw_lead}, saw_wall_withdraw={saw_wall_withdraw})"
+        assert!(reached_end, "Part E 2-tick path must complete without faulting");
+        // Independently prove via `WorkspaceEvaluator` that candidate 0 (`cand0_j0`) violated
+        // the box wall on tick 1 while withdrawn candidate 1 (`tick1_wire`) passed.
+        let eval = armd::chain::WorkspaceEvaluator::new(
+            &cfg.arm_model,
+            cfg.workspace.as_ref().unwrap(),
+            &cfg.camera_mount,
         );
+        let mut c_prev = eval.alloc_buf();
+        eval.eval_into_slotbuf_rt(&q_start, &mut c_prev, "verify").unwrap();
+        let mut min_d_cand0 = eval.init_min_depths(&c_prev);
+        let mut stack = Box::new(armd::chain::RtSweepStack::default());
+        let mut cand0 = tick1_cmd;
+        cand0[0] = cand0_j0;
+        let mut b0 = armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+        assert!(
+            eval.sweep_linear_step_slotbuf_rt(
+                &q_start,
+                &cand0,
+                &c_prev,
+                &mut min_d_cand0,
+                &mut b0,
+                armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK,
+                "verify",
+                "verify",
+                &mut stack,
+            )
+            .is_err(),
+            "candidate 0 ({cand0:?}) on tick 1 must violate the workspace wall"
+        );
+        let mut min_d_cand1 = eval.init_min_depths(&c_prev);
+        let mut b1 = armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+        eval.sweep_linear_step_slotbuf_rt(
+            &q_start,
+            &tick1_wire,
+            &c_prev,
+            &mut min_d_cand1,
+            &mut b1,
+            armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK,
+            "verify",
+            "verify",
+            &mut stack,
+        )
+        .expect("withdrawn candidate 1 emitted on tick 1 must pass the workspace sweep");
+
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+
+    // Part F (R2 Blocker regression): Immediate tracking workspace rejection where
+    // `issued current < cap < fallback candidate current <= measured current` and
+    // `static_ceiling_a == None`. The rejection handler invalidates `tracking.last_issued_positions`
+    // and replaces `commanded_positions` with `measured_positions` BEFORE
+    // `apply_tracking_fallback_step_into` runs; admission MUST compare against captured
+    // `fallback_prev_confirmed` (`q_issued`), refuse the over-cap fallback step, and emit
+    // `q_issued` on the wire with zero allocs/deallocs/locks.
+    {
+        use armd::model::WorkspacePolicy;
+
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.control_frequency_hz = 50;
+        cfg.camera_mount.offset_m = None;
+        cfg.power_budget.as_mut().unwrap().planning.enabled = false;
+        cfg.power_budget.as_mut().unwrap().static_admission_fraction = Some(0.85);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = 0.0;
+        let arm = cfg.arm_model.clone();
+        let raw_cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+        let q_issued = [0.0f32, -0.35, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_measured = [0.0f32, -0.55, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_cmd_wall = [0.25f32, -0.35, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let v_issued = [0.0f32, -0.50, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let i_issued = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_issued).unwrap();
+        let i_meas = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_measured).unwrap();
+        assert!(i_meas > i_issued + 0.10);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = raw_cap - i_issued - 0.002;
+        let budget = cfg.power_budget.clone().unwrap();
+        let cap = budget.static_admission_cap_a().unwrap();
+        assert!(
+            predict_static_holding_current_a(&budget, &arm, &q_issued).unwrap() < cap
+                && predict_static_holding_current_a(&budget, &arm, &q_measured).unwrap() > cap
+        );
+
+        // Place a box wall along Y between `J1 = 0.0` (`q_issued`/`q_measured`, inside box) and
+        // `J1 = 0.25` (`q_cmd_wall`, outside box) so `compute_position_lead_output_into` fails
+        // immediately with `WorkspaceRt`, while `tracking_fallback_compute_into` (at `J1 = 0.0`,
+        // braking from `q_issued` toward `q_measured`) stays inside the box and produces an
+        // `Ok(fb)` step whose static load lies in `(cap, i_meas]`.
+        let p_in = arm.frames_f32(&q_issued).unwrap().end.p;
+        let p_out = arm.frames_f32(&q_cmd_wall).unwrap().end.p;
+        let mut box_min = [-1.5f32, -1.5, -1.5];
+        let mut box_max = [1.5f32, 1.5, 1.5];
+        if p_out[1] > p_in[1] {
+            box_max[1] = (0.5 * (p_in[1] + p_out[1])) as f32;
+        } else {
+            box_min[1] = (0.5 * (p_in[1] + p_out[1])) as f32;
+        }
+        cfg.workspace = Some(WorkspacePolicy {
+            floor_z_m: -1.5,
+            box_min_m: box_min,
+            box_max_m: box_max,
+            max_reach_m: Some(1.5),
+            check_points_end_m: vec![[0.0, 0.0, 0.0]],
+            keepout_boxes: vec![],
+            link_capsules: vec![],
+            self_collision_enabled: false,
+            self_collision_min_clearance_m: 0.0,
+            self_collision_pairs: vec![],
+        });
+        cfg.joint_tracking = Some(JointTrackingConfig {
+            enabled: true,
+            joints: (0..6)
+                .map(|_| JointTrackingJoint {
+                    strategy: TrackingStrategy::PositionLead,
+                    lag_s: 0.08,
+                    max_lead_rad: 0.03,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+
+        let clock = ScriptedClock::new();
+        let wire_log = WireWriteLog::new();
+        let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.enabled = true;
+        drv.q[..7].copy_from_slice(&q_measured);
+        let drv = drv.with_wire_log(Arc::clone(&wire_log));
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.is_torqued = true;
+            inner.torque_intent = armd::supervisor::TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            inner.measured_positions = q_measured.to_vec();
+            inner.commanded_positions = q_cmd_wall.to_vec();
+            inner.target_positions = q_cmd_wall.to_vec();
+            inner.commanded_velocities = vec![0.0; 7];
+            inner.tracking.record_issued_in_place(&q_issued, &v_issued, None, None);
+            inner.tracking.last_nominal = Some((q_cmd_wall.to_vec(), vec![0.0; 7]));
+            inner.tracking.history_state = TrackingHistoryState::Issued;
+            inner.servo_stream_active = true;
+            inner.prewarm_rt_buffers();
+        }
+        let period_ns = 20_000_000u64;
+        let handle = sup
+            .start_executor_with_hooks(
+                alloc_cfg(Duration::from_nanos(period_ns)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let gate = RtReleaseGate::new(&sup, &handle);
+        let ((saw_power_limit, cmd_q), delta) =
+            gate.run_phase("immediate_tracking_reject_fallback_static_load_refusal", || {
+                let mut saw_power_limit = false;
+                for _ in 0..3 {
+                    clock.run_steps(period_ns, 1);
+                    if let Some(s) = sup.hub().latest() {
+                        if s.obs.motion_limit.as_ref().map(|m| m.reason)
+                            == Some(MotionLimitReason::Power)
+                        {
+                            saw_power_limit = true;
+                        }
+                    }
+                }
+                let cmd_q = sup.hub().latest().unwrap().rt.commanded_positions.clone();
+                ((saw_power_limit, cmd_q), saw_power_limit)
+            });
+        assert!(
+            delta.is_clean(),
+            "immediate tracking rejection fallback static-load refusal must be zero-alloc/zero-lock: {delta:?}"
+        );
+        assert!(saw_power_limit, "expected MotionLimitReason::Power when fallback step exceeds cap relative to fallback_prev_confirmed");
+        assert!(
+            (cmd_q[1] - q_issued[1]).abs() < 1e-4,
+            "Part F must hold fallback_prev_confirmed J2 ({:.4}), not measured ({:.4}), got {:.4}",
+            q_issued[1],
+            q_measured[1],
+            cmd_q[1]
+        );
+        let frames = wire_log.frames();
+        assert!(!frames.is_empty(), "Part F must record wire frames");
+        for (idx, frame) in frames.iter().enumerate() {
+            let a = predict_static_holding_current_a(&budget, &arm, frame).unwrap();
+            assert!(
+                a <= cap + STATIC_LOAD_EPS_A,
+                "Part F wire frame #{idx} exceeded static cap: {a:.4} A > {cap:.4} A (q={frame:?})"
+            );
+            assert!(
+                (frame[1] - q_issued[1]).abs() < 1e-4,
+                "Part F wire frame #{idx} must hold q_issued J2 ({:.4}), got {:.4}",
+                q_issued[1],
+                frame[1]
+            );
+        }
+
+        tokio::task::spawn_blocking(move || handle.stop_and_join())
+            .await
+            .unwrap();
+    }
+
+    // Part G (R2 Major 1 regression): Final quintic release (`Stepped::Quintic(finished=true)` ->
+    // `active_trajectory = None`, `quintic_settle = Some((act_id, Settle))`) where tracking output
+    // exceeds static cap. The settling action MUST fail with `STATIC_LOAD_LIMIT` and never report
+    // `done` on subsequent accepted releases, with zero allocs/deallocs/locks.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.control_frequency_hz = 50;
+        if let Some(ws) = cfg.workspace.as_mut() {
+            ws.floor_z_m = -1.5;
+            ws.box_min_m = [-1.5, -1.5, -1.5];
+            ws.box_max_m = [1.5, 1.5, 1.5];
+            ws.max_reach_m = Some(1.5);
+            ws.keepout_boxes.clear();
+        }
+        cfg.power_budget.as_mut().unwrap().planning.enabled = false;
+        cfg.power_budget.as_mut().unwrap().static_admission_fraction = Some(0.85);
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = 0.0;
+        let arm = cfg.arm_model.clone();
+        let raw_cap = cfg.power_budget.as_ref().unwrap().static_admission_cap_a().unwrap();
+        let q_low = [0.0f32, -0.35, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_prev_issued = [0.0f32, -0.355, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_end = [0.0f32, -0.358, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let q_lead_est = [0.0f32, -0.365, 1.4, 0.0, 0.0, 0.0, 0.0];
+        let v_nom_in_flight = [0.0f32, -0.40, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v_issued_in_flight = [0.0f32, -0.80, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let i_end = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_end).unwrap();
+        let i_lead = predict_static_holding_current_a(cfg.power_budget.as_ref().unwrap(), &arm, &q_lead_est).unwrap();
+        cfg.power_budget.as_mut().unwrap().static_reserve_a = raw_cap - 0.5 * (i_end + i_lead);
+        let budget = cfg.power_budget.clone().unwrap();
+        let cap = budget.static_admission_cap_a().unwrap();
+        assert!(
+            predict_static_holding_current_a(&budget, &arm, &q_end).unwrap() < cap
+                && predict_static_holding_current_a(&budget, &arm, &q_lead_est).unwrap() > cap
+        );
+
+        let mut joints = vec![JointTrackingJoint::default(); cfg.arm_dof()];
+        joints[1] = JointTrackingJoint {
+            strategy: TrackingStrategy::PositionLead,
+            lag_s: 0.08,
+            max_lead_rad: 0.03,
+            ..Default::default()
+        };
+        cfg.joint_tracking = Some(JointTrackingConfig { enabled: true, joints });
+
+        let clock = ScriptedClock::new();
+        let wire_log = WireWriteLog::new();
+        let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+        drv.enabled = true;
+        drv.q[..7].copy_from_slice(&q_prev_issued);
+        let drv = drv.with_wire_log(Arc::clone(&wire_log));
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        let act_id = 43u64;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.is_torqued = true;
+            inner.torque_intent = armd::supervisor::TorqueIntent::On;
+            inner.safety.set_torque(true).unwrap();
+            inner.measured_positions = q_prev_issued.to_vec();
+            inner.commanded_positions = q_low.to_vec();
+            inner.target_positions = q_low.to_vec();
+            inner.commanded_velocities = v_nom_in_flight.to_vec();
+            inner.tracking.record_issued_in_place(&q_prev_issued, &v_issued_in_flight, None, None);
+            inner.tracking.last_nominal = Some((q_low.to_vec(), v_nom_in_flight.to_vec()));
+            inner.tracking.history_state = TrackingHistoryState::Issued;
+            inner.last_action = Some(
+                serde_json::from_value(serde_json::json!({
+                    "id": act_id,
+                    "kind": "joint_move",
+                    "state": "running",
+                    "progress": 0.0,
+                    "started_at": 0.0,
+                }))
+                .expect("valid ActionStatus"),
+            );
+            let traj = armd::trajectory::MultiJointQuinticTrajectory::new(
+                &q_low,
+                &v_nom_in_flight,
+                &q_end,
+                &[0.0; 7],
+                0.02,
+            )
+            .unwrap();
+            inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, Some(act_id)));
+            inner.prewarm_rt_buffers();
+        }
+        let period_ns = 20_000_000u64;
+        let handle = sup
+            .start_executor_with_hooks(
+                alloc_cfg(Duration::from_nanos(period_ns)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let gate = RtReleaseGate::new(&sup, &handle);
+        let ((action_state, action_code, saw_power_limit), delta) =
+            gate.run_phase("power_static_load_tracking_final_quintic_settle_refusal", || {
+                let mut saw_power_limit = false;
+                for _ in 0..10 {
+                    clock.run_steps(period_ns, 1);
+                    if let Some(s) = sup.hub().latest() {
+                        if s.obs.motion_limit.as_ref().map(|m| m.reason)
+                            == Some(MotionLimitReason::Power)
+                        {
+                            saw_power_limit = true;
+                        }
+                    }
+                }
+                let s = sup.hub().latest().unwrap();
+                let (st, code) = s
+                    .obs
+                    .action
+                    .as_ref()
+                    .filter(|a| a.id == act_id)
+                    .map(|a| (a.state.clone(), a.code.clone()))
+                    .unwrap_or_default();
+                let failed = st == "failed" && code.as_deref() == Some("STATIC_LOAD_LIMIT");
+                ((st, code, saw_power_limit), failed && saw_power_limit)
+            });
+        assert!(
+            delta.is_clean(),
+            "final quintic settle tracking static-load refusal must be zero-alloc/zero-lock: {delta:?}"
+        );
+        assert_eq!(action_state, "failed", "final quintic release refused by static load must NEVER settle to done");
+        assert_eq!(action_code.as_deref(), Some("STATIC_LOAD_LIMIT"));
+        assert!(saw_power_limit);
+        let frames = wire_log.frames();
+        assert!(!frames.is_empty(), "Part G must record wire frames");
+        for (idx, frame) in frames.iter().enumerate() {
+            let a = predict_static_holding_current_a(&budget, &arm, frame).unwrap();
+            assert!(
+                a <= cap + STATIC_LOAD_EPS_A,
+                "Part G wire frame #{idx} exceeded static cap: {a:.4} A > {cap:.4} A"
+            );
+        }
 
         tokio::task::spawn_blocking(move || handle.stop_and_join())
             .await

@@ -12505,11 +12505,13 @@ impl SupervisorInner {
                                 let deferred_action_id = deferred_this
                                     .and_then(extract_id)
                                     .or_else(|| deferred_prev.and_then(extract_id));
+                                let quintic_settle_id = self.quintic_settle.as_ref().map(|(id, _)| *id);
                                 if let Some(action_id) = self
                                     .active_trajectory
                                     .as_ref()
                                     .and_then(|a| a.action_id)
                                     .or(deferred_action_id)
+                                    .or(quintic_settle_id)
                                 {
                                     self.abort_planned_motion_static_load_rt(Some(action_id));
                                 } else if self.active_trajectory.is_some()
@@ -12667,13 +12669,32 @@ impl SupervisorInner {
                                     );
                                 }
                                 crate::tracking::TrackingReject::WorkspaceRt(ws_rt) => {
-                                    tracing::warn!("Joint tracking output violated workspace ({}: {}): terminating motion", ws_rt.code(), ws_rt.phase);
+                                    if !self.safety.deferred_logging() {
+                                        tracing::warn!(
+                                            "Joint tracking output violated workspace ({}: {}): terminating motion",
+                                            ws_rt.code(),
+                                            ws_rt.phase
+                                        );
+                                    }
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
                                     self.safety.latch(
                                         crate::safety::FaultKind::Other,
                                         crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
                                             let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {} ({})", ws_rt.code(), ws_rt.phase));
+                                        }),
+                                    );
+                                }
+                                crate::tracking::TrackingReject::JointLimitRt(jl_rt) => {
+                                    if !self.safety.deferred_logging() {
+                                        tracing::warn!("Joint tracking output exceeded limits ({jl_rt}): terminating motion");
+                                    }
+                                    self.hold_measured_pose();
+                                    self.drop_macro_run("failed", Some("JOINT_LIMIT"));
+                                    self.safety.latch(
+                                        crate::safety::FaultKind::JointLimit,
+                                        crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
+                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {jl_rt}"));
                                         }),
                                     );
                                 }
