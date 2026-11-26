@@ -28,7 +28,11 @@ fn b601_limits() -> Vec<DamiaoLimits> {
 
 /// Bus with a deterministic clock shared with the driver: freshness and reply timeouts do not
 /// depend on wall-clock load.
-fn clocked_bus() -> FakeBus { FakeBus::with_clock(&b601_limits(), armd::transport::MockClock::new()) }
+fn clocked_bus() -> FakeBus {
+    let bus = FakeBus::with_clock(&b601_limits(), armd::transport::MockClock::new());
+    bus.with(|s| s.tx_step = std::time::Duration::from_micros(50));
+    bus
+}
 
 fn driver_on(bus: &FakeBus) -> DamiaoArmDriver<FakeBus> {
     DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(b601_limits()).unwrap()
@@ -344,7 +348,10 @@ fn active_rig(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus) {
 fn active_rig_clocked(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus, armd::transport::MockClock) {
     let clock = armd::transport::MockClock::new();
     let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
-    bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i] + if i == 3 { zero_j4 } else { 0.0 }; });
+    bus.with(|s| {
+        s.tx_step = std::time::Duration::from_micros(50);
+        for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i] + if i == 3 { zero_j4 } else { 0.0 }; }
+    });
     let mut d = disabled_driver(&bus);
     d.check_mapping_ranges();
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));

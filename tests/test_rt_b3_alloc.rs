@@ -1701,6 +1701,7 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     bus.with(|s| {
         s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
         s.immediate_replies = true;
+        s.tx_step = Duration::from_micros(50);
         s.push_all_feedback();
     });
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
@@ -2568,6 +2569,7 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         bus.with(|s| {
             s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             s.push_all_feedback();
         });
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
@@ -3514,6 +3516,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         bus.with(|s| {
             s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             s.push_all_feedback();
         });
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
