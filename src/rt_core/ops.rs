@@ -2866,10 +2866,13 @@ impl<O: CoreOps> ReleaseFixture<O> {
             if report.wakes == MAX_SERVICE_WAKES || self.clock.now() >= exec_cutoff { break; }
             report.wakes += 1;
             self.clock.advance(wake.saturating_duration_since(self.clock.now()));
+            let post_exec_optional_cutoff = release_deadline
+                .checked_sub(crate::driver::OPTIONAL_WORK_RELEASE_MARGIN.min(period / 3))
+                .unwrap_or(started);
             let post_cutoff = if is_urgent || self.engine.has_pending_urgent(&self.core) {
                 urgent_cutoff
             } else {
-                optional_cutoff
+                post_exec_optional_cutoff
             };
             if self.clock.now() >= post_cutoff { break; }
             self.engine.service_wake_with_clock(&mut self.core, &mut now_fn, release_deadline, next_gen, &mut report);

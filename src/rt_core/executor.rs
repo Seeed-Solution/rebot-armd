@@ -9978,10 +9978,16 @@ fn control_thread_main_inner(
                         step_wake_sleep_ns = step_wake_sleep_ns
                             .saturating_add(now_ns_fn().saturating_sub(sleep_t0_ns));
                     }
+                    let post_exec_optional_cutoff = release_deadline
+                        .checked_sub(
+                            crate::driver::OPTIONAL_WORK_RELEASE_MARGIN
+                                .min(Duration::from_nanos(release_period_ns / 3)),
+                        )
+                        .unwrap_or(release_start);
                     let post_cutoff = if is_urgent || engine.has_pending_urgent(&*core) {
                         urgent_wake_cutoff
                     } else {
-                        optional_wake_cutoff
+                        post_exec_optional_cutoff
                     };
                     if control_stop.load(Ordering::Acquire) || now_inst() >= post_cutoff {
                         break;

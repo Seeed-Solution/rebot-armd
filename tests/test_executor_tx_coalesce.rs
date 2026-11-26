@@ -1499,12 +1499,14 @@ fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() 
         .map(|r| r.limits())
         .collect();
     let gripper = gripper_drive_from_profile(&cfg).unwrap();
+    let mut rf_budget = cfg.damiao_tx_budget();
+    rf_budget.max_frames = 24;
     let mut rf_drv = DamiaoArmDriver::new(rf_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits)
         .unwrap()
         .with_gripper_drive(gripper)
         .unwrap()
-        .with_tx_budget(cfg.damiao_tx_budget());
+        .with_tx_budget(rf_budget);
     rf_drv.read_joint_states().unwrap();
     rf_inner.with(|s| s.push_all_feedback_now());
     rf_drv.read_joint_states().unwrap();
