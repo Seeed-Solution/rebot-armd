@@ -2887,9 +2887,559 @@ impl armd::grasp::DetectionSource for StubDetectionSource {
     }
 }
 
+/// Preemption-aware 2 ms bound matching `tests/test_legacy_torque_lock.rs` (`fix/flaky-rc`):
+/// every hold must have `sleep_us == 0`, on-CPU hold (`CLOCK_THREAD_CPUTIME_ID`) <= 2 ms,
+/// and unpreempted (`involuntary_csw == 0`) wall hold <= 2 ms.
+fn assert_all_holds_bounded_2ms(holds: &[armd::supervisor_lock::HoldRecord], label: &str) {
+    assert!(!holds.is_empty(), "expected recorded SupervisorLock holds during {label}");
+    for h in holds {
+        assert_eq!(
+            h.io_timing.map_or(0, |io| io.sleep_us),
+            0,
+            "SupervisorLock guard must never sleep during {label}: {h:?}"
+        );
+        if let Some(cpu) = h.cpu_hold {
+            assert!(
+                cpu <= Duration::from_millis(2),
+                "EVERY SupervisorLock guard on-CPU hold during {label} must stay <= 2 ms (cpu={cpu:?}, wall={:?}, hold={h:?})",
+                h.hold(),
+            );
+        }
+        if h.involuntary_csw == 0 {
+            assert!(
+                h.hold() <= Duration::from_millis(2),
+                "EVERY unpreempted SupervisorLock guard hold during {label} must stay <= 2 ms (wall={:?}, hold={h:?})",
+                h.hold(),
+            );
+        }
+    }
+}
+
+fn summarize_holds(holds: &[armd::supervisor_lock::HoldRecord]) -> (u64, u64, u64, u64) {
+    use armd::supervisor_lock::HoldKind;
+    let mut max_read_wall = 0u64;
+    let mut max_read_cpu = 0u64;
+    let mut max_write_wall = 0u64;
+    let mut max_write_cpu = 0u64;
+    for h in holds {
+        let wall = h.hold().as_micros() as u64;
+        let cpu = h.cpu_hold.map_or(wall, |c| c.as_micros() as u64);
+        match h.kind {
+            HoldKind::Read => {
+                max_read_wall = max_read_wall.max(wall);
+                max_read_cpu = max_read_cpu.max(cpu);
+            }
+            HoldKind::Write => {
+                max_write_wall = max_write_wall.max(wall);
+                max_write_cpu = max_write_cpu.max(cpu);
+            }
+        }
+    }
+    (max_read_wall, max_read_cpu, max_write_wall, max_write_cpu)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_ws_ordinary_owner_handlers_lock_hold_under_2ms_with_real_planning() {
     Box::pin(run_legacy_ws_ordinary_owner_handlers_lock_hold_audit()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_recording_start_active_sampling_during_motion_and_stop_lock_holds_under_2ms() {
+    use armd::api::create_router;
+    use armd::recording::{write_frames_to_parquet, EpisodeSidecar, JointZeroStamp, RecordFrame};
+    use common::{TestArm, INSPECT};
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let episodes_dir = tmp.path().join("episodes");
+    std::fs::create_dir_all(&episodes_dir).unwrap();
+
+    // Seed 30 existing episodes so `GET /api/v1/episodes` and `view` exercise real catalog work.
+    let seed_frames: Vec<RecordFrame> = (0..10)
+        .map(|k| RecordFrame {
+            timestamp: 1.0 + k as f64 * 0.02,
+            observation_state: INSPECT.to_vec(),
+            action: INSPECT.to_vec(),
+        })
+        .collect();
+    for idx in 0..30usize {
+        let id = format!("ep_seed_{idx:03}");
+        let p = episodes_dir.join(format!("{id}.parquet"));
+        write_frames_to_parquet(&p, &seed_frames).unwrap();
+        let sc = EpisodeSidecar {
+            id: id.clone(),
+            dataset: "default".into(),
+            task: format!("seed task {idx}"),
+            source: "sdk".into(),
+            sequence_id: None,
+            repeat_index: None,
+            outcome: "ok".into(),
+            recorded_at: format!("2026-11-26T00:00:{:02}.000Z", idx % 60),
+            duration_s: 0.2,
+            frames: seed_frames.len(),
+            joint_names: (1..=7).map(|j| format!("joint_{j}")).collect(),
+            units: "rad".into(),
+            joint_zero: JointZeroStamp::of(&[0.0; 7]),
+            profile_id: Some("rebot_b601dm".into()),
+            armd_version: env!("CARGO_PKG_VERSION").into(),
+            fps_nominal: 50.0,
+            truncated: false,
+            stopped_by: None,
+            arm_dof: Some(6),
+            gripper_joint: Some(6),
+            recovered: None,
+            first_state: Some(INSPECT.to_vec()),
+            last_state: Some(INSPECT.to_vec()),
+            tool_id: None,
+            tool_config_digest: None,
+            has_gripper_motion: Some(false),
+            frames_dropped: None,
+        };
+        std::fs::write(
+            episodes_dir.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&sc).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let cfg = dm_config_with_planning_load();
+    let arm = TestArm::new();
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(arm.clone())));
+    sup.set_episodes_dir(Some(episodes_dir.clone())).await;
+    sup.ensure_episodes_loaded().await.unwrap();
+
+    let router = create_router(sup.clone(), OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    // Concurrent 50 Hz legacy control tick loop.
+    let ticker_stop = Arc::new(AtomicBool::new(false));
+    let ticker_stop_bg = ticker_stop.clone();
+    let ticker_sup = sup.clone();
+    let ticker_jh = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        while !ticker_stop_bg.load(Ordering::Acquire) {
+            interval.tick().await;
+            ticker_sup.tick(0.02).await;
+        }
+    });
+
+    let _ = tokio::task::spawn_blocking(|| {}).await;
+    let (mut ws, gen) = common::controller(addr).await;
+    let (mut rec_ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .unwrap();
+    let ep = sup.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    reset_test_arm_state(&arm, &sup, INSPECT).await;
+
+    // Enable per-hold CPU + preemption history recording before recording start.
+    sup.inner().set_hold_history_enabled(true);
+    let _ = sup.inner().take_hold_history();
+
+    // 1. Start recording via lease-free WS command (first recording allocates RecordRing off-lock).
+    let start_ack = common::ws_reply(
+        &mut rec_ws,
+        json!({
+            "type": "command",
+            "request_id": 1,
+            "client_id": "rec_lock_probe",
+            "path": "/api/v1/record/start",
+            "body": {"dataset": "default", "task": "motion_sampling", "source": "sdk"}
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(start_ack["type"], "command_ack", "{start_ack}");
+    let rec_id = start_ack["recording_id"].as_str().unwrap().to_string();
+    let start_holds = sup.inner().take_hold_history();
+
+    // 2a. Quiet active-recording window (> 1 monitor period with no REST/WS teach traffic):
+    //     drive real motion so frames capture motion AND verify `teach::monitor` acquires ZERO
+    //     SupervisorLock guards (neither Read nor Write) during normal recording.
+    let mut jog_t = INSPECT.to_vec();
+    jog_t[0] += 0.18;
+    jog_t[3] -= 0.10;
+    let ep = sup.get_observation().await.epoch_id;
+    let jog_ack = common::rpc(
+        &mut ws,
+        gen,
+        ep,
+        "/api/v1/motion/jog",
+        json!({"target_positions": jog_t, "duration_secs": 0.4}),
+    )
+    .await;
+    assert_eq!(jog_ack["type"], "command_ack", "{jog_ack}");
+    let jog_holds = sup.inner().take_hold_history();
+
+    tokio::time::sleep(Duration::from_millis(320)).await;
+    let quiet_monitor_holds = sup.inner().take_hold_history();
+    let monitor_teach_holds: Vec<_> = quiet_monitor_holds
+        .iter()
+        .copied()
+        .filter(|h| !h.is_control_tick && h.location.file().ends_with("teach.rs"))
+        .collect();
+    assert!(
+        monitor_teach_holds.is_empty(),
+        "teach::monitor must acquire ZERO SupervisorLock guards during active sampling: {monitor_teach_holds:?}"
+    );
+
+    // 2b. Poll GET /api/v1/episodes concurrently while recording is still active (lists + serializes 30+ episodes).
+    let http = reqwest::Client::new();
+    let sample_until = Instant::now() + Duration::from_millis(380);
+    while Instant::now() < sample_until {
+        let resp = http.get(format!("http://{addr}/api/v1/episodes")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["recording"]["recording_id"], rec_id);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    let active_sampling_holds = sup.inner().take_hold_history();
+
+    // 3. Stop and save recording via WS command while 50 Hz ticks continue.
+    let stop_ack = common::ws_reply(
+        &mut rec_ws,
+        json!({
+            "type": "command",
+            "request_id": 2,
+            "client_id": "rec_lock_probe",
+            "path": "/api/v1/record/stop",
+            "body": {"save": true, "outcome": "ok"}
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(stop_ack["type"], "command_ack", "{stop_ack}");
+    let saved_frames = stop_ack["episode"]["frames"].as_u64().unwrap_or(0);
+    assert!(saved_frames >= 15, "expected active sampling during motion, got {saved_frames} frames");
+    let saved_parquet = episodes_dir.join(format!("{rec_id}.parquet"));
+    let recorded = armd::read_frames_from_parquet(&saved_parquet).expect("read saved episode parquet");
+    assert_eq!(recorded.len() as u64, saved_frames);
+    let q0_span = recorded
+        .iter()
+        .map(|f| f.observation_state[0])
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    assert!(
+        (q0_span.1 - q0_span.0) > 0.05,
+        "saved episode must record active motion on J1 (observed span {q0_span:?})"
+    );
+
+    // 4. Start a second recording immediately after saving and discard it (verifies no large
+    //    frame-buffer deallocation occurs inside the write lock on restart or discard).
+    let start2_ack = common::ws_reply(
+        &mut rec_ws,
+        json!({
+            "type": "command",
+            "request_id": 3,
+            "client_id": "rec_lock_probe",
+            "path": "/api/v1/record/start",
+            "body": {"dataset": "default", "task": "discard_probe", "source": "sdk"}
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(start2_ack["type"], "command_ack", "{start2_ack}");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let discard_ack = common::ws_reply(
+        &mut rec_ws,
+        json!({
+            "type": "command",
+            "request_id": 4,
+            "client_id": "rec_lock_probe",
+            "path": "/api/v1/record/stop",
+            "body": {"save": false}
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(discard_ack["type"], "command_ack", "{discard_ack}");
+    assert_eq!(discard_ack["discarded"], true);
+
+    let mut holds = start_holds;
+    holds.extend(jog_holds);
+    holds.extend(quiet_monitor_holds);
+    holds.extend(active_sampling_holds);
+    holds.extend(sup.inner().take_hold_history());
+    sup.inner().set_hold_history_enabled(false);
+    ticker_stop.store(true, Ordering::Release);
+    let _ = ticker_jh.await;
+
+    let non_tick: Vec<_> = holds.iter().copied().filter(|h| !h.is_control_tick).collect();
+    let teach_holds: Vec<_> = non_tick
+        .iter()
+        .copied()
+        .filter(|h| h.location.file().ends_with("teach.rs") || h.location.file().ends_with("rest.rs"))
+        .collect();
+    let (r_wall, r_cpu, w_wall, w_cpu) = summarize_holds(&non_tick);
+    let (tr_wall, tr_cpu, tw_wall, tw_cpu) = summarize_holds(&teach_holds);
+    eprintln!(
+        "[REC_LOCK_HOLD] frames={saved_frames} all_non_tick(n={}): read_max={r_wall}us(cpu={r_cpu}us) write_max={w_wall}us(cpu={w_cpu}us) | teach+rest(n={}): read_max={tr_wall}us(cpu={tr_cpu}us) write_max={tw_wall}us(cpu={tw_cpu}us)",
+        non_tick.len(),
+        teach_holds.len(),
+    );
+    assert!(
+        !teach_holds.is_empty(),
+        "expected recorded teach/rest holds during start/sample/stop"
+    );
+    assert_all_holds_bounded_2ms(&non_tick, "recording start/sample/motion/stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_ws_unload_and_park_presets_lock_holds_under_2ms_with_off_lock_planning() {
+    use armd::api::create_router_calibration;
+    use armd::api::proxy::DetectorUpstream;
+    use armd::calibration::CalibrationDeps;
+    use armd::diagnostics::DiagnosticsState;
+    use armd::grasp::GraspDeps;
+    use common::{TestArm, INSPECT};
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let keepout_path = tmp.path().join("keepout.json");
+    let gripper_calib_path = tmp.path().join("gripper_calib.json");
+    let commissioning_path = tmp.path().join("tool_commissioning.json");
+    let calib_path = tmp.path().join("calibration.json");
+    let setup_path = tmp.path().join("grasp_setup.json");
+
+    let mut cfg = dm_config_with_planning_load();
+    if let Some(ws) = cfg.workspace.as_mut() {
+        ws.keepout_boxes.push(KeepoutBox {
+            name: "rear_box".into(),
+            min_m: [-0.55, -0.45, 0.05],
+            max_m: [-0.35, -0.25, 0.25],
+        });
+    }
+    let arm = TestArm::new();
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(arm.clone())));
+    // Run startup loaders exactly like real boot to verify the very first unload hits the cache.
+    armd::keepout::load_into(&sup, &keepout_path).await.unwrap();
+    armd::gripper_calib::load_into(&sup, &gripper_calib_path).await;
+    armd::tool::load_commissioning_into(&sup, &commissioning_path).await;
+    armd::calibration::load_into(&sup, &calib_path, None).await.unwrap();
+
+    let up = DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let grasp_deps = GraspDeps {
+        source: Arc::new(StubDetectionSource),
+        setup_path: Some(setup_path.clone()),
+    };
+    let mut calib_deps = CalibrationDeps::new(calib_path.clone(), Some(setup_path.clone()), up.clone());
+    calib_deps.backup_dir = tmp.path().join("backups");
+    let router = create_router_calibration(
+        sup.clone(),
+        up,
+        grasp_deps,
+        DiagnosticsState::global(),
+        calib_deps,
+        OperatorAuth::disabled(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let ticker_stop = Arc::new(AtomicBool::new(false));
+    let ticker_stop_bg = ticker_stop.clone();
+    let ticker_sup = sup.clone();
+    let ticker_jh = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        while !ticker_stop_bg.load(Ordering::Acquire) {
+            interval.tick().await;
+            ticker_sup.tick(0.02).await;
+        }
+    });
+
+    let _ = tokio::task::spawn_blocking(|| {}).await;
+    let (mut ws, gen) = common::controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    reset_test_arm_state(&arm, &sup, INSPECT).await;
+
+    let cases: [(&str, bool, &str, Option<Vec<f32>>); 5] = [
+        ("/api/v1/motion/unload", false, "/api/v1/motion/unload", None),
+        ("preset:unload", true, "unload", None),
+        ("preset:park", true, "park", None),
+        ("preset:home", true, "home", None),
+        ("preset:custom", true, "custom_pose", Some({ let mut q = INSPECT.to_vec(); q[0] -= 0.18; q })),
+    ];
+
+    for (label, is_preset, target, pos_opt) in cases {
+        let pq_before = sup.inner().read().await.prepared_quintics_used;
+        sup.inner().set_hold_history_enabled(true);
+        let _ = sup.inner().take_hold_history();
+
+        let ep = sup.get_observation().await.epoch_id;
+        if is_preset {
+            let r = common::preset(&mut ws, gen, ep, target, pos_opt).await;
+            assert_eq!(r["type"], "preset_ack", "{label}: {r}");
+        } else {
+            let r = common::rpc(&mut ws, gen, ep, target, json!({})).await;
+            assert_eq!(r["type"], "command_ack", "{label}: {r}");
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let holds = sup.inner().take_hold_history();
+        sup.inner().set_hold_history_enabled(false);
+        let non_tick: Vec<_> = holds.iter().copied().filter(|h| !h.is_control_tick).collect();
+        let (r_wall, r_cpu, w_wall, w_cpu) = summarize_holds(&non_tick);
+        eprintln!(
+            "[UNLOAD_LOCK_HOLD] {label:<24} n={:<3} read_max={r_wall:>4}us(cpu={r_cpu:>4}us) write_max={w_wall:>4}us(cpu={w_cpu:>4}us)",
+            non_tick.len(),
+        );
+        assert_all_holds_bounded_2ms(&non_tick, label);
+        assert!(
+            sup.inner().read().await.prepared_quintics_used > pq_before,
+            "{label} must install via off-lock PreparedMotionSlot"
+        );
+
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+        if !sup.get_observation().await.is_torqued {
+            let ep = sup.get_observation().await.epoch_id;
+            let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+            assert_eq!(ack["type"], "command_ack", "re-torque after {label}: {ack}");
+            reset_test_arm_state(&arm, &sup, INSPECT).await;
+        }
+    }
+
+    // 2. Runtime config mutation (keepout activation) -> very first unload afterwards must hit
+    //    the refreshed off-lock motion config cache and stay <= 2 ms.
+    let ep = sup.get_observation().await.epoch_id;
+    let ko_ack = common::rpc(
+        &mut ws,
+        gen,
+        ep,
+        "/api/v1/workspace/keepout",
+        json!({"boxes": [{"name": "post_mut_box", "min_m": [0.45, -0.45, 0.05], "max_m": [0.55, -0.35, 0.20]}]}),
+    )
+    .await;
+    assert_eq!(ko_ack["type"], "command_ack", "keepout activation: {ko_ack}");
+    {
+        let pq_before = sup.inner().read().await.prepared_quintics_used;
+        sup.inner().set_hold_history_enabled(true);
+        let _ = sup.inner().take_hold_history();
+        let ep = sup.get_observation().await.epoch_id;
+        let r = common::rpc(&mut ws, gen, ep, "/api/v1/motion/unload", json!({})).await;
+        assert_eq!(r["type"], "command_ack", "post-mutation unload: {r}");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let holds = sup.inner().take_hold_history();
+        sup.inner().set_hold_history_enabled(false);
+        let non_tick: Vec<_> = holds.iter().copied().filter(|h| !h.is_control_tick).collect();
+        let (r_wall, r_cpu, w_wall, w_cpu) = summarize_holds(&non_tick);
+        eprintln!(
+            "[UNLOAD_LOCK_HOLD] {:<24} n={:<3} read_max={r_wall:>4}us(cpu={r_cpu:>4}us) write_max={w_wall:>4}us(cpu={w_cpu:>4}us)",
+            "unload(post_keepout)",
+            non_tick.len(),
+        );
+        assert_all_holds_bounded_2ms(&non_tick, "unload(post_keepout)");
+        assert!(sup.inner().read().await.prepared_quintics_used > pq_before);
+        reset_test_arm_state(&arm, &sup, INSPECT).await;
+        if !sup.get_observation().await.is_torqued {
+            let ep = sup.get_observation().await.epoch_id;
+            let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+            assert_eq!(ack["type"], "command_ack", "{ack}");
+            reset_test_arm_state(&arm, &sup, INSPECT).await;
+        }
+    }
+
+    // 3. Deferred park continuation (`holding_after_clear` -> `/api/v1/motion/unload` ->
+    //    `spawn_park_continuation` off-lock planning + short install) must keep every hold <= 2 ms.
+    {
+        let ep = sup.get_observation().await.epoch_id;
+        let estop_res = sup.trigger_e_stop().await;
+        assert!(estop_res.1 > ep);
+        let ep = sup.get_observation().await.epoch_id;
+        let clr = common::rpc(&mut ws, gen, ep, "/api/v1/safety/clear_fault", json!({})).await;
+        assert_eq!(clr["type"], "command_ack", "clear_fault for holding_after_clear: {clr}");
+        assert!(sup.inner().read().await.holding_after_clear());
+
+        let pq_before = sup.inner().read().await.prepared_quintics_used;
+        sup.inner().set_hold_history_enabled(true);
+        let _ = sup.inner().take_hold_history();
+        let ep = sup.get_observation().await.epoch_id;
+        let r = common::rpc(&mut ws, gen, ep, "/api/v1/motion/unload", json!({})).await;
+        assert_eq!(r["type"], "command_ack", "deferred continuation unload: {r}");
+        let wait_until = Instant::now() + Duration::from_secs(2);
+        while sup.inner().read().await.prepared_quintics_used == pq_before && Instant::now() < wait_until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            sup.inner().read().await.prepared_quintics_used > pq_before,
+            "deferred park continuation must install planned quintic off-lock"
+        );
+        let holds = sup.inner().take_hold_history();
+        sup.inner().set_hold_history_enabled(false);
+        let non_tick: Vec<_> = holds.iter().copied().filter(|h| !h.is_control_tick).collect();
+        let (r_wall, r_cpu, w_wall, w_cpu) = summarize_holds(&non_tick);
+        eprintln!(
+            "[UNLOAD_LOCK_HOLD] {:<24} n={:<3} read_max={r_wall:>4}us(cpu={r_cpu:>4}us) write_max={w_wall:>4}us(cpu={w_cpu:>4}us)",
+            "unload(deferred_cont)",
+            non_tick.len(),
+        );
+        assert_all_holds_bounded_2ms(&non_tick, "unload(deferred_cont)");
+    }
+
+    ticker_stop.store(true, Ordering::Release);
+    let _ = ticker_jh.await;
+
+    // 4. Regression check: explicitly disabled PowerBudget (`enabled: false`) survives a config
+    //    activation without hashing the disabled budget to nonzero (must not fail with PLAN_STALE).
+    {
+        let mut pb_cfg = dm_config_with_planning_load();
+        if let Some(pb) = pb_cfg.power_budget.as_mut() {
+            pb.enabled = false;
+        }
+        let pb_arm = TestArm::new();
+        let pb_sup = Arc::new(ArmSupervisor::new(pb_cfg).with_driver(Box::new(pb_arm.clone())));
+        let pb_keepout = tmp.path().join("pb_keepout.json");
+        armd::keepout::load_into(&pb_sup, &pb_keepout).await.unwrap();
+        let pb_router = create_router(pb_sup.clone(), OperatorAuth::disabled());
+        let pb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pb_addr = pb_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(pb_listener, pb_router).await.unwrap() });
+        let pb_stop = Arc::new(AtomicBool::new(false));
+        let pb_stop_bg = pb_stop.clone();
+        let pb_tick_sup = pb_sup.clone();
+        let pb_jh = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            while !pb_stop_bg.load(Ordering::Acquire) {
+                interval.tick().await;
+                pb_tick_sup.tick(0.02).await;
+            }
+        });
+        let (mut pb_ws, pb_gen) = common::controller(pb_addr).await;
+        let ep = pb_sup.get_observation().await.epoch_id;
+        let ack = common::rpc(&mut pb_ws, pb_gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        reset_test_arm_state(&pb_arm, &pb_sup, INSPECT).await;
+        let ws_before = pb_sup.inner().read().await.workspace_revision;
+        let ep = pb_sup.get_observation().await.epoch_id;
+        let ko = common::rpc(
+            &mut pb_ws,
+            pb_gen,
+            ep,
+            "/api/v1/workspace/keepout",
+            json!({"boxes": [{"name": "disabled_pb_box", "min_m": [0.45, -0.45, 0.05], "max_m": [0.55, -0.35, 0.20]}]}),
+        )
+        .await;
+        assert_eq!(ko["type"], "command_ack", "{ko}");
+        let ws_after = pb_sup.inner().read().await.workspace_revision;
+        assert!(ws_after > ws_before, "keepout activation must bump workspace_revision");
+        let cached_pb = pb_sup.hub().legacy_motion_config().expect("legacy motion config cached");
+        assert_eq!(
+            cached_pb.workspace_revision, ws_after,
+            "config activation must refresh legacy_motion_config to the activated workspace_revision"
+        );
+        assert_eq!(
+            cached_pb.power_budget_hash, 0,
+            "disabled PowerBudget must hash to 0 in cached MotionConfigSnapshot"
+        );
+        let ep = pb_sup.get_observation().await.epoch_id;
+        let unload_ack = common::rpc(&mut pb_ws, pb_gen, ep, "/api/v1/motion/unload", json!({})).await;
+        assert_eq!(unload_ack["type"], "command_ack", "disabled-PowerBudget unload must not PLAN_STALE: {unload_ack}");
+        pb_stop.store(true, Ordering::Release);
+        let _ = pb_jh.await;
+    }
 }
 
 async fn reset_test_arm_state(arm: &common::TestArm, sup: &Arc<ArmSupervisor>, q: [f32; 7]) {
@@ -3110,6 +3660,8 @@ async fn run_legacy_ws_ordinary_owner_handlers_lock_hold_audit() {
 
     let mut measurements: Vec<(&'static str, u32, String)> = Vec::new();
     tokio::time::sleep(Duration::from_millis(45)).await;
+    sup.inner().set_hold_history_enabled(true);
+    let _ = sup.inner().take_hold_history();
 
     // --- 1. Motion family (jog/move_joints, home, unload, presets, gravity_comp) ---
     let mut jog_t = INSPECT.to_vec();
@@ -3132,6 +3684,7 @@ async fn run_legacy_ws_ordinary_owner_handlers_lock_hold_audit() {
     for (label, name, pos_opt) in [
         ("preset:home", "home", None),
         ("preset:park", "park", None),
+        ("preset:unload", "unload", None),
         ("preset:custom", "custom_pose", Some({ let mut q = INSPECT.to_vec(); q[0] -= 0.20; q })),
     ] {
         let before = sup.tick_samples().len();
@@ -3309,18 +3862,14 @@ async fn run_legacy_ws_ordinary_owner_handlers_lock_hold_audit() {
         measurements.push(("acquire_lease", max_hold, "lease_granted".into()));
     }
 
+    let audit_holds = sup.inner().take_hold_history();
+    sup.inner().set_hold_history_enabled(false);
     ticker_stop.store(true, Ordering::Release);
     let _ = ticker_jh.await;
 
-    let mut over_2ms = Vec::new();
     for (label, hold_us, tag) in &measurements {
         eprintln!("[WS_LOCK_HOLD] {label:<36} writer_hold_us={hold_us:>6} reply={tag}");
-        if *hold_us > 2_000 {
-            over_2ms.push((*label, *hold_us));
-        }
     }
-    assert!(
-        over_2ms.is_empty(),
-        "WS ordinary owner handlers exceeded 2 ms write-lock hold budget: {over_2ms:?}\nAll measurements: {measurements:?}"
-    );
+    let non_tick: Vec<_> = audit_holds.iter().copied().filter(|h| !h.is_control_tick).collect();
+    assert_all_holds_bounded_2ms(&non_tick, "WS ordinary owner handlers audit");
 }
