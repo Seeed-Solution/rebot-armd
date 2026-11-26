@@ -1625,6 +1625,9 @@ pub struct PersistTestHooks {
     /// Runs on `armd-persist` in zero-check reconciliation after the worker-side operator sample
     /// and before `FinishReconcile` is queued (tests owner-side grant validation at commit time).
     pub before_finish_reconcile: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `armd-persist` after the pre-rename authority recheck and immediately before the
+    /// rename (tests the cancellation boundary at the file commit point).
+    pub before_rename_after_verify: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Fault-injection hook: panics in `control_thread_main` startup setup BEFORE `init_res`
     /// `catch_unwind` to verify outer unwind ownership retention.
     pub panic_in_startup_setup: bool,
@@ -8434,6 +8437,7 @@ fn spawn_persist_worker(
                 reservation: None,
                 proposal: None,
                 auth: None,
+                activation_rejected: false,
             };
             let res = super::requests::config::run_common_commit_sync(&mut backend);
             if matches!(res, Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected))
@@ -8463,6 +8467,8 @@ struct ExecutorPersistBackend<'a> {
     reservation: Option<Reservation>,
     proposal: Option<ConfigProposal>,
     auth: Option<super::requests::config::ConfigAuthContext>,
+    /// Set when the owner refused `Activate` after the rename (see `activation_rejected`).
+    activation_rejected: bool,
 }
 
 impl ExecutorPersistBackend<'_> {
@@ -8888,7 +8894,10 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
             msg_buf: String::with_capacity(160),
         });
         if !self.hooks.leave_final_reply_queued {
-            if let Some(PersistReply::Activated { activated_revision, .. }) = self.wait_reply() {
+            let reply = self.wait_reply();
+            self.activation_rejected =
+                matches!(reply, Some(ref r) if !matches!(r, PersistReply::Activated { .. }));
+            if let Some(PersistReply::Activated { activated_revision, .. }) = reply {
                 let prep_pol = pub_policy.clone();
                 self.published_config.apply_zero_check_commit(
                     self.job.offset_rad,
@@ -8935,6 +8944,16 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
 
     async fn reconcile_rename_join_error(&mut self, _err: String) -> Self::Err {
         super::requests::config::ZeroCheckCommitStop::Aborted
+    }
+
+    fn on_rename_starting(&mut self) {
+        if let Some(h) = self.hooks.before_rename_after_verify.as_ref() {
+            h();
+        }
+    }
+
+    fn activation_rejected(&self) -> bool {
+        self.activation_rejected
     }
 
     fn worker_disconnected_err(&mut self) -> Self::Err {

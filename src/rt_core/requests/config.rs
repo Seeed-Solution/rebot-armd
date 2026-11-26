@@ -4392,7 +4392,70 @@ pub(crate) trait CommonCommitWorker: Send {
     fn preserve_marker_on_abort(&self) -> bool {
         false
     }
+    /// Step 6 outcome after a rename: `true` only when the live owner definitively refused the
+    /// activation (the old configuration stays live). The worker then restores the previous file
+    /// contents before reporting the rejection, so a restart loads the configuration that was
+    /// live. `false` on success or when the activation outcome is unknown.
+    fn activation_rejected(&self) -> bool {
+        false
+    }
     fn worker_disconnected_err(&mut self) -> Self::Err;
+}
+
+/// Target file contents captured before the rename, for [`rollback_rejected_publish`].
+enum PriorFile {
+    Absent,
+    Content(String),
+}
+
+/// Reads the current contents of every target path; `None` when any target cannot be read
+/// (rollback is then unavailable and the reconciling hold is the only protection).
+fn snapshot_prior_files(paths: Vec<PathBuf>) -> Option<Vec<(PathBuf, PriorFile)>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let prior = match std::fs::read_to_string(&path) {
+            Ok(text) => PriorFile::Content(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PriorFile::Absent,
+            Err(e) => {
+                tracing::warn!(
+                    "Cannot snapshot {} before commit ({e}); rollback after a rejected activation unavailable",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        out.push((path, prior));
+    }
+    Some(out)
+}
+
+/// Cancellation boundary at the file commit point: the owner refused activation after the rename,
+/// so put the previous contents back (rename-over or remove, then parent-directory fsync).
+fn rollback_rejected_publish(prior: Vec<(PathBuf, PriorFile)>) {
+    for (path, prior) in prior {
+        let res = match prior {
+            PriorFile::Content(text) => crate::persist::write_atomic_outcome(&path, &text),
+            PriorFile::Absent => match std::fs::remove_file(&path) {
+                Ok(()) => Ok(PendingDirSync::for_path(&path).sync_parent_dir()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PublishOutcome::Published),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        match res {
+            Ok(PublishOutcome::Published) => tracing::warn!(
+                "Activation refused after disk publish; restored previous {}",
+                path.display()
+            ),
+            Ok(PublishOutcome::PublishedDurabilityUnconfirmed(w)) => tracing::error!(
+                "Activation refused after disk publish; restored previous {} but dir fsync failed: {w}",
+                path.display()
+            ),
+            Err(e) => tracing::error!(
+                "Activation refused after disk publish; restoring previous {} failed: {e}",
+                path.display()
+            ),
+        }
+    }
 }
 
 enum StagedFileOp {
@@ -4478,6 +4541,24 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
             pending_marker,
             existing_marker,
         } => (ops, pending_marker, existing_marker),
+    };
+
+    // 1c. Snapshot the current target contents so a post-rename activation refusal can restore
+    //     them (see step 6).
+    let mut prior_files = if file_ops.is_empty() {
+        None
+    } else {
+        let paths: Vec<PathBuf> = file_ops
+            .iter()
+            .map(|op| match op {
+                FileWriteOp::Replace(pw) => pw.path.clone(),
+                FileWriteOp::Remove(p) => p.clone(),
+            })
+            .collect();
+        run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || snapshot_prior_files(paths))
+            .await
+            .ok()
+            .flatten()
     };
 
     // 2. Off-thread stage + file fsync (`StagedWrite::stage`) strictly AFTER reserve.
@@ -4737,6 +4818,13 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
 
     // 6. Fresh post-dir-sync authority recheck + atomic activation + PublishedConfigHub update.
     let mut res = w.activate_and_publish(disk_published).await;
+    // A stop, E-stop, lease loss or revocation that landed between the pre-rename recheck and the
+    // rename is refused here; roll the file back so disk matches the live configuration.
+    if disk_published && w.activation_rejected() && !w.preserve_marker_on_abort() {
+        if let Some(prior) = prior_files.take() {
+            let _ = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || rollback_rejected_publish(prior)).await;
+        }
+    }
     if let Ok(ref mut ok) = res {
         if let Some(mp) = cleanup_marker_on_activate.take() {
             let rm_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
@@ -4796,6 +4884,8 @@ struct ConfigCommitBackend<FAuth, FPub> {
     guard: Option<ReservationGuard>,
     pre_held: Option<Reservation>,
     hw_mutated: bool,
+    /// Set when the owner refused activation after the rename (see `activation_rejected`).
+    activation_rejected: bool,
     grant: Option<GrantId>,
     domain: ConfigDomain,
     episode_pin_guard: Option<crate::recording::store::EpisodePinGuard>,
@@ -5266,6 +5356,7 @@ where
         {
             Ok(ConfigReply::Activated(Ok(act))) => act,
             Ok(ConfigReply::Activated(Err(e))) => {
+                self.activation_rejected = disk_published;
                 let is_reconciling = matches!(e, ConfigError::Reconciling(_)) || disk_published;
                 if is_reconciling {
                     if let Some(pg) = self.episode_pin_guard.take() {
@@ -5490,6 +5581,10 @@ where
         self.hw_mutated
     }
 
+    fn activation_rejected(&self) -> bool {
+        self.activation_rejected
+    }
+
     fn worker_disconnected_err(&mut self) -> Self::Err {
         if self.hw_mutated || self.pub_phase.load(Ordering::Acquire) != PUB_PHASE_PRE_RENAME {
             ConfigCommitError::post_publish_unknown(ArmError::Internal(
@@ -5640,6 +5735,7 @@ where
         guard: None,
         pre_held,
         hw_mutated,
+        activation_rejected: false,
         grant: None,
         domain,
         episode_pin_guard: None,
@@ -6430,6 +6526,8 @@ struct LegacyZeroCheckBackend {
     reservation: Option<Reservation>,
     proposal: Option<ConfigProposal>,
     auth: Option<ConfigAuthContext>,
+    /// Set when the owner refused activation after the rename (see `activation_rejected`).
+    activation_rejected: bool,
 }
 
 impl CommonCommitWorker for LegacyZeroCheckBackend {
@@ -6787,6 +6885,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
             )
             .is_ok()
         };
+        self.activation_rejected = !activated_ok;
         if activated_ok {
             self.published_config.apply_zero_check_commit(
                 self.job.offset_rad,
@@ -6835,6 +6934,10 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
         }
         tracing::error!("Legacy zero_check rename task failed: {err}");
         ZeroCheckCommitStop::Aborted
+    }
+
+    fn activation_rejected(&self) -> bool {
+        self.activation_rejected
     }
 
     fn worker_disconnected_err(&mut self) -> Self::Err {
@@ -6897,6 +7000,7 @@ pub(crate) async fn run_legacy_zero_check_commit(
         reservation: None,
         proposal: None,
         auth: None,
+        activation_rejected: false,
     };
     let _ = execute_common_commit(&mut backend).await;
 }
@@ -6915,6 +7019,8 @@ struct SyncZeroCheckBackend<'a> {
     reservation: Option<Reservation>,
     proposal: Option<ConfigProposal>,
     auth: Option<ConfigAuthContext>,
+    /// Set when the owner refused activation after the rename (see `activation_rejected`).
+    activation_rejected: bool,
 }
 
 impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
@@ -7063,7 +7169,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             now: Instant::now(),
             stop_generation: self.core.current_stop_gen(),
         };
-        let _ = zero_check_owner_activate(
+        self.activation_rejected = zero_check_owner_activate(
             self.core,
             &act_ctx,
             self.action_id,
@@ -7077,7 +7183,8 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             operator_revoked,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
-        );
+        )
+        .is_err();
         Ok(())
     }
 
@@ -7104,6 +7211,10 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
 
     async fn reconcile_rename_join_error(&mut self, _err: String) -> Self::Err {
         ZeroCheckCommitStop::Aborted
+    }
+
+    fn activation_rejected(&self) -> bool {
+        self.activation_rejected
     }
 
     fn worker_disconnected_err(&mut self) -> Self::Err {
@@ -7177,6 +7288,7 @@ pub(crate) fn commit_zero_check_sync(
         reservation: None,
         proposal: None,
         auth: None,
+        activation_rejected: false,
     };
     let _ = run_common_commit_sync(&mut backend);
 }
