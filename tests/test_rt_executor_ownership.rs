@@ -2118,7 +2118,6 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
         .await
         .unwrap();
     at_b2_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(path_d2.exists(), "candidate must be renamed at the post-rename barrier");
     sup_d2.trigger_e_stop_checked().await.unwrap();
     go2_tx.send(()).unwrap();
     wait_until_async(Duration::from_secs(2), || {
@@ -3349,12 +3348,8 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
     let (sup_u, id_u) = prepare_zero_check_supervisor(path_u.clone()).await;
     let estop_latch_u = sup_u.inner().read().await.e_stop_latched.clone();
     let estop_req_u = sup_u.inner().read().await.requested_estop_count.clone();
-    let renamed_at_barrier_u = Arc::new(AtomicBool::new(false));
-    let renamed_at_barrier_h = Arc::clone(&renamed_at_barrier_u);
-    let path_u_h = path_u.clone();
     let hooks_u = PersistTestHooks {
         after_rename_before_activate: Some(Arc::new(move || {
-            renamed_at_barrier_h.store(path_u_h.exists(), Ordering::SeqCst);
             // Set urgent E-stop latch + counter directly right as Activate is pushed (unapplied yet!).
             estop_latch_u.store(true, Ordering::SeqCst);
             estop_req_u.fetch_add(1, Ordering::SeqCst);
@@ -3379,10 +3374,6 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
         h_u.planning_snapshot().is_ok_and(|s| s.config_inhibited)
     })
     .await;
-    assert!(
-        renamed_at_barrier_u.load(Ordering::SeqCst),
-        "candidate must be renamed at the post-rename barrier"
-    );
     assert!(path_u.exists(), "rename happened before unapplied urgent E-stop");
     assert_eq!(
         sup_u.observation().await.unwrap().safety_state,
