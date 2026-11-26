@@ -207,8 +207,23 @@ impl DualRig {
         configure_inner: impl FnOnce(&mut armd::SupervisorInner),
         hooks: PersistTestHooks,
     ) -> Self {
+        Self::start_with_calib(owner, auth, configure_cfg, configure_inner, hooks, None).await
+    }
+
+    /// As [`Self::start`], with `initial_calib` written to `gripper_calib.json` before it loads.
+    async fn start_with_calib(
+        owner: RtOwner,
+        auth: OperatorAuth,
+        configure_cfg: impl FnOnce(&mut ArmConfig),
+        configure_inner: impl FnOnce(&mut armd::SupervisorInner),
+        hooks: PersistTestHooks,
+        initial_calib: Option<&str>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let calib_path = dir.path().join("gripper_calib.json");
+        if let Some(text) = initial_calib {
+            std::fs::write(&calib_path, text).unwrap();
+        }
 
         let mut cfg = ArmConfig::rebot_dm();
         cfg.collision = None;
@@ -798,6 +813,10 @@ async fn dual_owner_zero_check_store_offset_persists_shifts_and_refreshes_prep_e
         );
 
         assert!(rig.calib_path.exists(), "{owner:?}: gripper_calib.json must be written");
+        assert!(
+            !armd::gripper_calib::pending_path_for(&rig.calib_path).exists(),
+            "{owner:?}: no candidate may remain after a successful store"
+        );
         let on_disk: Value =
             serde_json::from_str(&std::fs::read_to_string(&rig.calib_path).unwrap()).unwrap();
         assert!(
@@ -1912,6 +1931,160 @@ async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked
         "GripperCalibration must stay held (reconciliation refused)"
     );
     rig.wait_zero_check_ctx_empty("reconcile_revoked").await;
+    rig.shutdown().await;
+}
+
+const OLD_CALIB: &str = "{\"offset_rad\":0.02}";
+
+/// Policy a fresh supervisor loads at startup from `path` (restart behavior).
+async fn policy_after_restart(path: &std::path::Path) -> (f32, f32) {
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    armd::gripper_calib::load_into(&sup, path).await;
+    let inner = sup.inner().read().await;
+    assert!(!inner.gripper_calib_invalid, "calibration file must load");
+    let p = inner.config.gripper_policy.as_ref().expect("gripper policy");
+    (p.closed_rad, p.open_rad)
+}
+
+/// Executor rig with `OLD_CALIB` on disk, operator auth enforced and an unlocked token.
+async fn old_calib_rig(
+    hooks: impl FnOnce(OperatorAuth, Arc<Mutex<Option<String>>>) -> PersistTestHooks,
+) -> (DualRig, String, (f32, f32)) {
+    let auth = OperatorAuth::enforced("123456", 1800);
+    let tok_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let hooks = hooks(auth.clone(), Arc::clone(&tok_slot));
+    let rig = DualRig::start_with_calib(
+        RtOwner::Executor,
+        auth,
+        |_| {},
+        |inner| inner.set_mock_gripper_stall_offset(Some(0.05)),
+        hooks,
+        Some(OLD_CALIB),
+    )
+    .await;
+    let old_policy = policy_after_restart(&rig.calib_path).await;
+    let unlock: Value = reqwest::Client::new()
+        .post(format!("http://{}/api/v1/auth/unlock", rig.addr))
+        .json(&json!({"pin": "123456"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = unlock["token"].as_str().unwrap().to_string();
+    *tok_slot.lock().unwrap() = Some(token.clone());
+    (rig, token, old_policy)
+}
+
+async fn run_store_check(rig: &DualRig, token: &str, client_id: &str) -> Value {
+    let mut ws = connect_ws(rig.addr, Some(token)).await;
+    let gen = acquire_lease(&mut ws, client_id, false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let (_, term, _) = run_cmd_to_terminal(
+        &mut ws,
+        gen,
+        ep,
+        "/api/v1/action/gripper_zero_check",
+        json!({"store_offset": true}),
+        Duration::from_secs(8),
+    )
+    .await;
+    term
+}
+
+/// The owner refuses activation (operator revoked after the candidate is staged): the official
+/// file keeps the old contents, the `.pending` candidate is removed, and a restart loads the old
+/// calibration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_refused_activation_leaves_official_file_and_restart_loads_old() {
+    let (rig, token, old_policy) = old_calib_rig(|auth, tok| PersistTestHooks {
+        after_rename_before_activate: Some(Arc::new(move || {
+            if let Some(t) = tok.lock().unwrap().as_deref() {
+                auth.lock(Some(t));
+            }
+            false
+        })),
+        ..Default::default()
+    })
+    .await;
+    let term = run_store_check(&rig, &token, "c-refuse").await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "OPERATOR_REQUIRED", "{term}");
+    assert_eq!(std::fs::read_to_string(&rig.calib_path).unwrap(), OLD_CALIB);
+    let pending = armd::gripper_calib::pending_path_for(&rig.calib_path);
+    let dl = Instant::now() + Duration::from_secs(2);
+    while pending.exists() {
+        assert!(Instant::now() < dl, "refused candidate must be unlinked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(policy_after_restart(&rig.calib_path).await, old_policy);
+    rig.wait_zero_check_ctx_empty("refused_activation").await;
+    rig.assert_zero_rt_allocs("refused_activation");
+    rig.shutdown().await;
+}
+
+/// Crash after activation, before the rename: the candidate stays at `.pending`; a restart loads
+/// the old calibration and removes the stale candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_crash_after_activation_restarts_with_old_and_removes_pending() {
+    let crashed = Arc::new(AtomicBool::new(false));
+    let crashed_h = Arc::clone(&crashed);
+    let (rig, token, old_policy) = old_calib_rig(move |_, _| PersistTestHooks {
+        after_activate_before_publish: Some(Arc::new(move || {
+            crashed_h.store(true, Ordering::Release);
+            true
+        })),
+        ..Default::default()
+    })
+    .await;
+    let term = run_store_check(&rig, &token, "c-crash-act").await;
+    assert_eq!(term["state"], "done", "{term}");
+    assert!(crashed.load(Ordering::Acquire), "worker must stop between activation and rename");
+    let pending = armd::gripper_calib::pending_path_for(&rig.calib_path);
+    assert!(pending.exists(), "candidate stays staged after the crash");
+    assert_eq!(std::fs::read_to_string(&rig.calib_path).unwrap(), OLD_CALIB);
+    assert_eq!(policy_after_restart(&rig.calib_path).await, old_policy);
+    assert!(!pending.exists(), "startup must remove the stale candidate");
+    rig.shutdown().await;
+}
+
+/// A stop and a lease change both land after the candidate is staged: the refusal code is the
+/// live activation check's (`check_zero_check_authority`), and the official file is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_stop_and_lease_change_refusal_uses_live_check_code() {
+    let rt = tokio::runtime::Handle::current();
+    let addr_slot: Arc<Mutex<Option<(SocketAddr, Arc<ArmSupervisor>)>>> = Arc::new(Mutex::new(None));
+    let stop_ack: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let stop_ack_h = Arc::clone(&stop_ack);
+    let addr_h = Arc::clone(&addr_slot);
+    let (rig, token, _old) = old_calib_rig(move |_, tok| PersistTestHooks {
+        after_rename_before_activate: Some(Arc::new(move || {
+            let (addr, sup) = addr_h.lock().unwrap().clone().expect("addr set");
+            let t = tok.lock().unwrap().clone();
+            let ack_slot = Arc::clone(&stop_ack_h);
+            rt.block_on(async move {
+                let mut ws2 = connect_ws(addr, t.as_deref()).await;
+                let gen2 = acquire_lease(&mut ws2, "c-thief", true).await;
+                let ep = sup.get_observation().await.epoch_id;
+                let ack = send_cmd(&mut ws2, gen2, ep, "/api/v1/motion/stop", json!({})).await;
+                *ack_slot.lock().unwrap() = Some(ack);
+                std::mem::forget(ws2);
+            });
+            false
+        })),
+        ..Default::default()
+    })
+    .await;
+    *addr_slot.lock().unwrap() = Some((rig.addr, Arc::clone(&rig.sup)));
+    let term = run_store_check(&rig, &token, "c-stop-lease").await;
+    let ack = stop_ack.lock().unwrap().clone().expect("stop sent");
+    assert_eq!(ack["type"], "command_ack", "stop by the new lease holder: {ack}");
+    assert_eq!(term["state"], "cancelled", "{term}");
+    assert_eq!(term["code"], "STOPPED", "{term}");
+    assert_eq!(std::fs::read_to_string(&rig.calib_path).unwrap(), OLD_CALIB);
     rig.shutdown().await;
 }
 

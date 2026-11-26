@@ -1625,6 +1625,9 @@ pub struct PersistTestHooks {
     /// Runs on `armd-persist` in zero-check reconciliation after the worker-side operator sample
     /// and before `FinishReconcile` is queued (tests owner-side grant validation at commit time).
     pub before_finish_reconcile: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `armd-persist` after the owner activated a zero-check candidate and before it is
+    /// renamed over the official path; `true` exits the worker there (simulated crash).
+    pub after_activate_before_publish: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Fault-injection hook: panics in `control_thread_main` startup setup BEFORE `init_res`
     /// `catch_unwind` to verify outer unwind ownership retention.
     pub panic_in_startup_setup: bool,
@@ -7514,6 +7517,11 @@ impl ControlState {
             Some("STOPPED") => "STOPPED",
             Some("DEADLINE_EXPIRED") => "DEADLINE_EXPIRED",
             Some("POLICY_REVISION_MISMATCH") => "POLICY_REVISION_MISMATCH",
+            Some("ESTOP_ACTIVE") => "ESTOP_ACTIVE",
+            Some("THERMAL_TRIP") => "THERMAL_TRIP",
+            Some("BUS_LOSS") => "BUS_LOSS",
+            Some("CANCELLED") => "CANCELLED",
+            Some("WRONG_TARGET") => "WRONG_TARGET",
             _ => "PERSIST_FAILED",
         }
     }
@@ -8434,8 +8442,18 @@ fn spawn_persist_worker(
                 reservation: None,
                 proposal: None,
                 auth: None,
+                official_path: None,
+                published: false,
             };
             let res = super::requests::config::run_common_commit_sync(&mut backend);
+            // FOLLOW-UP: other config domains (and legacy) still rename the candidate over the
+            // official path before activation; propose the same `.pending` + rename-after-activate
+            // ordering for them so a refused candidate never loads on restart.
+            if !backend.published
+                && !matches!(res, Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected))
+            {
+                backend.discard_pending();
+            }
             if matches!(res, Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected))
                 || hooks.exit_after_first_job
             {
@@ -8463,9 +8481,49 @@ struct ExecutorPersistBackend<'a> {
     reservation: Option<Reservation>,
     proposal: Option<ConfigProposal>,
     auth: Option<super::requests::config::ConfigAuthContext>,
+    /// Official calibration path while the candidate sits at its `.pending` sibling.
+    official_path: Option<std::path::PathBuf>,
+    /// The candidate was renamed over `official_path` after activation.
+    published: bool,
 }
 
 impl ExecutorPersistBackend<'_> {
+    /// After the owner activated the candidate: rename `.pending` over the official path and
+    /// fsync the directory. A failure leaves the old file (restart loads the old calibration).
+    fn publish_pending(&mut self) {
+        let Some(official) = self.official_path.clone() else { return };
+        let pending = crate::gripper_calib::pending_path_for(&official);
+        match std::fs::rename(&pending, &official) {
+            Ok(()) => {
+                self.published = true;
+                let ds = crate::persist::PendingDirSync::for_path(&official);
+                let outcome = match self.hooks.dir_sync_override.as_ref() {
+                    Some(f) => ds.sync_with(|dir| f(dir)),
+                    None => ds.sync_parent_dir(),
+                };
+                if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
+                    tracing::error!("Gripper calibration {} renamed but dir fsync failed: {w}", official.display());
+                }
+            }
+            Err(e) => tracing::error!(
+                "Activated gripper calibration not renamed over {} ({e}); a restart loads the previous calibration",
+                official.display()
+            ),
+        }
+    }
+
+    /// Refusal or failure before the rename: unlink the candidate (a failed unlink is harmless,
+    /// startup removes stale candidates).
+    fn discard_pending(&mut self) {
+        let Some(official) = self.official_path.as_ref() else { return };
+        let pending = crate::gripper_calib::pending_path_for(official);
+        match std::fs::remove_file(&pending) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("Cannot remove gripper calibration candidate {}: {e}", pending.display()),
+        }
+    }
+
     fn push_cmd(&mut self, mut cmd: PersistCmd) -> bool {
         if let Some(ch) = self.terminal_capture {
             match &cmd {
@@ -8600,7 +8658,12 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
     async fn prepare_write_after_reserve(
         &mut self,
     ) -> Result<Option<crate::persist::PendingWrite>, Self::Err> {
-        Ok(Some(self.job.ctx.serialize_write(self.job.offset_rad)))
+        let mut pw = self.job.ctx.serialize_write(self.job.offset_rad);
+        // Stage the candidate at `<official>.pending`; it reaches the official path only after
+        // the owner's live activation check succeeded (see `publish_pending`).
+        let pending = crate::gripper_calib::pending_path_for(&pw.path);
+        self.official_path = Some(std::mem::replace(&mut pw.path, pending));
+        Ok(Some(pw))
     }
 
     fn after_reserve_before_rename(&mut self) -> bool {
@@ -8810,6 +8873,10 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                         }
                         match self.wait_reply() {
                             Some(PersistReply::Activated { activated_revision, .. }) => {
+                                if self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h()) {
+                                    return ZeroCheckCommitStop::WorkerDisconnected;
+                                }
+                                self.publish_pending();
                                 let prep_pol = pub_pol.clone();
                                 self.published_config.apply_zero_check_commit(
                                     self.job.offset_rad,
@@ -8888,7 +8955,14 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
             msg_buf: String::with_capacity(160),
         });
         if !self.hooks.leave_final_reply_queued {
-            if let Some(PersistReply::Activated { activated_revision, .. }) = self.wait_reply() {
+            let reply = self.wait_reply();
+            if matches!(reply, Some(PersistReply::Activated { .. })) {
+                if self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h()) {
+                    return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
+                }
+                self.publish_pending();
+            }
+            if let Some(PersistReply::Activated { activated_revision, .. }) = reply {
                 let prep_pol = pub_policy.clone();
                 self.published_config.apply_zero_check_commit(
                     self.job.offset_rad,

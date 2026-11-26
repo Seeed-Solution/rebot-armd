@@ -453,10 +453,27 @@ fn load_baseline(inner: &mut SupervisorInner, path: &Path) {
     }
 }
 
+/// Sibling staging path of an executor `gripper_zero_check(store_offset=true)` candidate. The
+/// candidate is written and fsynced here, and renamed over `path` only after the owner activated
+/// it; a refused candidate therefore never reaches `path`.
+pub fn pending_path_for(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".pending");
+    path.with_file_name(name)
+}
+
 /// Load the persisted gripper calibration at startup (logs outcome).
+/// A stale `<path>.pending` (crash after activation, before the rename) is removed and ignored:
+/// the restart comes up with the previous calibration, the accepted safe direction.
 /// Invalid/corrupt file -> log a warning, ignore it, report observation.gripper_zero.state "calib_invalid".
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     persist::remove_staged_leftovers(path);
+    let pending = pending_path_for(path);
+    match std::fs::remove_file(&pending) {
+        Ok(()) => tracing::warn!("Removed unactivated gripper calibration candidate {}", pending.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("Cannot remove gripper calibration candidate {}: {e}", pending.display()),
+    }
     let mut inner = supervisor.inner().write().await;
     inner.gripper_calib_path = Some(path.to_path_buf());
     if let Some(bp) = baseline_path_for(path, inner.follower.as_deref()) { load_baseline(&mut inner, &bp); }
