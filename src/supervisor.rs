@@ -13902,12 +13902,13 @@ impl ArmSupervisor {
         }
     }
 
-    /// Effective control-loop owner (`Legacy` or `Executor`, lock-free).
+    /// Effective control-loop owner (`Legacy`, `Transferring`, `Executor`, or `Failed`, lock-free).
     pub fn effective_owner(&self) -> crate::model::EffectiveOwner {
-        if self.owner_mode() == OWNER_EXECUTOR {
-            crate::model::EffectiveOwner::Executor
-        } else {
-            crate::model::EffectiveOwner::Legacy
+        match self.owner_mode() {
+            OWNER_EXECUTOR => crate::model::EffectiveOwner::Executor,
+            OWNER_TRANSFERRING => crate::model::EffectiveOwner::Transferring,
+            OWNER_FAILED => crate::model::EffectiveOwner::Failed,
+            _ => crate::model::EffectiveOwner::Legacy,
         }
     }
 

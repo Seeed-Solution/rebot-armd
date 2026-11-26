@@ -3695,15 +3695,21 @@ pub enum EffectiveOwner {
     /// Legacy supervisor-lock control loop.
     #[default]
     Legacy,
+    /// Ownership transfer to the RT executor is in flight.
+    Transferring,
     /// Synchronous RT executor (`armd-control`) owning `ArmCore` and the actuator bus.
     Executor,
+    /// Executor ownership failed (e.g. detached SAFE-HOLD writer retains the driver).
+    Failed,
 }
 
 impl EffectiveOwner {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
+            Self::Transferring => "transferring",
             Self::Executor => "executor",
+            Self::Failed => "failed",
         }
     }
 }
@@ -3732,6 +3738,8 @@ pub enum OwnerReason {
     AutoFallbackDofLimit = 7,
     /// Executor startup failed recoverably on real hardware and handed back to `legacy` holding (DRV-F1).
     StartupFallbackToLegacy = 8,
+    /// Executor startup failed while a detached SAFE-HOLD writer retained the driver (B4 / `OWNER_FAILED`).
+    StartupFailedDetachedSafeHold = 9,
 }
 
 impl OwnerReason {
@@ -3746,6 +3754,7 @@ impl OwnerReason {
             Self::AutoFallbackMitProfile => "auto_fallback_mit_profile",
             Self::AutoFallbackDofLimit => "auto_fallback_dof_limit",
             Self::StartupFallbackToLegacy => "startup_fallback_to_legacy",
+            Self::StartupFailedDetachedSafeHold => "startup_failed_detached_safe_hold",
         }
     }
 
@@ -3759,6 +3768,7 @@ impl OwnerReason {
             6 => Self::AutoFallbackMitProfile,
             7 => Self::AutoFallbackDofLimit,
             8 => Self::StartupFallbackToLegacy,
+            9 => Self::StartupFailedDetachedSafeHold,
             _ => Self::Default,
         }
     }
@@ -3770,6 +3780,7 @@ impl OwnerReason {
                 | Self::AutoFallbackMitProfile
                 | Self::AutoFallbackDofLimit
                 | Self::StartupFallbackToLegacy
+                | Self::StartupFailedDetachedSafeHold
         )
     }
 }

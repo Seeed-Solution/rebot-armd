@@ -63,6 +63,7 @@ fn spawn_armd_and_wait_port(
         ])
         .env_remove("PORT")
         .env_remove("ARMD_RT_OWNER")
+        .env("RUST_LOG", "armd=info")
         .env("ARMD_APP_CONFIG", "off")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -139,6 +140,7 @@ fn run_armd_expect_fail(args: &[&str], envs: &[(&str, &str)]) -> String {
         ])
         .env_remove("PORT")
         .env_remove("ARMD_RT_OWNER")
+        .env("RUST_LOG", "armd=info")
         .env("ARMD_APP_CONFIG", "off")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -490,8 +492,21 @@ async fn binary_startup_precedence_auto_resolution_and_diagnostics() {
     );
     assert!(err_mit_dm.contains("MIT"), "MIT explicit executor refusal: {err_mit_dm}");
 
-    // (g) Omitted owner on rebot-dm (non-MIT) resolves to executor (no legacy fallback log) and
-    // proceeds straight to opening the requested CAN port.
+    // (f2) Invalid saved arm.armd_owner (e.g. typo "legcay") fails closed before opening hardware
+    // instead of silently falling through to Auto -> executor.
+    let app_cfg_typo = tmp.path().join("app_typo.json");
+    std::fs::write(&app_cfg_typo, r#"{"arm":{"armd_owner":"legcay"}}"#).unwrap();
+    let err_typo = run_armd_expect_fail(
+        &["--follower", "mock"],
+        &[("ARMD_APP_CONFIG", app_cfg_typo.to_str().unwrap())],
+    );
+    assert!(
+        err_typo.contains("arm.armd_owner") && err_typo.contains("legcay"),
+        "invalid saved arm.armd_owner must fail closed: {err_typo}"
+    );
+
+    // (g) Omitted owner on rebot-dm (non-MIT) positively resolves to executor (auto_qualified)
+    // before opening the requested CAN port.
     #[cfg(target_os = "linux")]
     {
         let out_dm = run_armd_expect_fail(
@@ -499,12 +514,12 @@ async fn binary_startup_precedence_auto_resolution_and_diagnostics() {
             &[],
         );
         assert!(
-            !out_dm.contains("Startup owner auto resolved to legacy"),
-            "rebot-dm without MIT must not fall back to legacy under Auto:\n{out_dm}"
+            out_dm.contains("Startup owner resolved: effective=executor reason=auto_qualified follower=rebot-dm"),
+            "rebot-dm with omitted owner must positively log executor resolution:\n{out_dm}"
         );
         assert!(
-            !out_dm.contains("only qualified for"),
-            "rebot-dm must pass owner gate:\n{out_dm}"
+            !out_dm.contains("Startup owner auto resolved to legacy"),
+            "rebot-dm without MIT must not fall back to legacy under Auto:\n{out_dm}"
         );
 
         // With MIT profile, omitted owner on rebot-dm logs the MIT fallback reason before CAN open.
@@ -545,7 +560,7 @@ async fn binary_startup_precedence_auto_resolution_and_diagnostics() {
 #[test]
 fn cockpit_owner_badge_shows_in_expert_and_only_on_fallback_in_simple() {
     let html = include_str!("../src/api/index.html");
-    assert!(html.contains("id=\"owner-badge\""));
+    assert!(html.contains("<button type=\"button\" class=\"sc-status-badge plain\" id=\"owner-badge\" hidden></button>"));
     assert!(html.contains("body.ui-simple #owner-badge:not(.is-fallback) { display: none !important; }"));
     assert!(html.contains("function renderOwnerStatus()"));
     for reason in [
@@ -558,6 +573,7 @@ fn cockpit_owner_badge_shows_in_expert_and_only_on_fallback_in_simple() {
         "auto_fallback_mit_profile",
         "auto_fallback_dof_limit",
         "startup_fallback_to_legacy",
+        "startup_failed_detached_safe_hold",
     ] {
         let key = format!("'owner.reason.{reason}'");
         assert!(
@@ -578,22 +594,32 @@ fn cockpit_owner_badge_shows_in_expert_and_only_on_fallback_in_simple() {
         let snippet = &html[start..end];
         let script = format!(
             r#"
-const badge = {{ hidden: true, textContent: '', className: '', title: '' }};
+let lastToast = null;
+const badge = {{
+  hidden: true, textContent: '', className: '', title: '', attrs: {{}},
+  setAttribute(k, v) {{ this.attrs[k] = v; }},
+  addEventListener(ev, fn) {{ this['on_' + ev] = fn; }},
+  classList: {{ contains(c) {{ return badge.className.split(/\s+/).includes(c); }} }},
+}};
 const S = {{ obs: null }};
 const $ = (id) => id === 'owner-badge' ? badge : null;
 const setText = (el, v) => {{ el.textContent = v; }};
 const setCls = (el, v) => {{ el.className = v; }};
+const toast = (msg, kind) => {{ lastToast = {{ msg, kind }}; }};
 const dict = {{
   'owner.badge.executor': 'RT',
   'owner.badge.legacy': 'Legacy',
   'owner.badge.fallback': 'Legacy · fallback',
+  'owner.badge.failed': 'Owner · failed',
   'owner.name.executor': 'RT executor',
   'owner.name.legacy': 'Legacy loop',
+  'owner.name.failed': 'Owner failed (SAFE-HOLD)',
   'owner.title': 'Control owner: {{owner}} ({{reason}})',
   'owner.reason.auto_qualified': 'auto qualified',
   'owner.reason.explicit_cli': 'explicit cli',
   'owner.reason.auto_fallback_mit_profile': 'mit fallback',
   'owner.reason.startup_fallback_to_legacy': 'startup fallback',
+  'owner.reason.startup_failed_detached_safe_hold': 'detached safe hold',
 }};
 const t = (k, p) => {{
   let s = dict[k] ?? k;
@@ -609,6 +635,7 @@ renderOwnerStatus();
 assert(badge.hidden === false, 'executor badge must be unhidden');
 assert(badge.textContent === 'RT', 'executor text: ' + badge.textContent);
 assert(!badge.className.includes('is-fallback'), 'executor must not be is-fallback');
+assert(badge.attrs['aria-label'] === badge.title, 'aria-label must match title');
 
 // 2. Explicit legacy: shown in expert, NOT marked is-fallback (hidden in simple).
 S.obs = {{ effective_owner: 'legacy', owner_reason: 'explicit_cli' }};
@@ -624,11 +651,19 @@ assert(badge.hidden === false, 'fallback badge must be unhidden');
 assert(badge.textContent === 'Legacy · fallback', 'fallback text: ' + badge.textContent);
 assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'fallback classes: ' + badge.className);
 assert(badge.title.includes('mit fallback'), 'fallback title: ' + badge.title);
+badge.on_click();
+assert(lastToast && lastToast.kind === 'warn' && lastToast.msg.includes('mit fallback'), 'click must surface reason via toast');
 
 // 4. Startup DRV-F1 fallback to legacy: also marked is-fallback + is-warn.
 S.obs = {{ effective_owner: 'legacy', owner_reason: 'startup_fallback_to_legacy' }};
 renderOwnerStatus();
 assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'startup fallback classes: ' + badge.className);
+
+// 5. Detached SAFE-HOLD failed owner: shown as failed warning in both expert & simple.
+S.obs = {{ effective_owner: 'failed', owner_reason: 'startup_failed_detached_safe_hold' }};
+renderOwnerStatus();
+assert(badge.textContent === 'Owner · failed', 'failed text: ' + badge.textContent);
+assert(badge.className.includes('is-fallback') && badge.className.includes('is-warn'), 'failed classes: ' + badge.className);
 "#
         );
         let out = Command::new("node").args(["-e", &script]).output().unwrap();
