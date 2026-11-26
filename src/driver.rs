@@ -19402,7 +19402,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 {
                     let stamp = self.current_j7_intent_stamp();
                     if let Ok(PosForceEmitOutcome::Sent { .. }) =
-                        pos_force_emitter::emit_tick(self, PosForceIntent::hold(stamp), stamp)
+                        self.emit_pos_force_j7(PosForceIntent::hold(stamp), stamp)
                     {
                         frames_sent = frames_sent.saturating_add(1);
                         if pf_j < 32 {
