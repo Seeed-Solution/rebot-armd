@@ -7938,15 +7938,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     release_rx_limit: u16,
     /// Optional per-release budgeted TX cap tightened by the owner's [`crate::rt_core::budget::ReleaseBudget`].
     release_tx_limit: Option<u16>,
-    /// While `true`, watchdog-continuity frames bypass `release_tx_limit` tightening (never
-    /// deferrable by the per-release ledger while still bounded by `self.tx_budget.max_frames`).
-    watchdog_continuity_bypass: bool,
-    /// While `true` (completing uncovered axes of an already-started armed MIT batch in an active
-    /// control release), continuity holds bypass `tx_release_deadline` while still enforcing
-    /// `fence_check()`, stop gates, and bounded recovery capacity.
-    watchdog_continuity_complete_partial: bool,
     /// Bounded extra recovery attempt slots (at most 1 per failed axis, capped at arm DOF, reset
-    /// each release) granted exclusively during `watchdog_continuity_complete_partial` so an
+    /// each release) granted exclusively during `ContinuityBypass::LedgerAndReleaseDeadline` so an
     /// exact-cap (`tx_budget.max_frames == batch_size`) mid-batch transient transport error does
     /// not starve the final uncovered axis.
     watchdog_continuity_recovery_budget: usize,
@@ -9297,8 +9290,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             release_rx_frames: 0,
             release_rx_limit: crate::rt_core::ops::RX_FRAME_BUDGET,
             release_tx_limit: None,
-            watchdog_continuity_bypass: false,
-            watchdog_continuity_complete_partial: false,
             watchdog_continuity_recovery_budget: 0,
             last_feedback_decode_offset_ns: vec![None; dof],
             uncertain_readback_probe: [None; MAX_MODE_JOINTS],
@@ -9746,11 +9737,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Effective budgeted TX attempt cap for the current control release (tightened monotonically
     /// by the owner's [`crate::rt_core::budget::ReleaseBudget`] only while inside an active
     /// managed control release; standalone off-tick driver operations and non-deferrable
-    /// watchdog-continuity frames use `self.tx_budget.max_frames`).
+    /// watchdog-continuity Hold/Stop frames use `self.tx_budget.max_frames`).
     #[inline]
     fn effective_tx_max_frames(&self) -> usize {
-        if !self.in_active_control_release() || self.watchdog_continuity_bypass {
-            return if self.watchdog_continuity_complete_partial {
+        self.effective_tx_max_frames_with_bypass(ContinuityBypass::None)
+    }
+
+    #[inline]
+    fn effective_tx_max_frames_with_bypass(&self, bypass: ContinuityBypass) -> usize {
+        if !self.in_active_control_release() || bypass.bypasses_ledger() {
+            return if bypass.bypasses_release_deadline() {
                 self.tx_budget
                     .max_frames
                     .saturating_add(self.watchdog_continuity_recovery_budget)
@@ -9761,6 +9757,33 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         match self.release_tx_limit {
             Some(lim) => self.tx_budget.max_frames.min(usize::from(lim)),
             None => self.tx_budget.max_frames,
+        }
+    }
+
+    /// Per-call continuity bypass policy for stationary J7 `Hold`/`Stop` frames.
+    /// Never applied to motion `Target` intents (enforced inside `pos_force_emitter` and `send`).
+    #[inline]
+    fn j7_hold_continuity_bypass(&self) -> ContinuityBypass {
+        if self.mit_fence.is_some() && self.mit_fence_trip.is_none() {
+            if self.in_active_control_release() {
+                ContinuityBypass::LedgerAndReleaseDeadline
+            } else {
+                ContinuityBypass::Ledger
+            }
+        } else {
+            ContinuityBypass::None
+        }
+    }
+
+    /// Explicit release cutoff deadline combining `tx_release_deadline` and the active tick pass
+    /// deadline so `send()` enforces the cutoff immediately before final CAN submission.
+    #[inline]
+    fn active_release_cutoff_deadline(&self) -> Option<Deadline> {
+        match (self.tx_release_deadline, self.tick_tx.map(|p| p.deadline)) {
+            (Some(cap), Some(pass_dl)) => Some(Deadline { at: cap.min(pass_dl) }),
+            (Some(cap), None) => Some(Deadline { at: cap }),
+            (None, Some(pass_dl)) => Some(Deadline { at: pass_dl }),
+            (None, None) => None,
         }
     }
 
@@ -9831,8 +9854,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     #[inline]
     fn can_start_tick_tx_n(&self, needed: usize) -> bool {
-        let max_frames = self.effective_tx_max_frames();
-        let release_cap = if self.watchdog_continuity_complete_partial {
+        self.can_start_tick_tx_n_with_bypass(needed, ContinuityBypass::None)
+    }
+
+    #[inline]
+    fn can_start_tick_tx_n_with_bypass(&self, needed: usize, bypass: ContinuityBypass) -> bool {
+        let max_frames = self.effective_tx_max_frames_with_bypass(bypass);
+        let release_cap = if bypass.bypasses_release_deadline() {
             None
         } else {
             self.tx_release_deadline
@@ -9843,15 +9871,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let effective_deadline = release_cap.map_or(pass.deadline, |cap| pass.deadline.min(cap));
         !pass.backpressured
             && pass.attempts.saturating_add(needed) <= max_frames
-            && (self.watchdog_continuity_complete_partial || self.now() < effective_deadline)
+            && (bypass.bypasses_release_deadline() || self.now() < effective_deadline)
     }
 
     #[inline]
-    fn can_start_tick_tx_for_kind(&self, kind: TxKind, _fenced: bool) -> bool {
-        if !self.can_start_tick_tx_n(1) {
+    fn can_start_tick_tx_for_kind(
+        &self,
+        kind: TxKind,
+        _fenced: bool,
+        bypass: ContinuityBypass,
+    ) -> bool {
+        // Continuity bypass is valid ONLY for stationary Hold/Stop frames; never for Target motion.
+        let effective_bypass = bypass.for_tx_kind(kind);
+        if !self.can_start_tick_tx_n_with_bypass(1, effective_bypass) {
             return false;
         }
-        if self.watchdog_continuity_bypass || !self.in_active_control_release() {
+        if effective_bypass.bypasses_ledger() || !self.in_active_control_release() {
             return true;
         }
         let is_continuity = matches!(
@@ -10338,9 +10373,38 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        self.send_with_lease_and_bypass(
+            kind,
+            expected_stamp,
+            expected_lease_gen,
+            deadline,
+            fenced,
+            ContinuityBypass::None,
+            build,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_with_lease_and_bypass(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        expected_lease_gen: u64,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        continuity_bypass: ContinuityBypass,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
         let prev = self.send_lease_gen;
         self.send_lease_gen = expected_lease_gen;
-        let res = self.send_plain(kind, expected_stamp, deadline, fenced, build);
+        let res = self.send_plain_with_bypass(
+            kind,
+            expected_stamp,
+            deadline,
+            fenced,
+            continuity_bypass,
+            build,
+        );
         self.send_lease_gen = prev;
         res
     }
@@ -10448,9 +10512,37 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         fenced: bool,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<CanFrame, TxRefusal> {
+        self.send_plain_with_bypass(
+            kind,
+            expected_stamp,
+            deadline,
+            fenced,
+            ContinuityBypass::None,
+            build,
+        )
+    }
+
+    fn send_plain_with_bypass(
+        &mut self,
+        kind: impl DamiaoTxKind,
+        expected_stamp: Option<StopStamp>,
+        deadline: Option<Deadline>,
+        fenced: bool,
+        continuity_bypass: ContinuityBypass,
+        build: impl FnOnce(&Self) -> Option<CanFrame>,
+    ) -> Result<CanFrame, TxRefusal> {
         let mut revoked: Option<&'static str> = None;
-        self.send(kind, expected_stamp, deadline, fenced, None, &mut revoked, build)
-            .map(|(f, _, _, _)| f)
+        self.send(
+            kind,
+            expected_stamp,
+            deadline,
+            fenced,
+            continuity_bypass,
+            None,
+            &mut revoked,
+            build,
+        )
+        .map(|(f, _, _, _)| f)
     }
 
     fn send_with_commissioning_gate(
@@ -10462,7 +10554,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<(CanFrame, u64, Instant, Option<i128>), Result<&'static str, TxRefusal>> {
         let mut revoked: Option<&'static str> = None;
-        match self.send(kind, expected_stamp, deadline, false, Some(pre_tx_gate), &mut revoked, build) {
+        match self.send(
+            kind,
+            expected_stamp,
+            deadline,
+            false,
+            ContinuityBypass::None,
+            Some(pre_tx_gate),
+            &mut revoked,
+            build,
+        ) {
             Ok(ok) => Ok(ok),
             Err(r) => {
                 if let Some(code) = revoked {
@@ -10481,11 +10582,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         expected_stamp: Option<StopStamp>,
         deadline: Option<Deadline>,
         fenced: bool,
+        continuity_bypass: ContinuityBypass,
         mut pre_tx_gate: Option<&mut dyn FnMut() -> Result<(), &'static str>>,
         revoked_out: &mut Option<&'static str>,
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<(CanFrame, u64, Instant, Option<i128>), TxRefusal> {
         let tx_kind = kind.tx_kind();
+        let effective_bypass = continuity_bypass.for_tx_kind(tx_kind);
         #[cfg(not(target_arch = "wasm32"))]
         let mut built_frame_for_shadow: Option<CanFrame> = None;
         let res = 'send_body: {
@@ -10501,7 +10604,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let budgeted = !Self::is_disable_tx_kind(kind);
             if budgeted {
                 let _ = self.ensure_tx_pass();
-                if !self.can_start_tick_tx_for_kind(kind, fenced) {
+                if !self.can_start_tick_tx_for_kind(kind, fenced, effective_bypass) {
                     break 'send_body Err(TxRefusal::Deferred);
                 }
             }
@@ -10611,7 +10714,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if deadline.is_some_and(|d| d.passed(submit_now)) {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
-            if budgeted && !self.can_start_tick_tx_for_kind(kind, fenced) {
+            if budgeted && !self.can_start_tick_tx_for_kind(kind, fenced, effective_bypass) {
                 break 'send_body Err(TxRefusal::Deferred);
             }
             if let Some(gate) = pre_tx_gate.as_mut() {
@@ -13054,7 +13157,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let cur_intent_stamp = self.current_j7_intent_stamp();
         let intent = self.pf_deferred_intent.unwrap_or_else(|| PosForceIntent::hold(cur_intent_stamp));
-        match pos_force_emitter::emit_tick(self, intent, cur_intent_stamp)? {
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        match pos_force_emitter::emit_tick(self, intent, cur_intent_stamp, hold_bypass)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
             PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
@@ -17632,93 +17736,94 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         sent_mask: &mut u64,
         sent_slot_mask: &mut u64,
     ) -> Result<(), (usize, TxRefusal)> {
-        let prev_bypass = self.watchdog_continuity_bypass;
-        let prev_partial = self.watchdog_continuity_complete_partial;
-        self.watchdog_continuity_bypass = true;
-        self.watchdog_continuity_complete_partial = complete_partial;
+        let hold_bypass = if complete_partial {
+            ContinuityBypass::LedgerAndReleaseDeadline
+        } else {
+            ContinuityBypass::Ledger
+        };
         if complete_partial {
             if let Some(pass) = self.tick_tx.as_mut() {
                 pass.backpressured = false;
             }
         }
         let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
-        let res = (|| -> Result<(), (usize, TxRefusal)> {
-            for i in 0..n {
-                let bit_i = 1u64 << i;
-                if (active_mask & bit_i) == 0 || (covered_mask & bit_i) != 0 {
-                    continue;
-                }
-                let pos_opt = hold_positions
-                    .and_then(|hp| hp.get(i).copied().flatten())
-                    .filter(|p| p.is_finite())
-                    .or_else(|| self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
-                    .or(self.motor_keepalive_hold_pos[i])
-                    .or_else(|| {
-                        self.cached_states
-                            .get(i)
-                            .map(|s| s.position)
-                            .filter(|p| p.is_finite())
-                    });
-                let Some(hold_pos) = pos_opt else {
-                    return Err((i, TxRefusal::BuildRefused));
-                };
-                let (kp, kd) = self
-                    .last_mit_params
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .map_or((None, None), |(kp, kd, _)| (Some(kp), Some(kd)));
-                let hold_target = JointTarget {
-                    position: hold_pos,
-                    velocity: Some(0.0),
-                    kp,
-                    kd,
-                    torque: Some(0.0),
-                };
-                if started[i].is_none() {
-                    started[i] = Some(self.now());
-                }
-                let mut retried_transport = false;
-                loop {
-                    match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
-                        d.build_verified_hold_frame(i, &hold_target)
-                    }) {
-                        Ok(sent_frame) => {
-                            let mit_params = self.resolved_mit_params(&hold_target);
-                            self.record_sent_target(i, sent_frame, Some(mit_params));
-                            *sent_any = true;
-                            *sent_mask |= bit_i;
-                            let bit = i.saturating_mul(2);
-                            if bit < 64 {
-                                *sent_slot_mask |= 1u64 << bit;
-                            }
-                            break;
+        for i in 0..n {
+            let bit_i = 1u64 << i;
+            if (active_mask & bit_i) == 0 || (covered_mask & bit_i) != 0 {
+                continue;
+            }
+            let pos_opt = hold_positions
+                .and_then(|hp| hp.get(i).copied().flatten())
+                .filter(|p| p.is_finite())
+                .or_else(|| self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+                .or(self.motor_keepalive_hold_pos[i])
+                .or_else(|| {
+                    self.cached_states
+                        .get(i)
+                        .map(|s| s.position)
+                        .filter(|p| p.is_finite())
+                });
+            let Some(hold_pos) = pos_opt else {
+                return Err((i, TxRefusal::BuildRefused));
+            };
+            let (kp, kd) = self
+                .last_mit_params
+                .get(i)
+                .copied()
+                .flatten()
+                .map_or((None, None), |(kp, kd, _)| (Some(kp), Some(kd)));
+            let hold_target = JointTarget {
+                position: hold_pos,
+                velocity: Some(0.0),
+                kp,
+                kd,
+                torque: Some(0.0),
+            };
+            if started[i].is_none() {
+                started[i] = Some(self.now());
+            }
+            let mut retried_transport = false;
+            loop {
+                match self.send_plain_with_bypass(
+                    TxKind::MeasuredHold(i),
+                    Some(start_stamp),
+                    None,
+                    true,
+                    hold_bypass,
+                    |d| d.build_verified_hold_frame(i, &hold_target),
+                ) {
+                    Ok(sent_frame) => {
+                        let mit_params = self.resolved_mit_params(&hold_target);
+                        self.record_sent_target(i, sent_frame, Some(mit_params));
+                        *sent_any = true;
+                        *sent_mask |= bit_i;
+                        let bit = i.saturating_mul(2);
+                        if bit < 64 {
+                            *sent_slot_mask |= 1u64 << bit;
                         }
-                        Err(TxRefusal::Transport(e))
-                            if complete_partial && !retried_transport && e.is_tx_backpressure() =>
-                        {
-                            if self.pending_stop_check(Some(start_stamp)).is_err() {
-                                return Err((i, TxRefusal::StopInhibited));
-                            }
-                            if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
-                                return Err((i, TxRefusal::MitFenceTripped(reason)));
-                            }
-                            retried_transport = true;
-                            self.watchdog_continuity_recovery_budget =
-                                self.watchdog_continuity_recovery_budget.saturating_add(1).min(n);
-                            if let Some(pass) = self.tick_tx.as_mut() {
-                                pass.backpressured = false;
-                            }
-                        }
-                        Err(r) => return Err((i, r)),
+                        break;
                     }
+                    Err(TxRefusal::Transport(e))
+                        if complete_partial && !retried_transport && e.is_tx_backpressure() =>
+                    {
+                        if self.pending_stop_check(Some(start_stamp)).is_err() {
+                            return Err((i, TxRefusal::StopInhibited));
+                        }
+                        if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
+                            return Err((i, TxRefusal::MitFenceTripped(reason)));
+                        }
+                        retried_transport = true;
+                        self.watchdog_continuity_recovery_budget =
+                            self.watchdog_continuity_recovery_budget.saturating_add(1).min(n);
+                        if let Some(pass) = self.tick_tx.as_mut() {
+                            pass.backpressured = false;
+                        }
+                    }
+                    Err(r) => return Err((i, r)),
                 }
             }
-            Ok(())
-        })();
-        self.watchdog_continuity_bypass = prev_bypass;
-        self.watchdog_continuity_complete_partial = prev_partial;
-        res
+        }
+        Ok(())
     }
 
     fn service_energized_watchdog_holds_with_targets(
@@ -17870,14 +17975,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.discard_staged_ctrl_tx();
         let mut sent_mask = 0u32;
         let mut aborted_flush = false;
-        let prev_bypass = self.watchdog_continuity_bypass;
         let urgent_continuity = abort_on_starve
             || due[..due_len]
                 .iter()
                 .any(|&(_, age)| age >= WATCHDOG_HOLD_URGENT_INTERVAL);
-        if urgent_continuity {
-            self.watchdog_continuity_bypass = true;
-        }
+        let hold_bypass = if urgent_continuity {
+            ContinuityBypass::Ledger
+        } else {
+            ContinuityBypass::None
+        };
         self.in_urgent_watchdog_hold = true;
         for &(i, _) in &due[..due_len] {
             let Some(pos) = (match hold_targets {
@@ -17892,9 +17998,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 continue;
             };
             let target = JointTarget::position(pos);
-            match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), deadline, false, |d| {
-                d.build_verified_hold_frame(i, &target)
-            }) {
+            match self.send_plain_with_bypass(
+                TxKind::MeasuredHold(i),
+                Some(start_stamp),
+                deadline,
+                false,
+                hold_bypass,
+                |d| d.build_verified_hold_frame(i, &target),
+            ) {
                 Ok(_) => {
                     sent_mask |= 1u32 << i;
                 }
@@ -17913,7 +18024,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         self.in_urgent_watchdog_hold = false;
-        self.watchdog_continuity_bypass = prev_bypass;
         let mut sent_any = sent_mask != 0;
         if sent_any {
             if aborted_flush
@@ -18835,9 +18945,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let mut revoked: Option<&'static str> = None;
             // Use `self.send(...)` directly so `seq_before`, `tx_started`, and `tx_offset_ns`
             // reflect the actual TX submission boundary (never a pre-send sample).
-            match self.send(TxKind::Refresh, None, None, false, None, &mut revoked, |_| {
-                Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
-            }) {
+            match self.send(
+                TxKind::Refresh,
+                None,
+                None,
+                false,
+                ContinuityBypass::None,
+                None,
+                &mut revoked,
+                |_| Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE)),
+            ) {
                 Ok((_frame, seq_before, tx_started, tx_offset_ns)) => {
                     if uncertain && i < MAX_MODE_JOINTS {
                         let retry_at = tx_started
@@ -21237,6 +21354,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 None,
                 Some(tx_deadline),
                 false,
+                ContinuityBypass::None,
                 None,
                 &mut revoked,
                 |_| Some(damiao::build_disable_frame(id)),
@@ -21576,14 +21694,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // Watchdog-continuity holds for an armed MIT fence are NEVER deferrable by the
                 // per-release ledger (`release_tx_limit`): send the complete hold batch within
                 // `self.tx_budget.max_frames`.
-                let prev_bypass = self.watchdog_continuity_bypass;
-                let prev_partial = self.watchdog_continuity_complete_partial;
-                self.watchdog_continuity_bypass = true;
-                if self.in_active_control_release()
+                let hold_bypass = if self.in_active_control_release()
                     && self.tx_release_deadline.is_some_and(|cap| self.now() >= cap)
                 {
-                    self.watchdog_continuity_complete_partial = true;
-                }
+                    ContinuityBypass::LedgerAndReleaseDeadline
+                } else {
+                    ContinuityBypass::Ledger
+                };
                 let mut fell_back_partial = false;
                 let loop_res: Result<(), ArmDriverError> = (|| {
                     for (i, target) in targets.iter().enumerate() {
@@ -21605,22 +21722,29 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             if started[i].is_none() {
                                 started[i] = Some(self.now());
                             }
-                            match self.send_plain(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
-                                let fresh_pos = d.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
-                                let hold_target = JointTarget {
-                                    position: fresh_pos,
-                                    velocity: Some(0.0),
-                                    kp: target.kp,
-                                    kd: target.kd,
-                                    torque: target.torque,
-                                };
-                                d.target_frames_checked(i, &hold_target)
-                                    .ok()?
-                                    .0
-                                    .get(slot)
-                                    .copied()
-                                    .flatten()
-                            }) {
+                            match self.send_plain_with_bypass(
+                                TxKind::RollbackHold(i),
+                                Some(start_stamp),
+                                None,
+                                true,
+                                hold_bypass,
+                                |d| {
+                                    let fresh_pos = d.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
+                                    let hold_target = JointTarget {
+                                        position: fresh_pos,
+                                        velocity: Some(0.0),
+                                        kp: target.kp,
+                                        kd: target.kd,
+                                        torque: target.torque,
+                                    };
+                                    d.target_frames_checked(i, &hold_target)
+                                        .ok()?
+                                        .0
+                                        .get(slot)
+                                        .copied()
+                                        .flatten()
+                                },
+                            ) {
                                 Ok(sent_frame) => {
                                     let mit_params = self.resolved_mit_params(target);
                                     self.record_sent_target(i, sent_frame, Some(mit_params));
@@ -21798,8 +21922,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                     Ok(())
                 })();
-                self.watchdog_continuity_bypass = prev_bypass;
-                self.watchdog_continuity_complete_partial = prev_partial;
                 loop_res?;
                 if self.pending_stop_check(Some(start_stamp)).is_err() {
                     self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
@@ -22193,7 +22315,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return arm_res;
         }
         let stop_intent_stamp = self.current_j7_intent_stamp();
-        match pos_force_emitter::emit_tick(self, PosForceIntent::stop(stop_intent_stamp), stop_intent_stamp) {
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        match pos_force_emitter::emit_tick(
+            self,
+            PosForceIntent::stop(stop_intent_stamp),
+            stop_intent_stamp,
+            hold_bypass,
+        ) {
             Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
             Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
                 self.last_tx_pf_status = pf_status;
@@ -22282,7 +22410,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
         }
-        let res = pos_force_emitter::emit_tick(self, intent, current);
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        let res = pos_force_emitter::emit_tick(self, intent, current, hold_bypass);
         if let Ok(PosForceEmitOutcome::Sent { joint, .. }) = res {
             if self.mit_fence.is_some() && joint < self.mit_fence_last_cmd.len() {
                 self.mit_fence_last_cmd[joint] = Some(self.now());
@@ -22479,14 +22608,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let mut sent_mask = 0u64;
                 let mut sent_slot_mask = 0u64;
                 let mut fell_back_partial = false;
-                let prev_bypass = self.watchdog_continuity_bypass;
-                let prev_partial = self.watchdog_continuity_complete_partial;
-                self.watchdog_continuity_bypass = true;
-                if self.in_active_control_release()
+                let hold_bypass = if self.in_active_control_release()
                     && self.tx_release_deadline.is_some_and(|cap| self.now() >= cap)
                 {
-                    self.watchdog_continuity_complete_partial = true;
-                }
+                    ContinuityBypass::LedgerAndReleaseDeadline
+                } else {
+                    ContinuityBypass::Ledger
+                };
                 let loop_res: Result<(), ArmDriverError> = (|| {
                     for (i, target) in targets.iter().enumerate() {
                         if (active_mask & (1u64 << i)) == 0 {
@@ -22500,19 +22628,26 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         if started[i].is_none() {
                             started[i] = Some(self.now());
                         }
-                        match self.send_plain(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
-                            if !captured_pos.is_finite() {
-                                return None;
-                            }
-                            let hold_target = JointTarget {
-                                position: captured_pos,
-                                velocity: Some(0.0),
-                                kp: target.kp,
-                                kd: target.kd,
-                                torque: target.torque,
-                            };
-                            d.build_verified_hold_frame(i, &hold_target)
-                        }) {
+                        match self.send_plain_with_bypass(
+                            TxKind::MeasuredHold(i),
+                            Some(start_stamp),
+                            None,
+                            true,
+                            hold_bypass,
+                            |d| {
+                                if !captured_pos.is_finite() {
+                                    return None;
+                                }
+                                let hold_target = JointTarget {
+                                    position: captured_pos,
+                                    velocity: Some(0.0),
+                                    kp: target.kp,
+                                    kd: target.kd,
+                                    torque: target.torque,
+                                };
+                                d.build_verified_hold_frame(i, &hold_target)
+                            },
+                        ) {
                             Ok(sent_frame) => {
                                 let mit_params = self.resolved_mit_params(target);
                                 self.record_sent_target(i, sent_frame, Some(mit_params));
@@ -22680,8 +22815,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                     Ok(())
                 })();
-                self.watchdog_continuity_bypass = prev_bypass;
-                self.watchdog_continuity_complete_partial = prev_partial;
                 loop_res?;
                 if self.pending_stop_check(Some(start_stamp)).is_err() {
                     self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
@@ -23697,15 +23830,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 _ => PosForceIntent::hold(pre_arm_intent_stamp),
             };
             let current_intent_stamp = self.current_j7_intent_stamp();
-            let prev_j7_bypass = self.watchdog_continuity_bypass;
-            let prev_j7_partial = self.watchdog_continuity_complete_partial;
-            if self.mit_fence.is_some() && self.mit_fence_trip.is_none() {
-                self.watchdog_continuity_bypass = true;
-                self.watchdog_continuity_complete_partial = self.in_active_control_release();
-            }
-            let j7_res = pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp);
-            self.watchdog_continuity_bypass = prev_j7_bypass;
-            self.watchdog_continuity_complete_partial = prev_j7_partial;
+            let hold_bypass = self.j7_hold_continuity_bypass();
+            let j7_res = pos_force_emitter::emit_tick(
+                self,
+                j7_intent,
+                current_intent_stamp,
+                hold_bypass,
+            );
             return match j7_res {
                 Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
                 Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
@@ -23853,7 +23984,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             ),
         };
         let current_intent_stamp = self.current_j7_intent_stamp();
-        match pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp)? {
+        let hold_bypass = self.j7_hold_continuity_bypass();
+        match pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp, hold_bypass)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
             PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
@@ -24961,6 +25093,42 @@ impl DamiaoTxKind for TxKind {
     }
 }
 
+/// Explicit per-call watchdog-continuity bypass mode (NEVER ambient state on `DamiaoArmDriver`).
+/// Valid ONLY for stationary Hold/Stop frames (`TxKind::Hold`, `TxKind::RollbackHold`,
+/// `TxKind::MeasuredHold`); ignored (forced to `None`) for all motion (`Target`) and other kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ContinuityBypass {
+    /// Normal per-release ledger and release cutoff enforcement.
+    #[default]
+    None,
+    /// Bypass per-release ledger tightening (`release_tx_limit`), keeping `tx_budget.max_frames`
+    /// and `tx_release_deadline`.
+    Ledger,
+    /// Bypass both per-release ledger tightening and `tx_release_deadline` (and allow bounded
+    /// `watchdog_continuity_recovery_budget` slots) for non-deferrable continuity holds.
+    LedgerAndReleaseDeadline,
+}
+
+impl ContinuityBypass {
+    #[inline]
+    const fn bypasses_ledger(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    #[inline]
+    const fn bypasses_release_deadline(self) -> bool {
+        matches!(self, Self::LedgerAndReleaseDeadline)
+    }
+
+    #[inline]
+    const fn for_tx_kind(self, kind: TxKind) -> Self {
+        match kind {
+            TxKind::Hold | TxKind::RollbackHold(_) | TxKind::MeasuredHold(_) => self,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Private single-emitter module for Damiao J7 `PosForce` (`0x300 + motor_id`) frames.
 ///
 /// Type-system enforcement:
@@ -25039,6 +25207,7 @@ mod pos_force_emitter {
     /// - `stale` (`allow_freeze == true`) -> FREEZE / documented boot-fallback parameters.
     /// - `stale` (`allow_freeze == false`) -> fails closed (`BuildRefused` /
     ///   `PosForceFeedbackExpired`), emitting 0 frames.
+    #[allow(clippy::too_many_arguments)]
     fn send_frame<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         kind: TxKind,
@@ -25048,7 +25217,15 @@ mod pos_force_emitter {
         allow_freeze: bool,
         retry: bool,
         fenced: bool,
+        deadline: Option<Deadline>,
+        continuity_bypass: ContinuityBypass,
     ) -> Result<CanFrame, TxRefusal> {
+        let effective_bypass = match intent {
+            PosForceIntentKind::Hold | PosForceIntentKind::Stop => {
+                continuity_bypass.for_tx_kind(kind)
+            }
+            PosForceIntentKind::Target { .. } => ContinuityBypass::None,
+        };
         let token = PosForceSendToken(());
         let build = |d: &DamiaoArmDriver<C>| -> Option<CanFrame> {
             let pf = d.pos_force.as_ref()?;
@@ -25098,14 +25275,15 @@ mod pos_force_emitter {
             Some(build_wire_frame(&token, motor_id, pos, vel_raw, cur_raw))
         };
         if retry {
-            driver.send_with_retry_inner(kind, expected_stamp, None, fenced, Some(&token), build)
+            driver.send_with_retry_inner(kind, expected_stamp, deadline, fenced, Some(&token), build)
         } else {
-            driver.send_with_lease(
+            driver.send_with_lease_and_bypass(
                 authorize_kind(&token, kind),
                 expected_stamp,
                 expected_lease_gen,
-                None,
+                deadline,
                 fenced,
+                effective_bypass,
                 build,
             )
         }
@@ -25129,6 +25307,8 @@ mod pos_force_emitter {
             false,
             false,
             false,
+            None,
+            ContinuityBypass::None,
         )
     }
 
@@ -25144,7 +25324,18 @@ mod pos_force_emitter {
         fenced: bool,
     ) -> Result<CanFrame, TxRefusal> {
         let kind = if is_rollback { TxKind::RollbackHold(joint) } else { TxKind::Hold };
-        send_frame(driver, kind, expected_stamp, 0, intent, false, true, fenced)
+        send_frame(
+            driver,
+            kind,
+            expected_stamp,
+            0,
+            intent,
+            false,
+            true,
+            fenced,
+            None,
+            ContinuityBypass::None,
+        )
     }
 
     /// Narrow standalone-driver recovery API: called ONLY from `DamiaoArmDriver::receive_feedback`
@@ -25172,6 +25363,8 @@ mod pos_force_emitter {
             false,
             false,
             false,
+            None,
+            ContinuityBypass::None,
         )
     }
 
@@ -25186,10 +25379,14 @@ mod pos_force_emitter {
     /// Single stop-generation / E-stop epoch / lease-generation enforcement rule: any `Target`
     /// intent whose `(stop_gen, estop_epoch, lease_gen)` stamp is stale or lease-fenced is
     /// degraded to `Hold` and is NEVER re-stamped with a newer generation.
+    ///
+    /// `hold_bypass` is an explicit per-call parameter valid ONLY for stationary `Hold`/`Stop`
+    /// frames (never applied to motion `Target` frames).
     pub(super) fn emit_tick<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         intent: PosForceIntent,
         current: PosForceIntentStamp,
+        hold_bypass: ContinuityBypass,
     ) -> Result<PosForceEmitOutcome, ArmDriverError> {
         let Some(pf_j) = driver.active_pos_force_joint() else {
             return Ok(PosForceEmitOutcome::NotApplicable);
@@ -25294,18 +25491,21 @@ mod pos_force_emitter {
                 PosForceIntentKind::Target { .. } => (TxKind::Target, intent.stamp.lease_gen),
                 PosForceIntentKind::Hold | PosForceIntentKind::Stop => (TxKind::RollbackHold(pf_j), 0),
             };
-            // Only stationary Hold/Stop continuity frames bypass ledger tightening and release
-            // cutoff under an armed MIT fence; Target motion frames always obey release cutoff
-            // and ledger budget and degrade to Hold if deferred.
+            // Only stationary Hold/Stop continuity frames receive `hold_bypass`; Target motion
+            // frames ALWAYS run with `ContinuityBypass::None` and an explicit release cutoff
+            // deadline checked immediately before `can.transmit`.
             let is_hold_intent = matches!(active_kind, PosForceIntentKind::Hold | PosForceIntentKind::Stop);
-            let prev_bypass = driver.watchdog_continuity_bypass;
-            let prev_partial = driver.watchdog_continuity_complete_partial;
-            if armed_mit && is_hold_intent {
-                driver.watchdog_continuity_bypass = true;
-                if driver.in_active_control_release() {
-                    driver.watchdog_continuity_complete_partial = true;
-                }
-            }
+            let attempt_bypass = if is_hold_intent {
+                hold_bypass
+            } else {
+                ContinuityBypass::None
+            };
+            let explicit_deadline = if attempt_bypass.bypasses_release_deadline() {
+                None
+            } else {
+                driver.active_release_cutoff_deadline()
+            };
+            let attempts_before = driver.tick_tx.map_or(0, |p| p.attempts);
             let send_res = send_frame(
                 driver,
                 kind,
@@ -25315,9 +25515,9 @@ mod pos_force_emitter {
                 true,
                 false,
                 false,
+                explicit_deadline,
+                attempt_bypass,
             );
-            driver.watchdog_continuity_bypass = prev_bypass;
-            driver.watchdog_continuity_complete_partial = prev_partial;
             match send_res {
                 Ok(frame) => break Some(frame),
                 Err(TxRefusal::LeaseFenced) => {
@@ -25355,6 +25555,15 @@ mod pos_force_emitter {
                         && !retried
                         && matches!(active_kind, PosForceIntentKind::Target { .. })
                     {
+                        if driver.in_active_control_release()
+                            && driver.tick_tx.map_or(0, |p| p.attempts) > attempts_before
+                        {
+                            let n_cap = driver.motor_ids.len().min(MAX_MODE_JOINTS);
+                            driver.watchdog_continuity_recovery_budget = driver
+                                .watchdog_continuity_recovery_budget
+                                .saturating_add(1)
+                                .min(n_cap);
+                        }
                         retried = true;
                         active_kind = PosForceIntentKind::Hold;
                         is_target_intent = false;
@@ -25453,8 +25662,7 @@ mod pos_force_emitter {
             driver.discard_staged_ctrl_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
-        let flush_blocked = if !is_target_intent && armed_mit && driver.in_active_control_release()
-        {
+        let flush_blocked = if !is_target_intent && hold_bypass.bypasses_release_deadline() {
             !driver.can.flush_is_noop() && driver.tick_tx.is_some_and(|p| driver.now() >= p.deadline)
         } else {
             driver.flush_cutoff_exceeded()
@@ -27952,6 +28160,7 @@ mod tx_chokepoint_tests {
             &mut drv,
             PosForceIntent::target(-0.8, Some(0.30), None, stamp),
             stamp,
+            ContinuityBypass::None,
         )
         .expect("emit_tick target");
         assert!(matches!(out_t, PosForceEmitOutcome::Sent { joint: 0, freeze: false, .. }));
@@ -27961,8 +28170,13 @@ mod tx_chokepoint_tests {
 
         bus.clear_tx();
         drv.begin_tx_tick();
-        let out_h = pos_force_emitter::emit_tick(&mut drv, PosForceIntent::hold(stamp), stamp)
-            .expect("emit_tick hold");
+        let out_h = pos_force_emitter::emit_tick(
+            &mut drv,
+            PosForceIntent::hold(stamp),
+            stamp,
+            ContinuityBypass::None,
+        )
+        .expect("emit_tick hold");
         assert!(matches!(out_h, PosForceEmitOutcome::Sent { joint: 0, .. }));
         let tx_h = bus.tx.lock().unwrap().clone();
         assert_eq!(tx_h.len(), 1);

@@ -1679,3 +1679,256 @@ fn safe_hold_keeps_holding_unconfirmed_on_deferral_and_j7_only_traffic() {
         "real DamiaoArmDriver completing all arm holds must clear holding_unconfirmed"
     );
 }
+
+#[test]
+fn j7_continuity_bypass_never_leaks_to_motion_target_after_arm_batch_cutoff() {
+    use armd::driver::{
+        ArmDriver, JointMode, JointTarget, PosForceEmitOutcome, PosForceIntent,
+        PosForceIntentKind, TxBatchOutcome,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Part A: Standalone armed MIT (`external_pos_force_emitter == false`).
+    // Arm batch (J1..J6) completes before `tx_release_deadline`; cutoff expires immediately
+    // after J6 submits (before J7 emission). The standalone path MUST NOT leak continuity
+    // bypass flags to the J7 motion `Target`: NO J7 `Target` (`vel_raw > 0`) may be sent;
+    // only a stationary `Hold` (`vel_raw == 0`) may be sent.
+    {
+        let clock = MockClock::new();
+        let (bus, drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+        let armed_expire = Arc::new(AtomicBool::new(false));
+        let hook_expire = armed_expire.clone();
+        let hook_clock = clock.clone();
+        let mut drv = drv.with_before_final_tx_gate_hook(Arc::new(move |frame| {
+            // Expire the release cutoff right as the 6th arm frame submits (arm batch completes,
+            // cutoff is expired before J7 Target is emitted).
+            if frame.id == 6 && hook_expire.swap(false, Ordering::SeqCst) {
+                hook_clock.advance(Duration::from_millis(12));
+            }
+        }));
+        bus.with(|s| {
+            for m in s.motors.iter_mut().take(6) {
+                m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
+            }
+        });
+        drv.set_torque(true).expect("enable torque");
+
+        let mut base_targets = vec![JointTarget::position(0.0); 7];
+        for t in base_targets.iter_mut().take(6) {
+            t.kp = Some(12.0);
+            t.kd = Some(0.8);
+            t.torque = Some(0.0);
+        }
+        let modes = [
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Position,
+        ];
+        drv.set_joint_modes(&modes, &base_targets)
+            .expect("set MIT modes");
+        drv.set_mit_deadline_fence(Some(Duration::from_millis(45)), Duration::from_millis(300));
+        drv.set_external_pos_force_emitter(false);
+
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.tx_times.clear();
+            s.push_all_feedback();
+        });
+        let _ = drv.read_joint_states();
+
+        let mut motion_targets = base_targets.clone();
+        motion_targets[6].position = 0.35;
+        motion_targets[6].velocity = Some(1.0);
+
+        let t0 = clock.now();
+        drv.begin_control_release(1);
+        drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(10)));
+        drv.sync_release_budget_limits(64, 16);
+        armed_expire.store(true, Ordering::SeqCst);
+
+        let _ = drv
+            .write_joint_targets_bounded(&motion_targets)
+            .expect("standalone armed MIT write must not trip fence when J7 degrades to Hold");
+        drv.set_tx_release_deadline(None);
+        assert!(
+            drv.mit_fence_trip().is_none(),
+            "degrading J7 Target to stationary Hold past cutoff must not trip armed MIT fence"
+        );
+
+        let tx_frames = bus.with(|s| s.tx_log.clone());
+        let arm_count = tx_frames.iter().filter(|f| (1..=6).contains(&f.id)).count();
+        assert_eq!(arm_count, 6, "arm batch J1..J6 must have completed before cutoff");
+        let j7_frames: Vec<_> = tx_frames.iter().filter(|f| f.id == 0x307).collect();
+        assert_eq!(j7_frames.len(), 1, "exactly one J7 0x307 frame must be emitted");
+        let vel_raw = u16::from_le_bytes([j7_frames[0].data[4], j7_frames[0].data[5]]);
+        assert_eq!(
+            vel_raw, 0,
+            "standalone J7 motion Target past cutoff must NOT be sent; only Hold (vel_raw=0) allowed, got vel_raw={vel_raw}"
+        );
+    }
+
+    // Part B: External emitter (`external_pos_force_emitter == true`), armed MIT.
+    // Arm batch completes before cutoff; cutoff expires inside `before_final_tx_gate_hook`
+    // immediately before final CAN submission of the J7 Target frame (after pre-build checks).
+    // The emitter must pass the explicit deadline and check it immediately before `can.transmit`:
+    // NO J7 Target (`vel_raw > 0`) may reach the wire; only a stationary Hold (`vel_raw == 0`) may.
+    {
+        let clock = MockClock::new();
+        let (bus, drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+        let fire_on_j7_target = Arc::new(AtomicBool::new(false));
+        let hook_fire = fire_on_j7_target.clone();
+        let hook_clock = clock.clone();
+        let mut drv = drv.with_before_final_tx_gate_hook(Arc::new(move |frame| {
+            if frame.id == 0x307 {
+                let vel_raw = u16::from_le_bytes([frame.data[4], frame.data[5]]);
+                if vel_raw > 0 && hook_fire.swap(false, Ordering::SeqCst) {
+                    hook_clock.advance(Duration::from_millis(12));
+                }
+            }
+        }));
+        bus.with(|s| {
+            for m in s.motors.iter_mut().take(6) {
+                m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
+            }
+        });
+        drv.set_torque(true).expect("enable torque");
+
+        let mut base_targets = vec![JointTarget::position(0.0); 7];
+        for t in base_targets.iter_mut().take(6) {
+            t.kp = Some(12.0);
+            t.kd = Some(0.8);
+            t.torque = Some(0.0);
+        }
+        let modes = [
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Mit,
+            JointMode::Position,
+        ];
+        drv.set_joint_modes(&modes, &base_targets)
+            .expect("set MIT modes");
+        drv.set_mit_deadline_fence(Some(Duration::from_millis(45)), Duration::from_millis(300));
+        drv.set_external_pos_force_emitter(true);
+
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.tx_times.clear();
+            s.push_all_feedback();
+        });
+        let _ = drv.read_joint_states();
+
+        let t0 = clock.now();
+        drv.begin_control_release(2);
+        drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(10)));
+        drv.sync_release_budget_limits(64, 16);
+        assert_eq!(
+            drv.write_joint_targets_bounded(&base_targets).unwrap(),
+            TxBatchOutcome::Complete
+        );
+
+        let stamp = drv.current_j7_intent_stamp();
+        let j7_intent = PosForceIntent {
+            kind: PosForceIntentKind::Target {
+                position: 0.35,
+                velocity: Some(1.0),
+                current_raw: None,
+            },
+            stamp,
+        };
+        fire_on_j7_target.store(true, Ordering::SeqCst);
+        let _ = drv
+            .emit_pos_force_j7(j7_intent, stamp)
+            .expect("external J7 emitter past cutoff under armed MIT must degrade to Hold");
+        drv.set_tx_release_deadline(None);
+
+        let j7_frames: Vec<_> = bus.with(|s| {
+            s.tx_log
+                .iter()
+                .filter(|f| f.id == 0x307)
+                .cloned()
+                .collect()
+        });
+        assert_eq!(
+            j7_frames.len(),
+            1,
+            "external emitter must refuse Target before can.transmit and emit only 1 Hold frame, got {} frames",
+            j7_frames.len()
+        );
+        let vel_raw = u16::from_le_bytes([j7_frames[0].data[4], j7_frames[0].data[5]]);
+        assert_eq!(
+            vel_raw, 0,
+            "external emitter must NOT transmit J7 Target (vel_raw > 0) once cutoff expires before CAN submit, got vel_raw={vel_raw}"
+        );
+    }
+
+    // Part C: External emitter (`external_pos_force_emitter == true`), unfenced POS_VEL.
+    // Cutoff expires right before final CAN submission of J7 Target -> must refuse with Deferred
+    // and transmit 0 J7 frames.
+    {
+        let clock = MockClock::new();
+        let (bus, drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+        let fire_on_j7_target = Arc::new(AtomicBool::new(false));
+        let hook_fire = fire_on_j7_target.clone();
+        let hook_clock = clock.clone();
+        let mut drv = drv.with_before_final_tx_gate_hook(Arc::new(move |frame| {
+            if frame.id == 0x307 {
+                let vel_raw = u16::from_le_bytes([frame.data[4], frame.data[5]]);
+                if vel_raw > 0 && hook_fire.swap(false, Ordering::SeqCst) {
+                    hook_clock.advance(Duration::from_millis(12));
+                }
+            }
+        }));
+        drv.set_torque(true).expect("enable torque");
+        drv.set_external_pos_force_emitter(true);
+
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.tx_times.clear();
+            s.push_all_feedback();
+        });
+        let _ = drv.read_joint_states();
+
+        let targets = vec![JointTarget::position(0.0); 7];
+        let t0 = clock.now();
+        drv.begin_control_release(3);
+        drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(10)));
+        drv.sync_release_budget_limits(64, 16);
+        assert_eq!(
+            drv.write_joint_targets_bounded(&targets).unwrap(),
+            TxBatchOutcome::Complete
+        );
+
+        let stamp = drv.current_j7_intent_stamp();
+        let j7_intent = PosForceIntent {
+            kind: PosForceIntentKind::Target {
+                position: 0.35,
+                velocity: Some(1.0),
+                current_raw: None,
+            },
+            stamp,
+        };
+        fire_on_j7_target.store(true, Ordering::SeqCst);
+        let out = drv.emit_pos_force_j7(j7_intent, stamp).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(
+            matches!(out, PosForceEmitOutcome::Deferred { .. }),
+            "unfenced external J7 Target past cutoff before CAN submit must return Deferred, got {out:?}"
+        );
+        let j7_count = bus.with(|s| s.tx_log.iter().filter(|f| f.id == 0x307).count());
+        assert_eq!(
+            j7_count, 0,
+            "unfenced external J7 Target past cutoff must transmit 0 frames"
+        );
+    }
+}
