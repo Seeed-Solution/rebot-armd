@@ -1271,6 +1271,8 @@ pub enum ClearRefusal {
     GravityCompUnconfirmed,
     DisablePending,
     MitLostUnsupported,
+    MitRecoveryConfirmRequired,
+    MitRecoveryIncomplete,
     MitModesUncertain,
     FreshFeedbackRequiredForRestingSupport,
     RestingPoseSupport(RestingSupportViolation),
@@ -1327,6 +1329,24 @@ impl std::fmt::Display for ClearRefusal {
             Self::GravityCompUnconfirmed => f.write_str("Gravity compensation: the switch back to POS_VEL is not confirmed yet"),
             Self::DisablePending => f.write_str("Torque disable is still unconfirmed"),
             Self::MitLostUnsupported => f.write_str("UNSUPPORTED: MIT lost recovery requires legacy path"),
+            Self::MitRecoveryConfirmRequired => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    write!(
+                        f,
+                        "{}: {}",
+                        crate::mit::RECOVERY_CONFIRM_CODE,
+                        crate::mit::RECOVERY_WARNING
+                    )
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    f.write_str("MIT_RECOVERY_CONFIRM_REQUIRED: MIT recovery disables all motors; support the arm at rest and confirm")
+                }
+            }
+            Self::MitRecoveryIncomplete => f.write_str(
+                "MIT recovery after a motor timeout did not yet confirm all motors disabled; keep supporting the arm at rest and clear again"
+            ),
             Self::MitModesUncertain => f.write_str("MIT tracking: the control mode of a joint is uncertain after a failed switch; check the arm and power-cycle the motors"),
             Self::FreshFeedbackRequiredForRestingSupport => f.write_str("Fresh feedback is required before checking resting pose support"),
             Self::RestingPoseSupport(violation) =>

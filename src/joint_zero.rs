@@ -738,6 +738,31 @@ impl ArmDriver for ZeroOffsetDriver {
     fn set_mode_switch_active_mask(&mut self, mask: u32) {
         self.inner.set_mode_switch_active_mask(mask);
     }
+    fn set_mode_switch_hold_targets(&mut self, targets: &[Option<crate::driver::ModeSwitchHoldTarget>]) {
+        let mut shifted = [None; crate::motor_mode::MAX_MODE_SWITCH_AXES];
+        let n = targets.len().min(shifted.len());
+        for i in 0..n {
+            if let Some(mut t) = targets[i] {
+                t.position += self.off(i);
+                shifted[i] = Some(t);
+            }
+        }
+        self.inner.set_mode_switch_hold_targets(&shifted[..n]);
+    }
+    fn mit_min_last_ctrl_tx(&self, mask: u64) -> Option<Instant> {
+        self.inner.mit_min_last_ctrl_tx(mask)
+    }
+    fn mit_expiry_recover_budgeted(
+        &mut self,
+        deadline: Instant,
+        started_at: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<bool, ArmDriverError> {
+        self.inner.mit_expiry_recover_budgeted(deadline, started_at, pre_tx_gate)
+    }
+    fn mit_expiry_recover_reset(&mut self) {
+        self.inner.mit_expiry_recover_reset();
+    }
     fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> {
         self.inner.axis_last_ctrl_tx(joint)
     }
