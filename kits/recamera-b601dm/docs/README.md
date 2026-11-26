@@ -73,7 +73,7 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 
 ### Control-loop owner (`armd_owner`)
 
-`K92rebot-teleop` passes `--owner <legacy|executor>` to `armd`, read from `/userdata/local/apps/rebot-teleop.config.json` (`arm.armd_owner`, falling back to top-level `armd_owner`). The default is `legacy`. Setting `"armd_owner": "executor"` opts into the synchronous RT executor (`armd-control`) on `rebot-dm` (or `mock`); other followers reject `executor` at startup, MIT-configured profiles remain legacy-only, and a recoverable executor startup failure on `rebot-dm` falls back to the `legacy` owner holding without torque-off.
+`armd` resolves its startup control-loop owner with precedence `--owner <auto|legacy|executor>` > `ARMD_RT_OWNER` > config `arm.armd_owner` (falling back to top-level `armd_owner` in `/userdata/local/apps/rebot-teleop.config.json`) > `auto`. The packaging default is `auto`: `K92rebot-teleop` omits `--owner` unless the config file sets `arm.armd_owner` (or top-level `armd_owner`), and upgrades preserve any explicitly stored value. Under `auto`, qualified `rebot-dm` and `mock` profiles run the synchronous RT executor (`armd-control`); all other followers (`so-arm101`, `so-arm100`, `rebot-rs`, `fashionstar`, `star-arm102`, `sim`) and MIT-configured profiles resolve to `legacy` with a startup log line naming the reason. An explicit `executor` request on an ineligible follower or MIT profile is refused at startup; a recoverable executor startup failure on `rebot-dm` hands back to `legacy` holding without torque-off. Both `/api/v1/observation` and `/api/v1/diagnostics` (`/api/v1/diagnostics/tick`) report `effective_owner` and `owner_reason`.
 
 ### 组装
 
@@ -85,7 +85,7 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 
 ### 控制循环所有者（`armd_owner`）
 
-`K92rebot-teleop` 从 `/userdata/local/apps/rebot-teleop.config.json` 读取 `arm.armd_owner`（未设置时回退到顶层 `armd_owner`），并通过 `--owner <legacy|executor>` 传给 `armd`。默认值为 `legacy`。设为 `"executor"` 可在 `rebot-dm`（或 `mock`）上显式启用同步实时执行器（`armd-control`）；其余从手在通过验证前会在启动时拒绝 `executor`，MIT 配置保持仅限 `legacy`，`rebot-dm` 上执行器启动可恢复失败时会回退至 `legacy` 保持姿态而不断力。
+`armd` 按以下优先级解析启动时的控制循环所有者：命令行 `--owner <auto|legacy|executor>` > 环境变量 `ARMD_RT_OWNER` > 配置 `arm.armd_owner`（位于 `/userdata/local/apps/rebot-teleop.config.json`，未设置时回退到顶层 `armd_owner`）> `auto`。软件包默认值为 `auto`：`K92rebot-teleop` 在配置未显式设置 `arm.armd_owner` 时省略 `--owner`，升级时保留已显式保存的值。在 `auto` 模式下，已认证的 `rebot-dm` 与 `mock` 默认启用同步实时执行器（`armd-control`）；其余从手（`so-arm101`、`so-arm100`、`rebot-rs`、`fashionstar`、`star-arm102`、`sim`）以及启用了 MIT 的配置自动回退至 `legacy`，并打印一条写明原因的启动日志。在不符合条件的从手或 MIT 配置上显式请求 `executor` 会在启动时拒绝；`rebot-dm` 上执行器启动发生可恢复失败时会切回 `legacy` 保持姿态而不断力。`/api/v1/observation` 与 `/api/v1/diagnostics`（含 `/api/v1/diagnostics/tick`）均输出 `effective_owner` 与 `owner_reason`。
 
 ## Verified capabilities
 

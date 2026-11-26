@@ -158,7 +158,15 @@ schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`w
 套件提供：armd 二进制（核心不改）、profile、可选的旁路进程（感知服务）、启动脚本；启动脚本启动这些进程并运行 `armd --follower <model> [--follower-port <port>] --config <profile>`。
 
 - 版本：代码中未版本化；下面的布局为本文档的第 1 版。
-- armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`、`ARMD_KEEPOUT`、`ARMD_POSES`、`ARMD_COLLISION`、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
+- armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_RT_OWNER`、`ARMD_APP_CONFIG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`、`ARMD_KEEPOUT`、`ARMD_POSES`、`ARMD_COLLISION`、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
+
+#### 启动控制循环所有者（供 Agent、测试与打包参考）
+
+- **优先级**：命令行 `--owner <auto|legacy|executor>` > 环境变量 `ARMD_RT_OWNER` > 配置 `arm.armd_owner`（来自 `ARMD_APP_CONFIG` 或 `/userdata/local/apps/rebot-teleop.config.json`，未设置时回退顶层 `armd_owner`）> `auto`。
+- **`auto` 规则**：对已认证的 `--follower rebot-dm` 和 `mock`（且配置符合条件）选择 `executor`；对其余从手（`so-arm101`、`so-arm100`、`rebot-rs`、`fashionstar`、`star-arm102`、`sim`）、启用 MIT 的配置或超出 `MAX_DOF` 的配置选择 `legacy`，并打印一条写明原因的启动日志。
+- **显式拒绝（fail-closed）**：在不符合条件的从手或配置上显式指定 `executor`（通过 CLI、环境变量或配置）会在启动时报错拒绝。
+- **打包（`K92rebot-teleop`）**：仅在 `/userdata/local/apps/rebot-teleop.config.json` 显式设置了 `arm.armd_owner` 时才传 `--owner`。应用清单默认值为 `"auto"`，升级保留用户已写入的值。
+- **诊断与测试注意**：`GET /api/v1/observation`、`GET /api/v1/diagnostics` 与 `GET /api/v1/diagnostics/tick` 均输出 `effective_owner` 与 `owner_reason`。由于 `mock` 与 `rebot-dm` 现默认走 `executor`，任何明确测试或依赖 legacy 路径的脚本、测试或 Agent 流程必须显式固定 `--owner legacy` 或 `ARMD_RT_OWNER=legacy`。
 
 官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.3.4）：
 

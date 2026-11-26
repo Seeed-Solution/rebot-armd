@@ -32,4 +32,8 @@ restart after a crash, log in `/userdata/rebot-teleop/logs`): see
 is required when building the recamera deb (the build stops without it); it puts the SDK in the deb.
 
 The deb installs the profile at `/usr/share/rebot-teleop/profile/rebot-b601dm.json`; the init
-script passes it with `--config` when the follower is `rebot-dm` and the file exists.
+script passes it with `--config` when the follower is `rebot-dm` and the file exists. The
+packaging default for `arm.armd_owner` is `auto` (`K92rebot-teleop` omits `--owner` unless the
+config sets it, resolving `rebot-dm` and `mock` to the RT executor and other followers or MIT
+profiles to `legacy`; see [docs/README.md](docs/README.md#control-loop-owner-armd_owner) /
+[中文](docs/README.md#控制循环所有者armd_owner)).
