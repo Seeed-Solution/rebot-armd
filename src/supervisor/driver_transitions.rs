@@ -10510,25 +10510,6 @@ impl SupervisorInner {
         let mut scratch_status = std::mem::take(&mut self.scratch.status);
         let attempt = self
             .with_driver_and_owner_ref(|owner, drv| {
-                if let Some(auth) = authority {
-                    if let Err(auth_err) =
-                        recheck_clear_fault_authority_readonly_with_op(owner, auth, now_fn(), true)
-                    {
-                        return CarryoverAttempt::Authority(auth_err);
-                    }
-                }
-                if owner.estop_request_unapplied() {
-                    return CarryoverAttempt::Refusal(R::EStopActive);
-                }
-                if !matches!(drv.enable_state(), EnableState::Disabled | EnableState::Unknown)
-                    || drv.has_any_joint_enabled()
-                {
-                    return CarryoverAttempt::Refusal(R::MotorErrorClearRequiresDisarmed);
-                }
-                if let Err(refusal) = Self::check_carryover_rest_pose_with_driver(&owner.config, &*drv)
-                {
-                    return CarryoverAttempt::Refusal(refusal);
-                }
                 let drv_deadline = if let Some(dl) = deadline {
                     let Ok((_, _, translated)) =
                         crate::supervisor::translate_driver_cutoff_conservative(drv, dl, now_fn)
@@ -10540,9 +10521,100 @@ impl SupervisorInner {
                 } else {
                     None
                 };
-                let outcome = drv.clear_carried_over_motor_errors(drv_deadline);
+
+                // 1. Drain any queued RX backlog FIRST so newer off-rest or enabled-motor frames
+                //    are never missed by the rest-pose or disarm interlocks.
+                if let Err(e) = drv.drain_rx_only_bounded(drv_deadline) {
+                    if deadline.is_some() {
+                        drv.set_tx_release_deadline(None);
+                    }
+                    return CarryoverAttempt::Refusal(R::DriverError(clear_fault_driver_error(&e)));
+                }
+
+                // 2. Re-check live authority and pending E-stop after RX drain.
+                if let Some(auth) = authority {
+                    if let Err(auth_err) =
+                        recheck_clear_fault_authority_readonly_with_op(owner, auth, now_fn(), true)
+                    {
+                        if deadline.is_some() {
+                            drv.set_tx_release_deadline(None);
+                        }
+                        return CarryoverAttempt::Authority(auth_err);
+                    }
+                }
+                if owner.estop_request_unapplied() {
+                    if deadline.is_some() {
+                        drv.set_tx_release_deadline(None);
+                    }
+                    return CarryoverAttempt::Refusal(R::EStopActive);
+                }
+
+                // 3. Require fresh disarm evidence across ALL motors (including J7) so a stale
+                //    enabled motor can never satisfy `enable_state == Unknown`.
+                let has_all_fresh_feedback = drv.is_feedback_valid();
+                let has_status_pre = drv.motor_status_into(&mut scratch_status);
+                let any_status_enabled = has_status_pre && scratch_status.contains(&1);
+                if !matches!(drv.enable_state(), EnableState::Disabled | EnableState::Unknown)
+                    || drv.has_any_joint_enabled()
+                    || any_status_enabled
+                {
+                    if deadline.is_some() {
+                        drv.set_tx_release_deadline(None);
+                    }
+                    return CarryoverAttempt::Refusal(R::MotorErrorClearRequiresDisarmed);
+                }
+                if !has_all_fresh_feedback {
+                    if deadline.is_some() {
+                        drv.set_tx_release_deadline(None);
+                    }
+                    return CarryoverAttempt::Refusal(R::FreshFeedbackRequiredForRestingSupport);
+                }
+
+                // 4. Evaluate J1–J6 rest-pose gate strictly AFTER the RX drain.
+                if let Err(refusal) = Self::check_carryover_rest_pose_with_driver(&owner.config, &*drv)
+                {
+                    if deadline.is_some() {
+                        drv.set_tx_release_deadline(None);
+                    }
+                    return CarryoverAttempt::Refusal(refusal);
+                }
+
+                // 5. Submit targeted `CMD_CLEAR_FAULTS` with a live pre-TX authority & E-stop gate
+                //    checked immediately before every CAN frame write.
+                let mut revoked_auth: Option<crate::rt_core::requests::lease::ClearFaultAuthorityError> =
+                    None;
+                let mut pre_tx_gate = || -> Result<(), &'static str> {
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) = recheck_clear_fault_authority_readonly_with_op(
+                            owner,
+                            auth,
+                            now_fn(),
+                            true,
+                        ) {
+                            revoked_auth = Some(auth_err);
+                            return Err("AUTHORITY_REVOKED");
+                        }
+                    }
+                    if owner.estop_request_unapplied() {
+                        return Err("ESTOP_PENDING");
+                    }
+                    Ok(())
+                };
+                let outcome = drv.clear_carried_over_motor_errors(drv_deadline, &mut pre_tx_gate);
                 if deadline.is_some() {
                     drv.set_tx_release_deadline(None);
+                }
+                if let Ok(CarryoverMotorClearOutcome::Revoked(code)) = outcome {
+                    if let Some(auth_err) = revoked_auth {
+                        return CarryoverAttempt::Authority(auth_err);
+                    }
+                    if code == "ESTOP_PENDING" {
+                        return CarryoverAttempt::Refusal(R::EStopActive);
+                    }
+                    return CarryoverAttempt::Refusal(R::BudgetExpired);
+                }
+                if owner.estop_request_unapplied() {
+                    return CarryoverAttempt::Refusal(R::EStopActive);
                 }
                 let persist_name = match outcome {
                     Ok(CarryoverMotorClearOutcome::ErrorPersists { code, .. }) => {
@@ -10587,7 +10659,11 @@ impl SupervisorInner {
                 }
                 match outcome {
                     Ok(CarryoverMotorClearOutcome::NoErrors | CarryoverMotorClearOutcome::Cleared) => {
-                        Ok(self.safety.state().clone())
+                        if self.estop_request_unapplied() {
+                            Err(apply_estop_refusal(self))
+                        } else {
+                            Ok(self.safety.state().clone())
+                        }
                     }
                     Ok(CarryoverMotorClearOutcome::ErrorPersists { joint, code }) => {
                         Err(ClearFaultWithAuthError::Clear(E::Rejected(
@@ -10611,6 +10687,9 @@ impl SupervisorInner {
                                 joint: joint.min(usize::from(u8::MAX)) as u8,
                             },
                         )))
+                    }
+                    Ok(CarryoverMotorClearOutcome::Revoked(_)) => {
+                        Err(ClearFaultWithAuthError::Clear(E::Rejected(R::BudgetExpired)))
                     }
                     Err(crate::driver::ArmDriverError::EstopInhibited) => {
                         Err(apply_estop_refusal(self))

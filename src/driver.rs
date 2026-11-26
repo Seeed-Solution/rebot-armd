@@ -1152,6 +1152,8 @@ pub enum CarryoverMotorClearOutcome {
     MotorEnabled { joint: usize },
     /// At least one affected motor did not return a fresh post-clear status reply within the bound.
     Unconfirmed { joint: usize },
+    /// Pre-transmit live authority/stop gate revoked immediately before `can.transmit`.
+    Revoked(&'static str),
 }
 
 pub trait ArmDriver: Send {
@@ -1874,15 +1876,23 @@ pub trait ArmDriver: Send {
         Err(ArmDriverError::Protocol("UNSUPPORTED: driver has no bounded clear_fault".into()))
     }
 
+    /// Pure RX-only bounded drain with zero TX and zero heap allocations; establishes a clean
+    /// empty-queue boundary before evaluating rest-pose / disarm gates for carried-over clears.
+    fn drain_rx_only_bounded(&mut self, _deadline: Option<Instant>) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+
     /// Clear carried-over motor hardware errors on affected motors ONLY while disarmed, then
     /// verify on a fresh post-clear status reply that every affected motor's error bit is gone
     /// and the motor stays disabled (never sends an enable command).
     ///
-    /// When `deadline` is `Some`, operates within the caller's RT release budget with zero heap
-    /// allocations.
+    /// Runs `pre_tx_gate` immediately before every CAN frame submission (re-verifying live
+    /// operator authority and pending E-stop at the hardware write boundary). When `deadline` is
+    /// `Some`, operates within the caller's RT release budget with zero heap allocations.
     fn clear_carried_over_motor_errors(
         &mut self,
         _deadline: Option<Instant>,
+        _pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<CarryoverMotorClearOutcome, ArmDriverError> {
         Err(ArmDriverError::ProtocolStatic(
             "UNSUPPORTED: driver does not support targeted motor error clear",
@@ -18513,9 +18523,37 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    fn drain_rx_only_bounded(&mut self, deadline: Option<Instant>) -> Result<(), ArmDriverError> {
+        let blocking = deadline.is_none();
+        if !blocking && (!self.can.supports_nonblocking_rt() || !self.can.supports_bounded_flush()) {
+            return Err(ArmDriverError::ProtocolStatic(
+                "UNSUPPORTED: transport does not support non-blocking RT I/O and bounded flush",
+            ));
+        }
+        let dl = deadline.map(|at| Deadline { at });
+        let release_cap_passed = |d: &Self| d.tx_release_deadline.is_some_and(|cap| d.now() >= cap);
+        if dl.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        let mut drained = self.drain_rx_frames_only(dl, 64);
+        if !drained && blocking {
+            for _ in 0..7 {
+                drained = self.drain_rx_frames_only(dl, 64);
+                if drained {
+                    break;
+                }
+            }
+        }
+        if !drained {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        Ok(())
+    }
+
     fn clear_carried_over_motor_errors(
         &mut self,
         deadline: Option<Instant>,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<CarryoverMotorClearOutcome, ArmDriverError> {
         let blocking = deadline.is_none();
         if !blocking && (!self.can.supports_nonblocking_rt() || !self.can.supports_bounded_flush()) {
@@ -18527,13 +18565,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if n == 0 {
             return Ok(CarryoverMotorClearOutcome::NoErrors);
         }
+        // Fail closed unless EVERY motor (including J7) has fresh feedback and none is enabled.
         if self.is_enabled
             || self.is_enabling
             || self.torque_transition_pending()
+            || !self.is_feedback_valid()
             || self.has_any_joint_enabled()
+            || self.motor_status.iter().take(n).any(|&st| st == 1)
         {
             return Err(ArmDriverError::ProtocolStatic(
-                "cannot clear carried-over motor errors while torque is enabled",
+                "cannot clear carried-over motor errors while torque is enabled or motor state is stale",
             ));
         }
         if let Some((_, at)) = self.mit_fence_trip {
@@ -18549,30 +18590,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let start_stamp = self.current_stop_stamp();
         self.pending_stop_check(Some(start_stamp))?;
 
-        // Pure RX-only pre-drain establishes a clean causal boundary (`self.rx_seq`) strictly
-        // before sending `CMD_CLEAR_FAULTS` so stale pre-clear frames can never satisfy verification.
-        let mut drained = self.drain_rx_frames_only(dl, 64);
-        if !drained && blocking {
-            for _ in 0..7 {
-                drained = self.drain_rx_frames_only(dl, 64);
-                if drained {
-                    break;
-                }
-            }
-        }
-        if !drained {
-            return Err(ArmDriverError::Transport(TransportError::Timeout));
-        }
-        // Re-check disarmed invariant and affected motor set after pre-drain.
-        if self.is_enabled
-            || self.is_enabling
-            || self.torque_transition_pending()
-            || self.has_any_joint_enabled()
-        {
-            return Err(ArmDriverError::ProtocolStatic(
-                "cannot clear carried-over motor errors while torque is enabled",
-            ));
-        }
         let mut affected_mask: u64 = 0;
         for i in 0..n {
             if damiao_fault_name(self.motor_status[i]).is_some() {
@@ -18580,49 +18597,61 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         if affected_mask == 0 {
+            self.pending_stop_check(Some(start_stamp))?;
+            if dl.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
+                return Err(ArmDriverError::Transport(TransportError::Timeout));
+            }
+            if let Err(code) = pre_tx_gate() {
+                return Ok(CarryoverMotorClearOutcome::Revoked(code));
+            }
             return Ok(CarryoverMotorClearOutcome::NoErrors);
         }
-        self.pending_stop_check(Some(start_stamp))?;
-        if dl.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
-            return Err(ArmDriverError::Transport(TransportError::Timeout));
-        }
 
-        let boundary_seq = self.rx_seq;
+        let mut tx_boundary_seq = [0u64; 64];
+        let mut sent_mask: u64 = 0;
         self.discard_all_pending_tx();
         self.begin_tx_tick();
-        let mut sent_any = false;
         let mut tx_err: Option<ArmDriverError> = None;
         for idx in 0..n {
             if (affected_mask & (1u64 << idx)) == 0 {
                 continue;
             }
-            match self.send_plain(TxKind::ClearFault, Some(start_stamp), dl, false, |d| {
-                Some(damiao::build_clear_faults_frame(d.motor_ids[idx]))
-            }) {
-                Ok(_) => sent_any = true,
-                Err(TxRefusal::DeadlinePassed) => {
+            // Establish a per-motor pre-write RX watermark immediately before submitting this
+            // motor's `CMD_CLEAR_FAULTS`, and re-verify live authority + E-stop inside
+            // `send_with_commissioning_gate` right at the `can.transmit` boundary.
+            tx_boundary_seq[idx] = self.rx_seq;
+            match self.send_with_commissioning_gate(
+                TxKind::ClearFault,
+                Some(start_stamp),
+                dl,
+                pre_tx_gate,
+                |d| Some(damiao::build_clear_faults_frame(d.motor_ids[idx])),
+            ) {
+                Ok(_) => sent_mask |= 1u64 << idx,
+                Err(Ok(code)) => return Ok(CarryoverMotorClearOutcome::Revoked(code)),
+                Err(Err(TxRefusal::DeadlinePassed)) => {
                     return Err(ArmDriverError::Transport(TransportError::Timeout));
                 }
-                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
                     return Err(ArmDriverError::EstopInhibited);
                 }
-                Err(TxRefusal::Deferred) => {
+                Err(Err(TxRefusal::Deferred)) => {
                     let pending = (affected_mask >> idx).count_ones() as usize;
                     tx_err = Some(ArmDriverError::TxDeferred { pending });
                     break;
                 }
-                Err(TxRefusal::Transport(e)) => {
+                Err(Err(TxRefusal::Transport(e))) => {
                     tx_err = Some(ArmDriverError::Transport(e));
                     break;
                 }
-                Err(r) => {
+                Err(Err(r)) => {
                     tx_err = Some(Self::refusal_to_driver_err(r));
                     break;
                 }
             }
         }
         self.pending_stop_check(Some(start_stamp))?;
-        if sent_any {
+        if sent_mask != 0 {
             if dl.is_some_and(|d| d.passed(self.now())) || self.flush_cutoff_exceeded() {
                 return Err(ArmDriverError::Transport(TransportError::Timeout));
             }
@@ -18637,8 +18666,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(e);
         }
 
-        // Verify on a fresh post-clear status reply (`last_feedback_seq[i] > boundary_seq`) that
-        // every affected motor's error bit is gone and every motor stays disabled (`status == 0`).
+        // Verify on a fresh post-clear status reply (`last_feedback_seq[i] > tx_boundary_seq[i]`)
+        // that every affected motor's error bit is gone and every motor stays disabled (`status == 0`).
         // Never sends `CMD_ENABLE`. If a motor did not automatically reply to `CMD_CLEAR_FAULTS`,
         // sends a single read-only `0xCC` status poll to the unanswered affected motor(s).
         let verify_start = self.now();
@@ -18648,9 +18677,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut polled_refresh = false;
         loop {
             let drained_empty = self.drain_rx_frames_only(verify_dl, 64);
+            self.pending_stop_check(Some(start_stamp))?;
+            if self.now() >= verify_deadline || release_cap_passed(self) {
+                return Err(ArmDriverError::Transport(TransportError::Timeout));
+            }
             let mut first_unconfirmed: Option<usize> = None;
             for i in 0..n {
-                if (affected_mask & (1u64 << i)) != 0 && self.last_feedback_seq[i] <= boundary_seq {
+                if (affected_mask & (1u64 << i)) != 0
+                    && self.last_feedback_seq[i] <= tx_boundary_seq[i]
+                {
                     first_unconfirmed = Some(i);
                     break;
                 }
@@ -18664,8 +18699,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     if damiao_fault_name(st).is_some() {
                         return Ok(CarryoverMotorClearOutcome::ErrorPersists { joint: i, code: st });
                     }
-                    if st != 0 {
+                    if st == 1 {
                         return Ok(CarryoverMotorClearOutcome::MotorEnabled { joint: i });
+                    }
+                    if st != 0 {
+                        return Ok(CarryoverMotorClearOutcome::ErrorPersists { joint: i, code: st });
                     }
                 }
                 for i in 0..n {
@@ -18677,30 +18715,34 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         return Ok(CarryoverMotorClearOutcome::MotorEnabled { joint: i });
                     }
                 }
+                self.pending_stop_check(Some(start_stamp))?;
+                if self.now() >= verify_deadline || release_cap_passed(self) {
+                    return Err(ArmDriverError::Transport(TransportError::Timeout));
+                }
                 return Ok(CarryoverMotorClearOutcome::Cleared);
-            }
-            self.pending_stop_check(Some(start_stamp))?;
-            if self.now() >= verify_deadline || release_cap_passed(self) {
-                return Ok(CarryoverMotorClearOutcome::Unconfirmed {
-                    joint: first_unconfirmed.unwrap_or(0),
-                });
             }
             if !polled_refresh && (!blocking || self.now() >= refresh_after) {
                 let mut sent_poll = false;
                 for idx in 0..n {
                     if (affected_mask & (1u64 << idx)) == 0
-                        || self.last_feedback_seq[idx] > boundary_seq
+                        || self.last_feedback_seq[idx] > tx_boundary_seq[idx]
                     {
                         continue;
                     }
-                    match self.send_plain(TxKind::Refresh, Some(start_stamp), verify_dl, false, |d| {
-                        Some(damiao::build_refresh_frame(d.motor_ids[idx]))
-                    }) {
+                    tx_boundary_seq[idx] = self.rx_seq;
+                    match self.send_with_commissioning_gate(
+                        TxKind::Refresh,
+                        Some(start_stamp),
+                        verify_dl,
+                        pre_tx_gate,
+                        |d| Some(damiao::build_refresh_frame(d.motor_ids[idx])),
+                    ) {
                         Ok(_) => sent_poll = true,
-                        Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                        Err(Ok(code)) => return Ok(CarryoverMotorClearOutcome::Revoked(code)),
+                        Err(Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
                             return Err(ArmDriverError::EstopInhibited);
                         }
-                        Err(_) => break,
+                        Err(Err(_)) => break,
                     }
                 }
                 polled_refresh = true;

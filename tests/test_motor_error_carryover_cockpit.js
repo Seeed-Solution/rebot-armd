@@ -53,6 +53,7 @@ const api = async (path, body, opts) => { calls.push({ path, body, opts }); retu
 ${source('reportedMotorErrors')}
 ${source('hasCarriedOverMotorErrors')}
 ${source('motorErrorSummary')}
+${source('mitFaultKey')}
 ${source('lockReason')}
 ${source('clearNeedsOperator')}
 ${source('opReasonKey')}
@@ -63,9 +64,10 @@ ${source('clearFault')}
 (async () => {
   const run = (code) => vm.runInContext(code, context);
 
-  // 1. Carried-over 0xD while Idle/disarmed is detected and summarized.
+  // 1. Carried-over 0xD while Idle/disarmed is detected, summarized, and keyed for commandRPC.
   assert.equal(run('hasCarriedOverMotorErrors()'), true);
   assert.equal(run('motorErrorSummary()'), 'J1 0xD (CAN Communication Loss)');
+  assert.equal(run('mitFaultKey()'), 'motor:1:13');
   assert.equal(run('clearNeedsOperator()'), true, 'carried-over motor error must be operator-only');
   assert.equal(run("opReasonKey('/api/v1/safety/clear_fault')"), 'op.why.motor_err');
 

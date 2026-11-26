@@ -3038,8 +3038,8 @@ const I18N = {
     'fault.limit': '关节超限 {name}: {val}°', 'fault.thermal': '过温 J{j}: {temp}°C / {limit}°C',
     // observation.fault.code -> short explanation + what to do (fc.<CODE> / fc.<CODE>.do)
     'fm.coded': '⚠️ {title}。{todo}。点此清除故障后长按「使能」。', 'lock.fault_coded': '⚠️ {title}：{todo}，然后点「清除故障」并长按「使能」',
-    'fm.motor_err': '⚠️ 电机残留错误：{d}（重启前锁存在电机内存中）。确认机械臂未使能且处于收纳位后点此清除（仅操作员，不会使能）；若仍存在请给电机断电重启。',
-    'fm.motor_err_op': '🔒 电机残留错误：{d}（重启前锁存在电机内存中）。需要操作员权限：确认机械臂未使能且处于收纳位后点此解锁并清除（不会使能）；若仍存在请给电机断电重启。',
+    'fm.motor_err': '⚠️ 电机报告硬件错误：{d}（锁存在电机内存中）。确认机械臂未使能且处于收纳位后点此清除（仅操作员，不会使能）；若仍存在请给电机断电重启。',
+    'fm.motor_err_op': '🔒 电机报告硬件错误：{d}（锁存在电机内存中）。需要操作员权限：确认机械臂未使能且处于收纳位后点此解锁并清除（不会使能）；若仍存在请给电机断电重启。',
     'fc.ESTOP': '急停已按下', 'fc.ESTOP.do': '确认周围安全后复位急停',
     'fc.BUS_LOSS': '电机总线断开', 'fc.BUS_LOSS.do': '检查电机线缆和电源是否接好',
     'fc.THERMAL_TRIP': '电机过热', 'fc.THERMAL_TRIP.do': '让机械臂停下冷却几分钟',
@@ -3308,8 +3308,8 @@ const I18N = {
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
     'fault.limit': 'Joint limit exceeded {name}: {val}°', 'fault.thermal': 'Over-temperature J{j}: {temp}°C / {limit}°C',
     'fm.coded': '⚠️ {title}. {todo}. Tap here to clear the fault, then hold "Enable".', 'lock.fault_coded': '⚠️ {title}: {todo}, then tap "Clear fault" and hold "Enable"',
-    'fm.motor_err': '⚠️ Carried-over motor error: {d} (latched in motor RAM before restart). Confirm the arm is disarmed at the rest pose and tap here to clear (operator-only; stays disabled); power-cycle the motor if it persists.',
-    'fm.motor_err_op': '🔒 Carried-over motor error: {d} (latched in motor RAM before restart). Operator access required: confirm the arm is disarmed at the rest pose and tap here to unlock and clear (stays disabled); power-cycle the motor if it persists.',
+    'fm.motor_err': '⚠️ Motor hardware error reported: {d} (latched in motor RAM). Confirm the arm is disarmed at the rest pose and tap here to clear (operator-only; stays disabled); power-cycle the motor if it persists.',
+    'fm.motor_err_op': '🔒 Motor hardware error reported: {d} (latched in motor RAM). Operator access required: confirm the arm is disarmed at the rest pose and tap here to unlock and clear (stays disabled); power-cycle the motor if it persists.',
     'fc.ESTOP': 'E-stop pressed', 'fc.ESTOP.do': 'Make sure the area is safe, then reset the E-stop',
     'fc.BUS_LOSS': 'Motor bus lost', 'fc.BUS_LOSS.do': 'Check the motor cable and power',
     'fc.THERMAL_TRIP': 'Motor overheated', 'fc.THERMAL_TRIP.do': 'Let the arm rest and cool for a few minutes',
@@ -8685,6 +8685,12 @@ function motorErrorSummary(list = reportedMotorErrors()) {
     const hex = '0x' + e.code.toString(16).toUpperCase();
     return e.name ? `J${e.joint} ${hex} (${e.name})` : `J${e.joint} ${hex}`;
   }).join(', ');
+}
+function mitFaultKey() {
+  const f = S.obs && S.obs.fault;
+  if (f && (f.code || f.message)) return String(f.code || '') + ':' + String(f.message || '');
+  const errs = reportedMotorErrors();
+  return errs.length ? 'motor:' + errs.map((e) => `${e.joint}:${e.code}`).join(',') : '';
 }
 function lockReason() {
   if (!isLive()) return t('lock.offline');

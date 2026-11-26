@@ -460,11 +460,15 @@ impl ArmDriver for ZeroOffsetDriver {
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> { self.inner.clear_fault() }
     fn clear_fault_budgeted(&mut self, deadline: Instant) -> Result<(), ArmDriverError> { self.inner.clear_fault_budgeted(deadline) }
+    fn drain_rx_only_bounded(&mut self, deadline: Option<Instant>) -> Result<(), ArmDriverError> {
+        self.inner.drain_rx_only_bounded(deadline)
+    }
     fn clear_carried_over_motor_errors(
         &mut self,
         deadline: Option<Instant>,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<crate::driver::CarryoverMotorClearOutcome, ArmDriverError> {
-        self.inner.clear_carried_over_motor_errors(deadline)
+        self.inner.clear_carried_over_motor_errors(deadline, pre_tx_gate)
     }
     fn clear_fault_disables_joints(&self) -> Vec<usize> { self.inner.clear_fault_disables_joints() }
     fn has_known_partial_enable(&self) -> bool { self.inner.has_known_partial_enable() }

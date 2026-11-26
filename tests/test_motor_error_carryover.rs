@@ -529,6 +529,72 @@ fn off_rest_pose_and_stale_feedback_refused_without_tx() {
             bus_stale.tx_log().is_empty(),
             "stale feedback refusal must send 0 CAN frames"
         );
+
+        // Queued off-rest J2 frame sitting in CAN RX after an at-rest tick must be drained and
+        // caught BEFORE sending CMD_CLEAR_FAULTS (Blocker 1 regression).
+        let (mut inner_queued, bus_queued, _clock_queued) = make_booted_carryover_supervisor(|s| {
+            s.motors[0].fault_state = 0xD;
+        });
+        bus_queued.with(|s| {
+            s.motors[1].q = 0.5;
+            let fb = s.motors[1].feedback_frame();
+            let now = s.clock.now();
+            s.rx.push_back((fb, Some(now)));
+        });
+        let err_queued = if use_rt {
+            let e = inner_queued
+                .clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50))
+                .expect_err("queued off-rest frame must refuse before TX on RT");
+            assert!(matches!(
+                e,
+                ClearFaultError::Rejected(ClearRefusal::MotorErrorNotAtRestPose(_))
+            ));
+            e.to_string()
+        } else {
+            inner_queued
+                .clear_fault()
+                .expect_err("queued off-rest frame must refuse before TX on legacy")
+                .to_string()
+        };
+        assert!(err_queued.contains("resting pose"), "{err_queued}");
+        assert!(
+            bus_queued.tx_log().is_empty(),
+            "queued off-rest refusal must send 0 CAN frames: {:?}",
+            bus_queued.tx_log()
+        );
+
+        // Stale enabled J7 while J1–J6 stay fresh at rest must be refused (Blocker 2 regression).
+        let (mut inner_j7, bus_j7, clock_j7) = make_booted_carryover_supervisor(|s| {
+            s.motors[0].fault_state = 0xD;
+            s.motors[6].enabled = true;
+        });
+        clock_j7.advance(Duration::from_millis(300));
+        // Push fresh feedback for J1–J6 only (J7 stays stale & enabled).
+        bus_j7.with(|s| {
+            let now = s.clock.now();
+            for i in 0..6 {
+                let fb = s.motors[i].feedback_frame();
+                s.rx.push_back((fb, Some(now)));
+            }
+        });
+        inner_j7.tick(0.02);
+        bus_j7.clear_tx_log();
+        let res_j7 = if use_rt {
+            inner_j7
+                .clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50))
+                .map_err(|e| e.to_string())
+        } else {
+            inner_j7.clear_fault().map_err(|e| e.to_string())
+        };
+        assert!(
+            res_j7.is_err(),
+            "use_rt={use_rt}: stale enabled J7 must refuse carryover clear"
+        );
+        assert!(
+            bus_j7.tx_log().is_empty(),
+            "use_rt={use_rt}: stale enabled J7 refusal must send 0 CAN frames: {:?}",
+            bus_j7.tx_log()
+        );
     }
 }
 
