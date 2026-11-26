@@ -5841,78 +5841,169 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
     rig.bus.with(|s| {
         s.follow_commands = true;
     });
-    let retired_before_7a = {
-        let mut b = exec.broker().lock().unwrap();
-        b.reclaim_plans();
-        b.stats().retired
-    };
-    let ep_ret = rig.sup.get_observation().await.epoch_id;
-    let mut jog_t = rest.to_vec();
-    jog_t[0] += 0.02;
-    let jog_ret = ws_rpc(
-        &mut ws,
-        10,
-        gen,
-        ep_ret,
-        "/api/v1/motion/jog",
-        json!({"target_positions": jog_t, "duration_secs": 0.25, "speed_scale": 1.0}),
-    )
-    .await;
-    assert_eq!(jog_ret["type"], "command_ack", "{jog_ret}");
-    let jog_action_id = jog_ret["action_id"].as_u64().expect("jog action_id");
-
-    let seq_ret0 = rig.sup.hub().published_seq();
-    let (rel_ret, jh_ret) = pause_hub(&rig.sup);
-    let dl_ret = Instant::now() + Duration::from_secs(3);
-    while rig.sup.hub().published_seq() < seq_ret0 + 16
-        || {
-            let mut b = exec.broker().lock().unwrap();
-            b.reclaim_plans();
-            b.stats().retired <= retired_before_7a
-        }
-    {
-        assert!(
-            Instant::now() < dl_ret,
-            "jog action {jog_action_id} did not finish and retire while StateHub reader_guard was held"
-        );
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-    let retired_during_stall = {
-        let mut b = exec.broker().lock().unwrap();
-        b.reclaim_plans();
-        b.stats().retired
-    };
-    assert!(
-        retired_during_stall > retired_before_7a,
-        "jog action {jog_action_id} plan must retire in broker strictly BEFORE dropping StateHub::reader_guard() ({retired_during_stall} vs {retired_before_7a})"
-    );
-    rel_ret.send(()).unwrap();
-    jh_ret.join().unwrap();
-
-    let dl_done = Instant::now() + Duration::from_secs(2);
-    loop {
-        let obs_done = rig.sup.get_observation().await;
-        if obs_done
-            .action
-            .as_ref()
-            .is_some_and(|a| a.id == jog_action_id && !a.is_running())
-        {
-            assert_eq!(obs_done.action.as_ref().map(|a| a.state.as_str()), Some("done"), "{obs_done:?}");
-            break;
-        }
-        assert!(Instant::now() < dl_done, "exact jog action {jog_action_id} did not settle: obs={obs_done:?}");
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-
-    // (b) Stalled router sink (`DeliveryDecision::Backpressured`): verify exact `stall_action_id`
-    //     is observed in `backpressured_ids` and retired BEFORE `stall_sink` is released, and
-    //     that exact `stall_action_id` is delivered after releasing backpressure!
     let _ = ws_send_wait_types(
         &mut ws,
         json!({"type": "release_lease", "client_id": "whole-rel-gc-mit", "generation": gen, "seq": 11}),
         &["lease_released"],
     )
     .await;
+    {
+        let client_hub = ClientId(911);
+        exec.open_connection_sync(911).unwrap().unwrap();
+        let hub_stall_terminals = Arc::new(Mutex::new(Vec::<(u64, armd::rt_core::broker::Outcome)>::new()));
+        let hub_term_cb = Arc::clone(&hub_stall_terminals);
+        let _hub_sink_guard = exec
+            .register_connection_reply_sink(
+                client_hub,
+                Arc::new(move |_, reply| {
+                    if let Reply::Terminal { action, outcome, .. } = reply {
+                        hub_term_cb.lock().unwrap().push((action.0, outcome));
+                    }
+                    DeliveryDecision::Delivered
+                }),
+                Some(8),
+            )
+            .unwrap();
+        let conn_hub =
+            armd::rt_core::requests::lease::ConnectionHandle::try_new(911, "stall-hub").unwrap();
+        let hub_gen = match rig
+            .sup
+            .acquire_lease_ws(conn_hub.clone(), "stall-hub", 1)
+            .await
+            .expect("acquire_lease_ws")
+        {
+            armd::rt_core::requests::lease::LeaseOutcome::Granted { generation, .. } => generation,
+            other => panic!("expected Granted, got {other:?}"),
+        };
+        let retired_before_7a = {
+            let mut b = exec.broker().lock().unwrap();
+            b.reclaim_plans();
+            b.stats().retired
+        };
+        let mut adm_h = rig.sup.capture_admission_stamp();
+        adm_h.connection_id = 911;
+        adm_h.lease_gen = hub_gen;
+        let snap_h = armd::rt_core::requests::actions::ActionSnapshot::capture(
+            &rig.sup,
+            adm_h,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let g_hub = armd::rt_core::requests::actions::prepare_gripper(
+            &snap_h,
+            &json!({"command": "move", "fraction": 0.15, "speed": 1.0}),
+            armd::supervisor::GripperBaselineCmd::None,
+        )
+        .unwrap();
+        let slot_h = g_hub.to_plan_slot(None).unwrap();
+        let write_h = |dst: &mut armd::rt_core::ops::PlanSlot| *dst = slot_h.clone();
+        let (_req_h, mut ack_rx_h, guard_h) = exec
+            .submit_external_action(
+                client_hub,
+                1,
+                snap_h.owner.authority,
+                Instant::now() + Duration::from_secs(5),
+                armd::rt_core::requests::actions::ActionSubmit::InstallPrepared {
+                    write: &write_h,
+                    kind: armd::rt_core::requests::actions::PreparedActionKind::Gripper,
+                    prepared_boot: exec.boot(),
+                    admission_request_id: adm_h.request_id,
+                    check_workspace_revision: false,
+                    poses_revision: None,
+                    calibration_revision: None,
+                    gripper_calib_revision: g_hub.stamp.gripper_calib_revision,
+                    power_budget_revision: None,
+                },
+                armd::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+                false,
+                None,
+            )
+            .unwrap();
+        let ack_h = loop {
+            exec.pump_broker_replies();
+            if let Ok(r) = ack_rx_h.try_recv() {
+                break r.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let _ = guard_h.confirm_enqueued();
+        let hub_action_id = match ack_h {
+            armd::rt_core::broker::Reply::Ack { action: Some(aid), .. } => aid.0,
+            other => panic!("expected Ack(Some(action_id)), got {other:?}"),
+        };
+        assert!(
+            hub_stall_terminals.lock().unwrap().is_empty(),
+            "action {hub_action_id} must still be in-flight when StateHub::reader_guard() is acquired"
+        );
+
+        let seq_ret0 = rig.sup.hub().published_seq();
+        let (rel_ret, jh_ret) = pause_hub(&rig.sup);
+        let dl_ret = Instant::now() + Duration::from_secs(3);
+        loop {
+            exec.pump_broker_replies();
+            let retired_now = {
+                let mut b = exec.broker().lock().unwrap();
+                b.reclaim_plans();
+                b.stats().retired
+            };
+            let exact_term_seen = hub_stall_terminals
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(aid, out)| aid == hub_action_id && out == armd::rt_core::broker::Outcome::Completed);
+            if rig.sup.hub().published_seq() >= seq_ret0 + 16
+                && retired_now > retired_before_7a
+                && exact_term_seen
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < dl_ret,
+                "action {hub_action_id} did not emit its exact terminal and retire while StateHub reader_guard was held (terminals={:?}, retired={retired_now} vs {retired_before_7a})",
+                hub_stall_terminals.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(
+            hub_stall_terminals
+                .lock()
+                .unwrap()
+                .contains(&(hub_action_id, armd::rt_core::broker::Outcome::Completed)),
+            "exact target terminal id {hub_action_id} must be observed strictly BEFORE dropping StateHub::reader_guard()"
+        );
+        let retired_during_stall = {
+            let mut b = exec.broker().lock().unwrap();
+            b.reclaim_plans();
+            b.stats().retired
+        };
+        assert!(
+            retired_during_stall > retired_before_7a,
+            "action {hub_action_id} plan must retire in broker strictly BEFORE dropping StateHub::reader_guard() ({retired_during_stall} vs {retired_before_7a})"
+        );
+        rel_ret.send(()).unwrap();
+        jh_ret.join().unwrap();
+
+        let dl_done = Instant::now() + Duration::from_secs(2);
+        loop {
+            let obs_done = rig.sup.get_observation().await;
+            if obs_done
+                .action
+                .as_ref()
+                .is_some_and(|a| a.id == hub_action_id && !a.is_running())
+            {
+                assert_eq!(obs_done.action.as_ref().map(|a| a.state.as_str()), Some("done"), "{obs_done:?}");
+                break;
+            }
+            assert!(Instant::now() < dl_done, "exact action {hub_action_id} did not settle: obs={obs_done:?}");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let _ = rig.sup.release_lease_ws(conn_hub, hub_gen).await;
+    }
+
+    // (b) Stalled router sink (`DeliveryDecision::Backpressured`): verify exact `stall_action_id`
+    //     is observed in `backpressured_ids` and retired BEFORE `stall_sink` is released, and
+    //     that exact `stall_action_id` is delivered after releasing backpressure!
     {
         let client_stall = ClientId(910);
         exec.open_connection_sync(910).unwrap().unwrap();
@@ -5965,7 +6056,7 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
         .unwrap();
         let g_prep = armd::rt_core::requests::actions::prepare_gripper(
             &snap_s,
-            &json!({"command": "move", "fraction": 0.2, "speed": 1.0}),
+            &json!({"command": "move", "fraction": 0.3, "speed": 1.0}),
             armd::supervisor::GripperBaselineCmd::None,
         )
         .unwrap();
