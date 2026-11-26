@@ -763,6 +763,37 @@ impl SlotBuf {
     pub fn is_heap(&self) -> bool {
         matches!(self, Self::Heap(_))
     }
+
+    /// Consumes this buffer and returns its backing heap `Vec` if heap-allocated (zero alloc/free).
+    pub fn into_heap_vec(self) -> Option<Vec<f64>> {
+        match self {
+            Self::Heap(v) => Some(v),
+            Self::Stack { .. } => None,
+        }
+    }
+
+    /// True if this buffer can hold `len` elements in place without heap allocation.
+    pub fn can_fit(&self, len: usize) -> bool {
+        match self {
+            Self::Stack { .. } => len <= MAX_STACK_WORKSPACE_SLOTS,
+            Self::Heap(v) => v.capacity() >= len,
+        }
+    }
+
+    /// Overwrites this buffer with `src` in place without heap allocation when `self.can_fit(src.len())`.
+    pub fn copy_from_slice_in_place(&mut self, src: &[f64]) {
+        match self {
+            Self::Stack { data, len } => {
+                debug_assert!(src.len() <= MAX_STACK_WORKSPACE_SLOTS);
+                data[..src.len()].copy_from_slice(src);
+                *len = src.len();
+            }
+            Self::Heap(v) => {
+                v.clear();
+                v.extend_from_slice(src);
+            }
+        }
+    }
 }
 
 /// Signed clearance of a capsule `(a, b, radius)` against an axis-aligned box `[lo, hi]`:

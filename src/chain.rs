@@ -1274,6 +1274,10 @@ pub struct EvalBufs {
     pub(crate) sweep_free: Vec<usize>,
     pub(crate) geom_bounds: Vec<f64>,
     pub(crate) min_depths_spare: Option<k::SlotBuf>,
+    pub(crate) tracking_ws_spare: Option<Vec<f64>>,
+    pub(crate) tracking_keepout_spare: Option<Vec<f64>>,
+    pub(crate) tracking_staged_ws: Vec<f64>,
+    pub(crate) tracking_staged_other: Vec<f64>,
     pub(crate) world_caps: Vec<([f64; 3], [f64; 3], f64)>,
 }
 
@@ -1307,6 +1311,8 @@ impl EvalBufs {
         ensure_f64(&mut self.scratch_cm, need_slots);
         ensure_f64(&mut self.scratch_min_d, need_slots);
         ensure_f64(&mut self.scratch_cand_min_d, need_slots);
+        ensure_f64(&mut self.tracking_staged_ws, need_slots);
+        ensure_f64(&mut self.tracking_staged_other, need_slots);
         ensure_f64(&mut self.geom_bounds, need_geoms);
         ensure_f64(&mut self.sweep_slab, RT_SWEEP_POOL_SLOTS * need_slots);
         if self.sweep_stack.capacity() < RT_SWEEP_POOL_SLOTS {
@@ -1325,6 +1331,17 @@ impl EvalBufs {
         if !reuse_spare {
             self.min_depths_spare = Some(k::SlotBuf::zeros(need_slots));
         }
+        if need_slots > k::MAX_STACK_WORKSPACE_SLOTS {
+            if !self.tracking_ws_spare.as_ref().is_some_and(|v| v.capacity() >= need_slots) {
+                self.tracking_ws_spare = Some(vec![0.0; need_slots]);
+            }
+            if !self.tracking_keepout_spare.as_ref().is_some_and(|v| v.capacity() >= need_slots) {
+                self.tracking_keepout_spare = Some(vec![0.0; need_slots]);
+            }
+        } else {
+            self.tracking_ws_spare = None;
+            self.tracking_keepout_spare = None;
+        }
     }
 }
 
@@ -1338,6 +1355,7 @@ pub struct WorkspaceEvaluator<'a> {
     floor: f64,
     box_lo: [f64; 3],
     box_hi: [f64; 3],
+    max_reach: Option<f64>,
     keepouts: SmallBuf<([f64; 3], [f64; 3]), 16>,
     end_locals: SmallBuf<[f64; 3], 16>,
     tcp_offset: [f64; 3],
@@ -1387,6 +1405,20 @@ impl<'a> WorkspaceEvaluator<'a> {
         tcp_offset: [f64; 3],
         bufs: &mut EvalBufs,
     ) -> Self {
+        Self::new_with_tcp_in_mode(model, ws, cam, tcp_offset, bufs, false)
+    }
+
+    /// Zero-allocation equivalent of constructing on `ws.keepout_only()` when `keepout_only` is
+    /// true: disables `floor`, outer `box`, and `max_reach` in the evaluator without cloning
+    /// `WorkspacePolicy` or its `keepout_boxes` / `link_capsules` vectors.
+    pub fn new_with_tcp_in_mode(
+        model: &'a ArmModel,
+        ws: &'a crate::model::WorkspacePolicy,
+        cam: &'a crate::model::CameraMount,
+        tcp_offset: [f64; 3],
+        bufs: &mut EvalBufs,
+        keepout_only: bool,
+    ) -> Self {
         let has_cam = cam.offset_m.is_some();
         let need_end = 1 + ws.check_points_end_m.len() + usize::from(has_cam);
         let mut end_locals = SmallBuf::new([0.0; 3], &mut bufs.end_locals, need_end);
@@ -1397,7 +1429,8 @@ impl<'a> WorkspaceEvaluator<'a> {
         if let Some(o) = cam.offset_m {
             end_locals.push(o.map(f64::from));
         }
-        let has_tcp_reach = ws.max_reach_m.is_some() && tcp_offset != [0.0; 3];
+        let max_reach = if keepout_only { None } else { ws.max_reach_m.map(f64::from) };
+        let has_tcp_reach = max_reach.is_some() && tcp_offset != [0.0; 3];
         let mut max_end_off = end_locals.iter().map(k::norm).fold(0.0, f64::max);
         if has_tcp_reach {
             max_end_off = max_end_off.max(k::norm(&tcp_offset));
@@ -1455,7 +1488,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         let num_end_pts = end_locals.len();
         let num_geoms = num_end_pts + capsules.len();
         let slots_per_geom = 7 + keepouts.len();
-        let has_reach = ws.max_reach_m.is_some();
+        let has_reach = max_reach.is_some();
         let reach_slots = usize::from(has_reach) + usize::from(has_tcp_reach);
         let self_collision_slot_start = num_geoms * slots_per_geom + reach_slots;
         let total_slots = self_collision_slot_start + self_pairs.len();
@@ -1465,9 +1498,10 @@ impl<'a> WorkspaceEvaluator<'a> {
             ws,
             cam,
             shoulder: model.shoulder_rz(),
-            floor: f64::from(ws.floor_z_m),
-            box_lo: ws.box_min_m.map(f64::from),
-            box_hi: ws.box_max_m.map(f64::from),
+            floor: if keepout_only { f64::NEG_INFINITY } else { f64::from(ws.floor_z_m) },
+            box_lo: if keepout_only { [f64::NEG_INFINITY; 3] } else { ws.box_min_m.map(f64::from) },
+            box_hi: if keepout_only { [f64::INFINITY; 3] } else { ws.box_max_m.map(f64::from) },
+            max_reach,
             keepouts,
             end_locals,
             tcp_offset,
@@ -1699,15 +1733,15 @@ impl<'a> WorkspaceEvaluator<'a> {
                 }
             }
         }
-        if let Some(reach) = self.ws.max_reach_m {
+        if let Some(reach) = self.max_reach {
             let reach_base = self.num_geoms * self.slots_per_geom;
             let p0 = f.end.p;
             let d = k::shoulder_reach_from(&p0, &self.shoulder);
-            buf[reach_base] = f64::from(reach) - d;
+            buf[reach_base] = reach - d;
             if self.has_tcp_reach {
                 let p_tcp = f.end.transform_point(&self.tcp_offset);
                 let d_tcp = k::shoulder_reach_from(&p_tcp, &self.shoulder);
-                buf[reach_base + 1] = f64::from(reach) - d_tcp;
+                buf[reach_base + 1] = reach - d_tcp;
             }
         }
         if !self.self_pairs.is_empty() {
@@ -1806,15 +1840,15 @@ impl<'a> WorkspaceEvaluator<'a> {
                 }
             }
         }
-        if let Some(reach) = self.ws.max_reach_m {
+        if let Some(reach) = self.max_reach {
             let reach_base = self.num_geoms * self.slots_per_geom;
             let p0 = f.end.p;
             let d = k::shoulder_reach_from(&p0, &self.shoulder);
-            buf[reach_base] = f64::from(reach) - d;
+            buf[reach_base] = reach - d;
             if self.has_tcp_reach {
                 let p_tcp = f.end.transform_point(&self.tcp_offset);
                 let d_tcp = k::shoulder_reach_from(&p_tcp, &self.shoulder);
-                buf[reach_base + 1] = f64::from(reach) - d_tcp;
+                buf[reach_base + 1] = reach - d_tcp;
             }
         }
         if !self.self_pairs.is_empty() {
@@ -2263,7 +2297,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
         if self.has_reach && slot >= self.num_geoms * self.slots_per_geom {
             let reach_idx = slot - self.num_geoms * self.slots_per_geom;
-            let bound = f64::from(self.ws.max_reach_m.unwrap_or(0.0));
+            let bound = self.max_reach.unwrap_or(0.0);
             let cid = "max_reach".to_string();
             let (point, gid) = if reach_idx == 0 {
                 (0, "end_origin".to_string())

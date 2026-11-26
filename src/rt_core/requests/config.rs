@@ -3190,6 +3190,7 @@ fn swap_config_candidate_in_place(
             core.retire_servo_ws_min_depths();
             core.keepout.revision += 1;
             retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, ws_eval_bufs));
+            core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
         }
         ConfigCandidate::Collision { enabled, sensitivity } => {
             if let Some(e) = enabled {
@@ -3245,6 +3246,7 @@ fn swap_config_candidate_in_place(
             retired.grasp_setup = core.config.grasp.replace(setup);
             if let Some(bufs) = ws_eval_bufs {
                 retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+                core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
             }
             core.grasp_setup_revision += 1;
         }
@@ -3308,6 +3310,7 @@ fn swap_config_candidate_in_place(
             }
             if let Some(bufs) = ws_eval_bufs {
                 retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+                core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
             }
             if ws_changed {
                 core.workspace_revision += 1;
@@ -3446,6 +3449,7 @@ fn swap_config_candidate_in_place(
             }
             if let Some(bufs) = ws_eval_bufs {
                 retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+                core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
             }
             if ws_changed {
                 core.workspace_revision += 1;

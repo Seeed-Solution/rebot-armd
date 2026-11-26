@@ -7,7 +7,7 @@ use crate::supervisor_lock::SupervisorLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::rt_core::scratch::{copy_into, copy_limits, fill_n};
+use crate::rt_core::scratch::{copy_into, fill_n};
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
 use crate::model::{ArmConfig, ArmObservation, MotionLimit, MotionLimitReason, ObservationSchema, RestingPosePolicy};
 use crate::recording::{EpisodeRecorder, RecordFrame, RecordingError};
@@ -2947,6 +2947,7 @@ impl SupervisorInner {
         if let Some((ws, cam)) = self.workspace_policy() {
             bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
         }
+        self.tracking.install_ws_depth_spares_from_eval_bufs(&mut bufs, None);
         self.ws_eval_bufs = bufs;
         // Single-buffer workspace spare invariant: at most one heap `SlotBuf` exists across
         // `(self.servo_ws_min_depths, self.ws_eval_bufs.min_depths_spare)`, so
@@ -4432,22 +4433,22 @@ impl SupervisorInner {
         keepout_sweep_with_tcp_tol(&self.config.arm_model, ws, cam, self.config.tcp_offset, escape_tol, at, travel, knots, budget)
     }
 
-    /// The command `hold_measured_pose` holds: the measured pose clamped to the limits
-    /// (the current command when a measurement is not finite), the gripper keeping its command.
-    pub(crate) fn measured_hold_pose(&self) -> Vec<f32> {
-        let mut hold = self.commanded_positions.clone();
+    /// Zero-allocation stack version of measured hold pose writing into `dst` (up to `dof`).
+    pub(crate) fn measured_hold_pose_into(&self, dst: &mut [f32]) -> usize {
+        let dof = self.commanded_positions.len().min(dst.len());
+        dst[..dof].copy_from_slice(&self.commanded_positions[..dof]);
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            for (i, (c, m)) in hold.iter_mut().zip(&self.measured_positions).enumerate() {
+            for (i, (c, m)) in dst[..dof].iter_mut().zip(&self.measured_positions).enumerate() {
                 let l = &self.config.limits[i];
                 *c = m.clamp(l.min_position, l.max_position);
             }
         }
         if let Some(g) = self.config.gripper_index() {
-            if let (Some(c), Some(&cmd)) = (hold.get_mut(g), self.commanded_positions.get(g)) {
+            if let (Some(c), Some(&cmd)) = (dst[..dof].get_mut(g), self.commanded_positions.get(g)) {
                 *c = cmd;
             }
         }
-        hold
+        dof
     }
 
     /// End every motion and hold the measured pose (clamped to the limits) with torque on;
@@ -10080,10 +10081,12 @@ impl SupervisorInner {
         // feedback confirms a clean baseline across every joint.
         if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
             if !sc.recovered.is_empty() {
-                tracing::warn!(
-                    "Driver emitted autonomous recovery writes for joints {:?}; suspending tracking compensation until fresh baseline",
-                    sc.recovered.iter().map(|i| i + 1).collect::<Vec<_>>()
-                );
+                if !self.safety.deferred_logging() {
+                    tracing::warn!(
+                        "Driver emitted autonomous recovery writes for joints {:?}; suspending tracking compensation until fresh baseline",
+                        sc.recovered.iter().map(|i| i + 1).collect::<Vec<_>>()
+                    );
+                }
                 self.tracking.suspend_for_recovery(&sc.recovered, Instant::now());
                 self.stop_motion();
                 self.servo_stream_active = false;
@@ -10102,25 +10105,24 @@ impl SupervisorInner {
                     && self.measured_positions.iter().all(|q| q.is_finite());
                 if all_fresh_post_recovery {
                     let gripper_idx = self.config.gripper_index();
-                    let recovered: Vec<usize> = self
-                        .tracking
-                        .recovery_joints
-                        .iter()
-                        .map(|&(j, _)| j)
-                        .collect();
-                    let mut recovered_updates = Vec::with_capacity(recovered.len());
-                    for &j in &recovered {
-                        if j < self.config.dof && Some(j) != gripper_idx {
+                    let mut recovered_updates = [(0usize, 0.0f32); crate::model::MAX_MOTION_DOF];
+                    let mut rec_len = 0usize;
+                    for &(j, _) in &self.tracking.recovery_joints {
+                        if j < self.config.dof
+                            && Some(j) != gripper_idx
+                            && rec_len < recovered_updates.len()
+                        {
                             let l = &self.config.limits[j];
                             let clamped = self.measured_positions[j].clamp(l.min_position, l.max_position);
                             self.commanded_positions[j] = clamped;
                             self.target_positions[j] = clamped;
-                            recovered_updates.push((j, clamped));
+                            recovered_updates[rec_len] = (j, clamped);
+                            rec_len += 1;
                         }
                     }
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.tracking.resume_from_recovery(&recovered_updates);
+                    self.tracking.resume_from_recovery(&recovered_updates[..rec_len]);
                 }
             }
         }
@@ -12000,7 +12002,9 @@ impl SupervisorInner {
                     && (self.active_trajectory.is_some() || self.servo_target.is_some() || self.pending_normal_unload)
                 {
                     // A new motion or park took over from the issued (braking) state.
-                    self.tracking.fallback_ramp = None;
+                    if let Some(old) = self.tracking.fallback_ramp.take() {
+                        self.tracking.recycle_fallback_ramp(old);
+                    }
                 }
                 if tracking_active && self.tracking.recovery_suspended {
                     // Driver emitted an autonomous recovery write; suspend supervisor target
@@ -12008,57 +12012,103 @@ impl SupervisorInner {
                 } else if tracking_active && self.driver.is_some() && self.tracking.fallback_ramp.is_some() {
                     // Rejection-fallback braking ramp, also while the rejection fault is latched.
                     // The rejected motion's caps (`FallbackRamp::limits`) stay in force, tightened
-                    // by the current power governor limit; the ramp keeps its original caps.
+                    // by the current power governor limit; the ramp keeps its original caps (0 alloc).
                     let mut ramp = self.tracking.fallback_ramp.take().expect("checked above");
-                    let governed = self.active_tracking_limits(servo_dt, time_scale);
-                    let mut orig_limits = std::mem::take(&mut self.scratch.fallback_limits);
-                    copy_limits(&mut orig_limits, &ramp.limits);
+                    let mut governed = std::mem::take(&mut self.scratch.fallback_limits);
+                    self.active_tracking_limits_into(servo_dt, time_scale, &mut governed);
+                    let mut orig_va = [(0.0_f32, 0.0_f32); crate::model::MAX_MOTION_DOF];
+                    let n_lim = ramp.limits.len().min(crate::model::MAX_MOTION_DOF);
+                    for (slot, l) in orig_va[..n_lim].iter_mut().zip(&ramp.limits[..n_lim]) {
+                        *slot = (l.max_velocity, l.max_acceleration);
+                    }
                     for (l, g) in ramp.limits.iter_mut().zip(&governed) {
                         l.max_velocity = l.max_velocity.min(g.max_velocity);
                         l.max_acceleration = l.max_acceleration.min(g.max_acceleration);
                     }
+                    self.scratch.fallback_limits = governed;
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let mut pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
-                    std::mem::swap(&mut pending.ramp.limits, &mut orig_limits);
-                    self.scratch.fallback_limits = orig_limits;
-                    tick_output = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                    let mut pending = self.tracking_fallback_compute_inline(ramp, servo_dt, &mut tick_sweep_budget);
+                    for (l, &(v, a)) in pending.ramp.limits[..n_lim].iter_mut().zip(&orig_va[..n_lim]) {
+                        l.max_velocity = v;
+                        l.max_acceleration = a;
+                    }
+                    tick_output = self.apply_tracking_fallback_step_inline(pending, gravity_output_enabled);
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else if ramp_out_handover || tracking_owned {
-                    let jt = self.config.joint_tracking.as_ref().unwrap();
-                    let active_limits = self.active_tracking_limits(servo_dt, time_scale);
+                    let mut active_limits = std::mem::take(&mut self.scratch.fallback_limits);
+                    self.active_tracking_limits_into(servo_dt, time_scale, &mut active_limits);
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let eval_res = if ramp_out_handover {
+                    let use_inline = !ramp_out_handover
+                        && self.handover_settling_since.is_none()
+                        && self.config.dof <= crate::model::MAX_MOTION_DOF;
+                    let eval_res = if use_inline {
+                        self.compute_position_lead_output_inline(
+                            servo_dt,
+                            false,
+                            &active_limits,
+                            &mut tick_sweep_budget,
+                        )
+                    } else if ramp_out_handover && self.config.dof <= crate::model::MAX_MOTION_DOF {
+                        self.compute_lead_ramp_out_inline(
+                            servo_dt,
+                            &active_limits,
+                            self.pending_normal_unload,
+                            &mut tick_sweep_budget,
+                        )
+                    } else if ramp_out_handover {
                         self.compute_lead_ramp_out_with_budget(
                             servo_dt,
                             &active_limits,
                             self.pending_normal_unload,
                             &mut tick_sweep_budget,
                         )
-                    } else if self.handover_settling_since.is_some() {
-                        // Moving lease handover with lead already ramped out: validate nominal
-                        // handover hold/braking without adding new lead.
-                        let mut zero_jt = jt.clone();
-                        for j in &mut zero_jt.joints {
-                            j.strategy = crate::tracking::TrackingStrategy::Position;
-                        }
-                        self.compute_position_lead_output_with_limits_and_budget(
-                            servo_dt,
-                            &zero_jt,
-                            &active_limits,
-                            &mut tick_sweep_budget,
-                        )
+                        .map(|o| {
+                            let dof = o.positions.len().min(crate::model::MAX_MOTION_DOF);
+                            let mut positions = [0.0_f32; crate::model::MAX_MOTION_DOF];
+                            let mut velocities = [0.0_f32; crate::model::MAX_MOTION_DOF];
+                            positions[..dof].copy_from_slice(&o.positions[..dof]);
+                            velocities[..dof].copy_from_slice(&o.velocities[..dof]);
+                            let ws_min_depths_rev = o.ws_min_depths.as_ref().map(|(rev, sb)| {
+                                let s = sb.as_slice();
+                                if self.ws_eval_bufs.tracking_staged_ws.len() < s.len() {
+                                    self.ws_eval_bufs.tracking_staged_ws.resize(s.len(), 0.0);
+                                }
+                                self.ws_eval_bufs.tracking_staged_ws[..s.len()].copy_from_slice(s);
+                                (*rev, s.len())
+                            });
+                            let ws_keepout_min_depths_rev = o.ws_keepout_min_depths.as_ref().map(|(rev, sb)| {
+                                let s = sb.as_slice();
+                                if self.ws_eval_bufs.tracking_staged_ws.len() < s.len() {
+                                    self.ws_eval_bufs.tracking_staged_ws.resize(s.len(), 0.0);
+                                }
+                                self.ws_eval_bufs.tracking_staged_ws[..s.len()].copy_from_slice(s);
+                                (*rev, s.len())
+                            });
+                            crate::tracking::TrackingOutputInline {
+                                positions,
+                                velocities,
+                                dof,
+                                multiplier: o.multiplier,
+                                withdrawn: o.withdrawn,
+                                sweep_evals_used: o.sweep_evals_used,
+                                ws_min_depths_rev,
+                                ws_keepout_min_depths_rev,
+                            }
+                        })
+                        .map_err(crate::tracking::TrackingRejectRt::from_tracking_reject)
                     } else {
-                        self.compute_position_lead_output_with_limits_and_budget(
+                        self.compute_position_lead_output_inline(
                             servo_dt,
-                            jt,
+                            true,
                             &active_limits,
                             &mut tick_sweep_budget,
                         )
                     };
                     match eval_res {
                         Ok(out) => {
-                            if self.check_static_load_tracking_output(&out.positions, true).is_err() {
+                            self.scratch.fallback_limits = active_limits;
+                            if self.check_static_load_tracking_output(&out.positions[..out.dof], true).is_err() {
                                 // Tracking lead or ramp-out output would worsen static load above
                                 // cap or under active static overload restriction: do not emit
                                 // `out.positions`; halt worsening motion and emit a safe hold pose.
@@ -12133,7 +12183,7 @@ impl SupervisorInner {
                                 let mut targets = std::mem::take(&mut self.scratch.targets);
                                 targets.clear();
                                 targets.extend(
-                                    out.positions
+                                    out.positions[..out.dof]
                                         .iter()
                                         .zip(self.commanded_velocities.iter())
                                         .enumerate()
@@ -12153,14 +12203,20 @@ impl SupervisorInner {
                                 tick_output = self.write_output_scratch(servo_dt);
                                 match &tick_output {
                                     TickOutput::Complete { .. } => {
-                                        let nominal = self.tracking.nominal_entry(&self.commanded_positions, servo_dt);
-                                        self.tracking.record_issued_with_ws_depths(
-                                            out.positions,
-                                            out.velocities,
-                                            out.ws_min_depths,
-                                            out.ws_keepout_min_depths,
+                                        let ws_slice = out
+                                            .ws_min_depths_rev
+                                            .map(|(rev, n)| (rev, &self.ws_eval_bufs.tracking_staged_ws[..n]));
+                                        let keepout_slice = out
+                                            .ws_keepout_min_depths_rev
+                                            .map(|(rev, n)| (rev, &self.ws_eval_bufs.tracking_staged_ws[..n]));
+                                        self.tracking.record_issued_and_nominal_inline(
+                                            &out.positions[..out.dof],
+                                            &out.velocities[..out.dof],
+                                            &self.commanded_positions,
+                                            servo_dt,
+                                            ws_slice,
+                                            keepout_slice,
                                         );
-                                        self.tracking.last_nominal = Some(nominal);
                                         if out.withdrawn {
                                             self.tracking.withdrawal_ticks += 1;
                                         }
@@ -12181,44 +12237,67 @@ impl SupervisorInner {
                         Err(reject) => {
                             let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
                             // Rejection fallback: evaluated from the intact history and park
-                            // state BEFORE the hold below invalidates them. It brakes the issued
-                            // output toward the measured hold within the active limits (continued
-                            // on later ticks by `fallback_ramp`), or latches a fault without
-                            // sending a frame when no step is feasible.
-                            let ramp = crate::tracking::FallbackRamp {
-                                hold: self.measured_hold_pose(),
-                                keepout_only: self.pending_normal_unload,
-                                limits: active_limits.clone(),
-                            };
-                            let pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
+                            // state BEFORE the hold below invalidates them. Reuses preallocated
+                            // `TrackingRuntime` spare buffers (0 RT allocs) and returns
+                            // `active_limits` directly to `self.scratch.fallback_limits`.
+                            let mut hold_buf = [0.0f32; crate::model::MAX_MOTION_DOF];
+                            let hold_len = self.measured_hold_pose_into(&mut hold_buf);
+                            let ramp = self.tracking.build_fallback_ramp(
+                                &hold_buf[..hold_len],
+                                self.pending_normal_unload,
+                                &active_limits,
+                            );
+                            self.scratch.fallback_limits = active_limits;
+                            let pending = self.tracking_fallback_compute_inline(ramp, servo_dt, &mut tick_sweep_budget);
                             match reject {
-                                crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
-                                    self.enter_servo_keepout_hold(&ws_err);
+                                crate::tracking::TrackingRejectRt::Workspace(f) if was_streaming => {
+                                    self.enter_servo_keepout_hold_rt(f);
                                 }
-                                crate::tracking::TrackingReject::Workspace(ws_err) => {
-                                    tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
+                                crate::tracking::TrackingRejectRt::Workspace(f) => {
+                                    if !self.safety.deferred_logging() {
+                                        tracing::warn!(
+                                            "Joint tracking output violated workspace ({} at {}): terminating motion",
+                                            f.code(),
+                                            f.phase
+                                        );
+                                    }
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
                                     self.safety.latch(
                                         crate::safety::FaultKind::Other,
                                         crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
-                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {ws_err}"));
+                                            let _ = core::fmt::write(
+                                                buf,
+                                                format_args!(
+                                                    "Joint tracking output rejected: {} ({})",
+                                                    f.code(),
+                                                    f.phase
+                                                ),
+                                            );
                                         }),
                                     );
                                 }
-                                crate::tracking::TrackingReject::JointLimit(msg) => {
-                                    tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
+                                crate::tracking::TrackingRejectRt::JointLimit(msg) => {
+                                    if !self.safety.deferred_logging() {
+                                        tracing::warn!(
+                                            "Joint tracking output exceeded limits ({}): terminating motion",
+                                            msg.as_str()
+                                        );
+                                    }
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("JOINT_LIMIT"));
                                     self.safety.latch(
                                         crate::safety::FaultKind::JointLimit,
                                         crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
-                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {msg}"));
+                                            let _ = core::fmt::write(
+                                                buf,
+                                                format_args!("Joint tracking output rejected: {}", msg.as_str()),
+                                            );
                                         }),
                                     );
                                 }
                             }
-                            tick_output = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                            tick_output = self.apply_tracking_fallback_step_inline(pending, gravity_output_enabled);
                         }
                     }
                     self.tracking.last_tick_sweep_evals =
