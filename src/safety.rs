@@ -376,6 +376,9 @@ pub enum SafetyError {
     #[error("Stopped before motion began")]
     Stopped,
 
+    #[error("Estimated holding current too high. Fold the arm back along a clear path.")]
+    StaticLoadLimit,
+
     #[error("Control lease is no longer current")]
     LeaseLost,
 

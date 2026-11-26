@@ -253,6 +253,45 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation RT static-load refusal hold for `armd-control`: keeps the last accepted
+    /// reference pose without committing a worsening intermediate step, drops any active servo
+    /// target, and ends a live policy stream with `STATIC_LOAD_LIMIT`.
+    pub(super) fn enter_servo_static_load_hold_rt(&mut self) {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() {
+            if self.rt_executor_owned {
+                self.terminate_policy_run_static(
+                    "STATIC_LOAD_LIMIT",
+                    "failed",
+                    Some("STATIC_LOAD_LIMIT"),
+                    Some(crate::power::STATIC_LOAD_LIMIT_MSG),
+                );
+            } else {
+                self.terminate_policy_run(
+                    "STATIC_LOAD_LIMIT",
+                    "failed",
+                    Some("STATIC_LOAD_LIMIT"),
+                    Some(crate::power::STATIC_LOAD_LIMIT_MSG.to_string()),
+                );
+            }
+        }
+        self.release_servo_target();
+        self.servo_settled_ticks.fill(0);
+        self.commanded_velocities.fill(0.0);
+        copy_into(&mut self.target_positions, &self.commanded_positions);
+        self.safety.mark_motion_finished();
+        self.note_motion_limit(MotionLimitReason::Power, None);
+    }
+
+    /// Ensure a refused static-load update never leaves an active servo target worsening the load.
+    pub(super) fn drop_worsening_servo_target_on_static_refusal(&mut self) {
+        if self.servo_target.is_some() {
+            self.release_servo_target();
+            self.servo_settled_ticks.fill(0);
+            copy_into(&mut self.target_positions, &self.commanded_positions);
+        }
+    }
+
     /// Joint-space step from the commanded position to `next` (linear in joint space)
     /// against the full workspace (floor, outer box, reach, keep-out boxes, link capsules),
     /// using the persistent per-constraint monotonic escape rule and up to [`MAX_KEEPOUT_EVALS_PER_TICK`]
@@ -707,6 +746,11 @@ impl SupervisorInner {
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
         self.clamp_j7_if_stale(targets, j7_gate);
+        if self.check_static_load_admission(targets).is_err() {
+            self.note_motion_limit(MotionLimitReason::Power, None);
+            self.drop_worsening_servo_target_on_static_refusal();
+            return Err(SafetyError::StaticLoadLimit);
+        }
         Ok(())
     }
 
@@ -764,6 +808,11 @@ impl SupervisorInner {
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
         self.clamp_j7_if_stale(targets, j7_gate);
+        if self.check_static_load_admission(targets).is_err() {
+            self.note_motion_limit(MotionLimitReason::Power, None);
+            self.drop_worsening_servo_target_on_static_refusal();
+            return Err(Refusal::code("STATIC_LOAD_LIMIT"));
+        }
         Ok(())
     }
 
@@ -1931,6 +1980,7 @@ impl SupervisorInner {
                 SafetyError::CollisionHold(_) => ("COLLISION_HOLD", "cancelled", "COLLISION_HOLD"),
                 SafetyError::SoftLimitExceeded { .. } => ("SOFT_LIMIT_EXCEEDED", "failed", "SOFT_LIMIT_EXCEEDED"),
                 SafetyError::WorkspaceViolation { .. } => ("WORKSPACE_VIOLATION", "failed", "WORKSPACE_VIOLATION"),
+                SafetyError::StaticLoadLimit => ("STATIC_LOAD_LIMIT", "failed", "STATIC_LOAD_LIMIT"),
                 SafetyError::NotArmed(_) => ("NOT_ARMED", "failed", "NOT_ARMED"),
                 _ => ("SAFETY_REJECTED", "failed", "SAFETY_ERROR"),
             };
@@ -2235,6 +2285,7 @@ impl SupervisorInner {
                 "COLLISION_HOLD" => ("COLLISION_HOLD", "cancelled", "COLLISION_HOLD", "Collision hold active"),
                 "SOFT_LIMIT_EXCEEDED" => ("SOFT_LIMIT_EXCEEDED", "failed", "SOFT_LIMIT_EXCEEDED", "Policy target exceeded joint soft limits"),
                 "WORKSPACE_VIOLATION" => ("WORKSPACE_VIOLATION", "failed", "WORKSPACE_VIOLATION", "Policy target violated workspace bounds"),
+                "STATIC_LOAD_LIMIT" => ("STATIC_LOAD_LIMIT", "failed", "STATIC_LOAD_LIMIT", crate::power::STATIC_LOAD_LIMIT_MSG),
                 "NOT_ARMED" => ("NOT_ARMED", "failed", "NOT_ARMED", "Arm is not armed"),
                 "COMMISSIONING_REQUIRED" => ("COMMISSIONING_REQUIRED", "failed", "COMMISSIONING_REQUIRED", "Tool commissioning required"),
                 _ => ("SAFETY_REJECTED", "failed", "SAFETY_ERROR", "Policy target rejected by safety filter"),
@@ -2745,6 +2796,7 @@ pub mod targets {
             SafetyError::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
             SafetyError::MotionBusy => "MOTION_BUSY",
             SafetyError::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
+            SafetyError::StaticLoadLimit => "STATIC_LOAD_LIMIT",
             SafetyError::EpochMismatch { .. } => "EPOCH_MISMATCH",
             SafetyError::SoftLimitExceeded { .. } => "SOFT_LIMIT_EXCEEDED",
             SafetyError::FaultActive(_) => "FAULT_ACTIVE",
@@ -2778,7 +2830,7 @@ pub mod targets {
             "MOTION_FORBIDDEN_IN_FAULT_STATE" => (409, "MotionForbiddenInFaultState", Some("Fault")),
             "TORQUE_OFF_WOULD_DROP" => (409, code, None),
             "CLEAR_FAULT_REJECTED" => (409, "ClearFaultRejected", Some("Fault")),
-            "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" => (422, code, None),
+            "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" | "STATIC_LOAD_LIMIT" => (422, code, None),
             "SOFT_LIMIT_EXCEEDED" | "SAFETY_ERROR" | "INVALID_COMMAND" => (400, code, None),
             "NOT_ARMED" => (412, code, None),
             "OPERATOR_CONFIRMATION_REQUIRED" | "RELEASE_GATE_REQUIRED" => (403, code, None),
@@ -2825,6 +2877,7 @@ pub mod targets {
             }
             "EPOCH_MISMATCH" => json!({"type":"epoch_sync", "epoch_id":ctx.epoch_id, "safety_state":ctx.safety_state}),
             "CALIBRATION_BUSY" => json!({"type":"servo_reject", "reason":"calibration_busy"}),
+            "STATIC_LOAD_LIMIT" => servo_reject("STATIC_LOAD_LIMIT", crate::power::STATIC_LOAD_LIMIT_MSG, ctx.epoch_id),
             code => {
                 let mut v = servo_reject(code, "servo target refused when the control loop applied it", ctx.epoch_id);
                 if let RefusalDetail::CurrentRevision(rev) = refusal.detail { v["current_revision"] = json!(rev); }

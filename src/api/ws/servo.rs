@@ -168,6 +168,15 @@ fn format_servo_command_refusal(
             "message": "Stopped before the action began",
             "epoch_id": epoch_id
         }),
+        "STATIC_LOAD_LIMIT" => json!({
+            "type": "command_reject",
+            "request_id": request_id,
+            "status": 422,
+            "code": "STATIC_LOAD_LIMIT",
+            "error": "STATIC_LOAD_LIMIT",
+            "message": crate::power::STATIC_LOAD_LIMIT_MSG,
+            "epoch_id": epoch_id
+        }),
         code => {
             let (status, error, safety_state) = crate::supervisor::targets::reject_fields(code);
             let mut reply = json!({

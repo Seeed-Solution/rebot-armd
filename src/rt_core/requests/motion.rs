@@ -77,7 +77,11 @@ pub fn power_budget_fingerprint(budget: Option<&PowerBudget>) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut mix = |bytes: &[u8]| { for &byte in bytes { h = (h ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3); } };
     mix(&[u8::from(b.enabled), u8::from(b.planning.enabled)]);
-    for f in [b.supply_rated_a, b.supply_trip_a, b.v_bus, b.base_w, b.k_cu, b.efficiency, b.planning.fraction] { mix(&f.to_bits().to_le_bytes()); }
+    for f in [b.supply_rated_a, b.supply_trip_a, b.v_bus, b.base_w, b.k_cu, b.efficiency, b.planning.fraction, b.static_reserve_a] { mix(&f.to_bits().to_le_bytes()); }
+    match b.static_admission_fraction {
+        Some(f) => { mix(&[1u8]); mix(&f.to_bits().to_le_bytes()); }
+        None => mix(&[0u8]),
+    }
     mix(&b.planning.min_scale.to_bits().to_le_bytes());
     mix(&(b.joints.len() as u64).to_le_bytes());
     for j in &b.joints {

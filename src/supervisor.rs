@@ -1374,6 +1374,7 @@ pub struct SupervisorInner {
     pub tracking: crate::tracking::TrackingRuntime,
     /// Supply-current estimate (`src/power.rs`).
     pub power: crate::power::PowerMonitor,
+    pub(crate) static_load_cache: crate::power::StaticLoadBaselineCache,
     /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
     pub follower: Option<String>,
     /// Base gripper policy from profile (unshifted).
@@ -2632,6 +2633,7 @@ impl SupervisorInner {
             torque_guard: crate::torque_guard::TorqueGuard::default(),
             tracking: crate::tracking::TrackingRuntime::with_capacity(dof),
             power: crate::power::PowerMonitor::default(),
+            static_load_cache: crate::power::StaticLoadBaselineCache::default(),
             follower: None,
             base_gripper_policy,
             gripper_calib_offset: None,
@@ -11317,6 +11319,8 @@ impl SupervisorInner {
                         self.enter_servo_blocked_hold(i, "no progress at the lead cap");
                     } else if let Err(f) = self.servo_step_workspace_rt(&next_positions, "servo_step") {
                         self.enter_servo_keepout_hold_rt(f);
+                    } else if self.check_static_load_admission(&next_positions).is_err() {
+                        self.enter_servo_static_load_hold_rt();
                     } else {
                         // swap: the previous command's memory goes back to the scratch
                         std::mem::swap(&mut self.commanded_positions, &mut next_positions);
@@ -11398,6 +11402,8 @@ impl SupervisorInner {
                 self.latch_servo_fault(i);
             } else if let Some(f) = braking.then(|| self.servo_step_workspace_rt(&next_positions, "braking").err()).flatten() {
                 self.enter_servo_keepout_hold_rt(f);
+            } else if braking && self.check_static_load_admission(&next_positions).is_err() {
+                self.enter_servo_static_load_hold_rt();
             } else {
                 // swap: the previous command's memory goes back to the scratch
                 std::mem::swap(&mut self.commanded_positions, &mut next_positions);

@@ -221,7 +221,8 @@ fn serde_defaults_and_absent_section() {
         {"kt_nm_per_a": 0.625, "r_phase_ohm": 0.58}]});
     let mut cfg: ArmConfig = serde_json::from_value(v.clone()).unwrap();
     cfg.validate().unwrap();
-    assert_eq!(cfg.power_budget.as_ref().unwrap(), &dm());
+    assert_eq!(cfg.power_budget.as_ref().unwrap().static_admission_fraction, None);
+    assert_eq!(cfg.power_budget.as_ref().unwrap(), &PowerBudget { static_admission_fraction: None, ..dm() });
     assert!(armd::model::Capabilities::from_config(&cfg).power_budget);
     // a joint entry needs kt and r
     v["power_budget"]["joints"][0] = serde_json::json!({"kt_nm_per_a": 2.0});

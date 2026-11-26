@@ -626,6 +626,33 @@ impl ArmModel {
         Ok(out)
     }
 
+    /// Cheap, zero-allocation fingerprint of the gravity model (variant + offsets or chain pointer)
+    /// used to invalidate cached static-load baselines when the loaded `ArmModel` changes.
+    #[inline]
+    pub fn gravity_model_fingerprint(&self) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        match self {
+            Self::RebotDevArm(off, _) => {
+                mix(&[1u8]);
+                for v in off {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+            }
+            Self::Chain(c) => {
+                mix(&[2u8]);
+                let ptr = std::sync::Arc::as_ptr(c) as usize;
+                mix(&(ptr as u64).to_le_bytes());
+                mix(&(c.dof() as u64).to_le_bytes());
+            }
+        }
+        h.max(1)
+    }
+
     /// For each arm joint, an upper bound on the distance from its axis to any point fixed
     /// to the tip at an offset of at most `max_offset` m: the link lengths from the joint
     /// to the tip plus the offset (configuration independent).

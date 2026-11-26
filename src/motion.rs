@@ -48,6 +48,9 @@ pub enum MotionError {
     /// Power budget planning (`src/power_plan.rs`): even the slowest allowed speed exceeds it.
     #[error("Power budget: {0}")]
     PowerBudget(String),
+    /// Predicted static holding current exceeds the configured static admission cap (`src/power.rs`).
+    #[error("Estimated holding current too high. Fold the arm back along a clear path.")]
+    StaticLoadLimit,
 }
 
 impl MotionError {
@@ -61,6 +64,7 @@ impl MotionError {
             Self::InvalidCommand(_) => "INVALID_COMMAND",
             Self::Unsupported(_) => "UNSUPPORTED",
             Self::PowerBudget(_) => "POWER_BUDGET",
+            Self::StaticLoadLimit => "STATIC_LOAD_LIMIT",
         }
     }
 }
