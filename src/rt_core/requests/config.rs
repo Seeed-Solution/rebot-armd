@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{json, Value};
@@ -680,14 +680,14 @@ struct PublishedConfigSlot {
 /// Off-RT published configuration store shared by REST readers, off-thread prepare,
 /// commit orchestrators, and `armd-persist` (`zero_check`). Never touched on `armd-control`.
 pub struct PublishedConfigHub {
-    slot: RwLock<PublishedConfigSlot>,
+    slot: crate::rt_core::rt_gate::RtGuardedRwLock<PublishedConfigSlot>,
     available: AtomicBool,
 }
 
 impl PublishedConfigHub {
     pub fn new(initial: PublishedConfig, legacy_lock_gen: u64) -> Self {
         Self {
-            slot: RwLock::new(PublishedConfigSlot {
+            slot: crate::rt_core::rt_gate::RtGuardedRwLock::new("PublishedConfigHub::slot", PublishedConfigSlot {
                 config: Arc::new(initial),
                 legacy_lock_gen,
             }),

@@ -99,9 +99,20 @@ pub enum ExternalSubmitError {
 ///    owner terminal is delivered strictly through `ActionReplyRouter -> ws_reply_sink` (holding
 ///    its router reservation credit through enqueue or abandonment) without duplicate delivery
 ///    from `TerminalBroadcaster`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WsWireAckTracker {
-    inner: Mutex<WsWireAckState>,
+    inner: super::rt_gate::RtGuardedMutex<WsWireAckState>,
+}
+
+impl Default for WsWireAckTracker {
+    fn default() -> Self {
+        Self {
+            inner: super::rt_gate::RtGuardedMutex::new(
+                "WsWireAckTracker::inner",
+                WsWireAckState::default(),
+            ),
+        }
+    }
 }
 
 const ABANDONED_ACTION_HISTORY_CAP: usize = 64;
@@ -525,7 +536,7 @@ impl Drop for AckCommitGuard {
 /// Lock order: `SerialDrainGate` (0) -> `BrokerDispatcher::state` (1) ->
 /// `ConnLifecycleClient::inner` (2) -> `broker` (3) -> `reply_router` (4).
 pub(crate) struct SerialDrainGate {
-    state: Mutex<SerialDrainState>,
+    state: super::rt_gate::RtGuardedMutex<SerialDrainState>,
     cv: Condvar,
     owner_tid: AtomicU64,
 }
@@ -556,7 +567,7 @@ pub(crate) enum DrainEnter {
 impl SerialDrainGate {
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(SerialDrainState {
+            state: super::rt_gate::RtGuardedMutex::new("SerialDrainGate::state", SerialDrainState {
                 active: false,
                 deferred_finish_stopped: None,
             }),

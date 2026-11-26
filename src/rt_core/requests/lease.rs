@@ -13,7 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -2152,7 +2152,7 @@ impl ConnLifecycleClientInner {
 
 /// Off-thread priority connection lifecycle client (never touched by `armd-control`).
 pub struct ConnLifecycleClient {
-    inner: Mutex<ConnLifecycleClientInner>,
+    inner: crate::rt_core::rt_gate::RtGuardedMutex<ConnLifecycleClientInner>,
 }
 
 /// Creates a matched priority connection lifecycle client and RT intake with capacity
@@ -2161,7 +2161,7 @@ pub fn conn_lifecycle_channel(exited: Arc<AtomicBool>) -> (ConnLifecycleClient, 
     let (req_tx, req_rx) = RingBuffer::new(CONN_LIFECYCLE_CAPACITY);
     let (rep_tx, rep_rx) = RingBuffer::new(CONN_LIFECYCLE_CAPACITY);
     let client = ConnLifecycleClient {
-        inner: Mutex::new(ConnLifecycleClientInner {
+        inner: crate::rt_core::rt_gate::RtGuardedMutex::new("ConnLifecycleClient::inner", ConnLifecycleClientInner {
             req_tx,
             rep_rx,
             slots: HashMap::with_capacity(MAX_LIVE_CONNECTIONS),

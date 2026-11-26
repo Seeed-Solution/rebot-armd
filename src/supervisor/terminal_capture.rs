@@ -1142,11 +1142,15 @@ impl TerminalCaptureChannel {
         if crate::rt_core::executor::on_rt_control_thread() {
             self.control_thread_lock_attempts
                 .fetch_add(1, Ordering::SeqCst);
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
             crate::rt_core::executor::assert_not_on_rt_control_thread(
                 "TerminalCaptureChannel::rx.lock",
             );
         }
-        crate::rt_core::executor::assert_not_in_rt_release("TerminalCaptureChannel::rx.lock");
+        if crate::rt_core::executor::in_rt_release() {
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
+            crate::rt_core::executor::assert_not_in_rt_release("TerminalCaptureChannel::rx.lock");
+        }
         self.rx.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1155,13 +1159,17 @@ impl TerminalCaptureChannel {
         if crate::rt_core::executor::on_rt_control_thread() {
             self.control_thread_lock_attempts
                 .fetch_add(1, Ordering::SeqCst);
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
             crate::rt_core::executor::assert_not_on_rt_control_thread(
                 "TerminalCaptureChannel::rich_action_cache.lock",
             );
         }
-        crate::rt_core::executor::assert_not_in_rt_release(
-            "TerminalCaptureChannel::rich_action_cache.lock",
-        );
+        if crate::rt_core::executor::in_rt_release() {
+            crate::rt_core::rt_gate::record_rt_lock_attempt();
+            crate::rt_core::executor::assert_not_in_rt_release(
+                "TerminalCaptureChannel::rich_action_cache.lock",
+            );
+        }
         self.rich_action_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())

@@ -51,6 +51,8 @@ pub mod config_iface;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod budget;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod rt_gate;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ops;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod requests;

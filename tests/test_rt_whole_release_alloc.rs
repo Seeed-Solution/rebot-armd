@@ -15,6 +15,8 @@
 //! 4. Known allocations in in-flight B3/A8-owned files are captured as `#[ignore]` tests with
 //!    exact `file:line` attribution and unblock conditions (affected families remain gated).
 
+mod mit_support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, ThreadId};
@@ -1932,4 +1934,527 @@ async fn cf1_calibration_and_software_zero_executor_zero_rt_alloc() {
         "retired tracking payload must actually own displaced heap buffers for off-RT drop: {drop_delta:?}"
     );
     drop(inner);
+}
+
+// ============================================================================
+// Primitive 5: Reusable RT Allocation & Lock Gate Suite
+// (Success, Rejection, Recovery, Park, and Lock-Boundary Positive Controls)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rt_gate_success_rejection_recovery_and_park_zero_alloc_zero_lock() {
+    use armd::rt_core::rt_gate::RtReleaseGate;
+    use armd::rt_core::requests::motion::{
+        prepare_motion, stage_jog, stage_park, MotionConfigSnapshot, MotionPlanSnapshot,
+        MotionRequest,
+    };
+    use armd::safety::SafetyState;
+
+    let clock = ScriptedClock::new();
+    let (drv, _) = WakeDriver::new(7, Duration::from_millis(4), Some(clock.clone()));
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
+
+    let motion_cfg = {
+        let inner = sup.inner().read().await;
+        Arc::new(MotionConfigSnapshot::from_supervisor(&inner))
+    };
+
+    let estop_req = sup.inner().read().await.requested_estop_count.clone();
+    let tail_probe: Arc<Mutex<Option<TailAllocProbe>>> = Arc::new(Mutex::new(None));
+    let parked_alloc: Arc<Mutex<Option<ParkedAlloc>>> = Arc::new(Mutex::new(None));
+
+    let period_ns = 10_000_000u64;
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                inject_release_tail_once: Some(Arc::clone(&tail_probe)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let gate = RtReleaseGate::new(&sup, &handle);
+
+    // Warm up initial publication under the gate.
+    let (_, warm_delta) = gate.run_phase("warmup_publish", || {
+        clock.run_steps(period_ns, 3);
+        ((), sup.hub().latest().is_some())
+    });
+    assert!(warm_delta.releases >= 3);
+
+    let mut client_seq = 1u64;
+    let next_auth = || {
+        let s = sup.hub().latest().expect("published obs");
+        Authority {
+            lease_generation: 0,
+            epoch: s.obs.epoch_id,
+            stop_generation: s.rt.stop_generation,
+            config_revision: 0,
+            parent_generation: 0,
+        }
+    };
+
+    // 1. SUCCESS: TorqueOn with real sub-release confirmation wake.
+    let (_, en_delta) = gate.run_phase("success_torque_on_subrelease_wake", || {
+        let auth = next_auth();
+        client_seq += 1;
+        let req = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                auth,
+                clock.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        let mut completed = false;
+        for _ in 0..8 {
+            clock.run_steps(period_ns, 1);
+            let rs = drain_broker(&handle);
+            if rs.iter().any(|r| {
+                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == req)
+            }) {
+                completed = true;
+                break;
+            }
+        }
+        let enabled = sup
+            .hub()
+            .latest()
+            .is_some_and(|s| s.obs.enable_state == EnableState::Enabled);
+        ((), completed && enabled)
+    });
+    assert!(en_delta.is_clean());
+
+    // 2. SUCCESS: Motion install + execution + terminal completion.
+    let (_, jog_delta) = gate.run_phase("success_jog_install_and_complete", || {
+        let snap = sup.hub().latest().unwrap();
+        let msnap = MotionPlanSnapshot::from_published(&snap, Arc::clone(&motion_cfg)).unwrap();
+        let mut to = snap.rt.commanded_positions.clone();
+        to[0] += 0.04;
+        let prepared = prepare_motion(&msnap, &MotionRequest::jog(to.clone(), Some(0.05), None)).unwrap();
+        let auth = next_auth();
+        client_seq += 1;
+        let req = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                auth,
+                clock.now() + Duration::from_secs(5),
+                Submit::Install(&|s: &mut PlanSlot| stage_jog(s, &prepared.slot)),
+            )
+            .unwrap();
+        let mut completed = false;
+        for _ in 0..100 {
+            clock.run_steps(period_ns, 1);
+            let rs = drain_broker(&handle);
+            if rs.iter().any(|r| {
+                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == req)
+            }) {
+                completed = true;
+                break;
+            }
+        }
+        let reached = sup
+            .hub()
+            .latest()
+            .is_some_and(|s| (s.rt.commanded_positions[0] - to[0]).abs() < 1e-3);
+        ((), completed && reached)
+    });
+    assert!(jog_delta.is_clean());
+
+    // 3. REJECTION: Expired deadline & wrong epoch (zero alloc, zero lock).
+    let (_, rej_delta) = gate.run_phase("rejection_expired_deadline_and_wrong_epoch", || {
+        let auth = next_auth();
+        let expired_dl = clock.now().checked_sub(Duration::from_millis(1)).unwrap_or(clock.now());
+        client_seq += 1;
+        let r_exp = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                auth,
+                expired_dl,
+                Submit::Transition(TransitionOp::TorqueOff),
+            )
+            .unwrap();
+        let bad_epoch_auth = Authority {
+            epoch: auth.epoch.saturating_add(99),
+            ..auth
+        };
+        client_seq += 1;
+        let r_ep = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                bad_epoch_auth,
+                clock.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOff),
+            )
+            .unwrap();
+        clock.run_steps(period_ns, 4);
+        let rs = drain_broker(&handle);
+        let saw_expired = rs.iter().any(|r| {
+            matches!(r, Reply::Refused { request, code: "DEADLINE_EXPIRED", .. } if *request == r_exp)
+        });
+        let saw_epoch = rs.iter().any(|r| {
+            matches!(r, Reply::Refused { request, code: "EPOCH_MISMATCH", .. } if *request == r_ep)
+        });
+        ((), saw_expired && saw_epoch)
+    });
+    assert!(rej_delta.is_clean());
+
+    // 4. PARK: Client InstallPark (moves to rest, settles, disables through TorqueTransition).
+    let (_, park_delta) = gate.run_phase("park_install_move_settle_disable", || {
+        let snap = sup.hub().latest().unwrap();
+        let msnap = MotionPlanSnapshot::from_published(&snap, Arc::clone(&motion_cfg)).unwrap();
+        let park_plan = prepare_motion(&msnap, &MotionRequest::park()).unwrap();
+        let auth = next_auth();
+        client_seq += 1;
+        let r_park = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                client_seq,
+                auth,
+                clock.now() + Duration::from_secs(10),
+                Submit::InstallPark(&|s: &mut PlanSlot| stage_park(s, &park_plan.slot)),
+            )
+            .unwrap();
+        let mut park_done = false;
+        for _ in 0..320 {
+            clock.run_steps(period_ns, 2);
+            let rs = drain_broker(&handle);
+            if rs.iter().any(|r| {
+                matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == r_park)
+            }) {
+                park_done = true;
+                break;
+            }
+        }
+        let s_after = sup.hub().latest().unwrap();
+        let parked_ok =
+            park_done && !s_after.obs.is_torqued && s_after.obs.safety_state == SafetyState::Idle;
+        ((), parked_ok)
+    });
+    assert!(park_delta.is_clean());
+
+    // 5. RECOVERY: E-Stop latch (Idle -> EStop) followed by ClearFault recovery (EStop -> Idle).
+    let epoch_before_estop = sup.hub().latest().unwrap().obs.epoch_id;
+    let (_, estop_delta) = gate.run_phase("recovery_estop_latch", || {
+        estop_req.fetch_add(1, Ordering::SeqCst);
+        clock.run_steps(period_ns, 3);
+        let s = sup.hub().latest().unwrap();
+        (
+            (),
+            s.obs.safety_state == SafetyState::EStop && s.obs.epoch_id > epoch_before_estop,
+        )
+    });
+    assert!(estop_delta.is_clean());
+
+    let (_, clear_delta) = gate
+        .run_phase_async("recovery_clear_fault_to_idle", async {
+            let clock_pump = Arc::clone(&clock);
+            let clear_fut = handle.clear_fault_async();
+            tokio::pin!(clear_fut);
+            let mut cleared = None;
+            for _ in 0..20 {
+                let c = Arc::clone(&clock_pump);
+                let _ = tokio::task::spawn_blocking(move || c.run_steps(period_ns, 1)).await;
+                if let Ok(res) = tokio::time::timeout(Duration::from_millis(5), &mut clear_fut).await
+                {
+                    cleared = Some(res);
+                    break;
+                }
+            }
+            let ok = matches!(cleared, Some(Ok(Ok(_))));
+            let back_idle = sup
+                .hub()
+                .latest()
+                .is_some_and(|s| s.obs.safety_state == SafetyState::Idle);
+            ((), ok && back_idle)
+        })
+        .await;
+    assert!(clear_delta.is_clean());
+
+    // 6. POSITIVE CONTROL (Allocation): inject one release-tail allocation and confirm the gate catches it.
+    let prealloc_free = ParkedAlloc::new_alloc(64);
+    let pos_guard = gate.begin_phase("positive_control_injected_alloc");
+    *tail_probe.lock().unwrap() = Some(TailAllocProbe::AllocAndFinalFreeLocal {
+        local: Some(prealloc_free),
+        park: Arc::clone(&parked_alloc),
+    });
+    clock.run_steps(period_ns, 1);
+    let pos_delta = pos_guard.finish();
+    assert!(
+        !pos_delta.is_clean() && pos_delta.release_allocs.alloc >= 1 && pos_delta.release_allocs.dealloc >= 1,
+        "gate positive control must catch injected RT heap allocation/deallocation: {pos_delta:?}"
+    );
+    drop(parked_alloc.lock().unwrap().take());
+
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+}
+
+#[test]
+fn rt_gate_marked_release_mode_switch_success_and_rollback_zero_alloc_zero_lock() {
+    use armd::driver::{gripper_drive_from_profile, DamiaoArmDriver, TxBudget};
+    use armd::motor_mode::{
+        ControlMode, ModeProgress, ModeSwitch, ModeSwitchPlan, ModeSwitchRecovery,
+        ReleaseBudget as ModeSwitchBudget,
+    };
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::rt_core::budget::ReleaseBudget;
+    use armd::rt_core::rt_gate::measure_marked_release;
+    use armd::transport::MockClock;
+    use mit_support::FakeBus;
+
+    let setup_driver = || {
+        let clock = MockClock::new();
+        let cfg = ArmConfig::rebot_dm();
+        let limits: Vec<DamiaoLimits> = cfg
+            .damiao_ranges
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.tx_step = Duration::from_micros(200);
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            s.tx_log.reserve(512);
+            s.tx_times.reserve(512);
+            s.rx.reserve(512);
+            s.pending.reserve(512);
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.0;
+                m.v = 0.0;
+                m.enabled = false;
+                m.set_reg_u32(damiao::RID_TIMEOUT, if i < 6 { 2000 } else { 0 });
+                m.set_reg_u32(
+                    damiao::RID_CTRL_MODE,
+                    if i == 6 {
+                        damiao::CTRL_MODE_POS_FORCE
+                    } else {
+                        damiao::CTRL_MODE_POS_VEL
+                    },
+                );
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_gripper_drive(gripper_drive_from_profile(&cfg).unwrap())
+            .unwrap();
+        let mut b = TxBudget::default();
+        b.max_frames = 16;
+        drv.set_tx_budget(b);
+        drv.set_rt_mode(true);
+        let _ = drv.check_mapping_ranges();
+        let _ = drv.read_joint_states();
+        drv.set_torque(true).expect("enable torque");
+        bus.with(|s| s.push_all_feedback());
+        let _ = drv.read_joint_states();
+        (clock, bus, drv)
+    };
+
+    thread::spawn(move || {
+        // 1. Success: real Damiao ModeSwitch confirm under marked RT release -> 0 allocs, 0 locks.
+        let (clock, bus, mut drv) = setup_driver();
+        let plan = ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap();
+        let mut ms = ModeSwitch::new(plan);
+        let mut allow_tx = || Ok(());
+        let no_stop = || false;
+        let (_, delta_ok) = measure_marked_release("mode_switch_confirm_success", || {
+            let mut confirmed = false;
+            for seq in 1..=15u64 {
+                clock.advance(Duration::from_millis(20));
+                bus.with(|s| s.push_all_feedback());
+                drv.begin_control_release(seq);
+                let now = clock.now();
+                let mut ledger = ReleaseBudget::new(seq, now, now + Duration::from_millis(10), 64, 16);
+                let b = ModeSwitchBudget::from_ledger(&ledger, now, now + Duration::from_millis(10), Duration::from_millis(20), 16);
+                if ms.step_with_gate_and_stop_proof_ledger(&mut drv, &mut allow_tx, &no_stop, b, &mut ledger)
+                    == ModeProgress::Confirmed
+                {
+                    confirmed = true;
+                    break;
+                }
+            }
+            ((), confirmed)
+        });
+        delta_ok.assert_clean();
+
+        // 2. Recovery: real Damiao ModeSwitch rollback on J2 RangeMismatch after J1 switched -> 0 allocs, 0 locks.
+        let (clock_rb, bus_rb, mut drv_rb) = setup_driver();
+        // J1 switches to Impedance; J2 fails mandatory range verification before write -> J1 rolls back cleanly.
+        drv_rb.set_axis_impedance_ranges_verified(1, false);
+        bus_rb.with(|s| {
+            s.motors[1].regs.insert(damiao::RID_TMAX, 99.0f32.to_le_bytes());
+        });
+        let plan_rb = ModeSwitchPlan::switch_axes(
+            &[(0, ControlMode::Impedance), (1, ControlMode::Impedance)],
+            ModeSwitchRecovery::RollbackToPrevious,
+        )
+        .unwrap();
+        let mut ms_rb = ModeSwitch::new(plan_rb);
+        let (_, delta_rb) = measure_marked_release("mode_switch_rollback_recovery", || {
+            let mut rolled_back = false;
+            for seq in 1..=40u64 {
+                clock_rb.advance(Duration::from_millis(20));
+                bus_rb.with(|s| s.push_all_feedback());
+                drv_rb.begin_control_release(seq);
+                let now = clock_rb.now();
+                let mut ledger = ReleaseBudget::new(seq, now, now + Duration::from_millis(10), 64, 16);
+                let b = ModeSwitchBudget::from_ledger(&ledger, now, now + Duration::from_millis(10), Duration::from_millis(20), 16);
+                if matches!(
+                    ms_rb.step_with_gate_and_stop_proof_ledger(&mut drv_rb, &mut allow_tx, &no_stop, b, &mut ledger),
+                    ModeProgress::RolledBack {
+                        failed_joint: 1,
+                        reason: armd::motor_mode::ModeSwitchFailure::RangeMismatch,
+                    }
+                ) {
+                    rolled_back = true;
+                    break;
+                }
+            }
+            let j1_restored = bus_rb.with(|s| s.motors[0].ctrl_mode() == damiao::CTRL_MODE_POS_VEL);
+            ((), rolled_back && j1_restored)
+        });
+        delta_rb.assert_clean();
+
+        // 3. Positive control: injected heap allocation inside measure_marked_release is caught.
+        let (_, delta_pos) = measure_marked_release("positive_control_marked_release_alloc", || {
+            let b = Box::new([0xAAu8; 64]);
+            std::hint::black_box(&b);
+            drop(b);
+            ((), true)
+        });
+        assert!(
+            delta_pos.allocs.alloc >= 1 && delta_pos.allocs.dealloc >= 1,
+            "positive control must detect injected alloc/dealloc: {delta_pos:?}"
+        );
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn rt_gate_lock_boundary_assertions_reject_before_touching_lock() {
+    use armd::rt_core::executor::{ControlThreadGuard, ReleaseGuard};
+    use armd::rt_core::publish::state_channel;
+    use armd::rt_core::record_ring::RecordRing;
+    use armd::rt_core::reply_router::WsWireAckTracker;
+    use armd::rt_core::requests::config::{PublishedConfig, PublishedConfigHub};
+    use armd::rt_core::requests::lease::conn_lifecycle_channel;
+    use armd::rt_core::rt_gate::rt_lock_attempts;
+    use armd::rt_core::urgent::urgent_stop_channel;
+    use armd::supervisor_lock::{DriverLock, SupervisorLock};
+
+    fn assert_rejected_on_both_marks(label: &str, mut touch: impl FnMut()) {
+        // 1. Inside ControlThreadGuard (marked RT control thread).
+        let before_t = rt_lock_attempts();
+        let res_t = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _tg = ControlThreadGuard::enter();
+            touch();
+        }));
+        assert!(res_t.is_err(), "{label}: must panic on marked RT control thread");
+        assert!(
+            rt_lock_attempts() > before_t,
+            "{label}: must increment rt_lock_attempts() strictly before panicking on RT control thread"
+        );
+
+        // 2. Inside ReleaseGuard alone (marked RT release).
+        let before_r = rt_lock_attempts();
+        let res_r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _rg = ReleaseGuard::enter();
+            touch();
+        }));
+        assert!(res_r.is_err(), "{label}: must panic inside marked RT release");
+        assert!(
+            rt_lock_attempts() > before_r,
+            "{label}: must increment rt_lock_attempts() strictly before panicking inside RT release"
+        );
+    }
+
+    // Hold StateHub::state and RecordRing::assembly on this thread while spawning a marked RT
+    // thread to prove rejection happens strictly BEFORE touching the underlying mutex (no deadlock).
+    let (_pub, hub) = state_channel(7);
+    let _hub_hold = hub.reader_guard();
+    let ring = Arc::new(RecordRing::new_for_test(7));
+    let _ring_hold = ring.consumer_guard();
+    let (urgent_client, _urgent_intake) = urgent_stop_channel(4, Arc::new(AtomicBool::new(false)));
+    let (conn_client, _conn_intake) = conn_lifecycle_channel(Arc::new(AtomicBool::new(false)));
+    let cfg_hub = Arc::new(PublishedConfigHub::new(
+        PublishedConfig::from_inner(&armd::SupervisorInner::new(ArmConfig::rebot_dm())),
+        0,
+    ));
+    let wire_ack = Arc::new(WsWireAckTracker::new());
+    let sup_lock = Arc::new(SupervisorLock::new(0u32));
+    let drv_lock = Arc::new(DriverLock::new(
+        Box::new(WakeDriver::new(7, Duration::from_millis(1), None).0),
+    ));
+
+    let hub_t = Arc::clone(&hub);
+    let ring_t = Arc::clone(&ring);
+    let cfg_t = Arc::clone(&cfg_hub);
+    let wire_t = Arc::clone(&wire_ack);
+    let sup_t = Arc::clone(&sup_lock);
+    let drv_t = Arc::clone(&drv_lock);
+
+    thread::spawn(move || {
+        assert_rejected_on_both_marks("StateHub::state.latest (contended)", || {
+            let _ = hub_t.latest();
+        });
+        assert_rejected_on_both_marks("StateHub::motion_config", || {
+            let _ = hub_t.motion_config();
+        });
+        assert_rejected_on_both_marks("StateHub::service_identity", || {
+            let _ = hub_t.service_identity();
+        });
+        assert_rejected_on_both_marks("RecordRing::assembly.drain (contended)", || {
+            let _ = ring_t.drain();
+        });
+        assert_rejected_on_both_marks("UrgentStopClient::inner", || {
+            let _ = urgent_client.in_flight();
+        });
+        assert_rejected_on_both_marks("ConnLifecycleClient::inner", || {
+            let _ = conn_client.live_slot_count();
+        });
+        assert_rejected_on_both_marks("PublishedConfigHub::slot", || {
+            let _ = cfg_t.latest();
+        });
+        assert_rejected_on_both_marks("WsWireAckTracker::inner", || {
+            let _ = wire_t.is_ack_barrier_active();
+        });
+        assert_rejected_on_both_marks("SupervisorLock::try_read", || {
+            let _ = sup_t.try_read();
+        });
+        assert_rejected_on_both_marks("DriverLock::try_lock", || {
+            drop(drv_t.try_lock());
+        });
+    })
+    .join()
+    .unwrap();
 }

@@ -1244,7 +1244,7 @@ impl MaintClientInner {
 
 /// Off-thread client for the pre-reserved 1-to-1 maintenance channel.
 pub(crate) struct MaintClient {
-    inner: Mutex<MaintClientInner>,
+    inner: super::rt_gate::RtGuardedMutex<MaintClientInner>,
 }
 
 impl MaintClient {
@@ -1255,7 +1255,7 @@ impl MaintClient {
         hub: Arc<StateHub>,
     ) -> Self {
         Self {
-            inner: Mutex::new(MaintClientInner {
+            inner: super::rt_gate::RtGuardedMutex::new("MaintClient::inner", MaintClientInner {
                 req_tx,
                 rep_rx,
                 in_flight: 0,
@@ -4170,7 +4170,7 @@ impl ServoTargetDispatcherInner {
 /// Off-thread coordinator owning [`TargetPort`], `close_servo` dispatch, streaming outcome
 /// delivery, and `/api/v1/motion/servo` command reply correlation (never touched by `armd-control`).
 pub(crate) struct ServoTargetDispatcher {
-    inner: Mutex<ServoTargetDispatcherInner>,
+    inner: super::rt_gate::RtGuardedMutex<ServoTargetDispatcherInner>,
     exited: Arc<AtomicBool>,
     atomic_fenced_lease_gen: Arc<AtomicU64>,
     #[cfg(feature = "policy-runtime")]
@@ -4192,7 +4192,7 @@ impl ServoTargetDispatcher {
         #[cfg(feature = "policy-runtime")]
         let policy_refusal_gen = writer.policy_refusal_gen_arc();
         Self {
-            inner: Mutex::new(ServoTargetDispatcherInner {
+            inner: super::rt_gate::RtGuardedMutex::new("ServoTargetDispatcher::inner", ServoTargetDispatcherInner {
                 port: crate::supervisor::targets::TargetPort::new(writer, arm, boot),
                 last_inflight_key: None,
                 command_waiters: std::collections::HashMap::new(),

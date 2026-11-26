@@ -29,7 +29,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::macro_action::{ContactWatch, SubState};
@@ -1284,7 +1284,7 @@ pub enum Poll {
 /// The readers' side (the dispatcher): the newest sample, and the wake-up of the dispatcher
 /// thread that forwards samples to subscribers.
 pub struct StateHub {
-    state: Mutex<HubState>,
+    state: super::rt_gate::RtGuardedMutex<HubState>,
     /// `seq` of the newest publication (0: none yet).
     published: AtomicU64,
     dispatcher: OnceLock<std::thread::Thread>,
@@ -1296,25 +1296,25 @@ pub struct StateHub {
     tick_frees: AtomicU64,
     /// Pre-sized observation template recorded atomically at executor startup activation so a
     /// reader warms its own `front` slot off-thread before handing it back to the RT producer.
-    prewarm_template: std::sync::RwLock<Option<Box<ArmObservation>>>,
+    prewarm_template: super::rt_gate::RtGuardedRwLock<Option<Box<ArmObservation>>>,
     /// Immutable motion planning config snapshot updated off-tick for executor zero-lock workers.
-    motion_config: std::sync::RwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
+    motion_config: super::rt_gate::RtGuardedRwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
     /// Separate motion planning config cache owned exclusively by legacy-mode paths so delayed
     /// legacy writebacks can never overwrite the executor's authoritative `motion_config`.
-    legacy_motion_config: std::sync::RwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
+    legacy_motion_config: super::rt_gate::RtGuardedRwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
     /// Off-thread schema cache paired with [`OwnerStateSnapshot::schema_revision`]. Never locked
     /// on the RT control thread.
-    schema_cache: Mutex<Option<(u64, Arc<ObservationSchema>)>>,
+    schema_cache: super::rt_gate::RtGuardedMutex<Option<(u64, Arc<ObservationSchema>)>>,
     /// Revision-tagged slow-changing planning environment published off-thread (never touched
     /// on `armd-control`; read by off-thread action preparation and macro orchestrators).
-    prep_env: Mutex<Option<Arc<super::requests::actions::ActionPrepEnv>>>,
+    prep_env: super::rt_gate::RtGuardedMutex<Option<Arc<super::requests::actions::ActionPrepEnv>>>,
     /// Off-RT arm identity and joint-zero metadata paired with RT `PublishedOwnerMeta` by
     /// `(arm, boot, tool_digest_hash, calibration_revision)`. Never locked on `armd-control`.
-    service_identity: std::sync::RwLock<Option<Arc<ServiceIdentity>>>,
+    service_identity: super::rt_gate::RtGuardedRwLock<Option<Arc<ServiceIdentity>>>,
     /// Bounded off-RT sidecar store of `measure_multiview` measurement payloads keyed by action
     /// ID (never touched on `armd-control`; bounded to 16 entries). Attached in [`Self::refresh`]
     /// to `obs.action` and `obs.previous_action` before any snapshot or terminal is delivered.
-    action_measurements: Mutex<std::collections::HashMap<u64, serde_json::Value>>,
+    action_measurements: super::rt_gate::RtGuardedMutex<std::collections::HashMap<u64, serde_json::Value>>,
     /// Pre-publication policy diagnostic seal watermark shared with `SupervisorInner` (never
     /// locked on `armd-control`).
     #[cfg(feature = "policy-runtime")]
@@ -1322,16 +1322,16 @@ pub struct StateHub {
     /// Bounded off-RT sidecar store of runner-emitted Shadow diagnostics and `PolicyStats` keyed
     /// by `action_id` (cap 64; never touched on `armd-control`). Lock order: `state -> policy_diag`.
     #[cfg(feature = "policy-runtime")]
-    policy_diag: Mutex<std::collections::VecDeque<PolicyDiagEntry>>,
+    policy_diag: super::rt_gate::RtGuardedMutex<std::collections::VecDeque<PolicyDiagEntry>>,
     /// Monotonic revision bumped on every accepted [`Self::update_policy_diag`] call.
     #[cfg(feature = "policy-runtime")]
     policy_diag_seq: AtomicU64,
     /// Off-RT SPSC stream producer for grasp/macro [`ActionDiagPatch`] updates (never touched on
     /// `armd-control`; never nested with `state` or `action_diag`).
-    action_diag_tx: Mutex<super::stream::StreamProducer<super::action_diag::ActionDiagPatch>>,
+    action_diag_tx: super::rt_gate::RtGuardedMutex<super::stream::StreamProducer<super::action_diag::ActionDiagPatch>>,
     /// Single off-RT consumer and bounded diagnostic overlay table (`state -> action_diag`,
     /// `terminal_capture.rx -> action_diag`, `maint_client -> action_diag`; leaf lock).
-    action_diag: Mutex<super::action_diag::ActionDiagStore>,
+    action_diag: super::rt_gate::RtGuardedMutex<super::action_diag::ActionDiagStore>,
     /// Monotonic revision bumped on every pushed [`ActionDiagPatch`].
     action_diag_seq: AtomicU64,
     /// Latest stream sequence number returned by `action_diag_tx.try_push` (read lock-free on
@@ -1363,7 +1363,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
     let (action_diag_tx, action_diag_store) =
         super::action_diag::ActionDiagStore::new_channel(super::action_diag::ACTION_DIAG_STREAM_CAP);
     let hub = Arc::new(StateHub {
-        state: Mutex::new(HubState {
+        state: super::rt_gate::RtGuardedMutex::new("StateHub::state", HubState {
             consumer,
             latest: None,
             last_policy_diag_seq: 0,
@@ -1375,21 +1375,21 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         record: OnceLock::new(),
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
-        prewarm_template: std::sync::RwLock::new(None),
-        motion_config: std::sync::RwLock::new(None),
-        legacy_motion_config: std::sync::RwLock::new(None),
-        schema_cache: Mutex::new(None),
-        prep_env: Mutex::new(None),
-        service_identity: std::sync::RwLock::new(None),
-        action_measurements: Mutex::new(std::collections::HashMap::new()),
+        prewarm_template: super::rt_gate::RtGuardedRwLock::new("StateHub::prewarm_template", None),
+        motion_config: super::rt_gate::RtGuardedRwLock::new("StateHub::motion_config", None),
+        legacy_motion_config: super::rt_gate::RtGuardedRwLock::new("StateHub::legacy_motion_config", None),
+        schema_cache: super::rt_gate::RtGuardedMutex::new("StateHub::schema_cache", None),
+        prep_env: super::rt_gate::RtGuardedMutex::new("StateHub::prep_env", None),
+        service_identity: super::rt_gate::RtGuardedRwLock::new("StateHub::service_identity", None),
+        action_measurements: super::rt_gate::RtGuardedMutex::new("StateHub::action_measurements", std::collections::HashMap::new()),
         #[cfg(feature = "policy-runtime")]
         policy_diag_sealed: OnceLock::new(),
         #[cfg(feature = "policy-runtime")]
-        policy_diag: Mutex::new(std::collections::VecDeque::with_capacity(POLICY_DIAG_CAPACITY)),
+        policy_diag: super::rt_gate::RtGuardedMutex::new("StateHub::policy_diag", std::collections::VecDeque::with_capacity(POLICY_DIAG_CAPACITY)),
         #[cfg(feature = "policy-runtime")]
         policy_diag_seq: AtomicU64::new(0),
-        action_diag_tx: Mutex::new(action_diag_tx),
-        action_diag: Mutex::new(action_diag_store),
+        action_diag_tx: super::rt_gate::RtGuardedMutex::new("StateHub::action_diag_tx", action_diag_tx),
+        action_diag: super::rt_gate::RtGuardedMutex::new("StateHub::action_diag", action_diag_store),
         action_diag_seq: AtomicU64::new(0),
         action_diag_pushed_seq: AtomicU64::new(0),
         action_diag_cutoff: super::action_diag::ActionDiagTerminalCutoff::new(),
