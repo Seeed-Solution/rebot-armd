@@ -780,11 +780,19 @@ async fn legacy_ws_stop_during_enable_aborts_cleanly_pre_and_post_partial_and_es
 
         let wait_dl = Instant::now() + Duration::from_secs(2);
         while Instant::now() < wait_dl {
-            if sup.inner().read().await.torque_transition_pending() {
+            if sup.inner().read().await.torque_transition_pending() && bus.enable_tx_count() > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        assert!(
+            sup.inner().read().await.torque_transition_pending(),
+            "enable transition must be in flight during partial enable before Stop"
+        );
+        assert!(
+            bus.enable_tx_count() > 0,
+            "expected partial enable TX before Stop"
+        );
         let tx_at_stop = {
             let mut inner = sup.inner().write().await;
             inner.authorized_stop();
@@ -830,6 +838,10 @@ async fn legacy_ws_stop_during_enable_aborts_cleanly_pre_and_post_partial_and_es
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        assert!(
+            sup.inner().read().await.torque_transition_pending(),
+            "enable transition must be in flight before E-stop"
+        );
         let _ = sup.trigger_e_stop().await;
         let tx_at_estop = bus.enable_tx_count();
         let reply = common::next_of(&mut ws, &["command_ack", "command_reject"]).await;
