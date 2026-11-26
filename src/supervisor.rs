@@ -12768,6 +12768,9 @@ impl SupervisorInner {
                 message: "routed mode-switch session requires a reserved terminal destination",
             });
         }
+        if !self.rt_executor_owned && terminal.is_some() {
+            return Err(ConfigError::OwnerStopped);
+        }
         if self.mode_switch.active_session.is_some() {
             return Err(ConfigError::Busy("a mode-switch session is already active"));
         }

@@ -1328,6 +1328,38 @@ async fn routed_session_admission_terminal_credit_invariants_and_slot_reuse() {
     assert!(core.sessions().slot(SessionSlot::ExclusiveOutput).is_some_and(|s| s.id == sid_int));
     assert_eq!(exec.router_global_reserved(), 0);
 
+    // Ownership-transition defense: an executor terminal reservation arriving at a Legacy owner
+    // (`!rt_executor_owned`) MUST fail closed with OwnerStopped and release its credit on guard drop.
+    let legacy_sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    legacy_sup.set_lease_enabled(false).await;
+    let mut g_handback = exec
+        .reserve_session_terminal(
+            ClientId(903),
+            ActionId(204),
+            ExternalDestinationPolicy::ConnectionOnly,
+        )
+        .unwrap();
+    let res_handback = g_handback.stage_for_admission().unwrap();
+    let handback_rep = legacy_sup
+        .dispatch_config_request(ConfigRequest::StartModeSwitch(
+            ModeSwitchStartRequest {
+                plan,
+                admission: legacy_sup.capture_admission_stamp(),
+                operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
+                deadline: Instant::now() + Duration::from_secs(2),
+                client: ClientId(903),
+            },
+            Some(res_handback),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        handback_rep,
+        ConfigReply::ModeSwitchStarted(Err(ConfigError::OwnerStopped))
+    ));
+    drop(g_handback);
+    assert_eq!(exec.router_global_reserved(), 0);
+
     assert_eq!(exec.stats().total_allocs(), AllocCounts::ZERO);
     assert_eq!(h.sup.inner().control_thread_attempts(), 0);
     h.shutdown(false).await;
