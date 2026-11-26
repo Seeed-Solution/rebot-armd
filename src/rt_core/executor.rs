@@ -1784,6 +1784,11 @@ enum PersistReply {
         _returned_warning: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
     },
+    PublishedAck {
+        _returned_msg: Option<String>,
+        _returned_warning: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
 }
 
 /// Dedicated bounded lock-free SPSC off-thread reclamation & deferred-log ring drained
@@ -7514,8 +7519,8 @@ impl ControlState {
                 }
             } else if let Some(action_id) = self.persist_awaiting_publish.take() {
                 // Worker exited or crashed after live activation before reporting publication:
-                // fail closed so durability is never claimed falsely (the old calibration remains
-                // on disk; startup cleans up the stale `.pending` candidate).
+                // fail closed so durability is never claimed falsely. The rename may or may not
+                // have run before worker loss, so do not assert which file sits on disk.
                 if core.zero_check_persisting == Some(action_id) {
                     core.zero_check_persisting = None;
                 }
@@ -7530,7 +7535,7 @@ impl ControlState {
                     action_id,
                     "failed",
                     "PERSIST_FAILED",
-                    "Persistence worker disconnected after activation before publishing; the old calibration remains on disk",
+                    "Persistence worker disconnected after activation before confirming publication; disk persistence is unconfirmed",
                     self.disconnect_code_buf.take(),
                     self.disconnect_msg_buf.take(),
                 );
@@ -8205,10 +8210,7 @@ impl ControlState {
                         }
                     };
                 self.push_persist_reply_or_retain(
-                    PersistReply::Done {
-                        _returned_policy: None,
-                        _returned_jaw: None,
-                        _returned_code: None,
+                    PersistReply::PublishedAck {
                         _returned_msg: returned_msg,
                         _returned_warning: returned_warning,
                         _returned_probe: probe,
@@ -8674,7 +8676,9 @@ impl ExecutorPersistBackend<'_> {
             ) {
                 return PublishPendingResult::WorkerDisconnected;
             }
-            if !self.hooks.leave_final_reply_queued && self.wait_reply().is_none() {
+            if !self.hooks.leave_final_reply_queued
+                && !matches!(self.wait_reply(), Some(PersistReply::PublishedAck { .. }))
+            {
                 return PublishPendingResult::WorkerDisconnected;
             }
             return PublishPendingResult::Published;
@@ -8751,7 +8755,9 @@ impl ExecutorPersistBackend<'_> {
         ) {
             return PublishPendingResult::WorkerDisconnected;
         }
-        if !self.hooks.leave_final_reply_queued && self.wait_reply().is_none() {
+        if !self.hooks.leave_final_reply_queued
+            && !matches!(self.wait_reply(), Some(PersistReply::PublishedAck { .. }))
+        {
             return PublishPendingResult::WorkerDisconnected;
         }
         result
@@ -11710,6 +11716,32 @@ fn control_thread_main_inner(
                 && (!has_live_receiver || !core_ref.quiesce_motion_and_refresh_hold_for_handback())
             {
                 return false;
+            }
+            if let Some(action_id) = core_ref.zero_check_persisting.take() {
+                // `armd-persist` is stopping with this executor; do not hand back a running
+                // action or `zero_check_persisting` marker that Legacy cannot settle (0 alloc).
+                if let Some(a) = core_ref
+                    .last_action
+                    .as_mut()
+                    .filter(|a| a.id == action_id && a.is_running())
+                {
+                    a.durability_confirmed = Some(false);
+                }
+                let _ = core_ref.finish_zero_check_action_in_place(
+                    action_id,
+                    "failed",
+                    "PERSIST_FAILED",
+                    "Executor handed back before gripper calibration persistence completed; disk persistence is unconfirmed",
+                    None,
+                    None,
+                );
+                ControlState::settle_zero_check_session_on_persist_end(
+                    core_ref,
+                    action_id,
+                    false,
+                    "PERSIST_FAILED",
+                    Instant::now(),
+                );
             }
             core_ref.rt_executor_owned = false;
             core_ref.before_publish_hook = None;

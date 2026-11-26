@@ -2183,29 +2183,30 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
-    // (g1) B1 barrier after `is_abandoned()` and before `pop()` with queued `Activate` + worker exit:
-    // MUST pop and activate cleanly (single terminal `done`, `config_inhibited == false`).
+    // (g1) B1 barrier after `is_abandoned()` and before `pop()` with queued `Published` + worker exit:
+    // MUST pop and complete cleanly (single terminal `done`, `durability_confirmed == true`,
+    // `config_inhibited == false`).
     let dir_g1 = tempfile::tempdir().unwrap();
     let path_g1 = dir_g1.path().join("gripper_calib.json");
     let (sup_g1, id_g1) = prepare_zero_check_supervisor(path_g1.clone()).await;
-    let renamed = Arc::new(AtomicBool::new(false));
+    let activated_ready = Arc::new(AtomicBool::new(false));
     let released_worker = Arc::new(AtomicBool::new(false));
     let (go_push_tx, go_push_rx) = mpsc::sync_channel::<()>(1);
     let go_push_rx = Arc::new(Mutex::new(go_push_rx));
-    let renamed_w = renamed.clone();
-    let renamed_c = renamed.clone();
+    let ready_w = activated_ready.clone();
+    let ready_c = activated_ready.clone();
     let released_c = released_worker.clone();
     let hooks_g1 = PersistTestHooks {
-        after_rename_before_activate: Some(Arc::new(move || {
-            renamed_w.store(true, Ordering::Release);
+        after_activate_before_publish: Some(Arc::new(move || {
+            ready_w.store(true, Ordering::Release);
             let _ = go_push_rx.lock().unwrap().recv();
             false
         })),
         after_abandoned_check_before_pop: Some(Arc::new(move || {
-            if renamed_c.load(Ordering::Acquire) && !released_c.swap(true, Ordering::AcqRel) {
+            if ready_c.load(Ordering::Acquire) && !released_c.swap(true, Ordering::AcqRel) {
                 let _ = go_push_tx.send(());
-                // Give worker a moment to push `Activate` and exit (`cmd_tx` dropped).
-                thread::sleep(Duration::from_millis(15));
+                // Give worker a moment to rename, dir-sync, push `Published`, and exit (`cmd_tx` dropped).
+                thread::sleep(Duration::from_millis(25));
             }
         })),
         exit_after_first_job: true,
@@ -2217,7 +2218,8 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
         .await
         .unwrap();
     let a_g1 = wait_action_terminal(&h_g1, id_g1).await;
-    assert_eq!(a_g1.state, "done", "B1 Activate must not double-fail or reconcile: {a_g1:?}");
+    assert_eq!(a_g1.state, "done", "B1 Published must not double-fail or reconcile: {a_g1:?}");
+    assert_eq!(a_g1.durability_confirmed, Some(true), "{a_g1:?}");
     wait_until_async(Duration::from_secs(1), || h_g1.persist_worker_exited()).await;
     // Even after worker exits and subsequent releases see `is_abandoned() == true`, hold stays clean!
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2307,6 +2309,68 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     assert!(inner.zero_check_persisting.is_none());
     assert!(inner.pending_zero_check_persist.is_none());
     assert_eq!(ConfigAuthority::revision(&inner, ConfigDomain::GripperCalibration), rev_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handback_while_awaiting_publish_clears_zero_check_persisting_and_fails_action_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gripper_calib.json");
+    let (sup, action_id) = prepare_zero_check_supervisor(path).await;
+    let (at_pause_tx, at_pause_rx) = mpsc::sync_channel::<()>(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+    let resume_rx = Arc::new(Mutex::new(resume_rx));
+    let hooks = PersistTestHooks {
+        after_activate_before_publish: Some(Arc::new(move || {
+            let _ = at_pause_tx.send(());
+            let _ = resume_rx.lock().unwrap().recv();
+            false
+        })),
+        ..Default::default()
+    };
+    let h = sup
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+        .await
+        .unwrap();
+
+    // Wait until live activation completed and worker paused before `publish_pending`.
+    tokio::task::spawn_blocking(move || at_pause_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+
+    // Release the worker shortly after handback begins so `armd-persist` exits cleanly during join.
+    let resume_handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = resume_tx.send(());
+    });
+    let (legacy_stop, legacy_join) = sup
+        .handback_to_legacy_with_live_loop(Duration::from_secs(3), Duration::from_millis(5))
+        .await
+        .expect("handback to legacy must succeed while awaiting publish");
+    resume_handle.await.unwrap();
+    h.stop_and_join();
+
+    {
+        let inner = sup.inner().read().await;
+        assert!(
+            inner.zero_check_persisting.is_none(),
+            "handback must clear zero_check_persisting so Legacy is not stranded in MOTION_BUSY"
+        );
+        let a = inner.last_action.as_ref().expect("last_action present");
+        assert_eq!(a.id, action_id);
+        assert_eq!(a.state, "failed", "{a:?}");
+        assert_eq!(a.code.as_deref(), Some("PERSIST_FAILED"), "{a:?}");
+        assert_eq!(a.durability_confirmed, Some(false), "{a:?}");
+        assert!(
+            inner
+                .sessions()
+                .slot(armd::rt_core::session::SessionSlot::ExclusiveOutput)
+                .is_none(),
+            "ExclusiveOutput session must be cleared on handback"
+        );
+    }
+
+    legacy_stop.store(true, Ordering::Release);
+    let _ = legacy_join.join();
 }
 
 // ============================================================================

@@ -2026,25 +2026,90 @@ async fn executor_zero_check_refused_activation_leaves_official_file_and_restart
     rig.shutdown().await;
 }
 
-/// Crash after activation, before the rename: the action fails closed (`PERSIST_FAILED`), the
-/// candidate stays at `.pending`, the hold is released, and a restart loads the old calibration
-/// and removes the stale candidate.
+/// Crash after activation, before the rename: while publication is paused the action stays
+/// running (no premature `done`); once the worker crashes, the action fails closed
+/// (`PERSIST_FAILED`, honest unconfirmed-persistence message), the candidate stays at `.pending`,
+/// the hold is released, and a restart loads the old calibration and removes the stale candidate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_zero_check_crash_after_activation_restarts_with_old_and_removes_pending() {
     let crashed = Arc::new(AtomicBool::new(false));
     let crashed_h = Arc::clone(&crashed);
+    let (at_pause_tx, at_pause_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let resume_rx = Arc::new(Mutex::new(resume_rx));
     let (rig, token, old_policy) = old_calib_rig(move |_, _| PersistTestHooks {
         after_activate_before_publish: Some(Arc::new(move || {
+            let _ = at_pause_tx.send(());
+            let _ = resume_rx.lock().unwrap().recv();
             crashed_h.store(true, Ordering::Release);
             true
         })),
         ..Default::default()
     })
     .await;
-    let term = run_store_check(&rig, &token, "c-crash-act").await;
+    let mut ws = connect_ws(rig.addr, Some(&token)).await;
+    let gen = acquire_lease(&mut ws, "c-crash-act", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let req_id = next_req_id();
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": req_id,
+            "generation": gen,
+            "epoch_id": ep,
+            "path": "/api/v1/action/gripper_zero_check",
+            "body": {"store_offset": true},
+        }),
+    )
+    .await;
+    let ack = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("request_id").and_then(Value::as_u64) == Some(req_id) {
+                return v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let action_id = ack["action_id"].as_u64().unwrap();
+
+    // Wait until live activation succeeded and the worker is paused before `publish_pending`.
+    tokio::task::spawn_blocking(move || at_pause_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+    // Action must STILL be running (no premature Durable completion before official publish).
+    let mid_obs = rig.sup.get_observation().await;
+    let mid_act = mid_obs.action.as_ref().expect("action present");
+    assert_eq!(mid_act.id, action_id);
+    assert_eq!(mid_act.state, "running", "action must stay running until publication: {mid_act:?}");
+    assert_eq!(mid_act.durability_confirmed, None, "{mid_act:?}");
+    // Hold is already released by live activation.
+    let mid_hold = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(mid_hold, ConfigReply::HoldInspected { state: None, .. }),
+        "hold must be released after live activation"
+    );
+
+    // Release the worker to crash before `publish_pending`.
+    resume_tx.send(()).unwrap();
+    let term = wait_terminal_for_id(&mut ws, action_id, Duration::from_secs(5)).await;
     assert_eq!(term["state"], "failed", "{term}");
     assert_eq!(term["code"], "PERSIST_FAILED", "{term}");
     assert_eq!(term["durability_confirmed"], json!(false), "{term}");
+    assert!(
+        !term["message"].as_str().unwrap_or("").contains("old calibration remains on disk"),
+        "worker-disconnect message must not falsely claim old file remains on disk: {term}"
+    );
     assert!(crashed.load(Ordering::Acquire), "worker must stop between activation and rename");
     let hold = rig
         .sup
