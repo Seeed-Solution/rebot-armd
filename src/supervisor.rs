@@ -18371,16 +18371,30 @@ impl ArmSupervisor {
         if settled_legacy {
             self.legacy_torque_notify.notify_waiters();
         }
+        let tick_usage = crate::diagnostics::tick::thread_usage(
+            &usage_start,
+            &usage_locked,
+            &usage_released,
+        );
+        #[cfg(target_os = "linux")]
+        let tick_cpu_hold = Some(Duration::from_nanos(
+            usage_released.cpu_ns().saturating_sub(usage_locked.cpu_ns()),
+        ));
+        #[cfg(not(target_os = "linux"))]
+        let tick_cpu_hold = None;
         // Record EVERY control-tick guard into opt-in test history (single Relaxed load when
         // disabled) so slow non-torque ticks are never hidden from lock-proof assertions.
         self.inner.record_tick_hold_for_history(
             std::panic::Location::caller(),
             tick_tq_dir.map(|_| "/api/v1/torque"),
             tick_tq_dir,
-            tick_tq_dir.map(|_| tick_io),
+            Some(tick_io),
             started,
             locked,
             released,
+            tick_cpu_hold,
+            tick_usage.lock_vcsw,
+            tick_usage.lock_ivcsw,
         );
         let (mid_nvcsw, mid_nivcsw) = mid_csw_delta(&mid_csw_start, &usage_released);
         if captured_any {
@@ -18470,7 +18484,7 @@ impl ArmSupervisor {
                 lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
                 lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
                 lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
-                ..crate::diagnostics::tick::thread_usage(&usage_start, &usage_locked, &usage_released)
+                ..tick_usage
             },
             waited_for: log.last_release.map(holder),
             longest_hold: log.longest.map(holder),

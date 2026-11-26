@@ -1155,6 +1155,13 @@ impl CswMark {
         #[cfg(not(target_os = "linux"))]
         CswMark::default()
     }
+
+    /// Voluntary and involuntary context-switch deltas between two `CswMark`s on the same thread.
+    #[inline]
+    pub fn delta(&self, end: &Self) -> (u32, u32) {
+        let n = |a: i64, b: i64| u32::try_from(b.saturating_sub(a).max(0)).unwrap_or(u32::MAX);
+        (n(self.vcsw, end.vcsw), n(self.ivcsw, end.ivcsw))
+    }
 }
 
 /// Voluntary and involuntary context-switch deltas between a `CswMark` (at `lock_end`)

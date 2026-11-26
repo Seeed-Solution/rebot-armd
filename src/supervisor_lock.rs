@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
-use crate::diagnostics::tick::HoldIoTiming;
+use crate::diagnostics::tick::{thread_cpu_ns, CswMark, HoldIoTiming};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldKind { Read, Write }
@@ -60,6 +60,13 @@ pub struct HoldRecord {
     pub acquired: Instant,
     /// Recorded just before the release.
     pub released: Instant,
+    /// Optional on-CPU thread time (`CLOCK_THREAD_CPUTIME_ID`) while the guard was held
+    /// (populated only when opt-in hold history is enabled on Linux; `None` otherwise).
+    pub cpu_hold: Option<Duration>,
+    /// Voluntary context switches (`ru_nvcsw`) while the guard was held (opt-in history on Linux).
+    pub voluntary_csw: u32,
+    /// Involuntary context switches (`ru_nivcsw`) while the guard was held (opt-in history on Linux).
+    pub involuntary_csw: u32,
 }
 
 impl HoldRecord {
@@ -108,7 +115,45 @@ struct Holds {
     history: std::sync::Mutex<Vec<HoldRecord>>,
 }
 
+#[derive(Clone, Copy)]
+struct HoldUsageStart {
+    tid: std::thread::ThreadId,
+    cpu_ns: u64,
+    csw: CswMark,
+}
+
+impl HoldUsageStart {
+    #[inline]
+    fn sample() -> Self {
+        Self {
+            tid: std::thread::current().id(),
+            cpu_ns: thread_cpu_ns(),
+            csw: CswMark::now(),
+        }
+    }
+
+    #[inline]
+    fn finish(self) -> (Option<Duration>, u32, u32) {
+        if std::thread::current().id() != self.tid {
+            return (None, 0, 0);
+        }
+        #[cfg(target_os = "linux")]
+        let cpu = Some(Duration::from_nanos(thread_cpu_ns().saturating_sub(self.cpu_ns)));
+        #[cfg(not(target_os = "linux"))]
+        let cpu = None;
+        let (vcsw, ivcsw) = self.csw.delta(&CswMark::now());
+        (cpu, vcsw, ivcsw)
+    }
+}
+
 impl Holds {
+    #[inline]
+    fn sample_usage_if_history(&self) -> Option<HoldUsageStart> {
+        self.history_enabled
+            .load(Ordering::Relaxed)
+            .then(HoldUsageStart::sample)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
@@ -121,6 +166,9 @@ impl Holds {
         called: Instant,
         acquired: Instant,
         released: Instant,
+        cpu_hold: Option<Duration>,
+        voluntary_csw: u32,
+        involuntary_csw: u32,
     ) {
         let r = HoldRecord {
             kind,
@@ -132,6 +180,9 @@ impl Holds {
             called,
             acquired,
             released,
+            cpu_hold,
+            voluntary_csw,
+            involuntary_csw,
         };
         self.log.lock().unwrap_or_else(|e| e.into_inner()).add(r);
         if self.history_enabled.load(Ordering::Relaxed) {
@@ -210,7 +261,8 @@ impl<T> SupervisorLock<T> {
             site: "SupervisorLock::read",
             inner: async move {
                 let guard = self.lock.read().await;
-                SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds }
+                let usage = self.holds.sample_usage_if_history();
+                SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called, usage), holds: &self.holds }
             },
         }
     }
@@ -220,7 +272,8 @@ impl<T> SupervisorLock<T> {
         let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::try_read");
         let guard = self.lock.try_read()?;
-        Ok(SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds })
+        let usage = self.holds.sample_usage_if_history();
+        Ok(SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called, usage), holds: &self.holds })
     }
 
     #[track_caller]
@@ -233,7 +286,8 @@ impl<T> SupervisorLock<T> {
             inner: async move {
                 let guard = self.lock.write().await;
                 self.bump();
-                SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds }
+                let usage = self.holds.sample_usage_if_history();
+                SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called, usage), holds: &self.holds }
             },
         }
     }
@@ -244,7 +298,8 @@ impl<T> SupervisorLock<T> {
         self.holds.check_not_on_control_thread("SupervisorLock::try_write");
         let guard = self.lock.try_write()?;
         self.bump();
-        Ok(SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds })
+        let usage = self.holds.sample_usage_if_history();
+        Ok(SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called, usage), holds: &self.holds })
     }
 
     #[track_caller]
@@ -253,7 +308,8 @@ impl<T> SupervisorLock<T> {
         self.holds.check_not_on_control_thread("SupervisorLock::blocking_write");
         let guard = self.lock.blocking_write();
         self.bump();
-        SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: &self.holds }
+        let usage = self.holds.sample_usage_if_history();
+        SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called, usage), holds: &self.holds }
     }
 
     #[track_caller]
@@ -267,7 +323,8 @@ impl<T> SupervisorLock<T> {
             inner: async move {
                 let guard = self.lock.clone().write_owned().await;
                 self.bump();
-                SupOwnedWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called), holds: self.holds.clone() }
+                let usage = self.holds.sample_usage_if_history();
+                SupOwnedWriteGuard { guard: ManuallyDrop::new(guard), t: Timing::new(location, called, usage), holds: self.holds.clone() }
             },
         }
     }
@@ -323,6 +380,9 @@ impl<T> SupervisorLock<T> {
         called: Instant,
         acquired: Instant,
         released: Instant,
+        cpu_hold: Option<Duration>,
+        voluntary_csw: u32,
+        involuntary_csw: u32,
     ) {
         if self.holds.history_enabled.load(Ordering::Relaxed) {
             self.holds
@@ -339,6 +399,9 @@ impl<T> SupervisorLock<T> {
                     called,
                     acquired,
                     released,
+                    cpu_hold,
+                    voluntary_csw,
+                    involuntary_csw,
                 });
         }
     }
@@ -359,11 +422,16 @@ struct Timing {
     io_timing: Option<HoldIoTiming>,
     called: Instant,
     acquired: Instant,
+    usage_start: Option<HoldUsageStart>,
 }
 
 impl Timing {
     #[inline]
-    fn new(location: &'static Location<'static>, called: Instant) -> Self {
+    fn new(
+        location: &'static Location<'static>,
+        called: Instant,
+        usage_start: Option<HoldUsageStart>,
+    ) -> Self {
         Self {
             location,
             command: None,
@@ -372,7 +440,13 @@ impl Timing {
             io_timing: None,
             called,
             acquired: Instant::now(),
+            usage_start,
         }
+    }
+
+    #[inline]
+    fn finish_usage(&self) -> (Option<Duration>, u32, u32) {
+        self.usage_start.map_or((None, 0, 0), HoldUsageStart::finish)
     }
 }
 
@@ -388,6 +462,7 @@ impl<T> Drop for SupReadGuard<'_, T> {
         // delay never inflates `hold()`), then unlock BEFORE acquiring hold-log / history mutexes
         // so lock recording never extends the actual hold duration.
         let released = Instant::now();
+        let (cpu_hold, vcsw, ivcsw) = self.t.finish_usage();
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
@@ -400,6 +475,9 @@ impl<T> Drop for SupReadGuard<'_, T> {
             self.t.called,
             self.t.acquired,
             released,
+            cpu_hold,
+            vcsw,
+            ivcsw,
         );
     }
 }
@@ -444,6 +522,7 @@ impl<T> SupWriteGuard<'_, T> {
 impl<T> Drop for SupWriteGuard<'_, T> {
     fn drop(&mut self) {
         let released = Instant::now();
+        let (cpu_hold, vcsw, ivcsw) = self.t.finish_usage();
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
@@ -456,6 +535,9 @@ impl<T> Drop for SupWriteGuard<'_, T> {
             self.t.called,
             self.t.acquired,
             released,
+            cpu_hold,
+            vcsw,
+            ivcsw,
         );
     }
 }
@@ -504,6 +586,7 @@ impl<T> SupOwnedWriteGuard<T> {
 impl<T> Drop for SupOwnedWriteGuard<T> {
     fn drop(&mut self) {
         let released = Instant::now();
+        let (cpu_hold, vcsw, ivcsw) = self.t.finish_usage();
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
         self.holds.record(
@@ -516,6 +599,9 @@ impl<T> Drop for SupOwnedWriteGuard<T> {
             self.t.called,
             self.t.acquired,
             released,
+            cpu_hold,
+            vcsw,
+            ivcsw,
         );
     }
 }
