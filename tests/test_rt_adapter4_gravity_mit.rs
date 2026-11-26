@@ -5868,7 +5868,7 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
             armd::rt_core::requests::lease::ConnectionHandle::try_new(911, "stall-hub").unwrap();
         let hub_gen = match rig
             .sup
-            .acquire_lease_ws(conn_hub.clone(), "stall-hub", 1)
+            .acquire_lease_ws(conn_hub, "stall-hub", 1)
             .await
             .expect("acquire_lease_ws")
         {

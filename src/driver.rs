@@ -9334,6 +9334,7 @@ const MAX_MODE_JOINTS: usize = 16;
 /// 3. Drain RX -> Round 1 `0xCC` status probe (`probe1_tx` -> `probe1_ack`, `state == 0`)
 /// 4. Drain RX -> Round 2 `0xCC` status probe (`probe2_tx` -> `probe2_ack`, `state == 0`),
 ///    submitted only after `probe1_ack` is received.
+///
 /// Retries advance `min_next_fb_seq` and drain RX before submitting a fresh probe so a retry
 /// never reuses a prior reply identity.
 #[derive(Debug, Clone, Copy, Default)]
