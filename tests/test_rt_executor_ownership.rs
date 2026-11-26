@@ -2098,11 +2098,12 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     assert!(!path_d.exists(), "pre-rename VerifyAuthority must abort before rename");
     h_d.stop_and_join();
 
-    // (d2) Post-rename revocation: barrier after rename + dir-sync before activate -> trigger E-stop ->
-    // allow activate -> disk has file, live policy unchanged, hold enters Reconciling.
+    // (d2) Post-staging revocation: barrier after `.pending` rename + dir-sync before activate ->
+    // trigger E-stop -> allow activate -> official file untouched, `.pending` unlinked, live policy
+    // unchanged, action fails with ESTOP_ACTIVE, E-stop stays latched, and hold is Cleared.
     let dir_d2 = tempfile::tempdir().unwrap();
     let path_d2 = dir_d2.path().join("gripper_calib.json");
-    let (sup_d2, _id_d2) = prepare_zero_check_supervisor(path_d2.clone()).await;
+    let (sup_d2, id_d2) = prepare_zero_check_supervisor(path_d2.clone()).await;
     let (at_b2_tx, at_b2_rx) = mpsc::sync_channel::<()>(1);
     let (go2_tx, go2_rx) = mpsc::sync_channel::<()>(1);
     let go2_rx = Arc::new(Mutex::new(go2_rx));
@@ -2121,10 +2122,18 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     at_b2_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     sup_d2.trigger_e_stop_checked().await.unwrap();
     go2_tx.send(()).unwrap();
+    let a_d2 = wait_action_terminal(&h_d2, id_d2).await;
+    assert_eq!(a_d2.state, "failed", "{a_d2:?}");
+    assert_eq!(a_d2.code.as_deref(), Some("ESTOP_ACTIVE"), "{a_d2:?}");
     wait_until_async(Duration::from_secs(2), || {
-        h_d2.planning_snapshot().is_ok_and(|s| s.config_inhibited)
+        h_d2.planning_snapshot().is_ok_and(|s| !s.config_inhibited)
     })
     .await;
+    assert_eq!(
+        sup_d2.observation().await.unwrap().safety_state,
+        SafetyState::EStop,
+        "E-stop latch must remain untouched after activation refusal"
+    );
     assert!(!path_d2.exists(), "refused candidate must not reach the official path");
     wait_until_async(Duration::from_secs(2), || !armd::gripper_calib::pending_path_for(&path_d2).exists()).await;
     assert!(!armd::gripper_calib::pending_path_for(&path_d2).exists(), "refused candidate must be unlinked");
@@ -2149,7 +2158,9 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     assert!(!path_e.exists());
     h_e.stop_and_join();
 
-    // (f) Worker disconnect AFTER rename -> hold enters Reconciling, action fails PERSIST_FAILED.
+    // (f) Worker disconnect AFTER `.pending` staging before `Activate` -> worker abandons
+    // `persist_granted` without calling `zero_check_owner_activate`, so `service_persistence`
+    // enters `Reconciling` conservatively (same as (e)) and fails the action with PERSIST_FAILED.
     let dir_f = tempfile::tempdir().unwrap();
     let path_f = dir_f.path().join("gripper_calib.json");
     let (sup_f, id_f) = prepare_zero_check_supervisor(path_f.clone()).await;
@@ -3348,7 +3359,8 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
     // (d) Unapplied urgent E-stop arriving AFTER Step 6 publish and BEFORE `PersistCmd::Activate`:
     // we inject `e_stop_latched + requested_estop_count` inside `after_rename_before_activate`
     // (without waiting for the next release Step 1 to apply it!) -> `Activate` MUST refuse,
-    // keep live policy/revision unchanged, and enter `Reconciling` (`config_inhibited == true`)!
+    // keep live policy/revision unchanged, release the hold (`config_inhibited == false`, since
+    // the candidate is only at `.pending` and the official file is intact), and keep E-stop latched.
     let dir_u = tempfile::tempdir().unwrap();
     let path_u = dir_u.path().join("gripper_calib_urgent.json");
     let (sup_u, id_u) = prepare_zero_check_supervisor(path_u.clone()).await;
@@ -3377,7 +3389,7 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
         "expected STOPPED/ESTOP refusal code, got {res_u:?}"
     );
     wait_until_async(Duration::from_secs(3), || {
-        h_u.planning_snapshot().is_ok_and(|s| s.config_inhibited)
+        h_u.planning_snapshot().is_ok_and(|s| !s.config_inhibited)
     })
     .await;
     assert!(!path_u.exists(), "refused candidate must not reach the official path");

@@ -6293,7 +6293,11 @@ pub(crate) fn zero_check_owner_activate(
         Err((
             "failed",
             "OPERATOR_REQUIRED",
-            "Operator session revoked after disk rename; reconciliation required",
+            if defer_publish {
+                "Operator session revoked before activation"
+            } else {
+                "Operator session revoked after disk rename; reconciliation required"
+            },
         ))
     } else {
         check_zero_check_authority(core, ctx, proposal, auth, action_id, base_revision, None)
@@ -6324,7 +6328,19 @@ pub(crate) fn zero_check_owner_activate(
             Ok((old_policy, old_jaw, code_buf, msg_buf))
         }
         Err((state, code, msg)) => {
-            if !matches!(
+            if defer_publish {
+                // Candidate is staged only at `.pending`; the official file on disk is intact,
+                // so activation refusal releases the hold (`Cleared`) instead of `Reconciling`.
+                if !matches!(
+                    core.core.config_mut().release_staged_unactivated(reservation),
+                    Released::Cleared
+                ) {
+                    let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                    core.core
+                        .config_mut()
+                        .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                }
+            } else if !matches!(
                 core.core.config_mut().activation_failed(reservation, code),
                 Activated::Reconciling { .. }
             ) {
