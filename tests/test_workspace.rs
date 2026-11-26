@@ -1573,3 +1573,478 @@ fn base_link_link5_contact_is_still_refused() {
         assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:base_")), "J4 {j4}: {detail:?}");
     }
 }
+
+/// Stretched pose and workspace config where the furthest gripper corner is exactly 10 mm
+/// beyond `box_max_x`, while floor, keep-outs, reach and self-collision remain strictly clear.
+fn stretched_beyond_box_max_x_setup() -> (ArmConfig, [f32; 7], f64) {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.lease_timeout_ms = 5000;
+    let q_start: [f32; 7] = [0.0, -0.90, -1.15, 0.85, 0.0, 0.0, 0.0];
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    ws.keepout_boxes.clear();
+    let max_x = |q: &[f32]| -> f64 {
+        let p = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        ws.check_points_end_m
+            .iter()
+            .map(|c| p.transform_point(&c.map(f64::from))[0])
+            .fold(p.p[0], f64::max)
+    };
+    let start_max_x = max_x(&q_start);
+    let box_max_x = start_max_x - 0.010; // start 10 mm beyond box_max_x
+    ws.box_max_m[0] = box_max_x as f32;
+    let actual_depth = start_max_x - f64::from(ws.box_max_m[0]);
+    assert!(
+        (actual_depth - 0.010).abs() < 1e-4,
+        "expected ~10 mm start depth beyond box_max_x, got {actual_depth:.6}"
+    );
+    // Ensure floor / other box walls / self-collision are clear at q_start
+    let eval = armd::chain::WorkspaceEvaluator::new(&ArmModel::REBOT_DEV_ARM, cfg.workspace.as_ref().unwrap(), &cfg.camera_mount);
+    let mut c0 = eval.alloc_buf();
+    eval.eval_into(&q_start, &mut c0, "plan").unwrap();
+    for (slot, &clr) in c0.as_slice().iter().enumerate() {
+        if slot < eval.num_geoms * eval.slots_per_geom && slot % eval.slots_per_geom == 4 {
+            continue; // box_max_x
+        }
+        assert!(clr >= -kinematics::WORKSPACE_EPS, "slot {slot} should be non-violating at q_start, got clr={clr:.5}");
+    }
+    (cfg, q_start, start_max_x)
+}
+
+#[test]
+fn workspace_box_escape_tolerance_stretched_pose_all_paths() {
+    use armd::motion::{plan_cartesian_opts, resolve_goal_opts, GoalSpec, PathOpts, RelFrame, Speed};
+
+    assert!((kinematics::WORKSPACE_ESCAPE_TOL_M - 0.005).abs() < 1e-12);
+    let (cfg, q_start, start_max_x) = stretched_beyond_box_max_x_setup();
+    let check_pts = cfg.workspace.as_ref().unwrap().check_points_end_m.clone();
+    let box_max_x = f64::from(cfg.workspace.as_ref().unwrap().box_max_m[0]);
+    let max_x_at = |q: &[f32]| -> f64 {
+        let p = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts
+            .iter()
+            .map(|c| p.transform_point(&c.map(f64::from))[0])
+            .fold(p.p[0], f64::max)
+    };
+
+    // Find J2 direction that increases max_x (stretching further forward)
+    let mut q_probe = q_start;
+    q_probe[1] += 0.01;
+    let fwd_sign = if max_x_at(&q_probe) > start_max_x { 1.0f32 } else { -1.0f32 };
+    let dx_per_rad = (max_x_at(&{
+        let mut q = q_start;
+        q[1] += 0.01 * fwd_sign;
+        q
+    }) - start_max_x)
+        / 0.01;
+    assert!(dx_per_rad > 0.05, "expected J2 to shift max_x, dx_per_rad={dx_per_rad}");
+
+    // 1) Pure lateral jog (J1 yaw): stretches a gripper corner forward by ~2-3 mm (< 5 mm, > WORKSPACE_EPS)
+    let mut q_lat_ok = q_start;
+    q_lat_ok[0] += 0.03;
+    let lat_deepen = max_x_at(&q_lat_ok) - start_max_x;
+    assert!(
+        lat_deepen > 0.0005 && lat_deepen < 0.0045,
+        "expected lateral jog deepening in (0.5mm, 4.5mm), got {:.4}m",
+        lat_deepen
+    );
+
+    // 2) Move deepening box_max_x by ~8 mm (> 5 mm)
+    let mut q_too_deep = q_start;
+    q_too_deep[1] += (0.008 / dx_per_rad) as f32 * fwd_sign;
+    let deep_delta = max_x_at(&q_too_deep) - start_max_x;
+    assert!(deep_delta > 0.006, "expected deepening > 6mm, got {:.4}m", deep_delta);
+
+    // 3) Retreat move reducing box_max_x intrusion (-x)
+    let mut q_retreat = q_start;
+    q_retreat[1] -= (0.015 / dx_per_rad) as f32 * fwd_sign;
+    assert!(max_x_at(&q_retreat) < box_max_x, "retreat should exit box_max_x");
+
+    // --- Joint jog (legacy SupervisorInner::jog) ---
+    {
+        let mut inner = armed(cfg.clone(), &q_start);
+        let s = inner.current_admission_stamp();
+        inner
+            .check_admission(s)
+            .map_err(armd::ArmError::from)
+            .and_then(|a| armd::SupervisorInner::jog(a, q_lat_ok.to_vec(), None, None))
+            .expect("lateral jog deepening < 5mm must be allowed");
+    }
+    {
+        let mut inner = armed(cfg.clone(), &q_start);
+        let s = inner.current_admission_stamp();
+        let err = inner
+            .check_admission(s)
+            .map_err(armd::ArmError::from)
+            .and_then(|a| armd::SupervisorInner::jog(a, q_too_deep.to_vec(), None, None))
+            .unwrap_err();
+        let ArmError::Safety(ref se @ SafetyError::WorkspaceViolation { ref detail, .. }) = err else {
+            panic!("expected WorkspaceViolation, got {err:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
+        assert!(detail.geometry_id.as_deref().is_some());
+        let msg = se.to_string();
+        assert!(
+            msg.contains("beyond the workspace front edge (box_max_x); move back or press Home"),
+            "unexpected jog error message: {msg}"
+        );
+        assert_eq!(detail.reason.as_deref(), Some(msg.as_str()));
+    }
+    {
+        let mut inner = armed(cfg.clone(), &q_start);
+        let s = inner.current_admission_stamp();
+        inner
+            .check_admission(s)
+            .map_err(armd::ArmError::from)
+            .and_then(|a| armd::SupervisorInner::jog(a, q_retreat.to_vec(), None, None))
+            .expect("retreat (-x) jog must be allowed");
+    }
+
+    // --- Servo target + step (legacy SupervisorInner::servo) ---
+    {
+        let mut inner = armed(cfg.clone(), &q_start);
+        let ep = inner.safety.epoch_id();
+        let s = inner.current_admission_stamp();
+        inner
+            .check_admission(s)
+            .and_then(|a| armd::SupervisorInner::servo(a, q_lat_ok.to_vec(), ep))
+            .expect("servo target deepening < 5mm must be allowed");
+        inner.tick(0.02);
+        assert!(!inner.servo_blocked_hold, "servo step deepening < 5mm must not hold");
+    }
+    {
+        let mut inner = armed(cfg.clone(), &q_start);
+        let ep = inner.safety.epoch_id();
+        let s = inner.current_admission_stamp();
+        let err = inner
+            .check_admission(s)
+            .and_then(|a| armd::SupervisorInner::servo(a, q_too_deep.to_vec(), ep))
+            .unwrap_err();
+        let SafetyError::WorkspaceViolation { detail, .. } = &err else {
+            panic!("expected WorkspaceViolation on servo, got {err:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
+        assert!(err.to_string().contains("beyond the workspace front edge (box_max_x); move back or press Home"));
+    }
+    {
+        let mut inner = armed(cfg.clone(), &q_start);
+        let ep = inner.safety.epoch_id();
+        let s = inner.current_admission_stamp();
+        inner
+            .check_admission(s)
+            .and_then(|a| armd::SupervisorInner::servo(a, q_retreat.to_vec(), ep))
+            .expect("servo retreat (-x) must be allowed");
+    }
+
+    // --- Cartesian move_relative / move_to (plan_cartesian_opts) ---
+    {
+        let inner = armed(cfg.clone(), &q_start);
+        let input = inner.plan_input().unwrap();
+        // Lateral +y with small +2mm forward deepening -> allowed
+        let (goal_ok, opts) = resolve_goal_opts(
+            &input,
+            &GoalSpec::Relative { frame: RelFrame::Base, d: [0.002, 0.02, 0.0], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None },
+        );
+        plan_cartesian_opts(&input, goal_ok, Speed::default(), opts)
+            .expect("Cartesian lateral move deepening < 5mm must be allowed");
+
+        // Forward +8mm deepening (> 5mm) -> refused with actionable front edge message
+        let (goal_bad, opts_bad) = resolve_goal_opts(
+            &input,
+            &GoalSpec::Relative { frame: RelFrame::Base, d: [0.008, 0.0, 0.0], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None },
+        );
+        let err = plan_cartesian_opts(&input, goal_bad, Speed::default(), opts_bad).unwrap_err();
+        let armd::motion::MotionError::WorkspaceViolation { detail, .. } = &err else {
+            panic!("expected MotionError::WorkspaceViolation, got {err:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
+        assert!(err.to_string().contains("beyond the workspace front edge (box_max_x); move back or press Home"));
+
+        // Retreat -2cm (-x) -> allowed
+        let (goal_back, _) = resolve_goal_opts(
+            &input,
+            &GoalSpec::Relative { frame: RelFrame::Base, d: [-0.02, 0.0, 0.0], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None },
+        );
+        plan_cartesian_opts(&input, goal_back, Speed::default(), PathOpts::default())
+            .expect("Cartesian retreat (-x) must be allowed");
+    }
+
+    // --- New intrusion (starting inside box_max_x) keeps WORKSPACE_EPS (0.1 mm), NOT 5 mm ---
+    {
+        let mut cfg_inside = cfg.clone();
+        cfg_inside.workspace.as_mut().unwrap().box_max_m[0] = (start_max_x + 0.0005) as f32; // start 0.5 mm inside
+        let mut inner = armed(cfg_inside, &q_start);
+        let s = inner.current_admission_stamp();
+        let err = inner
+            .check_admission(s)
+            .map_err(armd::ArmError::from)
+            .and_then(|a| armd::SupervisorInner::jog(a, q_lat_ok.to_vec(), None, None))
+            .unwrap_err();
+        let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+            panic!("new intrusion into box_max_x by ~2mm must be refused, got {err:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
+    }
+}
+
+#[test]
+fn workspace_escape_tolerance_does_not_loosen_floor_or_keepout() {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    let check_pts = ws.check_points_end_m.clone();
+    let min_z_at = |q: &[f32]| -> f64 {
+        let p = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts
+            .iter()
+            .map(|c| p.transform_point(&c.map(f64::from))[2])
+            .fold(p.p[2], f64::min)
+    };
+    let start_z = min_z_at(&INSPECT);
+    // Start 10 mm below floor_z
+    cfg.workspace.as_mut().unwrap().floor_z_m = (start_z + 0.010) as f32;
+    let mut q_probe = INSPECT;
+    q_probe[1] += 0.01;
+    let down_sign = if min_z_at(&q_probe) < start_z { 1.0f32 } else { -1.0f32 };
+    let dz_per_rad = (start_z - min_z_at(&{
+        let mut q = INSPECT;
+        q[1] += 0.01 * down_sign;
+        q
+    })) / 0.01;
+    // Deepen floor_z by ~2 mm (< 5 mm, > WORKSPACE_EPS): MUST still be refused!
+    let mut q_floor_deeper = INSPECT;
+    q_floor_deeper[1] += (0.002 / dz_per_rad) as f32 * down_sign;
+    let floor_delta = start_z - min_z_at(&q_floor_deeper);
+    assert!(floor_delta > 0.001 && floor_delta < 0.004, "floor_delta={floor_delta}");
+    {
+        let mut inner = armed(cfg.clone(), &INSPECT);
+        let s = inner.current_admission_stamp();
+        let err = inner
+            .check_admission(s)
+            .map_err(armd::ArmError::from)
+            .and_then(|a| armd::SupervisorInner::jog(a, q_floor_deeper.to_vec(), None, None))
+            .unwrap_err();
+        let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+            panic!("floor deepening by 2mm must be refused, got {err:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("floor_z"));
+    }
+
+    // Keep-out box: start 10 mm inside keepout box on +X face, deepen by ~2 mm (< 5 mm, > WORKSPACE_EPS): MUST be refused!
+    let mut cfg_ko = ArmConfig::rebot_dm();
+    cfg_ko.collision = None;
+    cfg_ko.power_budget = None;
+    cfg_ko.workspace.as_mut().unwrap().check_points_end_m = vec![[0.0, 0.0, 0.0]];
+    let p_in = ArmModel::REBOT_DEV_ARM.fk_f32(&INSPECT).unwrap().p;
+    // Place keepout box so end_origin is 10 mm inside its -X face (min_x = p_in[0] - 0.010, max_x = p_in[0] + 0.090)
+    cfg_ko.workspace.as_mut().unwrap().keepout_boxes.push(armd::model::KeepoutBox {
+        name: "person_zone".into(),
+        min_m: [p_in[0] as f32 - 0.010, p_in[1] as f32 - 0.05, p_in[2] as f32 - 0.05],
+        max_m: [p_in[0] as f32 + 0.090, p_in[1] as f32 + 0.05, p_in[2] as f32 + 0.05],
+    });
+    let mut q_ko_probe = INSPECT;
+    q_ko_probe[1] += 0.01;
+    let x_sign = if ArmModel::REBOT_DEV_ARM.fk_f32(&q_ko_probe).unwrap().p[0] > p_in[0] { 1.0f32 } else { -1.0f32 };
+    let dx_per_rad = (ArmModel::REBOT_DEV_ARM.fk_f32(&{
+        let mut q = INSPECT;
+        q[1] += 0.01 * x_sign;
+        q
+    }).unwrap().p[0] - p_in[0]) / 0.01;
+    let mut q_ko_deeper = INSPECT;
+    q_ko_deeper[1] += (0.002 / dx_per_rad) as f32 * x_sign;
+    let ko_delta = ArmModel::REBOT_DEV_ARM.fk_f32(&q_ko_deeper).unwrap().p[0] - p_in[0];
+    assert!(ko_delta > 0.001 && ko_delta < 0.004, "ko_delta={ko_delta}");
+    {
+        let mut inner = armed(cfg_ko, &INSPECT);
+        let s = inner.current_admission_stamp();
+        let err = inner
+            .check_admission(s)
+            .map_err(armd::ArmError::from)
+            .and_then(|a| armd::SupervisorInner::jog(a, q_ko_deeper.to_vec(), None, None))
+            .unwrap_err();
+        let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+            panic!("keepout deepening by 2mm must be refused, got {err:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("keepout:person_zone"));
+    }
+}
+
+#[test]
+fn workspace_box_edge_messages_all_six_faces_and_geometries() {
+    let cases = [
+        ("box_max_x", "end_point:5", 0.010, "gripper is 1.0 cm beyond the workspace front edge (box_max_x); move back or press Home"),
+        ("box_min_x", "end_origin", 0.015, "gripper is 1.5 cm beyond the workspace back edge (box_min_x); move forward or press Home"),
+        ("box_max_y", "end_point:2", 0.024, "gripper is 2.4 cm beyond the workspace left edge (box_max_y); move right or press Home"),
+        ("box_min_y", "camera_mount", 0.008, "camera is 0.8 cm beyond the workspace right edge (box_min_y); move left or press Home"),
+        ("box_max_z", "capsule:upper_arm", 0.012, "arm is 1.2 cm beyond the workspace top edge (box_max_z); move down or press Home"),
+        ("box_min_z", "end_point:1", 0.006, "gripper is 0.6 cm beyond the workspace bottom edge (box_min_z); move up or press Home"),
+        ("box_max_x", "end_point:5", 0.0002, "gripper is 0.2 mm beyond the workspace front edge (box_max_x); move back or press Home"),
+    ];
+    for (cid, gid, depth, expected) in cases {
+        let mut buf = String::new();
+        assert!(armd::chain::write_workspace_box_edge_reason(&mut buf, cid, gid, depth));
+        assert_eq!(buf, expected);
+    }
+    let mut non_box = String::new();
+    assert!(!armd::chain::write_workspace_box_edge_reason(&mut non_box, "floor_z", "end_origin", 0.01));
+    assert!(!armd::chain::write_workspace_box_edge_reason(&mut non_box, "keepout:table", "end_origin", 0.01));
+    assert!(!armd::chain::write_workspace_box_edge_reason(&mut non_box, "max_reach", "end_origin", 0.01));
+    assert!(non_box.is_empty());
+
+    // RT mailbox encoding preserves exact capsule id and single-rounded depth (0.96 mm -> 1.0 mm, never 0.1 cm).
+    let mut cap_bytes = [0u8; 32];
+    cap_bytes[..9].copy_from_slice(b"upper_arm");
+    let (cid, gid, reason) = armd::chain::decode_workspace_box_edge_refusal(
+        1,
+        255,
+        9,
+        &cap_bytes,
+        0.00096_f32.to_bits(),
+    )
+    .expect("decode capsule refusal");
+    assert_eq!(cid, "box_max_x");
+    assert_eq!(gid, "capsule:upper_arm");
+    assert_eq!(reason, "arm is 1.0 mm beyond the workspace front edge (box_max_x); move back or press Home");
+}
+
+#[tokio::test]
+async fn workspace_box_escape_parity_legacy_and_executor() {
+    let (cfg, q_start, start_max_x) = stretched_beyond_box_max_x_setup();
+    let check_pts = cfg.workspace.as_ref().unwrap().check_points_end_m.clone();
+    let max_x_at = |q: &[f32]| -> f64 {
+        let p = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts
+            .iter()
+            .map(|c| p.transform_point(&c.map(f64::from))[0])
+            .fold(p.p[0], f64::max)
+    };
+    let mut q_probe = q_start;
+    q_probe[1] += 0.01;
+    let fwd_sign = if max_x_at(&q_probe) > start_max_x { 1.0f32 } else { -1.0f32 };
+    let dx_per_rad = (max_x_at(&{
+        let mut q = q_start;
+        q[1] += 0.01 * fwd_sign;
+        q
+    }) - start_max_x)
+        / 0.01;
+    let mut q_lat_ok = q_start;
+    q_lat_ok[0] += 0.03;
+    let mut q_too_deep = q_start;
+    q_too_deep[1] += (0.008 / dx_per_rad) as f32 * fwd_sign;
+    let mut q_retreat = q_start;
+    q_retreat[1] -= (0.015 / dx_per_rad) as f32 * fwd_sign;
+
+    let mut servo_reject_fields: Vec<(String, String, String, String)> = Vec::new();
+    for use_executor in [false, true] {
+        let label = if use_executor { "executor" } else { "legacy" };
+        let sup = std::sync::Arc::new(armd::ArmSupervisor::new(cfg.clone()));
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = q_start.to_vec();
+            inner.measured_positions = q_start.to_vec();
+            inner.target_positions = q_start.to_vec();
+        }
+        let exec_handle = if use_executor {
+            Some(
+                sup.start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(
+                    std::time::Duration::from_millis(20),
+                ))
+                .await
+                .expect("start_executor"),
+            )
+        } else {
+            None
+        };
+        let router = armd::create_router(sup.clone(), armd::OperatorAuth::disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let ticker_task = if !use_executor {
+            let t = sup.clone();
+            Some(tokio::spawn(async move {
+                let mut iv = tokio::time::interval(std::time::Duration::from_millis(20));
+                loop { iv.tick().await; t.tick(0.02).await; }
+            }))
+        } else {
+            None
+        };
+
+        let (mut ws, gen) = common::controller(addr).await;
+        let ep = sup.get_observation().await.epoch_id;
+        let ack = common::rpc(&mut ws, gen, ep, "/api/v1/torque", serde_json::json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "{label}: torque enable: {ack}");
+        let ep = sup.get_observation().await.epoch_id;
+
+        // 1. Deepening > 5 mm via jog -> refused with WORKSPACE_VIOLATION + actionable message
+        let rej = common::rpc(&mut ws, gen, ep, "/api/v1/motion/jog", serde_json::json!({"target_positions": q_too_deep})).await;
+        assert_eq!(rej["type"], "command_reject", "{label}: jog >5mm: {rej}");
+        assert_eq!(rej["code"], "WORKSPACE_VIOLATION", "{label}: {rej}");
+        assert_eq!(rej["constraint_id"], "box_max_x", "{label}: {rej}");
+        assert!(rej["geometry_id"].as_str().is_some(), "{label}: {rej}");
+        assert!(
+            rej["message"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x); move back or press Home")),
+            "{label}: unexpected jog reject message: {rej}"
+        );
+
+        // 2. Deepening > 5 mm via move_relative -> refused with WORKSPACE_VIOLATION + actionable message
+        let rej_cart = common::rpc(
+            &mut ws,
+            gen,
+            ep,
+            "/api/v1/action/move_relative",
+            serde_json::json!({"frame": "base", "d": [0.008, 0.0, 0.0]}),
+        ).await;
+        assert_eq!(rej_cart["type"], "command_reject", "{label}: move_relative >5mm: {rej_cart}");
+        assert_eq!(rej_cart["code"], "WORKSPACE_VIOLATION", "{label}: {rej_cart}");
+        assert_eq!(rej_cart["constraint_id"], "box_max_x", "{label}: {rej_cart}");
+        assert!(
+            rej_cart["message"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x); move back or press Home")),
+            "{label}: unexpected move_relative reject message: {rej_cart}"
+        );
+
+        // 3. Servo target deepening > 5 mm -> servo_reject with WORKSPACE_VIOLATION + structured box-edge fields on BOTH owners
+        common::servo(&mut ws, gen, ep, &q_too_deep).await;
+        let srej = common::servo_reject_within(&mut ws, 1000).await.expect("servo_reject >5mm");
+        assert_eq!(srej["code"], "WORKSPACE_VIOLATION", "{label}: {srej}");
+        assert_eq!(srej["constraint_id"], "box_max_x", "{label}: {srej}");
+        assert_eq!(srej["violation_phase"], "servo_target", "{label}: {srej}");
+        assert!(srej["geometry_id"].as_str().is_some(), "{label}: {srej}");
+        assert!(
+            srej["reason"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x); move back or press Home")),
+            "{label}: unexpected servo_reject reason: {srej}"
+        );
+        servo_reject_fields.push((
+            srej["constraint_id"].as_str().unwrap().to_string(),
+            srej["geometry_id"].as_str().unwrap().to_string(),
+            srej["violation_phase"].as_str().unwrap().to_string(),
+            srej["reason"].as_str().unwrap().to_string(),
+        ));
+
+        // 4. Servo target deepening < 5 mm (lateral) -> accepted (no servo_reject)
+        common::servo(&mut ws, gen, ep, &q_lat_ok).await;
+        let no_rej = common::servo_reject_within(&mut ws, 150).await;
+        assert!(no_rej.is_none(), "{label}: lateral servo <5mm must be accepted, got {no_rej:?}");
+
+        // Stop servo before sending planned motions
+        let stop_ack = common::rpc(&mut ws, gen, ep, "/api/v1/motion/stop", serde_json::json!({})).await;
+        assert_eq!(stop_ack["type"], "command_ack", "{label}: stop: {stop_ack}");
+        let ep = sup.get_observation().await.epoch_id;
+
+        // 5. Retreat (-x) via jog -> accepted on both owners
+        let ret_ack = common::rpc(&mut ws, gen, ep, "/api/v1/motion/jog", serde_json::json!({"target_positions": q_retreat})).await;
+        assert_eq!(ret_ack["type"], "command_ack", "{label}: retreat jog: {ret_ack}");
+
+        drop(ws);
+        if let Some(t) = ticker_task { t.abort(); }
+        server_task.abort();
+        if let Some(h) = exec_handle { h.stop_and_join(); }
+    }
+    assert_eq!(
+        servo_reject_fields[0], servo_reject_fields[1],
+        "legacy and executor servo_reject fields must match identically"
+    );
+}

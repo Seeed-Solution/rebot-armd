@@ -28,7 +28,7 @@ pub enum MotionError {
     /// `path: "joint"`: no IK seed reached the goal pose within the joint limits (best of `seeds`).
     #[error("No IK solution for the goal pose within the joint limits (best of {seeds} seeds: position error {ep:.4} m, rotation error {er:.4} rad)")]
     IkGoalUnreachable { ep: f64, er: f64, seeds: usize },
-    #[error("Path leaves the safe workspace at s={s:.3}: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
+    #[error("{}", format_motion_workspace_violation(*s, *point, limit, *value, *bound, detail))]
     WorkspaceViolation {
         s: f64,
         point: usize,
@@ -48,6 +48,25 @@ pub enum MotionError {
     /// Power budget planning (`src/power_plan.rs`): even the slowest allowed speed exceeds it.
     #[error("Power budget: {0}")]
     PowerBudget(String),
+}
+
+fn format_motion_workspace_violation(
+    s: f64,
+    point: usize,
+    limit: &str,
+    value: f64,
+    bound: f64,
+    detail: &kinematics::WorkspaceViolationDetail,
+) -> String {
+    if let (Some(cid), Some(reason)) = (detail.constraint_id.as_deref(), detail.reason.as_deref()) {
+        if matches!(
+            cid,
+            "box_min_x" | "box_max_x" | "box_min_y" | "box_max_y" | "box_min_z" | "box_max_z"
+        ) {
+            return reason.to_string();
+        }
+    }
+    format!("Path leaves the safe workspace at s={s:.3}: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")
 }
 
 impl MotionError {

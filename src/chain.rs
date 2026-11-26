@@ -967,6 +967,114 @@ impl ArmModel {
 }
 
 /// Failure produced by [`WorkspaceChecker`].
+/// Formats an actionable English rejection message for outer workspace box boundaries
+/// (`box_min/max x/y/z`), returning `true` when `cid` matched a workspace box edge.
+pub fn write_workspace_box_edge_reason(
+    w: &mut impl core::fmt::Write,
+    cid: &str,
+    gid: &str,
+    depth: f64,
+) -> bool {
+    let (edge, recover) = match cid {
+        "box_max_x" => ("front edge", "move back"),
+        "box_min_x" => ("back edge", "move forward"),
+        "box_max_y" => ("left edge", "move right"),
+        "box_min_y" => ("right edge", "move left"),
+        "box_max_z" => ("top edge", "move down"),
+        "box_min_z" => ("bottom edge", "move up"),
+        _ => return false,
+    };
+    let part = if gid == "camera_mount" {
+        "camera"
+    } else if gid.starts_with("capsule:") {
+        "arm"
+    } else {
+        "gripper"
+    };
+    if depth >= 0.001 {
+        let cm = depth * 100.0;
+        let _ = write!(
+            w,
+            "{part} is {cm:.1} cm beyond the workspace {edge} ({cid}); {recover} or press Home"
+        );
+    } else {
+        let mm = (depth * 1000.0).max(0.1);
+        let _ = write!(
+            w,
+            "{part} is {mm:.1} mm beyond the workspace {edge} ({cid}); {recover} or press Home"
+        );
+    }
+    true
+}
+
+/// Decodes a compact [`crate::rt_core::mailbox::RefusalDetail::WorkspaceBoxEdge`] payload back
+/// into `(constraint_id, geometry_id, actionable_reason)` off the RT thread.
+pub fn decode_workspace_box_edge_refusal(
+    edge_idx: u8,
+    geom_kind: u8,
+    capsule_len: u8,
+    capsule_id: &[u8; 32],
+    depth_bits: u32,
+) -> Option<(&'static str, String, String)> {
+    let cid = match edge_idx {
+        0 => "box_min_x",
+        1 => "box_max_x",
+        2 => "box_min_y",
+        3 => "box_max_y",
+        4 => "box_min_z",
+        5 => "box_max_z",
+        _ => return None,
+    };
+    let gid = match geom_kind {
+        0 => "end_origin".to_string(),
+        254 => "camera_mount".to_string(),
+        255 => {
+            let n = usize::from(capsule_len).min(capsule_id.len());
+            let name = core::str::from_utf8(&capsule_id[..n]).unwrap_or("link");
+            format!("capsule:{name}")
+        }
+        n => format!("end_point:{n}"),
+    };
+    let depth = f64::from(f32::from_bits(depth_bits));
+    if !depth.is_finite() {
+        return None;
+    }
+    let mut reason = String::new();
+    write_workspace_box_edge_reason(&mut reason, cid, &gid, depth);
+    Some((cid, gid, reason))
+}
+
+/// Attaches structured workspace box-edge fields (`constraint_id`, `geometry_id`,
+/// `violation_phase`, `reason`, `message`) to a JSON rejection reply off the RT thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn attach_workspace_box_edge_fields(
+    reply: &mut serde_json::Value,
+    detail: crate::rt_core::mailbox::RefusalDetail,
+    phase: &str,
+) -> bool {
+    let crate::rt_core::mailbox::RefusalDetail::WorkspaceBoxEdge {
+        edge_idx,
+        geom_kind,
+        capsule_len,
+        capsule_id,
+        depth_bits,
+    } = detail
+    else {
+        return false;
+    };
+    let Some((cid, gid, reason)) =
+        decode_workspace_box_edge_refusal(edge_idx, geom_kind, capsule_len, &capsule_id, depth_bits)
+    else {
+        return false;
+    };
+    reply["constraint_id"] = serde_json::json!(cid);
+    reply["geometry_id"] = serde_json::json!(gid);
+    reply["violation_phase"] = serde_json::json!(phase);
+    reply["reason"] = serde_json::json!(reason);
+    reply["message"] = serde_json::json!(reason);
+    true
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceFailure {
     pub point: usize,
@@ -1221,6 +1329,7 @@ pub struct WorkspaceEvaluator<'a> {
     pub self_collision_slot_start: usize,
     pub total_slots: usize,
     pub escape_tol: f64,
+    pub box_escape_tol: f64,
 }
 
 impl<'a> WorkspaceEvaluator<'a> {
@@ -1350,6 +1459,7 @@ impl<'a> WorkspaceEvaluator<'a> {
             self_collision_slot_start,
             total_slots,
             escape_tol: k::WORKSPACE_EPS,
+            box_escape_tol: k::WORKSPACE_ESCAPE_TOL_M,
         }
     }
 
@@ -1364,7 +1474,79 @@ impl<'a> WorkspaceEvaluator<'a> {
 
     pub fn with_escape_tol(mut self, escape_tol: f64) -> Self {
         self.escape_tol = escape_tol;
+        self.box_escape_tol = escape_tol.max(k::WORKSPACE_ESCAPE_TOL_M);
         self
+    }
+
+    /// True when `slot` is one of the 6 outer workspace box faces (`box_min/max x/y/z`),
+    /// as opposed to `floor_z`, keep-out boxes, `max_reach`, or `self_collision`.
+    #[inline]
+    pub fn is_box_slot(&self, slot: usize) -> bool {
+        slot < self.num_geoms * self.slots_per_geom
+            && (1..=6).contains(&(slot % self.slots_per_geom))
+    }
+
+    /// Escape tolerance for an already-violated constraint at `slot`.
+    #[inline]
+    pub fn slot_escape_tol(&self, slot: usize) -> f64 {
+        if self.is_box_slot(slot) {
+            self.box_escape_tol
+        } else {
+            self.escape_tol
+        }
+    }
+
+    /// Zero-allocation compact refusal detail for an RT workspace box-edge violation.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    pub fn box_edge_refusal_detail(&self, failure: &WorkspaceFailureRt) -> crate::rt_core::mailbox::RefusalDetail {
+        let WorkspaceFailureKindRt::Constraint { slot, depth, .. } = failure.kind else {
+            return crate::rt_core::mailbox::RefusalDetail::None;
+        };
+        if !self.is_box_slot(slot) || !depth.is_finite() {
+            return crate::rt_core::mailbox::RefusalDetail::None;
+        }
+        let gi = slot / self.slots_per_geom;
+        let ci = slot % self.slots_per_geom;
+        // ci: 1=min_x, 2=min_y, 3=min_z, 4=max_x, 5=max_y, 6=max_z
+        let edge_idx: u8 = match ci {
+            1 => 0,
+            4 => 1,
+            2 => 2,
+            5 => 3,
+            3 => 4,
+            6 => 5,
+            _ => return crate::rt_core::mailbox::RefusalDetail::None,
+        };
+        let mut capsule_id = [0u8; 32];
+        let mut capsule_len = 0u8;
+        let geom_kind: u8 = if gi == 0 {
+            0
+        } else if gi < self.num_end_pts {
+            if self.has_cam && gi + 1 == self.num_end_pts {
+                254
+            } else {
+                gi.min(253) as u8
+            }
+        } else {
+            if let Some(cap) = self.ws.link_capsules.get(gi - self.num_end_pts) {
+                let bytes = cap.id.as_bytes();
+                let mut len = bytes.len().min(capsule_id.len());
+                while len > 0 && !cap.id.is_char_boundary(len) {
+                    len -= 1;
+                }
+                capsule_id[..len].copy_from_slice(&bytes[..len]);
+                capsule_len = len as u8;
+            }
+            255
+        };
+        crate::rt_core::mailbox::RefusalDetail::WorkspaceBoxEdge {
+            edge_idx,
+            geom_kind,
+            capsule_len,
+            capsule_id,
+            depth_bits: (depth.max(0.0) as f32).to_bits(),
+        }
     }
 
     pub fn alloc_buf(&self) -> k::SlotBuf {
@@ -1740,13 +1922,15 @@ impl<'a> WorkspaceEvaluator<'a> {
                     let mut w = CappedStrWriter(reason_buf);
                     if !depth.is_finite() {
                         let _ = write!(w, "invalid workspace check for {cid_ref} ({gid_ref})");
-                    } else if min_d <= k::WORKSPACE_EPS {
-                        let _ = write!(w, "new intrusion into {cid_ref} by {depth:.3}m (geometry {gid_ref})");
-                    } else {
-                        let _ = write!(
-                            w,
-                            "deepened {cid_ref} intrusion from {min_d:.3}m to {depth:.3}m (geometry {gid_ref})"
-                        );
+                    } else if !write_workspace_box_edge_reason(&mut w, cid_ref, gid_ref, depth) {
+                        if min_d <= k::WORKSPACE_EPS {
+                            let _ = write!(w, "new intrusion into {cid_ref} by {depth:.3}m (geometry {gid_ref})");
+                        } else {
+                            let _ = write!(
+                                w,
+                                "deepened {cid_ref} intrusion from {min_d:.3}m to {depth:.3}m (geometry {gid_ref})"
+                            );
+                        }
                     }
                 }
             }
@@ -1770,7 +1954,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         let cs = &clr[..self.total_slots];
         let md = &mut min_depths[..self.total_slots];
         if let Some((slot, depth, min_d, _)) =
-            k::first_workspace_rejection_with_tol(cs, md, self.escape_tol)
+            k::first_workspace_rejection_with_slot_tol(cs, md, |s| self.slot_escape_tol(s))
         {
             return Err(WorkspaceFailureRt {
                 kind: WorkspaceFailureKindRt::Constraint { slot, depth, min_d },
@@ -1791,7 +1975,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         let cs = &clr[..self.total_slots];
         let md = &min_depths[..self.total_slots];
         if let Some((slot, depth, min_d, _)) =
-            k::first_workspace_rejection_with_tol(cs, md, self.escape_tol)
+            k::first_workspace_rejection_with_slot_tol(cs, md, |s| self.slot_escape_tol(s))
         {
             return Err(WorkspaceFailureRt {
                 kind: WorkspaceFailureKindRt::Constraint { slot, depth, min_d },
@@ -1855,7 +2039,7 @@ impl<'a> WorkspaceEvaluator<'a> {
             let allowed = if min_d <= k::WORKSPACE_EPS {
                 k::WORKSPACE_EPS
             } else {
-                min_d + self.escape_tol
+                min_d + self.slot_escape_tol(slot)
             };
             let d_max = 0.5 * (l_g - c0[slot] - c1[slot]);
             if d_max > allowed {
@@ -2011,10 +2195,15 @@ impl<'a> WorkspaceEvaluator<'a> {
         let reason_for = |cid: &str, gid: &str| -> String {
             if !depth.is_finite() {
                 format!("invalid workspace check for {cid} ({gid})")
-            } else if min_d <= k::WORKSPACE_EPS {
-                format!("new intrusion into {cid} by {depth:.3}m (geometry {gid})")
             } else {
-                format!("deepened {cid} intrusion from {min_d:.3}m to {depth:.3}m (geometry {gid})")
+                let mut msg = String::new();
+                if write_workspace_box_edge_reason(&mut msg, cid, gid, depth) {
+                    msg
+                } else if min_d <= k::WORKSPACE_EPS {
+                    format!("new intrusion into {cid} by {depth:.3}m (geometry {gid})")
+                } else {
+                    format!("deepened {cid} intrusion from {min_d:.3}m to {depth:.3}m (geometry {gid})")
+                }
             }
         };
         if slot >= self.self_collision_slot_start {
@@ -2145,7 +2334,9 @@ impl<'a> WorkspaceEvaluator<'a> {
         phase: &str,
     ) -> Result<(), WorkspaceFailure> {
         let cs = clr.as_slice();
-        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection_with_tol(cs, min_depths.as_slice(), self.escape_tol) {
+        if let Some((slot, depth, min_d, _allowed)) =
+            k::first_workspace_rejection_with_slot_tol(cs, min_depths.as_slice(), |s| self.slot_escape_tol(s))
+        {
             return Err(self.describe_failure(slot, cs[slot], depth, min_d, phase));
         }
         k::advance_min_depths(cs, min_depths.as_mut_slice());
@@ -2165,7 +2356,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         min_depths: &mut k::SlotBuf,
     ) -> bool {
         let cs = clr.as_slice();
-        if k::first_workspace_rejection_with_tol(cs, min_depths.as_slice(), self.escape_tol).is_some() {
+        if k::first_workspace_rejection_with_slot_tol(cs, min_depths.as_slice(), |s| self.slot_escape_tol(s)).is_some() {
             return false;
         }
         k::advance_min_depths(cs, min_depths.as_mut_slice());
@@ -2180,7 +2371,9 @@ impl<'a> WorkspaceEvaluator<'a> {
         phase: &str,
     ) -> Result<(), WorkspaceFailure> {
         let cs = clr.as_slice();
-        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection_with_tol(cs, min_depths.as_slice(), self.escape_tol) {
+        if let Some((slot, depth, min_d, _allowed)) =
+            k::first_workspace_rejection_with_slot_tol(cs, min_depths.as_slice(), |s| self.slot_escape_tol(s))
+        {
             return Err(self.describe_failure(slot, cs[slot], depth, min_d, phase));
         }
         Ok(())
@@ -2236,7 +2429,7 @@ impl<'a> WorkspaceEvaluator<'a> {
             let allowed = if min_d <= k::WORKSPACE_EPS {
                 k::WORKSPACE_EPS
             } else {
-                min_d + self.escape_tol
+                min_d + self.slot_escape_tol(slot)
             };
             let d_max = 0.5 * (l_g - s0[slot] - s1[slot]);
             if d_max > allowed {

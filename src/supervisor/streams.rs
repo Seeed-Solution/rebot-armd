@@ -442,7 +442,8 @@ impl SupervisorInner {
     /// scratch slices from `self.ws_eval_bufs` (zero heap allocations for any legal workspace
     /// size, including 32 end points + multiple keep-out boxes, and never builds allocating
     /// [`crate::chain::WorkspaceFailure`] strings on refusal).
-    fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), &'static str> {
+    fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), crate::rt_core::mailbox::Refusal> {
+        use crate::rt_core::mailbox::Refusal;
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let result = (|| {
             let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
@@ -484,23 +485,23 @@ impl SupervisorInner {
                     )
                     .is_err()
             {
-                Err("WORKSPACE_VIOLATION")
+                Err(Refusal::code("WORKSPACE_VIOLATION"))
             } else {
                 eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
-                if eval
+                match eval
                     .eval_into_slice_rt(target, &mut bufs.scratch_c1, &mut bufs.world_caps, "plan")
-                    .is_err()
-                    || eval
-                        .check_and_advance_slice_rt(
+                    .and_then(|()| {
+                        eval.check_and_advance_slice_rt(
                             &bufs.scratch_c1,
                             &mut bufs.scratch_min_d,
                             "servo_target",
                         )
-                        .is_err()
-                {
-                    Err("WORKSPACE_VIOLATION")
-                } else {
-                    Ok(())
+                    }) {
+                    Ok(()) => Ok(()),
+                    Err(f) => Err(Refusal {
+                        code: "WORKSPACE_VIOLATION",
+                        detail: eval.box_edge_refusal_detail(&f),
+                    }),
                 }
             };
             eval.recycle(&mut bufs);
@@ -757,9 +758,10 @@ impl SupervisorInner {
             }
             return Err(Refusal::code(code));
         }
-        if let Err(code) = self.servo_target_workspace_rt(targets) {
+        if let Err(refusal) = self.servo_target_workspace_rt(targets) {
+            self.clear_workspace_violation_rt();
             self.note_motion_limit(MotionLimitReason::Workspace, None);
-            return Err(Refusal::code(code));
+            return Err(refusal);
         }
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
@@ -2827,7 +2829,11 @@ pub mod targets {
             "CALIBRATION_BUSY" => json!({"type":"servo_reject", "reason":"calibration_busy"}),
             code => {
                 let mut v = servo_reject(code, "servo target refused when the control loop applied it", ctx.epoch_id);
-                if let RefusalDetail::CurrentRevision(rev) = refusal.detail { v["current_revision"] = json!(rev); }
+                if let RefusalDetail::CurrentRevision(rev) = refusal.detail {
+                    v["current_revision"] = json!(rev);
+                } else {
+                    crate::chain::attach_workspace_box_edge_fields(&mut v, refusal.detail, "servo_target");
+                }
                 v
             }
         })

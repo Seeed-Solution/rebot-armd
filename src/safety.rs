@@ -328,7 +328,7 @@ pub enum SafetyError {
     #[error("Tool commissioning required before {0}; confirm commissioning or use low-speed debug (speed_scale <= 0.2)")]
     CommissioningRequired(String),
 
-    #[error("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
+    #[error("{}", format_workspace_violation(*point, limit, *value, *bound, detail))]
     WorkspaceViolation {
         point: usize,
         limit: String,
@@ -352,6 +352,24 @@ pub enum SafetyError {
 
     #[error("Admission stamp has already been consumed or carries an invalid request id")]
     StampAlreadyConsumed,
+}
+
+fn format_workspace_violation(
+    point: usize,
+    limit: &str,
+    value: f32,
+    bound: f32,
+    detail: &crate::kinematics::WorkspaceViolationDetail,
+) -> String {
+    if let (Some(cid), Some(reason)) = (detail.constraint_id.as_deref(), detail.reason.as_deref()) {
+        if matches!(
+            cid,
+            "box_min_x" | "box_max_x" | "box_min_y" | "box_max_y" | "box_min_z" | "box_max_z"
+        ) {
+            return reason.to_string();
+        }
+    }
+    format!("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")
 }
 
 impl SafetyError {

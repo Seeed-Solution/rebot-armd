@@ -1246,7 +1246,7 @@ async function main() {
 
         // 5(e): Pure real browser pointer drag & held ArrowRight repeat on #grip-range (marked before confirm)
         log('--- Scenario 5(e): Real pointer drag & ArrowRight repeat on #grip-range ---');
-        if (await page.evaluate(() => S.ui !== 'expert')) await page.click('#btn-ui');
+        if (await page.evaluate(() => S.ui !== 'expert')) await page.click('#ui-seg button[data-ui="expert"]');
         await page.click('#mode-seg button[data-mode="cart"]');
         await page.waitForSelector('#grip-range', { state: 'visible', timeout: 3000 });
         await page.evaluate(() => { S.ws.close(); });
@@ -1638,12 +1638,22 @@ async function main() {
             await waitForCockpitLive(page);
             await waitFn(page, () => S.auth?.enforced === true && !document.getElementById('btn-op')?.hidden, null, 5000);
             for (const mode of ['simple', 'expert']) {
-              await page.evaluate((m) => setUi(m), mode);
+              await page.click(`#ui-seg button[data-ui="${mode}"]`);
               await page.waitForTimeout(180);
-              const metrics = await page.evaluate(() => {
+              const metrics = await page.evaluate((m) => {
                 const tb = document.querySelector('.topbar');
                 const lb = document.getElementById('btn-lang');
+                const seg = document.getElementById('ui-seg');
+                const sp = document.getElementById('speed-pill');
                 const r = lb ? lb.getBoundingClientRect() : null;
+                const segR = seg ? seg.getBoundingClientRect() : null;
+                const spR = sp ? sp.getBoundingClientRect() : null;
+                const segBtns = seg ? [...seg.querySelectorAll('button')].map((b) => ({
+                  ui: b.dataset.ui,
+                  text: b.textContent.trim(),
+                  on: b.classList.contains('on'),
+                  checked: b.getAttribute('aria-checked'),
+                })) : [];
                 const clipped = [...tb.querySelectorAll(':scope > *, .head-stats > *')].filter((el) => {
                   const cs = getComputedStyle(el);
                   if (cs.display === 'none' || el.hidden) return false;
@@ -1654,16 +1664,83 @@ async function main() {
                   innerWidth: window.innerWidth,
                   scrollWidth: document.documentElement.scrollWidth,
                   langRect: r ? { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height } : null,
+                  hasOldBtnUi: !!document.getElementById('btn-ui'),
+                  segHeight: segR ? Math.round(segR.height) : 0,
+                  speedHeight: spR ? Math.round(spR.height) : 0,
+                  segBtns,
+                  activeMode: S.ui,
                   clipped,
                 };
-              });
+              }, mode);
               const tag = `Scenario 8 ${vp.label} ${lang} ${mode}`;
+              assert.equal(metrics.hasOldBtnUi, false, `${tag}: legacy #btn-ui must be removed`);
+              assert.equal(metrics.activeMode, mode, `${tag}: clicking #ui-seg failed to switch to ${mode}`);
+              assert.equal(metrics.segBtns.length, 2, `${tag}: #ui-seg must have 2 options`);
+              const expectedLabels = lang === 'zh' ? ['简易', '专家'] : ['Simple', 'Expert'];
+              assert.deepEqual(metrics.segBtns.map((b) => b.text), expectedLabels, `${tag}: unexpected #ui-seg labels`);
+              assert(metrics.segBtns.every((b) => (b.ui === mode) === (b.on && b.checked === 'true')),
+                `${tag}: #ui-seg active highlight mismatch: ${JSON.stringify(metrics.segBtns)}`);
+              assert(metrics.segHeight >= 24 && metrics.segHeight <= 30 && Math.abs(metrics.segHeight - metrics.speedHeight) <= 4,
+                `${tag}: #ui-seg height ${metrics.segHeight}px should match pill height ${metrics.speedHeight}px`);
               assert.equal(metrics.scrollWidth, metrics.innerWidth, `${tag}: scrollWidth ${metrics.scrollWidth} !== innerWidth ${metrics.innerWidth}`);
               assert.equal(metrics.clipped.length, 0, `${tag}: clipped header items: ${JSON.stringify(metrics.clipped)}`);
               assert(metrics.langRect && metrics.langRect.left >= 0 && metrics.langRect.right <= metrics.innerWidth
                 && metrics.langRect.top >= 0 && metrics.langRect.bottom <= vp.height,
                 `${tag}: #btn-lang outside viewport: ${JSON.stringify(metrics.langRect)}`);
               await assertReachable(page, '#btn-lang', tag);
+
+              // Open settings drawer: verify no floating controls overlap it and E-stop remains hit-testable immediately, settled, & scrolled
+              await page.click('#btn-sset');
+              await page.waitForSelector('#sset:not([hidden])', { timeout: 2000 });
+              for (const settleLabel of ['immediate', 'settled', 'scrolled']) {
+                if (settleLabel === 'settled') await page.waitForTimeout(260);
+                if (settleLabel === 'scrolled') {
+                  await page.evaluate(() => {
+                    const d = document.querySelector('#sset .calib-drawer');
+                    if (d) d.scrollTop = d.scrollHeight;
+                  });
+                  await page.waitForTimeout(60);
+                }
+                const dInfo = await page.evaluate(() => {
+                  const vw = window.innerWidth, vh = window.innerHeight;
+                  const sw = document.documentElement.scrollWidth;
+                  const sset = document.getElementById('sset');
+                  const drawer = sset.querySelector('.calib-drawer');
+                  const dr = drawer.getBoundingClientRect();
+                  const pts = [
+                    ['top-left', dr.left + 20, dr.top + 20],
+                    ['top-mid', dr.left + dr.width / 2, dr.top + 20],
+                    ['top-right', dr.right - 20, dr.top + 20],
+                    ['mid-right', dr.right - 24, dr.top + 120],
+                    ['center', dr.left + dr.width / 2, dr.top + dr.height / 2],
+                    ['bot-right', dr.right - 30, dr.bottom - 40],
+                  ];
+                  const overlaps = [];
+                  for (const [name, x, y] of pts) {
+                    if (x < 0 || y < 0 || x >= vw || y >= vh) continue;
+                    const hit = document.elementFromPoint(x, y);
+                    if (!hit || !sset.contains(hit)) {
+                      overlaps.push({ name, hit: hit ? `${hit.tagName}#${hit.id}.${hit.className}` : null });
+                    }
+                  }
+                  const estops = [...document.querySelectorAll('#btn-estop, #sset .head-estop')].map((el) => {
+                    const cs = getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    const vis = !el.hidden && cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                    const inVp = vis && r.left >= 0 && r.top >= 0 && r.right <= vw + 0.5 && r.bottom <= vh + 0.5;
+                    const hit = inVp ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : null;
+                    return { id: el.id || el.className, vis, inVp, hitOk: !!hit && (hit === el || el.contains(hit)) };
+                  });
+                  return { vw, sw, overlaps, estops, drawerOpacity: parseFloat(getComputedStyle(drawer).opacity) };
+                });
+                assert.equal(dInfo.sw, dInfo.vw, `${tag} drawer(${settleLabel}): scrollWidth ${dInfo.sw} !== innerWidth ${dInfo.vw}`);
+                assert.equal(dInfo.drawerOpacity, 1, `${tag} drawer(${settleLabel}): drawer opacity must be 1, got ${dInfo.drawerOpacity}`);
+                assert.equal(dInfo.overlaps.length, 0, `${tag} drawer(${settleLabel}): controls overlapped drawer: ${JSON.stringify(dInfo.overlaps)}`);
+                assert(dInfo.estops.some((e) => e.vis && e.inVp && e.hitOk),
+                  `${tag} drawer(${settleLabel}): no E-stop visible & hit-testable: ${JSON.stringify(dInfo.estops)}`);
+              }
+              await page.click('#sset-close');
+              await waitHidden(page, '#sset', 2000);
             }
             assert.equal(http404.length, 0, `Scenario 8 ${vp.label} ${lang}: unexpected 404s: ${JSON.stringify(http404)}`);
             guards.assertClean(`Scenario 8 ${vp.label} ${lang}`);
