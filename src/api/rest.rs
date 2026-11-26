@@ -874,6 +874,23 @@ pub async fn post_vision_detector(
     Ok(Json(crate::vision_detector::switch(&supervisor, deps.source.as_ref(), &body).await?))
 }
 
+/// `POST /api/v1/vision/models` (operator): switch the detector variant and/or depth model slot
+/// from the provider's catalogue (`crate::vision_detector::switch_models`).
+pub async fn post_vision_models(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let body: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("Body is not JSON ({e}): send {{\"detector\"?: name|null, \"depth\"?: name|null}}"),
+            "INVALID_COMMAND".into(),
+        )
+    })?;
+    Ok(Json(crate::vision_detector::switch_models(&supervisor, deps.source.as_ref(), &body).await?))
+}
+
 /// `GET /api/v1/calibration`: the camera calibration in effect, the live mount and grasp
 /// fields, and the backups (`crate::calibration`).
 pub async fn get_calibration(

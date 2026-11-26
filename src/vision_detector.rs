@@ -430,8 +430,10 @@ pub fn model_config_status(mode_json: &Value) -> ModelConfigStatus {
     evaluate_model_config(mode_json, &manifest, &root)
 }
 
-/// Path of the REST route.
+/// Path of the simple-mode detection-kind switch REST route.
 pub const PATH: &str = "/api/v1/vision/detector";
+/// Path of the expert-mode model variant / depth slot switch REST route.
+pub const MODELS_PATH: &str = "/api/v1/vision/models";
 /// How long the switch waits for the provider's swap (`/api/mode` polled).
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -522,6 +524,113 @@ pub fn parse_kind(body: &Value) -> Result<&'static str, ArmError> {
     }
 }
 
+/// Parsed `POST /api/v1/vision/models` body: at least one of `detector` or `depth`.
+/// `None` = keep current slot, `Some(None)` = unload slot, `Some(Some(name))` = load catalogue model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelsPatch {
+    pub detector: Option<Option<String>>,
+    pub depth: Option<Option<String>>,
+}
+
+/// Parse `{"detector"?: name|null, "depth"?: name|null}` (at least one slot, no unknown fields).
+pub fn parse_models_patch(body: &Value) -> Result<ModelsPatch, ArmError> {
+    let invalid = |m: String| ArmError::Rejected { status: 400, code: "INVALID_COMMAND".into(), message: m };
+    let obj = body.as_object().ok_or_else(|| {
+        invalid("Body must be a JSON object with \"detector\" and/or \"depth\" (model name or null to unload).".into())
+    })?;
+    if let Some(k) = obj.keys().find(|k| !matches!(k.as_str(), "detector" | "depth")) {
+        return Err(invalid(format!(
+            "Unknown field {k:?}: send \"detector\" and/or \"depth\" (model name from the catalogue, or null to unload)."
+        )));
+    }
+    let parse_slot = |slot: &str| -> Result<Option<Option<String>>, ArmError> {
+        match obj.get(slot) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(Value::String(s)) if !s.is_empty() && s.len() <= 64 => Ok(Some(Some(s.clone()))),
+            Some(Value::String(_)) => Err(invalid(format!(
+                "{slot} model name must be 1..64 bytes. Choose a model from the catalogue or send null to unload."
+            ))),
+            Some(_) => Err(invalid(format!(
+                "{slot} must be a catalogue model name string or null to unload."
+            ))),
+        }
+    };
+    let detector = parse_slot("detector")?;
+    let depth = parse_slot("depth")?;
+    if detector.is_none() && depth.is_none() {
+        return Err(invalid("No model slot given: include \"detector\" and/or \"depth\" (name or null).".into()));
+    }
+    Ok(ModelsPatch { detector, depth })
+}
+
+fn format_ion_budget_error(target_desc: &str, v: &Value, depth_loaded: bool) -> ArmError {
+    let mb = |k: &str| v.get(k).and_then(Value::as_f64);
+    let need = match (mb("need_mb"), mb("limit_mb")) {
+        (Some(n), Some(l)) => format!(" (needs {n:.1} MB, limit {l:.1} MB)"),
+        _ => String::new(),
+    };
+    let fix = if depth_loaded {
+        "Disable/unload the depth model first or choose a smaller detector variant, then switch again."
+    } else {
+        "Keep the current model or choose a smaller variant from the catalogue, then switch again."
+    };
+    rejected(409, "ION_BUDGET", format!(
+        "The vision service refused {target_desc}: not enough camera ION memory for the selected models (ION_BUDGET{need}). {fix}"
+    ))
+}
+
+async fn execute_swap(
+    source: &dyn DetectionSource,
+    req_body: &Value,
+    target_desc: &str,
+    depth_loaded_after: bool,
+) -> Result<crate::grasp::ProviderModels, ArmError> {
+    let unreachable = |e: String| rejected(503, "DETECTION_UNAVAILABLE", format!(
+        "Cannot reach the vision service ({e}). Check that the camera app (rebot-vision) is running, then try again."
+    ));
+    let (status, v) = source.set_models(req_body).await.map_err(unreachable)?;
+    let error = v.get("error").and_then(Value::as_str).unwrap_or("refused");
+    match status {
+        200..=299 => {}
+        404 => return Err(rejected(422, "UNSUPPORTED", "The vision service cannot switch models (POST /api/models answered 404). Update rebot-teleop on the device.")),
+        409 if error == "SWAP_BUSY" => return Err(busy("the vision service is switching models")),
+        409 if error == "ION_BUDGET" => return Err(format_ion_budget_error(target_desc, &v, depth_loaded_after)),
+        400..=499 => return Err(rejected(422, "MODEL_SWITCH_REFUSED", format!(
+            "The vision service refused to load {target_desc}: {error}. Check the model file and slot compatibility on the device."
+        ))),
+        _ => return Err(rejected(502, "DETECTION_UNAVAILABLE", format!(
+            "The vision service answered {status} to the model switch. Check rebot-vision on the device, then try again."
+        ))),
+    }
+    let Some(generation) = v.get("generation").and_then(Value::as_u64) else {
+        return Err(rejected(502, "DETECTION_UNAVAILABLE", "The vision service's model switch reply has no generation. Update rebot-teleop on the device."));
+    };
+    let deadline = Instant::now() + SWITCH_TIMEOUT;
+    loop {
+        let m = source.mode_info().await.map_err(unreachable)?;
+        if let Some(pm) = m.models.filter(|pm| pm.generation >= generation && matches!(pm.swap_state.as_str(), "idle" | "failed")) {
+            if pm.swap_state == "failed" {
+                let why = pm.swap_error.as_deref().unwrap_or("unknown error");
+                let code = if why.starts_with("ION_BUDGET") { "ION_BUDGET" } else { "MODEL_SWITCH_FAILED" };
+                let fix = if code == "ION_BUDGET" {
+                    "Disable/unload the depth model or pick a smaller detector variant, then try again."
+                } else {
+                    "Keep the current model, or check the model file and free camera memory on the device, then try again."
+                };
+                return Err(rejected(409, code, format!("The vision service could not load {target_desc} ({why}). {fix}")));
+            }
+            return Ok(pm);
+        }
+        if Instant::now() >= deadline {
+            return Err(rejected(504, "DETECTION_UNAVAILABLE", format!(
+                "The vision service did not finish loading {target_desc} within {} s. Check rebot-vision on the device, then try again.", SWITCH_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Switch the provider's detector to the default model of the requested kind. Reply
 /// `{kind, model, changed, generation}`.
 pub async fn switch(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
@@ -551,46 +660,109 @@ pub async fn switch(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSourc
     if models.resident.detector.as_deref() == Some(name.as_str()) && models.swap_state != "failed" {
         return Ok(reply(false, models.generation));
     }
-    let (status, v) = source.set_models(&json!({"detector": name})).await.map_err(unreachable)?;
-    let error = v.get("error").and_then(Value::as_str).unwrap_or("refused");
-    match status {
-        200..=299 => {}
-        404 => return Err(rejected(422, "UNSUPPORTED", "The vision service cannot switch models (POST /api/models answered 404). Update rebot-teleop on the device.")),
-        409 if error == "SWAP_BUSY" => return Err(busy("the vision service is switching models")),
-        409 if error == "ION_BUDGET" => {
-            let mb = |k: &str| v.get(k).and_then(Value::as_f64);
-            let need = match (mb("need_mb"), mb("limit_mb")) {
-                (Some(n), Some(l)) => format!(" (needs {n:.1} MB, limit {l:.1} MB)"),
-                _ => String::new(),
-            };
-            return Err(rejected(409, "ION_BUDGET", format!(
-                "The vision service refused {name}: not enough camera memory next to the loaded models (ION_BUDGET{need}). Keep the current kind, or unload the depth model first (a grasp task with models.depth null), then switch again."
-            )));
-        }
-        400..=499 => return Err(rejected(422, "MODEL_SWITCH_REFUSED", format!("The vision service refused to load {name}: {error}. Check the model on the device."))),
-        _ => return Err(rejected(502, "DETECTION_UNAVAILABLE", format!("The vision service answered {status} to the model switch. Check rebot-vision on the device, then try again."))),
+    let pm = execute_swap(source, &json!({"detector": name}), &name, models.resident.depth.is_some()).await?;
+    Ok(reply(true, pm.generation))
+}
+
+/// Switch the provider's detector variant and/or depth slot by catalogue name (or `null` to unload).
+/// Reply `{detector, depth, changed, generation}`.
+pub async fn switch_models(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
+    let patch = parse_models_patch(body)?;
+    if let Some(a) = supervisor.hub().latest().and_then(|s| s.obs.action.as_ref().and_then(|a| busy_action(&a.kind, &a.state))) {
+        return Err(busy(a));
     }
-    let Some(generation) = v.get("generation").and_then(Value::as_u64) else {
-        return Err(rejected(502, "DETECTION_UNAVAILABLE", "The vision service's model switch reply has no generation. Update rebot-teleop on the device."));
+    if MEASURES.load(Ordering::SeqCst) > 0 { return Err(busy("a depth measurement is running")); }
+    let Ok(_serial) = crate::grasp::MODEL_SWITCH.try_lock() else {
+        return Err(busy("another model switch is in progress"));
     };
-    let deadline = Instant::now() + SWITCH_TIMEOUT;
-    loop {
-        let m = source.mode_info().await.map_err(unreachable)?;
-        if let Some(pm) = m.models.as_ref().filter(|pm| pm.generation >= generation && matches!(pm.swap_state.as_str(), "idle" | "failed")) {
-            if pm.swap_state == "failed" {
-                let why = pm.swap_error.as_deref().unwrap_or("unknown error");
-                let code = if why.starts_with("ION_BUDGET") { "ION_BUDGET" } else { "MODEL_SWITCH_FAILED" };
-                return Err(rejected(409, code, format!("The vision service could not load {name} ({why}). Keep the current kind, or check the model and the free camera memory on the device, then switch again.")));
+    let unreachable = |e: String| rejected(503, "DETECTION_UNAVAILABLE", format!(
+        "Cannot reach the vision service ({e}). Check that the camera app (rebot-vision) is running, then try again."
+    ));
+    let mode = source.mode_info().await.map_err(unreachable)?;
+    let Some(models) = mode.models.as_ref() else {
+        return Err(rejected(422, "UNSUPPORTED", "The vision service cannot switch models (no models in GET /api/mode). Update rebot-teleop on the device."));
+    };
+
+    let mut req = serde_json::Map::new();
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(det) = &patch.detector {
+        if let Some(name) = det {
+            if !models.catalogue.contains_key(name) {
+                let have: Vec<&str> = models.catalogue.keys().map(String::as_str).collect();
+                return Err(rejected(422, "MODEL_NOT_FOUND", format!(
+                    "Detector model {name:?} is not in the vision service's catalogue ({}). Pick an installed model or refresh the model list.",
+                    if have.is_empty() { "empty".to_string() } else { have.join(", ") }
+                )));
             }
-            return Ok(reply(true, pm.generation));
+            if models.catalogue_kinds.get(name).map(String::as_str) == Some("depth") {
+                return Err(rejected(400, "INVALID_COMMAND", format!(
+                    "Model {name:?} is a depth model and cannot be loaded into the detector slot. Pass it under \"depth\" instead."
+                )));
+            }
+            parts.push(name.clone());
+        } else {
+            parts.push("detector=off".into());
         }
-        if Instant::now() >= deadline {
-            return Err(rejected(504, "DETECTION_UNAVAILABLE", format!(
-                "The vision service did not finish loading {name} within {} s. Check rebot-vision on the device, then try again.", SWITCH_TIMEOUT.as_secs()
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        req.insert("detector".into(), match det { Some(n) => json!(n), None => Value::Null });
     }
+    if let Some(dep) = &patch.depth {
+        if let Some(name) = dep {
+            if !models.catalogue.contains_key(name) {
+                let have: Vec<&str> = models.catalogue.keys().map(String::as_str).collect();
+                return Err(rejected(422, "MODEL_NOT_FOUND", format!(
+                    "Depth model {name:?} is not in the vision service's catalogue ({}). Pick an installed depth model or refresh the model list.",
+                    if have.is_empty() { "empty".to_string() } else { have.join(", ") }
+                )));
+            }
+            if let Some(k) = models.catalogue_kinds.get(name) {
+                if k != "depth" {
+                    return Err(rejected(400, "INVALID_COMMAND", format!(
+                        "Model {name:?} has kind {k:?} and cannot be loaded into the depth slot. Pass it under \"detector\" instead."
+                    )));
+                }
+            }
+            parts.push(name.clone());
+        } else {
+            parts.push("depth=off".into());
+        }
+        req.insert("depth".into(), match dep { Some(n) => json!(n), None => Value::Null });
+    }
+
+    let want_det = patch.detector.as_ref().unwrap_or(&models.resident.detector);
+    let want_dep = patch.depth.as_ref().unwrap_or(&models.resident.depth);
+    if *want_det == models.resident.detector && *want_dep == models.resident.depth && models.swap_state != "failed" {
+        return Ok(json!({
+            "detector": models.resident.detector,
+            "depth": models.resident.depth,
+            "changed": false,
+            "generation": models.generation,
+        }));
+    }
+
+    // Pre-check ION budget from catalogue when the provider reports both ion and model sizes.
+    if let Some([base, total, reserve]) = models.ion {
+        let det_mb = want_det.as_ref().and_then(|n| models.catalogue.get(n).copied().flatten());
+        let dep_mb = want_dep.as_ref().and_then(|n| models.catalogue.get(n).copied().flatten());
+        let known = (want_det.is_none() || det_mb.is_some()) && (want_dep.is_none() || dep_mb.is_some());
+        if known {
+            let need = base + reserve + det_mb.unwrap_or(0.0) + dep_mb.unwrap_or(0.0);
+            if need > total + 1e-9 {
+                return Err(format_ion_budget_error(
+                    &parts.join(" + "),
+                    &json!({"need_mb": need, "limit_mb": total}),
+                    want_dep.is_some(),
+                ));
+            }
+        }
+    }
+
+    let pm = execute_swap(source, &Value::Object(req), &parts.join(" + "), want_dep.is_some()).await?;
+    Ok(json!({
+        "detector": pm.resident.detector,
+        "depth": pm.resident.depth,
+        "changed": true,
+        "generation": pm.generation,
+    }))
 }
 
 #[cfg(test)]

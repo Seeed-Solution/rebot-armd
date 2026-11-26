@@ -4137,6 +4137,10 @@ pub struct VisionCapabilities {
     /// can switch models shows in `GET /api/v1/vision/mode` `models`.
     #[serde(default)]
     pub detector_switch: bool,
+    /// `POST /api/v1/vision/models` (operator): switch the detector variant and/or depth model
+    /// slot from the provider's catalogue (`GET /api/v1/vision/mode` `models.catalogue`).
+    #[serde(default)]
+    pub model_switch: bool,
     /// armd proxies the provider's mode API at this route (`GET`/`POST`). Present from
     /// capabilities version 2; whether the provider has it shows in `modes`.
     pub mode_endpoint: String,
@@ -4600,7 +4604,13 @@ impl Capabilities {
             teach: Some(TeachCapabilities { version: TEACH_VERSION, episodes: true, sequences: true }),
             #[cfg(target_arch = "wasm32")]
             teach: None,
-            vision: VisionCapabilities { detection_proxy: true, detector_switch: cfg!(not(target_arch = "wasm32")), mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
+            vision: VisionCapabilities {
+                detection_proxy: true,
+                detector_switch: cfg!(not(target_arch = "wasm32")),
+                model_switch: cfg!(not(target_arch = "wasm32")),
+                mode_endpoint: VISION_MODE_ENDPOINT.to_string(),
+                ..Default::default()
+            },
             policy_runtime,
         }
     }

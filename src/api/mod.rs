@@ -321,6 +321,7 @@ pub fn create_router_full_with_sandbox(
                 .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route(crate::vision_detector::PATH, post(rest::post_vision_detector).layer(middleware::from_fn(require_operator)))
+        .route(crate::vision_detector::MODELS_PATH, post(rest::post_vision_models).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe", post(proxy::post_vision_subscribe).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe/{id}", axum::routing::delete(proxy::delete_vision_subscribe).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe/{id}/keepalive", post(proxy::post_vision_keepalive).layer(middleware::from_fn(require_operator)))

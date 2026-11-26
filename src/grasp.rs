@@ -1196,6 +1196,8 @@ pub struct ProviderModels {
     pub swap_error: Option<String>,
     /// Catalogue name -> `ion_mb` (None when not reported).
     pub catalogue: BTreeMap<String, Option<f64>>,
+    /// Catalogue name -> `kind` (`detect`, `segment`, `obb`, `depth`), when reported.
+    pub catalogue_kinds: BTreeMap<String, String>,
     /// `ion` (`base_mb`, `total_mb`, `reserve_mb`), when reported.
     pub ion: Option<[f64; 3]>,
 }
@@ -1206,8 +1208,12 @@ impl ProviderModels {
         let name = |s: Option<&Value>| s.and_then(Value::as_str).map(str::to_string);
         let resident = m.get("resident");
         let swap = m.get("swap");
-        let catalogue = m.get("catalogue").and_then(Value::as_array).map(|a| a.iter().filter_map(|e| {
+        let entries = m.get("catalogue").and_then(Value::as_array);
+        let catalogue = entries.map(|a| a.iter().filter_map(|e| {
             Some((e.get("name")?.as_str()?.to_string(), f(e, &["ion_mb"])))
+        }).collect()).unwrap_or_default();
+        let catalogue_kinds = entries.map(|a| a.iter().filter_map(|e| {
+            Some((e.get("name")?.as_str()?.to_string(), e.get("kind")?.as_str()?.to_string()))
         }).collect()).unwrap_or_default();
         let ion = v.get("ion").and_then(|i| Some([f(i, &["base_mb"])?, f(i, &["total_mb"])?, f(i, &["reserve_mb"])?]));
         Some(Self {
@@ -1216,6 +1222,7 @@ impl ProviderModels {
             swap_state: name(swap.and_then(|s| s.get("state"))).unwrap_or_else(|| "idle".into()),
             swap_error: name(swap.and_then(|s| s.get("error"))),
             catalogue,
+            catalogue_kinds,
             ion,
         })
     }
