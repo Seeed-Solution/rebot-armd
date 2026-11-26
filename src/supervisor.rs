@@ -1245,6 +1245,9 @@ pub struct SupervisorInner {
     /// Release-side session lifecycle driver (`ExclusiveOutput` + singleton `Recorder`).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) sessions: crate::rt_core::session::SessionDriver,
+    /// Inline RT recorder stream producer and frozen close fence (0 alloc, 0 lock on `armd-control`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) rt_recorder: crate::rt_core::recorder::RtRecorder,
     /// True when startup found an incomplete or unreadable pending calibration commit marker.
     pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
@@ -2538,6 +2541,8 @@ impl SupervisorInner {
             commissioning: crate::mit::CommissioningMachine::default(),
             #[cfg(not(target_arch = "wasm32"))]
             sessions: crate::rt_core::session::SessionDriver::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            rt_recorder: crate::rt_core::recorder::RtRecorder::new(),
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
@@ -12076,10 +12081,24 @@ impl SupervisorInner {
         self.tick_phase(3);
         let timestamp = self.start_time.elapsed().as_secs_f64();
 
-        // 5. Record frame if episode recording is active: a teach session appends to the
-        // preallocated ring (no allocation, `crate::rt_core::record_ring`); a recorder started
-        // directly (no session) keeps its frames itself
-        if self.recording_frame_room() {
+        // 5. Record frame if episode recording is active:
+        //    - Executor owner: streams `Copy` sample over `rt_core/stream` (0 alloc, 0 lock).
+        //    - Legacy owner: appends to `record_ring` or direct `recorder` buffer.
+        if self.rt_executor_owned {
+            #[cfg(not(target_arch = "wasm32"))]
+            if self
+                .sessions
+                .slot(crate::rt_core::session::SessionSlot::Recorder)
+                .is_some_and(crate::rt_core::session::ActiveSession::is_live)
+            {
+                let _ = self.rt_recorder.try_push_sample(
+                    self.control_release_seq,
+                    timestamp,
+                    &self.measured_positions,
+                    &self.commanded_positions,
+                );
+            }
+        } else if self.recording_frame_room() {
             if self.core.recording_active() {
                 let seq = self.core.published_seq() + 1;
                 self.core.record_sample(seq, timestamp, &self.measured_positions, &self.commanded_positions);
@@ -12767,6 +12786,10 @@ pub struct ArmSupervisor {
     /// Off-RT sidecar store of `calib_hover` jobs when `OWNER_EXECUTOR` is active (never touched
     /// by `armd-control`; bounded to `calib_hover::KEEP_JOBS`).
     executor_hover_jobs: std::sync::Mutex<Vec<crate::calib_hover::HoverJob>>,
+    /// Off-RT coordinator for executor-owned teach recording sessions (PR0B `SessionSlot::Recorder`
+    /// + `rt_core/stream`; never locked on `armd-control`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) executor_recorder: Arc<crate::teach::ExecutorRecorder>,
     /// Test-only override for legacy WS `/api/v1/torque` request deadline in ms (0 = default).
     legacy_torque_deadline_override_ms: AtomicU64,
     /// Off-lock wakeup broadcast for legacy WS `/api/v1/torque` waiters, notified strictly AFTER
@@ -13423,6 +13446,8 @@ impl ArmSupervisor {
             instance_id,
             watchdog_park_planning: Arc::new(AtomicBool::new(false)),
             executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            executor_recorder: Arc::new(crate::teach::ExecutorRecorder::new()),
             legacy_torque_deadline_override_ms: AtomicU64::new(0),
             legacy_torque_notify: Arc::new(tokio::sync::Notify::new()),
             headless_detached_drain_active: Arc::new(AtomicBool::new(false)),
@@ -13991,17 +14016,29 @@ impl ArmSupervisor {
     }
 
     /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
-    /// live owner and removes it from the `EpisodeStore` catalog. Returns `Ok(true)` if removed,
-    /// `Ok(false)` if absent, or `Err(409 IN_USE)` if referenced or pinned by a sequence save.
-    pub async fn take_episode_for_delete(&self, id: &str) -> Result<bool, ArmError> {
+    /// live owner, removes it from the `EpisodeStore` catalog on a blocking thread (off the Tokio
+    /// worker), and returns its RAII deletion claim guard (`Some(guard)`) if removed, `None` if
+    /// absent, or `Err(409 IN_USE)` if referenced. Dropping the guard on async cancellation marks
+    /// the claim retryable so the episode ID is never stranded.
+    pub async fn take_episode_for_delete_claim(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::recording::store::EpisodeDeleteClaimGuard>, ArmError> {
         use crate::recording::store::TakeEpisodeOutcome;
         loop {
             let rev0 = self.sequences_revision();
             self.check_episode_delete_allowed(id).await?;
-            let store = self.episode_store().await;
-            match store.take_if_unpinned_and_rev_matches(id, &self.sequences_revision, rev0) {
-                TakeEpisodeOutcome::Removed => return Ok(true),
-                TakeEpisodeOutcome::NotFound => return Ok(false),
+            let store = self.try_episode_store().await?;
+            let id_owned = id.to_string();
+            let seq_rev = Arc::clone(&self.sequences_revision);
+            let outcome = tokio::task::spawn_blocking(move || {
+                store.take_if_unpinned_and_rev_matches(&id_owned, &seq_rev, rev0)
+            })
+            .await
+            .map_err(|e| ArmError::Internal(format!("episode delete take failed: {e}")))?;
+            match outcome {
+                TakeEpisodeOutcome::Removed(guard) => return Ok(Some(guard)),
+                TakeEpisodeOutcome::NotFound => return Ok(None),
                 TakeEpisodeOutcome::Pinned => {
                     let mut users = self
                         .published_config()
@@ -14023,19 +14060,46 @@ impl ArmSupervisor {
         }
     }
 
+    /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
+    /// live owner and removes it from the `EpisodeStore` catalog. Returns `Ok(true)` if removed,
+    /// `Ok(false)` if absent, or `Err(409 IN_USE)` if referenced or pinned by a sequence save.
+    pub async fn take_episode_for_delete(&self, id: &str) -> Result<bool, ArmError> {
+        self.take_episode_for_delete_claim(id)
+            .await
+            .map(|opt| opt.is_some())
+    }
+
     /// Linearizably verifies every episode in `dataset` is unreferenced (saved, running, or
-    /// reserved) and atomically removes all of them from the `EpisodeStore` catalog.
-    pub async fn take_dataset_episodes_for_delete(&self, dataset: &str) -> Result<Vec<String>, ArmError> {
+    /// reserved) and no recording/import pins `dataset`, then atomically removes all of them from
+    /// the `EpisodeStore` catalog while returning their deletion claim tokens and a
+    /// [`DatasetDeleteGuard`] blocking new pins.
+    pub async fn take_dataset_episodes_for_delete(
+        &self,
+        dataset: &str,
+    ) -> Result<(Vec<(String, u64)>, crate::recording::store::DatasetDeleteGuard), ArmError> {
         use crate::recording::store::TakeDatasetOutcome;
         loop {
             let rev0 = self.sequences_revision();
-            let store = self.episode_store().await;
+            let store = self.try_episode_store().await?;
             let ids = store.episodes_of(dataset);
             for id in &ids {
                 self.check_episode_delete_allowed(id).await?;
             }
-            match store.take_dataset_if_unpinned_and_rev_matches(&ids, &self.sequences_revision, rev0) {
-                TakeDatasetOutcome::Removed(taken) => return Ok(taken),
+            match store.take_dataset_if_unpinned_and_rev_matches(
+                dataset,
+                &ids,
+                &self.sequences_revision,
+                rev0,
+            ) {
+                TakeDatasetOutcome::Removed(taken, guard) => return Ok((taken, guard)),
+                TakeDatasetOutcome::DatasetRecordingBusy => {
+                    return Err(ArmError::detailed(
+                        409,
+                        "RECORDER_BUSY",
+                        "a recording into this dataset is running",
+                        serde_json::json!({}),
+                    ));
+                }
                 TakeDatasetOutcome::Pinned(pinned_id) => {
                     let mut users = self
                         .published_config()
@@ -15650,13 +15714,51 @@ impl ArmSupervisor {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn executor_recorder(&self) -> &Arc<crate::teach::ExecutorRecorder> {
+        &self.executor_recorder
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn executor_base_gen(&self) -> u64 {
+        self.executor_base_gen.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn terminal_capture_channel_arc(&self) -> Arc<terminal_capture::TerminalCaptureChannel> {
+        Arc::clone(&self.terminal_capture_channel)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn update_sequence_rich_status_off_rt(
+        &self,
+        action_id: u64,
+        f: impl FnOnce(&mut crate::motion::ActionStatus),
+    ) {
+        self.terminal_capture_channel
+            .update_rich_action_off_rt(action_id, "sequence", f);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn apply_sequence_overlay_off_rt(&self, obs: &mut ArmObservation) {
+        if let Some(a) = obs.action.as_mut() {
+            self.terminal_capture_channel.apply_sequence_overlay_off_rt(a);
+        }
+        if let Some(a) = obs.previous_action.as_mut() {
+            self.terminal_capture_channel.apply_sequence_overlay_off_rt(a);
+        }
+    }
+
     /// The current observation, without the supervisor lock while the control loop runs
     /// (`GET /api/v1/observation`).
     pub async fn observation(&self) -> Result<ArmObservation, ArmError> {
-        match self.fresh(true).await? {
-            Fresh::Sample(s) => Ok(s.obs.clone()),
-            Fresh::Locked(inner) => Ok(inner.current_observation()),
-        }
+        let mut obs = match self.fresh(true).await? {
+            Fresh::Sample(s) => s.obs.clone(),
+            Fresh::Locked(inner) => inner.current_observation(),
+        };
+        self.apply_sequence_overlay_off_rt(&mut obs);
+        Ok(obs)
     }
 
     /// [`Self::observation`] for in-process callers and tests: when it is unavailable in Legacy
@@ -15670,12 +15772,15 @@ impl ArmSupervisor {
                     if let Some(h) = self.executor_handle() {
                         if let Ok(mut obs) = h.observation_async().await {
                             self.hub.attach_action_measurement(&mut obs);
+                            self.apply_sequence_overlay_off_rt(&mut obs);
                             self.hub.attach_action_diag(&mut obs);
                             return obs;
                         }
                     }
                     if let Some(s) = self.hub.latest() {
-                        return s.obs.clone();
+                        let mut obs = s.obs.clone();
+                        self.apply_sequence_overlay_off_rt(&mut obs);
+                        return obs;
                     }
                     return ArmObservation::blank();
                 }
@@ -15687,11 +15792,14 @@ impl ArmSupervisor {
                 if let Some(h) = self.executor_handle() {
                     if let Ok(mut obs) = h.observation_async().await {
                         self.hub.attach_action_measurement(&mut obs);
+                        self.apply_sequence_overlay_off_rt(&mut obs);
                         self.hub.attach_action_diag(&mut obs);
                         return obs;
                     }
                 }
-                self.hub.latest().map_or_else(ArmObservation::blank, |s| s.obs.clone())
+                let mut obs = self.hub.latest().map_or_else(ArmObservation::blank, |s| s.obs.clone());
+                self.apply_sequence_overlay_off_rt(&mut obs);
+                obs
             }
         }
     }
@@ -19246,7 +19354,7 @@ impl ArmSupervisor {
 fn dispatch_loop(
     hub: &crate::rt_core::publish::StateHub,
     tx: &broadcast::Sender<ArmObservation>,
-    terminals: &TerminalBroadcaster,
+    terminals: &Arc<TerminalBroadcaster>,
     terminal_capture: &terminal_capture::TerminalCaptureChannel,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
     tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
@@ -19380,7 +19488,13 @@ fn dispatch_loop(
         // already delivered via a synthetic post-publish terminal (across all consumers and
         // diagnostic-only refreshes).
         if terminal_capture.inflight() == 0 && terminals.pending_total() == 0 {
-            if let Some(obs) = pending_telemetry.take() {
+            if let Some(mut obs) = pending_telemetry.take() {
+                if let Some(a) = obs.action.as_mut() {
+                    terminal_capture.apply_sequence_overlay_off_rt(a);
+                }
+                if let Some(a) = obs.previous_action.as_mut() {
+                    terminal_capture.apply_sequence_overlay_off_rt(a);
+                }
                 let stale_running = obs
                     .action
                     .as_ref()
@@ -19396,6 +19510,8 @@ fn dispatch_loop(
     // and emit any final safety overflow summary. Drain `terminal_capture` BEFORE
     // `flush_and_report_shutdown` so final broker reply routing sees every captured entry.
     if let Some(ring) = hub.record_ring() { ring.drain(); }
+    let _ = terminal_capture
+        .wait_for_sequence_commit_idle_until(Instant::now() + Duration::from_secs(5));
     let final_snap = hub.latest().or(latest_snap);
     terminal_capture.drain_into(
         terminals,
@@ -19602,7 +19718,12 @@ mod observation_snapshot_tests {
         }
         assert_eq!(sup.get_recording_state().await.1, 300);
         let (tx, rx) = std::sync::mpsc::channel();
-        sup.save_recording_with(move |_, frames| { tx.send(frames.to_vec()).unwrap(); Ok(()) }).await.unwrap();
+        sup.save_recording_with(move |path, frames| {
+            tx.send(frames.to_vec()).unwrap();
+            crate::recording::write_episode_parquet(path, frames, None, &[])
+        })
+        .await
+        .unwrap();
         // a tick after the stop fence records nothing
         sup.tick(0.02).await;
         let frames = rx.recv().unwrap();

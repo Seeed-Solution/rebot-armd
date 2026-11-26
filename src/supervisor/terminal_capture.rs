@@ -971,6 +971,7 @@ impl TerminalCaptureTx {
     }
 }
 
+#[derive(Clone)]
 struct CachedRichEntry {
     id: u64,
     status: Option<ActionStatus>,
@@ -1002,6 +1003,44 @@ pub(crate) struct TerminalCaptureChannel {
     admission_cap: AtomicUsize,
     test_push_cap: AtomicUsize,
     drain_paused: AtomicBool,
+    /// Off-RT sequence repeat commit barrier: when non-zero, holds `action_id` of a sequence
+    /// whose RT-committed repeat episode is still finishing disk/catalog publication so terminal
+    /// delivery waits until `episodes` and `EpisodeStore` are finalized (never touched on RT).
+    sequence_commit_inflight: AtomicU64,
+    /// Condvar signaled when `sequence_commit_inflight` clears so normal shutdown drains and
+    /// delivers every originating WS terminal and observer broadcast with the committed episode ID
+    /// before broker/router finalization runs.
+    sequence_commit_wait: (Mutex<()>, std::sync::Condvar),
+}
+
+/// Off-RT RAII guard holding [`TerminalCaptureChannel::sequence_commit_inflight`] while an
+/// RT-committed sequence repeat episode finishes off-thread publication and rich-status mirroring.
+pub(crate) struct SequenceCommitGuard {
+    channel: Arc<TerminalCaptureChannel>,
+    hub: Arc<StateHub>,
+    action_id: u64,
+}
+
+impl Drop for SequenceCommitGuard {
+    fn drop(&mut self) {
+        if self.action_id != 0 {
+            let _g = self
+                .channel
+                .sequence_commit_wait
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = self.channel.sequence_commit_inflight.compare_exchange(
+                self.action_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.channel.sequence_commit_wait.1.notify_all();
+            drop(_g);
+            self.hub.wake();
+        }
+    }
 }
 
 impl TerminalCaptureChannel {
@@ -1020,12 +1059,66 @@ impl TerminalCaptureChannel {
             admission_cap: AtomicUsize::new(TERMINAL_CAPTURE_ADMISSION_CAP),
             test_push_cap: AtomicUsize::new(TERMINAL_CAPTURE_RING_CAPACITY),
             drain_paused: AtomicBool::new(false),
+            sequence_commit_inflight: AtomicU64::new(0),
+            sequence_commit_wait: (Mutex::new(()), std::sync::Condvar::new()),
         });
         let tx = TerminalCaptureTx {
             producer,
             channel: Arc::clone(&channel),
         };
         (tx, channel)
+    }
+
+    pub(crate) fn acquire_sequence_commit_guard(
+        self: &Arc<Self>,
+        action_id: u64,
+        hub: Arc<StateHub>,
+    ) -> SequenceCommitGuard {
+        if action_id != 0 {
+            let _g = self
+                .sequence_commit_wait
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.sequence_commit_inflight.store(action_id, Ordering::Release);
+        }
+        SequenceCommitGuard {
+            channel: Arc::clone(self),
+            hub,
+            action_id,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_sequence_commit_inflight(&self, action_id: u64) -> bool {
+        action_id != 0 && self.sequence_commit_inflight.load(Ordering::Acquire) == action_id
+    }
+
+    /// Bounded off-RT wait used by normal shutdown finalization: waits up to `deadline` for any
+    /// in-flight RT-committed sequence repeat to finish local disk publication and update
+    /// `rich_action_cache`. Returns `true` if idle before `deadline`, `false` if still active.
+    pub(crate) fn wait_for_sequence_commit_idle_until(&self, deadline: std::time::Instant) -> bool {
+        if self.sequence_commit_inflight.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        let mut g = self
+            .sequence_commit_wait
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while self.sequence_commit_inflight.load(Ordering::Acquire) != 0 {
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                return false;
+            }
+            let (ng, _) = self
+                .sequence_commit_wait
+                .1
+                .wait_timeout(g, rem)
+                .unwrap_or_else(|e| e.into_inner());
+            g = ng;
+        }
+        true
     }
 
     #[inline]
@@ -1117,6 +1210,71 @@ impl TerminalCaptureChannel {
         });
     }
 
+    /// Off-RT helper updating a sequence action's rich metadata in `rich_action_cache` without
+    /// touching `SupervisorLock` or `armd-control`.
+    pub(crate) fn update_rich_action_off_rt(
+        &self,
+        action_id: u64,
+        kind: &str,
+        f: impl FnOnce(&mut ActionStatus),
+    ) {
+        if action_id == 0 {
+            return;
+        }
+        let make_blank = || {
+            let mut a = ActionStatus::blank();
+            a.id = action_id;
+            a.kind = HolderLabel::new(kind);
+            a.state = HolderLabel::new("running");
+            a
+        };
+        let mut cache = self.lock_rich_cache();
+        if let Some(existing) = cache.iter_mut().find(|e| e.id == action_id) {
+            let status = existing.status.get_or_insert_with(make_blank);
+            f(status);
+            return;
+        }
+        while cache.len() >= TERMINAL_FIFO_CAPACITY {
+            cache.pop_front();
+        }
+        let mut status = make_blank();
+        f(&mut status);
+        cache.push_back(CachedRichEntry {
+            id: action_id,
+            status: Some(status),
+            message: None,
+            durability_warning: None,
+        });
+    }
+
+    /// Off-RT helper applying mirrored sequence rich fields onto an observation's `ActionStatus`
+    /// without removing the cache entry (used for live telemetry & `observation()` reads).
+    pub(crate) fn apply_sequence_overlay_off_rt(&self, action: &mut ActionStatus) {
+        if action.id == 0 || action.kind.as_str() != "sequence" {
+            return;
+        }
+        // Acquire-load `sequence_commit_inflight` BEFORE locking `rich_action_cache`:
+        // - If true, hold back any terminal state to `"running"` so polling clients never observe
+        //   a terminal missing an RT-committed repeat episode.
+        // - If false, Acquire synchronizes with `SequenceCommitGuard::drop`'s Release, guaranteeing
+        //   `rich_action_cache` already holds the committed episode ID.
+        let commit_inflight = self.is_sequence_commit_inflight(action.id);
+        let cache = self.lock_rich_cache();
+        if let Some(cached) = cache
+            .iter()
+            .find(|e| e.id == action.id)
+            .and_then(|e| e.status.as_ref())
+        {
+            merge_sequence_rich_fields(action, cached);
+        }
+        drop(cache);
+        if commit_inflight && !action.is_running() {
+            action.state = HolderLabel::new("running");
+            action.code = None;
+            action.finished_at = None;
+        }
+    }
+
     /// Off-RT mirror for >256-byte persistence worker error messages so delayed recovery past
     /// the 2 s window never truncates `ActionStatus::message`.
     pub(crate) fn mirror_action_message(&self, action_id: u64, message: &str) {
@@ -1161,16 +1319,8 @@ impl TerminalCaptureChannel {
     }
 
     fn take_rich_entry(&self, action_id: u64) -> Option<CachedRichEntry> {
-        let mut cache = self.lock_rich_cache();
-        let pos = cache.iter().position(|e| e.id == action_id)?;
-        let item = cache.remove(pos);
-        // Prune older consumed entries boundedly.
-        while cache.front().is_some_and(|e| e.id < action_id)
-            && cache.len() > TERMINAL_FIFO_CAPACITY / 2
-        {
-            cache.pop_front();
-        }
-        item
+        let cache = self.lock_rich_cache();
+        cache.iter().find(|e| e.id == action_id).cloned()
     }
 
     /// Allocates the next authoritative monotonic `terminal_seq` (`1, 2, 3, ...`), visible
@@ -1241,6 +1391,12 @@ impl TerminalCaptureChannel {
         let consumed_seq = latest_snap.map_or(0, |s| s.meta.seq);
         let latest_obs = latest_snap.map(|s| &s.obs);
         while let Ok(head) = rx.peek() {
+            // Keep the sequence repeat commit barrier active in EVERY drain (including shutdown
+            // drains where `respect_publish_barrier == false`) so a terminal never omits an
+            // RT-committed repeat episode.
+            if self.is_sequence_commit_inflight(head.action_id) {
+                break;
+            }
             if enforce_barrier {
                 if let Some(req_seq) = head.publish_seq {
                     if consumed_seq < req_seq {
@@ -1340,6 +1496,40 @@ fn match_action(cand: &ActionStatus, rec: &TerminalCaptureRecord) -> bool {
         && cand.code == rec.code
 }
 
+fn merge_sequence_rich_fields(dst: &mut ActionStatus, src: &ActionStatus) {
+    if dst.sequence_id.is_none() {
+        dst.sequence_id = src.sequence_id.clone();
+    }
+    if dst.repeats.is_none() {
+        dst.repeats = src.repeats;
+    }
+    if src.repeat_index.is_some() {
+        dst.repeat_index = src.repeat_index;
+    }
+    if src.step_index.is_some() {
+        dst.step_index = src.step_index;
+    }
+    if src.step_type.is_some() {
+        dst.step_type = src.step_type.clone();
+    }
+    if dst.is_running() {
+        if src.phase.is_some() {
+            dst.phase = src.phase;
+        }
+        if src.progress > dst.progress {
+            dst.progress = src.progress;
+        }
+    }
+    if dst.episodes.len() < src.episodes.len() {
+        dst.episodes = src.episodes.clone();
+    }
+    if !dst.is_running() && dst.state.as_str() != "done" && dst.failed_step.is_none() {
+        dst.failed_step = src.failed_step.or(src.step_index);
+    } else if dst.failed_step.is_none() && src.failed_step.is_some() {
+        dst.failed_step = src.failed_step;
+    }
+}
+
 fn resolve_full_action(
     rec: &TerminalCaptureRecord,
     live_slots: &[Option<&ActionStatus>],
@@ -1375,6 +1565,11 @@ fn resolve_full_action(
             // on drain timing.
             rec.apply_terminal_overlay(&mut matched);
             if let Some(sc) = sidecar {
+                if let Some(cached) = sc.status.as_ref() {
+                    if matched.kind.as_str() == "sequence" {
+                        merge_sequence_rich_fields(&mut matched, cached);
+                    }
+                }
                 if rec.has_message && rec.message.is_truncated() {
                     if let Some(full_msg) = sc.message {
                         matched.message = Some(full_msg);
@@ -1392,6 +1587,12 @@ fn resolve_full_action(
             let mut out = match sc.status {
                 Some(mut cached) => {
                     rec.apply_terminal_overlay(&mut cached);
+                    if cached.kind.as_str() == "sequence"
+                        && cached.state.as_str() != "done"
+                        && cached.failed_step.is_none()
+                    {
+                        cached.failed_step = cached.step_index;
+                    }
                     cached
                 }
                 None => rec.build_action_status(),

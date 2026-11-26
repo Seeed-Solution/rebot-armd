@@ -897,6 +897,18 @@ pub enum MaintenanceOp {
     },
     MarkBaselineDirty,
     Config(Box<super::requests::config::ConfigExchange>),
+    RecorderStart {
+        op_id: u64,
+        max_frames: usize,
+        bound_action_id: u64,
+    },
+    RecorderStop {
+        op_id: u64,
+        session_id: super::session::SessionId,
+        save: bool,
+        reason: &'static str,
+        require_alive_action_id: u64,
+    },
     #[doc(hidden)]
     ProbeOwnedPayload { payload: Box<dyn Any + Send> },
 }
@@ -919,6 +931,8 @@ pub enum MaintenanceResult {
     BaselineDirtyMarked,
     Config(Box<super::requests::config::ConfigExchange>),
     StoppedWithConfig(Box<super::requests::config::ConfigExchange>),
+    RecorderStarted(Result<super::recorder::RecorderStartAck, super::recorder::RecorderStartError>),
+    RecorderStopped(Result<super::recorder::RecorderStopFence, super::recorder::RecorderStopError>),
     ProbeReturned,
     Stopped,
 }
@@ -2698,6 +2712,13 @@ impl BrokerDispatcher {
         delivered
     }
 
+    fn wait_sequence_commit_until(&self, deadline: Instant) -> bool {
+        match self.terminal_capture_drain.as_ref() {
+            Some((ch, _, _)) => ch.wait_for_sequence_commit_idle_until(deadline),
+            None => true,
+        }
+    }
+
     fn finalize_stopped_under_gate(&self, rt_joined: bool, allow_callbacks: bool) {
         // 1. On normal shutdown (`allow_callbacks == true`), drain any in-flight records from the
         //    authoritative `TerminalCaptureChannel` against the final snapshot BEFORE the final
@@ -2841,6 +2862,8 @@ pub(crate) struct OffThreadSinks {
     servo_dispatcher: Arc<ServoTargetDispatcher>,
     hub: Arc<StateHub>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
+    recorder_assembly: Arc<super::recorder::RecorderAssembly>,
+    recorder_shared: Arc<super::recorder::RtRecorderShared>,
 }
 
 impl OffThreadSinks {
@@ -2912,6 +2935,9 @@ impl OffThreadSinks {
     ) {
         self.drain_diag(tick_stats);
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
+        let _ = self
+            .recorder_assembly
+            .try_drain_bounded(super::recorder::RECORDER_DISPATCH_DRAIN_BOUND);
         {
             let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
             let mut ret_tx = self.reclaim_return_tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -3054,6 +3080,9 @@ impl OffThreadSinks {
     ) {
         self.drain_pre_broker(tick_stats);
         self.drain_post_terminal(drain_broker);
+        let _ = self
+            .recorder_assembly
+            .drain_bounded(super::recorder::RECORDER_STREAM_CAPACITY);
         let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
         let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
         if total > 0 && total != log_g.2 {
@@ -4564,20 +4593,29 @@ impl RtExecutorShared {
         }
 
         // Final off-thread drain and reclamation (single finalization owner for broker/router):
-        // - Normal teardown (`!is_process_exit` within `deadline`): drains P-F1's
-        //   `TerminalCaptureChannel` before final broker reply delivery and route retirement.
-        // - Emergency / `ProcessExit` or expired deadline: strictly bounded by the remaining
-        //   shared `deadline` without invoking slow callbacks.
+        // 1. Close maintenance/stop/lifecycle clients first so any recorder coordinator still
+        //    awaiting an RT stop reply wakes immediately and drops its `SequenceCommitGuard`.
+        // 2. On normal teardown (`!is_process_exit`) with time remaining before `deadline`, wait
+        //    strictly within `deadline` for any RT-committed sequence repeat to finish local
+        //    publication. If it completes in time, normal finalization drains and delivers every
+        //    terminal and originating WS reply before retiring the router; if disk publication
+        //    stalls past `deadline`, fall into the bounded emergency branch so the public shutdown
+        //    deadline is never violated and no incomplete terminal is emitted.
+        self.maint_client.finish_stopped();
+        self.urgent_stop_client.finish_stopped();
+        self.conn_lifecycle_client.finish_stopped();
+        let commit_idle = if !is_process_exit && Instant::now() < deadline {
+            self.broker_dispatcher.wait_sequence_commit_until(deadline)
+        } else {
+            true
+        };
         let emergency_bound = if is_process_exit {
             Some(deadline.saturating_duration_since(Instant::now()))
-        } else if Instant::now() >= deadline {
+        } else if !commit_idle || Instant::now() >= deadline {
             Some(Duration::ZERO)
         } else {
             None
         };
-        self.maint_client.finish_stopped();
-        self.urgent_stop_client.finish_stopped();
-        self.conn_lifecycle_client.finish_stopped();
         self.broker_dispatcher
             .finish_stopped_inner(emergency_bound, rt_joined);
         if !is_process_exit || Instant::now() < deadline {
@@ -5575,6 +5613,66 @@ impl RtExecutorHandle {
         Arc::clone(&self.shared.lifecycle.safe_hold)
     }
 
+    pub fn recorder_assembly(&self) -> Arc<super::recorder::RecorderAssembly> {
+        Arc::clone(&self.shared.sinks.recorder_assembly)
+    }
+
+    pub fn recorder_shared(&self) -> Arc<super::recorder::RtRecorderShared> {
+        Arc::clone(&self.shared.sinks.recorder_shared)
+    }
+
+    pub async fn start_recorder_session(
+        &self,
+        op_id: u64,
+        max_frames: usize,
+        bound_action_id: u64,
+    ) -> Result<
+        Result<super::recorder::RecorderStartAck, super::recorder::RecorderStartError>,
+        OwnerError,
+    > {
+        match self
+            .shared
+            .maint_client
+            .call_async(MaintenanceOp::RecorderStart {
+                op_id,
+                max_frames,
+                bound_action_id,
+            })
+            .await?
+        {
+            MaintenanceResult::RecorderStarted(res) => Ok(res),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn stop_recorder_session(
+        &self,
+        op_id: u64,
+        session_id: super::session::SessionId,
+        save: bool,
+        reason: &'static str,
+        require_alive_action_id: u64,
+    ) -> Result<
+        Result<super::recorder::RecorderStopFence, super::recorder::RecorderStopError>,
+        OwnerError,
+    > {
+        match self
+            .shared
+            .maint_client
+            .call_async(MaintenanceOp::RecorderStop {
+                op_id,
+                session_id,
+                save,
+                reason,
+                require_alive_action_id,
+            })
+            .await?
+        {
+            MaintenanceResult::RecorderStopped(res) => Ok(res),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
     #[doc(hidden)]
     pub fn lifecycle_owner_state(&self) -> u8 {
         self.shared.lifecycle.owner_state()
@@ -5926,6 +6024,13 @@ pub(crate) fn spawn_executor(
     let broker = Arc::new(Mutex::new(broker));
     let reply_router = Arc::new(Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)));
     let session_terminal_rx = core.sessions.attach_terminal_channel();
+    let (rec_stream_tx, rec_stream_rx) =
+        super::stream::channel::<super::recorder::RecorderSample>(
+            super::recorder::RECORDER_STREAM_CAPACITY,
+        );
+    core.rt_recorder.attach_producer(rec_stream_tx);
+    let recorder_shared = core.rt_recorder.shared();
+    let recorder_assembly = Arc::new(super::recorder::RecorderAssembly::new(rec_stream_rx));
     let broker_dispatcher = Arc::new(BrokerDispatcher::new(
         Arc::clone(&broker),
         Arc::clone(&conn_lifecycle_client),
@@ -5976,6 +6081,8 @@ pub(crate) fn spawn_executor(
         servo_dispatcher: Arc::clone(&servo_dispatcher),
         hub: Arc::clone(&hub),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
+        recorder_assembly,
+        recorder_shared,
     });
 
     let startup_bound = hooks
@@ -6813,6 +6920,30 @@ impl ControlState {
                 super::requests::config::handle_config_exchange(core, ctx, &mut ex);
                 MaintenanceResult::Config(ex)
             }
+            MaintenanceOp::RecorderStart {
+                op_id,
+                max_frames,
+                bound_action_id,
+            } => MaintenanceResult::RecorderStarted(core.admit_rt_recorder_session(
+                op_id,
+                max_frames,
+                bound_action_id,
+                ctx.now,
+            )),
+            MaintenanceOp::RecorderStop {
+                op_id,
+                session_id,
+                save,
+                reason,
+                require_alive_action_id,
+            } => MaintenanceResult::RecorderStopped(core.stop_rt_recorder_session(
+                op_id,
+                session_id,
+                save,
+                reason,
+                require_alive_action_id,
+                ctx.now,
+            )),
             MaintenanceOp::ProbeOwnedPayload { payload } => {
                 returned_probe = Some(payload);
                 MaintenanceResult::ProbeReturned
@@ -10406,6 +10537,13 @@ fn control_thread_main_inner(
         } else {
             "STOPPED"
         });
+        core.revoke_recorder_for_teardown(if panicked {
+            "CONTROL_PANIC"
+        } else if session_uncertain_safe_hold {
+            "SAFE_HOLD"
+        } else {
+            "SHUTDOWN"
+        });
         let _ = core.flush_published_session_terminals();
         state.drain_maintenance_stopped();
         state.drain_persistence_stopped(core);
@@ -10579,6 +10717,7 @@ fn control_thread_main_inner(
         let has_live_receiver = lifecycle.handback_has_live_receiver();
         let prep_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let core_ref = core_slot.as_deref_mut().expect("core owned");
+            core_ref.revoke_recorder_for_teardown("HANDBACK");
             let disarmed = core_is_confirmed_disarmed(core_ref);
             if !disarmed
                 && (!has_live_receiver || !core_ref.quiesce_motion_and_refresh_hold_for_handback())

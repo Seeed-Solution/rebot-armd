@@ -696,13 +696,39 @@ pub fn prepare_run(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<
 }
 
 /// Prepare a `run_sequence` plan from a published [`ActionSnapshot`] (0 `SupervisorLock` on
-/// `OWNER_EXECUTOR`). Refuses `record: Some(...)` upfront when `for_executor == true` so an
-/// executor run never touches the detached recorder shell.
+/// `OWNER_EXECUTOR`). Validates recording preconditions (`episodes.enabled()`, dataset existence);
+/// callers with an [`ArmSupervisor`] should also validate `check_recorder_idle()` via
+/// [`prepare_run_from_snapshot_with_recorder`] (and `begin_executor_inner` enforces it before
+/// starting the parent macro).
 pub fn prepare_run_from_snapshot(
     snap: &crate::rt_core::requests::actions::ActionSnapshot,
     body: &Value,
     epoch: u64,
-    for_executor: bool,
+    _for_executor: bool,
+) -> Result<RunPlan, ArmError> {
+    prepare_run_from_snapshot_inner(snap, body, epoch, None)
+}
+
+/// Async helper wrapping [`prepare_run_from_snapshot`] with exact Legacy error precedence for
+/// `record`: `episodes.enabled()` -> `recorder_idle()` -> `episodes.has_dataset(dataset)`.
+pub async fn prepare_run_from_snapshot_with_recorder(
+    sup: &ArmSupervisor,
+    snap: &crate::rt_core::requests::actions::ActionSnapshot,
+    body: &Value,
+    epoch: u64,
+) -> Result<RunPlan, ArmError> {
+    if body.get("record").is_some_and(|v| !v.is_null()) {
+        sup.ensure_episodes_loaded().await?;
+    }
+    let idle = sup.check_recorder_idle().await;
+    prepare_run_from_snapshot_inner(snap, body, epoch, Some(idle))
+}
+
+fn prepare_run_from_snapshot_inner(
+    snap: &crate::rt_core::requests::actions::ActionSnapshot,
+    body: &Value,
+    epoch: u64,
+    recorder_idle: Option<Result<(), ArmError>>,
 ) -> Result<RunPlan, ArmError> {
     if snap.env.config.active_tool.commissioning_required {
         return Err(crate::safety::SafetyError::CommissioningRequired(
@@ -711,12 +737,6 @@ pub fn prepare_run_from_snapshot(
         .into());
     }
     let request = parse_run(body)?;
-    if for_executor && request.record.is_some() {
-        return Err(crate::motion::MotionError::Unsupported(
-            "sequence recording is not supported in RT executor owner mode".into(),
-        )
-        .into());
-    }
     if epoch != snap.owner.authority.epoch {
         return Err(crate::safety::SafetyError::EpochMismatch {
             expected: snap.owner.authority.epoch,
@@ -809,6 +829,17 @@ pub fn prepare_run_from_snapshot(
             format!("steps {stale:?} use poses / episodes taught with another joint zero; check them, then run with allow_stale: true"),
             json!({"steps": stale}),
         ));
+    }
+    if let Some((dataset, _)) = &request.record {
+        if !snap.env.episodes.enabled() {
+            return Err(crate::recording::StoreError::Disabled.into());
+        }
+        if let Some(idle_res) = recorder_idle {
+            idle_res?;
+        }
+        if !snap.env.episodes.has_dataset(dataset) {
+            return Err(crate::recording::StoreError::DatasetNotFound(dataset.clone()).into());
+        }
     }
     snap.check_preconditions()?;
     let expected_duration_s = expected_duration_from_snapshot(snap, &steps, repeats, request.record.is_some());
@@ -1219,11 +1250,16 @@ async fn begin_executor_inner(
     wire_tracker: Option<Arc<crate::rt_core::reply_router::WsWireAckTracker>>,
 ) -> Result<((u64, f64), crate::rt_core::reply_router::AckCommitGuard), ArmError> {
     use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
-    if plan.request.record.is_some() {
-        return Err(crate::motion::MotionError::Unsupported(
-            "sequence recording is not supported in RT executor owner mode".into(),
-        )
-        .into());
+    if let Some((dataset, _)) = &plan.request.record {
+        sup.ensure_episodes_loaded().await?;
+        let st = sup.try_episode_store().await?;
+        if !st.enabled() {
+            return Err(crate::recording::StoreError::Disabled.into());
+        }
+        sup.check_recorder_idle().await?;
+        if !st.has_dataset(dataset) {
+            return Err(crate::recording::StoreError::DatasetNotFound(dataset.clone()).into());
+        }
     }
     let handle = sup.executor_handle().ok_or_else(|| ArmError::Rejected {
         status: 503,
@@ -1273,6 +1309,16 @@ async fn begin_executor_inner(
     sup.published_config_hub().update(|cfg| {
         cfg.sequences.pins = Some(pins);
     });
+    sup.update_sequence_rich_status_off_rt(id, |a| {
+        a.sequence_id = Some(plan.sequence.id.clone());
+        a.repeats = Some(plan.repeats);
+        a.repeat_index = Some(0);
+        if let Some((first_idx, first_step)) = plan.steps.first() {
+            a.step_index = Some(*first_idx);
+            a.step_type = Some(first_step.kind().into());
+            a.phase = Some(crate::model::HolderLabel::new(first_step.kind()));
+        }
+    });
     tracing::info!(
         "Sequence {} ('{}', id {}) started on RT executor ({} steps, {} repeats)",
         id,
@@ -1306,6 +1352,17 @@ async fn cleanup(
 ) {
     maybe_pause_test_cleanup(sequence_id).await;
     if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+        let owner = crate::teach::RecorderOwner::Sequence { action_id: id };
+        if sup.is_recording_owned_by(&owner).await {
+            if let Err(e) = sup
+                .stop_recording_as(crate::teach::Stopper::Owner(owner), false, None, None)
+                .await
+            {
+                tracing::warn!("Sequence {id}: discarding its recording failed: {e}");
+            } else {
+                tracing::info!("Sequence {id}: unfinished repeat's recording discarded");
+            }
+        }
         if let Some(e) = panic {
             tracing::error!("Sequence {id} orchestrator failed: {e}");
             let ctx = MacroCtx {
@@ -1399,8 +1456,17 @@ async fn run(
                     a.repeat_index = Some(r);
                 });
                 inner.set_action_phase(id, step.kind(), progress, None, None);
-            } else if !ctx.alive().await {
-                return end(&ctx, Err(Stop::Cancelled), current).await;
+            } else {
+                if !ctx.alive().await {
+                    return end(&ctx, Err(Stop::Cancelled), current).await;
+                }
+                sup.update_sequence_rich_status_off_rt(id, |a| {
+                    a.step_index = Some(*index);
+                    a.step_type = Some(step.kind().into());
+                    a.repeat_index = Some(r);
+                    a.phase = Some(crate::model::HolderLabel::new(step.kind()));
+                    a.progress = progress;
+                });
             }
             current = Some(*index);
             if let Err(stop) = run_step(&ctx, &plan, step).await { return end(&ctx, Err(stop), current).await; }
@@ -1409,11 +1475,16 @@ async fn run(
             if !ctx.alive().await { return end(&ctx, Err(Stop::Cancelled), current).await; }
             match sup.stop_recording_as(crate::teach::Stopper::Owner(owner.clone()), true, Some("ok"), None).await {
                 Ok(crate::teach::Stopped::Saved { sidecar, .. }) => {
+                    // On executor, `run_stop_recording_executor` attaches `sidecar.id` to
+                    // `rich_action_cache` inside its `SequenceCommitGuard` before releasing the barrier.
                     if !ctx.is_executor() {
                         sup.inner().write().await.update_action(id, |a| a.episodes.push(sidecar.id.clone()));
                     }
                 }
                 Ok(_) => {}
+                Err(ArmError::Safety(crate::safety::SafetyError::Stopped)) => {
+                    return end(&ctx, Err(Stop::Cancelled), current).await;
+                }
                 Err(e) => return end(&ctx, Err(arm_fail(e)), current).await,
             }
         }
@@ -1437,6 +1508,10 @@ async fn end(ctx: &MacroCtx, result: Result<(), Stop>, step: Option<usize>) {
                 if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && a.is_running()) {
                     a.failed_step = step;
                 }
+            } else {
+                ctx.sup.update_sequence_rich_status_off_rt(ctx.id, |a| {
+                    a.failed_step = step;
+                });
             }
             ctx.finish(
                 FinishState::Failed,

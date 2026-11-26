@@ -499,10 +499,10 @@ async fn pf1_mock_ws_replay_success_reject_cancel_stop_and_handover() {
     req_id += 1;
     assert_ne!(rec_rej["code"].as_str(), Some("EXECUTOR_ROUTING_PENDING"), "{rec_rej}");
 
-    // Unmigrated record/start stays at 503 EXECUTOR_ROUTING_PENDING.
+    // Unmigrated grasp/measure stays at 503 EXECUTOR_ROUTING_PENDING.
     let unmig_rej = ws_reply(
         &mut ws_ctrl,
-        json!({"type": "command", "request_id": req_id, "generation": gen_ctrl, "epoch_id": ep, "path": "/api/v1/record/start", "body": {"dataset": "d"}}),
+        json!({"type": "command", "request_id": req_id, "generation": gen_ctrl, "epoch_id": ep, "path": "/api/v1/grasp/measure", "body": {}}),
         &["command_reject"],
     )
     .await;

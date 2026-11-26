@@ -558,6 +558,8 @@ pub(super) enum ExecutorWsRoute {
     Motion,
     /// Direct dispatch to `actions::handle_executor_ws_action`.
     Action,
+    /// Direct dispatch to pre-lock lease-free handler (teach recording/episodes/datasets).
+    LeaseFree,
     /// Direct dispatch to `policy::handle_executor_ws_policy`.
     #[cfg(feature = "policy-runtime")]
     Policy,
@@ -749,9 +751,9 @@ fn validate_entry(entry: &DispatchEntry) {
             assert!(
                 matches!(
                     entry.executor_route,
-                    ExecutorWsRoute::None | ExecutorWsRoute::Unified
+                    ExecutorWsRoute::None | ExecutorWsRoute::Unified | ExecutorWsRoute::LeaseFree
                 ),
-                "LeaseFree handler must use None (LegacyOnly) or Unified executor route: {:?}",
+                "LeaseFree handler must use None (LegacyOnly), Unified or LeaseFree (ExecutorRequest) route: {:?}",
                 entry.key
             );
         }
