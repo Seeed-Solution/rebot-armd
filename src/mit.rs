@@ -2890,7 +2890,7 @@ impl crate::supervisor::SupervisorInner {
         let thermal_cooldown = self.thermal_cooldown;
         let post_read = self.driver.as_mut().and_then(|d| {
             d.with_mut(|drv| {
-                let states = drv.read_joint_states().ok()?;
+                let states = drv.read_joint_states_rx_only().ok()?;
                 let post_seqs = drv.feedback_seqs();
                 let seqs_after_recovery = pre_recovery_seqs.len() == dof
                     && post_seqs.len() == dof

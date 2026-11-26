@@ -7253,11 +7253,17 @@ impl ControlState {
         if std::mem::replace(&mut core.zero_check_stream_pushed, false) {
             self.persist_wake.unpark();
         }
-        while let Some(run) = core.pop_retired_gravity_comp() {
-            push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::GravityCompRun(run));
+        while !self.offload_reclaim_tx.is_full() {
+            let Some(run) = core.pop_retired_gravity_comp() else {
+                break;
+            };
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
         }
-        while let Some(pol) = core.pop_retired_gravity_comp_policy() {
-            push_offload_no_rt_free(&mut self.offload_reclaim_tx, OffloadReclaim::GravityCompPolicy(pol));
+        while !self.offload_reclaim_tx.is_full() {
+            let Some(pol) = core.pop_retired_gravity_comp_policy() else {
+                break;
+            };
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompPolicy(pol));
         }
     }
 

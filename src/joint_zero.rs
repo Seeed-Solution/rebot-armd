@@ -179,6 +179,14 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Ok(states)
     }
+    fn read_joint_states_rx_only(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let mut states = self.inner.read_joint_states_rx_only()?;
+        for (i, s) in states.iter_mut().enumerate() {
+            let o = self.off(i);
+            if o != 0.0 { s.position -= o; }
+        }
+        Ok(states)
+    }
     fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         self.inner.read_joint_states_into(out)?;
         for (i, s) in out.iter_mut().enumerate() {
