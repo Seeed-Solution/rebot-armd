@@ -473,20 +473,38 @@ impl DetectorDefaults {
 }
 
 /// Single-view depth measurements (`POST /api/v1/grasp/measure`) in flight: they trigger the
-/// detector, so a switch waits until they are done.
+/// detector, so a switch waits until they are done, and new measurements wait until a switch finishes.
 static MEASURES: AtomicUsize = AtomicUsize::new(0);
+static VISION_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
-/// Held by a running depth measurement ([`measure_in_flight`]).
-pub struct MeasureGuard(());
+/// Held by a running depth measurement ([`try_measure_in_flight`] / [`measure_in_flight`]).
+pub struct MeasureGuard {
+    _read: Option<tokio::sync::RwLockReadGuard<'static, ()>>,
+}
 
 impl Drop for MeasureGuard {
     fn drop(&mut self) { MEASURES.fetch_sub(1, Ordering::SeqCst); }
 }
 
+/// Admits a depth measurement if no model switch holds the vision lock; returns `409 VISION_BUSY`
+/// when a model swap is in progress so swaps and measurements cannot overlap in either order.
+pub fn try_measure_in_flight() -> Result<MeasureGuard, ArmError> {
+    let read = VISION_LOCK.try_read().map_err(|_| {
+        rejected(
+            409,
+            "VISION_BUSY",
+            "Cannot start depth measurement while a vision model switch is in progress. Wait until the model swap finishes, then try again.",
+        )
+    })?;
+    MEASURES.fetch_add(1, Ordering::SeqCst);
+    Ok(MeasureGuard { _read: Some(read) })
+}
+
 /// Marks a depth measurement as running until the guard is dropped.
 pub fn measure_in_flight() -> MeasureGuard {
+    let read = VISION_LOCK.try_read().ok();
     MEASURES.fetch_add(1, Ordering::SeqCst);
-    MeasureGuard(())
+    MeasureGuard { _read: read }
 }
 
 /// Why an action of `kind` in `state` blocks a switch (None: it does not).
@@ -564,13 +582,15 @@ pub fn parse_models_patch(body: &Value) -> Result<ModelsPatch, ArmError> {
     Ok(ModelsPatch { detector, depth })
 }
 
-fn format_ion_budget_error(target_desc: &str, v: &Value, depth_loaded: bool) -> ArmError {
+fn format_ion_budget_error(target_desc: &str, v: &Value, depth_loaded: bool, loading_depth: bool) -> ArmError {
     let mb = |k: &str| v.get(k).and_then(Value::as_f64);
     let need = match (mb("need_mb"), mb("limit_mb")) {
         (Some(n), Some(l)) => format!(" (needs {n:.1} MB, limit {l:.1} MB)"),
         _ => String::new(),
     };
-    let fix = if depth_loaded {
+    let fix = if loading_depth {
+        "Choose a smaller detector variant (or unload the detector) so the depth model fits in ION memory, then try again."
+    } else if depth_loaded {
         "Disable/unload the depth model first or choose a smaller detector variant, then switch again."
     } else {
         "Keep the current model or choose a smaller variant from the catalogue, then switch again."
@@ -584,7 +604,10 @@ async fn execute_swap(
     source: &dyn DetectionSource,
     req_body: &Value,
     target_desc: &str,
+    expected_det: Option<Option<&str>>,
+    expected_dep: Option<Option<&str>>,
     depth_loaded_after: bool,
+    loading_depth: bool,
 ) -> Result<crate::grasp::ProviderModels, ArmError> {
     let unreachable = |e: String| rejected(503, "DETECTION_UNAVAILABLE", format!(
         "Cannot reach the vision service ({e}). Check that the camera app (rebot-vision) is running, then try again."
@@ -595,7 +618,7 @@ async fn execute_swap(
         200..=299 => {}
         404 => return Err(rejected(422, "UNSUPPORTED", "The vision service cannot switch models (POST /api/models answered 404). Update rebot-teleop on the device.")),
         409 if error == "SWAP_BUSY" => return Err(busy("the vision service is switching models")),
-        409 if error == "ION_BUDGET" => return Err(format_ion_budget_error(target_desc, &v, depth_loaded_after)),
+        409 if error == "ION_BUDGET" => return Err(format_ion_budget_error(target_desc, &v, depth_loaded_after, loading_depth)),
         400..=499 => return Err(rejected(422, "MODEL_SWITCH_REFUSED", format!(
             "The vision service refused to load {target_desc}: {error}. Check the model file and slot compatibility on the device."
         ))),
@@ -614,11 +637,23 @@ async fn execute_swap(
                 let why = pm.swap_error.as_deref().unwrap_or("unknown error");
                 let code = if why.starts_with("ION_BUDGET") { "ION_BUDGET" } else { "MODEL_SWITCH_FAILED" };
                 let fix = if code == "ION_BUDGET" {
-                    "Disable/unload the depth model or pick a smaller detector variant, then try again."
+                    if loading_depth {
+                        "Choose a smaller detector variant (or unload the detector) so the depth model fits in ION memory, then try again."
+                    } else {
+                        "Disable/unload the depth model or pick a smaller detector variant, then try again."
+                    }
                 } else {
                     "Keep the current model, or check the model file and free camera memory on the device, then try again."
                 };
                 return Err(rejected(409, code, format!("The vision service could not load {target_desc} ({why}). {fix}")));
+            }
+            let det_ok = expected_det.is_none_or(|exp| pm.resident.detector.as_deref() == exp);
+            let dep_ok = expected_dep.is_none_or(|exp| pm.resident.depth.as_deref() == exp);
+            if !det_ok || !dep_ok {
+                return Err(rejected(409, "MODEL_SWITCH_FAILED", format!(
+                    "The vision service finished at generation {} with detector={:?} depth={:?} instead of {target_desc}. Refresh the model list and retry if needed.",
+                    pm.generation, pm.resident.detector, pm.resident.depth
+                )));
             }
             return Ok(pm);
         }
@@ -636,19 +671,25 @@ async fn execute_swap(
 pub async fn switch(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
     let kind = parse_kind(body)?;
     let defaults = supervisor.inner().read().await.config.vision_detectors.clone().unwrap_or_default();
-    if let Some(a) = supervisor.hub().latest().and_then(|s| s.obs.action.as_ref().and_then(|a| busy_action(&a.kind, &a.state))) {
-        return Err(busy(a));
-    }
-    if MEASURES.load(Ordering::SeqCst) > 0 { return Err(busy("a depth measurement is running")); }
-    // one model change at a time (grasp task preflights take the same lock)
+    // one model change at a time (grasp task preflights take the same lock) and mutually exclusive with depth measurements
     let Ok(_serial) = crate::grasp::MODEL_SWITCH.try_lock() else {
         return Err(busy("another model switch is in progress"));
     };
+    let Ok(_vision_w) = VISION_LOCK.try_write() else {
+        return Err(busy("a depth measurement is running"));
+    };
+    if MEASURES.load(Ordering::SeqCst) > 0 { return Err(busy("a depth measurement is running")); }
+    if let Some(a) = supervisor.hub().latest().and_then(|s| s.obs.action.as_ref().and_then(|a| busy_action(&a.kind, &a.state))) {
+        return Err(busy(a));
+    }
     let unreachable = |e: String| rejected(503, "DETECTION_UNAVAILABLE", format!("Cannot reach the vision service ({e}). Check that the camera app (rebot-vision) is running, then try again."));
     let mode = source.mode_info().await.map_err(unreachable)?;
     let Some(models) = mode.models.as_ref() else {
         return Err(rejected(422, "UNSUPPORTED", "The vision service cannot switch models (no models in GET /api/mode). Update rebot-teleop on the device."));
     };
+    if !matches!(models.swap_state.as_str(), "idle" | "failed") {
+        return Err(busy("the vision service is switching models"));
+    }
     let Some(name) = defaults.names(kind).iter().find(|n| models.catalogue.contains_key(*n)).cloned() else {
         let have: Vec<&str> = models.catalogue.keys().map(String::as_str).collect();
         return Err(rejected(422, "MODEL_NOT_FOUND", format!(
@@ -657,10 +698,18 @@ pub async fn switch(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSourc
         )));
     };
     let reply = |changed: bool, generation: u64| json!({"kind": kind, "model": name, "changed": changed, "generation": generation});
-    if models.resident.detector.as_deref() == Some(name.as_str()) && models.swap_state != "failed" {
+    if models.resident.detector.as_deref() == Some(name.as_str()) && models.swap_state == "idle" {
         return Ok(reply(false, models.generation));
     }
-    let pm = execute_swap(source, &json!({"detector": name}), &name, models.resident.depth.is_some()).await?;
+    let pm = execute_swap(
+        source,
+        &json!({"detector": name}),
+        &name,
+        Some(Some(name.as_str())),
+        None,
+        models.resident.depth.is_some(),
+        false,
+    ).await?;
     Ok(reply(true, pm.generation))
 }
 
@@ -668,13 +717,16 @@ pub async fn switch(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSourc
 /// Reply `{detector, depth, changed, generation}`.
 pub async fn switch_models(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
     let patch = parse_models_patch(body)?;
-    if let Some(a) = supervisor.hub().latest().and_then(|s| s.obs.action.as_ref().and_then(|a| busy_action(&a.kind, &a.state))) {
-        return Err(busy(a));
-    }
-    if MEASURES.load(Ordering::SeqCst) > 0 { return Err(busy("a depth measurement is running")); }
     let Ok(_serial) = crate::grasp::MODEL_SWITCH.try_lock() else {
         return Err(busy("another model switch is in progress"));
     };
+    let Ok(_vision_w) = VISION_LOCK.try_write() else {
+        return Err(busy("a depth measurement is running"));
+    };
+    if MEASURES.load(Ordering::SeqCst) > 0 { return Err(busy("a depth measurement is running")); }
+    if let Some(a) = supervisor.hub().latest().and_then(|s| s.obs.action.as_ref().and_then(|a| busy_action(&a.kind, &a.state))) {
+        return Err(busy(a));
+    }
     let unreachable = |e: String| rejected(503, "DETECTION_UNAVAILABLE", format!(
         "Cannot reach the vision service ({e}). Check that the camera app (rebot-vision) is running, then try again."
     ));
@@ -682,6 +734,9 @@ pub async fn switch_models(supervisor: &Arc<ArmSupervisor>, source: &dyn Detecti
     let Some(models) = mode.models.as_ref() else {
         return Err(rejected(422, "UNSUPPORTED", "The vision service cannot switch models (no models in GET /api/mode). Update rebot-teleop on the device."));
     };
+    if !matches!(models.swap_state.as_str(), "idle" | "failed") {
+        return Err(busy("the vision service is switching models"));
+    }
 
     let mut req = serde_json::Map::new();
     let mut parts: Vec<String> = Vec::new();
@@ -730,7 +785,7 @@ pub async fn switch_models(supervisor: &Arc<ArmSupervisor>, source: &dyn Detecti
 
     let want_det = patch.detector.as_ref().unwrap_or(&models.resident.detector);
     let want_dep = patch.depth.as_ref().unwrap_or(&models.resident.depth);
-    if *want_det == models.resident.detector && *want_dep == models.resident.depth && models.swap_state != "failed" {
+    if *want_det == models.resident.detector && *want_dep == models.resident.depth && models.swap_state == "idle" {
         return Ok(json!({
             "detector": models.resident.detector,
             "depth": models.resident.depth,
@@ -739,6 +794,7 @@ pub async fn switch_models(supervisor: &Arc<ArmSupervisor>, source: &dyn Detecti
         }));
     }
 
+    let loading_depth = matches!(patch.depth, Some(Some(_))) && patch.detector.is_none();
     // Pre-check ION budget from catalogue when the provider reports both ion and model sizes.
     if let Some([base, total, reserve]) = models.ion {
         let det_mb = want_det.as_ref().and_then(|n| models.catalogue.get(n).copied().flatten());
@@ -751,12 +807,23 @@ pub async fn switch_models(supervisor: &Arc<ArmSupervisor>, source: &dyn Detecti
                     &parts.join(" + "),
                     &json!({"need_mb": need, "limit_mb": total}),
                     want_dep.is_some(),
+                    loading_depth,
                 ));
             }
         }
     }
 
-    let pm = execute_swap(source, &Value::Object(req), &parts.join(" + "), want_dep.is_some()).await?;
+    let expected_det = patch.detector.as_ref().map(|o| o.as_deref());
+    let expected_dep = patch.depth.as_ref().map(|o| o.as_deref());
+    let pm = execute_swap(
+        source,
+        &Value::Object(req),
+        &parts.join(" + "),
+        expected_det,
+        expected_dep,
+        want_dep.is_some(),
+        loading_depth,
+    ).await?;
     Ok(json!({
         "detector": pm.resident.detector,
         "depth": pm.resident.depth,

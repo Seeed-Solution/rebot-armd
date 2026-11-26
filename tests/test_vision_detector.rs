@@ -279,3 +279,64 @@ async fn vision_models_requires_operator_and_respects_busy() {
     let (s, v) = post_models(addr, json!({"detector": SEG384}), tok).await;
     assert_eq!((s, v["detector"].as_str()), (200, Some(SEG384)), "{v}");
 }
+
+#[tokio::test]
+async fn vision_models_async_lifecycle_busy_and_mismatch() {
+    let _serial = SERIAL.lock().await;
+    let p = Provider::new(&[DET, SEG384, DEPTH], DET);
+    let addr = serve(p.clone(), OperatorAuth::disabled(), ArmConfig::rebot_dm()).await;
+
+    // 1. Provider already running a swap -> even a matching resident request returns 409 VISION_BUSY (never false no-op)
+    p.mode.lock().unwrap()["models"]["swap"]["state"] = json!("running");
+    let (s, v) = post_models(addr, json!({"detector": DET}), None).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("VISION_BUSY")), "{v}");
+    p.mode.lock().unwrap()["models"]["swap"]["state"] = json!("idle");
+
+    // 2. Async lifecycle: 202 returns while swap is pending; concurrent measure & second swap rejected with 409 VISION_BUSY; completes on poll
+    *p.reply.lock().unwrap() = Some((202, json!({"generation": 2})));
+    p.mode.lock().unwrap()["models"]["swap"]["state"] = json!("idle");
+    let p_bg = p.clone();
+    let req_task = tokio::spawn(async move {
+        post_models(addr, json!({"detector": SEG384}), None).await
+    });
+    // Wait until set_models was called and switch_models holds VISION_LOCK while polling
+    for _ in 0..40 {
+        if !p_bg.calls.lock().unwrap().is_empty() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(p_bg.calls.lock().unwrap().len(), 1);
+    // Measure admission during active swap must be rejected with VISION_BUSY
+    let err = armd::vision_detector::try_measure_in_flight().err().expect("measure must be blocked during swap");
+    assert!(format!("{err:?}").contains("VISION_BUSY"), "{err:?}");
+    // Concurrent switch request must also be rejected with 409 VISION_BUSY without calling provider
+    let (s2, v2) = post_models(addr, json!({"depth": DEPTH}), None).await;
+    assert_eq!((s2, v2["code"].as_str()), (409, Some("VISION_BUSY")), "{v2}");
+    assert_eq!(p_bg.calls.lock().unwrap().len(), 1);
+
+    // Transition provider from pending -> running -> idle with matching resident
+    p_bg.mode.lock().unwrap()["models"]["swap"]["state"] = json!("running");
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    {
+        let mut m = p_bg.mode.lock().unwrap();
+        m["models"]["generation"] = json!(2);
+        m["models"]["swap"]["state"] = json!("idle");
+        m["models"]["resident"]["detector"] = json!(SEG384);
+    }
+    let (s_ok, v_ok) = req_task.await.unwrap();
+    assert_eq!((s_ok, v_ok["detector"].as_str(), v_ok["generation"].as_u64()), (200, Some(SEG384), Some(2)), "{v_ok}");
+
+    // 3. Provider finishes at requested generation with WRONG resident model -> 409 MODEL_SWITCH_FAILED (not false 200)
+    *p.reply.lock().unwrap() = Some((202, json!({"generation": 3})));
+    {
+        let mut m = p.mode.lock().unwrap();
+        m["models"]["generation"] = json!(3);
+        m["models"]["swap"]["state"] = json!("idle");
+        m["models"]["resident"]["detector"] = json!(DET); // does not match requested SEG384? request DET while resident stays SEG384
+    }
+    {
+        let mut m = p.mode.lock().unwrap();
+        m["models"]["resident"]["detector"] = json!(SEG384);
+    }
+    let (s_mis, v_mis) = post_models(addr, json!({"detector": DET}), None).await;
+    assert_eq!((s_mis, v_mis["code"].as_str()), (409, Some("MODEL_SWITCH_FAILED")), "{v_mis}");
+}

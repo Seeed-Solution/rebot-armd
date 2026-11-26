@@ -2361,7 +2361,7 @@ body.ui-expert .ops .ex-presets .gc-sw { grid-column: 1 / -1; min-height: 44px; 
   body.ui-expert .ex-mchip { min-height: 36px; padding: 0 8px; font-size: 12px; gap: 5px; margin-left: auto; max-width: 52%; }
   body.ui-expert .ex-vcard > .video { flex: none; width: 100%; aspect-ratio: 16 / 9; max-height: 22dvh; min-height: 120px; }
 
-  body.ui-expert .ex-ctx { min-height: 0; max-height: none; padding: 7px 10px; gap: 5px; }
+  body.ui-expert .ex-ctx { min-height: 0; max-height: 24dvh; overflow-y: auto; padding: 7px 10px; gap: 5px; }
   body.ui-expert .ex-ctx .ex-ghosts { display: none; }
   body.ui-expert .ex-ctx .ex-empty { gap: 6px; }
   body.ui-expert .ex-ctx .ex-empty-t b { font-size: 13px; }
@@ -2378,7 +2378,7 @@ body.ui-expert .ops .ex-presets .gc-sw { grid-column: 1 / -1; min-height: 44px; 
   body.ui-expert #ex-obj-host .oc-task:not([hidden]) { grid-column: 1; grid-row: auto; justify-self: stretch; width: 100%; justify-content: space-between; min-height: 34px; padding: 0 10px; font-size: 12px; }
 
   body.ui-expert .ex-pdeck {
-    order: 2; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
+    order: 2; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 160px;
     margin: 6px 8px 8px; overflow: hidden;
     background: var(--sc-color-bg-container); border: 1px solid #e3efcc; border-radius: var(--sc-radius-lg);
   }
@@ -2581,11 +2581,12 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
           <div id="ex-depth-sec">
             <div class="ex-depth-head">
               <h4><span><span data-i18n="ex.models.depth">深度模型</span><span class="ex-en" id="ex-depth-name">Depth</span></span></h4>
-              <button class="ex-vis-sw" id="ex-depth-sw" type="button" role="switch" aria-checked="false" data-op="/api/v1/vision/models" style="min-height:36px;padding:0 4px">
+              <button class="ex-vis-sw" id="ex-depth-sw" type="button" role="switch" aria-checked="false" data-op-mark style="min-height:36px;padding:0 4px">
                 <span class="mono" id="ex-depth-mb" style="font-size:12px;color:var(--sc-color-text-secondary)"></span>
                 <span class="ex-sw-track"></span>
               </button>
             </div>
+            <div class="ex-mlist" id="ex-dep-list" role="radiogroup" data-i18n-aria="ex.models.depth" aria-label="深度模型" hidden></div>
             <div class="ex-hint" id="ex-depth-hint" data-i18n="ex.depth.note">模型估计，未校准，仅表示相对远近</div>
           </div>
           <div class="ex-ion" id="ex-ion-box" hidden>
@@ -3329,7 +3330,7 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
       <div class="ex-menu-group">
         <div class="ex-menu-k" data-i18n="ex.more.calib">标定与配置</div>
         <button class="ex-menu-item" id="ex-m-gset" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer"><span><b data-i18n="gset.title">抓取设置</b><small data-i18n="ex.gset.desc">桌面高度、夹爪位置与抓取任务</small></span><span>›</span></button>
-        <button class="ex-menu-item" id="ex-m-calib" type="button" data-op="calib.open" data-op-mode="offer"><span><b data-i18n="calib.open">相机标定</b><small data-i18n="ex.calib.desc">相机内参、手眼标定向导与精校</small></span><span>›</span></button>
+        <button class="ex-menu-item" id="ex-m-calib" type="button" data-op-mark><span><b data-i18n="calib.open">相机标定</b><small data-i18n="ex.calib.desc">相机内参、手眼标定向导与精校</small></span><span>›</span></button>
         <button class="ex-menu-item" id="ex-m-sset" type="button"><span><b data-i18n="sset.title">设置（工具与碰撞保护）</b><small data-i18n="ex.sset.desc">零位标定、夹爪标定、碰撞保护灵敏度</small></span><span>›</span></button>
       </div>
       <div class="ex-menu-group">
@@ -13029,6 +13030,7 @@ const EX = {
   err: '',
   ptab: 'move',
   dtab: 'tele',
+  lastGen: null,
   phoneMq: window.matchMedia('(max-width: 600px)'),
 };
 const exIsPhone = () => S.ui === 'expert' && EX.phoneMq.matches;
@@ -13198,7 +13200,16 @@ function exIonNumbers() {
   if (total == null || base == null) return null;
   const res = reserve ?? 0;
   const budget = Math.max(0, total - base - res);
-  return { total, base, reserve: res, budget };
+  const used = num(ion.used_mb);
+  return { total, base, reserve: res, budget, used };
+}
+function exInvalidateHeldForModelChange() {
+  const hadHeld = typeof detHeld === 'function' && detHeld();
+  if (hadHeld && typeof detClearOverlay === 'function') detClearOverlay();
+  if (typeof GR !== 'undefined' && GR.sel && (!DET.enabled || hadHeld)) {
+    GR.sel = null;
+    if (typeof renderGrasp === 'function') renderGrasp();
+  }
 }
 function exModelDesc(kind) {
   if (kind === 'segment') return t('ex.det.seg');
@@ -13213,6 +13224,11 @@ function exKindLabel(kind) {
   return t('ex.kind.other');
 }
 function renderExpertVision() {
+  const curGen = VM.models && typeof VM.models.generation === 'number' ? VM.models.generation : null;
+  if (curGen != null) {
+    if (EX.lastGen != null && curGen !== EX.lastGen) exInvalidateHeldForModelChange();
+    EX.lastGen = curGen;
+  }
   if (S.ui !== 'expert') return;
   const ok = VM.state === 'ok';
   const on = !!DET.avail && svOn();
@@ -13261,8 +13277,8 @@ function renderExpertVision() {
   const capOff = S.caps && S.caps.vision && S.caps.vision.model_switch === false;
   const curDetEntry = detModels.find((e) => e.name === resDet) || null;
   const curDepEntry = depModels.find((e) => e.name === resDep) || (resDep ? { name: resDep, ion_mb: null } : null);
-  const depMb = curDepEntry && typeof curDepEntry.ion_mb === 'number' && isFinite(curDepEntry.ion_mb) ? curDepEntry.ion_mb : 0;
-  const detMb = curDetEntry && typeof curDetEntry.ion_mb === 'number' && isFinite(curDetEntry.ion_mb) ? curDetEntry.ion_mb : 0;
+  const depMb = resDep ? (curDepEntry && typeof curDepEntry.ion_mb === 'number' && isFinite(curDepEntry.ion_mb) ? curDepEntry.ion_mb : null) : 0;
+  const detMb = resDet ? (curDetEntry && typeof curDetEntry.ion_mb === 'number' && isFinite(curDetEntry.ion_mb) ? curDetEntry.ion_mb : null) : 0;
 
   // Detector variant list
   const list = $('ex-det-list');
@@ -13277,14 +13293,14 @@ function renderExpertVision() {
       for (const m of detModels) {
         const isCur = m.name === resDet;
         const mMb = typeof m.ion_mb === 'number' && isFinite(m.ion_mb) ? m.ion_mb : null;
-        const comb = ion && mMb != null ? mMb + (resDep ? depMb : 0) : null;
+        const comb = ion && mMb != null && depMb != null ? mMb + depMb : null;
         const over = !!(ion && comb != null && comb > ion.budget + 1e-6);
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'ex-mrow' + (isCur ? ' cur' : '') + (over ? ' bad' : '');
         btn.setAttribute('role', 'radio');
         btn.setAttribute('aria-checked', String(isCur));
-        btn.dataset.op = '/api/v1/vision/models';
+        btn.setAttribute('data-op-mark', '');
         btn.dataset.exDet = m.name;
         btn.disabled = EX.busy || armBusy || capOff || over;
         const radio = document.createElement('i'); radio.className = 'ex-radio';
@@ -13308,8 +13324,8 @@ function renderExpertVision() {
     }
   }
 
-  // Depth model slot
-  const depSec = $('ex-depth-sec'), depSep = $('ex-depth-sep');
+  // Depth model slot (toggle + variant picker when multiple depth variants exist)
+  const depSec = $('ex-depth-sec'), depSep = $('ex-depth-sep'), depList = $('ex-dep-list');
   const firstDep = depModels.find((e) => e.metric !== false) || depModels[0] || null;
   if (depSec && depSep) {
     const showDep = !!(firstDep || resDep);
@@ -13319,14 +13335,47 @@ function renderExpertVision() {
       const targetDep = curDepEntry || firstDep;
       const targetMb = targetDep && typeof targetDep.ion_mb === 'number' && isFinite(targetDep.ion_mb) ? targetDep.ion_mb : null;
       const depOn = !!resDep;
-      const wouldComb = ion && !depOn && targetMb != null ? detMb + targetMb : null;
+      const wouldComb = ion && !depOn && targetMb != null && detMb != null ? detMb + targetMb : null;
       const depOver = !!(ion && wouldComb != null && wouldComb > ion.budget + 1e-6);
       setText($('ex-depth-name'), targetDep ? targetDep.name : 'Depth');
-      setText($('ex-depth-mb'), targetMb != null ? `${targetMb.toFixed(1)} MB` : '');
+      setText($('ex-depth-mb'), targetMb != null ? `${targetMb.toFixed(1)} MB` : '--');
       const dsw = $('ex-depth-sw');
       dsw.setAttribute('aria-checked', String(depOn));
       dsw.disabled = EX.busy || armBusy || capOff || (!depOn && depOver);
       dsw.dataset.targetDep = targetDep ? targetDep.name : '';
+      if (depList) {
+        depList.textContent = '';
+        depList.hidden = depModels.length <= 1;
+        if (depModels.length > 1) {
+          for (const dm of depModels) {
+            const isCur = dm.name === resDep;
+            const dmMb = typeof dm.ion_mb === 'number' && isFinite(dm.ion_mb) ? dm.ion_mb : null;
+            const dComb = ion && dmMb != null && detMb != null ? detMb + dmMb : null;
+            const dOver = !!(ion && dComb != null && dComb > ion.budget + 1e-6);
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'ex-mrow' + (isCur ? ' cur' : '') + (dOver ? ' bad' : '');
+            btn.setAttribute('role', 'radio');
+            btn.setAttribute('aria-checked', String(isCur));
+            btn.setAttribute('data-op-mark', '');
+            btn.dataset.exDep = dm.name;
+            btn.disabled = EX.busy || armBusy || capOff || dOver;
+            const radio = document.createElement('i'); radio.className = 'ex-radio';
+            const nm = document.createElement('span'); nm.className = 'ex-nm';
+            nm.textContent = dm.name;
+            const mb = document.createElement('span'); mb.className = 'ex-mb';
+            mb.textContent = dmMb != null ? `${dmMb.toFixed(1)} MB` : '--';
+            const sub = document.createElement('span'); sub.className = 'ex-sub';
+            sub.textContent = dOver ? t('ex.depth.over', { need: dComb.toFixed(1), limit: ion.budget.toFixed(1) }) : (isCur ? t('ex.det.cur').replace(/·\s*$/, '') : t('ex.depth.note'));
+            btn.append(radio, nm, mb, sub);
+            btn.addEventListener('click', () => {
+              if (isCur || EX.busy || dOver) return;
+              exModelSwitch({ depth: dm.name });
+            });
+            depList.appendChild(btn);
+          }
+        }
+      }
       const dhint = $('ex-depth-hint');
       if (depOver) {
         dhint.className = 'ex-warn-box';
@@ -13338,22 +13387,25 @@ function renderExpertVision() {
     }
   }
 
-  // ION memory bar (live provider numbers only)
+  // ION memory bar (live provider numbers only; never fabricate 0.0 MB when a resident size is unknown)
   const ionBox = $('ex-ion-box');
   if (ionBox) {
     ionBox.hidden = !ion;
     if (ion) {
-      const usedModels = detMb + (resDep ? depMb : 0);
-      const detPct = ion.budget > 0 ? Math.min(100, (detMb / ion.budget) * 100) : 0;
-      const depPct = ion.budget > 0 ? Math.min(100 - detPct, ((resDep ? depMb : 0) / ion.budget) * 100) : 0;
-      const rem = ion.budget - usedModels;
-      $('ex-ion-bar').classList.toggle('over', rem < -1e-6);
+      const bothKnown = detMb != null && depMb != null;
+      const providerModelsUsed = ion.used != null ? Math.max(0, ion.used - ion.base) : null;
+      const usedModels = bothKnown ? (detMb + depMb) : providerModelsUsed;
+      const detPct = ion.budget > 0 && detMb != null ? Math.min(100, (detMb / ion.budget) * 100) : (ion.budget > 0 && usedModels != null ? Math.min(100, (usedModels / ion.budget) * 100) : 0);
+      const depPct = ion.budget > 0 && bothKnown ? Math.min(100 - detPct, (depMb / ion.budget) * 100) : 0;
+      const rem = usedModels != null ? ion.budget - usedModels : null;
+      $('ex-ion-bar').classList.toggle('over', rem != null && rem < -1e-6);
       $('ex-ion-det').style.width = detPct.toFixed(1) + '%';
       $('ex-ion-dep').style.width = depPct.toFixed(1) + '%';
-      const sum = t('ex.ion.sum', { used: usedModels.toFixed(1), budget: ion.budget.toFixed(1) });
-      const parts = t('ex.ion.parts', { det: detMb.toFixed(1), dep: (resDep ? depMb : 0).toFixed(1) });
+      const usedStr = usedModels != null ? usedModels.toFixed(1) : '--';
+      const sum = t('ex.ion.sum', { used: usedStr, budget: ion.budget.toFixed(1) });
+      const parts = t('ex.ion.parts', { det: detMb != null ? detMb.toFixed(1) : '--', dep: depMb != null ? depMb.toFixed(1) : '--' });
       setText($('ex-ion-summary'), `${sum} · ${parts}`);
-      setText($('ex-ion-rem'), rem >= 0 ? t('ex.ion.rem', { rem: rem.toFixed(1) }) : t('ex.ion.over', { over: Math.abs(rem).toFixed(1) }));
+      setText($('ex-ion-rem'), rem == null ? '--' : (rem >= 0 ? t('ex.ion.rem', { rem: rem.toFixed(1) }) : t('ex.ion.over', { over: Math.abs(rem).toFixed(1) })));
       setText($('ex-ion-note'), t('ex.ion.note', { total: ion.total.toFixed(1), base: ion.base.toFixed(1), res: ion.reserve.toFixed(1) }));
     }
   }
@@ -13392,6 +13444,26 @@ async function exModelSwitch(patch, retried = false) {
     toast(t('ex.det.fail'), 'warn', 'VISION_BUSY');
     return;
   }
+  // Preserve requested patch across PIN unlock even if catalogue polling recreates buttons while the dialog is open.
+  if (opLocked() && !retried) {
+    const ok = await opRequire('/api/v1/vision/models');
+    if (!ok) return;
+    await vmRefresh();
+    const cat = exCatalogue();
+    if (patch.detector && !cat.some((e) => e.name === patch.detector)) {
+      EX.err = t('ec.model_nf');
+      renderExpertVision();
+      toast(t('ex.det.fail'), 'err', 'MODEL_NOT_FOUND');
+      return;
+    }
+    if (patch.depth && !cat.some((e) => e.name === patch.depth)) {
+      EX.err = t('ec.model_nf');
+      renderExpertVision();
+      toast(t('ex.det.fail'), 'err', 'MODEL_NOT_FOUND');
+      return;
+    }
+    return exModelSwitch(patch, true);
+  }
   EX.busy = true; EX.err = '';
   renderExpertVision();
   let unlock = false;
@@ -13411,12 +13483,16 @@ async function exModelSwitch(patch, retried = false) {
       unlock = true;
     } else if (!res.ok) {
       const known = { DETECTION_UNAVAILABLE: 'VISION_DOWN' }[code] || code;
-      const why = (EC_KEYS[known] ? t(EC_KEYS[known]) : '') || (data && data.message) || ('HTTP ' + res.status);
-      const mb = /needs ([\d.]+) MB, limit ([\d.]+) MB/.exec((data && data.message) || '');
-      EX.err = (mb ? `(${mb[1]} / ${mb[2]} MB) ` : '') + why;
+      const srvMsg = data && typeof data.message === 'string' && data.message.trim() ? data.message.trim() : '';
+      const mb = /needs ([\d.]+) MB, limit ([\d.]+) MB/.exec(srvMsg);
+      const localWhy = known === 'ION_BUDGET' && patch.depth && !patch.detector
+        ? t('ex.depth.over', { need: mb ? mb[1] : '?', limit: mb ? mb[2] : '?' })
+        : (EC_KEYS[known] ? t(EC_KEYS[known]) : '');
+      EX.err = srvMsg || localWhy || ('HTTP ' + res.status);
       toast(t('ex.det.fail') + (mb ? ` (${mb[1]} / ${mb[2]} MB)` : ''), 'err', known || String(res.status),
         code === 'OPERATOR_REQUIRED' ? { path: '/api/v1/vision/models' } : null);
     } else {
+      if (!data || data.changed !== false) exInvalidateHeldForModelChange();
       const loaded = patch.detector !== undefined
         ? (patch.detector || t('ex.det.unloaded'))
         : (patch.depth ? patch.depth : `${t('ex.models.depth')}: ${t('ex.det.unloaded')}`);

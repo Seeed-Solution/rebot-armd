@@ -760,6 +760,7 @@ impl DetectionSource for PhaseBVision {
                     swap_state: "idle".into(),
                     swap_error: None,
                     catalogue: Default::default(),
+                    catalogue_kinds: Default::default(),
                     ion: None,
                 }),
             })
