@@ -4664,6 +4664,8 @@ impl SupervisorInner {
             owner,
             meta,
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.flush_published_session_terminals();
         let publish_only_us = crate::diagnostics::tick::us(publish_start.elapsed());
         self.last_publish_only_us = publish_only_us;
         TickPublished {
@@ -4702,10 +4704,6 @@ impl SupervisorInner {
         self.nonblocking_driver_release = keep_nb;
         let published = self.publish_at(timestamp, generation, keep);
         self.nonblocking_driver_release = false;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = self.flush_published_session_terminals();
-        }
         published
     }
 
@@ -6749,6 +6747,18 @@ impl SupervisorInner {
         let policy_busy = self.policy_loading || self.policy_run.is_some();
         #[cfg(not(feature = "policy-runtime"))]
         let policy_busy = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let (mode_switch, prev_mode_switch_terminal) = if self.mode_switch.is_idle() {
+            (None, None)
+        } else {
+            (
+                self.current_mode_switch_snapshot()
+                    .map(crate::rt_core::publish::PublishedModeSwitch::from),
+                self.mode_switch
+                    .latest_terminal()
+                    .map(crate::rt_core::publish::PublishedModeSwitch::from),
+            )
+        };
         PublishedOwnerMeta {
             arm: self.core.id(),
             boot: self.boot_id,
@@ -6780,9 +6790,9 @@ impl SupervisorInner {
             held,
             macro_state,
             #[cfg(not(target_arch = "wasm32"))]
-            mode_switch: self.current_mode_switch_snapshot(),
+            mode_switch,
             #[cfg(not(target_arch = "wasm32"))]
-            recent_mode_switch_terminals: self.mode_switch.recent_terminals(),
+            prev_mode_switch_terminal,
         }
     }
 
@@ -12250,8 +12260,8 @@ impl ModeSwitchRunner {
     }
 
     #[inline]
-    pub(crate) fn recent_terminals(&self) -> [Option<crate::motor_mode::ModeSwitchSnapshot>; 4] {
-        self.recent_terminals
+    pub(crate) fn is_idle(&self) -> bool {
+        self.active_session.is_none() && self.recent_terminal_cursor == 0
     }
 
     pub(crate) fn retire_if_session(&mut self, sid: crate::rt_core::session::SessionId) {
@@ -12313,14 +12323,15 @@ impl SupervisorInner {
     pub(crate) fn current_mode_switch_snapshot(
         &self,
     ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
-        let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
-            let mut m = 0u32;
-            let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
-            m
-        });
-        if let (Some(sid), Some(machine)) =
-            (self.mode_switch.active_session, self.mode_switch.machine.as_ref())
-        {
+        let Some(sid) = self.mode_switch.active_session else {
+            return self.mode_switch.latest_terminal();
+        };
+        if let Some(machine) = self.mode_switch.machine.as_ref() {
+            let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
+                let mut m = 0u32;
+                let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+                m
+            });
             return Some(machine.snapshot(sid.0, drv_uncertain));
         }
         self.mode_switch.latest_terminal()
@@ -16520,12 +16531,10 @@ impl ArmSupervisor {
             meta.mode_switch
                 .filter(|s| s.session_id == session_id)
                 .or_else(|| {
-                    meta.recent_mode_switch_terminals
-                        .iter()
-                        .flatten()
-                        .copied()
-                        .find(|s| s.session_id == session_id)
+                    meta.prev_mode_switch_terminal
+                        .filter(|s| s.session_id == session_id)
                 })
+                .map(crate::motor_mode::ModeSwitchSnapshot::from)
         };
         if let Ok(svc) = self
             .read_services(crate::rt_core::publish::ReadRequirements::identity())
