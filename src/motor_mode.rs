@@ -2665,6 +2665,21 @@ pub mod switch {
                             decode_offset_ns,
                             ..
                         } if got == expected_mode => {
+                            // Blocker 2 (R5): a causal ConfirmOnly reply is published only when it
+                            // agrees with the cached mode; on an energized axis a contradiction
+                            // fences the axis and escalates to SAFE-HOLD.
+                            if !from_write
+                                && drv.axis_is_energized(j)
+                                && drv.axis_confirmed_mode(j).is_some_and(|c| c != got)
+                            {
+                                drv.latch_axis_mode_uncertain(j);
+                                return Some(self.handle_axis_failure(
+                                    drv,
+                                    slot.target.joint,
+                                    ModeSwitchFailure::ReadbackMismatch,
+                                    true,
+                                ));
+                            }
                             if expected_mode == ControlMode::PositionForce {
                                 // R2 Blocker 2: ALWAYS fence the axis (`latch_axis_mode_uncertain`)
                                 // while mandatory PositionForce causal master-ID feedback is pending,

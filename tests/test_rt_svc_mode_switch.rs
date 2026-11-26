@@ -1994,3 +1994,42 @@ fn applied_stop_proof_after_first_axis_confirms_is_stopped_recovered() {
     }
     assert_eq!(prog, ModeProgress::StoppedRecovered { reason: ModeSwitchFailure::Stopped });
 }
+
+/// Blocker 2: an energized axis whose cached mode is Impedance answers a causal ConfirmOnly
+/// readback with PositionVelocity (the requested mode). The reply contradicts the cached mode, so
+/// it must not be published: the axis is fenced and the session escalates to SAFE-HOLD.
+#[test]
+fn confirm_only_reply_contradicting_cached_mode_on_energized_axis_escalates() {
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(500), true, TIMEOUT_2000_COUNTS);
+    let mut raw_drv = build_damiao_driver(bus.clone(), &cfg, 8);
+    enable_driver_sync(&mut raw_drv, &bus, Some(&clock));
+    let mut ex_drv = ExclusiveDriver::new(Box::new(raw_drv));
+    // Driver cache: J1 verified Impedance; wire: J1 is POS_VEL.
+    ex_drv.get_mut().as_mut().set_axis_confirmed_mode(0, Some(ControlMode::Impedance));
+    let mut plan = ModeSwitchPlan::empty(ModeSwitchIntent::ConfirmOnly);
+    plan.axes[0] = AxisTarget::new(0, ControlMode::PositionVelocity);
+    plan.len = 1;
+    let mut ms = ModeSwitch::new(plan);
+    let mut prog = ModeProgress::Pending { wake: None };
+    let mut seq = 1u64;
+    for _ in 0..12 {
+        clock.advance(PERIOD_50HZ);
+        bus.with(|s| s.run_watchdogs());
+        seq += 1;
+        prog = step_release_on_exclusive(&mut ex_drv, &mut ms, &clock, PERIOD_50HZ, 8, seq);
+        if prog.is_terminal() {
+            break;
+        }
+    }
+    assert_eq!(
+        prog,
+        ModeProgress::Ambiguous {
+            failed_joint: 0,
+            reason: ModeSwitchFailure::ReadbackMismatch,
+        }
+    );
+    assert_eq!(ex_drv.get_ref().axis_confirmed_mode(0), None, "contradicting reply must not be published");
+    assert_ne!(ex_drv.get_ref().mode_write_uncertain_mask() & 1, 0, "J1 must be fenced");
+}
