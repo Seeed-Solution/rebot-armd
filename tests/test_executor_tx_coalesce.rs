@@ -82,7 +82,7 @@ impl IrqInterferenceModel {
     fn on_tx_frame(&mut self) -> Duration {
         self.tx_in_tick = self.tx_in_tick.saturating_add(1);
         let base_irq_us = self.rng.range(100, 260);
-        let burst_us = if self.tick_index % 37 == 0 && self.tx_in_tick == 4 {
+        let burst_us = if self.tick_index.is_multiple_of(37) && self.tx_in_tick == 4 {
             self.rng.range(450, 750)
         } else if self.tx_in_tick > 8 {
             // Stacked extra frames (> 8 in one release) trigger additional SPI FIFO IRQ cycles.
@@ -826,7 +826,7 @@ async fn legacy_j1_motion_180s_sg2002_sim() {
     };
     stamp.request_id = 1;
     let sup_ws = sup.clone();
-    let conn_clone = conn.clone();
+    let conn_clone = conn;
     let ws_task = tokio::spawn(async move {
         sup_ws
             .torque_ws_with_deadline(
@@ -1091,7 +1091,7 @@ async fn legacy_enable_hold_rest_disable_cycle_sg2002_sim() {
         stamp.request_id = req_en;
         req_id += 1;
         let sup_ws = sup.clone();
-        let conn_en = conn.clone();
+        let conn_en = conn;
         let ws_en = tokio::spawn(async move {
             sup_ws
                 .torque_ws_with_deadline(
@@ -1158,7 +1158,7 @@ async fn legacy_enable_hold_rest_disable_cycle_sg2002_sim() {
         stamp2.request_id = req_dis;
         req_id += 1;
         let sup_ws2 = sup.clone();
-        let conn_dis = conn.clone();
+        let conn_dis = conn;
         let ws_dis = tokio::spawn(async move {
             sup_ws2
                 .torque_ws_with_deadline(
@@ -1296,14 +1296,14 @@ fn coalesced_fallback_optional_deferral_and_bounded_rx_recovery() {
     bus.begin_release();
     drv.begin_control_release(5);
     drv.set_tx_release_deadline(Some(clock.now() + Duration::from_millis(18)));
-    drv.service_release_watchdog_fallback();
+    drv.service_release_watchdog_fallback(u64::MAX, None);
     let fb_tx = take_tx_metrics();
     assert_eq!(fb_tx.by_kind.urgent_hold, 6, "all 6 unserviced arm motors must receive urgent_hold");
     assert_eq!(fb_tx.by_kind.normal, 0);
 
     // Calling fallback a second time in the SAME release emits 0 duplicate holds (coalesced!).
     reset_tx_metrics();
-    drv.service_release_watchdog_fallback();
+    drv.service_release_watchdog_fallback(u64::MAX, None);
     let fb_dup = take_tx_metrics();
     assert_eq!(fb_dup.by_kind.urgent_hold, 0, "coalescing must prevent duplicate urgent holds in same release");
 
@@ -1349,4 +1349,203 @@ fn coalesced_fallback_optional_deferral_and_bounded_rx_recovery() {
         }
     );
     assert_eq!(snap.tx.since_boot_by_kind, snap.tx.by_kind_total);
+}
+
+/// Real-flush (`flush_is_noop() == false`) CAN transport wrapper that can fail transmit on a chosen
+/// CAN ID or fail `flush()` to prove confirmed-delivery watchdog accounting.
+#[derive(Clone)]
+struct RealFlushBus {
+    inner: SgPerfBus,
+    fail_tx_id: Arc<Mutex<Option<u32>>>,
+    fail_flush: Arc<Mutex<bool>>,
+}
+
+impl CanTransport for RealFlushBus {
+    fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+        self.inner.clock()
+    }
+    fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+    fn supports_nonblocking_rt(&self) -> bool {
+        true
+    }
+    fn flush_is_noop(&self) -> bool {
+        false
+    }
+    fn rx_clock_sample(&self) -> Option<RxClockSample> {
+        self.inner.rx_clock_sample()
+    }
+    fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+        if *self.fail_tx_id.lock().unwrap() == Some(frame.id) {
+            return Err(TransportError::Io(std::io::Error::other("injected mid-batch tx failure")));
+        }
+        self.inner.transmit(frame)
+    }
+    fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.inner.receive()
+    }
+    fn receive_with_rx_time(&mut self) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
+        self.inner.receive_with_rx_time()
+    }
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+        self.inner.receive_timestamped()
+    }
+    fn flush(&mut self) -> Result<(), TransportError> {
+        if *self.fail_flush.lock().unwrap() {
+            return Err(TransportError::Io(std::io::Error::other("injected flush failure")));
+        }
+        self.inner.flush()
+    }
+}
+
+#[test]
+fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() {
+    // 1. Blocker 1 + Major 3: off-tick blocking `set_torque(true)` fast-path still services due
+    //    watchdog holds inline; Window 2 `begin_wake_tx_pass` refreshes expired Window-1 `tick_tx`
+    //    without clearing `release_ctrl_tx_mask`.
+    let clock = Arc::new(MockClock::new());
+    let bus = SgPerfBus::new(clock.clone(), 0xA0D1_0001, [1, 1, 1, 1, 1, 1, 1]);
+    let cfg = build_sg2002_config();
+    let mut drv = build_sg2002_driver(bus.clone(), &cfg);
+    drv.set_torque(true).unwrap();
+    clock.advance(Duration::from_millis(5));
+    drv.read_joint_states().unwrap();
+
+    clock.advance(Duration::from_millis(25));
+    reset_tx_metrics();
+    bus.begin_release();
+    drv.set_torque(true).unwrap();
+    let offtick_tx = take_tx_metrics();
+    assert_eq!(
+        offtick_tx.by_kind.urgent_hold, 6,
+        "off-tick fast-path set_torque(true) must still emit inline urgent holds for due motors"
+    );
+
+    clock.advance(Duration::from_millis(10));
+    reset_tx_metrics();
+    bus.begin_release();
+    drv.begin_control_release(10);
+    let rel_start = clock.now();
+    drv.set_tx_release_deadline(Some(rel_start + Duration::from_millis(18)));
+    let mut states = Vec::with_capacity(7);
+    drv.read_joint_states_budgeted(&mut states, rel_start + Duration::from_millis(4), 64)
+        .unwrap();
+    clock.advance(Duration::from_millis(12));
+    drv.begin_wake_tx_pass();
+    reset_tx_metrics();
+    drv.service_release_watchdog_fallback(u64::MAX, None);
+    let wake_fb = take_tx_metrics();
+    assert_eq!(
+        wake_fb.by_kind.urgent_hold, 6,
+        "Window 2 begin_wake_tx_pass must refresh expired Window-1 tick_tx so urgent holds succeed"
+    );
+
+    // 2. Blocker 2: Owner-authorized mask & targets strictly restrict fallback holds (never falls
+    //    back to driver cached_states for unauthorized or `None`-target joints).
+    clock.advance(Duration::from_millis(25));
+    reset_tx_metrics();
+    bus.begin_release();
+    drv.begin_control_release(11);
+    drv.set_tx_release_deadline(Some(clock.now() + Duration::from_millis(18)));
+    let owner_targets = [None, Some(0.15_f32), None, None, None, None, None];
+    drv.service_release_watchdog_fallback(1u64 << 1, Some(&owner_targets));
+    let auth_tx = take_tx_metrics();
+    assert_eq!(
+        auth_tx.by_kind.urgent_hold, 1,
+        "fallback must hold ONLY owner-authorized joint 1, never unauthorized energized joints"
+    );
+    let j1_q = bus.with(|s| s.motors[1].q);
+    assert!(
+        (j1_q - 0.15).abs() < 1e-3,
+        "fallback must command owner-captured hold target 0.15 on J2, got {j1_q}"
+    );
+    reset_tx_metrics();
+    drv.service_release_watchdog_fallback(0, Some(&[None; 7]));
+    assert_eq!(take_tx_metrics().by_kind.urgent_hold, 0);
+
+    // 3. Major 1: Real-flush (`!flush_is_noop()`) mid-batch hard TX error must NOT credit J1's
+    //    watchdog timestamp or `release_ctrl_tx_mask`, so J1 still receives a hold once recovered.
+    let rf_clock = Arc::new(MockClock::new());
+    let rf_inner = SgPerfBus::new(rf_clock.clone(), 0xF105_0001, [1, 1, 1, 1, 1, 1, 1]);
+    let fail_tx_id = Arc::new(Mutex::new(None));
+    let fail_flush = Arc::new(Mutex::new(false));
+    let rf_bus = RealFlushBus {
+        inner: rf_inner.clone(),
+        fail_tx_id: fail_tx_id.clone(),
+        fail_flush: fail_flush.clone(),
+    };
+    let limits: Vec<DamiaoLimits> = cfg
+        .damiao_ranges
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|r| r.limits())
+        .collect();
+    let gripper = gripper_drive_from_profile(&cfg).unwrap();
+    let mut rf_drv = DamiaoArmDriver::new(rf_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(gripper)
+        .unwrap()
+        .with_tx_budget(cfg.damiao_tx_budget());
+    rf_drv.read_joint_states().unwrap();
+    rf_inner.with(|s| s.push_all_feedback_now());
+    rf_drv.read_joint_states().unwrap();
+    assert_eq!(rf_drv.check_mapping_ranges().status, armd::driver::RangeCheckStatus::Passed);
+    rf_inner.with(|s| s.immediate_init = false);
+    rf_drv.set_torque(true).unwrap();
+    rf_clock.advance(Duration::from_millis(5));
+    rf_drv.read_joint_states().unwrap();
+
+    rf_clock.advance(Duration::from_millis(25));
+    *fail_tx_id.lock().unwrap() = Some(0x102);
+    rf_drv.begin_control_release(1);
+    rf_drv.set_tx_release_deadline(Some(rf_clock.now() + Duration::from_millis(18)));
+    let targets: Vec<_> = (0..7).map(|_| armd::driver::JointTarget::position(0.0)).collect();
+    assert!(
+        rf_drv.write_joint_targets_bounded(&targets).is_err(),
+        "mid-batch J2 hard TX error must return Err before flush"
+    );
+    *fail_tx_id.lock().unwrap() = None;
+    rf_drv.begin_wake_tx_pass();
+    reset_tx_metrics();
+    rf_drv.service_release_watchdog_fallback(u64::MAX, None);
+    let recovered_fb = take_tx_metrics();
+    assert_eq!(
+        recovered_fb.by_kind.urgent_hold, 6,
+        "unflushed J1 must NOT be credited after mid-batch J2 error; all 6 joints must receive holds"
+    );
+
+    // 4. Major 4: `ThreadUsage::merge_tx_metrics` merges Window 2 TX counts without clobbering
+    //    `tx_pending` on empty wakes.
+    let mut usage = armd::diagnostics::tick::ThreadUsage {
+        tx_frames: 6,
+        tx_by_kind: TxFrameKindCounts {
+            normal: 6,
+            ..Default::default()
+        },
+        tx_pending: 2,
+        ..Default::default()
+    };
+    usage.merge_tx_metrics(armd::diagnostics::tick::TxTickMetrics::ZERO);
+    assert_eq!(usage.tx_pending, 2, "zero Window-2 metrics must preserve Window-1 tx_pending");
+    usage.merge_tx_metrics(armd::diagnostics::tick::TxTickMetrics {
+        frames: 2,
+        by_kind: TxFrameKindCounts {
+            urgent_hold: 1,
+            enable_disable: 1,
+            ..Default::default()
+        },
+        sum_wall_ns: 1_200_000,
+        max_wall_ns: 700_000,
+        pending: 0,
+        ..Default::default()
+    });
+    assert_eq!(usage.tx_frames, 8);
+    assert_eq!(usage.tx_by_kind.normal, 6);
+    assert_eq!(usage.tx_by_kind.urgent_hold, 1);
+    assert_eq!(usage.tx_by_kind.enable_disable, 1);
+    assert_eq!(usage.tx_send_us, 1_200);
+    assert_eq!(usage.tx_frame_max_us, 700);
 }

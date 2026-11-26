@@ -9609,7 +9609,7 @@ fn control_thread_main_inner(
                     u64,
                     u64,
                     u64,
-                    Option<(super::ops::ReleaseReport, Instant, u64, Instant, Duration)>,
+                    Option<(super::ops::ReleaseReport, Instant, u64, Instant, Instant, Duration)>,
                 )> {
                     let _guard = ReleaseGuard::enter();
                     assert!(
@@ -9873,10 +9873,17 @@ fn control_thread_main_inner(
                     );
                     let shadow_flush_ns = now_ns_fn().saturating_sub(shadow_t0_ns);
 
-                    let wake_cutoff = release_deadline
+                    let optional_wake_cutoff = release_deadline
                         .checked_sub(optional_margin)
                         .unwrap_or(release_start);
-                    let next_wake = report.poll.wake_before(wake_cutoff);
+                    let urgent_wake_cutoff = release_deadline
+                        .checked_sub(crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN)
+                        .unwrap_or(release_start);
+                    let next_wake = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
+                        Some(now_inst())
+                    } else {
+                        report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
+                    };
                     drop(_guard);
                     Some((
                         sample,
@@ -9884,13 +9891,22 @@ fn control_thread_main_inner(
                         step_return_ns,
                         post_cpu_start_ns,
                         shadow_flush_ns,
-                        next_wake.map(|_| (report, release_deadline, next_release_ns, wake_cutoff, optional_margin)),
+                        next_wake.map(|_| {
+                            (
+                                report,
+                                release_deadline,
+                                next_release_ns,
+                                optional_wake_cutoff,
+                                urgent_wake_cutoff,
+                                optional_margin,
+                            )
+                        }),
                     ))
                 },
             ))
         };
 
-        // ---- Window 2: Disjoint sub-release transition wakes before `wake_cutoff` ----
+        // ---- Window 2: Disjoint sub-release transition/urgent wakes ----
         let mut step_sample: Option<TickSample> = None;
         let mut step_post_t0: Option<Instant> = None;
         let mut step_return_ns: Option<u64> = None;
@@ -9915,7 +9931,14 @@ fn control_thread_main_inner(
                 ret_ns,
                 cpu_ns,
                 shadow_ns,
-                Some((mut report, release_deadline, next_release_ns, wake_cutoff, optional_margin)),
+                Some((
+                    mut report,
+                    release_deadline,
+                    next_release_ns,
+                    optional_wake_cutoff,
+                    urgent_wake_cutoff,
+                    optional_margin,
+                )),
             ))) => {
                 step_sample = Some(sample);
                 step_post_t0 = Some(post_t0);
@@ -9923,14 +9946,18 @@ fn control_thread_main_inner(
                 step_post_cpu_start_ns = Some(cpu_ns);
                 step_shadow_flush_ns = shadow_ns;
                 let mut wakes = 0u32;
-                let mut next_wake = report.poll.wake_before(wake_cutoff);
+                let mut next_wake = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
+                    Some(now_inst())
+                } else {
+                    report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
+                };
                 let mut wake_err: Option<Box<dyn Any + Send>> = None;
                 while let Some(wake) = next_wake {
                     if wakes >= MAX_SERVICE_WAKES || control_stop.load(Ordering::Acquire) {
                         break;
                     }
                     let now = now_inst();
-                    if now >= wake_cutoff || wake > wake_cutoff {
+                    if now >= urgent_wake_cutoff || wake > urgent_wake_cutoff {
                         break;
                     }
                     if wake > now {
@@ -9944,7 +9971,7 @@ fn control_thread_main_inner(
                         step_wake_sleep_ns = step_wake_sleep_ns
                             .saturating_add(now_ns_fn().saturating_sub(sleep_t0_ns));
                     }
-                    if control_stop.load(Ordering::Acquire) || now_inst() >= wake_cutoff {
+                    if control_stop.load(Ordering::Acquire) || now_inst() >= urgent_wake_cutoff {
                         break;
                     }
                     wakes += 1;
@@ -10002,7 +10029,12 @@ fn control_thread_main_inner(
                             let ws_ns = now_ns_fn().saturating_sub(ws_t0_ns);
                             let _wake_tail_local =
                                 state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
-                            (report.poll.wake_before(wake_cutoff), ws_ns)
+                            let next = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
+                                Some(now_inst())
+                            } else {
+                                report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
+                            };
+                            (next, ws_ns)
                         }))
                     };
                     step_wake_poll_ns = step_wake_poll_ns
@@ -10053,6 +10085,8 @@ fn control_thread_main_inner(
                 ..Default::default()
             });
             sample.release_us = stamped_release_us;
+            let wake_tx = crate::diagnostics::tick::take_tx_metrics();
+            sample.usage.merge_tx_metrics(wake_tx);
             if let Some(post_t0) = step_post_t0 {
                 let post_us = crate::diagnostics::tick::us(
                     now_inst().saturating_duration_since(post_t0),

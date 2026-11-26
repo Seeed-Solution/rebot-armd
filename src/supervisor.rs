@@ -8680,6 +8680,12 @@ impl SupervisorInner {
                 } else {
                     J7PosForceGate::default()
                 };
+                let torque_poll = self.core.poll_transition();
+                let urgent_wake = if torque_poll.is_some() || park_wake.is_some() {
+                    d.next_watchdog_hold_wake()
+                } else {
+                    None
+                };
                 let poll = crate::rt_core::ops::HardwarePoll {
                     driverless: false,
                     feedback_valid: d.is_feedback_valid(),
@@ -8687,9 +8693,10 @@ impl SupervisorInner {
                     oldest_feedback_age: oldest,
                     rx_frames,
                     budget_exhausted,
-                    torque: self.core.poll_transition(),
+                    torque: torque_poll,
                     park_wake,
                     park_state_changed,
+                    urgent_wake,
                 };
                 (poll, gate)
             })
@@ -8723,6 +8730,7 @@ impl SupervisorInner {
                     torque: self.core.poll_transition(),
                     park_wake,
                     park_state_changed,
+                    urgent_wake: None,
                 };
                 (poll, gate)
             });
@@ -11660,26 +11668,62 @@ impl SupervisorInner {
         }
         self.j7_intent = None;
         // Coalesced end-of-release watchdog fallback: normal control/hold output has now run;
-        // emit an urgent stationary hold ONLY for already-enabled arm joints whose normal output
-        // in this release was absent, deferred, or failed and whose watchdog deadline needs it.
+        // emit an urgent stationary hold ONLY for owner-authorized already-enabled arm joints whose
+        // normal output in this release was absent, deferred, or failed and whose watchdog deadline
+        // needs it. Stopped / E-stop / FailedHold / pending-disable states strictly consume the
+        // owner's `measured_hold` joint mask & captured targets (never overriding
+        // `UnheldNoFreshFeedback` or `DisableProtective`).
         // Restores `drv_release_cap` so an expired action deadline never suppresses watchdog safety.
+        let is_stopped_or_failed_hold_fb = self.safety.state().is_stopped()
+            || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
+        let pending_disable_hold_fb =
+            (self.disable_pending || transition_owns_bus) && self.torque_intent == TorqueIntent::On;
         if !self.shutdown_committed
             && !enable_transition_owns_bus
             && !stop_inhibited_this_tick
             && !disconnect_fenced_mid_tick
             && !self.urgent_stop_unapplied()
             && !output_tx_cap_expired
+            && self.stopped_hold_eligible()
+            && (self.is_torqued || is_stopped_or_failed_hold_fb || pending_disable_hold_fb)
         {
+            let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+            let use_owner_hold_targets = is_stopped_or_failed_hold_fb || pending_disable_hold_fb;
+            let mut owner_hold_targets = [None; crate::rt_core::mailbox::MAX_DOF];
+            let authorized_mask = if use_owner_hold_targets {
+                let mut mask = 0u64;
+                for j in 0..dof {
+                    if let Some(pos) = self.measured_hold.captured_positions[j] {
+                        if pos.is_finite()
+                            && !matches!(
+                                self.measured_hold.joint_status[j],
+                                crate::driver::JointHoldStatus::UnheldNoFreshFeedback
+                                    | crate::driver::JointHoldStatus::UnheldNoVerifiedMode
+                                    | crate::driver::JointHoldStatus::SkippedOff
+                            )
+                        {
+                            owner_hold_targets[j] = Some(pos);
+                            mask |= 1u64 << j;
+                        }
+                    }
+                }
+                mask
+            } else if dof >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << dof) - 1
+            };
             let release_cap = self.active_tx_cutoff.map(|c| c.drv_release_cap);
             let use_try = self.rt_executor_owned || self.nonblocking_driver_release;
             #[cfg(not(target_arch = "wasm32"))]
             let shadow_rt = &mut self.torque_shadow;
             if let Some(d) = self.driver.as_mut() {
+                let target_slice = use_owner_hold_targets.then_some(&owner_hold_targets[..dof]);
                 let run_fb = |drv: &mut dyn ArmDriver| {
                     if let Some(cap) = release_cap {
                         drv.set_tx_release_deadline(Some(cap));
                     }
-                    drv.service_release_watchdog_fallback();
+                    drv.service_release_watchdog_fallback(authorized_mask, target_slice);
                     #[cfg(not(target_arch = "wasm32"))]
                     shadow_rt.drain_from_driver(drv);
                 };

@@ -729,6 +729,36 @@ pub struct ThreadUsage {
     pub tx_frame_cpu_max_us: u32,
 }
 
+impl ThreadUsage {
+    /// Merge additional CAN TX metrics (e.g. from Window 2 sub-release wakes) into this release's
+    /// usage summary before diagnostics publication (zero heap allocation).
+    #[inline]
+    pub fn merge_tx_metrics(&mut self, tx: TxTickMetrics) {
+        if tx == TxTickMetrics::ZERO {
+            return;
+        }
+        self.tx_frames = self.tx_frames.saturating_add(tx.frames);
+        self.tx_by_kind.normal = self.tx_by_kind.normal.saturating_add(tx.by_kind.normal);
+        self.tx_by_kind.hold = self.tx_by_kind.hold.saturating_add(tx.by_kind.hold);
+        self.tx_by_kind.urgent_hold = self.tx_by_kind.urgent_hold.saturating_add(tx.by_kind.urgent_hold);
+        self.tx_by_kind.refresh_0xcc = self.tx_by_kind.refresh_0xcc.saturating_add(tx.by_kind.refresh_0xcc);
+        self.tx_by_kind.recovery = self.tx_by_kind.recovery.saturating_add(tx.by_kind.recovery);
+        self.tx_by_kind.enable_disable = self.tx_by_kind.enable_disable.saturating_add(tx.by_kind.enable_disable);
+        self.tx_would_block = self.tx_would_block.saturating_add(tx.would_block);
+        self.tx_enobufs = self.tx_enobufs.saturating_add(tx.enobufs);
+        self.tx_deferred = self.tx_deferred.saturating_add(tx.deferred);
+        if tx.frames > 0 || tx.deferred > 0 || tx.pending > 0 || tx.dropped_stale > 0 || tx.dropped_stopped > 0 {
+            self.tx_pending = tx.pending;
+        }
+        self.tx_dropped_stale = self.tx_dropped_stale.saturating_add(tx.dropped_stale);
+        self.tx_dropped_stopped = self.tx_dropped_stopped.saturating_add(tx.dropped_stopped);
+        self.tx_send_us = self.tx_send_us.saturating_add(ns_to_us_u32(tx.sum_wall_ns));
+        self.tx_send_cpu_us = self.tx_send_cpu_us.saturating_add(ns_to_us_u32(tx.sum_cpu_ns));
+        self.tx_frame_max_us = self.tx_frame_max_us.max(ns_to_us_u32(tx.max_wall_ns));
+        self.tx_frame_cpu_max_us = self.tx_frame_cpu_max_us.max(ns_to_us_u32(tx.max_cpu_ns));
+    }
+}
+
 /// The guard of another task the tick waited for: the last one released before the tick
 /// got the lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
