@@ -12506,10 +12506,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut frames = 0usize;
         let mut drained = false;
         while frames < limit {
-            if effective_deadline.is_some_and(|d| self.now() >= d) {
+            let attempt = self.now();
+            if effective_deadline.is_some_and(|d| attempt >= d) {
                 break;
             }
-            let attempt = self.now();
             match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames += 1;
@@ -17530,8 +17530,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut frames_processed = 0usize;
         let mut rx_drained = false;
         let mut hit_err = false;
-        while frames_processed < limit && self.now() < effective_deadline {
+        while frames_processed < limit {
             let attempt = self.now();
+            if attempt >= effective_deadline {
+                break;
+            }
             match self.receive_with_rx_time_timed() {
                 Ok((frame, rx_time)) => {
                     frames_processed += 1;
@@ -17610,6 +17613,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// and (when `complete_partial` is true) `tx_release_deadline` so watchdog continuity is
     /// never broken by ledger deferral or a mid-batch release-deadline/transient-TX interruption.
     ///
+    /// Uses ONLY driver-authorized stationary hold references (never a pending motion target's
+    /// position, gains, or feedforward torque) so a lease-exempt continuity hold cannot carry
+    /// motion data past lease revocation.
+    ///
     /// Still strictly enforces `fence_check()`, stop gates, verified hold modes, and
     /// `self.tx_budget.max_frames`.
     #[allow(clippy::too_many_arguments)]
@@ -17617,7 +17624,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         &mut self,
         active_mask: u64,
         covered_mask: u64,
-        targets: Option<&[JointTarget]>,
         hold_positions: Option<&[Option<f32>]>,
         start_stamp: StopStamp,
         complete_partial: bool,
@@ -17646,12 +17652,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     .and_then(|hp| hp.get(i).copied().flatten())
                     .filter(|p| p.is_finite())
                     .or_else(|| self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
-                    .or_else(|| {
-                        targets
-                            .and_then(|ts| ts.get(i))
-                            .map(|t| t.position)
-                            .filter(|p| p.is_finite())
-                    })
                     .or(self.motor_keepalive_hold_pos[i])
                     .or_else(|| {
                         self.cached_states
@@ -17662,13 +17662,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 let Some(hold_pos) = pos_opt else {
                     return Err((i, TxRefusal::BuildRefused));
                 };
-                let src_target = targets.and_then(|ts| ts.get(i));
+                let (kp, kd) = self
+                    .last_mit_params
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map_or((None, None), |(kp, kd, _)| (Some(kp), Some(kd)));
                 let hold_target = JointTarget {
                     position: hold_pos,
                     velocity: Some(0.0),
-                    kp: src_target.and_then(|t| t.kp),
-                    kd: src_target.and_then(|t| t.kd),
-                    torque: src_target.and_then(|t| t.torque),
+                    kp,
+                    kd,
+                    torque: Some(0.0),
                 };
                 if started[i].is_none() {
                     started[i] = Some(self.now());
@@ -17780,7 +17785,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let send_res = self.send_mit_continuity_holds_for_uncovered(
                 active_mask,
                 0,
-                None,
                 hold_targets,
                 start_stamp,
                 complete_partial,
@@ -21673,7 +21677,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                     match self.send_mit_continuity_holds_for_uncovered(
                                         active_mask,
                                         covered,
-                                        Some(targets),
                                         None,
                                         start_stamp,
                                         true,
@@ -21745,7 +21748,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                                 .send_mit_continuity_holds_for_uncovered(
                                                     active_mask,
                                                     covered,
-                                                    Some(targets),
                                                     None,
                                                     start_stamp,
                                                     true,
@@ -22280,17 +22282,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
         }
-        let prev_bypass = self.watchdog_continuity_bypass;
-        let prev_partial = self.watchdog_continuity_complete_partial;
-        if self.mit_fence.is_some() && self.mit_fence_trip.is_none() {
-            self.watchdog_continuity_bypass = true;
-            if self.in_active_control_release() {
-                self.watchdog_continuity_complete_partial = true;
-            }
-        }
         let res = pos_force_emitter::emit_tick(self, intent, current);
-        self.watchdog_continuity_bypass = prev_bypass;
-        self.watchdog_continuity_complete_partial = prev_partial;
         if let Ok(PosForceEmitOutcome::Sent { joint, .. }) = res {
             if self.mit_fence.is_some() && joint < self.mit_fence_last_cmd.len() {
                 self.mit_fence_last_cmd[joint] = Some(self.now());
@@ -22558,7 +22550,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 match self.send_mit_continuity_holds_for_uncovered(
                                     active_mask,
                                     covered,
-                                    Some(targets),
                                     None,
                                     start_stamp,
                                     true,
@@ -22640,7 +22631,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                             .send_mit_continuity_holds_for_uncovered(
                                                 active_mask,
                                                 covered,
-                                                Some(targets),
                                                 None,
                                                 start_stamp,
                                                 true,
@@ -23345,7 +23335,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     match self.send_mit_continuity_holds_for_uncovered(
                         active_mask,
                         0,
-                        Some(targets),
                         None,
                         start_stamp,
                         true,
@@ -23412,7 +23401,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.last_target_tx_sent_mask = 0;
                     return Ok(TxBatchOutcome::Deferred { pending: batch_frames });
                 }
-                if self.now() >= self.effective_tx_pass_deadline(pass) {
+                if (!self.in_active_control_release()
+                    && self.now() >= self.effective_tx_pass_deadline(pass))
+                    || self.now() >= pass.deadline
+                {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
@@ -23454,7 +23446,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 }
                             }
                             Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed)
-                                if self.in_active_control_release() && sent_mask != 0 =>
+                                if self.in_active_control_release()
+                                    && (sent_mask != 0
+                                        || self
+                                            .tick_tx
+                                            .is_none_or(|p| !p.backpressured && self.now() < p.deadline)) =>
                             {
                                 if self.strict_stop_check(Some(start_stamp)).is_err() {
                                     self.trip_fence(MitFenceTripReason::EstopDuringBatch {
@@ -23471,7 +23467,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 match self.send_mit_continuity_holds_for_uncovered(
                                     active_mask,
                                     covered,
-                                    Some(targets),
                                     None,
                                     start_stamp,
                                     true,
@@ -23578,7 +23573,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                             .send_mit_continuity_holds_for_uncovered(
                                                 active_mask,
                                                 covered,
-                                                Some(targets),
                                                 None,
                                                 start_stamp,
                                                 true,
@@ -25292,6 +25286,7 @@ mod pos_force_emitter {
             }
         }
 
+        let armed_mit = driver.mit_fence.is_some() && driver.mit_fence_trip.is_none();
         let mut active_kind = effective_kind;
         let mut retried = false;
         let sent_frame = loop {
@@ -25299,7 +25294,19 @@ mod pos_force_emitter {
                 PosForceIntentKind::Target { .. } => (TxKind::Target, intent.stamp.lease_gen),
                 PosForceIntentKind::Hold | PosForceIntentKind::Stop => (TxKind::RollbackHold(pf_j), 0),
             };
-            match send_frame(
+            // Only stationary Hold/Stop continuity frames bypass ledger tightening and release
+            // cutoff under an armed MIT fence; Target motion frames always obey release cutoff
+            // and ledger budget and degrade to Hold if deferred.
+            let is_hold_intent = matches!(active_kind, PosForceIntentKind::Hold | PosForceIntentKind::Stop);
+            let prev_bypass = driver.watchdog_continuity_bypass;
+            let prev_partial = driver.watchdog_continuity_complete_partial;
+            if armed_mit && is_hold_intent {
+                driver.watchdog_continuity_bypass = true;
+                if driver.in_active_control_release() {
+                    driver.watchdog_continuity_complete_partial = true;
+                }
+            }
+            let send_res = send_frame(
                 driver,
                 kind,
                 Some(start_stamp),
@@ -25308,7 +25315,10 @@ mod pos_force_emitter {
                 true,
                 false,
                 false,
-            ) {
+            );
+            driver.watchdog_continuity_bypass = prev_bypass;
+            driver.watchdog_continuity_complete_partial = prev_partial;
+            match send_res {
                 Ok(frame) => break Some(frame),
                 Err(TxRefusal::LeaseFenced) => {
                     if !retried && matches!(active_kind, PosForceIntentKind::Target { .. }) {
@@ -25334,12 +25344,22 @@ mod pos_force_emitter {
                         // An invalid/unencodable target never suppresses J7: degrade to Hold.
                         if matches!(active_kind, PosForceIntentKind::Target { .. }) {
                             active_kind = PosForceIntentKind::Hold;
+                            is_target_intent = false;
                         }
                         continue;
                     }
                     break None;
                 }
                 Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed) => {
+                    if armed_mit
+                        && !retried
+                        && matches!(active_kind, PosForceIntentKind::Target { .. })
+                    {
+                        retried = true;
+                        active_kind = PosForceIntentKind::Hold;
+                        is_target_intent = false;
+                        continue;
+                    }
                     if !driver.pos_force_feedback_valid(pf_j, driver.now()) {
                         let _ = driver.check_pos_force_freshness_for_tx();
                     }
@@ -25433,7 +25453,13 @@ mod pos_force_emitter {
             driver.discard_staged_ctrl_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
-        if driver.flush_cutoff_exceeded() {
+        let flush_blocked = if !is_target_intent && armed_mit && driver.in_active_control_release()
+        {
+            !driver.can.flush_is_noop() && driver.tick_tx.is_some_and(|p| driver.now() >= p.deadline)
+        } else {
+            driver.flush_cutoff_exceeded()
+        };
+        if flush_blocked {
             driver.mark_tx_pass_backpressured();
             driver.discard_staged_ctrl_tx();
             return Err(TransportError::Timeout.into());

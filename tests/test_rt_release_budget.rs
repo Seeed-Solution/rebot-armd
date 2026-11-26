@@ -874,6 +874,154 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
 }
 
 #[test]
+fn armed_mit_continuity_hold_rejects_pending_target_torque_and_j7_motion_past_cutoff() {
+    use armd::driver::{
+        ArmDriver, JointMode, JointTarget, PosForceEmitOutcome, PosForceIntent,
+        PosForceIntentKind, TxBatchOutcome,
+    };
+
+    let clock = MockClock::new();
+    let (bus, mut drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+    bus.with(|s| {
+        for m in s.motors.iter_mut().take(6) {
+            m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
+        }
+    });
+    drv.set_torque(true).expect("enable torque");
+
+    // Release 1: establish authorized MIT parameters at position 0.0, torque 0.0.
+    let mut base_targets = vec![JointTarget::position(0.0); 7];
+    for t in base_targets.iter_mut().take(6) {
+        t.kp = Some(12.0);
+        t.kd = Some(0.8);
+        t.torque = Some(0.0);
+    }
+    let modes = [
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Position,
+    ];
+    drv.set_joint_modes(&modes, &base_targets)
+        .expect("set MIT modes");
+    drv.set_mit_deadline_fence(Some(Duration::from_millis(45)), Duration::from_millis(300));
+    drv.set_external_pos_force_emitter(true);
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.tx_times.clear();
+        s.push_all_feedback();
+    });
+    let _ = drv.read_joint_states();
+    let t1 = clock.now();
+    drv.begin_control_release(1);
+    drv.set_tx_release_deadline(Some(t1 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 16);
+    assert_eq!(
+        drv.write_joint_targets_bounded(&base_targets).unwrap(),
+        TxBatchOutcome::Complete
+    );
+    drv.set_tx_release_deadline(None);
+
+    // Release 2 (Finding 2): pending motion targets carry large feedforward torque (4.5 Nm)
+    // and displaced position (0.45 rad), while ledger tightens TX cap below the 6-frame arm batch
+    // so continuity holds run. Every emitted MIT continuity frame must keep torque ~ 0.0 Nm and
+    // position ~ 0.0 rad (never copying pending target position or feedforward torque).
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.tx_times.clear();
+        s.push_all_feedback();
+    });
+    let _ = drv.read_joint_states();
+    let mut aggressive_targets = vec![JointTarget::position(0.45); 7];
+    for t in aggressive_targets.iter_mut().take(6) {
+        t.kp = Some(40.0);
+        t.kd = Some(2.0);
+        t.torque = Some(4.5);
+    }
+    let t2 = clock.now();
+    drv.begin_control_release(2);
+    drv.set_tx_release_deadline(Some(t2 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 3);
+    let r2 = drv.write_joint_targets_bounded(&aggressive_targets).unwrap();
+    assert!(matches!(r2, TxBatchOutcome::Deferred { .. }));
+    assert!(drv.mit_fence_trip().is_none());
+    drv.set_tx_release_deadline(None);
+    let r2_frames = bus.with(|s| s.tx_log.clone());
+    assert_eq!(r2_frames.len(), 6, "all 6 MIT axes must receive continuity holds");
+    for frame in &r2_frames {
+        let p_raw = ((frame.data[0] as u16) << 8) | (frame.data[1] as u16);
+        let t_raw = (((frame.data[6] as u16) & 0x0F) << 8) | (frame.data[7] as u16);
+        assert!(
+            (i32::from(p_raw) - 0x8000).abs() <= 4,
+            "continuity hold for id=0x{:x} must hold ~0.0 rad, not pending target 0.45 rad (p_raw=0x{p_raw:04x})",
+            frame.id
+        );
+        assert!(
+            (i32::from(t_raw) - 0x800).abs() <= 2,
+            "continuity hold for id=0x{:x} must carry ~0.0 Nm torque, not pending target 4.5 Nm (t_raw=0x{t_raw:03x})",
+            frame.id
+        );
+    }
+
+    // Release 3 (Finding 1 + Finding 3):
+    // - Zero-send cutoff: `tx_release_deadline` is already reached on entry (while `pass.deadline`
+    //   is still open); arm write must fall back to continuity holds without tripping the fence.
+    // - J7 motion target past cutoff: submitting `PosForceIntentKind::Target` with `velocity > 0`
+    //   after `tx_release_deadline` must degrade to stationary Hold (`vel_raw == 0`), never
+    //   transmitting a J7 motion frame past cutoff.
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.tx_times.clear();
+        s.push_all_feedback();
+    });
+    let _ = drv.read_joint_states();
+    let t3 = clock.now();
+    drv.begin_control_release(3);
+    drv.set_tx_release_deadline(Some(t3)); // already at cutoff before first send
+    drv.sync_release_budget_limits(64, 16);
+    let r3 = drv.write_joint_targets_bounded(&aggressive_targets).unwrap();
+    assert!(
+        matches!(r3, TxBatchOutcome::Deferred { .. }),
+        "zero-send release cutoff must defer targets and emit continuity holds: {r3:?}"
+    );
+    assert!(
+        drv.mit_fence_trip().is_none(),
+        "zero-send release cutoff must not trip armed MIT fence: {:?}",
+        drv.mit_fence_trip()
+    );
+    let stamp = drv.current_j7_intent_stamp();
+    let j7_intent = PosForceIntent {
+        kind: PosForceIntentKind::Target {
+            position: 0.35,
+            velocity: Some(1.0),
+            current_raw: None,
+        },
+        stamp,
+    };
+    let j7_out = drv.emit_pos_force_j7(j7_intent, stamp).unwrap();
+    assert!(
+        matches!(j7_out, PosForceEmitOutcome::Sent { .. }),
+        "J7 past cutoff under armed MIT must degrade to stationary Hold and send: {j7_out:?}"
+    );
+    drv.set_tx_release_deadline(None);
+    let r3_frames = bus.with(|s| s.tx_log.clone());
+    let j7_frame = r3_frames
+        .iter()
+        .find(|f| f.id == 0x307)
+        .expect("degraded J7 Hold frame 0x307 must be emitted");
+    let j7_vel_raw = u16::from_le_bytes([j7_frame.data[4], j7_frame.data[5]]);
+    assert_eq!(
+        j7_vel_raw, 0,
+        "J7 motion target past release cutoff must degrade to stationary Hold (vel_raw=0), got {j7_vel_raw}"
+    );
+}
+
+#[test]
 fn tightened_zero_tx_release_does_not_leak_to_standalone_driver_tx() {
     use armd::driver::{JointTarget, TxBatchOutcome};
 
