@@ -2098,7 +2098,7 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     h_d.stop_and_join();
 
     // (d2) Post-rename revocation: barrier after rename + dir-sync before activate -> trigger E-stop ->
-    // allow activate -> disk has file, live policy unchanged, hold enters Reconciling.
+    // allow activate -> live policy unchanged, hold enters Reconciling, renamed file rolled back.
     let dir_d2 = tempfile::tempdir().unwrap();
     let path_d2 = dir_d2.path().join("gripper_calib.json");
     let (sup_d2, _id_d2) = prepare_zero_check_supervisor(path_d2.clone()).await;
@@ -2124,7 +2124,9 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
         h_d2.planning_snapshot().is_ok_and(|s| s.config_inhibited)
     })
     .await;
-    assert!(path_d2.exists(), "rename happened before post-rename revocation");
+    // The rename happened (Reconciling above); the refused activation rolled the file back.
+    wait_until_async(Duration::from_secs(2), || !path_d2.exists()).await;
+    assert!(!path_d2.exists(), "refused activation must roll the renamed file back");
     h_d2.stop_and_join();
 
     // (e) Worker disconnect BEFORE rename -> hold enters Reconciling, action fails PERSIST_FAILED.
@@ -3374,7 +3376,9 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
         h_u.planning_snapshot().is_ok_and(|s| s.config_inhibited)
     })
     .await;
-    assert!(path_u.exists(), "rename happened before unapplied urgent E-stop");
+    // The rename happened (Reconciling above); the refused activation rolled the file back.
+    wait_until_async(Duration::from_secs(2), || !path_u.exists()).await;
+    assert!(!path_u.exists(), "refused activation must roll the renamed file back");
     assert_eq!(
         sup_u.observation().await.unwrap().safety_state,
         SafetyState::EStop,
