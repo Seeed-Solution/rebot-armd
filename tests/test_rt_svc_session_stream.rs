@@ -628,11 +628,11 @@ async fn energized_uncertain_session_triggers_same_release_safe_hold_with_zero_a
         let mut prep = PreparedSession::exclusive(SessionKind::Custom(42), ClientId(33));
         prep.deadline = Some(now + Duration::from_millis(35));
         prep.escalate_safe_hold_on_uncertain = true;
-        let adm = inner.check_admission(make_admit_stamp(0, 0, ep, sg, 1)).unwrap();
+        let adm = inner.check_admission(make_admit_stamp(0, 0, ep, sg, 1001)).unwrap();
         let sid = admit_session(adm, prep, now).unwrap();
         assert!(inner.sessions_mut().set_hw_state_uncertain(SessionSlot::ExclusiveOutput, sid, true));
 
-        let adm_rec = inner.check_admission(make_admit_stamp(0, 0, ep, sg, 2)).unwrap();
+        let adm_rec = inner.check_admission(make_admit_stamp(0, 0, ep, sg, 1002)).unwrap();
         let _rec_id = admit_session(adm_rec, PreparedSession::recorder(ClientId(33)), now).unwrap();
         (ep, sg)
     };
