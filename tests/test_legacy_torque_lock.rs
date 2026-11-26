@@ -506,14 +506,36 @@ async fn lock_proof_legacy_ws_enable_withheld_35ms_bounds_every_guard_hold_under
         tq_io.sleep_us,
     );
 
-    assert!(
-        max_hold <= Duration::from_millis(2),
-        "EVERY SupervisorLock guard hold during 35 ms enable must stay <= 2 ms (max_hold={max_hold:?}, holds={holds:?})"
-    );
+    assert_all_holds_bounded_2ms(&holds, "35 ms enable");
     assert!(
         max_tick_wait_us <= 2_000,
         "control tick lock wait during 35 ms enable must stay <= 2000 us (got {max_tick_wait_us} us)"
     );
+}
+
+fn assert_all_holds_bounded_2ms(holds: &[armd::supervisor_lock::HoldRecord], label: &str) {
+    assert!(!holds.is_empty(), "expected recorded SupervisorLock holds during {label}");
+    for h in holds {
+        assert_eq!(
+            h.io_timing.map_or(0, |io| io.sleep_us),
+            0,
+            "SupervisorLock guard must never sleep during {label}: {h:?}"
+        );
+        if let Some(cpu) = h.cpu_hold {
+            assert!(
+                cpu <= Duration::from_millis(2),
+                "EVERY SupervisorLock guard on-CPU hold during {label} must stay <= 2 ms (cpu={cpu:?}, wall={:?}, hold={h:?})",
+                h.hold(),
+            );
+        }
+        if h.involuntary_csw == 0 {
+            assert!(
+                h.hold() <= Duration::from_millis(2),
+                "EVERY unpreempted SupervisorLock guard hold during {label} must stay <= 2 ms (wall={:?}, hold={h:?})",
+                h.hold(),
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -651,10 +673,7 @@ async fn lock_proof_legacy_ws_disable_delayed_35ms_bounds_every_guard_hold_under
         max_hold.as_micros(),
         torque_holds[0].direction,
     );
-    assert!(
-        max_hold <= Duration::from_millis(2),
-        "EVERY guard hold during 35 ms disable must stay <= 2 ms (got {max_hold:?})"
-    );
+    assert_all_holds_bounded_2ms(&holds, "35 ms disable");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -892,11 +911,7 @@ async fn legacy_ws_unverified_range_check_recovers_and_mismatch_refuses_with_zer
 
         assert_eq!(ack["type"], "command_ack", "{ack}");
         assert_eq!(ack["is_torqued"], true);
-        let max_hold = holds.iter().map(|h| h.hold()).max().unwrap_or(Duration::ZERO);
-        assert!(
-            max_hold <= Duration::from_millis(2),
-            "RangeCheck recovery + enable must keep every guard hold <= 2 ms (got {max_hold:?})"
-        );
+        assert_all_holds_bounded_2ms(&holds, "RangeCheck recovery + enable");
     }
 
     // Subcase B: motor 2 silent at startup (`Unverified`), later answers with mismatched PMAX ->
@@ -1075,11 +1090,7 @@ async fn legacy_ws_sustained_rx_backlog_at_50hz_stays_under_2ms() {
         holds.iter().any(|h| h.command == Some("/api/v1/torque")),
         "hold history must include attributed /api/v1/torque guards"
     );
-    let max_hold = holds.iter().map(|h| h.hold()).max().unwrap_or(Duration::ZERO);
-    assert!(
-        max_hold <= Duration::from_millis(2),
-        "sustained RX backlog at 50 Hz must keep EVERY guard hold <= 2 ms (got {max_hold:?})"
-    );
+    assert_all_holds_bounded_2ms(&holds, "sustained RX backlog at 50 Hz");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
