@@ -9726,7 +9726,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Remaining per-release RX frames allowed on this driver under the active control release.
     #[inline]
     fn driver_remaining_release_rx(&self) -> u16 {
-        if self.control_release_managed {
+        if self.in_active_control_release() {
             self.release_rx_limit.saturating_sub(self.release_rx_frames)
         } else {
             crate::rt_core::ops::RX_FRAME_BUDGET
@@ -9736,7 +9736,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Tightens a caller-supplied RX frame limit against the active control release ledger.
     #[inline]
     fn clamp_release_rx_limit(&self, max_rx_frames: u16) -> u16 {
-        if self.control_release_managed {
+        if self.in_active_control_release() {
             max_rx_frames.min(self.driver_remaining_release_rx())
         } else {
             max_rx_frames.min(crate::rt_core::ops::RX_FRAME_BUDGET)
@@ -12380,7 +12380,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Pure RX-only drain (no autonomous recovery/refresh TX, no `begin_tx_tick`, zero heap
     /// allocation). Returns `true` when the transport explicitly reported an empty RX queue.
     fn drain_rx_frames_only(&mut self, deadline: Option<Deadline>, max_frames: usize) -> bool {
-        let limit = if self.control_release_managed {
+        let limit = if self.in_active_control_release() {
             max_frames.min(usize::from(self.driver_remaining_release_rx()))
         } else {
             max_frames
@@ -12407,7 +12407,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if frames > 0 {
             let f_u16 = u16::try_from(frames).unwrap_or(u16::MAX);
-            if self.control_release_managed {
+            if self.in_active_control_release() {
                 self.release_rx_frames = self.release_rx_frames.saturating_add(f_u16);
             }
             if let Some(rem) = self.rx_frame_limit.as_mut() {
@@ -14308,7 +14308,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             .rx_frame_limit
             .unwrap_or(crate::rt_core::ops::RX_FRAME_BUDGET)
             .min(crate::rt_core::ops::RX_FRAME_BUDGET);
-        usize::from(if self.control_release_managed {
+        usize::from(if self.in_active_control_release() {
             base.min(self.driver_remaining_release_rx())
         } else {
             base
@@ -14320,7 +14320,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// single frame ledger.
     fn account_rx_pass(&mut self, frames_processed: usize, exhausted: bool) {
         let frames = u16::try_from(frames_processed).unwrap_or(u16::MAX);
-        if self.control_release_managed {
+        if self.in_active_control_release() {
             self.release_rx_frames = self.release_rx_frames.saturating_add(frames);
         }
         if let Some(rem) = self.rx_frame_limit.as_mut() {
@@ -17391,7 +17391,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let base = self
             .rx_frame_limit
             .map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
-        let limit = if self.control_release_managed {
+        let limit = if self.in_active_control_release() {
             base.min(usize::from(self.driver_remaining_release_rx()))
         } else {
             base
@@ -17421,7 +17421,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if self.rx_frame_limit.is_some() {
             self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
-        } else if frames_processed > 0 && self.control_release_managed {
+        } else if frames_processed > 0 && self.in_active_control_release() {
             let f_u16 = u16::try_from(frames_processed).unwrap_or(u16::MAX);
             self.release_rx_frames = self.release_rx_frames.saturating_add(f_u16);
         }
@@ -18961,7 +18961,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             match self.can.receive_with_rx_time() {
                 Ok((frame, rx_time)) => {
                     frames = frames.saturating_add(1);
-                    if self.control_release_managed {
+                    if self.in_active_control_release() {
                         self.release_rx_frames = self.release_rx_frames.saturating_add(1);
                     }
                     self.process_rx_frame(&frame, true, rx_time);

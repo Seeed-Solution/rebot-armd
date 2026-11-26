@@ -385,6 +385,7 @@ fn sub_budget_only_tightens_and_deadline_exhaustion_returns_pending_then_resumes
     let t1 = clock.now();
     let mut tight_ledger = ReleaseBudget::new(11, t1, t1 + Duration::from_millis(10), 64, 16);
     tight_ledger.charge_rx(60, false); // only 4 RX frames left in parent ledger
+    drv.set_tx_release_deadline(Some(t1 + Duration::from_millis(10)));
     drv.sync_release_budget_limits(tight_ledger.rx_remaining(), tight_ledger.tx_remaining());
     let mut ms_wide = ModeSwitchBudget::from_ledger(
         &tight_ledger,
@@ -401,6 +402,7 @@ fn sub_budget_only_tightens_and_deadline_exhaustion_returns_pending_then_resumes
         ms_wide,
         &mut tight_ledger,
     );
+    drv.set_tx_release_deadline(None);
     assert!(
         matches!(p_tight, ModeProgress::Pending { .. }),
         "tight remaining RX with 10 stray frames must stay Pending, got {p_tight:?}"
