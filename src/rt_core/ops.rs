@@ -1673,6 +1673,15 @@ impl CoreOps for SupervisorInner {
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> HardwarePoll {
         self.last_clock_now = Some(budget.now);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow.enqueue_at(
+            budget.now,
+            crate::torque::shadow::ShadowInputKind::TransitionWake {
+                live_intent: self.shadow_live_intent(),
+                live_is_torqued: self.is_torqued,
+                live_stopped: self.safety.state().is_stopped(),
+            },
+        );
         let trans = self.service_torque_transition_with_clock(budget, now_fn);
         let mut park_wake = None;
         let mut park_state_changed = false;
@@ -2898,6 +2907,20 @@ impl<O: CoreOps> ReleaseFixture<O> {
         // The next release starts one period later
         self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
         report
+    }
+
+    /// Test helper: explicitly run one Window-2 sub-release transition wake at an arbitrary
+    /// deterministic clock instant (used to reproduce sub-release repeat-disable wake timing).
+    #[doc(hidden)]
+    pub fn service_wake_at_clock(
+        &mut self,
+        now_fn: impl FnMut() -> Instant,
+        release_deadline: Instant,
+        report: &mut ReleaseReport,
+    ) -> bool {
+        let next_gen = self.engine.releases();
+        self.engine
+            .service_wake_with_clock(&mut self.core, now_fn, release_deadline, next_gen, report)
     }
 }
 

@@ -127,6 +127,13 @@ fn indep_recipient_passes(
     if matches!(rec.role, JointRole::LoadBearing) && !rec.rest_evidence_qualified {
         return false;
     }
+    if now_us < dev.poisoned_until_us {
+        return false;
+    }
+    // LegacyJ7 gripper never gates rest-pose disable (matches live arm drivers' arm-joint-only rest gate).
+    if matches!(rec.role, JointRole::Gripper(GripperReleasePolicy::LegacyJ7)) {
+        return true;
+    }
     if win.count != REST_WINDOW_SAMPLES {
         return false;
     }
@@ -819,6 +826,30 @@ fn check_rest_gate_invariants(
 // 4. Dispatch Invariants
 // =========================================================================
 
+fn is_valid_pre_tx_enable_cancel(
+    prev: &TorqueState,
+    event: &Event,
+    actions: &ActionSet,
+    group: u8,
+) -> bool {
+    let gi = group as usize;
+    matches!(
+        event,
+        Event::EnableCancelledPreTx {
+            group: ev_group,
+            attempt_id,
+            ..
+        } if *ev_group == group
+            && prev.groups[gi].drive_state == DriveState::ReadyToSwitchOn
+            && prev.groups[gi].enable_tx.is_some_and(|etx| {
+                etx.attempt_id == *attempt_id
+                    && !etx.any_write_sent
+                    && etx.confirmed_channels.is_empty()
+            })
+            && actions.disables[gi].is_none()
+    )
+}
+
 fn check_dispatch_invariants(
     state: &TorqueState,
     prev: &TorqueState,
@@ -826,35 +857,37 @@ fn check_dispatch_invariants(
     actions: &ActionSet,
 ) -> Result<(), Violation> {
     // B1 + Zero-write invariant: Off can ONLY be committed by a correlated WriteResult for the
-    // live pending_disable_dispatch with at least one remaining recipient Sent or Ambiguous!
+    // live pending_disable_dispatch with at least one remaining recipient Sent or Ambiguous
+    // (or a verified pre-TX enable cancellation where zero enable writes were ever sent).
     for g in 0..state.config.group_count {
         let gi = g as usize;
         if prev.groups[gi].torque_intent == TorqueIntent::On
             && state.groups[gi].torque_intent == TorqueIntent::Off
         {
-            let valid_commit = match (event, prev.groups[gi].pending_disable_dispatch) {
-                (Event::WriteResult(wr), Some(pend)) => {
-                    let expected_kind = match pend.kind {
-                        DisableKind::Requested => WriteKind::DisableRequested,
-                        DisableKind::Protective => WriteKind::DisableProtective,
-                    };
-                    wr.group == g
-                        && wr.kind == expected_kind
-                        && wr.dispatch_id == pend.dispatch_id
-                        && wr.generation == pend.generation
-                        && wr
-                            .target_mask
-                            .intersect(pend.remaining_recipients)
-                            .iter()
-                            .any(|r| {
-                                matches!(
-                                    wr.outcomes[r as usize],
-                                    MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous
-                                )
-                            })
-                }
-                _ => false,
-            };
+            let valid_commit = is_valid_pre_tx_enable_cancel(prev, event, actions, g)
+                || match (event, prev.groups[gi].pending_disable_dispatch) {
+                    (Event::WriteResult(wr), Some(pend)) => {
+                        let expected_kind = match pend.kind {
+                            DisableKind::Requested => WriteKind::DisableRequested,
+                            DisableKind::Protective => WriteKind::DisableProtective,
+                        };
+                        wr.group == g
+                            && wr.kind == expected_kind
+                            && wr.dispatch_id == pend.dispatch_id
+                            && wr.generation == pend.generation
+                            && wr
+                                .target_mask
+                                .intersect(pend.remaining_recipients)
+                                .iter()
+                                .any(|r| {
+                                    matches!(
+                                        wr.outcomes[r as usize],
+                                        MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous
+                                    )
+                                })
+                    }
+                    _ => false,
+                };
             if !valid_commit {
                 return Err(Violation::new(
                     ViolationKind::IntentCommittedOffWithoutCorrelatedSentOrAmbiguousWrite,
@@ -1032,9 +1065,13 @@ fn check_enable_invariants(
 
     for g in 0..state.config.group_count {
         let gi = g as usize;
+        let clean_pre_tx_cancel = state.groups[gi].drive_state == DriveState::SwitchOnDisabled
+            && state.groups[gi].torque_intent == TorqueIntent::Off
+            && is_valid_pre_tx_enable_cancel(prev, event, actions, g);
         if prev.groups[gi].drive_state == DriveState::ReadyToSwitchOn
             && state.groups[gi].drive_state != DriveState::ReadyToSwitchOn
             && state.groups[gi].drive_state != DriveState::OperationEnabled
+            && !clean_pre_tx_cancel
             && !state.groups[gi].drive_state.is_protective()
             && state.groups[gi].drive_state != DriveState::SafeHold
             && (state.groups[gi].drive_state != DriveState::FailedHold

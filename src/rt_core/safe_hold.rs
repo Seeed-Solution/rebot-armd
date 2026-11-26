@@ -649,6 +649,7 @@ impl SafeHoldBuffers {
             // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
             self.acknowledge_stops_for_safe_hold();
             drv.set_pending_pos_force_hold_hint(true);
+            let mut stale_hold_mask: u64 = 0;
             if let Ok(report) = drv.write_measured_hold_masked(hold_mask, &self.hold_targets[..dof])
             {
                 if report.sent_any {
@@ -661,6 +662,11 @@ impl SafeHoldBuffers {
                             | crate::driver::JointHoldStatus::HeldStaleTarget
                     ) {
                         sent_hold_mask |= 1u64 << j;
+                        if report.joint_status[j]
+                            == crate::driver::JointHoldStatus::HeldStaleTarget
+                        {
+                            stale_hold_mask |= 1u64 << j;
+                        }
                     }
                 }
                 if sent_hold_mask == 0 && report.sent_any {
@@ -677,22 +683,47 @@ impl SafeHoldBuffers {
                     {
                         ctrl.j7_tx_count.fetch_add(1, Ordering::Release);
                         sent_hold_mask |= 1u64 << j7;
+                        if report.joint_status[j7]
+                            == crate::driver::JointHoldStatus::HeldStaleTarget
+                        {
+                            stale_hold_mask |= 1u64 << j7;
+                        }
                     }
                 }
             }
             if let Some(ref mut sh) = shadow {
                 sh.drain_from_driver(drv);
             }
-        }
-        if let Some(ref mut sh) = shadow {
-            sh.enqueue(crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
-                hold_mask: crate::torque::ChannelMask(sent_hold_mask as u32),
-                contended: false,
-                escalated: false,
-                live_intent: crate::torque::TorqueIntent::On,
-                live_is_torqued: true,
-                live_stopped: true,
-            });
+            let checkpoint_now = drv.clock_now();
+            if let Some(ref mut sh) = shadow {
+                sh.enqueue_at(
+                    checkpoint_now,
+                    crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
+                        hold_mask: crate::torque::ChannelMask(sent_hold_mask as u32),
+                        stale_held_mask: crate::torque::ChannelMask(stale_hold_mask as u32),
+                        contended: false,
+                        escalated: false,
+                        live_intent: crate::torque::TorqueIntent::On,
+                        live_is_torqued: true,
+                        live_stopped: true,
+                    },
+                );
+                sh.flush_deferred_steps();
+            }
+        } else if let Some(ref mut sh) = shadow {
+            let checkpoint_now = drv.clock_now();
+            sh.enqueue_at(
+                checkpoint_now,
+                crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {
+                    hold_mask: crate::torque::ChannelMask::EMPTY,
+                    stale_held_mask: crate::torque::ChannelMask::EMPTY,
+                    contended: false,
+                    escalated: false,
+                    live_intent: crate::torque::TorqueIntent::On,
+                    live_is_torqued: true,
+                    live_stopped: true,
+                },
+            );
             sh.flush_deferred_steps();
         }
 

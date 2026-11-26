@@ -23,8 +23,8 @@
 //!    desired vs. verified [`crate::motor_mode::ControlMode`], last motion-write boundary,
 //!    thermal derate state, and functional [`types::JointRole`]:
 //!    - `LoadBearing`: requires full `K = 3` rest-pose gate before non-protective disable.
-//!    - `Gripper(LegacyJ7)`: 3 fresh distinct causal samples across distinct releases, no rest
-//!      position tolerance; stop / `FailedHold` never opens jaws or raises force.
+//!    - `Gripper(LegacyJ7)`: never gates rest-pose disable (matches live arm drivers' arm-joint-only
+//!      rest gate); stop / `FailedHold` never opens jaws or raises force.
 //!    - `Gripper(ExplicitHand)`: requires explicit release authorization plus verified release
 //!      evidence (`SupportedObject` or `VerifiedEmptyGrasp`); unknown evidence defers or refuses.
 //!    - `ActiveTool(StopOutput | BoundedRetention)`: semantic safe output required at profile load.

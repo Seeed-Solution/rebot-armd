@@ -2599,8 +2599,10 @@ fn replay_for_violation(cfg: TorqueConfig, events: &[Event]) -> Option<(usize, V
 fn set_event_now_us(ev: &mut Event, new_now: u64) {
     match ev {
         Event::Release { now_us }
+        | Event::TransitionWake { now_us }
         | Event::HandshakeResult { now_us, .. }
         | Event::EnableStart { now_us, .. }
+        | Event::EnableCancelledPreTx { now_us, .. }
         | Event::DisableRequest { now_us, .. }
         | Event::Stop { now_us, .. }
         | Event::FaultClear { now_us, .. }
@@ -3071,5 +3073,183 @@ fn step_and_check_invariants_zero_alloc_under_timed_alloc() {
         delta,
         AllocCounts::ZERO,
         "step() / is_disable_authorized() / check_invariants() MUST perform zero heap ops, got {delta:?}"
+    );
+}
+
+#[test]
+fn transition_wake_pre_tx_cancel_idempotent_enable_continuous_k3_and_orphan_expiry() {
+    // 1. Pre-TX enable cancel transitions ReadyToSwitchOn -> SwitchOnDisabled ONLY when zero
+    //    enable writes were sent and zero channels were confirmed; once any enable write is sent
+    //    (or when starting from OperationEnabled), cancel MUST fail closed into FailedHold.
+    let mut s = TorqueState::new(single_arm_config(2)).unwrap();
+    checked_step(&mut s, Event::Release { now_us: 1_000 });
+    let en0 = checked_step(&mut s, Event::EnableStart { group: 0, now_us: 1_000 });
+    let att0 = en0.enable_for(0).expect("enable starts").attempt_id;
+    assert_eq!(s.groups[0].drive_state, DriveState::ReadyToSwitchOn);
+
+    // Duplicate EnableStart while already ReadyToSwitchOn still refuses AlreadyEnabled.
+    let dup_en = checked_step(&mut s, Event::EnableStart { group: 0, now_us: 1_500 });
+    assert_eq!(
+        dup_en.refusal_for(0).map(|r| r.code),
+        Some(RefusalCode::AlreadyEnabled)
+    );
+
+    // Pre-TX cancel before any enable wire write cleanly returns to SwitchOnDisabled / Off.
+    checked_step(
+        &mut s,
+        Event::EnableCancelledPreTx {
+            group: 0,
+            attempt_id: att0,
+            now_us: 2_000,
+        },
+    );
+    assert_eq!(s.groups[0].drive_state, DriveState::SwitchOnDisabled);
+    assert_eq!(s.groups[0].torque_intent, TorqueIntent::Off);
+
+    // After any enable write is sent (`Sent`), EnableCancelledPreTx MUST enter FailedHold.
+    let en1 = checked_step(&mut s, Event::EnableStart { group: 0, now_us: 3_000 });
+    let att1 = en1.enable_for(0).expect("second enable starts").attempt_id;
+    let gen1 = s.groups[0].stop_generation;
+    checked_step(
+        &mut s,
+        Event::WriteResult(WriteResult::uniform(
+            0,
+            0,
+            WriteKind::Enable,
+            att1,
+            gen1,
+            3_500,
+            3_500,
+            ChannelMask::bit(0),
+            MotorWriteOutcome::Sent,
+        )),
+    );
+    checked_step(
+        &mut s,
+        Event::EnableCancelledPreTx {
+            group: 0,
+            attempt_id: att1,
+            now_us: 4_000,
+        },
+    );
+    assert_eq!(s.groups[0].drive_state, DriveState::FailedHold);
+    assert_eq!(s.groups[0].torque_intent, TorqueIntent::On);
+
+    // 2. Idempotent EnableStart while OperationEnabled succeeds and sets any_write_sent = true.
+    let mut s2 = TorqueState::new(single_arm_config(2)).unwrap();
+    enable_group_clean(&mut s2, 0, 10_000);
+    assert_eq!(s2.groups[0].drive_state, DriveState::OperationEnabled);
+    let idem = checked_step(&mut s2, Event::EnableStart { group: 0, now_us: 20_000 });
+    let idem_att = idem
+        .enable_for(0)
+        .expect("idempotent EnableStart from OperationEnabled must be accepted")
+        .attempt_id;
+    assert!(s2.groups[0].enable_tx.unwrap().any_write_sent);
+    checked_step(
+        &mut s2,
+        Event::HandshakeResult {
+            group: 0,
+            attempt_id: idem_att,
+            now_us: 21_000,
+            confirmed_mask: ChannelMask::from_count(2),
+            outcome: HandshakeOutcome::Confirmed,
+        },
+    );
+    assert_eq!(s2.groups[0].drive_state, DriveState::OperationEnabled);
+
+    // 3. Continuous K=3 rest-window accumulation before DisableRequest authorizes immediately,
+    //    and TransitionWake advances Repeat 2 & 3 at +20ms without bumping current_release_id.
+    let mut sid = 100u64;
+    for k in 0..3u64 {
+        let t = 50_000 + k * 15_000;
+        checked_step(&mut s2, Event::Release { now_us: t });
+        for c in 0..2u8 {
+            sid += 1;
+            checked_step(&mut s2, Event::CausalSample(sample_at(c, sid, t, 0.0)));
+        }
+    }
+    let rel_before_wake = s2.current_release_id;
+    let dreq = checked_step(
+        &mut s2,
+        Event::DisableRequest {
+            group: 0,
+            now_us: 80_500,
+            explicit_release_authorized: false,
+            recipient_mask_override: None,
+        },
+    );
+    let d1 = dreq
+        .disable_for(0)
+        .expect("pre-existing valid K=3 window must authorize DisableRequest immediately");
+    assert_eq!(d1.repeat_index, 0);
+    checked_step(
+        &mut s2,
+        Event::WriteResult(WriteResult::uniform(
+            0,
+            0,
+            WriteKind::DisableRequested,
+            d1.dispatch_id,
+            d1.generation,
+            81_000,
+            81_000,
+            d1.recipients,
+            MotorWriteOutcome::Sent,
+        )),
+    );
+    // Sub-release TransitionWake at +20 ms emits Repeat 2 WITHOUT incrementing release_id.
+    let w2 = checked_step(&mut s2, Event::TransitionWake { now_us: 101_000 });
+    assert_eq!(s2.current_release_id, rel_before_wake);
+    let d2 = w2
+        .disable_for(0)
+        .expect("TransitionWake must emit Repeat 2 at +20 ms");
+    assert_eq!(d2.repeat_index, 1);
+    checked_step(
+        &mut s2,
+        Event::WriteResult(WriteResult::uniform(
+            0,
+            0,
+            WriteKind::DisableRequested,
+            d2.dispatch_id,
+            d2.generation,
+            101_500,
+            101_500,
+            d2.recipients,
+            MotorWriteOutcome::Sent,
+        )),
+    );
+    // Repeat 3 emitted on TransitionWake, but simulate lost WriteResult -> orphaned dispatch.
+    let w3 = checked_step(&mut s2, Event::TransitionWake { now_us: 121_500 });
+    let d3 = w3
+        .disable_for(0)
+        .expect("TransitionWake must emit Repeat 3 at +20 ms");
+    assert_eq!(d3.repeat_index, 2);
+
+    // Before deadline, EnableStart is still fenced with DisableInProgress.
+    let fenced_en = checked_step(&mut s2, Event::EnableStart { group: 0, now_us: 200_000 });
+    assert_eq!(
+        fenced_en.refusal_for(0).map(|r| r.code),
+        Some(RefusalCode::DisableInProgress)
+    );
+
+    // Once deadline expires, Release/TransitionWake finishes tx AND clears orphaned dispatch,
+    // allowing the next cycle's EnableStart to succeed cleanly.
+    checked_step(
+        &mut s2,
+        Event::TransitionWake {
+            now_us: d3.deadline_us + 1_000,
+        },
+    );
+    assert!(s2.groups[0].disable_tx.is_none());
+    assert!(s2.groups[0].pending_disable_dispatch.is_none());
+    let next_en = checked_step(
+        &mut s2,
+        Event::EnableStart {
+            group: 0,
+            now_us: d3.deadline_us + 2_000,
+        },
+    );
+    assert!(
+        next_en.enable_for(0).is_some(),
+        "next cycle EnableStart must succeed after orphaned dispatch expires"
     );
 }

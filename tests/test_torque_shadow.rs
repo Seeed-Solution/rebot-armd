@@ -1076,6 +1076,7 @@ fn run_fuzz_trace_on_owner(owner: ShadowOwner, ops: &[FuzzOp]) -> ShadowRunOutco
                         } else {
                             ChannelMask::from_count(7)
                         },
+                        stale_held_mask: ChannelMask::EMPTY,
                         contended,
                         escalated: false,
                         live_intent,
@@ -2073,6 +2074,7 @@ async fn r1_review_regressions_comparator_remount_unknown_queue_and_disabled_all
         });
         rt.enqueue(ShadowInputKind::LiveHoldCheckpoint {
             hold_mask: ChannelMask::EMPTY,
+            stale_held_mask: ChannelMask::EMPTY,
             contended: true,
             escalated: false,
             live_intent: TorqueIntent::On,
@@ -2383,6 +2385,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t1,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x3c),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2408,6 +2411,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t2,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7c),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2433,6 +2437,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t3,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7f),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2458,6 +2463,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t4,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7f),
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2503,6 +2509,7 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             t5,
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask: ChannelMask(0x7e), // live dropped J1 while reducer predicts 0x7f
+                stale_held_mask: ChannelMask::EMPTY,
                 contended: false,
                 escalated: false,
                 live_intent: TorqueIntent::On,
@@ -2622,4 +2629,1098 @@ fn failed_hold_ramp_shadow_comparison_has_zero_divergences() {
             "live FailedHold ramp must report 0 invariant violations: {snap:?}"
         );
     }
+}
+
+// =========================================================================
+// 14. Real-Arm Replay Regressions: dev21 Legacy & dev22 Executor + Follow-Ups
+// =========================================================================
+
+#[test]
+fn realarm_dev21_legacy_soak_and_boot_resync_zero_divergences() {
+    // Reproduces dev21/dev20 real-arm patterns on BOTH Legacy & Executor owners:
+    // - Cold boot -> enable -> idempotent re-enable while already OperationEnabled (0 AlreadyEnabled!)
+    // - Pre-TX enable cancel -> clean SwitchOnDisabled -> subsequent enable succeeds
+    // - Normal park lifecycle (`ParkLifecycle`) -> 0 seq gaps (`interval_unverifiable == false`)
+    // - FailedHold + J7 `HeldStaleTarget` (> 100 ms stale J7 while J1..J6 stay fresh) ->
+    //   classified as ReviewedPr2Only(LiveHeldStaleTarget), 0 unexplained divergences, plus
+    //   negative guard confirming genuine missing/unverified hold bits still diverge
+    // - SAFE-HOLD with fresh + stale target, FRESHEN, watchdog hold, driver remount, and
+    //   Legacy -> Executor -> Legacy owner handover/handback
+    // - Byte-identical CAN wire frames (shadow ON vs shadow OFF)
+
+    fn run_dev21_legacy(shadow_enabled: bool) -> (Vec<CanFrame>, armd::torque::shadow::TorqueShadowDiagnostics) {
+        let clock = Arc::new(MockClock::new());
+        let bus = FakeCan::new(clock.clone());
+        let mut cfg = build_dm_config(shadow_enabled);
+        cfg.damiao_gripper = None;
+        let drv = build_dm_driver(bus.clone(), &cfg);
+        let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+
+        // 1. Cold boot + initial rest feedback + enable + idempotent re-enable while Armed.
+        bus.with(|s| {
+            s.set_pose(&[0.0; 7]);
+            s.push_all_feedback();
+        });
+        inner.tick_control(0.02);
+        let st = inner.current_admission_stamp();
+        let adm = inner.check_admission(st).unwrap();
+        SupervisorInner::enable_torque(adm).unwrap();
+
+        // Idempotent re-enable ~35 ms after already Armed (exact dev20/dev21 pattern).
+        clock.advance(Duration::from_millis(35));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick_control(0.02);
+        let st2 = inner.current_admission_stamp();
+        let adm2 = inner.check_admission(st2).unwrap();
+        SupervisorInner::enable_torque(adm2).unwrap();
+
+        // 2. Stationary K=3 rest window accumulated BEFORE DisableRequest -> clean disable.
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(25));
+            bus.with(|s| {
+                s.set_pose(&[0.0; 7]);
+                s.push_all_feedback();
+            });
+            inner.tick_control(0.02);
+        }
+        inner.disable_torque().unwrap();
+        for _ in 0..5 {
+            clock.advance(Duration::from_millis(25));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick_control(0.02);
+        }
+
+        // 3. FRESHEN path: idle > 120 ms while disarmed -> re-enable triggers FRESHEN -> Armed.
+        clock.advance(Duration::from_millis(160));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick_control(0.02);
+        let st3 = inner.current_admission_stamp();
+        let adm3 = inner.check_admission(st3).unwrap();
+        SupervisorInner::enable_torque(adm3).unwrap();
+
+        // 4. BusLoss / Watchdog-style fault stop -> holds -> clear fault -> rest-disable.
+        clock.advance(Duration::from_millis(25));
+        bus.with(|s| s.push_all_feedback());
+        inner.apply_stop_policy(armd::safety::StopPolicy::BusLossFallback);
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(25));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick_control(0.02);
+        }
+        inner.clear_fault().unwrap();
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(25));
+            bus.with(|s| {
+                s.set_pose(&[0.0; 7]);
+                s.push_all_feedback();
+            });
+            inner.tick_control(0.02);
+        }
+        inner.disable_torque().unwrap();
+        for _ in 0..5 {
+            clock.advance(Duration::from_millis(25));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick_control(0.02);
+        }
+
+        // 5. Remount driver while disarmed -> boot sync stays aligned -> enable cleanly.
+        let drv2 = build_dm_driver(bus.clone(), &cfg);
+        inner = inner.with_driver(Box::new(drv2));
+        clock.advance(Duration::from_millis(25));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick_control(0.02);
+        let st4 = inner.current_admission_stamp();
+        let adm4 = inner.check_admission(st4).unwrap();
+        SupervisorInner::enable_torque(adm4).unwrap();
+
+        inner.test_flush_and_drain_torque_shadow();
+        let tx = bus.with(|s| s.tx_log.clone());
+        let diag = inner.torque_shadow_diagnostics();
+        (tx, diag)
+    }
+
+    let (tx_off, _) = run_dev21_legacy(false);
+    let (tx_on, diag_leg) = run_dev21_legacy(true);
+    assert_eq!(
+        tx_off, tx_on,
+        "dev21 Legacy replay CAN wire frames must be byte-identical with shadow ON vs OFF"
+    );
+    assert!(diag_leg.comparisons_total > 0);
+    assert_eq!(
+        diag_leg.unexplained_divergences_total, 0,
+        "dev21 Legacy replay must have 0 unexplained divergences: {diag_leg:?}"
+    );
+    assert_eq!(diag_leg.taxonomy.invariant_violation, 0);
+    assert!(!diag_leg.ring.interval_unverifiable, "no seq gap or overflow allowed: {diag_leg:?}");
+    assert_eq!(diag_leg.ring.ring_dropped_records, 0);
+    assert_eq!(diag_leg.ring.staging_dropped_records, 0);
+
+    // 6. Normal ParkLifecycle + Pre-TX cancel + J7 HeldStaleTarget + negative guards on BOTH owners.
+    for owner in [ShadowOwner::Legacy, ShadowOwner::Executor] {
+        let clock = Arc::new(MockClock::new());
+        let cfg = build_dm_config(true);
+        let (mut rt, hub) = ShadowRuntime::new_with_hub(
+            &cfg,
+            true,
+            VendorKind::Damiao,
+            true,
+            Some(clock.clone() as Arc<dyn DriverClock>),
+        );
+        rt.set_owner(owner);
+
+        // Seed verified modes on Damiao.
+        let t0 = clock.now();
+        for ch in 0..7u8 {
+            rt.enqueue_at(
+                t0,
+                ShadowInputKind::DriverObs(ShadowDriverObs::ModeVerified {
+                    channel: ch,
+                    mode: armd::motor_mode::ControlMode::PositionVelocity,
+                    now: t0,
+                    provenance: EvidenceProvenance::HardwareCausal,
+                }),
+            );
+        }
+
+        // Pre-TX enable cancel (0 enable writes sent) -> clean SwitchOnDisabled -> next EnableStart succeeds!
+        let op_cancel = rt.alloc_live_op_id();
+        rt.enqueue_at(
+            t0,
+            ShadowInputKind::Release {
+                release_seq: 1,
+                live_intent: TorqueIntent::Off,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        rt.enqueue_at(
+            t0,
+            ShadowInputKind::EnableStart {
+                live_op_id: op_cancel,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        rt.enqueue_at(
+            t0,
+            ShadowInputKind::EnableCancelledPreTx {
+                live_op_id: op_cancel,
+                live_intent: TorqueIntent::Off,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+
+        // Normal ParkLifecycle (non-tier1) must NOT create a seq gap or latch interval_unverifiable!
+        rt.enqueue_at(
+            t0,
+            ShadowInputKind::ParkLifecycle {
+                live_op_id: 99,
+                admitted: true,
+                settled_ok: None,
+            },
+        );
+        rt.enqueue_at(
+            t0,
+            ShadowInputKind::ParkLifecycle {
+                live_op_id: 99,
+                admitted: false,
+                settled_ok: Some(true),
+            },
+        );
+
+        // Now arm, enter FailedHold with all 7 channels captured, then let J7 go stale (> 100 ms)
+        // while live holds J7 via `HeldStaleTarget` (`stale_held_mask = bit(6)`):
+        clock.advance(Duration::from_millis(20));
+        let t1 = clock.now();
+        let op_en = rt.alloc_live_op_id();
+        rt.enqueue_at(
+            t1,
+            ShadowInputKind::Release {
+                release_seq: 2,
+                live_intent: TorqueIntent::Off,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        rt.enqueue_at(
+            t1,
+            ShadowInputKind::EnableStart {
+                live_op_id: op_en,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        let mut sid = 1u64;
+        for ch in 0..7u8 {
+            sid += 1;
+            rt.enqueue_at(
+                t1,
+                ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                    channel: ch,
+                    sample_id: sid,
+                    stamp: RxStampKind::Valid {
+                        rx_at: t1,
+                        drift_ns: 0,
+                        live_post_settle: true,
+                    },
+                    decode_now: t1,
+                    position_rad: 0.0,
+                    velocity_rad_s: Some(0.0),
+                    temperature_c: Some(30.0),
+                    reported_enabled: Some(true),
+                    correlated_after_write_done: None,
+                    poll_issued: None,
+                    provenance: EvidenceProvenance::HardwareCausal,
+                }),
+            );
+        }
+        rt.enqueue_at(
+            t1,
+            ShadowInputKind::HandshakeResult {
+                live_op_id: op_en,
+                confirmed_mask: ChannelMask::EMPTY,
+                outcome: HandshakeOutcome::Failed,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        // Advance 120 ms keeping J1..J6 fresh, J7 stale (> 100 ms): live holds 0x7f with stale bit 6.
+        for r in 3..=9u64 {
+            clock.advance(Duration::from_millis(20));
+            let tr = clock.now();
+            rt.enqueue_at(
+                tr,
+                ShadowInputKind::Release {
+                    release_seq: r,
+                    live_intent: TorqueIntent::On,
+                    live_is_torqued: true,
+                    live_stopped: true,
+                },
+            );
+            for ch in 0..6u8 {
+                sid += 1;
+                rt.enqueue_at(
+                    tr,
+                    ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                        channel: ch,
+                        sample_id: sid,
+                        stamp: RxStampKind::Valid {
+                            rx_at: tr,
+                            drift_ns: 0,
+                            live_post_settle: true,
+                        },
+                        decode_now: tr,
+                        position_rad: 0.0,
+                        velocity_rad_s: Some(0.0),
+                        temperature_c: Some(30.0),
+                        reported_enabled: Some(true),
+                        correlated_after_write_done: None,
+                        poll_issued: None,
+                        provenance: EvidenceProvenance::HardwareCausal,
+                    }),
+                );
+            }
+        }
+        let t_stale = clock.now();
+        rt.enqueue_at(
+            t_stale,
+            ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: ChannelMask(0x7f),
+                stale_held_mask: ChannelMask::bit(6),
+                contended: false,
+                escalated: false,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        rt.flush_and_drain_sync();
+        let snap = hub.snapshot();
+        assert_eq!(
+            snap.unexplained_divergences_total, 0,
+            "owner={owner:?}: verified HeldStaleTarget + ParkLifecycle + pre-TX cancel must have 0 unexplained divergences: {snap:?}"
+        );
+        assert_eq!(snap.taxonomy.invariant_violation, 0);
+        assert!(!snap.ring.interval_unverifiable, "owner={owner:?}: ParkLifecycle must not cause seq gap: {snap:?}");
+        assert!(
+            snap.taxonomy.reviewed_pr2_only >= 1,
+            "owner={owner:?}: J7 HeldStaleTarget must be recorded under reviewed_pr2_only: {snap:?}"
+        );
+
+        // Negative guard: if live drops a fresh predicted joint (J1) while holding stale J7,
+        // it MUST STILL be flagged as an unexplained divergence!
+        clock.advance(Duration::from_millis(20));
+        let t_neg = clock.now();
+        rt.enqueue_at(
+            t_neg,
+            ShadowInputKind::Release {
+                release_seq: 10,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        for ch in 0..6u8 {
+            sid += 1;
+            rt.enqueue_at(
+                t_neg,
+                ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                    channel: ch,
+                    sample_id: sid,
+                    stamp: RxStampKind::Valid {
+                        rx_at: t_neg,
+                        drift_ns: 0,
+                        live_post_settle: true,
+                    },
+                    decode_now: t_neg,
+                    position_rad: 0.0,
+                    velocity_rad_s: Some(0.0),
+                    temperature_c: Some(30.0),
+                    reported_enabled: Some(true),
+                    correlated_after_write_done: None,
+                    poll_issued: None,
+                    provenance: EvidenceProvenance::HardwareCausal,
+                }),
+            );
+        }
+        rt.enqueue_at(
+            t_neg,
+            ShadowInputKind::LiveHoldCheckpoint {
+                hold_mask: ChannelMask(0x7e), // J1 missing, J7 stale extra -> mixed mismatch!
+                stale_held_mask: ChannelMask::bit(6),
+                contended: false,
+                escalated: false,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: true,
+            },
+        );
+        rt.flush_and_drain_sync();
+        let snap_neg = hub.snapshot();
+        assert_eq!(
+            snap_neg.unexplained_divergences_total, 1,
+            "owner={owner:?}: mixed missing fresh hold + stale extra must still diverge: {snap_neg:?}"
+        );
+    }
+}
+
+#[test]
+fn realarm_dev22_executor_multicycle_window2_wake_zero_divergences() {
+    // Reproduces the exact real-arm dev22 executor 1/13/14 cycle divergence pattern across 4
+    // consecutive enable -> hold -> multi-tick rest-disable cycles with Window 2 sub-release wakes
+    // firing Repeat 3 just after a Release that saw `now < next_repeat_at`, plus transient
+    // WouldBlock backpressure and split multi-tick disable passes.
+    fn run_dev22_executor(shadow_enabled: bool) -> (Vec<CanFrame>, armd::torque::shadow::TorqueShadowDiagnostics) {
+        let clock = Arc::new(MockClock::new());
+        let bus = FakeCan::new(clock.clone());
+        let mut cfg = build_dm_config(shadow_enabled);
+        cfg.damiao_gripper = None;
+        let drv = build_dm_driver(bus.clone(), &cfg);
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
+        inner.test_set_torque_shadow_owner(ShadowOwner::Executor);
+        let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(22),
+            Capacities { commands: 8, plans: 1, replies: 32 },
+            armd::rt_core::ops::VirtualClock::starting_at(clock.now()),
+        );
+        // 50 Hz (20 ms) release period matching real-arm dev22, with Window 2 sub-release wakes
+        // firing ~500 us after a Release that saw `now < next_repeat_at`.
+
+        let sync_clocks = |fx: &ReleaseFixture<SupervisorInner>, clock: &MockClock| {
+            let fx_now = fx.now();
+            let c_now = clock.now();
+            if fx_now > c_now {
+                clock.advance(fx_now.saturating_duration_since(c_now));
+            } else if c_now > fx_now {
+                fx.clock().advance(c_now.saturating_duration_since(fx_now));
+            }
+        };
+
+        bus.with(|s| {
+            s.set_pose(&[0.0; 7]);
+            s.push_all_feedback();
+        });
+        let _ = fx.step_with_clock(|| clock.now());
+        sync_clocks(&fx, &clock);
+
+        let mut req_id = 1u64;
+        for cycle in 0..4u64 {
+            // 1. Enable torque via broker.
+            let ep = fx.core.safety.epoch_id();
+            let _ = broker
+                .submit(
+                    ClientId(1),
+                    req_id,
+                    Authority {
+                        lease_generation: 0,
+                        epoch: ep,
+                        stop_generation: 0,
+                        config_revision: 0,
+                        parent_generation: 0,
+                    },
+                    clock.now() + Duration::from_secs(5),
+                    Submit::Transition(TransitionOp::TorqueOn),
+                )
+                .unwrap();
+            req_id += 1;
+
+            let mut enabled = false;
+            for _ in 0..80 {
+                sync_clocks(&fx, &clock);
+                bus.with(|s| {
+                    s.set_pose(&[0.0; 7]);
+                    s.push_all_feedback();
+                });
+                let rep = fx.step_with_clock(|| clock.now());
+                sync_clocks(&fx, &clock);
+                fx.core.test_flush_and_drain_torque_shadow();
+                if let Some((_, Outcome::Completed)) = rep.transition_ended {
+                    enabled = true;
+                    break;
+                }
+            }
+            assert!(enabled, "cycle {cycle}: TorqueOn must complete");
+
+            // 2. Hold stationary at rest across >= 3 releases spanning >= 20 ms (pre-existing K=3 window!).
+            for _ in 0..15 {
+                sync_clocks(&fx, &clock);
+                bus.with(|s| {
+                    s.set_pose(&[0.0; 7]);
+                    s.push_all_feedback();
+                });
+                let _ = fx.step_with_clock(|| clock.now());
+                sync_clocks(&fx, &clock);
+                fx.core.test_flush_and_drain_torque_shadow();
+            }
+
+            // 3. Submit TorqueOff and drive repeats using BOTH periodic Release (Window 1) AND
+            //    explicit sub-release Window 2 `service_wake_at_clock` firing Repeat 3 just after
+            //    a Release that saw `now < next_repeat_at`, plus transient WouldBlock on cycle 2.
+            let ep2 = fx.core.safety.epoch_id();
+            let _ = broker
+                .submit(
+                    ClientId(1),
+                    req_id,
+                    Authority {
+                        lease_generation: 0,
+                        epoch: ep2,
+                        stop_generation: 0,
+                        config_revision: 0,
+                        parent_generation: 0,
+                    },
+                    clock.now() + Duration::from_secs(5),
+                    Submit::Transition(TransitionOp::TorqueOff),
+                )
+                .unwrap();
+            req_id += 1;
+
+            let mut disabled = false;
+            let mut injected_wb = false;
+            for _ in 0..80u32 {
+                // Inject a single transient WouldBlock on J5..J7 during cycle 2's Repeat 2
+                // to exercise split multi-tick disable passes (`0xf` then `0x70`).
+                if cycle == 2 && !injected_wb {
+                    let dis_sent = bus.with(|s| {
+                        s.tx_log
+                            .iter()
+                            .filter(|f| !f.is_extended && f.dlc == 8 && f.data == damiao::CMD_DISABLE)
+                            .count()
+                    });
+                    if dis_sent >= (cycle as usize) * 21 + 7 {
+                        bus.with(|s| s.fail_disable_mask = 0x70);
+                        injected_wb = true;
+                    }
+                } else {
+                    bus.with(|s| s.fail_disable_mask = 0);
+                }
+                sync_clocks(&fx, &clock);
+                bus.with(|s| {
+                    s.set_pose(&[0.0; 7]);
+                    s.push_all_feedback();
+                });
+                let step_start = clock.now();
+                let mut rep = fx.step_with_clock(|| clock.now());
+                if let Some((_, Outcome::Completed)) = rep.transition_ended {
+                    sync_clocks(&fx, &clock);
+                    fx.core.test_flush_and_drain_torque_shadow();
+                    disabled = true;
+                    break;
+                }
+                // Fire explicit Window-2 sub-release wake 500 us after step_start (before next
+                // 20 ms release) matching real-arm dev22 Repeat 3 sub-release wake timing!
+                let wake_at = step_start + Duration::from_micros(500);
+                if wake_at > clock.now() {
+                    clock.advance(wake_at.saturating_duration_since(clock.now()));
+                }
+                let wake_dl = clock.now() + Duration::from_millis(5);
+                let _ = fx.service_wake_at_clock(|| clock.now(), wake_dl, &mut rep);
+                fx.core.test_flush_and_drain_torque_shadow();
+                sync_clocks(&fx, &clock);
+                if let Some((_, Outcome::Completed)) = rep.transition_ended {
+                    disabled = true;
+                    break;
+                }
+            }
+            bus.with(|s| s.fail_disable_mask = 0);
+            assert!(disabled, "cycle {cycle}: TorqueOff must complete");
+
+            // Drain a couple idle ticks between cycles.
+            for _ in 0..3 {
+                sync_clocks(&fx, &clock);
+                bus.with(|s| s.push_all_feedback());
+                let _ = fx.step_with_clock(|| clock.now());
+                sync_clocks(&fx, &clock);
+                fx.core.test_flush_and_drain_torque_shadow();
+            }
+        }
+
+        fx.core.test_flush_and_drain_torque_shadow();
+        let tx = bus.with(|s| s.tx_log.clone());
+        let diag = fx.core.torque_shadow_diagnostics();
+        (tx, diag)
+    }
+
+    let (tx_off, _) = run_dev22_executor(false);
+    let (tx_on, diag) = run_dev22_executor(true);
+    assert_eq!(
+        tx_off, tx_on,
+        "dev22 Executor 4-cycle replay CAN wire frames must be byte-identical with shadow ON vs OFF"
+    );
+    assert_eq!(diag.owner, ShadowOwner::Executor);
+    assert!(diag.comparisons_total >= 16, "expected >= 16 comparisons across 4 cycles: {diag:?}");
+    assert_eq!(
+        diag.unexplained_divergences_total, 0,
+        "dev22 Executor 4-cycle Window-2 replay must produce 0 unexplained divergences: {diag:?}"
+    );
+    assert_eq!(diag.taxonomy.invariant_violation, 0);
+    assert!(!diag.ring.interval_unverifiable, "dev22 replay must stay verifiable: {diag:?}");
+    assert_eq!(diag.ring.ring_dropped_records, 0);
+    assert_eq!(diag.ring.staging_dropped_records, 0);
+
+    // Negative guard: an unfulfilled predicted disable with no live WriteResult MUST still flag ExtraAction!
+    let clock = Arc::new(MockClock::new());
+    let cfg = build_dm_config(true);
+    let (mut rt, hub) = ShadowRuntime::new_with_hub(
+        &cfg,
+        true,
+        VendorKind::Damiao,
+        true,
+        Some(clock.clone() as Arc<dyn DriverClock>),
+    );
+    rt.set_owner(ShadowOwner::Executor);
+    let t0 = clock.now();
+    for ch in 0..7u8 {
+        rt.enqueue_at(
+            t0,
+            ShadowInputKind::DriverObs(ShadowDriverObs::ModeVerified {
+                channel: ch,
+                mode: armd::motor_mode::ControlMode::PositionVelocity,
+                now: t0,
+                provenance: EvidenceProvenance::HardwareCausal,
+            }),
+        );
+    }
+    let op = rt.alloc_live_op_id();
+    rt.enqueue_at(
+        t0,
+        ShadowInputKind::Release {
+            release_seq: 1,
+            live_intent: TorqueIntent::Off,
+            live_is_torqued: false,
+            live_stopped: false,
+        },
+    );
+    rt.enqueue_at(
+        t0,
+        ShadowInputKind::EnableStart {
+            live_op_id: op,
+            live_refusal: None,
+            live_intent: TorqueIntent::On,
+            live_is_torqued: true,
+            live_stopped: false,
+        },
+    );
+    rt.enqueue_at(
+        t0,
+        ShadowInputKind::HandshakeResult {
+            live_op_id: op,
+            confirmed_mask: ChannelMask::from_count(7),
+            outcome: HandshakeOutcome::Confirmed,
+            live_intent: TorqueIntent::On,
+            live_is_torqued: true,
+            live_stopped: false,
+        },
+    );
+    let mut sid = 10u64;
+    for r in 2..=5u64 {
+        clock.advance(Duration::from_millis(15));
+        let tr = clock.now();
+        rt.enqueue_at(
+            tr,
+            ShadowInputKind::Release {
+                release_seq: r,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        for ch in 0..7u8 {
+            sid += 1;
+            rt.enqueue_at(
+                tr,
+                ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                    channel: ch,
+                    sample_id: sid,
+                    stamp: RxStampKind::Valid {
+                        rx_at: tr,
+                        drift_ns: 0,
+                        live_post_settle: true,
+                    },
+                    decode_now: tr,
+                    position_rad: 0.0,
+                    velocity_rad_s: Some(0.0),
+                    temperature_c: Some(30.0),
+                    reported_enabled: Some(true),
+                    correlated_after_write_done: None,
+                    poll_issued: None,
+                    provenance: EvidenceProvenance::HardwareCausal,
+                }),
+            );
+        }
+    }
+    let dop = rt.alloc_live_op_id();
+    let td = clock.now();
+    // Authorize immediate disable prediction, then NEVER send a live WriteResult and advance 5 releases!
+    rt.enqueue_at(
+        td,
+        ShadowInputKind::DisableRequest {
+            live_op_id: dop,
+            explicit_release_authorized: false,
+            live_refusal: None,
+            live_intent: TorqueIntent::On,
+            live_is_torqued: true,
+            live_stopped: false,
+        },
+    );
+    for r in 6..=10u64 {
+        clock.advance(Duration::from_millis(250));
+        let tr = clock.now();
+        rt.enqueue_at(
+            tr,
+            ShadowInputKind::Release {
+                release_seq: r,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+    }
+    rt.flush_and_drain_sync();
+    let neg_snap = hub.snapshot();
+    assert!(
+        neg_snap.taxonomy.extra_action >= 1,
+        "unfulfilled predicted disable past effective deadline must still report ExtraAction: {neg_snap:?}"
+    );
+}
+
+#[test]
+fn shadow_followup_feetech_partial_damiao_refusal_and_panic_contended_loss() {
+    // 1. Follow-up Major #1: Feetech partial disable includes deferred/refused servo in target_mask.
+    struct PartialFeetechSerial {
+        clock: Arc<MockClock>,
+        tx_count: usize,
+        rx_buf: VecDeque<u8>,
+    }
+    impl Transport for PartialFeetechSerial {
+        fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+            self.tx_count += 1;
+            // Feetech packet: [0xFF, 0xFF, id, len, inst, ...]
+            if data.len() >= 5 && data[0] == 0xFF && data[1] == 0xFF {
+                let id = data[2];
+                let inst = data[4];
+                if inst == 0x03 {
+                    // WRITE TORQUE_ENABLE=0: servo 1 succeeds (ACK), servo 2 returns WouldBlock!
+                    if id == 2 {
+                        return Err(TransportError::WouldBlock);
+                    }
+                    // Status ACK packet: 0xFF 0xFF id 0x02 0x00 checksum
+                    let cksum = !(id.wrapping_add(2));
+                    self.rx_buf.extend([0xFF, 0xFF, id, 0x02, 0x00, cksum]);
+                }
+            }
+            Ok(data.len())
+        }
+        fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
+            let _ = self.write(data)?;
+            Ok(())
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            if self.rx_buf.is_empty() {
+                self.clock.advance(Duration::from_millis(5));
+                return Err(TransportError::Timeout);
+            }
+            let n = buf.len().min(self.rx_buf.len());
+            for b in buf.iter_mut().take(n) {
+                *b = self.rx_buf.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(self.clock.clone() as Arc<dyn DriverClock>)
+        }
+    }
+
+    let fclock = Arc::new(MockClock::new());
+    let mut fdrv = FeetechArmDriver::new(
+        PartialFeetechSerial {
+            clock: fclock.clone(),
+            tx_count: 0,
+            rx_buf: VecDeque::new(),
+        },
+        vec![1, 2],
+    );
+    fdrv.set_shadow_enabled(true);
+    let _ = fdrv.begin_disable_torque(armd::driver::DisableKind::DisableProtective {
+        reason: armd::driver::DisableProtectiveReason::ProcessExit,
+    });
+    let mut fbuf = vec![None; DRIVER_SHADOW_STAGING_CAP];
+    let (fn_obs, fdrop) = fdrv.drain_shadow_observations(&mut fbuf);
+    assert_eq!(fdrop, 0);
+    let partial_wr = fbuf[..fn_obs].iter().find_map(|o| match o {
+        Some(ShadowDriverObs::WriteResult {
+            kind: WriteKind::DisableProtective,
+            target_mask,
+            outcomes,
+            ..
+        }) => Some((*target_mask, *outcomes)),
+        _ => None,
+    });
+    let (mask, outcomes) = partial_wr.expect("expected Feetech DisableProtective WriteResult");
+    assert_eq!(
+        mask,
+        ChannelMask::from_count(2),
+        "Feetech partial disable target_mask must include BOTH servo 0 (Sent) and servo 1 (Deferred)"
+    );
+    assert_eq!(outcomes[0], MotorWriteOutcome::Sent);
+    assert_eq!(outcomes[1], MotorWriteOutcome::Deferred);
+
+    // 1b. Feetech single-repeat partial disable (`{0: Sent, 1: Deferred}`) followed by retry
+    //     `{1: Sent}` on the next wake MUST reconcile the same dispatch_id with 0 divergences!
+    {
+        let mut f_cfg = build_dm_config(true);
+        f_cfg.dof = 2;
+        f_cfg.joint_names = vec!["j1".into(), "j2".into()];
+        f_cfg.damiao_gripper = None;
+        if let Some(ref mut rp) = f_cfg.resting_pose {
+            rp.positions = Some(vec![0.0; 2]);
+        }
+        let rclock = Arc::new(MockClock::new());
+        let (mut frt, fhub) = ShadowRuntime::new_with_hub(
+            &f_cfg,
+            true,
+            VendorKind::Feetech,
+            true,
+            Some(rclock.clone() as Arc<dyn DriverClock>),
+        );
+        let t0 = rclock.now();
+        frt.enqueue_at(
+            t0,
+            ShadowInputKind::EnableStart {
+                live_op_id: 1,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        frt.enqueue_at(
+            t0,
+            ShadowInputKind::HandshakeResult {
+                live_op_id: 1,
+                confirmed_mask: ChannelMask::from_count(2),
+                outcome: HandshakeOutcome::Confirmed,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        rclock.advance(Duration::from_millis(20));
+        let t1 = rclock.now();
+        frt.enqueue_at(
+            t1,
+            ShadowInputKind::Thermal {
+                channel: 0,
+                temperature_c: 85.0,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        let mut partial_outcomes = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        partial_outcomes[0] = MotorWriteOutcome::Sent;
+        partial_outcomes[1] = MotorWriteOutcome::Deferred;
+        frt.enqueue_at(
+            t1,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::DisableProtective,
+                target_mask: ChannelMask::from_count(2),
+                outcomes: partial_outcomes,
+                write_done: t1,
+                now: t1,
+                ambiguous_gap: false,
+            }),
+        );
+        rclock.advance(Duration::from_millis(5));
+        let t2 = rclock.now();
+        let mut retry_outcomes = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        retry_outcomes[1] = MotorWriteOutcome::Sent;
+        frt.enqueue_at(
+            t2,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::DisableProtective,
+                target_mask: ChannelMask::bit(1),
+                outcomes: retry_outcomes,
+                write_done: t2,
+                now: t2,
+                ambiguous_gap: false,
+            }),
+        );
+        frt.flush_and_drain_sync();
+        let fsnap = fhub.snapshot();
+        assert_eq!(
+            fsnap.unexplained_divergences_total, 0,
+            "Feetech partial Sent+Deferred followed by retry Sent must reconcile with 0 divergences: {fsnap:?}"
+        );
+        assert_eq!(fsnap.taxonomy.invariant_violation, 0);
+    }
+
+    // 1c. LegacyJ7 feedback during post-motion settle MUST NOT revoke arm-only rest authorization!
+    {
+        let jclock = Arc::new(MockClock::new());
+        let mut jcfg = build_dm_config(true);
+        jcfg.damiao_gripper = None;
+        let (mut jrt, jhub) = ShadowRuntime::new_with_hub(
+            &jcfg,
+            true,
+            VendorKind::Damiao,
+            true,
+            Some(jclock.clone() as Arc<dyn DriverClock>),
+        );
+        let t0 = jclock.now();
+        for ch in 0..7u8 {
+            jrt.enqueue_at(
+                t0,
+                ShadowInputKind::DriverObs(ShadowDriverObs::ModeVerified {
+                    channel: ch,
+                    mode: armd::motor_mode::ControlMode::PositionVelocity,
+                    now: t0,
+                    provenance: EvidenceProvenance::HardwareCausal,
+                }),
+            );
+        }
+        jrt.enqueue_at(
+            t0,
+            ShadowInputKind::EnableStart {
+                live_op_id: 1,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        jrt.enqueue_at(
+            t0,
+            ShadowInputKind::HandshakeResult {
+                live_op_id: 1,
+                confirmed_mask: ChannelMask::from_count(7),
+                outcome: HandshakeOutcome::Confirmed,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        let mut sid = 1u64;
+        for r in 1..=3u64 {
+            jclock.advance(Duration::from_millis(15));
+            let tr = jclock.now();
+            jrt.enqueue_at(
+                tr,
+                ShadowInputKind::Release {
+                    release_seq: r,
+                    live_intent: TorqueIntent::On,
+                    live_is_torqued: true,
+                    live_stopped: false,
+                },
+            );
+            for ch in 0..6u8 {
+                sid += 1;
+                jrt.enqueue_at(
+                    tr,
+                    ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                        channel: ch,
+                        sample_id: sid,
+                        stamp: RxStampKind::Valid {
+                            rx_at: tr,
+                            drift_ns: 0,
+                            live_post_settle: true,
+                        },
+                        decode_now: tr,
+                        position_rad: 0.0,
+                        velocity_rad_s: Some(0.0),
+                        temperature_c: Some(30.0),
+                        reported_enabled: Some(true),
+                        correlated_after_write_done: None,
+                        poll_issued: None,
+                        provenance: EvidenceProvenance::HardwareCausal,
+                    }),
+                );
+            }
+        }
+        let t_req = jclock.now();
+        // Open DisableRequest (immediately authorized by arm J1..J6 K=3 window).
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DisableRequest {
+                live_op_id: 2,
+                explicit_release_authorized: false,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        // J7 writes motion + receives in-settle feedback: MUST NOT revoke arm authorization!
+        let mut j7_mo = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        j7_mo[6] = MotorWriteOutcome::Sent;
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::Motion,
+                target_mask: ChannelMask::bit(6),
+                outcomes: j7_mo,
+                write_done: t_req,
+                now: t_req,
+                ambiguous_gap: false,
+            }),
+        );
+        sid += 1;
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                channel: 6,
+                sample_id: sid,
+                stamp: RxStampKind::Valid {
+                    rx_at: t_req,
+                    drift_ns: 0,
+                    live_post_settle: false,
+                },
+                decode_now: t_req,
+                position_rad: 0.5,
+                velocity_rad_s: Some(0.2),
+                temperature_c: Some(30.0),
+                reported_enabled: Some(true),
+                correlated_after_write_done: None,
+                poll_issued: None,
+                provenance: EvidenceProvenance::HardwareCausal,
+            }),
+        );
+        let mut dis_ok = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        for c in 0..7 {
+            dis_ok[c] = MotorWriteOutcome::Sent;
+        }
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::DisableRequested,
+                target_mask: ChannelMask::from_count(7),
+                outcomes: dis_ok,
+                write_done: t_req,
+                now: t_req,
+                ambiguous_gap: false,
+            }),
+        );
+        jrt.flush_and_drain_sync();
+        let jsnap = jhub.snapshot();
+        assert_eq!(
+            jsnap.unexplained_divergences_total, 0,
+            "LegacyJ7 motion/in-settle sample must not revoke arm-only rest authorization: {jsnap:?}"
+        );
+        assert_eq!(jsnap.taxonomy.invariant_violation, 0);
+    }
+
+    // 2. Follow-up Major #2: Damiao single-motor pre-transport refusal scopes to the targeted motor.
+    let dclock = Arc::new(MockClock::new());
+    let dbus = FakeCan::new(dclock.clone());
+    let dcfg = build_dm_config(true);
+    let mut ddrv = build_dm_driver(dbus.clone(), &dcfg);
+    ddrv.set_shadow_enabled(true);
+    // Latch stop so a single-motor Hold write hits StopInhibited after frame build.
+    let es = Arc::new(armd::rt_core::urgent::EstopState::new());
+    es.request_and_latch();
+    ddrv.set_estop_state(es);
+    let _ = ddrv.write_measured_hold_masked(1u64 << 2, &vec![armd::driver::JointTarget {
+        position: 0.0,
+        velocity: Some(0.0),
+        torque: Some(0.0),
+        kp: None,
+        kd: None,
+    }; 7]);
+    let mut dbuf = vec![None; DRIVER_SHADOW_STAGING_CAP];
+    let (dn_obs, _) = ddrv.drain_shadow_observations(&mut dbuf);
+    let scoped = dbuf[..dn_obs].iter().find_map(|o| match o {
+        Some(ShadowDriverObs::WriteResult {
+            kind: WriteKind::Hold,
+            target_mask,
+            ..
+        }) => Some(*target_mask),
+        _ => None,
+    });
+    assert_eq!(
+        scoped,
+        Some(ChannelMask::bit(2)),
+        "single-motor Damiao pre-transport refusal must attribute only to motor 2, not full 0x7f"
+    );
+
+    // 3. Follow-up Major #4: Contended legacy panic staging-loss cutoff on TorqueShadowHub.
+    let cfg = build_dm_config(true);
+    let (mut rt, hub) = ShadowRuntime::new_with_hub(&cfg, true, VendorKind::Damiao, true, None);
+    for seq in 1..=3u64 {
+        rt.enqueue(ShadowInputKind::Release {
+            release_seq: seq,
+            live_intent: TorqueIntent::Off,
+            live_is_torqued: false,
+            live_stopped: false,
+        });
+    }
+    rt.flush_and_drain_sync();
+    assert!(!hub.snapshot().ring.interval_unverifiable);
+    hub.record_contended_staging_loss(1);
+    let after_loss = hub.snapshot();
+    assert!(
+        after_loss.ring.interval_unverifiable,
+        "contended legacy panic loss must latch interval_unverifiable: {after_loss:?}"
+    );
+    assert_eq!(
+        after_loss.ring.first_unverifiable_seq,
+        Some(4),
+        "contended cutoff must start at last_allocated_seq + 1 (= 4): {after_loss:?}"
+    );
+    assert_eq!(after_loss.ring.staging_dropped_records, 1);
 }

@@ -4638,7 +4638,21 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
             if let Some((eg, sg)) = client_park {
                 if let Err(e) = self.client_park_stop_check(eg, sg) {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    for rem in idx..n.min(crate::torque::MAX_CHANNELS) {
+                        if !skip_dispatched || (self.disable_dispatched_mask & (1u64 << rem)) == 0 {
+                            shadow_target_mask.insert(rem as u8);
+                            shadow_outcomes[rem] = crate::torque::MotorWriteOutcome::RejectedStale;
+                        }
+                    }
                     if !wrote_any && self.disable_dispatched_mask == 0 {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.stage_feetech_disable_batch(
+                            kind,
+                            shadow_target_mask,
+                            shadow_outcomes,
+                            shadow_ambiguous_gap,
+                        );
                         return Err(e);
                     }
                     write_err = Some(ArmDriverError::HardwareFault(
@@ -4665,11 +4679,32 @@ impl<T: Transport> FeetechArmDriver<T> {
                     }
                 }
                 Ok(false) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    for rem in idx..n.min(crate::torque::MAX_CHANNELS) {
+                        if !skip_dispatched || (self.disable_dispatched_mask & (1u64 << rem)) == 0 {
+                            shadow_target_mask.insert(rem as u8);
+                            shadow_outcomes[rem] = crate::torque::MotorWriteOutcome::Deferred;
+                        }
+                    }
                     deferred = true;
                     break;
                 }
                 Err(e) if client_park.is_some() && is_estop_inhibited(&e) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    for rem in idx..n.min(crate::torque::MAX_CHANNELS) {
+                        if !skip_dispatched || (self.disable_dispatched_mask & (1u64 << rem)) == 0 {
+                            shadow_target_mask.insert(rem as u8);
+                            shadow_outcomes[rem] = crate::torque::MotorWriteOutcome::RejectedStale;
+                        }
+                    }
                     if !wrote_any && self.disable_dispatched_mask == 0 {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.stage_feetech_disable_batch(
+                            kind,
+                            shadow_target_mask,
+                            shadow_outcomes,
+                            shadow_ambiguous_gap,
+                        );
                         return Err(e);
                     }
                     write_err = Some(ArmDriverError::HardwareFault(
@@ -4678,6 +4713,11 @@ impl<T: Transport> FeetechArmDriver<T> {
                     break;
                 }
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        shadow_target_mask.insert(idx as u8);
+                        shadow_outcomes[idx] = crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
                     if refused_err.is_none() {
                         refused_err = Some(e);
                     }
@@ -7947,6 +7987,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     #[cfg(not(target_arch = "wasm32"))]
     defer_disable_shadow: bool,
     #[cfg(not(target_arch = "wasm32"))]
+    shadow_disable_pass_sent_mask: u64,
+    #[cfg(not(target_arch = "wasm32"))]
     pending_disable_shadow: Option<PendingDisableShadowBatch>,
     /// Bitmask of joints (`1u32 << idx`) that have received a `CMD_ENABLE` frame (or reported
     /// `state == 1`) and have not subsequently received `CMD_DISABLE` or causal post-enable
@@ -9111,6 +9153,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             #[cfg(not(target_arch = "wasm32"))]
             defer_disable_shadow: false,
             #[cfg(not(target_arch = "wasm32"))]
+            shadow_disable_pass_sent_mask: 0,
+            #[cfg(not(target_arch = "wasm32"))]
             pending_disable_shadow: None,
             motor_energized_mask: 0,
             motor_last_ctrl_tx: [None; MAX_MODE_JOINTS],
@@ -9914,7 +9958,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[inline]
-    fn stage_damiao_pretransport_refusal(&mut self, kind: TxKind, refusal: &TxRefusal) {
+    fn flush_pending_disable_shadow_now(&mut self) {
+        if self.pending_disable_shadow.is_some() {
+            let now = self.now();
+            PendingDisableShadowBatch::flush_into(
+                &mut self.pending_disable_shadow,
+                &mut self.shadow_staging,
+                now,
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    fn stage_damiao_pretransport_refusal(
+        &mut self,
+        kind: TxKind,
+        refusal: &TxRefusal,
+        targeted_idx: Option<usize>,
+    ) {
         if !self.shadow_staging.is_enabled()
             || matches!(
                 refusal,
@@ -9924,19 +9986,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return;
         }
         let n = self.motor_ids.len().min(crate::torque::MAX_CHANNELS) as u8;
+        let scoped_mask = match targeted_idx {
+            Some(idx) if idx < crate::torque::MAX_CHANNELS => {
+                crate::torque::ChannelMask::bit(idx as u8)
+            }
+            _ => crate::torque::ChannelMask::from_count(n),
+        };
         let (wk, mask) = match kind {
             TxKind::DisableRequested { .. } | TxKind::ClientParkDisable { .. } => {
-                (crate::torque::WriteKind::DisableRequested, crate::torque::ChannelMask::from_count(n))
+                (crate::torque::WriteKind::DisableRequested, scoped_mask)
             }
             TxKind::DisableProtective { .. } => {
-                (crate::torque::WriteKind::DisableProtective, crate::torque::ChannelMask::from_count(n))
+                (crate::torque::WriteKind::DisableProtective, scoped_mask)
             }
             TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) if j < crate::torque::MAX_CHANNELS => {
                 (crate::torque::WriteKind::Hold, crate::torque::ChannelMask::bit(j as u8))
             }
-            TxKind::Hold => (crate::torque::WriteKind::Hold, crate::torque::ChannelMask::from_count(n)),
+            TxKind::Hold => (crate::torque::WriteKind::Hold, scoped_mask),
             TxKind::Target | TxKind::Recovery => {
-                (crate::torque::WriteKind::Motion, crate::torque::ChannelMask::from_count(n))
+                (crate::torque::WriteKind::Motion, scoped_mask)
             }
             _ => return,
         };
@@ -10014,6 +10082,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         build: impl FnOnce(&Self) -> Option<CanFrame>,
     ) -> Result<(CanFrame, u64, Instant, Option<i128>), TxRefusal> {
         let tx_kind = kind.tx_kind();
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut built_frame_for_shadow: Option<CanFrame> = None;
         let res = 'send_body: {
             let expected_lease_gen = self.send_lease_gen;
             let has_pos_force_token = kind.pos_force_token().is_some();
@@ -10065,6 +10135,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 break 'send_body Err(TxRefusal::BuildRefused);
             };
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                built_frame_for_shadow = Some(frame);
+            }
 
             // 5. Re-read physical stop latch, pending gate, stop-generation stamp, lease fence,
             //    MIT fence, position-force submission freshness, deadline, and tick TX cutoff AFTER
@@ -10418,16 +10492,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                                     | crate::torque::WriteKind::DisableProtective
                             )
                         {
+                            if outcome == crate::torque::MotorWriteOutcome::Sent && idx < 64 {
+                                self.shadow_disable_pass_sent_mask |= 1u64 << idx;
+                            }
                             // When a multi-tick requested disable already dispatched >= 1 motor in
-                            // this tick and hits TX backpressure on the next motor, keep the paused
+                            // this pass and hits TX backpressure on the next motor, keep the paused
                             // motor unresolved in `pending_disable_dispatch.remaining_recipients`
                             // (matching budget-pause) so the next tick's Sent write reconciles it.
+                            // Uses shadow-only pass progress (`shadow_disable_pass_sent_mask`) so
+                            // Phase C repeats do not mistake prior-pass `disable_dispatched_mask`.
                             let paused_mid_multitick = matches!(
                                 wk,
                                 crate::torque::WriteKind::DisableRequested
                             ) && outcome == crate::torque::MotorWriteOutcome::Deferred
                                 && (self.pending_disable_shadow.is_some()
-                                    || self.disable_dispatched_mask != 0);
+                                    || self.shadow_disable_pass_sent_mask != 0);
                             if !paused_mid_multitick {
                                 let mut outcomes = [crate::torque::MotorWriteOutcome::NotTargeted;
                                     crate::torque::MAX_CHANNELS];
@@ -10466,7 +10545,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Err(ref refusal) = res {
             if !self.defer_disable_shadow {
-                self.stage_damiao_pretransport_refusal(tx_kind, refusal);
+                let target_idx = match tx_kind {
+                    TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) => Some(j),
+                    _ => built_frame_for_shadow.and_then(|f| {
+                        self.motor_ids
+                            .iter()
+                            .position(|&id| u32::from(id) == f.id)
+                            .or_else(|| self.damiao_command_motor_index(&f))
+                    }),
+                };
+                self.stage_damiao_pretransport_refusal(tx_kind, refusal, target_idx);
             }
         }
         res
@@ -15655,6 +15743,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.stage_damiao_pretransport_refusal(
                             Self::disable_tx_kind(kind),
                             &TxRefusal::TorqueOffWouldDrop,
+                            None,
                         );
                         return Err(ArmDriverError::TorqueOffWouldDrop);
                     }
@@ -15713,6 +15802,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = true;
+            self.shadow_disable_pass_sent_mask = if skip_dispatched {
+                self.disable_dispatched_mask
+            } else {
+                0
+            };
         }
         for idx in 0..self.motor_ids.len() {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
@@ -15763,14 +15857,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                 }
                 Err(r @ (TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) if client_park => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
                     if !sent_any && self.disable_dispatched_mask == 0 {
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             self.defer_disable_shadow = false;
-                            if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
-                                deferred_refusal_mask.insert(idx as u8);
-                                deferred_refusal_outcomes[idx] =
-                                    crate::torque::MotorWriteOutcome::RejectedStale;
+                            if self.shadow_staging.is_enabled() && !deferred_refusal_mask.is_empty() {
                                 let wk = match tx_kind {
                                     TxKind::DisableProtective { .. } => {
                                         crate::torque::WriteKind::DisableProtective
@@ -15787,6 +15884,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                                         write_done: None,
                                     },
                                 );
+                                self.flush_pending_disable_shadow_now();
                             }
                         }
                         self.awaiting_rx_boundary = prev_awaiting_rx_boundary || !self.last_read_drained;
@@ -15893,6 +15991,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 other_err = Some(e.into());
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flush_pending_disable_shadow_now();
         if let Some(reason) = abort_reason {
             let uncertain = if flush_failed && !self.can.flush_is_noop() {
                 sent_this_pass_mask
@@ -16377,8 +16477,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let mut abort_reason: Option<PartialDisableReason> = None;
             let mut other_err = None;
             #[cfg(not(target_arch = "wasm32"))]
+            let mut deferred_refusal_mask = crate::torque::ChannelMask::EMPTY;
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut deferred_refusal_outcomes =
+                [crate::torque::MotorWriteOutcome::NotTargeted; crate::torque::MAX_CHANNELS];
+            #[cfg(not(target_arch = "wasm32"))]
             {
                 self.defer_disable_shadow = true;
+                self.shadow_disable_pass_sent_mask = self.disable_dispatched_mask;
             }
             for idx in 0..self.motor_ids.len() {
                 if idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
@@ -16428,6 +16534,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         break;
                     }
                     Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if idx < crate::torque::MAX_CHANNELS {
+                            deferred_refusal_mask.insert(idx as u8);
+                            deferred_refusal_outcomes[idx] =
+                                crate::torque::MotorWriteOutcome::RejectedStale;
+                        }
                         abort_reason = Some(
                             if self.is_stop_pending() || (!started_in_estop && self.is_stop_latched())
                             {
@@ -16439,10 +16551,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         break;
                     }
                     Err(TxRefusal::DisableRequestExpired) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if idx < crate::torque::MAX_CHANNELS {
+                            deferred_refusal_mask.insert(idx as u8);
+                            deferred_refusal_outcomes[idx] =
+                                crate::torque::MotorWriteOutcome::RejectedStale;
+                        }
                         abort_reason = Some(PartialDisableReason::DeadlineExpired);
                         break;
                     }
                     Err(TxRefusal::TorqueOffWouldDrop) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if idx < crate::torque::MAX_CHANNELS {
+                            deferred_refusal_mask.insert(idx as u8);
+                            deferred_refusal_outcomes[idx] =
+                                crate::torque::MotorWriteOutcome::RejectedStale;
+                        }
                         let moved_joint = match self.evaluate_remaining_arm_joints_rest() {
                             RemainingRestStatus::MovedBeyondRest { joint } => joint,
                             _ => idx,
@@ -16454,6 +16578,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                     Err(TxRefusal::DisableWaitEvidence) => break,
                     Err(r) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if !matches!(r, TxRefusal::Transport(_)) && idx < crate::torque::MAX_CHANNELS {
+                            deferred_refusal_mask.insert(idx as u8);
+                            deferred_refusal_outcomes[idx] = match r {
+                                TxRefusal::Deferred => crate::torque::MotorWriteOutcome::Deferred,
+                                _ => crate::torque::MotorWriteOutcome::RejectedStale,
+                            };
+                        }
                         other_err = Some(Self::refusal_to_driver_err(r));
                         abort_reason = Some(PartialDisableReason::TransportError);
                         break;
@@ -16463,6 +16595,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 self.defer_disable_shadow = false;
+                if self.shadow_staging.is_enabled() && !deferred_refusal_mask.is_empty() {
+                    let wk = match tx_kind {
+                        TxKind::DisableProtective { .. } => {
+                            crate::torque::WriteKind::DisableProtective
+                        }
+                        _ => crate::torque::WriteKind::DisableRequested,
+                    };
+                    PendingDisableShadowBatch::merge_batch(
+                        &mut self.pending_disable_shadow,
+                        PendingDisableShadowBatch {
+                            kind: wk,
+                            target_mask: deferred_refusal_mask,
+                            outcomes: deferred_refusal_outcomes,
+                            ambiguous_gap: false,
+                            write_done: None,
+                        },
+                    );
+                }
             }
             let mut flush_failed = false;
             if sent_any {
@@ -16470,6 +16620,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     flush_failed = true;
                     other_err = Some(e.into());
                 }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            self.flush_pending_disable_shadow_now();
+            if sent_any {
                 let _ = self.receive_feedback();
             }
             if let Some(reason) = abort_reason {
@@ -16622,8 +16776,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut refused_err = None;
         let mut other_err = None;
         #[cfg(not(target_arch = "wasm32"))]
+        let mut deferred_refusal_mask = crate::torque::ChannelMask::EMPTY;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut deferred_refusal_outcomes =
+            [crate::torque::MotorWriteOutcome::NotTargeted; crate::torque::MAX_CHANNELS];
+        #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = true;
+            self.shadow_disable_pass_sent_mask = repeat_pass_mask;
         }
         for idx in 0..self.motor_ids.len() {
             if idx < 64 && (repeat_pass_mask & (1u64 << idx)) != 0 {
@@ -16648,11 +16808,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::DisableWaitEvidence) => wait_evidence = true,
                 Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
                     if refused_err.is_none() {
                         refused_err = Some(Self::refusal_to_driver_err(r));
                     }
                 }
                 Err(r) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if !matches!(r, TxRefusal::Transport(_)) && idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] = match r {
+                            TxRefusal::Deferred => crate::torque::MotorWriteOutcome::Deferred,
+                            _ => crate::torque::MotorWriteOutcome::RejectedStale,
+                        };
+                    }
                     tracing::warn!("Repeat disable transmit failed for motor {}: {:?}", self.motor_ids[idx], r);
                     if other_err.is_none() {
                         other_err = Some(Self::refusal_to_driver_err(r));
@@ -16663,6 +16837,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = false;
+            if self.shadow_staging.is_enabled() && !deferred_refusal_mask.is_empty() {
+                let wk = match tx_kind {
+                    TxKind::DisableProtective { .. } => {
+                        crate::torque::WriteKind::DisableProtective
+                    }
+                    _ => crate::torque::WriteKind::DisableRequested,
+                };
+                PendingDisableShadowBatch::merge_batch(
+                    &mut self.pending_disable_shadow,
+                    PendingDisableShadowBatch {
+                        kind: wk,
+                        target_mask: deferred_refusal_mask,
+                        outcomes: deferred_refusal_outcomes,
+                        ambiguous_gap: false,
+                        write_done: None,
+                    },
+                );
+            }
         }
         let mut flush_ok = true;
         if sent_any {
@@ -16673,6 +16865,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     other_err = Some(e.into());
                 }
             }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flush_pending_disable_shadow_now();
+        if sent_any {
             let _ = self.receive_feedback();
         }
         if let Some(e) = refused_err {
@@ -18564,6 +18760,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = true;
+            self.shadow_disable_pass_sent_mask = self.disable_dispatched_mask;
         }
         for idx in 0..n {
             if (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
@@ -18678,18 +18875,26 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         if let Some(step) = early_ret {
+            #[cfg(not(target_arch = "wasm32"))]
+            self.flush_pending_disable_shadow_now();
             return step;
         }
         if sent_any && !self.can.flush_is_noop() {
             if self.flush_cutoff_exceeded() || self.now() >= deadline {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.flush_pending_disable_shadow_now();
                 return crate::mit::CommissioningDisableStep::InProgress {
                     dispatched_mask: self.disable_dispatched_mask,
                 };
             }
             if self.flush_can_and_commit().is_err() {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.flush_pending_disable_shadow_now();
                 return crate::mit::CommissioningDisableStep::Refused("disable flush failed");
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flush_pending_disable_shadow_now();
         if (self.disable_dispatched_mask & all_mask) == all_mask {
             self.disable_dispatched_mask = 0;
             crate::mit::CommissioningDisableStep::AllDispatched {
@@ -19428,6 +19633,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = true;
+            self.shadow_disable_pass_sent_mask = 0;
         }
         for i in pending_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
@@ -19485,6 +19691,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let _ = self.receive_feedback();
         self.rx_deadline = None;
         self.rx_frame_limit = None;
+
+        // Flush pending disable shadow batch AFTER bounded RX so shadow work never shifts
+        // panic-disable RX deadline budgets (Major #1).
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flush_pending_disable_shadow_now();
 
         let remaining = self.unconfirmed_disable_joints();
         if remaining.is_empty() {
