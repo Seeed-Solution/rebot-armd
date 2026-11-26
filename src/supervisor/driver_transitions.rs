@@ -10581,7 +10581,7 @@ impl SupervisorInner {
                             BudgetedResetAttempt::Ran(res)
                         })
                         .ok_or(ClearFaultWithAuthError::Clear(E::FeedbackUnavailable))?;
-                    if let Some(b) = release_budget.as_deref_mut() {
+                    if let Some(b) = release_budget {
                         if reset_rx_delta > 0 {
                             b.charge_rx(reset_rx_delta, false);
                         }
@@ -10793,7 +10793,7 @@ impl SupervisorInner {
         deadline: Option<Instant>,
         expected_epoch: Option<u64>,
         authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
-        mut release_budget: Option<&mut crate::rt_core::budget::ReleaseBudget>,
+        release_budget: Option<&mut crate::rt_core::budget::ReleaseBudget>,
     ) -> Result<SafetyState, ClearFaultWithAuthError> {
         use crate::driver::CarryoverMotorClearOutcome;
         use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly_with_op;
@@ -11024,7 +11024,7 @@ impl SupervisorInner {
                 return Err(e);
             }
         };
-        if let Some(b) = release_budget.as_deref_mut() {
+        if let Some(b) = release_budget {
             if co_rx_delta > 0 {
                 b.charge_rx(co_rx_delta, false);
             }

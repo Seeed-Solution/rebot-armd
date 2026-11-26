@@ -9769,12 +9769,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if pf_joint == Some(i) || self.base_mode(i) == DamiaoControlMode::PosForce {
                 continue;
             }
-            if armed_mit {
-                reserved += 1;
-            } else if (self.motor_energized_mask & (1u32 << i)) != 0
-                && self.verified_hold_mode(i).is_some()
-                && self.motor_last_ctrl_tx[i]
-                    .is_some_and(|t| now.saturating_duration_since(t) >= WATCHDOG_HOLD_URGENT_INTERVAL)
+            if armed_mit
+                || ((self.motor_energized_mask & (1u32 << i)) != 0
+                    && self.verified_hold_mode(i).is_some()
+                    && self.motor_last_ctrl_tx[i].is_some_and(|t| {
+                        now.saturating_duration_since(t) >= WATCHDOG_HOLD_URGENT_INTERVAL
+                    }))
             {
                 reserved += 1;
             }
