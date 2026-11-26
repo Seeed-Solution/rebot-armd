@@ -10450,6 +10450,11 @@ impl SupervisorInner {
                     let before_budget = drv.release_budget_consumed();
                     if let Some((rx_rem, tx_rem)) = budget_rem {
                         drv.sync_release_budget_limits(rx_rem, tx_rem);
+                    } else {
+                        // Standalone off-release clear_fault call: exit any prior managed release
+                        // and open a fresh TX pass before installing the release-margin deadline
+                        // so a backpressured/expired pass from a prior release never blocks 0xCC.
+                        drv.reset_standalone_tx_pass();
                     }
                     drv.set_tx_release_deadline(Some(drv_deadline));
                     let res = drv.probe_tx_ready_budgeted(drv_deadline);

@@ -12396,6 +12396,8 @@ impl SupervisorInner {
             && !self.urgent_stop_unapplied()
             && !output_tx_cap_expired
             && !matches!(tick_output, TickOutput::ActionDeadlineRefused { .. })
+            && !(self.mit.owner == crate::mit::MitOwner::Active
+                && matches!(tick_output, TickOutput::Error { .. }))
             && self.stopped_hold_eligible()
             && (self.is_torqued || is_stopped_or_failed_hold_fb || pending_disable_hold_fb)
         {

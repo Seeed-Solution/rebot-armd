@@ -549,6 +549,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
     fn begin_control_release(&mut self, release_seq: u64) { self.inner.begin_control_release(release_seq) }
     fn begin_wake_tx_pass(&mut self) { self.inner.begin_wake_tx_pass() }
+    fn reset_standalone_tx_pass(&mut self) { self.inner.reset_standalone_tx_pass() }
     fn tx_budget_max_frames(&self) -> Option<u16> { self.inner.tx_budget_max_frames() }
     fn release_budget_consumed(&self) -> (u16, u16) { self.inner.release_budget_consumed() }
     fn sync_release_budget_limits(&mut self, rx_remaining: u16, tx_remaining: u16) {

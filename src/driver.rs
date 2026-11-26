@@ -1247,6 +1247,10 @@ pub trait ArmDriver: Send {
     /// and mark that Step 5 normal output will NOT run again in this release.
     fn begin_wake_tx_pass(&mut self) {}
 
+    /// Exit any prior managed control release and open a fresh standalone TX pass (used by
+    /// direct off-release `clear_fault` calls that are not sharing a `ReleaseBudget` ledger).
+    fn reset_standalone_tx_pass(&mut self) {}
+
     /// Configured per-release budgeted TX attempt cap, if this driver enforces one.
     fn tx_budget_max_frames(&self) -> Option<u16> { None }
 
@@ -9773,7 +9777,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 || ((self.motor_energized_mask & (1u32 << i)) != 0
                     && self.verified_hold_mode(i).is_some()
                     && self.motor_last_ctrl_tx[i].is_some_and(|t| {
-                        now.saturating_duration_since(t) >= WATCHDOG_HOLD_URGENT_INTERVAL
+                        now.saturating_duration_since(t) >= WATCHDOG_DISABLE_FALLBACK_INTERVAL
                     }))
             {
                 reserved += 1;
@@ -9830,7 +9834,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     #[inline]
-    fn can_start_tick_tx_for_kind(&self, kind: TxKind, fenced: bool) -> bool {
+    fn can_start_tick_tx_for_kind(&self, kind: TxKind, _fenced: bool) -> bool {
         if !self.can_start_tick_tx_n(1) {
             return false;
         }
@@ -9839,8 +9843,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let is_continuity = matches!(
             kind,
-            TxKind::MeasuredHold(_) | TxKind::RollbackHold(_)
-        ) || (matches!(kind, TxKind::Target) && fenced && self.mit_fence.is_some());
+            TxKind::Target | TxKind::MeasuredHold(_) | TxKind::RollbackHold(_)
+        );
         if is_continuity {
             return true;
         }
@@ -18638,6 +18642,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.discard_staged_ctrl_tx();
         self.output_step_pending_in_release = false;
+    }
+
+    fn reset_standalone_tx_pass(&mut self) {
+        self.control_release_managed = false;
+        self.begin_tx_tick();
     }
 
     fn tx_budget_max_frames(&self) -> Option<u16> {
