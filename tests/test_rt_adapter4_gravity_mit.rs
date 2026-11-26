@@ -19,8 +19,9 @@ mod mit_support;
 #[global_allocator]
 static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,12 +37,16 @@ use armd::mit::{self, MitJointQualification, MitQualificationFile};
 use armd::model::{ArmConfig, ControlMode, JointState, JointTrackingConfig, KeepoutBox, TrackingStrategy};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{ClientId, DeliveryDecision, Reply};
-use armd::rt_core::executor::{ExecutorConfig, ExecutorStats, PanicPolicy, RtExecutorHandle};
+use armd::rt_core::executor::{
+    ExecutorClock, ExecutorConfig, ExecutorStats, PanicPolicy, PersistTestHooks, RtExecutorHandle,
+    ESTOP_ACK_CAPACITY, MAINT_QUEUE_CAPACITY, RECLAIM_STATE_CAPACITY, RECLAIM_TRAJ_CAPACITY,
+};
 use armd::rt_core::requests::config::{
     capture_config_admission, gravity_comp_command_with_auth, run_executor_mit_hand_back,
 };
+use armd::rt_core::urgent::URGENT_STOP_CAPACITY;
 use armd::safety::{FaultCode, FaultKind, SafetyState};
-use armd::supervisor::ArmSupervisor;
+use armd::supervisor::{ArmSupervisor, PendingZeroCheckPersist, ZeroCheckPersistContext};
 use armd::transport::{CanFrame, CanRxTime, CanTransport, DriverClock, MockClock, RxClockSample, TransportError};
 use futures_util::{SinkExt, StreamExt};
 use mit_support::{FakeBus, SW_VER};
@@ -449,7 +454,7 @@ impl LiveRig {
             gc.exit_hold_ms = 60;
         }
         let bus = configure_damiao_bus(pose, Duration::from_micros(300), TIMEOUT_2000_COUNTS);
-        let tx_wall_times = Arc::new(std::sync::Mutex::new(Vec::with_capacity(16_384)));
+        let tx_wall_times = Arc::new(std::sync::Mutex::new(Vec::with_capacity(65_536)));
         let stats_slot: Arc<std::sync::OnceLock<Arc<ExecutorStats>>> =
             Arc::new(std::sync::OnceLock::new());
         {
@@ -460,10 +465,7 @@ impl LiveRig {
                     let rel = stats_cb
                         .get()
                         .map_or(0, |st| st.releases_started.load(Ordering::Relaxed));
-                    let mut v = times_cb.lock().unwrap();
-                    if v.len() < v.capacity() {
-                        v.push((Instant::now(), rel));
-                    }
+                    times_cb.lock().unwrap().push((Instant::now(), rel));
                 }));
             });
         }
@@ -731,6 +733,13 @@ fn audit_bus_log(
     window_start: Instant,
     window_end: Instant,
 ) -> WireAudit {
+    assert_eq!(
+        tx_log.len(),
+        tx_meta.len(),
+        "audit_bus_log requires complete per-frame metadata without truncation ({} vs {})",
+        tx_log.len(),
+        tx_meta.len()
+    );
     let mut active_mode = initial_modes;
     let mut last_ctrl = [window_start; 6];
     let mut max_gap = [Duration::ZERO; 6];
@@ -739,8 +748,10 @@ fn audit_bus_log(
     let mut j7_total_frames = 0usize;
     let mut j7_per_release: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
 
-    for (frame, meta_opt) in tx_log.iter().zip(tx_meta.iter()) {
-        let Some((t, release_id)) = *meta_opt else { continue };
+    for (idx, (frame, meta_opt)) in tx_log.iter().zip(tx_meta.iter()).enumerate() {
+        let (t, release_id) = meta_opt.unwrap_or_else(|| {
+            panic!("audit_bus_log missing metadata for frame #{idx}: {frame:?}")
+        });
         if t < window_start || t > window_end {
             continue;
         }
@@ -3960,16 +3971,24 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
         });
         assert_eq!(clears_after_fail, 1, "first ClearFault attempt must be logged");
 
-        // Release 5: bus recovers -> `mit_expiry_cleared_mask` was NOT set so ClearFault IS re-sent!
-        clock.advance(Duration::from_millis(20));
-        drv.begin_control_release(5);
-        inner.with(|s| s.push_all_feedback());
-        drv.read_joint_states().unwrap();
-        let dl5 = clock.now() + Duration::from_millis(500);
-        drv.set_tx_release_deadline(Some(dl5));
-        let r5 = drv.mit_expiry_recover_budgeted(dl5, started_at, &mut gate).unwrap();
-        drv.set_tx_release_deadline(None);
-        assert!(r5, "recovery must succeed once ClearFault flush recovers");
+        // Releases 5..=10: bus recovers -> `mit_expiry_cleared_mask` was NOT set so ClearFault IS
+        // re-sent, then Disable + Barrier + 0xCC complete across releases under max_frames = 16.
+        let mut finished = false;
+        for rel in 5..=10 {
+            clock.advance(Duration::from_millis(20));
+            drv.begin_control_release(rel);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+            let dl = clock.now() + Duration::from_millis(500);
+            drv.set_tx_release_deadline(Some(dl));
+            let r = drv.mit_expiry_recover_budgeted(dl, started_at, &mut gate).unwrap();
+            drv.set_tx_release_deadline(None);
+            if r {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "recovery must succeed once ClearFault flush recovers");
         let clears_total = inner.with(|s| {
             s.tx_log.iter().filter(|f| f.data == damiao::CMD_CLEAR_FAULTS).count()
         });
@@ -3977,6 +3996,200 @@ fn mit_expiry_recover_causal_confirmation_and_flush_failure_retry() {
             clears_total, 2,
             "ClearFault MUST be re-sent after flush failure (mit_expiry_cleared_mask not set)"
         );
+        assert!(inner.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
+    }
+
+    // (c) R1 Blocker 2: Delayed-wire transport (`flush_is_noop() == true`) separating host
+    //     `transmit()` enqueue from actual wire delivery to motors. A delayed `state == 0`
+    //     feedback arriving strictly AFTER host `tx_at` while `CMD_DISABLE` + `REG_READ(RID_CTRL_MODE)`
+    //     are still queued in `pending_wire` MUST NOT falsely commit; only after `CMD_DISABLE` +
+    //     barrier + `0xCC` are delivered onto the wire does recovery commit.
+    {
+        #[derive(Clone)]
+        struct DelayedWireBus {
+            inner: FakeBus,
+            pending_wire: Arc<Mutex<VecDeque<CanFrame>>>,
+            hold_wire: Arc<AtomicBool>,
+        }
+
+        impl DelayedWireBus {
+            fn deliver_wire(&mut self) -> usize {
+                let frames: Vec<CanFrame> = self.pending_wire.lock().unwrap().drain(..).collect();
+                let n = frames.len();
+                for f in frames {
+                    self.inner.transmit(&f).unwrap();
+                }
+                n
+            }
+        }
+
+        impl CanTransport for DelayedWireBus {
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+                self.inner.clock()
+            }
+            fn rx_clock_now(&self) -> Option<CanRxTime> {
+                self.inner.rx_clock_now()
+            }
+            fn rx_clock_sample(&self) -> Option<RxClockSample> {
+                self.inner.rx_clock_sample()
+            }
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+                if self.hold_wire.load(Ordering::Acquire) {
+                    self.pending_wire.lock().unwrap().push_back(*frame);
+                    Ok(())
+                } else {
+                    self.inner.transmit(frame)
+                }
+            }
+            fn receive(&mut self) -> Result<CanFrame, TransportError> {
+                self.inner.receive()
+            }
+            fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+                self.inner.receive_timestamped()
+            }
+            fn receive_with_rx_time(&mut self) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
+                self.inner.receive_with_rx_time()
+            }
+            fn flush(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn supports_bounded_flush(&self) -> bool {
+                self.inner.supports_bounded_flush()
+            }
+            fn supports_nonblocking_rt(&self) -> bool {
+                self.inner.supports_nonblocking_rt()
+            }
+            fn flush_is_noop(&self) -> bool {
+                true
+            }
+        }
+
+        let clock = MockClock::new();
+        let inner = FakeBus::with_clock(&limits, clock.clone());
+        inner.with(|s| {
+            s.poll_feeds_watchdog = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.v = 0.0;
+                m.enabled = i != 3;
+                if i == 3 {
+                    m.state_override = Some(0xD);
+                }
+            }
+            s.push_all_feedback();
+        });
+        let pending_wire = Arc::new(Mutex::new(VecDeque::new()));
+        let hold_wire = Arc::new(AtomicBool::new(false));
+        let mut bus = DelayedWireBus {
+            inner: inner.clone(),
+            pending_wire: Arc::clone(&pending_wire),
+            hold_wire: Arc::clone(&hold_wire),
+        };
+        let mut drv = build_standalone_mit_recovery_driver(bus.clone(), &rest);
+        let started_at = clock.now();
+        for rel in 1..=3 {
+            clock.advance(Duration::from_millis(25));
+            drv.begin_control_release(rel);
+            inner.with(|s| s.push_all_feedback());
+            drv.read_joint_states().unwrap();
+        }
+
+        // Switch to delayed-wire mode: host transmit() enqueues into `pending_wire` only.
+        hold_wire.store(true, Ordering::Release);
+        clock.advance(Duration::from_millis(25));
+        drv.begin_control_release(4);
+        inner.with(|s| s.push_all_feedback());
+        drv.read_joint_states().unwrap();
+        let dl4 = clock.now() + Duration::from_millis(500);
+        let mut gate = || Ok(());
+        drv.set_tx_release_deadline(Some(dl4));
+        let r4 = drv.mit_expiry_recover_budgeted(dl4, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(!r4, "recovery must not commit while CMD_DISABLE + barrier sit in pending_wire");
+        assert_eq!(
+            pending_wire.lock().unwrap().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+            7,
+            "7 CMD_DISABLE frames must be queued in pending_wire"
+        );
+        assert_eq!(
+            pending_wire
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ && f.data[3] == damiao::RID_CTRL_MODE)
+                .count(),
+            7,
+            "7 REG_READ(RID_CTRL_MODE) barrier frames must be queued in pending_wire"
+        );
+        assert!(
+            inner.with(|s| s.motors.iter().enumerate().all(|(i, m)| i == 3 || m.enabled)),
+            "motors must still be enabled on wire before deliver_wire()"
+        );
+
+        // Advance clock by 2 ms (strictly AFTER host `tx_at`!) and inject delayed `state == 0`
+        // feedback for all 7 motors while motors are still enabled in `pending_wire`.
+        clock.advance(Duration::from_millis(2));
+        let delayed_ts = clock.now();
+        inner.with(|s| {
+            let mut frames = Vec::with_capacity(s.motors.len());
+            for m in s.motors.iter_mut() {
+                let prev_en = m.enabled;
+                let prev_ovr = m.state_override;
+                m.enabled = false;
+                m.state_override = None;
+                frames.push(m.feedback_frame());
+                m.enabled = prev_en;
+                m.state_override = prev_ovr;
+            }
+            for fb in frames {
+                s.push_rx_at(fb, Some(delayed_ts));
+            }
+        });
+        drv.begin_control_release(5);
+        drv.read_joint_states().unwrap();
+        let dl5 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl5));
+        let r5 = drv.mit_expiry_recover_budgeted(dl5, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(
+            !r5,
+            "delayed state==0 feedback after tx_at MUST NOT commit before CMD_DISABLE + barrier reach wire"
+        );
+        assert!(inner.with(|s| s.rx.is_empty()), "all 7 delayed state==0 frames must be drained");
+
+        // Deliver ONLY ClearFault + CMD_DISABLE + REG_READ(RID_CTRL_MODE) -> 0x33 barrier replies arrive,
+        // release 6 enqueues 0xCC refreshes (still held in pending_wire) -> MUST still return Ok(false)!
+        assert_eq!(bus.deliver_wire(), 15);
+        clock.advance(Duration::from_millis(2));
+        drv.begin_control_release(6);
+        drv.read_joint_states().unwrap();
+        let dl6 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl6));
+        let r6 = drv.mit_expiry_recover_budgeted(dl6, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(!r6, "recovery must not commit while 0xCC refreshes still sit in pending_wire");
+        assert_eq!(
+            pending_wire
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                .count(),
+            7,
+            "7 0xCC post-barrier refreshes must be queued in pending_wire"
+        );
+
+        // Now deliver 0xCC refreshes onto wire -> post-barrier state==0 feedback arrives -> Ok(true)!
+        assert_eq!(bus.deliver_wire(), 7);
+        clock.advance(Duration::from_millis(2));
+        drv.begin_control_release(7);
+        drv.read_joint_states().unwrap();
+        let dl7 = clock.now() + Duration::from_millis(500);
+        drv.set_tx_release_deadline(Some(dl7));
+        let r7 = drv.mit_expiry_recover_budgeted(dl7, started_at, &mut gate).unwrap();
+        drv.set_tx_release_deadline(None);
+        assert!(r7, "recovery must commit once post-barrier 0xCC reaches wire and confirms state==0");
         assert!(inner.with(|s| s.motors.iter().all(|m| !m.enabled && m.state_override.is_none())));
     }
 }
@@ -4192,21 +4405,216 @@ async fn dual_owner_mit_recovery_authority_revocation_and_new_estop_abort() {
         rig.shutdown().await;
     }
 
-    // Subcase A (ordinary completion branch) & Subcase B (applied E-stop latch branch)
-    // across BOTH OwnerKind::Executor and OwnerKind::Legacy.
+    // Subcase A1 (R1 Major 1): Mid-TX per-frame `pre_tx_gate` revocation on BOTH Legacy and Executor.
+    // Revoke operator token on the 1st CMD_DISABLE frame so the 2nd CMD_DISABLE aborts at `pre_tx_gate`,
+    // proving per-frame pre-TX authority gating aborts remaining CAN TX identically on both owners.
+    for owner in [OwnerKind::Executor, OwnerKind::Legacy] {
+        let cfg = mit_config_j4();
+        let rest = rest_pose_of(&cfg);
+        let qual = valid_mit_qualification_j4(&cfg);
+        let auth = OperatorAuth::enforced("123456", 1800);
+        let rig = LiveRig::start(
+            owner,
+            cfg,
+            rest,
+            auth.clone(),
+            Some(qual),
+            false,
+        )
+        .await;
+
+        let tok = unlock_operator_token(&rig.base_url, "123456").await;
+        let mut ws = ws_connect(&rig.ws_url).await;
+        let granted = ws_send_wait_types(
+            &mut ws,
+            json!({"type": "acquire_lease", "client_id": "mit-midtx-rev", "seq": 1}),
+            &["lease_granted"],
+        )
+        .await;
+        let gen = granted["generation"].as_u64().unwrap();
+        let auth_ack = ws_send_wait_types(
+            &mut ws,
+            json!({"type": "auth", "seq": 2, "token": tok}),
+            &["auth_ack"],
+        )
+        .await;
+        assert_eq!(auth_ack["role"], "operator");
+        let ep0 = rig.sup.get_observation().await.epoch_id;
+
+        let arm_ack = ws_rpc(&mut ws, 1, gen, ep0, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(arm_ack["type"], "command_ack", "{owner:?}: {arm_ack}");
+        let dl_mit = Instant::now() + Duration::from_secs(3);
+        while rig.bus.with(|s| s.motors[3].ctrl_mode()) != damiao::CTRL_MODE_MIT {
+            assert!(Instant::now() < dl_mit);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        induce_j4_mit_expiry_fault(&rig, owner).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..5 {
+            rig.bus.with(|s| s.push_all_feedback());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let rec_epoch = rig.sup.get_observation().await.epoch_id;
+        rig.clear_bus_log();
+
+        let dis_cnt = Arc::new(AtomicUsize::new(0));
+        let dis_cb = Arc::clone(&dis_cnt);
+        let grant_live = auth.operator_grant(Some(&tok));
+        let (rev_tx, rev_rx) = mpsc::sync_channel::<()>(1);
+        let auth_task = auth.clone();
+        let tok_task = tok.clone();
+        let rev_jh = thread::spawn(move || {
+            if rev_rx.recv().is_ok() {
+                auth_task.lock(Some(&tok_task));
+            }
+        });
+        rig.bus.with(|s| {
+            s.on_disable = Some(Arc::new(move || {
+                if dis_cb.fetch_add(1, Ordering::SeqCst) + 1 == 1 {
+                    let _ = rev_tx.send(());
+                    let dl = Instant::now() + Duration::from_millis(200);
+                    while grant_live.is_valid_at(Instant::now(), true) && Instant::now() < dl {
+                        std::hint::spin_loop();
+                    }
+                }
+            }));
+        });
+
+        let rej = ws_rpc(
+            &mut ws,
+            2,
+            gen,
+            rec_epoch,
+            "/api/v1/safety/clear_fault",
+            json!({"mit_recovery": "torque_off_all"}),
+        )
+        .await;
+        rig.bus.with(|s| s.on_disable = None);
+        let _ = rev_jh.join();
+        assert!(!grant_live.is_valid_at(Instant::now(), true));
+        assert_eq!(rej["type"], "command_reject", "{owner:?}: {rej}");
+        assert_eq!(rej["status"], 403, "{owner:?}: {rej}");
+        assert_eq!(rej["code"], "OPERATOR_REQUIRED", "{owner:?}: {rej}");
+
+        let (disable_count, barrier_non_j4_after_dis, first_dis_idx, cc_after_dis) = rig.bus.with(|s| {
+            let dis = s.tx_log.iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
+            let first_dis = s.tx_log.iter().position(|f| f.data == damiao::CMD_DISABLE);
+            let (bar_post, cc_post) = first_dis.map_or((0, 0), |idx| {
+                let tail = &s.tx_log[idx + 1..];
+                // Background L2 `enforce_unverified_mode_readback_parts` only probes unverified J4 (MIT),
+                // whereas recovery barrier probes disabled axes starting from J1 (`data[0] == 1`).
+                let bar = tail
+                    .iter()
+                    .filter(|f| {
+                        f.id == 0x7FF
+                            && f.data[0] != 4
+                            && f.data[2] == damiao::REG_READ
+                            && f.data[3] == damiao::RID_CTRL_MODE
+                    })
+                    .count();
+                let cc = tail
+                    .iter()
+                    .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                    .count();
+                (bar, cc)
+            });
+            (dis, bar_post, first_dis, cc_post)
+        });
+        assert!(first_dis_idx.is_some(), "{owner:?}: expected 1st CMD_DISABLE before revocation");
+        assert!(
+            disable_count < 7,
+            "{owner:?}: mid-TX pre_tx_gate revocation must abort remaining CMD_DISABLE frames (got {disable_count})"
+        );
+        assert_eq!(
+            barrier_non_j4_after_dis, 0,
+            "{owner:?}: zero post-disable REG_READ(RID_CTRL_MODE) recovery barrier frames allowed after revocation"
+        );
+        assert_eq!(
+            cc_after_dis, 0,
+            "{owner:?}: zero post-disable 0xCC frames allowed after revocation"
+        );
+
+        let obs_after = rig.sup.get_observation().await;
+        assert!(
+            matches!(obs_after.safety_state, SafetyState::Fault(_)),
+            "{owner:?}: safety fault must stay latched after mid-TX revocation, got {:?}",
+            obs_after.safety_state
+        );
+
+        // Re-unlock operator and verify subsequent clear_fault completes cleanly to Idle.
+        let tok2 = unlock_operator_token(&rig.base_url, "123456").await;
+        let auth_ack2 = ws_send_wait_types(
+            &mut ws,
+            json!({"type": "auth", "seq": 3, "token": tok2}),
+            &["auth_ack"],
+        )
+        .await;
+        assert_eq!(auth_ack2["role"], "operator");
+        for _ in 0..4 {
+            rig.bus.with(|s| s.push_all_feedback());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let clr_ok = ws_rpc(
+            &mut ws,
+            3,
+            gen,
+            rig.sup.get_observation().await.epoch_id,
+            "/api/v1/safety/clear_fault",
+            json!({"mit_recovery": "torque_off_all"}),
+        )
+        .await;
+        assert_eq!(clr_ok["type"], "command_ack", "{owner:?}: {clr_ok}");
+        assert_eq!(rig.sup.get_observation().await.safety_state, SafetyState::Idle);
+        rig.assert_rt_clean(&format!("MIT recovery mid-TX revocation ({owner:?})"));
+        rig.shutdown().await;
+    }
+
+    // Subcase A2 (ordinary completion branch) & Subcase B (applied E-stop latch branch):
+    // Post-confirmation revocation AFTER the 7th post-barrier `0xCC` frame passes `pre_tx_gate`
+    // (before final logical clear) across BOTH OwnerKind::Executor and OwnerKind::Legacy.
     for applied_estop in [false, true] {
         for owner in [OwnerKind::Executor, OwnerKind::Legacy] {
             let cfg = mit_config_j4();
             let rest = rest_pose_of(&cfg);
             let qual = valid_mit_qualification_j4(&cfg);
             let auth = OperatorAuth::enforced("123456", 1800);
-            let rig = LiveRig::start(
+
+            let watch_post_confirm = Arc::new(AtomicBool::new(false));
+            let arm_revoke_after_tx = Arc::new(AtomicBool::new(false));
+            let barrier_cnt = Arc::new(AtomicUsize::new(0));
+            let cc_cnt = Arc::new(AtomicUsize::new(0));
+            let watch_cb = Arc::clone(&watch_post_confirm);
+            let arm_cb = Arc::clone(&arm_revoke_after_tx);
+            let bar_cb = Arc::clone(&barrier_cnt);
+            let cc_cb = Arc::clone(&cc_cnt);
+            let hook: Arc<dyn Fn(&CanFrame) + Send + Sync> = Arc::new(move |frame: &CanFrame| {
+                if !watch_cb.load(Ordering::Acquire) {
+                    return;
+                }
+                if frame.id == 0x7FF
+                    && frame.data[2] == damiao::REG_READ
+                    && frame.data[3] == damiao::RID_CTRL_MODE
+                {
+                    bar_cb.fetch_add(1, Ordering::SeqCst);
+                } else if bar_cb.load(Ordering::SeqCst) >= 7
+                    && frame.id == 0x7FF
+                    && frame.data[2] == 0xCC
+                    && cc_cb.fetch_add(1, Ordering::SeqCst) + 1 == 7
+                {
+                    arm_cb.store(true, Ordering::SeqCst);
+                }
+            });
+
+            let rig = LiveRig::start_with_hook(
                 owner,
                 cfg,
                 rest,
                 auth.clone(),
                 Some(qual),
                 false,
+                Some(hook),
             )
             .await;
 
@@ -4256,12 +4664,8 @@ async fn dual_owner_mit_recovery_authority_revocation_and_new_estop_abort() {
             let obs_pre_rec = rig.sup.get_observation().await;
             let rec_epoch = obs_pre_rec.epoch_id;
 
-            // Revoke operator token right on the 7th CMD_DISABLE frame (after physical
-            // disable frames have been dispatched to all 7 motors, BEFORE final commit).
-            // Perform the HashMap::remove on a dedicated OS thread so neither `armd-control`
-            // nor a starved Tokio worker blocks or allocates on `armd-control`.
-            let dis_cnt = Arc::new(AtomicUsize::new(0));
-            let dis_cb = Arc::clone(&dis_cnt);
+            // Revoke operator token strictly AFTER the 7th post-barrier `0xCC` frame passes
+            // `pre_tx_gate` (all 7 motors disabled and confirmed, BEFORE final logical clear).
             let grant_live = auth.operator_grant(Some(&tok));
             let (rev_tx, rev_rx) = mpsc::sync_channel::<()>(1);
             let auth_task = auth.clone();
@@ -4271,17 +4675,24 @@ async fn dual_owner_mit_recovery_authority_revocation_and_new_estop_abort() {
                     auth_task.lock(Some(&tok_task));
                 }
             });
+            let arm_tx_cb = Arc::clone(&arm_revoke_after_tx);
+            let grant_tx_cb = grant_live;
+            let prev_on_tx = rig.bus.with(|s| s.on_tx.take());
             rig.bus.with(|s| {
-                s.on_disable = Some(Arc::new(move || {
-                    if dis_cb.fetch_add(1, Ordering::SeqCst) + 1 == 7 {
+                s.on_tx = Some(Arc::new(move || {
+                    if let Some(ref prev) = prev_on_tx {
+                        prev();
+                    }
+                    if arm_tx_cb.swap(false, Ordering::SeqCst) {
                         let _ = rev_tx.send(());
                         let dl = Instant::now() + Duration::from_millis(200);
-                        while grant_live.is_valid_at(Instant::now(), true) && Instant::now() < dl {
+                        while grant_tx_cb.is_valid_at(Instant::now(), true) && Instant::now() < dl {
                             std::hint::spin_loop();
                         }
                     }
                 }));
             });
+            watch_post_confirm.store(true, Ordering::Release);
 
             let rej = ws_rpc(
                 &mut ws,
@@ -4292,11 +4703,11 @@ async fn dual_owner_mit_recovery_authority_revocation_and_new_estop_abort() {
                 json!({"mit_recovery": "torque_off_all"}),
             )
             .await;
-            rig.bus.with(|s| s.on_disable = None);
+            watch_post_confirm.store(false, Ordering::Release);
             let _ = rev_jh.join();
             assert!(
                 !grant_live.is_valid_at(Instant::now(), true),
-                "{owner:?} applied_estop={applied_estop}: operator grant must have been revoked on 7th disable (motor_errors={:?})",
+                "{owner:?} applied_estop={applied_estop}: operator grant must have been revoked on 7th post-barrier 0xCC (motor_errors={:?})",
                 obs_pre_rec.motor_errors
             );
             assert_eq!(
@@ -4439,10 +4850,9 @@ fn mit_expiry_recover_combined_rx_and_tx_budget_exhaustion() {
 
     let mut drv = build_standalone_mit_recovery_driver(bus.clone(), &rest);
     let mut tight_tb = TxBudget::default();
-    // 3 faulted motors require 3 ClearFault frames (> max_frames=2), proving budgeted ClearFault
-    // pauses across releases without duplicating ClearFault, while safety-direction CMD_DISABLE
-    // remains exempt from motion TxBudget (bounded by release deadline).
-    tight_tb.max_frames = 2;
+    // 3 faulted motors require 3 ClearFault + 7 MitRecoveryDisable + 7 Barrier(0x33) + 7 Refresh(0xCC)
+    // = 24 TX frames (> max_frames=4), proving EVERY TX frame respects TxBudget.max_frames = 4.
+    tight_tb.max_frames = 4;
     drv.set_tx_budget(tight_tb);
 
     let started_at = clock.now();
@@ -4494,15 +4904,13 @@ fn mit_expiry_recover_combined_rx_and_tx_budget_exhaustion() {
     );
     assert_eq!(rx_rem4, 16, "expected 14 recovery RX frames consumed (16 left)");
     let tx_rel4 = bus.with(|s| s.tx_log.len());
-    assert!(tx_rel4 <= 2, "release 4 TX ({tx_rel4}) exceeded TxBudget.max_frames=2");
+    assert!(tx_rel4 <= 4, "release 4 TX ({tx_rel4}) exceeded TxBudget.max_frames=4");
 
-    // Releases 5..=10: Step 2 drains remaining 16 frames, then recovery advances under
-    // `TxBudget { max_frames: 2 }` across multiple releases: Release 5 sends 2 ClearFaults and
-    // pauses on TxRefusal::Deferred, Release 6 sends the 3rd ClearFault (zero duplicates) and
-    // completes with the 7 safety-exempt DisableRequested frames.
+    // Releases 5..=25: Step 2 drains remaining 16 frames, then recovery advances under
+    // `TxBudget { max_frames: 4 }` across multiple releases with EVERY TX frame counted.
     let mut finished = false;
     let mut paused_on_tx_budget = false;
-    for rel in 5..=10 {
+    for rel in 5..=25 {
         clock.advance(Duration::from_millis(10));
         let tx_before = bus.with(|s| s.tx_log.len());
         drv.begin_control_release(rel);
@@ -4511,17 +4919,12 @@ fn mit_expiry_recover_combined_rx_and_tx_budget_exhaustion() {
         drv.read_joint_states().unwrap();
         let step = drv.mit_expiry_recover_budgeted(dl, started_at, &mut gate).unwrap();
         drv.set_tx_release_deadline(None);
-        let budgeted_tx_this_rel = bus.with(|s| {
-            s.tx_log[tx_before..]
-                .iter()
-                .filter(|f| f.data != damiao::CMD_DISABLE)
-                .count()
-        });
+        let total_tx_this_rel = bus.with(|s| s.tx_log[tx_before..].len());
         assert!(
-            budgeted_tx_this_rel <= 2,
-            "release {rel} sent {budgeted_tx_this_rel} budgeted TX frames, exceeding TxBudget.max_frames=2"
+            total_tx_this_rel <= 4,
+            "release {rel} sent {total_tx_this_rel} TX frames, exceeding TxBudget.max_frames=4"
         );
-        if !step && budgeted_tx_this_rel == 2 {
+        if !step && total_tx_this_rel == 4 {
             paused_on_tx_budget = true;
         }
         if step {
@@ -4531,7 +4934,7 @@ fn mit_expiry_recover_combined_rx_and_tx_budget_exhaustion() {
     }
     assert!(
         paused_on_tx_budget,
-        "expected recovery to pause at least once after hitting ClearFault TxBudget.max_frames=2"
+        "expected recovery to pause at least once after hitting TxBudget.max_frames=4"
     );
     assert!(finished, "recovery must finish across subsequent TX-budgeted releases");
 
@@ -4950,9 +5353,13 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
     assert_eq!(obs_idle.safety_state, SafetyState::Idle);
     assert!(!obs_idle.is_torqued);
 
-    // 7. Terminal retirement while `StateHub` consumer is stalled -> drop stalled consumer ->
-    //    verify clean off-thread retirement and zero RT allocs/locks across ALL 7 phases!
-    let retired_before = exec.broker().lock().unwrap().stats().retired;
+    // 7. Stalled consumers:
+    //    (a) Stalled `StateHub::reader_guard()` holds `armd-dispatch` on `hub.latest()` while
+    //        `armd-control` finishes `jog_ret` across >= 8 releases with 0 RT allocs/locks.
+    //    (b) Stalled router `ConnectionReplySink` (`DeliveryDecision::Backpressured`) holds
+    //        delivery while the exact `jog_stall_id` terminal ALREADY retires from `broker`
+    //        (`broker.stats().retired` increments STRICTLY BEFORE dropping backpressure!),
+    //        then un-stalling delivers that exact terminal (`terminals_delivered` increments).
     let rearm2 = ws_rpc(&mut ws, 9, gen, obs_idle.epoch_id, "/api/v1/torque", json!({"enable": true})).await;
     assert_eq!(rearm2["type"], "command_ack", "{rearm2}");
     let dl_mit3 = Instant::now() + Duration::from_secs(3);
@@ -4968,17 +5375,18 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
     });
     let ep_ret = rig.sup.get_observation().await.epoch_id;
     let mut jog_t = rest.to_vec();
-    jog_t[0] += 0.05;
+    jog_t[0] += 0.02;
     let jog_ret = ws_rpc(
         &mut ws,
         10,
         gen,
         ep_ret,
         "/api/v1/motion/jog",
-        json!({"target_positions": jog_t, "duration_secs": 0.08, "speed_scale": 1.0}),
+        json!({"target_positions": jog_t, "duration_secs": 0.25, "speed_scale": 1.0}),
     )
     .await;
     assert_eq!(jog_ret["type"], "command_ack", "{jog_ret}");
+    let jog_action_id = jog_ret["action_id"].as_u64().expect("jog action_id");
 
     let seq_ret0 = rig.sup.hub().published_seq();
     let (rel_ret, jh_ret) = pause_hub(&rig.sup);
@@ -4993,12 +5401,141 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
     let dl_done = Instant::now() + Duration::from_secs(2);
     loop {
         let obs_done = rig.sup.get_observation().await;
-        let ret_now = exec.broker().lock().unwrap().stats().retired;
-        if obs_done.action.as_ref().is_some_and(|a| !a.is_running()) && ret_now > retired_before {
+        if obs_done
+            .action
+            .as_ref()
+            .is_some_and(|a| a.id == jog_action_id && !a.is_running())
+        {
+            assert_eq!(obs_done.action.as_ref().map(|a| a.state.as_str()), Some("done"), "{obs_done:?}");
             break;
         }
-        assert!(Instant::now() < dl_done, "terminal retirement did not finish: obs={obs_done:?}");
+        assert!(Instant::now() < dl_done, "exact jog action {jog_action_id} did not settle: obs={obs_done:?}");
         tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    // (b) Stalled router sink (`DeliveryDecision::Backpressured`): verify exact terminal
+    //     retirement into `reply_router` happens BEFORE `stall_sink` is released!
+    let _ = ws_send_wait_types(
+        &mut ws,
+        json!({"type": "release_lease", "client_id": "whole-rel-gc-mit", "generation": gen, "seq": 11}),
+        &["lease_released"],
+    )
+    .await;
+    {
+        let client_stall = ClientId(910);
+        exec.open_connection_sync(910).unwrap().unwrap();
+        let stall_sink = Arc::new(AtomicBool::new(true));
+        let stall_cb = Arc::clone(&stall_sink);
+        let delivered_ids = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let delivered_cb = Arc::clone(&delivered_ids);
+        let _stall_guard = exec
+            .register_connection_reply_sink(
+                client_stall,
+                Arc::new(move |_, reply| {
+                    if stall_cb.load(Ordering::Acquire) {
+                        return DeliveryDecision::Backpressured;
+                    }
+                    if let armd::rt_core::broker::Reply::Terminal { action, .. } = reply {
+                        delivered_cb.lock().unwrap().push(action.0);
+                    }
+                    DeliveryDecision::Delivered
+                }),
+                Some(8),
+            )
+            .unwrap();
+        let conn_stall =
+            armd::rt_core::requests::lease::ConnectionHandle::try_new(910, "stall-sink").unwrap();
+        let stall_gen = match rig
+            .sup
+            .acquire_lease_ws(conn_stall, "stall-sink", 1)
+            .await
+            .expect("acquire_lease_ws")
+        {
+            armd::rt_core::requests::lease::LeaseOutcome::Granted { generation, .. } => generation,
+            other => panic!("expected Granted, got {other:?}"),
+        };
+        let retired_before = exec.broker().lock().unwrap().stats().retired;
+        let delivered_before = exec.reply_router_stats().terminals_delivered;
+        let mut adm_s = rig.sup.capture_admission_stamp();
+        adm_s.connection_id = 910;
+        adm_s.lease_gen = stall_gen;
+        let snap_s = armd::rt_core::requests::actions::ActionSnapshot::capture(
+            &rig.sup,
+            adm_s,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let g_prep = armd::rt_core::requests::actions::prepare_gripper(
+            &snap_s,
+            &json!({"command": "move", "fraction": 0.2, "speed": 1.0}),
+            armd::supervisor::GripperBaselineCmd::None,
+        )
+        .unwrap();
+        let slot_s = g_prep.to_plan_slot(None).unwrap();
+        let write_s = |dst: &mut armd::rt_core::ops::PlanSlot| *dst = slot_s.clone();
+        let (_req_s, mut ack_rx_s, guard_s) = exec
+            .submit_external_action(
+                client_stall,
+                1,
+                snap_s.owner.authority,
+                Instant::now() + Duration::from_secs(5),
+                armd::rt_core::requests::actions::ActionSubmit::InstallPrepared {
+                    write: &write_s,
+                    kind: armd::rt_core::requests::actions::PreparedActionKind::Gripper,
+                    prepared_boot: exec.boot(),
+                    admission_request_id: adm_s.request_id,
+                    check_workspace_revision: false,
+                    poses_revision: None,
+                    calibration_revision: None,
+                    gripper_calib_revision: g_prep.stamp.gripper_calib_revision,
+                    power_budget_revision: None,
+                },
+                armd::rt_core::reply_router::ExternalDestinationPolicy::ConnectionOnly,
+                false,
+                None,
+            )
+            .unwrap();
+        let ack_s = loop {
+            exec.pump_broker_replies();
+            if let Ok(r) = ack_rx_s.try_recv() {
+                break r.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let _ = guard_s.confirm_enqueued();
+        let stall_action_id = match ack_s {
+            armd::rt_core::broker::Reply::Ack { action: Some(aid), .. } => aid.0,
+            other => panic!("expected Ack(Some(action_id)), got {other:?}"),
+        };
+        let dl_retire = Instant::now() + Duration::from_secs(2);
+        loop {
+            exec.pump_broker_replies();
+            let ret_now = exec.broker().lock().unwrap().stats().retired;
+            let st_now = exec.reply_router_stats();
+            if ret_now > retired_before && st_now.pending_external_deliveries > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < dl_retire,
+                "jog action {stall_action_id} terminal did not retire while router sink stalled (retired {ret_now} vs {retired_before}, st={st_now:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            delivered_ids.lock().unwrap().is_empty(),
+            "terminal must NOT be delivered while router sink returns Backpressured"
+        );
+        assert_eq!(exec.reply_router_stats().terminals_delivered, delivered_before);
+
+        stall_sink.store(false, Ordering::Release);
+        let dl_deliv = Instant::now() + Duration::from_secs(2);
+        while !delivered_ids.lock().unwrap().contains(&stall_action_id) {
+            exec.pump_broker_replies();
+            assert!(Instant::now() < dl_deliv, "jog action {stall_action_id} terminal was not delivered after un-stall");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(exec.reply_router_stats().terminals_delivered > delivered_before);
     }
 
     assert_eq!(
@@ -5011,5 +5548,335 @@ async fn executor_whole_release_and_wake_zero_alloc_lock_stalled_consumers_gravi
         0,
         "armd-control must make 0 SupervisorLock attempts"
     );
+    rig.shutdown().await;
+
+    // 8. R1 Major 3: Gravity-comp reclaim queue backpressure (`503 RECLAIM_BACKPRESSURE`,
+    //    0 `mem::forget`, 0 RT allocs/deallocs) while `offload_reclaim_tx` consumer is stalled.
+    {
+        struct ScriptedClock {
+            base: Instant,
+            state: Mutex<(u64, u64, Option<u64>)>,
+            cv: Condvar,
+        }
+        impl ScriptedClock {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    base: Instant::now(),
+                    state: Mutex::new((0, 0, None)),
+                    cv: Condvar::new(),
+                })
+            }
+            fn run_steps(&self, period_ns: u64, steps: u64) {
+                let mut s = self.state.lock().unwrap();
+                let target = s.1 + period_ns * steps;
+                s.1 = target;
+                let expect_park = target + period_ns;
+                self.cv.notify_all();
+                let dl = Instant::now() + Duration::from_secs(5);
+                while s.2 != Some(expect_park) {
+                    let rem = dl.saturating_duration_since(Instant::now());
+                    assert!(!rem.is_zero(), "scripted clock park timeout");
+                    let (next, _) = self.cv.wait_timeout(s, rem).unwrap();
+                    s = next;
+                }
+            }
+        }
+        impl ExecutorClock for ScriptedClock {
+            fn now(&self) -> Instant {
+                self.base + Duration::from_nanos(self.state.lock().unwrap().0)
+            }
+            fn now_ns(&self) -> u64 {
+                self.state.lock().unwrap().0
+            }
+            fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
+                let mut s = self.state.lock().unwrap();
+                if s.0 >= target_ns {
+                    self.cv.notify_all();
+                    return false;
+                }
+                while !stop.load(Ordering::Acquire) && s.0 < target_ns && s.1 < target_ns {
+                    s.2 = Some(target_ns);
+                    self.cv.notify_all();
+                    s = self.cv.wait(s).unwrap();
+                }
+                s.2 = None;
+                if !stop.load(Ordering::Acquire) && s.0 < target_ns {
+                    s.0 = target_ns;
+                }
+                self.cv.notify_all();
+                true
+            }
+            fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let mut s = self.state.lock().unwrap();
+                s.0 = s.0.saturating_add(dur.as_nanos().min(u128::from(u64::MAX)) as u64);
+                self.cv.notify_all();
+            }
+            fn wake(&self) {
+                let _g = self.state.lock().unwrap();
+                self.cv.notify_all();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg_bp = ArmConfig::rebot_dm();
+        cfg_bp.lease_timeout_ms = 600_000;
+        if let Some(gc) = cfg_bp.gravity_comp.as_mut() {
+            gc.ramp_in_s = 0.02;
+            gc.exit_hold_ms = 0;
+        }
+        let clock_bp = ScriptedClock::new();
+        let pause_persist = Arc::new(AtomicBool::new(true));
+        let job_slot: Arc<Mutex<Option<(PendingZeroCheckPersist, Option<Box<dyn std::any::Any + Send>>)>>> =
+            Arc::new(Mutex::new(None));
+        let hooks = PersistTestHooks {
+            clock: Some(clock_bp.clone()),
+            pause_persist_worker: Some(pause_persist.clone()),
+            inject_pending_persist_job_once: Some(job_slot.clone()),
+            ..Default::default()
+        };
+        let sup_bp = Arc::new(ArmSupervisor::new(cfg_bp));
+        sup_bp.set_lease_enabled(false).await;
+        sup_bp.enable_torque(sup_bp.capture_admission_stamp()).await.unwrap();
+
+        let period_ns = 10_000_000u64;
+        let mut ecfg_bp = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
+        ecfg_bp.alloc_timing = true;
+        ecfg_bp.panic_policy = PanicPolicy::StopExecutor;
+        let exec_bp = sup_bp.start_executor_with_hooks(ecfg_bp, hooks).await.unwrap();
+        clock_bp.run_steps(period_ns, 2);
+
+        // Stall `armd-dispatch` on `StateHub::reader_guard()` so `offload_reclaim_rx` is not drained.
+        let (rel_bp, jh_bp) = pause_hub(&sup_bp);
+        let dl_wait = Instant::now() + Duration::from_secs(5);
+        while sup_bp.hub().latest_waiters() < 1 {
+            assert!(Instant::now() < dl_wait, "dispatcher did not block on StateHub::latest()");
+            sup_bp.hub().wake();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Fill `persist_job_tx` (4) + `offload_reclaim_tx` (OFFLOAD_RECLAIM_CAPACITY - 8)
+        // leaving 8 slots in `offload_reclaim_tx` so we never overflow into `retained_persist_job`.
+        let offload_cap = MAINT_QUEUE_CAPACITY
+            + 1
+            + 6
+            + 12
+            + ESTOP_ACK_CAPACITY
+            + RECLAIM_STATE_CAPACITY
+            + URGENT_STOP_CAPACITY
+            + RECLAIM_TRAJ_CAPACITY
+            + 4
+            + 2;
+        for id in 1..=(4 + offload_cap - 8) as u64 {
+            let job = PendingZeroCheckPersist {
+                action_id: id,
+                offset_rad: 0.01,
+                base_revision: 1,
+                connection_id: 0,
+                lease_owner: None,
+                estop_epoch: 1,
+                stop_gen: 0,
+                deadline: Instant::now() + Duration::from_secs(5),
+                ctx: Box::new(ZeroCheckPersistContext {
+                    path: dir.path().join(format!("bp_{id}.json")),
+                    jaw_opening: None,
+                    stale: None,
+                    tool_id: "stock".into(),
+                    tool_config_digest: String::new(),
+                    active_tool_is_stock: true,
+                    base_gripper_policy: Some(armd::model::GripperPolicy::rebot_dm()),
+                    gripper_limit: None,
+                    operator_auth: None,
+                    sat_msg_buf: String::with_capacity(64),
+                }),
+            };
+            *job_slot.lock().unwrap() = Some((job, None));
+            clock_bp.run_steps(period_ns, 1);
+        }
+
+        let run_gc_cmd = |enable: bool| {
+            let sup_c = Arc::clone(&sup_bp);
+            let clk_c = Arc::clone(&clock_bp);
+            async move {
+                let adm = capture_config_admission(&sup_c, 0, 0, None);
+                let fut = tokio::spawn(async move {
+                    gravity_comp_command_with_auth(
+                        &sup_c,
+                        adm,
+                        None,
+                        OperatorRequirement::NotRequired,
+                        ClientId(0),
+                        enable,
+                        None,
+                        None,
+                    )
+                    .await
+                });
+                while !fut.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    clk_c.run_steps(period_ns, 1);
+                }
+                fut.await.unwrap()
+            }
+        };
+
+        // Cycle enter+exit until `offload_reclaim_tx` + `retired_gravity_comp` (cap 8) fill,
+        // proving the next gravity_comp entry fails closed with `503 RECLAIM_BACKPRESSURE`!
+        let mut saw_backpressure = false;
+        for _ in 0..20 {
+            match run_gc_cmd(true).await {
+                Ok(rep) => {
+                    assert!(rep.active);
+                    clock_bp.run_steps(period_ns, 4);
+                    let _ex = run_gc_cmd(false).await.unwrap();
+                    clock_bp.run_steps(period_ns, 6);
+                }
+                Err(armd::ArmError::Rejected { status: 503, code, .. })
+                    if code == "RECLAIM_BACKPRESSURE" =>
+                {
+                    saw_backpressure = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected gravity_comp error under reclaim stall: {other:?}"),
+            }
+        }
+        assert!(saw_backpressure, "9th retired gravity_comp entry must fail closed with 503 RECLAIM_BACKPRESSURE");
+        assert_eq!(exec_bp.stats().total_allocs(), AllocCounts::ZERO);
+
+        // Resume reclaim consumer & persistence worker, drain retired queues, and verify recovery!
+        pause_persist.store(false, Ordering::Release);
+        rel_bp.send(()).unwrap();
+        jh_bp.join().unwrap();
+        for _ in 0..10 {
+            clock_bp.run_steps(period_ns, 1);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let resumed_enter = run_gc_cmd(true).await.expect("gravity_comp enter must succeed after reclaim resumes");
+        assert!(resumed_enter.active);
+        clock_bp.run_steps(period_ns, 4);
+        let _resumed_exit = run_gc_cmd(false).await.unwrap();
+        clock_bp.run_steps(period_ns, 6);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(exec_bp.stats().total_allocs(), AllocCounts::ZERO);
+        assert_eq!(sup_bp.inner().control_thread_attempts(), 0);
+        tokio::task::spawn_blocking(move || exec_bp.stop_and_join()).await.unwrap();
+        assert_eq!(
+            sup_bp.inner().read().await.retired_gravity_comp_queue_lens(),
+            (0, 0),
+            "all retired gravity_comp runs and policies must be reclaimed off-thread (0 mem::forget)"
+        );
+    }
+}
+
+// ============================================================================
+// 25. R1 Blocker 1: Legacy Damiao rearm and NormalUnload use PR0B/PR0C
+//     ModeSwitch (never synchronous dual-format rollback)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_damiao_rearm_and_normal_unload_use_mode_switch_never_dual_rollback() {
+    let cfg = mit_config_j4();
+    let rest = rest_pose_of(&cfg);
+    let qual = valid_mit_qualification_j4(&cfg);
+    let rig = LiveRig::start(
+        OwnerKind::Legacy,
+        cfg,
+        rest,
+        OperatorAuth::disabled(),
+        Some(qual),
+        false,
+    )
+    .await;
+
+    let mut ws = ws_connect(&rig.ws_url).await;
+    let granted = ws_send_wait_types(
+        &mut ws,
+        json!({"type": "acquire_lease", "client_id": "legacy-ms-rearm", "seq": 1}),
+        &["lease_granted"],
+    )
+    .await;
+    let gen = granted["generation"].as_u64().unwrap();
+    let ep0 = rig.sup.get_observation().await.epoch_id;
+
+    let arm_ack = ws_rpc(&mut ws, 1, gen, ep0, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(arm_ack["type"], "command_ack", "{arm_ack}");
+    let dl_mit = Instant::now() + Duration::from_secs(3);
+    loop {
+        let hw_mit = rig.bus.with(|s| s.motors[3].ctrl_mode()) == damiao::CTRL_MODE_MIT;
+        let owner_active = rig.sup.inner().read().await.mit_active();
+        if hw_mit && owner_active {
+            break;
+        }
+        assert!(Instant::now() < dl_mit);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    // 1. Direct synchronous `mit_hand_back` is forbidden on DamiaoArmDriver.
+    {
+        let mut inner = rig.sup.inner().write().await;
+        let sync_err = inner
+            .mit_hand_back("test")
+            .expect_err("synchronous mit_hand_back must be forbidden on DamiaoArmDriver");
+        assert!(sync_err.contains("ModeSwitch") || sync_err.contains("PosVelHandback"), "{sync_err}");
+    }
+
+    // 2. WS `/api/v1/torque` (`enable: true`) rearm while MIT is active runs through PR0B/PR0C
+    //    PosVelHandback (J4 -> POS_VEL precedes RID_TIMEOUT readback, 0 CMD_DISABLE frames),
+    //    then re-arms MIT cleanly.
+    rig.clear_bus_log();
+    let ep_rearm = rig.sup.get_observation().await.epoch_id;
+    let rearm_ack = ws_rpc(&mut ws, 2, gen, ep_rearm, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(rearm_ack["type"], "command_ack", "{rearm_ack}");
+    let (back_idx, read_idx, disable_cnt) = rig.bus.with(|s| {
+        let back = s
+            .tx_log
+            .iter()
+            .position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data);
+        let read = s
+            .tx_log
+            .iter()
+            .position(|f| f.id == 0x7FF && f.data[..4] == [4, 0, damiao::REG_READ, damiao::RID_TIMEOUT]);
+        let dis = s.tx_log.iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
+        (back, read, dis)
+    });
+    let back_i = back_idx.expect("PosVelHandback must write J4 CTRL_MODE_POS_VEL before rearm");
+    let read_i = read_idx.expect("rearm must read J4 RID_TIMEOUT");
+    assert!(back_i < read_i, "J4 PosVelHandback must complete before RID_TIMEOUT readback");
+    assert_eq!(disable_cnt, 0, "rearm must emit 0 CMD_DISABLE frames");
+
+    let dl_mit2 = Instant::now() + Duration::from_secs(3);
+    loop {
+        let hw_mit = rig.bus.with(|s| s.motors[3].ctrl_mode()) == damiao::CTRL_MODE_MIT;
+        let owner_active = rig.sup.inner().read().await.mit_active();
+        if hw_mit && owner_active {
+            break;
+        }
+        assert!(Instant::now() < dl_mit2);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    // 3. `StopPolicy::NormalUnload` while MIT is active defers to `PosVelHandback`, hands J4 back
+    //    to `POS_VEL`, and parks cleanly with all motors disabled.
+    rig.clear_bus_log();
+    rig.sup.apply_stop_policy(armd::StopPolicy::NormalUnload).await;
+    let dl_park = Instant::now() + Duration::from_secs(4);
+    loop {
+        let obs = rig.sup.get_observation().await;
+        if !obs.is_torqued && rig.bus.with(|s| s.motors.iter().all(|m| !m.enabled)) {
+            break;
+        }
+        assert!(Instant::now() < dl_park, "NormalUnload park did not finish: {obs:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rig.bus.with(|s| {
+        assert_eq!(s.motors[3].ctrl_mode(), damiao::CTRL_MODE_POS_VEL);
+        assert!(s.tx_log.iter().any(|f| {
+            f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data
+        }));
+        assert!(s.motors.iter().all(|m| !m.enabled));
+    });
     rig.shutdown().await;
 }
