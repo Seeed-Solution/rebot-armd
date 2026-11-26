@@ -360,6 +360,8 @@ struct ZeroCheckDriverState {
     last_written_j7: Option<f32>,
     /// History of written J7 targets after recording is enabled.
     recorded_j7_targets: Vec<f32>,
+    /// Write instants matching `recorded_j7_targets`.
+    recorded_j7_at: Vec<Instant>,
     record_targets: bool,
     /// When `Some((age, cached_q))`, holds J7 feedback stale by `age` and reports `cached_q`
     /// without advancing `rx_at[6]`, testing E-stop freshness preservation.
@@ -387,6 +389,7 @@ impl ZeroCheckDriver {
                 max_j7_step_rad: 0.0,
                 last_written_j7: None,
                 recorded_j7_targets: Vec::with_capacity(512),
+                recorded_j7_at: Vec::with_capacity(512),
                 record_targets: false,
                 stale_j7: None,
                 j7_temperature_c: 30.0,
@@ -604,6 +607,7 @@ impl ArmDriver for ZeroCheckDriver {
             s.last_written_j7 = Some(t7.position);
             if s.record_targets && s.recorded_j7_targets.len() < s.recorded_j7_targets.capacity() {
                 s.recorded_j7_targets.push(t7.position);
+                s.recorded_j7_at.push(Instant::now());
             }
             if let Some((_, cached_q)) = s.stale_j7 {
                 s.q[6] = cached_q;
@@ -1211,6 +1215,13 @@ async fn dual_owner_zero_check_timeout_and_torque_cap_speed_limit_parity() {
         let ack_t = send_cmd(&mut ws, gen, epoch, "/api/v1/torque", json!({"enable": true})).await;
         assert_eq!(ack_t["type"], "command_ack", "{owner:?}: {ack_t}");
         let epoch = rig.sup.get_observation().await.epoch_id;
+        {
+            let mut s = drv.state.lock().unwrap();
+            s.recorded_j7_targets.clear();
+            s.recorded_j7_at.clear();
+            s.max_j7_step_rad = 0.0;
+            s.record_targets = true;
+        }
 
         let (_, term, _) = run_cmd_to_terminal(
             &mut ws,
@@ -1227,12 +1238,49 @@ async fn dual_owner_zero_check_timeout_and_torque_cap_speed_limit_parity() {
             "{owner:?}: torque stall stop_rad mismatch: {term}"
         );
         assert_eq!(term["pass"], json!(true), "{owner:?}: {term}");
-        let max_step = drv.state.lock().unwrap().max_j7_step_rad;
-        // Seek runs at 0.3 rad/s -> per-tick step <= 0.3 * 0.02s (+ jitter margin 0.03 rad).
-        assert!(
-            max_step <= 0.05,
-            "{owner:?}: seek speed exceeded expected cap (max_j7_step_rad={max_step})"
-        );
+        // Seek speed is 0.3 rad/s (`start_gripper_zero_check`, wire velocity ceiling). Legacy ticks
+        // with a fixed dt of 20 ms: every write steps at most 0.3 * 0.02 = 0.006 rad. The executor
+        // runs a 5 ms period with monotonic-clock dt: a write steps at most 0.3 rad/s times the
+        // time since the previous write, plus one period of clock skew.
+        const SEEK_SPEED_RAD_S: f64 = 0.3;
+        let nominal_dt_s = match owner {
+            RtOwner::Legacy => 0.02,
+            RtOwner::Executor => 0.005,
+        };
+        {
+            let s = drv.state.lock().unwrap();
+            let (t, at) = (&s.recorded_j7_targets, &s.recorded_j7_at);
+            assert_eq!(t.len(), at.len());
+            // Closing segment: up to the first retreat write (stall back-off, not seek motion).
+            let end = (1..t.len()).find(|&i| t[i] < t[i - 1]).unwrap_or(t.len());
+            assert!(end >= 10, "{owner:?}: too few seek writes recorded ({end})");
+            for i in 1..end {
+                let dq = f64::from(t[i] - t[i - 1]);
+                let step_ceiling = match owner {
+                    RtOwner::Legacy => SEEK_SPEED_RAD_S * nominal_dt_s,
+                    RtOwner::Executor => {
+                        SEEK_SPEED_RAD_S * (at[i].duration_since(at[i - 1]).as_secs_f64() + nominal_dt_s)
+                    }
+                } + 1e-5;
+                assert!(
+                    dq <= step_ceiling,
+                    "{owner:?}: write {i} seek step {dq:.5} rad exceeds ceiling {step_ceiling:.5} rad"
+                );
+                // Position advances in step with elapsed time: never ahead of 0.3 rad/s.
+                let elapsed = at[i].duration_since(at[0]).as_secs_f64();
+                let advance = f64::from(t[i] - t[0]);
+                assert!(
+                    advance <= SEEK_SPEED_RAD_S * (elapsed + nominal_dt_s) * 1.05 + 1e-4,
+                    "{owner:?}: write {i} advanced {advance:.4} rad in {elapsed:.3} s (> 0.3 rad/s)"
+                );
+            }
+            let elapsed = at[end - 1].duration_since(at[0]).as_secs_f64();
+            let rate = f64::from(t[end - 1] - t[0]) / elapsed;
+            assert!(
+                (0.8 * SEEK_SPEED_RAD_S..=1.05 * SEEK_SPEED_RAD_S).contains(&rate),
+                "{owner:?}: mean seek rate {rate:.3} rad/s not in step with 0.3 rad/s"
+            );
+        }
         rig.assert_zero_rt_allocs("torque_cap_speed_limit");
         rig.shutdown().await;
 
@@ -1395,6 +1443,7 @@ async fn executor_zero_check_stop_estop_and_lease_loss_cancellation_and_slot_reu
     {
         let mut s = drv.state.lock().unwrap();
         s.recorded_j7_targets.clear();
+        s.recorded_j7_at.clear();
         s.record_targets = true;
     }
     let stop_ack = send_cmd(&mut ws, gen, epoch, "/api/v1/motion/stop", json!({})).await;
@@ -2182,6 +2231,7 @@ async fn executor_zero_check_estop_preserves_commanded_when_j7_feedback_stale() 
         let mut s = driver.state.lock().unwrap();
         s.stale_j7 = Some((Duration::from_millis(350), -0.80));
         s.recorded_j7_targets.clear();
+        s.recorded_j7_at.clear();
         s.record_targets = true;
     }
     tokio::time::sleep(Duration::from_millis(25)).await;
