@@ -599,6 +599,7 @@ pub fn check_static_admission_values(
 /// Cached baseline static holding current for the current applied reference pose (fixed arrays,
 /// zero heap allocation). Invalidated whenever the reference pose, `ArmModel`, or `PowerBudget`
 /// changes.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StaticLoadBaselineCache {
     valid: bool,
@@ -609,6 +610,7 @@ pub(crate) struct StaticLoadBaselineCache {
     base_a: f32,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl StaticLoadBaselineCache {
     /// Returns the predicted static holding current at `ref_q`, reusing the cached value only
     /// while `ref_q[..arm_dof]`, `arm`, and `budget` are unchanged.

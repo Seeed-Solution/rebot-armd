@@ -8377,16 +8377,6 @@ impl SupervisorInner {
         copy_into(&mut self.target_positions, &self.commanded_positions);
     }
 
-    /// Single owner-side J7 position-force staleness handler shared by BOTH motion and stopped-hold
-    /// paths:
-    /// - `Fresh`: resets the staleness timer.
-    /// - `Unobserved`: leaves state unchanged.
-    /// - `Stale { joint, age, fresh_gen }`: immediately terminates any running gripper action with
-    ///   `"J7_FEEDBACK_STALE"` (J7 gets the `vel_raw = 0` freeze frame at the last fresh measured
-    ///   position plus a `0xCC` refresh while J1–J6 continue), and advances the continuous
-    ///   staleness duration on the driver clock; at or above `damiao_gripper.feedback_stale_fault_ms`
-    ///   (default 250 ms, 200..=450 ms), halts motion zero-alloc and latches recoverable
-    ///   [`FaultKind::J7FeedbackStale`] once per fault episode.
     /// Classify whether a `BusLoss` matches a synchronized multi-motor feedback drop (all
     /// previously reporting motors stale, with their last valid RX timestamps clustered within
     /// [`POWER_LOSS_SYNC_WINDOW_MS`]). Zero heap allocations, O(dof) timestamp comparisons.
@@ -8444,6 +8434,16 @@ impl SupervisorInner {
         }
     }
 
+    /// Single owner-side J7 position-force staleness handler shared by BOTH motion and stopped-hold
+    /// paths:
+    /// - `Fresh`: resets the staleness timer.
+    /// - `Unobserved`: leaves state unchanged.
+    /// - `Stale { joint, age, fresh_gen }`: immediately terminates any running gripper action with
+    ///   `"J7_FEEDBACK_STALE"` (J7 gets the `vel_raw = 0` freeze frame at the last fresh measured
+    ///   position plus a `0xCC` refresh while J1–J6 continue), and advances the continuous
+    ///   staleness duration on the driver clock; at or above `damiao_gripper.feedback_stale_fault_ms`
+    ///   (default 250 ms, 200..=450 ms), halts motion zero-alloc and latches recoverable
+    ///   [`FaultKind::J7FeedbackStale`] once per fault episode.
     fn handle_j7_feedback_staleness(
         &mut self,
         pf_status: crate::driver::PosForceTxStatus,
