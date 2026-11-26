@@ -2684,9 +2684,10 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
         SupervisorInner::enable_torque(admitted).expect("arm with MIT qualification");
-        inner.rt_executor_owned = true;
         inner.safety.set_off_thread_reclaim(true);
-        // Step stationary ticks until MIT handover completes and triple-buffer slots warm up.
+        // Step stationary ticks until MIT handover completes before switching the test harness
+        // into direct `rt_executor_owned` `tick_publish` mode (without a full `RtExecutor`
+        // `service_sessions_release` loop to drive non-blocking PR0C `ModeSwitch` activation).
         for _ in 0..25 {
             {
                 let mut g = bus.0.lock().unwrap();
@@ -2703,6 +2704,7 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
             inner.mit.handover_error,
             inner.mit.lost_reason
         );
+        inner.rt_executor_owned = true;
         // Disable Phase-1 position-lead tracking (`src/tracking.rs`, out of scope for M3) after
         // real MIT handover completes so `tick_publish` exercises the full MIT `mit_supervise` ->
         // `write_output_scratch` -> `mit_prepare_inline` -> `write_joint_targets_bounded` ->

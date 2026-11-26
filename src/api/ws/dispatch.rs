@@ -554,7 +554,7 @@ pub(super) enum ExecutorWsRoute {
     Unified,
     /// Direct dispatch to `servo::handle_executor_ws_servo`.
     Servo,
-    /// Direct dispatch to `config::handle_executor_ws_command` (config, calibration, gravity_comp).
+    /// Direct dispatch to `config::handle_executor_ws_command` (config, calibration).
     ConfigOrCalib,
     /// Direct dispatch to `motion::handle_executor_ws_motion`.
     Motion,

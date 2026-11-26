@@ -2025,6 +2025,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     Reply::Terminal {
                         action, outcome, ..
                     } => {
+                        // P-F1 session terminals (ModeSwitch / Commissioning) use the
+                        // SESSION_REQUEST_ID_BIT namespace so non-WS router consumers receive
+                        // them directly; WS clients observe service state via `read_services`
+                        // and must never receive a synthetic `obs.action` frame for them.
+                        if (action.0 & crate::rt_core::reply_router::SESSION_REQUEST_ID_BIT) != 0 {
+                            return DeliveryDecision::Delivered;
+                        }
                         if sink_tracker.is_abandoned(action.0) {
                             return DeliveryDecision::Abandoned;
                         }

@@ -1045,10 +1045,14 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 other => panic!("{owner:?}: expected Exiting with elapsed_s == 0, got {other:?}"),
             }
         }
-        // Bus clears -> 6 Complete ticks (120 ms > 100 ms exit_hold_ms) complete handback cleanly!
+        // Bus clears -> Complete ticks advance `exit_hold_ms` (100 ms) and drive the shared
+        // PR0C non-blocking MIT -> POS_VEL ModeSwitch handback to completion on both owners!
         rig_gc.bus.with(|s| s.tx_enobufs = false);
-        for _ in 0..6 {
+        for _ in 0..32 {
             rig_gc.step();
+            if rig_gc.inner().gravity_comp.is_none() {
+                break;
+            }
         }
         assert!(rig_gc.inner().gravity_comp.is_none(), "{owner:?}: gravity comp should hand back after Complete ticks");
         assert!(rig_gc.inner().safety.state().is_operational());
@@ -1178,11 +1182,17 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 "{owner:?}: stationary tick whose stiff hold deferred must NOT start POS_VEL handback"
             );
             assert!(rig_jt.inner().safety.state().is_operational());
-            // Bus clears -> 1 Complete tick arms handback + 1 dedicated transition release completes it.
+            // Bus clears -> 1 Complete tick arms handback; both owners start the shared PR0C
+            // ModeSwitch handback on the scheduled transition release and complete all 6 axes cleanly.
             rig_jt.bus.with(|s| s.tx_enobufs = false);
             rig_jt.step();
             assert!(rig_jt.inner().gravity_comp.is_some(), "{owner:?}: handback waits for scheduled transition release");
-            rig_jt.step();
+            for _ in 0..30 {
+                rig_jt.step();
+                if rig_jt.inner().gravity_comp.is_none() {
+                    break;
+                }
+            }
             assert!(rig_jt.inner().gravity_comp.is_none(), "{owner:?}: scheduled transition release completes handback");
             assert!(rig_jt.inner().safety.state().is_operational());
         }
@@ -1219,8 +1229,11 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             // Bus clears on next tick after discarding aged frames -> recovers cleanly!
             rig_s2.inner_mut().driver.as_mut().unwrap().write().unwrap().discard_pending_tx();
             rig_s2.bus.with(|s| s.tx_enobufs = false);
-            for _ in 0..7 {
+            for _ in 0..32 {
                 rig_s2.step();
+                if rig_s2.inner().gravity_comp.is_none() {
+                    break;
+                }
             }
             assert!(rig_s2.inner().gravity_comp.is_none());
             assert!(rig_s2.inner().safety.state().is_operational());
@@ -3652,13 +3665,16 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
         );
         assert!(rig.inner().gravity_comp.is_some(), "transient J7 staleness must not kick out gravity comp");
     }
-    // Exit gravity comp while J1-J6 are fresh (J7 still transiently stale, total 200 ms < 250 ms):
-    // arm-only handback must complete without wedging or faulting!
+    // Exit gravity comp while J1-J6 are fresh (J7 still transiently stale, total < 250 ms):
+    // arm-only PR0C ModeSwitch handback must complete without wedging or faulting!
     rig.bus.with(|s| s.immediate_replies = true);
     rig.inner_mut().exit_gravity_comp("STOPPED", "operator exit");
-    for _ in 0..4 {
+    for _ in 0..24 {
         rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
-        rig.step_dt(DT, false);
+        rig.step_dt(0.005, false);
+        if rig.inner().gravity_comp.is_none() {
+            break;
+        }
     }
     assert!(rig.inner().gravity_comp.is_none(), "arm-only handback must complete without wedging on stale J7");
     assert!(rig.inner().safety.state().is_operational(), "transient J7 loss (< 250 ms) must stay operational");
