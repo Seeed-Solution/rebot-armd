@@ -4428,8 +4428,8 @@ fn mit_expiry_recover_combined_rx_and_tx_budget_exhaustion() {
         for (i, m) in s.motors.iter_mut().enumerate() {
             m.q = rest[i];
             m.v = 0.0;
-            m.enabled = !matches!(i, 2 | 3 | 4);
-            if matches!(i, 2 | 3 | 4) {
+            m.enabled = !matches!(i, 2..=4);
+            if matches!(i, 2..=4) {
                 // 3 faulted motors -> 3 ClearFault + 7 Disable = 10 TX frames > max_frames(4)
                 m.state_override = Some(0xD);
             }

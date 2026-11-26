@@ -2737,6 +2737,7 @@ impl crate::supervisor::SupervisorInner {
         // the SAME driver lock guard that issues `drv.mit_expiry_recover()` so there is zero
         // check-to-command gap (ZERO commits & ZERO bus commands on refusal/revocation).
         pre_ctx.expected_epoch = expected_epoch;
+        #[allow(clippy::large_enum_variant)]
         enum PreRecoveryOutcome {
             Ran(Vec<u64>, Result<(), String>),
             ClearRefusal(ClearRefusal),
