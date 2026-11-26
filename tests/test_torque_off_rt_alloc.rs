@@ -2058,9 +2058,11 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
     );
     td_hub.stop_and_flush_bounded(Duration::from_secs(1));
 
-    // 4a. Direct `record_post_panic_disable_shadow` on `armd-control` with `DriverSlot::Exclusive`:
-    //     must drain driver staging lock-free with (0, 0) allocs/frees and 0 driver lock attempts.
-    {
+    // 4a. Direct `record_post_panic_disable_shadow` on `armd-control` with `DriverSlot::Exclusive`
+    //     across unsaturated Confirmed, unsaturated Failed, and saturated SPSC ring cases:
+    //     must perform (0, 0) allocs/frees and 0 driver mutex lock attempts in every case,
+    //     and latch ring loss when saturated.
+    for (saturate_ring, failed_outcome) in [(false, false), (false, true), (true, false)] {
         let td_clock = Arc::new(MockClock::new());
         let td_bus = ZeroAllocBus::new(td_clock.clone());
         let mut td_cfg = ArmConfig::rebot_dm();
@@ -2080,31 +2082,51 @@ fn rt_torque_off_shadow_on_ring_saturation_and_staging_overflow_zero_allocs() {
         ex_inner.test_into_exclusive_driver().unwrap();
         td_bus.with(|s| s.push_all_feedback());
         let _ = ex_inner.tick_control(0.02);
+        if saturate_ring {
+            for _ in 0..(armd::torque::shadow::SHADOW_RING_CAPACITY + 16) {
+                td_clock.advance(Duration::from_millis(2));
+                let _ = ex_inner.tick_control(0.002);
+            }
+        }
+        let outcome = if failed_outcome {
+            armd::supervisor::PanicDisableOutcome::Failed("injected failure".into())
+        } else {
+            armd::supervisor::PanicDisableOutcome::Confirmed
+        };
         let locks_before = ex_inner.test_driver_lock_attempts();
         let (_, a_ex, f_ex) = counted(|| {
             let _rt_guard = armd::rt_core::executor::ControlThreadGuard::enter();
-            ex_inner.test_record_post_panic_disable_shadow(
-                true,
-                &armd::supervisor::PanicDisableOutcome::Confirmed,
-            );
+            ex_inner.test_record_post_panic_disable_shadow(true, &outcome);
         });
         assert_eq!(
             (a_ex, f_ex),
             (0, 0),
-            "record_post_panic_disable_shadow(Exclusive) on armd-control must perform (0, 0) heap ops"
+            "record_post_panic_disable_shadow(Exclusive, sat={saturate_ring}, failed={failed_outcome}) on armd-control must perform (0, 0) heap ops"
         );
         assert_eq!(
             ex_inner.test_driver_lock_attempts(),
             locks_before,
-            "record_post_panic_disable_shadow(Exclusive) must perform 0 driver mutex lock attempts"
+            "record_post_panic_disable_shadow(Exclusive, sat={saturate_ring}, failed={failed_outcome}) must perform 0 driver mutex lock attempts"
         );
         ex_inner.test_flush_and_drain_torque_shadow();
         let ex_diag = ex_inner.torque_shadow_diagnostics();
         assert!(ex_diag.events_processed > 0);
-        assert!(
-            !ex_diag.ring.interval_unverifiable,
-            "exclusive drain on armd-control should not latch staging loss: {ex_diag:?}"
-        );
+        if saturate_ring {
+            assert!(
+                ex_diag.ring.interval_unverifiable && ex_diag.ring.ring_dropped_records > 0,
+                "saturated exclusive RT teardown must latch ring loss: {ex_diag:?}"
+            );
+        } else if failed_outcome {
+            assert!(
+                ex_diag.ring.interval_unverifiable && ex_diag.ring.staging_dropped_records >= 1,
+                "failed exclusive RT teardown must latch staging loss: {ex_diag:?}"
+            );
+        } else {
+            assert!(
+                !ex_diag.ring.interval_unverifiable,
+                "unsaturated confirmed exclusive drain on armd-control should not latch loss: {ex_diag:?}"
+            );
+        }
     }
 
     // 4b. Direct `record_post_panic_disable_shadow` on `armd-control` with `DriverSlot::Legacy`

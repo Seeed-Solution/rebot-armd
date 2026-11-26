@@ -1370,6 +1370,9 @@ impl ShadowRuntime {
         driver_clock: Option<Arc<dyn DriverClock>>,
         sync: LiveBootSync,
     ) {
+        // Flush any queued old-driver FIFO inputs in the PREVIOUS driver's clock domain before
+        // installing the new driver clock and reinitializing the state mirrors.
+        self.flush_deferred_steps();
         self.vendor = vendor;
         self.clock = ShadowClock::new(driver_clock);
         if !self.enabled {
@@ -3572,23 +3575,23 @@ impl TorqueShadowConsumer {
             });
         }
 
-        // 2. Expire unresolved predicted disable obligations on release / transition-wake boundaries.
+        // 2. Expire unresolved predicted disable obligations on release / transition-wake boundaries
+        //    using the replayed reducer dispatch lifecycle and exact effective deadline (never
+        //    prematurely dropping an active budget-paused dispatch that is still within deadline).
         if matches!(
             rec.event,
             Some(Event::Release { .. } | Event::TransitionWake { .. })
         ) {
             if let Some(pending) = self.pending_disable {
-                let tx_gone = self
-                    .state
-                    .as_ref()
-                    .is_some_and(|st| st.groups[0].disable_tx.is_none());
+                let dispatch_gone_in_reducer = self.state.as_ref().is_some_and(|st| {
+                    st.groups[0]
+                        .pending_disable_dispatch
+                        .is_none_or(|p| p.dispatch_id != pending.dispatch_id)
+                });
                 let past_deadline = pending.deadline_us > 0 && rec.now_us >= pending.deadline_us;
-                let stale_after_tx_gone =
-                    tx_gone && rec.release_id > pending.last_progress_release_id.saturating_add(1);
-                let stalled = rec.release_id > pending.last_progress_release_id.saturating_add(3);
-                if !pending.remaining_recipients.is_empty()
-                    && (past_deadline || stale_after_tx_gone || stalled)
-                {
+                let stale_after_gone = dispatch_gone_in_reducer
+                    && rec.release_id > pending.last_progress_release_id.saturating_add(1);
+                if !pending.remaining_recipients.is_empty() && (past_deadline || stale_after_gone) {
                     self.pending_disable = None;
                     self.push_divergence(
                         ShadowDivergenceEntry {
@@ -3796,7 +3799,7 @@ impl TorqueShadowConsumer {
         }
 
         // 5b. Reconcile live disable WriteResult against pending predicted disable obligations.
-        if let (Some(Event::WriteResult(_)), Some(lk)) = (rec.event, live.live_disable_kind) {
+        if let (Some(Event::WriteResult(wr)), Some(lk)) = (rec.event, live.live_disable_kind) {
             if let Some(mut exp) = self.pending_disable {
                 if lk != exp.kind || rec.join.generation != exp.generation {
                     self.push_divergence(
@@ -3840,10 +3843,39 @@ impl TorqueShadowConsumer {
                             atomics,
                         );
                     }
+                    // Mirror the reducer's single-repeat (`disable_repeats == 1`) retry rule:
+                    // when >= 1 recipient has already been sent/ambiguous and other recipients
+                    // reported `Deferred`/`LockContended`, keep those deferred recipients in
+                    // `exp.remaining_recipients` so the driver's subsequent retry `Sent` reconciles
+                    // cleanly against the same `dispatch_id`.
+                    let single_repeat = self
+                        .state
+                        .as_ref()
+                        .is_some_and(|st| st.config.groups[0].disable_repeats == 1);
+                    let mut deferred_in_wr = ChannelMask::EMPTY;
+                    let mut any_sent_or_ambiguous_in_wr = false;
+                    for r in live.live_disable_recipients.iter() {
+                        match wr.outcomes[r as usize] {
+                            MotorWriteOutcome::Sent | MotorWriteOutcome::Ambiguous => {
+                                any_sent_or_ambiguous_in_wr = true;
+                            }
+                            MotorWriteOutcome::Deferred | MotorWriteOutcome::LockContended => {
+                                deferred_in_wr.insert(r);
+                            }
+                            _ => {}
+                        }
+                    }
+                    let already_had_sent =
+                        exp.remaining_recipients != exp.expected_recipients;
+                    let settled_mask = if single_repeat
+                        && (any_sent_or_ambiguous_in_wr || already_had_sent)
+                    {
+                        live.live_disable_recipients.difference(deferred_in_wr)
+                    } else {
+                        live.live_disable_recipients
+                    };
                     let prev_remaining = exp.remaining_recipients;
-                    exp.remaining_recipients = ChannelMask(
-                        exp.remaining_recipients.raw() & !live.live_disable_recipients.raw(),
-                    );
+                    exp.remaining_recipients = exp.remaining_recipients.difference(settled_mask);
                     if exp.remaining_recipients != prev_remaining {
                         exp.last_progress_release_id = rec.release_id;
                     }

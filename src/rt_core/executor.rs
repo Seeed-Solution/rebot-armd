@@ -8606,6 +8606,13 @@ fn run_bounded_teardown_disable(
     let disable_timeout = hooks
         .panic_disable_timeout
         .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (pre_intent, pre_torqued, pre_stopped, pre_ts) = (
+        core.shadow_live_intent(),
+        core.is_torqued,
+        core.safety.state().is_stopped(),
+        core.cached_driver_clock_now(),
+    );
     let td_obs = Arc::clone(teardown_disable);
     let exited_obs = Arc::clone(exited);
     let cv_obs = Arc::clone(control_exited_cv);
@@ -8655,7 +8662,14 @@ fn run_bounded_teardown_disable(
     );
     if let Some(outcome) = completed {
         #[cfg(not(target_arch = "wasm32"))]
-        core.record_post_panic_disable_shadow(policy.is_some(), &outcome);
+        core.record_post_panic_disable_shadow_at(
+            policy.is_some(),
+            &outcome,
+            pre_intent,
+            pre_torqued,
+            pre_stopped,
+            pre_ts,
+        );
         outcome.log(context, effective_budget);
         if matches!(policy, Some(PanicPolicy::AbortProcess)) {
             crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
@@ -8665,7 +8679,14 @@ fn run_bounded_teardown_disable(
     } else {
         let outcome = crate::supervisor::PanicDisableOutcome::TimedOut;
         #[cfg(not(target_arch = "wasm32"))]
-        core.record_post_panic_disable_shadow(policy.is_some(), &outcome);
+        core.record_post_panic_disable_shadow_at(
+            policy.is_some(),
+            &outcome,
+            pre_intent,
+            pre_torqued,
+            pre_stopped,
+            pre_ts,
+        );
         outcome
     }
 }
@@ -10285,6 +10306,13 @@ fn control_thread_main_inner(
         // physical disarm cleanly without sending unnecessary torque-off frames (and if any axis
         // replies enabled or silent, fall through to bounded `DisableProtective { ProcessExit }`).
         let core_ref = core_slot.as_deref_mut().expect("core owned");
+        #[cfg(not(target_arch = "wasm32"))]
+        let (pre_intent, pre_torqued, pre_stopped, pre_ts) = (
+            core_ref.shadow_live_intent(),
+            core_ref.is_torqued,
+            core_ref.safety.state().is_stopped(),
+            core_ref.cached_driver_clock_now(),
+        );
         let idle_disarm_proven = if core_ref.eligible_for_readonly_disarm_proof() {
             let now = Instant::now();
             let base_dl = explicit_dl.unwrap_or_else(|| {
@@ -10302,7 +10330,14 @@ fn control_thread_main_inner(
         let outcome = if idle_disarm_proven {
             let outcome = crate::supervisor::PanicDisableOutcome::Confirmed;
             #[cfg(not(target_arch = "wasm32"))]
-            core_ref.record_post_panic_disable_shadow(false, &outcome);
+            core_ref.record_post_panic_disable_shadow_at(
+                false,
+                &outcome,
+                pre_intent,
+                pre_torqued,
+                pre_stopped,
+                pre_ts,
+            );
             teardown_disable.set_outcome(outcome.clone());
             outcome
         } else {

@@ -3313,7 +3313,7 @@ fn realarm_dev22_executor_multicycle_window2_wake_zero_divergences() {
         },
     );
     for r in 6..=10u64 {
-        clock.advance(Duration::from_millis(10));
+        clock.advance(Duration::from_millis(250));
         let tr = clock.now();
         rt.enqueue_at(
             tr,
@@ -3329,7 +3329,7 @@ fn realarm_dev22_executor_multicycle_window2_wake_zero_divergences() {
     let neg_snap = hub.snapshot();
     assert!(
         neg_snap.taxonomy.extra_action >= 1,
-        "unfulfilled predicted disable must still report ExtraAction: {neg_snap:?}"
+        "unfulfilled predicted disable past effective deadline must still report ExtraAction: {neg_snap:?}"
     );
 }
 
@@ -3416,6 +3416,254 @@ fn shadow_followup_feetech_partial_damiao_refusal_and_panic_contended_loss() {
     );
     assert_eq!(outcomes[0], MotorWriteOutcome::Sent);
     assert_eq!(outcomes[1], MotorWriteOutcome::Deferred);
+
+    // 1b. Feetech single-repeat partial disable (`{0: Sent, 1: Deferred}`) followed by retry
+    //     `{1: Sent}` on the next wake MUST reconcile the same dispatch_id with 0 divergences!
+    {
+        let mut f_cfg = build_dm_config(true);
+        f_cfg.dof = 2;
+        f_cfg.joint_names = vec!["j1".into(), "j2".into()];
+        f_cfg.damiao_gripper = None;
+        if let Some(ref mut rp) = f_cfg.resting_pose {
+            rp.positions = Some(vec![0.0; 2]);
+        }
+        let rclock = Arc::new(MockClock::new());
+        let (mut frt, fhub) = ShadowRuntime::new_with_hub(
+            &f_cfg,
+            true,
+            VendorKind::Feetech,
+            true,
+            Some(rclock.clone() as Arc<dyn DriverClock>),
+        );
+        let t0 = rclock.now();
+        frt.enqueue_at(
+            t0,
+            ShadowInputKind::EnableStart {
+                live_op_id: 1,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        frt.enqueue_at(
+            t0,
+            ShadowInputKind::HandshakeResult {
+                live_op_id: 1,
+                confirmed_mask: ChannelMask::from_count(2),
+                outcome: HandshakeOutcome::Confirmed,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        rclock.advance(Duration::from_millis(20));
+        let t1 = rclock.now();
+        frt.enqueue_at(
+            t1,
+            ShadowInputKind::Thermal {
+                channel: 0,
+                temperature_c: 85.0,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        let mut partial_outcomes = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        partial_outcomes[0] = MotorWriteOutcome::Sent;
+        partial_outcomes[1] = MotorWriteOutcome::Deferred;
+        frt.enqueue_at(
+            t1,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::DisableProtective,
+                target_mask: ChannelMask::from_count(2),
+                outcomes: partial_outcomes,
+                write_done: t1,
+                now: t1,
+                ambiguous_gap: false,
+            }),
+        );
+        rclock.advance(Duration::from_millis(5));
+        let t2 = rclock.now();
+        let mut retry_outcomes = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        retry_outcomes[1] = MotorWriteOutcome::Sent;
+        frt.enqueue_at(
+            t2,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::DisableProtective,
+                target_mask: ChannelMask::bit(1),
+                outcomes: retry_outcomes,
+                write_done: t2,
+                now: t2,
+                ambiguous_gap: false,
+            }),
+        );
+        frt.flush_and_drain_sync();
+        let fsnap = fhub.snapshot();
+        assert_eq!(
+            fsnap.unexplained_divergences_total, 0,
+            "Feetech partial Sent+Deferred followed by retry Sent must reconcile with 0 divergences: {fsnap:?}"
+        );
+        assert_eq!(fsnap.taxonomy.invariant_violation, 0);
+    }
+
+    // 1c. LegacyJ7 feedback during post-motion settle MUST NOT revoke arm-only rest authorization!
+    {
+        let jclock = Arc::new(MockClock::new());
+        let mut jcfg = build_dm_config(true);
+        jcfg.damiao_gripper = None;
+        let (mut jrt, jhub) = ShadowRuntime::new_with_hub(
+            &jcfg,
+            true,
+            VendorKind::Damiao,
+            true,
+            Some(jclock.clone() as Arc<dyn DriverClock>),
+        );
+        let t0 = jclock.now();
+        for ch in 0..7u8 {
+            jrt.enqueue_at(
+                t0,
+                ShadowInputKind::DriverObs(ShadowDriverObs::ModeVerified {
+                    channel: ch,
+                    mode: armd::motor_mode::ControlMode::PositionVelocity,
+                    now: t0,
+                    provenance: EvidenceProvenance::HardwareCausal,
+                }),
+            );
+        }
+        jrt.enqueue_at(
+            t0,
+            ShadowInputKind::EnableStart {
+                live_op_id: 1,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: false,
+                live_stopped: false,
+            },
+        );
+        jrt.enqueue_at(
+            t0,
+            ShadowInputKind::HandshakeResult {
+                live_op_id: 1,
+                confirmed_mask: ChannelMask::from_count(7),
+                outcome: HandshakeOutcome::Confirmed,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        let mut sid = 1u64;
+        for r in 1..=3u64 {
+            jclock.advance(Duration::from_millis(15));
+            let tr = jclock.now();
+            jrt.enqueue_at(
+                tr,
+                ShadowInputKind::Release {
+                    release_seq: r,
+                    live_intent: TorqueIntent::On,
+                    live_is_torqued: true,
+                    live_stopped: false,
+                },
+            );
+            for ch in 0..6u8 {
+                sid += 1;
+                jrt.enqueue_at(
+                    tr,
+                    ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                        channel: ch,
+                        sample_id: sid,
+                        stamp: RxStampKind::Valid {
+                            rx_at: tr,
+                            drift_ns: 0,
+                            live_post_settle: true,
+                        },
+                        decode_now: tr,
+                        position_rad: 0.0,
+                        velocity_rad_s: Some(0.0),
+                        temperature_c: Some(30.0),
+                        reported_enabled: Some(true),
+                        correlated_after_write_done: None,
+                        poll_issued: None,
+                        provenance: EvidenceProvenance::HardwareCausal,
+                    }),
+                );
+            }
+        }
+        let t_req = jclock.now();
+        // Open DisableRequest (immediately authorized by arm J1..J6 K=3 window).
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DisableRequest {
+                live_op_id: 2,
+                explicit_release_authorized: false,
+                live_refusal: None,
+                live_intent: TorqueIntent::On,
+                live_is_torqued: true,
+                live_stopped: false,
+            },
+        );
+        // J7 writes motion + receives in-settle feedback: MUST NOT revoke arm authorization!
+        let mut j7_mo = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        j7_mo[6] = MotorWriteOutcome::Sent;
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::Motion,
+                target_mask: ChannelMask::bit(6),
+                outcomes: j7_mo,
+                write_done: t_req,
+                now: t_req,
+                ambiguous_gap: false,
+            }),
+        );
+        sid += 1;
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DriverObs(ShadowDriverObs::CausalSample {
+                channel: 6,
+                sample_id: sid,
+                stamp: RxStampKind::Valid {
+                    rx_at: t_req,
+                    drift_ns: 0,
+                    live_post_settle: false,
+                },
+                decode_now: t_req,
+                position_rad: 0.5,
+                velocity_rad_s: Some(0.2),
+                temperature_c: Some(30.0),
+                reported_enabled: Some(true),
+                correlated_after_write_done: None,
+                poll_issued: None,
+                provenance: EvidenceProvenance::HardwareCausal,
+            }),
+        );
+        let mut dis_ok = [MotorWriteOutcome::NotTargeted; armd::torque::MAX_CHANNELS];
+        for c in 0..7 {
+            dis_ok[c] = MotorWriteOutcome::Sent;
+        }
+        jrt.enqueue_at(
+            t_req,
+            ShadowInputKind::DriverObs(ShadowDriverObs::WriteResult {
+                device: 0,
+                kind: WriteKind::DisableRequested,
+                target_mask: ChannelMask::from_count(7),
+                outcomes: dis_ok,
+                write_done: t_req,
+                now: t_req,
+                ambiguous_gap: false,
+            }),
+        );
+        jrt.flush_and_drain_sync();
+        let jsnap = jhub.snapshot();
+        assert_eq!(
+            jsnap.unexplained_divergences_total, 0,
+            "LegacyJ7 motion/in-settle sample must not revoke arm-only rest authorization: {jsnap:?}"
+        );
+        assert_eq!(jsnap.taxonomy.invariant_violation, 0);
+    }
 
     // 2. Follow-up Major #2: Damiao single-motor pre-transport refusal scopes to the targeted motor.
     let dclock = Arc::new(MockClock::new());

@@ -4577,9 +4577,11 @@ impl<T: Transport> FeetechArmDriver<T> {
             if let Some((eg, sg)) = client_park {
                 if let Err(e) = self.client_park_stop_check(eg, sg) {
                     #[cfg(not(target_arch = "wasm32"))]
-                    if idx < crate::torque::MAX_CHANNELS {
-                        shadow_target_mask.insert(idx as u8);
-                        shadow_outcomes[idx] = crate::torque::MotorWriteOutcome::RejectedStale;
+                    for rem in idx..n.min(crate::torque::MAX_CHANNELS) {
+                        if !skip_dispatched || (self.disable_dispatched_mask & (1u64 << rem)) == 0 {
+                            shadow_target_mask.insert(rem as u8);
+                            shadow_outcomes[rem] = crate::torque::MotorWriteOutcome::RejectedStale;
+                        }
                     }
                     if !wrote_any && self.disable_dispatched_mask == 0 {
                         #[cfg(not(target_arch = "wasm32"))]
@@ -4590,13 +4592,6 @@ impl<T: Transport> FeetechArmDriver<T> {
                             shadow_ambiguous_gap,
                         );
                         return Err(e);
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    for rem in (idx + 1)..n.min(crate::torque::MAX_CHANNELS) {
-                        if !skip_dispatched || (self.disable_dispatched_mask & (1u64 << rem)) == 0 {
-                            shadow_target_mask.insert(rem as u8);
-                            shadow_outcomes[rem] = crate::torque::MotorWriteOutcome::RejectedStale;
-                        }
                     }
                     write_err = Some(ArmDriverError::HardwareFault(
                         "Client park disable stopped mid-batch after partial servo disable".into(),
@@ -4634,9 +4629,11 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
                 Err(e) if client_park.is_some() && is_estop_inhibited(&e) => {
                     #[cfg(not(target_arch = "wasm32"))]
-                    if idx < crate::torque::MAX_CHANNELS {
-                        shadow_target_mask.insert(idx as u8);
-                        shadow_outcomes[idx] = crate::torque::MotorWriteOutcome::RejectedStale;
+                    for rem in idx..n.min(crate::torque::MAX_CHANNELS) {
+                        if !skip_dispatched || (self.disable_dispatched_mask & (1u64 << rem)) == 0 {
+                            shadow_target_mask.insert(rem as u8);
+                            shadow_outcomes[rem] = crate::torque::MotorWriteOutcome::RejectedStale;
+                        }
                     }
                     if !wrote_any && self.disable_dispatched_mask == 0 {
                         #[cfg(not(target_arch = "wasm32"))]
@@ -4647,13 +4644,6 @@ impl<T: Transport> FeetechArmDriver<T> {
                             shadow_ambiguous_gap,
                         );
                         return Err(e);
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    for rem in (idx + 1)..n.min(crate::torque::MAX_CHANNELS) {
-                        if !skip_dispatched || (self.disable_dispatched_mask & (1u64 << rem)) == 0 {
-                            shadow_target_mask.insert(rem as u8);
-                            shadow_outcomes[rem] = crate::torque::MotorWriteOutcome::RejectedStale;
-                        }
                     }
                     write_err = Some(ArmDriverError::HardwareFault(
                         "Client park disable stopped mid-batch after partial servo disable".into(),
@@ -9881,10 +9871,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ) -> Result<(CanFrame, u64, Instant, Option<i128>), TxRefusal> {
         let tx_kind = kind.tx_kind();
         #[cfg(not(target_arch = "wasm32"))]
-        let mut built_target_idx: Option<usize> = match tx_kind {
-            TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) => Some(j),
-            _ => None,
-        };
+        let mut built_frame_for_shadow: Option<CanFrame> = None;
         let res = 'send_body: {
             let expected_lease_gen = self.send_lease_gen;
             let has_pos_force_token = kind.pos_force_token().is_some();
@@ -9938,11 +9925,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             };
             #[cfg(not(target_arch = "wasm32"))]
             {
-                built_target_idx = self
-                    .motor_ids
-                    .iter()
-                    .position(|&id| u32::from(id) == frame.id)
-                    .or_else(|| self.damiao_command_motor_index(&frame));
+                built_frame_for_shadow = Some(frame);
             }
 
             // 5. Re-read physical stop latch, pending gate, stop-generation stamp, lease fence,
@@ -10322,7 +10305,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Err(ref refusal) = res {
             if !self.defer_disable_shadow {
-                self.stage_damiao_pretransport_refusal(tx_kind, refusal, built_target_idx);
+                let target_idx = match tx_kind {
+                    TxKind::RollbackHold(j) | TxKind::MeasuredHold(j) => Some(j),
+                    _ => built_frame_for_shadow.and_then(|f| {
+                        self.motor_ids
+                            .iter()
+                            .position(|&id| u32::from(id) == f.id)
+                            .or_else(|| self.damiao_command_motor_index(&f))
+                    }),
+                };
+                self.stage_damiao_pretransport_refusal(tx_kind, refusal, target_idx);
             }
         }
         res
@@ -15507,14 +15499,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                 }
                 Err(r @ (TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) if client_park => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if idx < crate::torque::MAX_CHANNELS {
+                        deferred_refusal_mask.insert(idx as u8);
+                        deferred_refusal_outcomes[idx] =
+                            crate::torque::MotorWriteOutcome::RejectedStale;
+                    }
                     if !sent_any && self.disable_dispatched_mask == 0 {
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             self.defer_disable_shadow = false;
-                            if self.shadow_staging.is_enabled() && idx < crate::torque::MAX_CHANNELS {
-                                deferred_refusal_mask.insert(idx as u8);
-                                deferred_refusal_outcomes[idx] =
-                                    crate::torque::MotorWriteOutcome::RejectedStale;
+                            if self.shadow_staging.is_enabled() && !deferred_refusal_mask.is_empty() {
                                 let wk = match tx_kind {
                                     TxKind::DisableProtective { .. } => {
                                         crate::torque::WriteKind::DisableProtective
@@ -18988,8 +18983,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        self.flush_pending_disable_shadow_now();
 
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
@@ -18997,6 +18990,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let _ = self.receive_feedback();
         self.rx_deadline = None;
         self.rx_frame_limit = None;
+
+        // Flush pending disable shadow batch AFTER bounded RX so shadow work never shifts
+        // panic-disable RX deadline budgets (Major #1).
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flush_pending_disable_shadow_now();
 
         let remaining = self.unconfirmed_disable_joints();
         if remaining.is_empty() {

@@ -395,6 +395,14 @@ fn revoke_unconsumed_rest_auth(state: &mut TorqueState, group: u8) {
     }
 }
 
+#[inline]
+fn is_rest_gate_participant(role: JointRole) -> bool {
+    !matches!(
+        role,
+        JointRole::PassiveSensor | JointRole::Gripper(GripperReleasePolicy::LegacyJ7)
+    )
+}
+
 /// Drop stale captures (`> max_capture_age_us`) and prune/reset stale rest windows (B8).
 fn refresh_captures_and_windows(state: &mut TorqueState, now_us: u64) {
     for c in 0..state.config.channel_count {
@@ -413,6 +421,9 @@ fn refresh_captures_and_windows(state: &mut TorqueState, now_us: u64) {
     }
 
     for r in 0..state.config.recipient_count {
+        if !is_rest_gate_participant(state.config.recipients[r as usize].role) {
+            continue;
+        }
         if state.rest_windows[r as usize].count == 0 {
             continue;
         }
@@ -519,10 +530,14 @@ fn handle_transition_wake(state: &mut TorqueState, now_us: u64, actions: &mut Ac
         }
 
         if state.groups[gi].drive_state == DriveState::ReadyToSwitchOn {
-            let expired = state.groups[gi]
-                .enable_tx
-                .is_some_and(|etx| now_us >= etx.deadline_us);
-            if expired {
+            // Only expire into FailedHold on a sub-release wake when enable writes were already
+            // sent (or confirmed); a zero-write pre-TX attempt is resolved in causal order by live
+            // `EnableCancelledPreTx` / `HandshakeResult::Failed` (or full `Release` expiry).
+            let expired_post_tx = state.groups[gi].enable_tx.is_some_and(|etx| {
+                now_us >= etx.deadline_us
+                    && (etx.any_write_sent || !etx.confirmed_channels.is_empty())
+            });
+            if expired_post_tx {
                 enter_failed_hold(state, g, now_us, actions);
             }
         }
@@ -1195,18 +1210,23 @@ fn handle_causal_sample(
     }
 
     let rec = ch_cfg.recipient;
+    let rest_participant = is_rest_gate_participant(ch_cfg.role);
 
     // 3. Future-dated timestamps are rejected and never clamped; invalid evidence resets window + revokes auth (B9).
     if sample.rx_timestamp_us > sample.now_us || sample.rx_timestamp_us > now_us {
-        reset_recipient_window(state, rec);
-        revoke_unconsumed_rest_auth(state, g);
+        if rest_participant {
+            reset_recipient_window(state, rec);
+            revoke_unconsumed_rest_auth(state, g);
+        }
         return;
     }
 
     // 4. Clock offset drift > 1 ms invalidates rest window and revokes unconsumed auth.
     if sample.clock_offset_drift_us > CLOCK_OFFSET_MAX_DRIFT_US {
-        reset_recipient_window(state, rec);
-        revoke_unconsumed_rest_auth(state, g);
+        if rest_participant {
+            reset_recipient_window(state, rec);
+            revoke_unconsumed_rest_auth(state, g);
+        }
         return;
     }
 
@@ -1217,8 +1237,10 @@ fn handle_causal_sample(
             .poll_issued_us
             .is_some_and(|p| p < state.devices[d].poisoned_until_us)
     {
-        reset_recipient_window(state, rec);
-        revoke_unconsumed_rest_auth(state, g);
+        if rest_participant {
+            reset_recipient_window(state, rec);
+            revoke_unconsumed_rest_auth(state, g);
+        }
         if dev_cfg.poison_silence_us > 0 {
             let extended = sample.rx_timestamp_us.saturating_add(dev_cfg.poison_silence_us);
             state.devices[d].poisoned_until_us = state.devices[d].poisoned_until_us.max(extended);
@@ -1236,8 +1258,10 @@ fn handle_causal_sample(
             .poll_issued_us
             .is_some_and(|pi| sample.rx_timestamp_us < pi)
     {
-        reset_recipient_window(state, rec);
-        revoke_unconsumed_rest_auth(state, g);
+        if rest_participant {
+            reset_recipient_window(state, rec);
+            revoke_unconsumed_rest_auth(state, g);
+        }
         return;
     }
 
@@ -1246,15 +1270,19 @@ fn handle_causal_sample(
         .last_sample_us
         .is_some_and(|prev_ts| sample.rx_timestamp_us < prev_ts)
     {
-        reset_recipient_window(state, rec);
-        revoke_unconsumed_rest_auth(state, g);
+        if rest_participant {
+            reset_recipient_window(state, rec);
+            revoke_unconsumed_rest_auth(state, g);
+        }
         return;
     }
 
     // 8. Freshness check (<= max_capture_age_us, <= 100 ms) BEFORE applying thermal or capture (M6).
     if !is_sample_fresh(sample.rx_timestamp_us, now_us, ch_cfg.max_capture_age_us) {
-        reset_recipient_window(state, rec);
-        revoke_unconsumed_rest_auth(state, g);
+        if rest_participant {
+            reset_recipient_window(state, rec);
+            revoke_unconsumed_rest_auth(state, g);
+        }
         return;
     }
 
@@ -1438,6 +1466,9 @@ fn feed_passive_rest_window_sample(state: &mut TorqueState, g: u8, sample: Causa
     }
     let ch = sample.channel as usize;
     let ch_cfg = state.config.channels[ch];
+    if !is_rest_gate_participant(ch_cfg.role) {
+        return;
+    }
     let rec = ch_cfg.recipient;
     let rec_cfg = state.config.recipients[rec as usize];
 
@@ -1502,6 +1533,9 @@ fn feed_rest_gate_sample(
     }
     let ch = sample.channel as usize;
     let ch_cfg = state.config.channels[ch];
+    if !is_rest_gate_participant(ch_cfg.role) {
+        return;
+    }
     let rec = ch_cfg.recipient;
     let rec_idx = rec as usize;
     if !tx.recipient_mask.contains(rec) {
@@ -1879,7 +1913,7 @@ fn handle_write_result(
                     // B6: motion invalidates prior grasp release evidence.
                     rt.last_release_evidence = ReleaseEvidence::Unknown;
                     let ch_cfg = state.config.channels[c as usize];
-                    if !matches!(ch_cfg.role, JointRole::PassiveSensor)
+                    if is_rest_gate_participant(ch_cfg.role)
                         && ch_cfg.recipient < state.config.recipient_count
                     {
                         reset_recipient_window(state, ch_cfg.recipient);
@@ -1981,7 +2015,24 @@ fn handle_disable_write_result(
         }
     }
 
-    pend.remaining_recipients = pend.remaining_recipients.difference(matched_recipients);
+    let any_sent_or_ambiguous_now = !sent_mask.is_empty() || !ambiguous_mask.is_empty();
+    // On single-repeat drivers (e.g. Feetech `disable_repeats == 1`), once >= 1 recipient has
+    // already committed off (`Sent`/`Ambiguous`), any `Deferred`/`LockContended` recipients in the
+    // same dispatch stay in `remaining_recipients` so the driver's subsequent retry `Sent`
+    // reconciles the exact same `dispatch_id` without leaving an unmatched live write.
+    let retryable_deferred = if grp_cfg.disable_repeats == 1
+        && (any_sent_or_ambiguous_now
+            || !pend.sent_mask.is_empty()
+            || !pend.ambiguous_mask.is_empty())
+    {
+        deferred_mask
+    } else {
+        ChannelMask::EMPTY
+    };
+
+    pend.remaining_recipients = pend
+        .remaining_recipients
+        .difference(matched_recipients.difference(retryable_deferred));
     pend.sent_mask = pend.sent_mask.union(sent_mask);
     pend.ambiguous_mask = pend.ambiguous_mask.union(ambiguous_mask);
     pend.failed_mask = pend.failed_mask.union(failed_mask);
@@ -1992,7 +2043,6 @@ fn handle_disable_write_result(
     state.groups[gi].physically_sent_off_mask =
         state.groups[gi].physically_sent_off_mask.union(sent_mask);
 
-    let any_sent_or_ambiguous_now = !sent_mask.is_empty() || !ambiguous_mask.is_empty();
     if any_sent_or_ambiguous_now {
         // First successful or possibly-sent disable IMMEDIATELY commits TorqueIntent::Off!
         state.groups[gi].torque_intent = TorqueIntent::Off;

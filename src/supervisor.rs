@@ -13654,7 +13654,22 @@ impl ArmSupervisor {
                             deadline: now + DRAIN_BUDGET,
                             max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
                         };
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let live_intent = inner.shadow_live_intent();
+                            let live_is_torqued = inner.is_torqued;
+                            let live_stopped = inner.safety.state().is_stopped();
+                            inner.torque_shadow.enqueue_at(
+                                now,
+                                crate::torque::shadow::ShadowInputKind::TransitionWake {
+                                    live_intent,
+                                    live_is_torqued,
+                                    live_stopped,
+                                },
+                            );
+                        }
                         let _ = inner.service_torque_transition(&budget);
+                        inner.flush_torque_shadow();
                         let settled =
                             std::mem::replace(&mut inner.legacy_torque_settled_this_tick, false);
                         (inner.has_detached_torque_transition(), settled)
