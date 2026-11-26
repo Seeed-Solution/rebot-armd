@@ -2006,6 +2006,406 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
 @media (min-width: 820px) {
   body:has(.calib-mask:not([hidden])) .toasts { left: calc((100vw - 440px) / 2); max-width: calc(100vw - 440px - 32px); }
 }
+
+/* ===== expert mode (Layout A on tablet/desktop, Layout B-style on phone portrait) ===== */
+body.ui-expert { overflow: hidden; }
+body.ui-expert .app { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+body.ui-expert .topbar {
+  height: 52px; padding: 0 12px; gap: 8px; flex: none; position: relative; z-index: 60;
+  padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right));
+}
+body.ui-expert .topbar .brand { display: flex; flex: none; }
+body.ui-expert .topbar .brand-mark { width: 28px; height: 28px; }
+body.ui-expert .topbar .brand-text small, body.ui-expert .topbar .brand-text .full { display: none; }
+body.ui-expert .topbar .head-stats,
+body.ui-expert .topbar #btn-fs,
+body.ui-expert .topbar #btn-task,
+body.ui-expert .topbar #btn-sset { display: none !important; }
+body.ui-expert .topbar .ui-mode-btn { margin: 0; min-height: 44px; height: 44px; padding: 0 12px; border-radius: var(--sc-radius-md); background: var(--sc-color-primary-soft); border: 1px solid var(--sc-color-border); color: var(--sc-color-primary-dark); }
+body.ui-expert .topbar .ex-top-grow { flex: 1; }
+body.ui-expert .topbar #btn-pset,
+body.ui-expert .topbar #btn-ex-more,
+body.ui-expert .topbar #btn-op,
+body.ui-expert .topbar #btn-lang { min-height: 44px; min-width: 44px; height: 44px; padding: 0 12px; border-radius: var(--sc-radius-md); font-size: 13px; }
+body.ui-expert .topbar #btn-pset { display: inline-flex; width: auto; gap: 6px; }
+body.ui-expert .topbar #btn-pset[hidden] { display: none; }
+body.ui-expert .topbar #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; }
+body.ui-expert .topbar #btn-ex-more { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--sc-color-border-neutral); background: #fff; font-weight: 500; }
+body.ui-expert .topbar #btn-ex-more:hover { border-color: var(--sc-color-primary); color: var(--sc-color-primary-dark); }
+body.ui-expert .topbar #ex-ph-status { display: none; }
+
+/* Layout A: video hero + object card on left, safety + motion rail on right */
+body.ui-expert .main {
+  flex: 1; min-height: 0; display: grid; gap: 12px; padding: 12px;
+  padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right));
+  grid-template-columns: minmax(0, 1fr) 372px;
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "stage side";
+  overflow: hidden;
+}
+body.ui-expert .stage { grid-area: stage; display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; position: relative; }
+body.ui-expert .side { grid-area: side; display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: hidden; padding: 0; }
+body.ui-expert #pose-card { display: none !important; }
+body.ui-expert .video > .hud { display: none !important; }
+
+/* Video card with attached perception bar (nothing permanent floats over video) */
+.ex-vcard {
+  display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; position: relative;
+  background: var(--sc-color-bg-container); border: 1px solid #e3efcc; border-radius: var(--sc-radius-lg);
+  box-shadow: 0 4px 20px -2px rgba(91,125,21,0.07), 0 2px 8px -1px rgba(0,0,0,0.04);
+}
+.ex-vbar {
+  flex: none; display: flex; align-items: center; gap: 8px; padding: 6px 10px; min-height: 56px;
+  border-bottom: 1px solid var(--sc-color-border-neutral); overflow-x: auto; scrollbar-width: none;
+}
+.ex-vbar::-webkit-scrollbar { display: none; }
+.ex-vbar .ex-vsep { width: 1px; height: 26px; background: var(--sc-color-border-neutral); flex: none; }
+.ex-vbar .view-switch { position: static; inset: auto; transform: none; width: auto; height: auto; display: inline-flex; padding: 3px; gap: 2px; border-radius: var(--sc-radius-md); background: var(--sc-color-bg-sunken); border: 1px solid var(--sc-color-border); box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none; flex: none; }
+.ex-vbar .view-switch button { min-height: 36px; min-width: 42px; padding: 0 11px; border-radius: var(--sc-radius-base); font-size: 13px; font-weight: 500; color: var(--sc-color-text-secondary); }
+.ex-vbar .view-switch button[aria-checked="true"] { background: #fff; color: var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-weight: 600; }
+.ex-vis-sw {
+  display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 8px; border-radius: var(--sc-radius-md);
+  font-size: 13px; font-weight: 600; color: var(--sc-color-text); white-space: nowrap; flex: none;
+}
+.ex-vis-sw:disabled { opacity: .45; cursor: not-allowed; }
+.ex-vis-sw .ex-sw-track { position: relative; width: 42px; height: 24px; border-radius: 12px; background: #cbd5e1; transition: background .15s; flex: none; }
+.ex-vis-sw .ex-sw-track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.22); transition: left .15s; }
+.ex-vis-sw[aria-checked="true"] .ex-sw-track { background: var(--sc-color-primary); }
+.ex-vis-sw[aria-checked="true"] .ex-sw-track::after { left: 21px; }
+.ex-mchip {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 12px; border-radius: 22px;
+  border: 1px solid var(--sc-color-border); background: var(--sc-color-primary-soft);
+  font-size: 13px; font-weight: 600; color: var(--sc-color-primary-dark); white-space: nowrap; flex: none; min-width: 0;
+}
+.ex-mchip #ex-mchip-name { overflow: hidden; text-overflow: ellipsis; }
+.ex-mchip:hover { border-color: var(--sc-color-primary); }
+.ex-mchip[aria-expanded="true"] { background: var(--sc-color-primary-dark); color: #fff; border-color: var(--sc-color-primary-dark); }
+.ex-mchip .ex-kind { display: inline-flex; align-items: center; height: 22px; padding: 0 7px; border-radius: 6px; font-size: 11.5px; font-weight: 600; background: #eef6ff; color: #1d4ed8; flex: none; }
+.ex-mchip[aria-expanded="true"] .ex-kind { background: rgba(255,255,255,0.2); color: #fff; }
+.ex-vbar #btn-trigger {
+  min-height: 44px; padding: 0 12px; border-radius: var(--sc-radius-md); font-size: 13px; font-weight: 500;
+  border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text); box-shadow: none; flex: none; white-space: nowrap;
+}
+.ex-vbar #btn-trigger::before { display: none; }
+.ex-vbar #btn-trigger:hover { border-color: var(--sc-color-primary); color: var(--sc-color-primary-dark); }
+.ex-vbar .ex-vgrow { flex: 1; min-width: 4px; }
+.ex-live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--sc-color-text-secondary); white-space: nowrap; flex: none; }
+.ex-live .ex-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--sc-status-warning-fg); flex: none; }
+.ex-live.ok .ex-dot { background: var(--sc-color-primary); }
+body.ui-expert .ex-vcard > .video {
+  flex: 1 1 auto; min-height: 160px; border: 0; border-radius: 0 0 var(--sc-radius-lg) var(--sc-radius-lg);
+  box-shadow: none; background: #0f1a2b;
+}
+
+/* Expert Model & Overlay Popover (transient, left column only — never covers right safety rail) */
+.ex-vpop {
+  position: absolute; top: 56px; left: 10px; width: min(440px, calc(100% - 20px)); max-height: calc(100% - 62px);
+  overflow-y: auto; z-index: 45; background: #fff; border: 1px solid var(--sc-color-border-neutral);
+  border-radius: var(--sc-radius-lg); box-shadow: 0 14px 38px rgba(15,26,43,.22); padding: 10px 12px;
+}
+.ex-vpop[hidden] { display: none !important; }
+.ex-vpop-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ex-vpop-head h4, .ex-vpop h4 { font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--sc-color-text); }
+.ex-vpop .ex-en { color: var(--sc-color-text-tertiary); font-weight: 400; font-size: 11.5px; margin-left: 4px; }
+.ex-op-tag { font-size: 11.5px; font-weight: 600; color: var(--sc-status-warning-fg); background: var(--sc-status-warning-bg); padding: 2px 7px; border-radius: 6px; white-space: nowrap; }
+.ex-vpop-x { min-width: 32px; min-height: 32px; border-radius: var(--sc-radius-base); display: inline-grid; place-items: center; font-size: 18px; color: var(--sc-color-text-secondary); }
+.ex-vpop-x:hover { background: var(--sc-color-bg-sunken); color: var(--sc-color-text); }
+.ex-mlist { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.ex-mrow {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 1px 8px; align-items: center; text-align: left;
+  width: 100%; padding: 6px 9px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral);
+  background: #fff; min-height: 44px; transition: border-color .15s, background .15s;
+}
+.ex-mrow:hover:not(:disabled) { border-color: var(--sc-color-primary); }
+.ex-mrow.cur { background: var(--sc-color-primary-soft); border-color: var(--sc-color-border); }
+.ex-mrow.bad { background: #fffaf0; border-color: #f5deb0; cursor: not-allowed; }
+.ex-mrow:disabled:not(.bad) { opacity: .6; cursor: wait; }
+.ex-mrow .ex-radio { width: 16px; height: 16px; border-radius: 50%; border: 2px solid #c4ccd6; flex: none; }
+.ex-mrow.cur .ex-radio { border-color: var(--sc-color-primary-dark); box-shadow: inset 0 0 0 3px #fff; background: var(--sc-color-primary-dark); }
+.ex-mrow .ex-nm { font-weight: 600; font-size: 12.5px; color: var(--sc-color-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-mrow .ex-mb { font-family: var(--mono); font-size: 11.5px; color: var(--sc-color-text-secondary); white-space: nowrap; }
+.ex-mrow .ex-sub { grid-column: 2 / 4; font-size: 11px; color: var(--sc-color-text-secondary); line-height: 1.3; }
+.ex-mrow.bad .ex-sub { color: var(--sc-status-warning-fg); }
+.ex-sep { border: 0; border-top: 1px solid var(--sc-color-border-neutral); margin: 8px 0; }
+.ex-depth-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ex-ion { margin-top: 6px; }
+.ex-ion-bar { position: relative; height: 9px; border-radius: 5px; background: var(--sc-color-bg-sunken); border: 1px solid var(--sc-color-border); overflow: hidden; display: flex; }
+.ex-ion-bar i { display: block; height: 100%; transition: width .2s; }
+.ex-ion-bar .ex-ion-det { background: var(--sc-color-primary); }
+.ex-ion-bar .ex-ion-dep { background: #60a5fa; }
+.ex-ion-bar.over .ex-ion-det, .ex-ion-bar.over .ex-ion-dep { background: var(--sc-status-danger-fg); }
+.ex-ion-k { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; margin-top: 3px; flex-wrap: wrap; }
+.ex-hint { font-size: 11px; color: var(--sc-color-text-secondary); margin-top: 2px; line-height: 1.35; }
+.ex-err-box { margin-top: 6px; padding: 7px 9px; border-radius: var(--sc-radius-md); background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); font-size: 12px; line-height: 1.4; }
+.ex-warn-box { margin-top: 6px; padding: 7px 9px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; line-height: 1.4; }
+.ex-ovl { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.ex-tg {
+  display: inline-flex; align-items: center; gap: 5px; min-height: 34px; padding: 0 10px; border-radius: 17px;
+  border: 1px solid var(--sc-color-border-neutral); background: #fff; font-size: 12.5px; color: var(--sc-color-text);
+}
+.ex-tg[aria-pressed="true"] { background: var(--sc-color-primary-soft); border-color: var(--sc-color-primary); color: var(--sc-color-primary-dark); font-weight: 600; }
+.ex-tg:disabled { opacity: .45; cursor: not-allowed; }
+.ex-tg .ex-chk { width: 13px; height: 13px; border-radius: 3px; border: 1.5px solid #c4ccd6; flex: none; position: relative; }
+.ex-tg[aria-pressed="true"] .ex-chk { background: var(--sc-color-primary-dark); border-color: var(--sc-color-primary-dark); }
+.ex-tg[aria-pressed="true"] .ex-chk::after { content: "✓"; position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font-size: 9px; font-weight: 700; }
+.ex-vpop-foot { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--sc-color-border-neutral); }
+.ex-vpop-foot .btn { min-height: 36px; padding: 0 12px; font-size: 12.5px; }
+
+/* Contextual Object Card directly under the video */
+.ex-ctx {
+  flex: none; min-height: 104px; max-height: 220px; overflow-y: auto; padding: 11px 14px;
+  display: flex; flex-direction: column; justify-content: center; gap: 6px;
+}
+.ex-empty { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.ex-empty-t { display: flex; flex-direction: column; flex: 1 1 200px; min-width: 0; gap: 2px; }
+.ex-empty-t b { font-size: 14.5px; color: var(--sc-color-text); }
+.ex-empty-acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.ex-empty-acts .btn { min-height: 44px; }
+.ex-ghosts { flex-basis: 100%; display: flex; gap: 8px; flex-wrap: wrap; }
+.ex-ghosts .btn { min-height: 36px; opacity: .5; border-style: dashed; pointer-events: none; font-size: 12.5px; }
+body.ui-expert #ex-obj-host:empty { display: none; }
+body.ui-expert #ex-obj-host { display: flex; flex-direction: column; gap: 8px; }
+body.ui-expert #ex-obj-host .grasp-bar {
+  position: static; transform: none; left: auto; bottom: auto; width: auto; max-width: none;
+  background: transparent; border: 0; box-shadow: none; padding: 0; backdrop-filter: none; -webkit-backdrop-filter: none;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px 10px;
+}
+body.ui-expert #ex-obj-host .grasp-info { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+body.ui-expert #ex-obj-host .grasp-prog { grid-column: 1 / -1; }
+body.ui-expert #ex-obj-host .grasp-info b { font-size: 16.5px; font-weight: 700; }
+body.ui-expert #ex-obj-host .oc-src:not(:empty) { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 6px; font-size: 12px; font-weight: 600; background: #eef6ff; color: #1d4ed8; }
+body.ui-expert #ex-obj-host .oc-x { display: inline-grid; place-items: center; margin-left: auto; width: 36px; height: 36px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; font-size: 18px; }
+body.ui-expert #ex-obj-host .grasp-acts { grid-column: 1; grid-row: 2; display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+body.ui-expert #ex-obj-host .grasp-acts .btn { min-height: 44px; padding: 0 15px; }
+body.ui-expert #ex-obj-host #grasp-go { min-width: 112px; font-size: 15px; font-weight: 600; }
+body.ui-expert #ex-obj-host #meas-go { background: var(--sc-color-primary-soft); border-color: var(--sc-color-border); color: var(--sc-color-primary-dark); }
+body.ui-expert #ex-obj-host #grasp-cancel { display: none; }
+body.ui-expert #ex-obj-host .oc-task:not([hidden]) {
+  grid-column: 2; grid-row: 2; justify-self: end; align-self: center;
+  display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; width: auto;
+  border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; font-size: 13px; color: var(--sc-color-text-secondary); white-space: nowrap;
+}
+body.ui-expert #ex-obj-host .oc-task b { color: var(--sc-color-text); font-weight: 600; }
+body.ui-expert #ex-obj-host .oc-sub:not([hidden]) { grid-column: 1 / -1; grid-row: 3; display: block; font-size: 11.5px; color: var(--sc-color-text-secondary); }
+body.ui-expert #ex-obj-host .meas-card {
+  position: static; left: auto; right: auto; bottom: auto; width: auto; max-height: none; z-index: auto;
+  border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-md); background: var(--sc-color-bg-sunken);
+  box-shadow: none; padding: 10px 12px;
+}
+body.ui-expert #ex-obj-host .depth-panel {
+  position: static; left: auto; bottom: auto; width: auto; max-width: none; z-index: auto;
+  background: transparent; border: 0; box-shadow: none; padding: 0; backdrop-filter: none; -webkit-backdrop-filter: none;
+}
+
+/* Right rail: Tier 1 safety always on top, Motion card below */
+body.ui-expert #safety { flex: none; padding: 10px 12px; position: relative; z-index: 1045; gap: 8px; }
+body.ui-expert #safety .safety-row { display: grid; grid-template-columns: 1.32fr 0.72fr 0.96fr; gap: 7px; }
+body.ui-expert #safety .sw,
+body.ui-expert #safety .btn-stop,
+body.ui-expert #safety .btn-estop { min-height: 58px; padding: 4px 7px; }
+body.ui-expert #safety .sw-text small { font-size: 10px; line-height: 1.15; }
+body.ui-expert #safety .btn-stop, body.ui-expert #safety .btn-estop { flex-direction: column; gap: 2px; font-size: 14px; }
+body.ui-expert #safety .btn-stop span, body.ui-expert #safety .btn-estop span { align-items: center; }
+body.ui-expert .ex-sline { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; margin-top: 2px; font-size: 11.5px; min-width: 0; }
+body.ui-expert .ex-sline .lease-status { padding: 3px 7px; min-width: 0; flex: 0 1 auto; font-size: 11.5px; }
+body.ui-expert .ex-sline .ex-link { font-family: var(--mono); color: var(--sc-color-text-secondary); white-space: nowrap; flex: none; font-size: 11px; }
+body.ui-expert .ex-sline .pwr { margin-left: auto; flex: 0 1 116px; min-width: 72px; gap: 4px; font-size: 11px; }
+body.ui-expert .ex-sline .pwr-bar { min-width: 24px; }
+body.ui-expert .ex-sline .pwr-pct { min-width: 2.4em; }
+body.ui-expert #safety .btn-park-off, body.ui-expert #safety .op-inline, body.ui-expert #safety .btn-preempt { min-height: 44px; }
+/* Expert mode toasts sit at the bottom of the left stage / screen so they never cover Stop/E-Stop or the perception bar */
+body.ui-expert .toasts { top: auto; bottom: max(14px, env(safe-area-inset-bottom)); flex-direction: column-reverse; }
+@media (min-width: 601px) {
+  body.ui-expert .toasts { left: calc((100vw - 384px) / 2); max-width: calc(100vw - 408px); }
+}
+
+/* Right rail: Motion card (.ops) */
+body.ui-expert .ops {
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 0; overflow: hidden;
+  background: var(--sc-color-bg-container); border: 1px solid #e3efcc; border-radius: var(--sc-radius-lg);
+  box-shadow: 0 4px 20px -2px rgba(91,125,21,0.07), 0 2px 8px -1px rgba(0,0,0,0.04);
+}
+body.ui-expert .ops .toolbar {
+  flex: none; padding: 8px 10px; gap: 6px; border-bottom: 1px solid var(--sc-color-border-neutral);
+  display: flex; align-items: center; flex-wrap: nowrap;
+}
+body.ui-expert .ops #mode-seg button { min-height: 40px; padding: 0 10px; font-size: 13px; }
+body.ui-expert .ops #mode-seg button svg { display: none; }
+body.ui-expert .ops .toolbar .tool-group,
+body.ui-expert .ops .toolbar #btn-calib,
+body.ui-expert .ops .toolbar #btn-home { display: none; }
+body.ui-expert .ops .ex-speed-btn {
+  min-height: 40px; padding: 0 10px; font-size: 12.5px; font-weight: 600; white-space: nowrap;
+  border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text);
+}
+body.ui-expert .ops .ex-speed-btn:hover { border-color: var(--sc-color-primary); color: var(--sc-color-primary-dark); }
+body.ui-expert .ops .panel {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; border: 0; border-radius: 0; box-shadow: none;
+  padding: 10px; scrollbar-width: thin;
+}
+body.ui-expert .ops .panel-head { margin-bottom: 8px; gap: 6px; }
+body.ui-expert .ops .ph-title { font-size: 12px; }
+body.ui-expert .ops #input-seg button { min-height: 36px; padding: 0 10px; }
+body.ui-expert .ops .jog-list { grid-template-columns: 1fr; gap: 6px; }
+body.ui-expert .ops .jrow { grid-template-columns: 56px minmax(0, 1fr) 56px; padding: 5px; gap: 5px; }
+body.ui-expert .ops .jbtn { min-height: 46px; }
+body.ui-expert .ops .cart-read { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+body.ui-expert .ops .cart-read > div { padding: 4px 6px; }
+body.ui-expert .ops .cart-read b { font-size: 13px; }
+body.ui-expert .ops .cart-ctl { grid-template-columns: 1fr; gap: 8px; }
+body.ui-expert .ops .cart-steps { gap: 6px; flex-wrap: wrap; }
+body.ui-expert .ops .dpad { grid-template-columns: repeat(3, 46px); grid-template-rows: repeat(3, 44px); }
+body.ui-expert .ops .vcol { grid-template-rows: 44px auto 44px; width: 46px; }
+body.ui-expert .ops .cart-sticks { gap: 10px; flex-wrap: wrap; }
+body.ui-expert .ops .stick-zone { grid-template-columns: 1fr 1fr; gap: 8px; }
+body.ui-expert .ops .stick-center { grid-column: 1 / -1; justify-content: center; }
+body.ui-expert .ops { --stick: 108px; --knob: 38px; }
+body.ui-expert .ops .ex-presets {
+  flex: none; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px;
+  padding: 8px 10px; border-top: 1px solid var(--sc-color-border-neutral); background: var(--sc-color-bg-sunken);
+}
+body.ui-expert .ops .ex-presets .btn { min-height: 44px; padding: 0 8px; font-size: 12.5px; gap: 4px; }
+body.ui-expert .ops .ex-presets .gc-sw { grid-column: 1 / -1; min-height: 44px; padding: 4px 10px; border-style: dashed; }
+
+/* Tablet landscape compact (1024x768) */
+@media (max-width: 1120px) and (min-width: 601px) {
+  body.ui-expert .main { grid-template-columns: minmax(0, 1fr) 348px; gap: 10px; padding: 10px; }
+  body.ui-expert .ex-vbar .ex-live { display: none; }
+  body.ui-expert .ex-ctx { min-height: 92px; max-height: 184px; padding: 9px 12px; }
+  body.ui-expert #safety .sw, body.ui-expert #safety .btn-stop, body.ui-expert #safety .btn-estop { min-height: 54px; }
+  body.ui-expert .ex-sline .pwr-lbl { display: none; }
+  body.ui-expert .toasts { left: calc((100vw - 358px) / 2); max-width: calc(100vw - 382px); }
+  body.ui-expert .ops { --stick: 98px; --knob: 34px; }
+}
+
+/* Expert More & Diagnostics drawers — leave Stop/E-Stop uncovered on every viewport! */
+.ex-drawer-mask {
+  position: fixed; top: 52px; left: 0; right: 384px; bottom: 0; z-index: 1025;
+  background: rgba(15, 26, 43, 0.34); display: flex; justify-content: flex-start;
+}
+.ex-drawer-mask[hidden] { display: none !important; }
+.ex-drawer {
+  width: min(520px, 100%); height: 100%; background: var(--sc-color-bg-layout);
+  border-right: 1px solid var(--sc-color-border); box-shadow: 12px 0 36px rgba(15,26,43,0.18);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.ex-drawer-head {
+  flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 12px 14px; background: #fff; border-bottom: 1px solid var(--sc-color-border);
+}
+.ex-drawer-head h3 { font-size: 16px; font-weight: 700; }
+.ex-drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.ex-menu-group { display: flex; flex-direction: column; gap: 6px; }
+.ex-menu-k { font-size: 12px; font-weight: 600; color: var(--sc-color-text-secondary); padding: 2px 4px; }
+.ex-menu-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
+  min-height: 48px; padding: 8px 12px; border-radius: var(--sc-radius-md);
+  border: 1px solid var(--sc-color-border-neutral); background: #fff; text-align: left; font-weight: 500;
+}
+.ex-menu-item:hover { border-color: var(--sc-color-primary); color: var(--sc-color-primary-dark); }
+.ex-menu-item small { display: block; font-size: 11.5px; font-weight: 400; color: var(--sc-color-text-secondary); }
+.ex-diag-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 8px 12px 0; background: #fff; border-bottom: 1px solid var(--sc-color-border-neutral); }
+.ex-diag-tabs button { min-height: 44px; font-size: 13px; font-weight: 600; color: var(--sc-color-text-secondary); border-bottom: 3px solid transparent; }
+.ex-diag-tabs button[aria-selected="true"] { color: var(--sc-color-primary-dark); border-bottom-color: var(--sc-color-primary); }
+#ex-diag-body .sc-card { overflow: visible; }
+
+/* In expert mode, keep existing drawers clear of the right safety rail (desktop/tablet) so Stop/E-Stop stay reachable */
+@media (min-width: 601px) {
+  body.ui-expert .calib-mask { top: 52px; left: 0; right: 384px; bottom: 0; justify-content: flex-start; }
+  body.ui-expert .calib-drawer { width: min(460px, 100%); border-right: 1px solid var(--sc-color-border); border-left: 0; }
+}
+@media (max-width: 1120px) and (min-width: 601px) {
+  .ex-drawer-mask, body.ui-expert .calib-mask { right: 358px; }
+}
+
+/* Phone portrait (max-width: 600px): Layout B-style — no page scroll, pinned top safety bar, tabbed bottom deck */
+.ex-pdeck { display: none; }
+@media (max-width: 600px) {
+  body.ui-expert { overflow: hidden; height: 100vh; height: 100dvh; }
+  body.ui-expert .app { height: 100vh; height: 100dvh; overflow: hidden; }
+  body.ui-expert .topbar { height: 48px; padding: 0 8px; gap: 5px; position: relative; z-index: 1050; }
+  body.ui-expert .topbar .brand-text { display: none; }
+  body.ui-expert .topbar #ex-ph-status { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; font-size: 11.5px; }
+  body.ui-expert .topbar #btn-pset { display: none !important; }
+  body.ui-expert .topbar .ui-mode-btn { height: 38px; min-height: 38px; padding: 0 8px; font-size: 12px; }
+  body.ui-expert .topbar .ui-mode-btn svg { display: none; }
+  body.ui-expert .topbar #btn-ex-more, body.ui-expert .topbar #btn-op, body.ui-expert .topbar #btn-lang { height: 38px; min-height: 38px; min-width: 38px; padding: 0 8px; font-size: 12px; }
+  body.ui-expert .topbar #btn-ex-more .ex-lbl-ph, body.ui-expert .topbar #btn-op .op-lbl { display: none; }
+
+  body.ui-expert .main {
+    display: flex; flex-direction: column; gap: 0; padding: 0; flex: 1; min-height: 0; overflow: hidden;
+  }
+  body.ui-expert .side { display: contents; }
+  body.ui-expert #safety {
+    order: -10; flex: none; position: relative; top: auto; z-index: 1045;
+    border-radius: 0; border-left: 0; border-right: 0; border-top: 0;
+    padding: 6px 8px 7px; box-shadow: 0 4px 12px rgba(15,26,43,0.08);
+  }
+  body.ui-expert #safety .safety-row { grid-template-columns: 1.32fr 0.72fr 0.96fr; gap: 6px; }
+  body.ui-expert #safety .sw, body.ui-expert #safety .btn-stop, body.ui-expert #safety .btn-estop { min-height: 48px; padding: 2px 6px; font-size: 13px; border-radius: var(--sc-radius-md); }
+  body.ui-expert #safety .btn-stop, body.ui-expert #safety .btn-estop { flex-direction: row; gap: 4px; }
+  body.ui-expert #safety .btn-stop small, body.ui-expert #safety .btn-estop small { display: none; }
+  body.ui-expert #safety .btn-stop svg, body.ui-expert #safety .btn-estop svg { width: 18px; height: 18px; }
+  body.ui-expert #safety .ex-sline { display: none; }
+  body.ui-expert:not(.offline):not(.stopped) #safety .lock-note { display: none; }
+
+  body.ui-expert .stage { order: 1; flex: none; padding: 6px 8px 0; gap: 6px; }
+  body.ui-expert .ex-vcard { flex: none; }
+  body.ui-expert .ex-vbar { min-height: 42px; padding: 4px 6px; gap: 5px; }
+  body.ui-expert .ex-vbar .ex-vsep, body.ui-expert .ex-vbar .ex-live, body.ui-expert .ex-vbar #ex-trig-slot { display: none; }
+  body.ui-expert .ex-vbar .view-switch button { min-height: 34px; min-width: 38px; padding: 0 8px; font-size: 12px; }
+  body.ui-expert .ex-vis-sw { min-height: 36px; padding: 0 4px; gap: 5px; font-size: 12px; }
+  body.ui-expert .ex-vis-sw .ex-sw-track { width: 36px; height: 22px; }
+  body.ui-expert .ex-vis-sw .ex-sw-track::after { width: 16px; height: 16px; }
+  body.ui-expert .ex-vis-sw[aria-checked="true"] .ex-sw-track::after { left: 17px; }
+  body.ui-expert .ex-mchip { min-height: 36px; padding: 0 8px; font-size: 12px; gap: 5px; margin-left: auto; max-width: 52%; }
+  body.ui-expert .ex-vcard > .video { flex: none; width: 100%; aspect-ratio: 16 / 9; max-height: 22dvh; min-height: 120px; }
+
+  body.ui-expert .ex-ctx { min-height: 0; max-height: 24dvh; overflow-y: auto; padding: 7px 10px; gap: 5px; }
+  body.ui-expert .ex-ctx .ex-ghosts { display: none; }
+  body.ui-expert .ex-ctx .ex-empty { gap: 6px; }
+  body.ui-expert .ex-ctx .ex-empty-t b { font-size: 13px; }
+  body.ui-expert .ex-ctx .ex-empty-t .ex-hint { display: none; }
+  body.ui-expert .ex-ctx .ex-empty-acts .btn { min-height: 38px; padding: 0 10px; font-size: 12.5px; }
+  body.ui-expert #ex-obj-host .grasp-bar { grid-template-columns: minmax(0, 1fr); gap: 5px; }
+  body.ui-expert #ex-obj-host .grasp-info { gap: 6px; }
+  body.ui-expert #ex-obj-host .grasp-info b { font-size: 14.5px; }
+  body.ui-expert #ex-obj-host .oc-x { width: 32px; height: 32px; font-size: 16px; }
+  body.ui-expert #ex-obj-host .grasp-acts { grid-column: 1; gap: 6px; }
+  body.ui-expert #ex-obj-host .grasp-acts .btn { min-height: 38px; padding: 0 10px; font-size: 13px; flex: 1 1 auto; }
+  body.ui-expert #ex-obj-host #grasp-go { min-width: 0; font-size: 13.5px; }
+  body.ui-expert #ex-obj-host .oc-sub { display: none !important; }
+  body.ui-expert #ex-obj-host .oc-task:not([hidden]) { grid-column: 1; grid-row: auto; justify-self: stretch; width: 100%; justify-content: space-between; min-height: 34px; padding: 0 10px; font-size: 12px; }
+
+  body.ui-expert .ex-pdeck {
+    order: 2; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 160px;
+    margin: 6px 8px 8px; overflow: hidden;
+    background: var(--sc-color-bg-container); border: 1px solid #e3efcc; border-radius: var(--sc-radius-lg);
+  }
+  .ex-ptabs { flex: none; display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--sc-color-border-neutral); background: #fff; }
+  .ex-ptabs button { min-height: 44px; font-size: 13.5px; font-weight: 600; color: var(--sc-color-text-secondary); border-bottom: 3px solid transparent; }
+  .ex-ptabs button[aria-selected="true"] { color: var(--sc-color-primary-dark); border-bottom-color: var(--sc-color-primary); }
+  .ex-ppane { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: none; flex-direction: column; }
+  .ex-ppane.on { display: flex; }
+  body.ui-expert .ex-ppane .ops { border: 0; border-radius: 0; box-shadow: none; flex: 1 1 auto; overflow: visible; }
+  body.ui-expert .ex-ppane .ops .panel { overflow: visible; padding: 8px; }
+  body.ui-expert .ex-ppane .ops .ex-presets { display: none; }
+  body.ui-expert .ex-ppane .ex-vpop {
+    position: static; top: auto; left: auto; width: auto; max-height: none; z-index: auto;
+    border: 0; border-radius: 0; box-shadow: none; padding: 10px; display: block !important;
+  }
+  body.ui-expert .ex-ppane .ex-vpop .ex-vpop-x { display: none; }
+  .ex-pposes { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .ex-pposes-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .ex-pposes-grid .btn { min-height: 46px; padding: 0 10px; font-size: 13px; }
+
+  /* Phone drawers sit below the pinned safety bar so Stop/E-Stop stay uncovered */
+  .ex-drawer-mask, body.ui-expert .calib-mask {
+    top: var(--ex-safe-bot, 118px); left: 0; right: 0; bottom: 0; z-index: 1030;
+  }
+  .ex-drawer, body.ui-expert .calib-drawer { width: 100%; max-width: 100%; border-right: 0; border-radius: 16px 16px 0 0; }
+}
+body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
 </style>
 </head>
 <body class="ui-simple offline locked controls-unavailable">
@@ -2037,6 +2437,8 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
     <button class="ui-mode-btn" id="btn-ui" type="button" data-i18n-title="ui.to_expert.t" title="切换到专家模式：关节点动、遥测、标定、录制和全部抓取参数">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h7"/><circle cx="17" cy="6" r="2"/><circle cx="14" cy="18" r="2"/></svg><span id="btn-ui-txt" data-i18n="ui.to_expert">专家模式</span>
     </button>
+    <span class="sc-status-badge only-expert" id="ex-ph-status">--</span>
+    <span class="ex-top-grow only-expert"></span>
     <div class="head-stats">
       <button class="speed-pill" id="speed-pill" data-i18n-aria="speed.adjust" aria-label="速度调节">60% ▾</button>
       <span class="sc-status-badge plain" id="tool-badge" hidden></span>
@@ -2058,6 +2460,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
     <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
     </button>
+    <button class="btn only-expert" id="btn-ex-more" type="button" aria-haspopup="dialog" aria-controls="ex-more" data-i18n-aria="ex.more" aria-label="更多与诊断">≡<span class="ex-lbl-ph" data-i18n="ex.more.s">更多</span></button>
     <button class="op-btn" id="btn-op" type="button" aria-label="操作员权限" title="操作员权限" data-i18n-aria="op.title" data-i18n-title="op.title" hidden></button>
     <button class="lang-btn" id="btn-lang" type="button" aria-label="Switch language">EN</button>
   </header>
@@ -2126,7 +2529,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
           <div class="v3-legend"><span class="k-meas"><i></i><b data-i18n="v3.leg.meas">实测</b></span><span class="k-cmd"><i></i><b data-i18n="v3.leg.cmd">指令</b></span><span class="k-ws"><i></i><b data-i18n="v3.leg.ws">工作空间</b></span><span class="k-ko"><i></i><b data-i18n="v3.leg.ko">禁入区</b></span></div>
         </div>
         <div class="grasp-bar" id="grasp-bar" role="group" data-i18n-aria="grasp.aria" aria-label="点框抓取" hidden>
-          <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span><span class="oc-src only-simple" id="grasp-src"></span><button class="oc-x only-simple" id="grasp-x" type="button" data-i18n-aria="oc.x" aria-label="取消选择">×</button></div>
+          <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span><span class="oc-src" id="grasp-src"></span><button class="oc-x" id="grasp-x" type="button" data-i18n-aria="oc.x" aria-label="取消选择">×</button></div>
           <div class="grasp-prog" id="grasp-prog" hidden><span id="grasp-phase">--</span><div class="calib-bar"><i id="grasp-fill"></i></div></div>
           <div class="grasp-acts">
             <button class="btn btn-primary" id="grasp-go" type="button" data-i18n="grasp.go">抓取</button>
@@ -2134,8 +2537,8 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
             <button class="btn" id="grasp-cancel" type="button" data-i18n="grasp.cancel">取消</button>
             <button class="btn grasp-stop" id="grasp-stop" type="button" data-i18n="grasp.stop" hidden>停止</button>
           </div>
-          <div class="oc-sub only-simple" id="grasp-sub"><span></span><span id="meas-sub"></span></div>
-          <button class="oc-task only-simple" id="grasp-task" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer"><span data-i18n="oc.task">抓取任务</span><b id="grasp-task-name">默认</b><span class="oc-task-set" data-i18n="oc.task.set">设置 ›</span></button>
+          <div class="oc-sub" id="grasp-sub"><span></span><span id="meas-sub"></span></div>
+          <button class="oc-task" id="grasp-task" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer"><span data-i18n="oc.task">抓取任务</span><b id="grasp-task-name">默认</b><span class="oc-task-set" data-i18n="oc.task.set">设置 ›</span></button>
         </div>
         <div class="s-objhint only-simple" id="s-objhint" role="status" hidden></div>
         <div class="meas-card" id="meas-card" role="region" aria-live="polite" data-i18n-aria="ms.title" aria-label="尺寸测量" hidden></div>
@@ -2148,8 +2551,111 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
         <div class="grasp-pick" id="grasp-pick" role="status" hidden><span data-i18n="gset.grip.tap">点击画面中夹爪之间物体的中心</span><button class="btn" id="grasp-pick-x" type="button" data-i18n="grasp.cancel">取消</button></div>
         <div class="banner" data-i18n="banner.lock">遥测断开 · 控制已锁定</div>
       </div>
+      <!-- expert: video card wrapper (attached perception toolbar + clean video + transient model popover) -->
+      <div class="ex-vcard only-expert" id="ex-vcard">
+        <div class="ex-vbar" id="ex-vbar">
+          <span id="ex-vs-slot"></span>
+          <span class="ex-vsep"></span>
+          <button class="ex-vis-sw" id="ex-vis-on" type="button" role="switch" aria-checked="false" data-op="/api/v1/vision/mode" data-i18n-aria="sv.on.aria" aria-label="识别开关">
+            <span class="ex-sw-track"></span><span data-i18n="sv.title">识别</span>
+          </button>
+          <button class="ex-mchip" id="ex-model-chip" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="ex-vpop">
+            <span class="ex-kind" id="ex-mchip-kind">--</span><span id="ex-mchip-name">--</span> ▾
+          </button>
+          <span id="ex-trig-slot"></span>
+          <span class="ex-vgrow"></span>
+          <span class="ex-live" id="ex-live"><i class="ex-dot"></i><span id="ex-live-txt">--</span></span>
+        </div>
+        <div class="ex-vpop" id="ex-vpop" role="dialog" data-i18n-aria="ex.models.title" aria-label="视觉模型与叠加" hidden>
+          <div class="ex-vpop-head">
+            <h4><span><span data-i18n="ex.models.det">识别模型</span><span class="ex-en">Detector</span></span></h4>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="ex-op-tag" id="ex-op-tag" data-i18n="ex.op_req">🔒 需操作员</span>
+              <button class="ex-vpop-x" id="ex-vpop-x" type="button" data-i18n-aria="op.close" aria-label="关闭">×</button>
+            </div>
+          </div>
+          <div class="ex-warn-box" id="ex-model-warn" role="status" hidden></div>
+          <div class="ex-err-box" id="ex-model-err" role="alert" hidden></div>
+          <div class="ex-mlist" id="ex-det-list" role="radiogroup" data-i18n-aria="ex.models.det" aria-label="识别模型"></div>
+          <hr class="ex-sep" id="ex-depth-sep">
+          <div id="ex-depth-sec">
+            <div class="ex-depth-head">
+              <h4><span><span data-i18n="ex.models.depth">深度模型</span><span class="ex-en" id="ex-depth-name">Depth</span></span></h4>
+              <button class="ex-vis-sw" id="ex-depth-sw" type="button" role="switch" aria-checked="false" data-op-mark style="min-height:36px;padding:0 4px">
+                <span class="mono" id="ex-depth-mb" style="font-size:12px;color:var(--sc-color-text-secondary)"></span>
+                <span class="ex-sw-track"></span>
+              </button>
+            </div>
+            <div class="ex-mlist" id="ex-dep-list" role="radiogroup" data-i18n-aria="ex.models.depth" aria-label="深度模型" hidden></div>
+            <div class="ex-hint" id="ex-depth-hint" data-i18n="ex.depth.note">模型估计，未校准，仅表示相对远近</div>
+          </div>
+          <div class="ex-ion" id="ex-ion-box" hidden>
+            <div class="ex-ion-bar" id="ex-ion-bar" aria-label="ION 模型预算"><i class="ex-ion-det" id="ex-ion-det"></i><i class="ex-ion-dep" id="ex-ion-dep"></i></div>
+            <div class="ex-ion-k"><span id="ex-ion-summary">--</span><span class="mono" id="ex-ion-rem" style="color:var(--sc-color-text-secondary)"></span></div>
+            <div class="ex-hint" id="ex-ion-note"></div>
+          </div>
+          <hr class="ex-sep">
+          <h4><span><span data-i18n="ex.ovl.title">画面叠加</span><span class="ex-en" data-i18n="ex.ovl.sub">仅本页</span></span></h4>
+          <div class="ex-ovl" id="ex-ovl">
+            <button type="button" class="ex-tg" data-ex-ovl="box" aria-pressed="true"><i class="ex-chk"></i><span data-i18n="sv.show.box">框</span></button>
+            <button type="button" class="ex-tg" data-ex-ovl="contour" aria-pressed="true"><i class="ex-chk"></i><span data-i18n="sv.show.contour">轮廓</span></button>
+            <button type="button" class="ex-tg" data-ex-ovl="label" aria-pressed="true"><i class="ex-chk"></i><span data-i18n="sv.show.label">标签</span></button>
+            <button type="button" class="ex-tg" data-ex-ovl="aruco" data-op="/api/v1/vision/mode" aria-pressed="false"><i class="ex-chk"></i><span>ArUco</span></button>
+            <button type="button" class="ex-tg" data-ex-ovl="depth" data-op="/api/v1/vision/depth" aria-pressed="false"><i class="ex-chk"></i><span data-i18n="depth.btn">深度（估计）</span></button>
+          </div>
+          <div class="ex-vpop-foot">
+            <button type="button" class="btn" id="ex-vpop-snap" data-op="/api/v1/detection/trigger" data-i18n="det.trig">单次识别</button>
+            <button type="button" class="btn" id="ex-vpop-gset" data-op="/api/v1/grasp/setup" data-op-mode="offer" data-i18n="sv.gset">抓取设置 ›</button>
+          </div>
+        </div>
+      </div>
+      <!-- expert: contextual selected-object / depth card directly under the video -->
+      <div class="sc-card ex-ctx only-expert" id="ex-ctx">
+        <div class="ex-empty" id="ex-obj-empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:26px;height:26px;color:var(--sc-color-primary-dark);flex:none" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M12 9v6M9 12h6"/></svg>
+          <div class="ex-empty-t">
+            <b id="ex-empty-title" data-i18n="ex.empty.off">打开识别，然后点选画面中的物体</b>
+            <span class="ex-hint" id="ex-empty-sub" data-i18n="ex.empty.sub">选中后可以抓取、测量尺寸、选择抓取任务</span>
+          </div>
+          <div class="ex-empty-acts">
+            <button type="button" class="btn btn-primary" id="ex-empty-on" data-op="/api/v1/vision/mode" data-i18n="ex.empty.open">打开识别</button>
+            <button type="button" class="btn" id="ex-empty-snap" data-op="/api/v1/detection/trigger" data-i18n="det.trig">单次识别</button>
+          </div>
+          <div class="ex-ghosts" aria-hidden="true">
+            <span class="btn" data-i18n="grasp.go">抓取</span>
+            <span class="btn" data-i18n="ex.ghost.meas">测量尺寸 · 臂会移动</span>
+            <span class="btn" data-i18n="ex.ghost.task">抓取任务 ▾</span>
+          </div>
+        </div>
+        <div id="ex-obj-host"></div>
+      </div>
       <!-- simple, portrait / stacked: the hint, the object card and the measurement card go here, under the video -->
       <div class="s-slot only-simple" id="s-slot"></div>
+    </section>
+
+    <!-- expert phone portrait (Layout B-style): tabbed bottom deck -->
+    <section class="ex-pdeck only-expert" id="ex-pdeck" aria-label="操作台">
+      <div class="ex-ptabs" id="ex-ptabs" role="tablist">
+        <button type="button" role="tab" data-ptab="move" aria-selected="true" data-i18n="ex.tab.move">移动</button>
+        <button type="button" role="tab" data-ptab="vision" aria-selected="false" data-i18n="ex.tab.vision">视觉</button>
+        <button type="button" role="tab" data-ptab="poses" aria-selected="false" data-i18n="ex.tab.poses">点位</button>
+      </div>
+      <div class="ex-ppane on" id="ex-ppane-move" role="tabpanel"></div>
+      <div class="ex-ppane" id="ex-ppane-vision" role="tabpanel"></div>
+      <div class="ex-ppane" id="ex-ppane-poses" role="tabpanel">
+        <div class="ex-pposes">
+          <div class="ex-pposes-grid">
+            <button type="button" class="btn ex-pre-btn" data-ex-preset="home" data-i18n="home">⌂ 回零</button>
+            <button type="button" class="btn ex-pre-btn" data-ex-preset="inspect" data-i18n="pre.inspect">◉ 观察</button>
+            <button type="button" class="btn ex-pre-btn" data-ex-preset="park" data-i18n="pre.park">▣ 收纳</button>
+            <button type="button" class="btn" id="ex-ph-open-teach" data-i18n="tch.title">点位与动作 ›</button>
+          </div>
+          <div class="ex-pposes-grid">
+            <button type="button" class="btn" id="ex-ph-open-diag" data-i18n="ex.diag.title">诊断与遥测 ›</button>
+            <button type="button" class="btn" id="ex-ph-open-gset" data-op="/api/v1/grasp/setup" data-op-mode="offer" data-i18n="gset.title">抓取设置 ›</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- ===== expert: fine control ===== -->
@@ -2174,10 +2680,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><path d="M14 4h6v6"/><path d="M20 4l-6 6"/><circle cx="17" cy="17" r="3.5"/><path d="M6.5 14v6M3.5 17h6"/></svg>
           <span data-i18n="calib.open">相机标定</span>
         </button>
-        <button class="btn" id="btn-home">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-7 8 7"/><path d="M6 10v10h12V10"/></svg>
-          <span data-i18n="home">回零</span>
-        </button>
+        <button class="ex-speed-btn only-expert" id="ex-speed-btn" type="button" data-i18n-aria="speed.adjust" aria-label="速度调节">速度 60% ▾</button>
       </div>
 
       <div class="panel sc-card">
@@ -2297,6 +2800,14 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
           </div>
         </div>
       </div>
+      <div class="ex-presets only-expert" id="ex-presets">
+        <button class="btn" id="btn-home" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-7 8 7"/><path d="M6 10v10h12V10"/></svg>
+          <span data-i18n="home">回零</span>
+        </button>
+        <button class="btn ex-pre-btn" id="ex-pre-inspect" data-ex-preset="inspect" type="button" data-i18n="pre.inspect">观察</button>
+        <button class="btn ex-pre-btn" id="ex-pre-park" data-ex-preset="park" type="button" data-i18n="pre.park">收纳</button>
+      </div>
     </section>
 
     <!-- ===== side column ===== -->
@@ -2320,6 +2831,9 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
         <div class="lease-status" id="lease-status" role="status" aria-live="polite" hidden>
           <i class="lease-dot" aria-hidden="true"></i>
           <span id="lease-status-txt">--</span>
+        </div>
+        <div class="ex-sline only-expert" id="ex-sline">
+          <span class="ex-link" id="ex-link">-- Hz</span>
         </div>
         <!-- after a fault / E-stop clear with the motors still holding: park and torque off (the enable switch resumes) -->
         <button class="btn op-inline" id="op-inline" type="button" data-i18n="op.inline" hidden>🔒 复位需要操作员权限 · 解锁并复位</button>
@@ -2463,7 +2977,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       </div>
 
       <!-- expert: telemetry -->
-      <div class="sc-card only-expert">
+      <div class="sc-card only-expert" id="ex-card-comm">
         <div class="sc-card-title"><span data-i18n="comm.title">通信与状态</span><span class="mono" style="font-size:12px;color:var(--sc-color-text-tertiary)" id="epoch-txt">epoch --</span></div>
         <div class="kv">
           <div><span data-i18n="kv.hz">遥测帧率 (WS)</span><b id="t-hz">--</b></div>
@@ -2482,7 +2996,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       </div>
 
       <!-- expert: joints -->
-      <div class="sc-card only-expert">
+      <div class="sc-card only-expert" id="ex-card-joints">
         <div class="sc-card-title"><span><span data-i18n="jt.title">关节状态</span><small data-i18n="jt.sub">角度 / 弧度 / 速度 / 力矩 / 温度</small></span></div>
         <table class="jtable">
           <thead><tr><th data-i18n="jt.joint">关节</th><th data-i18n="jt.deg">角度°</th><th>rad</th><th>°/s</th><th data-i18n="jt.torque">力矩</th><th>°C</th></tr></thead>
@@ -2492,7 +3006,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       </div>
 
       <!-- expert: dataset -->
-      <div class="sc-card only-expert">
+      <div class="sc-card only-expert" id="ex-card-rec">
         <div class="sc-card-title"><span><span data-i18n="rec.title">数据集录制</span><small>LeRobot</small></span><span class="sc-status-badge" id="rec-state" data-i18n="rec.idle">空闲</span></div>
         <div class="rec-body">
           <label class="field">Episode ID<input id="rec-id" spellcheck="false" autocomplete="off"></label>
@@ -2522,7 +3036,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       </div>
 
       <!-- expert: keyboard -->
-      <div class="sc-card only-expert">
+      <div class="sc-card only-expert" id="ex-card-kbd">
         <div class="sc-card-title"><span data-i18n="kb.title">键盘快捷键</span></div>
         <div class="kbd-help">
           <span class="sub" data-i18n="mode.joint">关节点动</span>
@@ -2796,6 +3310,53 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
       <small data-i18n="col.sens.hint">高：轻微受阻就停；低：只在明显受阻时停。</small>
       <small class="col-note" data-i18n="col.set.note">注意：这台机械臂的碰撞阈值还没有标定，灵敏度只作试用参考；碰撞保护不能代替急停。</small>
       <div class="calib-live mono" id="col-status">--</div>
+    </div>
+  </aside>
+</div>
+<!-- expert: More menu drawer (leaves Stop/E-Stop uncovered) -->
+<div class="ex-drawer-mask" id="ex-more" hidden>
+  <aside class="ex-drawer" role="dialog" aria-modal="false" aria-labelledby="ex-more-h">
+    <div class="ex-drawer-head">
+      <h3 id="ex-more-h" data-i18n="ex.more">更多与诊断</h3>
+      <button class="btn calib-x" id="ex-more-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="ex-drawer-body">
+      <div class="ex-menu-group">
+        <div class="ex-menu-k" data-i18n="ex.more.diag">诊断与数据</div>
+        <button class="ex-menu-item" id="ex-m-diag" type="button"><span><b data-i18n="ex.diag.title">诊断与遥测</b><small data-i18n="ex.diag.desc">遥测帧率、关节状态表、数据集录制与快捷键</small></span><span>›</span></button>
+        <button class="ex-menu-item" id="ex-m-task" type="button"><span><b data-i18n="task.title">任务与策略</b><small data-i18n="ex.task.desc">实时指令流与环境状态</small></span><span>›</span></button>
+        <button class="ex-menu-item" id="ex-m-teach" type="button"><span><b data-i18n="tch.title">点位与动作</b><small data-i18n="ex.teach.desc">命名点位、动作序列与轨迹录制</small></span><span>›</span></button>
+      </div>
+      <div class="ex-menu-group">
+        <div class="ex-menu-k" data-i18n="ex.more.calib">标定与配置</div>
+        <button class="ex-menu-item" id="ex-m-gset" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer"><span><b data-i18n="gset.title">抓取设置</b><small data-i18n="ex.gset.desc">桌面高度、夹爪位置与抓取任务</small></span><span>›</span></button>
+        <button class="ex-menu-item" id="ex-m-calib" type="button" data-op-mark><span><b data-i18n="calib.open">相机标定</b><small data-i18n="ex.calib.desc">相机内参、手眼标定向导与精校</small></span><span>›</span></button>
+        <button class="ex-menu-item" id="ex-m-sset" type="button"><span><b data-i18n="sset.title">设置（工具与碰撞保护）</b><small data-i18n="ex.sset.desc">零位标定、夹爪标定、碰撞保护灵敏度</small></span><span>›</span></button>
+      </div>
+      <div class="ex-menu-group">
+        <div class="ex-menu-k" data-i18n="ex.more.view">界面</div>
+        <button class="ex-menu-item" id="ex-m-simple" type="button"><span><b data-i18n="ui.to_simple">简易模式</b><small data-i18n="ui.to_simple.t">回到简易模式：画面、摇杆和点选抓取</small></span><span>›</span></button>
+        <button class="ex-menu-item" id="ex-m-fs" type="button" hidden><span><b data-i18n="fs.title">全屏</b><small data-i18n="fs.enter">切换全屏显示</small></span><span>›</span></button>
+      </div>
+    </div>
+  </aside>
+</div>
+<!-- expert: Diagnostics drawer (telemetry, joint table, dataset recording, keyboard help) -->
+<div class="ex-drawer-mask" id="ex-diag" hidden>
+  <aside class="ex-drawer" role="dialog" aria-modal="false" aria-labelledby="ex-diag-h">
+    <div class="ex-drawer-head">
+      <h3 id="ex-diag-h" data-i18n="ex.diag.title">诊断与遥测</h3>
+      <button class="btn calib-x" id="ex-diag-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="ex-diag-tabs" id="ex-diag-tabs" role="tablist">
+      <button type="button" role="tab" data-dtab="tele" aria-selected="true" data-i18n="ex.diag.tele">遥测与关节</button>
+      <button type="button" role="tab" data-dtab="rec" aria-selected="false" data-i18n="ex.diag.rec">录制与回放</button>
+      <button type="button" role="tab" data-dtab="kbd" aria-selected="false" data-i18n="kb.title">键盘快捷键</button>
+    </div>
+    <div class="ex-drawer-body" id="ex-diag-body">
+      <div id="ex-diag-tele" style="display:flex;flex-direction:column;gap:10px"></div>
+      <div id="ex-diag-rec" style="display:flex;flex-direction:column;gap:10px" hidden></div>
+      <div id="ex-diag-kbd" style="display:flex;flex-direction:column;gap:10px" hidden></div>
     </div>
   </aside>
 </div>
@@ -3392,8 +3953,39 @@ Object.assign(I18N.zh, {
   'gset.tasks': '抓取任务', 'gset.task.def.d': '用下面的高度和夹爪位置抓取选中的物体。',
   'gset.tasks.hidden': '另有 {n} 个任务需要别的识别模型，简易模式不列出（在专家模式使用）。',
   'lease.tq.on': '扭矩开', 'lease.tq.off': '扭矩关',
-  'ec.vision_busy': '抓取或测量正在使用识别：结束（或按停止）后再切换', 'ec.ion_budget': '相机内存不够同时加载这个模型和已加载的模型：保持当前识别方式',
-  'ec.model_nf': '设备上没有这种识别方式的默认模型：在设备上安装模型，或在机械臂配置的 vision_detectors 中指定',
+  'ec.vision_busy': '抓取或测量正在使用识别：结束（或按停止）后再切换', 'ec.ion_budget': '相机 ION 内存不足：先关闭深度模型或改选更小的检测/分割变体，再切换',
+  'ec.model_nf': '设备目录中未找到该模型：刷新列表、在设备上安装模型，或在配置中指定',
+  'ec.model_switch_failed': '模型加载失败：保持当前模型，检查设备模型文件与剩余 ION 内存后重试',
+  'ec.model_switch_refused': '视觉服务拒绝加载该模型：检查模型槽位与设备目录后重试',
+  'ec.unsupported': '当前视觉服务不支持模型切换：在设备上更新 rebot-teleop 后重试',
+  'op.why.models': '切换视觉识别模型或深度模型需要操作员权限',
+  'ex.more': '更多与诊断', 'ex.more.s': '更多', 'ex.more.diag': '诊断与数据', 'ex.more.calib': '标定与配置', 'ex.more.view': '界面',
+  'ex.diag.title': '诊断与遥测', 'ex.diag.desc': '遥测帧率、关节状态表、数据集录制与快捷键',
+  'ex.diag.tele': '遥测与关节', 'ex.diag.rec': '录制与回放',
+  'ex.task.desc': '实时指令流与环境状态', 'ex.teach.desc': '命名点位、动作序列与轨迹录制',
+  'ex.gset.desc': '桌面高度、夹爪位置与抓取任务', 'ex.calib.desc': '相机内参、手眼标定向导与精校',
+  'ex.sset.desc': '零位标定、夹爪标定、碰撞保护灵敏度',
+  'ex.models.title': '视觉模型与叠加', 'ex.models.det': '识别模型', 'ex.models.depth': '深度模型',
+  'ex.op_req': '🔒 需操作员', 'ex.op_ok': '🔓 操作员已解锁',
+  'ex.depth.note': '模型估计，未校准，仅表示相对远近',
+  'ex.depth.none': '设备目录中没有深度模型', 'ex.depth.over': '⚠ 与当前识别模型合计 {need} MB，超出预算 {limit} MB；先改选更小的识别模型',
+  'ex.det.cur': '当前 · ', 'ex.det.seg': '框 + 轮廓，抓取用轮廓算宽度和角度', 'ex.det.det': '只有框，没有轮廓', 'ex.det.obb': '旋转框（OBB）',
+  'ex.det.over': '⚠ 与深度模型合计 {need} MB，超出 ION 预算 {limit} MB；先关闭深度模型',
+  'ex.det.none': '视觉服务未提供模型目录（升级 rebot-teleop 以切换变体）',
+  'ex.det.unloaded': '未加载', 'ex.det.switching': '正在切换模型…',
+  'ex.det.ok': '已加载模型：{name}', 'ex.det.fail': '模型未切换',
+  'ex.ion.sum': '模型 ION {used} / {budget} MB', 'ex.ion.rem': '余 {rem} MB', 'ex.ion.over': '超出 {over} MB',
+  'ex.ion.parts': '识别 {det} + 深度 {dep}',
+  'ex.ion.note': '预算 = {total} MB ION − {base} MB 相机/编码 − {res} MB 余量 · 切换约 0.6–0.8 s，期间识别暂停',
+  'ex.ovl.title': '画面叠加', 'ex.ovl.sub': '仅本页',
+  'ex.empty.off': '打开识别，然后点选画面中的物体', 'ex.empty.on0': '画面中暂无识别到的物体',
+  'ex.empty.on_n': '已识别 {n} 个物体，点选画面中的物体开始操作',
+  'ex.empty.sub': '选中后可以抓取、测量尺寸、选择抓取任务', 'ex.empty.open': '打开识别',
+  'ex.ghost.meas': '测量尺寸 · 臂会移动', 'ex.ghost.task': '抓取任务 ▾',
+  'ex.tab.move': '移动', 'ex.tab.vision': '视觉', 'ex.tab.poses': '点位',
+  'ex.speed.btn': '速度 {p}% ▾',
+  'ex.task.loads': '抓取时将自动加载：{m}',
+  'ex.kind.segment': '分割', 'ex.kind.detect': '检测', 'ex.kind.obb': 'OBB', 'ex.kind.other': '模型',
 });
 Object.assign(I18N.en, {
   'ui.to_expert': 'Expert mode', 'ui.to_simple': 'Simple mode',
@@ -3413,8 +4005,39 @@ Object.assign(I18N.en, {
   'gset.tasks': 'Grasp task', 'gset.task.def.d': 'Grasps the selected object with the heights and gripper position below.',
   'gset.tasks.hidden': '{n} more tasks need another detection model and are not listed in simple mode (use expert mode).',
   'lease.tq.on': 'torque on', 'lease.tq.off': 'torque off',
-  'ec.vision_busy': 'A grasp or measurement is using recognition: switch after it ends (or press Stop)', 'ec.ion_budget': 'Not enough camera memory for this model next to the loaded ones: keep the current kind',
-  'ec.model_nf': 'The device has no default model of this kind: install the model on the device, or name one in vision_detectors of the arm profile',
+  'ec.vision_busy': 'A grasp or measurement is using recognition: switch after it ends (or press Stop)', 'ec.ion_budget': 'Not enough camera ION memory for this combination: unload the depth model first or choose a smaller detector variant, then retry',
+  'ec.model_nf': 'Model not found in device catalogue: refresh the list, install the model on the device, or check the arm profile',
+  'ec.model_switch_failed': 'Model failed to load: keep the current model, verify the model file and free ION memory on the device, then retry',
+  'ec.model_switch_refused': 'Vision service refused the model change: check the model slot and device catalogue, then retry',
+  'ec.unsupported': 'The vision service does not support model switching: update rebot-teleop on the device',
+  'op.why.models': 'Switching vision detector or depth models needs operator access',
+  'ex.more': 'More & Diagnostics', 'ex.more.s': 'More', 'ex.more.diag': 'Diagnostics & Data', 'ex.more.calib': 'Calibration & Setup', 'ex.more.view': 'Interface',
+  'ex.diag.title': 'Diagnostics', 'ex.diag.desc': 'Telemetry rates, joint table, dataset recording & shortcuts',
+  'ex.diag.tele': 'Telemetry & Joints', 'ex.diag.rec': 'Recording',
+  'ex.task.desc': 'Live command log & policy environment', 'ex.teach.desc': 'Named poses, motion sequences & trajectories',
+  'ex.gset.desc': 'Table height, gripper pixel & grasp tasks', 'ex.calib.desc': 'Camera intrinsics, hand-eye wizard & fine check',
+  'ex.sset.desc': 'Motor zero, gripper calibration & collision guard',
+  'ex.models.title': 'Vision Models & Overlays', 'ex.models.det': 'Detector Model', 'ex.models.depth': 'Depth Model',
+  'ex.op_req': '🔒 Operator only', 'ex.op_ok': '🔓 Operator unlocked',
+  'ex.depth.note': 'Model estimate, uncalibrated — relative distance only',
+  'ex.depth.none': 'No depth model in device catalogue', 'ex.depth.over': '⚠ Combined {need} MB exceeds {limit} MB budget; switch to a smaller detector first',
+  'ex.det.cur': 'Active · ', 'ex.det.seg': 'Boxes + mask outlines for adaptive grasp width & angle', 'ex.det.det': 'Boxes only, no outlines', 'ex.det.obb': 'Oriented boxes (OBB)',
+  'ex.det.over': '⚠ Combined with depth is {need} MB, over {limit} MB ION budget; turn off depth model first',
+  'ex.det.none': 'Vision service has no model catalogue (update rebot-teleop to switch variants)',
+  'ex.det.unloaded': 'Unloaded', 'ex.det.switching': 'Switching model…',
+  'ex.det.ok': 'Loaded model: {name}', 'ex.det.fail': 'Model switch failed',
+  'ex.ion.sum': 'Model ION {used} / {budget} MB', 'ex.ion.rem': '{rem} MB free', 'ex.ion.over': '{over} MB over',
+  'ex.ion.parts': 'Det {det} + Depth {dep}',
+  'ex.ion.note': 'Budget = {total} MB ION − {base} MB cam/enc − {res} MB reserve · switch ~0.6–0.8 s (pauses detection)',
+  'ex.ovl.title': 'Overlays', 'ex.ovl.sub': 'This page only',
+  'ex.empty.off': 'Turn on recognition, then tap an object in the video', 'ex.empty.on0': 'No objects recognised yet',
+  'ex.empty.on_n': '{n} objects recognised — tap one in the video',
+  'ex.empty.sub': 'Select an object to grasp, measure size, or pick a grasp task', 'ex.empty.open': 'Turn on recognition',
+  'ex.ghost.meas': 'Measure size · arm moves', 'ex.ghost.task': 'Grasp task ▾',
+  'ex.tab.move': 'Move', 'ex.tab.vision': 'Vision', 'ex.tab.poses': 'Poses',
+  'ex.speed.btn': 'Speed {p}% ▾',
+  'ex.task.loads': 'Will load on grasp: {m}',
+  'ex.kind.segment': 'Seg', 'ex.kind.detect': 'Det', 'ex.kind.obb': 'OBB', 'ex.kind.other': 'Model',
 });
 // calibration tools (settings drawer, gripper tool)
 Object.assign(I18N.zh, {
@@ -4141,6 +4764,7 @@ const EC_KEYS = {
   LEASE_LOST: 'ec.lease_lost', NOT_ARMED: 'ec.not_armed', RATE_LIMITED: 'ec.rate', INSECURE_TRANSPORT: 'ec.insecure',
   VISION_DOWN: 'ec.vision_down', VISION_TIMEOUT: 'ec.vision_timeout', MODEL_NOT_LOADED: 'vm.noyolo', COMMAND_TIMEOUT: 'err.cmdtimeout',
   VISION_BUSY: 'ec.vision_busy', ION_BUDGET: 'ec.ion_budget', MODEL_NOT_FOUND: 'ec.model_nf',
+  MODEL_SWITCH_FAILED: 'ec.model_switch_failed', MODEL_SWITCH_REFUSED: 'ec.model_switch_refused', UNSUPPORTED: 'ec.unsupported',
 };
 const errWhy = (code) => (EC_KEYS[code] ? t(EC_KEYS[code]) : '');
 function toast(msg, kind = '', code = '', opts = null) {
@@ -4360,7 +4984,7 @@ const isOperational = () => S.state === 'Armed' || S.state === 'Moving';
 // collision guard protective stop (observation.collision.active): enabled, but motion commands are held
 const colHold = () => !!(S.obs && S.obs.collision && S.obs.collision.active);
 const canMove = () => isOperational() && !colHold();
-const CONTROL_INPUT_SEL = '.disc, .pad, .preset, #btn-home, #btn-pose, #s-grip, #grip-range, .jbtn, .pose-go, #btn-gc';
+const CONTROL_INPUT_SEL = '.disc, .pad, .preset, .ex-pre-btn, #btn-home, #btn-pose, #s-grip, #grip-range, .jbtn, .pose-go, #btn-gc';
 const pageHasControl = () => !!(isLive() && isOperational() && !colHold() && S.leaseGeneration != null);
 function syncControlInputsUi(active) {
   document.body.classList.toggle('controls-unavailable', !active);
@@ -5412,6 +6036,7 @@ function renderDetToggle() {
     pill.title = t('det.fps.tip', { idle, active });
   }
   if (typeof renderVisionMode === 'function') renderVisionMode();
+  if (typeof renderExpertVision === 'function') renderExpertVision();
 }
 
 /* Single-shot detection. Primary: POST /detection/trigger, which runs inference on a frame newer than the call
@@ -5793,6 +6418,7 @@ function renderVisionMode() {
   }
   depthRender();
   if (typeof renderSVis === 'function') renderSVis();
+  if (typeof renderExpertVision === 'function') renderExpertVision();
 }
 /* A tap on the selector: Off clears everything, YOLO / ArUco / Depth toggle independently. */
 function vmToggle(m) {
@@ -5982,7 +6608,7 @@ function depthRender() {
   if (DEPTH.on && depthBlock()) { depthSet(false); return; }
   panel.hidden = !DEPTH.on;
   $('depth-overlay').hidden = !DEPTH.on;
-  if (!DEPTH.on) { $('depth-read').hidden = true; return; }
+  if (!DEPTH.on) { $('depth-read').hidden = true; if (typeof exSyncCtx === 'function') exSyncCtx(); return; }
   panel.setAttribute('aria-label', t('depth.title'));
   setText($('dp-title'), t('depth.title'));
   const live = $('dp-live');
@@ -6000,6 +6626,7 @@ function depthRender() {
   if (!txt && m) txt = t('depth.frame', { id: m.meta.frame_id, age: t('depth.age', { s: Math.max(0, (performance.now() - m.at) / 1000).toFixed(1) }) });
   setText(st, txt);
   st.classList.toggle('is-warn', DEPTH.stWarn);
+  if (typeof exSyncCtx === 'function') exSyncCtx();
 }
 function depthStatus(key, warn = false) { DEPTH.st = key; DEPTH.stWarn = warn; depthRender(); }
 function depthClearMap() {
@@ -10147,6 +10774,8 @@ function setSpeed(i) {
   store('rebot.speed', String(S.speedIdx));
   const pill = $('speed-pill');
   if (pill) pill.textContent = Math.round(CFG.speeds[S.speedIdx] * 100) + '% ▾';
+  const exSp = $('ex-speed-btn');
+  if (exSp) exSp.textContent = t('ex.speed.btn', { p: Math.round(CFG.speeds[S.speedIdx] * 100) });
   for (const b of $('speed-seg').children) {
     const on = Number(b.dataset.i) === S.speedIdx;
     b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
@@ -10681,6 +11310,7 @@ function setUi(ui) {
     const legacy = store('rebot.mode'); // pre-cartesian builds stored jog | stick
     setMode(store('rebot.ctl') || 'joint', store('rebot.input') || (legacy === 'stick' ? 'stick' : 'btn'));
   }
+  if (typeof exPlaceDom === 'function') exPlaceDom();
 }
 $('ui-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { S.uiUserSet = true; setUi(b.dataset.ui); } });
 $('btn-ui').addEventListener('click', () => { S.uiUserSet = true; setUi($('btn-ui').dataset.ui); });
@@ -11230,7 +11860,7 @@ function drawOverlay() {
       g.stroke();
       g.restore();
     }
-    if (S.ui === 'simple' && !showOpt('label')) { g.restore(); continue; }
+    if (!showOpt('label')) { g.restore(); continue; }
 
     // 2. 目标中心微型十字准星 (半径 4px，带白色中心点与半透明外圈)
     const cx = rect.x + d.cx * rect.w;
@@ -11823,7 +12453,7 @@ function graspRunningAction() {
   const a = S.obs && S.obs.action;
   return a && a.kind === 'grasp' && a.state === 'running' ? a : null;
 }
-const graspDetOn = () => (S.dof === 7 || isSoArmProfile()) && DET.avail && DET.enabled;
+const graspDetOn = () => (S.dof === 7 || isSoArmProfile()) && DET.avail && (DET.enabled || detHeld());
 function graspRPC(path, body) {
   return commandRPC(path, body).then((d) => { syncEpoch(d.epoch_id); return d; }, (e) => {
     if (!isCancelledErr(e)) toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message) : e.message, 'err', e.code || '');
@@ -11917,13 +12547,17 @@ $('video-box').addEventListener('click', (e) => {
   // tap an ArUco marker (or its tag) for its pose HUD; tap it again for the automatic choice
   const mk = aruAt(e.clientX, e.clientY);
   if (mk !== undefined) { ARU.pick = ARU.pick === mk ? null : mk; buzz(10); return; }
-  if (!graspDetOn() && detHeld()) { detClearOverlay(); return; } // tap dismisses a held single-shot result
   if (!graspDetOn() || graspRunningAction() || GR.sending) return;
   const [u, v] = pt;
   const hits = (S.detections || []).filter((d) => !d.aruco && u >= d.x0 && u <= d.x1 && v >= d.y0 && v <= d.y1)
     .sort((a, b) => a.w * a.h - b.w * b.h);
   const d = hits[0];
-  GR.sel = d ? { label: d.label, score: d.score, box: [d.x0, d.y0, d.x1, d.y1], seenAt: performance.now() } : null;
+  if (!d && !DET.enabled && detHeld()) { GR.sel = null; detClearOverlay(); renderGrasp(); return; } // empty-space tap dismisses a held single-shot result
+  GR.sel = d ? {
+    label: d.label, score: d.score, box: [d.x0, d.y0, d.x1, d.y1], seenAt: performance.now(),
+    contour: d.contour || null, contourBox: d.contour ? [d.x0, d.y0, d.x1, d.y1] : null, contourAt: d.contour ? performance.now() : 0,
+  } : null;
+  if (d && !DET.enabled && detHeld()) S.detHoldUntil = performance.now() + 60000;
   if (d) { buzz(10); if (MS.state && MS.state !== 'running') msClose(); }
   renderGrasp();
 });
@@ -12018,7 +12652,7 @@ function renderGrasp() {
   $('grasp-pick').hidden = !GR.pickGrip;
   const gs = $('btn-gset');
   if (gs) gs.hidden = !(GR.supported || (S.caps && S.caps.grasp));
-  if (!show) { placeObjCard(null); return; }
+  if (!show) { placeObjCard(null); if (typeof exSyncCtx === 'function') exSyncCtx(); return; }
   $('grasp-info').hidden = !GR.sel;
   if (GR.sel) {
     setText($('grasp-label'), GR.sel.label);
@@ -12048,6 +12682,7 @@ function renderGrasp() {
     setText($('grasp-phase'), txt);
     $('grasp-fill').style.width = Math.round(Math.min(1, Math.max(0, run.progress || 0)) * 100) + '%';
   }
+  if (typeof exSyncCtx === 'function') exSyncCtx();
 }
 $('grasp-go').addEventListener('click', graspGo);
 $('grasp-cancel').addEventListener('click', () => { GR.sel = null; renderGrasp(); });
@@ -12088,6 +12723,7 @@ function msRender() {
   if (!c) return;
   const wasHidden = c.hidden;
   c.hidden = !MS.state;
+  if (typeof exSyncCtx === 'function') exSyncCtx();
   if (wasHidden && !c.hidden && typeof svSheetPlace === 'function') requestAnimationFrame(svSheetPlace);
   if (!MS.state) return;
   c.textContent = '';
@@ -12294,8 +12930,8 @@ graspLoadSetup(true);
    detection kind or detector model differs from the loaded one are not listed in simple mode (no switching from here). */
 const SV = { kindBusy: false, scrollBack: null };
 const SHOW = (() => { try { const v = JSON.parse(store('rebot.sv.show') || 'null'); if (v && typeof v === 'object') return { contour: v.contour !== false, box: !!v.box, label: v.label !== false }; } catch (_) {} return { contour: true, box: false, label: true }; })();
-// expert mode draws everything as before
-const showOpt = (k) => (S.ui === 'simple' ? SHOW[k] : true);
+const EX_SHOW = (() => { try { const v = JSON.parse(store('rebot.ex.show') || 'null'); if (v && typeof v === 'object') return { contour: v.contour !== false, box: v.box !== false, label: v.label !== false }; } catch (_) {} return { contour: true, box: true, label: true }; })();
+const showOpt = (k) => (S.ui === 'simple' ? SHOW[k] : EX_SHOW[k]);
 const svArmBusy = () => !!(graspRunningAction() || ['starting', 'running'].includes(MS.state) || (S.obs && S.obs.action && S.obs.action.kind === 'measure_multiview' && S.obs.action.state === 'running'));
 function svChipText() {
   if (!DET.avail) return t('det.na');
@@ -12419,6 +13055,613 @@ function initSVis() {
   renderSVis();
 }
 
+/* ---- expert mode: Layout A (tablet/desktop) + Layout B-style (phone portrait), model variants + ION, diagnostics ---- */
+const EX = {
+  popOpen: false,
+  busy: false,
+  err: '',
+  ptab: 'move',
+  dtab: 'tele',
+  lastGen: null,
+  phoneMq: window.matchMedia('(max-width: 600px)'),
+};
+const exIsPhone = () => S.ui === 'expert' && EX.phoneMq.matches;
+function exShortModelName(name) {
+  if (!name) return '--';
+  if (/seg.*384/i.test(name)) return 'seg_384';
+  if (/segment/i.test(name)) return 'segment';
+  if (/detection|detect/i.test(name)) return 'detect';
+  if (/obb/i.test(name)) return 'obb';
+  return name.length > 16 ? name.slice(0, 14) + '…' : name;
+}
+function exUpdateSafeBot() {
+  if (!exIsPhone()) return;
+  const s = $('safety');
+  if (!s) return;
+  const r = s.getBoundingClientRect();
+  if (r.bottom > 48) document.documentElement.style.setProperty('--ex-safe-bot', Math.ceil(r.bottom) + 'px');
+}
+function exPlaceDom() {
+  const expert = S.ui === 'expert';
+  const phone = exIsPhone();
+  const stage = document.querySelector('.stage');
+  const main = document.querySelector('.main');
+  const side = $('side');
+  const ops = document.querySelector('.ops');
+  const vb = $('video-box');
+  const vs = $('view-switch');
+  const trig = $('btn-trigger');
+  const vcard = $('ex-vcard');
+  const vpop = $('ex-vpop');
+  const objHost = $('ex-obj-host');
+  const safety = $('safety');
+  const sline = $('ex-sline');
+  const ls = $('lease-status');
+  const pwr = $('pwr');
+  const gc = $('btn-gc');
+  if (!stage || !vb || !vcard || !safety) return;
+
+  if (expert) {
+    // Video + view-switch + trigger inside video card
+    if (vb.parentElement !== vcard) vcard.insertBefore(vb, vpop);
+    if (vs && vs.parentElement !== $('ex-vs-slot')) $('ex-vs-slot').appendChild(vs);
+    if (trig && trig.parentElement !== $('ex-trig-slot')) $('ex-trig-slot').appendChild(trig);
+    // Contextual object/measure/depth inside object card under video
+    for (const id of ['grasp-bar', 'meas-card', 'depth-panel']) {
+      const el = $(id);
+      if (el && el.parentElement !== objHost) objHost.appendChild(el);
+    }
+    // Unified safety status line
+    if (ls && ls.parentElement !== sline) sline.insertBefore(ls, $('ex-link'));
+    if (pwr && pwr.parentElement !== sline) sline.appendChild(pwr);
+    // Diagnostics cards inside diagnostics drawer tabs
+    const teleHost = $('ex-diag-tele'), recHost = $('ex-diag-rec'), kbdHost = $('ex-diag-kbd');
+    if (teleHost && $('ex-card-comm') && $('ex-card-comm').parentElement !== teleHost) teleHost.appendChild($('ex-card-comm'));
+    if (teleHost && $('ex-card-joints') && $('ex-card-joints').parentElement !== teleHost) teleHost.appendChild($('ex-card-joints'));
+    if (recHost && $('ex-card-rec') && $('ex-card-rec').parentElement !== recHost) recHost.appendChild($('ex-card-rec'));
+    if (kbdHost && $('ex-card-kbd') && $('ex-card-kbd').parentElement !== kbdHost) kbdHost.appendChild($('ex-card-kbd'));
+
+    if (phone) {
+      // Layout B-style phone portrait: motion inside Move tab, model picker inside Vision tab
+      if (ops && ops.parentElement !== $('ex-ppane-move')) $('ex-ppane-move').appendChild(ops);
+      if (vpop && vpop.parentElement !== $('ex-ppane-vision')) $('ex-ppane-vision').appendChild(vpop);
+      if (vpop) vpop.hidden = false;
+      const pposes = $('ex-ppane-poses')?.querySelector('.ex-pposes');
+      if (gc && pposes && gc.parentElement !== pposes) pposes.appendChild(gc);
+      EX.popOpen = false;
+      $('ex-model-chip')?.setAttribute('aria-expanded', String(EX.ptab === 'vision'));
+    } else {
+      // Layout A tablet/desktop: motion card in right rail, model picker popover in video card
+      if (ops && ops.parentElement !== side) side.appendChild(ops);
+      if (vpop && vpop.parentElement !== vcard) vcard.appendChild(vpop);
+      if (vpop) vpop.hidden = !EX.popOpen;
+      if (gc && $('ex-presets') && gc.parentElement !== $('ex-presets')) $('ex-presets').appendChild(gc);
+      $('ex-model-chip')?.setAttribute('aria-expanded', String(EX.popOpen));
+    }
+    requestAnimationFrame(exUpdateSafeBot);
+  } else {
+    // Restore everything symmetrically to simple mode
+    if (vb.parentElement !== stage) stage.insertBefore(vb, vcard);
+    if (vs && vs.parentElement !== vb) vb.insertBefore(vs, vb.querySelector('.hud'));
+    if (trig && $('det-ctl') && trig.parentElement !== $('det-ctl')) $('det-ctl').insertBefore(trig, $('fps-pill'));
+    const gpick = $('grasp-pick');
+    for (const id of ['grasp-bar', 'meas-card', 'depth-panel']) {
+      const el = $(id);
+      if (el && el.parentElement === objHost) vb.insertBefore(el, gpick || null);
+    }
+    if (typeof placeSlot === 'function') placeSlot();
+    if (ls && ls.parentElement !== safety) safety.insertBefore(ls, sline);
+    if (pwr && pwr.parentElement !== safety) safety.insertBefore(pwr, $('lock-note'));
+    if (gc && gc.parentElement !== safety) safety.insertBefore(gc, $('lock-note'));
+    if (ops && ops.parentElement !== main) main.insertBefore(ops, side);
+    if (vpop && vpop.parentElement !== vcard) vcard.appendChild(vpop);
+    EX.popOpen = false;
+    if (vpop) vpop.hidden = true;
+    exMoreOpen(false);
+    exDiagOpen(false);
+  }
+  exSyncCtx();
+  renderExpertVision();
+}
+function exSyncCtx() {
+  const empty = $('ex-obj-empty');
+  if (!empty) return;
+  if (S.ui !== 'expert') { empty.hidden = true; return; }
+  const hasActive = !($('grasp-bar')?.hidden) || !($('meas-card')?.hidden) || !($('depth-panel')?.hidden);
+  empty.hidden = hasActive;
+}
+function exVpopOpen(open) {
+  if (exIsPhone()) {
+    if (open) exPhoneTab('vision');
+    return;
+  }
+  EX.popOpen = !!open;
+  const pop = $('ex-vpop'), chip = $('ex-model-chip');
+  if (pop) pop.hidden = !EX.popOpen;
+  if (chip) chip.setAttribute('aria-expanded', String(EX.popOpen));
+  if (EX.popOpen) { EX.err = ''; renderExpertVision(); }
+}
+function exPhoneTab(tab) {
+  if (!['move', 'vision', 'poses'].includes(tab)) return;
+  EX.ptab = tab;
+  for (const b of $('ex-ptabs').querySelectorAll('button[data-ptab]')) {
+    b.setAttribute('aria-selected', String(b.dataset.ptab === tab));
+  }
+  for (const p of ['move', 'vision', 'poses']) {
+    $('ex-ppane-' + p)?.classList.toggle('on', p === tab);
+  }
+  if (exIsPhone()) $('ex-model-chip')?.setAttribute('aria-expanded', String(tab === 'vision'));
+}
+function exMoreOpen(open) {
+  const m = $('ex-more');
+  if (!m) return;
+  if (open) { exDiagOpen(false); exVpopOpen(false); exUpdateSafeBot(); }
+  m.hidden = !open;
+  if ($('ex-m-fs')) $('ex-m-fs').hidden = $('btn-fs') ? $('btn-fs').hidden : true;
+  if ($('ex-m-gset')) $('ex-m-gset').hidden = !(GR.supported || (S.caps && S.caps.grasp));
+  if ($('ex-m-sset')) $('ex-m-sset').hidden = $('btn-sset') ? $('btn-sset').hidden : false;
+  if ($('ex-m-teach')) $('ex-m-teach').hidden = $('btn-pset') ? $('btn-pset').hidden : false;
+}
+function exDiagOpen(open, tab) {
+  const m = $('ex-diag');
+  if (!m) return;
+  if (open) { exMoreOpen(false); exVpopOpen(false); exUpdateSafeBot(); }
+  m.hidden = !open;
+  if (tab) exDiagTab(tab);
+}
+function exDiagTab(tab) {
+  if (!['tele', 'rec', 'kbd'].includes(tab)) return;
+  EX.dtab = tab;
+  for (const b of $('ex-diag-tabs').querySelectorAll('button[data-dtab]')) {
+    b.setAttribute('aria-selected', String(b.dataset.dtab === tab));
+  }
+  for (const k of ['tele', 'rec', 'kbd']) {
+    const el = $('ex-diag-' + k);
+    if (el) el.hidden = k !== tab;
+  }
+}
+function exCatalogue() {
+  const raw = VM.models && Array.isArray(VM.models.catalogue) ? VM.models.catalogue : [];
+  return raw.filter((e) => e && typeof e === 'object' && typeof e.name === 'string');
+}
+function exIonNumbers() {
+  const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
+  const ion = VM.ion;
+  if (!ion) return null;
+  const total = num(ion.total_mb), base = num(ion.base_mb), reserve = num(ion.reserve_mb);
+  if (total == null || base == null) return null;
+  const res = reserve ?? 0;
+  const budget = Math.max(0, total - base - res);
+  const used = num(ion.used_mb);
+  return { total, base, reserve: res, budget, used };
+}
+function exInvalidateHeldForModelChange() {
+  const hadHeld = typeof detHeld === 'function' && detHeld();
+  if (hadHeld && typeof detClearOverlay === 'function') detClearOverlay();
+  if (typeof GR !== 'undefined' && GR.sel && (!DET.enabled || hadHeld)) {
+    GR.sel = null;
+    if (typeof renderGrasp === 'function') renderGrasp();
+  }
+}
+function exModelDesc(kind) {
+  if (kind === 'segment') return t('ex.det.seg');
+  if (kind === 'detect') return t('ex.det.det');
+  if (kind === 'obb') return t('ex.det.obb');
+  return '';
+}
+function exKindLabel(kind) {
+  if (kind === 'segment') return t('ex.kind.segment');
+  if (kind === 'detect') return t('ex.kind.detect');
+  if (kind === 'obb') return t('ex.kind.obb');
+  return t('ex.kind.other');
+}
+function renderExpertVision() {
+  const curGen = VM.models && typeof VM.models.generation === 'number' ? VM.models.generation : null;
+  if (curGen != null) {
+    if (EX.lastGen != null && curGen !== EX.lastGen) exInvalidateHeldForModelChange();
+    EX.lastGen = curGen;
+  }
+  if (S.ui !== 'expert') return;
+  const ok = VM.state === 'ok';
+  const on = !!DET.avail && svOn();
+  const sw = $('ex-vis-on');
+  if (sw) {
+    sw.setAttribute('aria-checked', String(on));
+    sw.disabled = !DET.avail || VM.busy || DET.busy || DET.snap || (ok && !VM.yolo && !on);
+  }
+  const resDet = (VM.models && VM.models.resident && VM.models.resident.detector) || VM.modelName || null;
+  const resDep = (VM.models && VM.models.resident && VM.models.resident.depth) || null;
+  const kind = VM.kind || '';
+  setText($('ex-mchip-kind'), kind ? exKindLabel(kind) : t('ex.kind.other'));
+  setText($('ex-mchip-name'), resDet ? exShortModelName(resDet) : (DET.avail ? t('ex.det.unloaded') : '--'));
+  const chip = $('ex-model-chip');
+  if (chip) chip.disabled = DET.avail === false && !ok;
+
+  const opTag = $('ex-op-tag');
+  if (opTag) {
+    opTag.hidden = !S.auth.enforced && !opLocked();
+    if (!opTag.hidden) setText(opTag, opLocked() ? t('ex.op_req') : t('ex.op_ok'));
+  }
+
+  // Model config warning (missing / mismatched md5)
+  const mw = $('ex-model-warn');
+  if (mw) {
+    const mc = ok ? VM.modelConfig : null;
+    const bad = !!(mc && mc.optimal === false);
+    mw.hidden = !bad;
+    if (bad) {
+      const miss = Array.isArray(mc.missing) ? mc.missing.filter(Boolean) : [];
+      const mism = Array.isArray(mc.mismatched) ? mc.mismatched.filter(Boolean) : [];
+      const parts = [];
+      if (miss.length) parts.push(t('sv.model.missing', { list: miss.join(', ') }));
+      if (mism.length) parts.push(t('sv.model.mismatch', { list: mism.join(', ') }));
+      setText(mw, parts.length ? t('sv.model.warn', { detail: parts.join(t('sv.model.sep')) }) : t('sv.model.warn_gen'));
+    }
+  }
+  const errEl = $('ex-model-err');
+  if (errEl) { errEl.hidden = !EX.err; if (EX.err) setText(errEl, EX.err); }
+
+  const cat = exCatalogue();
+  const detModels = cat.filter((e) => e.kind !== 'depth');
+  const depModels = cat.filter((e) => e.kind === 'depth');
+  const ion = exIonNumbers();
+  const armBusy = svArmBusy();
+  const capOff = S.caps && S.caps.vision && S.caps.vision.model_switch === false;
+  const curDetEntry = detModels.find((e) => e.name === resDet) || null;
+  const curDepEntry = depModels.find((e) => e.name === resDep) || (resDep ? { name: resDep, ion_mb: null } : null);
+  const depMb = resDep ? (curDepEntry && typeof curDepEntry.ion_mb === 'number' && isFinite(curDepEntry.ion_mb) ? curDepEntry.ion_mb : null) : 0;
+  const detMb = resDet ? (curDetEntry && typeof curDetEntry.ion_mb === 'number' && isFinite(curDetEntry.ion_mb) ? curDetEntry.ion_mb : null) : 0;
+
+  // Detector variant list
+  const list = $('ex-det-list');
+  if (list) {
+    list.textContent = '';
+    if (!detModels.length) {
+      const note = document.createElement('div');
+      note.className = 'ex-hint';
+      note.textContent = resDet ? `${exKindLabel(kind)} · ${resDet} — ${t('ex.det.none')}` : t('ex.det.none');
+      list.appendChild(note);
+    } else {
+      for (const m of detModels) {
+        const isCur = m.name === resDet;
+        const mMb = typeof m.ion_mb === 'number' && isFinite(m.ion_mb) ? m.ion_mb : null;
+        const comb = ion && mMb != null && depMb != null ? mMb + depMb : null;
+        const over = !!(ion && comb != null && comb > ion.budget + 1e-6);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'ex-mrow' + (isCur ? ' cur' : '') + (over ? ' bad' : '');
+        btn.setAttribute('role', 'radio');
+        btn.setAttribute('aria-checked', String(isCur));
+        btn.setAttribute('data-op-mark', '');
+        btn.dataset.exDet = m.name;
+        btn.disabled = EX.busy || armBusy || capOff || over;
+        const radio = document.createElement('i'); radio.className = 'ex-radio';
+        const nm = document.createElement('span'); nm.className = 'ex-nm';
+        nm.textContent = `${exKindLabel(m.kind)} ${m.kind || ''} · ${m.name}`;
+        const mb = document.createElement('span'); mb.className = 'ex-mb';
+        mb.textContent = mMb != null ? `${mMb.toFixed(1)} MB` : '--';
+        const sub = document.createElement('span'); sub.className = 'ex-sub';
+        if (over) {
+          sub.textContent = t('ex.det.over', { need: comb.toFixed(1), limit: ion.budget.toFixed(1) });
+        } else {
+          sub.textContent = (isCur ? t('ex.det.cur') : '') + exModelDesc(m.kind);
+        }
+        btn.append(radio, nm, mb, sub);
+        btn.addEventListener('click', () => {
+          if (isCur || EX.busy || over) return;
+          exModelSwitch({ detector: m.name });
+        });
+        list.appendChild(btn);
+      }
+    }
+  }
+
+  // Depth model slot (toggle + variant picker when multiple depth variants exist)
+  const depSec = $('ex-depth-sec'), depSep = $('ex-depth-sep'), depList = $('ex-dep-list');
+  const firstDep = depModels.find((e) => e.metric !== false) || depModels[0] || null;
+  if (depSec && depSep) {
+    const showDep = !!(firstDep || resDep);
+    depSec.hidden = !showDep;
+    depSep.hidden = !showDep;
+    if (showDep) {
+      const targetDep = curDepEntry || firstDep;
+      const targetMb = targetDep && typeof targetDep.ion_mb === 'number' && isFinite(targetDep.ion_mb) ? targetDep.ion_mb : null;
+      const depOn = !!resDep;
+      const wouldComb = ion && !depOn && targetMb != null && detMb != null ? detMb + targetMb : null;
+      const depOver = !!(ion && wouldComb != null && wouldComb > ion.budget + 1e-6);
+      setText($('ex-depth-name'), targetDep ? targetDep.name : 'Depth');
+      setText($('ex-depth-mb'), targetMb != null ? `${targetMb.toFixed(1)} MB` : '--');
+      const dsw = $('ex-depth-sw');
+      dsw.setAttribute('aria-checked', String(depOn));
+      dsw.disabled = EX.busy || armBusy || capOff || (!depOn && depOver);
+      dsw.dataset.targetDep = targetDep ? targetDep.name : '';
+      if (depList) {
+        depList.textContent = '';
+        depList.hidden = depModels.length <= 1;
+        if (depModels.length > 1) {
+          for (const dm of depModels) {
+            const isCur = dm.name === resDep;
+            const dmMb = typeof dm.ion_mb === 'number' && isFinite(dm.ion_mb) ? dm.ion_mb : null;
+            const dComb = ion && dmMb != null && detMb != null ? detMb + dmMb : null;
+            const dOver = !!(ion && dComb != null && dComb > ion.budget + 1e-6);
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'ex-mrow' + (isCur ? ' cur' : '') + (dOver ? ' bad' : '');
+            btn.setAttribute('role', 'radio');
+            btn.setAttribute('aria-checked', String(isCur));
+            btn.setAttribute('data-op-mark', '');
+            btn.dataset.exDep = dm.name;
+            btn.disabled = EX.busy || armBusy || capOff || dOver;
+            const radio = document.createElement('i'); radio.className = 'ex-radio';
+            const nm = document.createElement('span'); nm.className = 'ex-nm';
+            nm.textContent = dm.name;
+            const mb = document.createElement('span'); mb.className = 'ex-mb';
+            mb.textContent = dmMb != null ? `${dmMb.toFixed(1)} MB` : '--';
+            const sub = document.createElement('span'); sub.className = 'ex-sub';
+            sub.textContent = dOver ? t('ex.depth.over', { need: dComb.toFixed(1), limit: ion.budget.toFixed(1) }) : (isCur ? t('ex.det.cur').replace(/·\s*$/, '') : t('ex.depth.note'));
+            btn.append(radio, nm, mb, sub);
+            btn.addEventListener('click', () => {
+              if (isCur || EX.busy || dOver) return;
+              exModelSwitch({ depth: dm.name });
+            });
+            depList.appendChild(btn);
+          }
+        }
+      }
+      const dhint = $('ex-depth-hint');
+      if (depOver) {
+        dhint.className = 'ex-warn-box';
+        setText(dhint, t('ex.depth.over', { need: wouldComb.toFixed(1), limit: ion.budget.toFixed(1) }));
+      } else {
+        dhint.className = 'ex-hint';
+        setText(dhint, t('ex.depth.note'));
+      }
+    }
+  }
+
+  // ION memory bar (live provider numbers only; never fabricate 0.0 MB when a resident size is unknown)
+  const ionBox = $('ex-ion-box');
+  if (ionBox) {
+    ionBox.hidden = !ion;
+    if (ion) {
+      const bothKnown = detMb != null && depMb != null;
+      const providerModelsUsed = ion.used != null ? Math.max(0, ion.used - ion.base) : null;
+      const usedModels = bothKnown ? (detMb + depMb) : providerModelsUsed;
+      const detPct = ion.budget > 0 && detMb != null ? Math.min(100, (detMb / ion.budget) * 100) : (ion.budget > 0 && usedModels != null ? Math.min(100, (usedModels / ion.budget) * 100) : 0);
+      const depPct = ion.budget > 0 && bothKnown ? Math.min(100 - detPct, (depMb / ion.budget) * 100) : 0;
+      const rem = usedModels != null ? ion.budget - usedModels : null;
+      $('ex-ion-bar').classList.toggle('over', rem != null && rem < -1e-6);
+      $('ex-ion-det').style.width = detPct.toFixed(1) + '%';
+      $('ex-ion-dep').style.width = depPct.toFixed(1) + '%';
+      const usedStr = usedModels != null ? usedModels.toFixed(1) : '--';
+      const sum = t('ex.ion.sum', { used: usedStr, budget: ion.budget.toFixed(1) });
+      const parts = t('ex.ion.parts', { det: detMb != null ? detMb.toFixed(1) : '--', dep: depMb != null ? depMb.toFixed(1) : '--' });
+      setText($('ex-ion-summary'), `${sum} · ${parts}`);
+      setText($('ex-ion-rem'), rem == null ? '--' : (rem >= 0 ? t('ex.ion.rem', { rem: rem.toFixed(1) }) : t('ex.ion.over', { over: Math.abs(rem).toFixed(1) })));
+      setText($('ex-ion-note'), t('ex.ion.note', { total: ion.total.toFixed(1), base: ion.base.toFixed(1), res: ion.reserve.toFixed(1) }));
+    }
+  }
+
+  // Overlay chips
+  const sel = ok ? vmSel() : { aruco: false };
+  const dBlock = ok ? depthBlock() : t('vm.tip.na');
+  for (const b of $('ex-ovl').querySelectorAll('button[data-ex-ovl]')) {
+    const k = b.dataset.exOvl;
+    if (k === 'box' || k === 'contour' || k === 'label') {
+      b.setAttribute('aria-pressed', String(!!EX_SHOW[k]));
+      if (k === 'contour') b.hidden = kind && kind !== 'segment';
+    } else if (k === 'aruco') {
+      b.setAttribute('aria-pressed', String(!!sel.aruco));
+      b.disabled = !ok || VM.busy || DET.snap;
+    } else if (k === 'depth') {
+      b.setAttribute('aria-pressed', String(!!DEPTH.on));
+      b.disabled = !DEPTH.on && !!dBlock;
+      b.title = dBlock || t('depth.tip');
+    }
+  }
+  const vsnap = $('ex-vpop-snap');
+  if (vsnap) {
+    vsnap.disabled = !DET.avail || DET.busy || DET.snap;
+    setText(vsnap, t(DET.snap ? 'det.trig.busy' : 'det.trig'));
+  }
+  const vgset = $('ex-vpop-gset');
+  if (vgset) vgset.hidden = !(GR.supported || (S.caps && S.caps.grasp));
+}
+
+async function exModelSwitch(patch, retried = false) {
+  if (EX.busy) return;
+  if (svArmBusy()) {
+    EX.err = t('ec.vision_busy');
+    renderExpertVision();
+    toast(t('ex.det.fail'), 'warn', 'VISION_BUSY');
+    return;
+  }
+  // Preserve requested patch across PIN unlock even if catalogue polling recreates buttons while the dialog is open.
+  if (opLocked() && !retried) {
+    const ok = await opRequire('/api/v1/vision/models');
+    if (!ok) return;
+    await vmRefresh();
+    const cat = exCatalogue();
+    if (patch.detector && !cat.some((e) => e.name === patch.detector)) {
+      EX.err = t('ec.model_nf');
+      renderExpertVision();
+      toast(t('ex.det.fail'), 'err', 'MODEL_NOT_FOUND');
+      return;
+    }
+    if (patch.depth && !cat.some((e) => e.name === patch.depth)) {
+      EX.err = t('ec.model_nf');
+      renderExpertVision();
+      toast(t('ex.det.fail'), 'err', 'MODEL_NOT_FOUND');
+      return;
+    }
+    return exModelSwitch(patch, true);
+  }
+  EX.busy = true; EX.err = '';
+  renderExpertVision();
+  let unlock = false;
+  try {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), 9000);
+    let res, data = null;
+    try {
+      res = await fetch('/api/v1/vision/models', {
+        method: 'POST', signal: ctl.signal, cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+      });
+      try { data = await res.json(); } catch (_) {}
+    } finally { clearTimeout(tm); }
+    const code = (data && data.code) || '';
+    if (res.status === 403 && code === 'OPERATOR_REQUIRED' && !retried) {
+      unlock = true;
+    } else if (!res.ok) {
+      const known = { DETECTION_UNAVAILABLE: 'VISION_DOWN' }[code] || code;
+      const srvMsg = data && typeof data.message === 'string' && data.message.trim() ? data.message.trim() : '';
+      const mb = /needs ([\d.]+) MB, limit ([\d.]+) MB/.exec(srvMsg);
+      const localWhy = known === 'ION_BUDGET' && patch.depth && !patch.detector
+        ? t('ex.depth.over', { need: mb ? mb[1] : '?', limit: mb ? mb[2] : '?' })
+        : (EC_KEYS[known] ? t(EC_KEYS[known]) : '');
+      EX.err = srvMsg || localWhy || ('HTTP ' + res.status);
+      toast(t('ex.det.fail') + (mb ? ` (${mb[1]} / ${mb[2]} MB)` : ''), 'err', known || String(res.status),
+        code === 'OPERATOR_REQUIRED' ? { path: '/api/v1/vision/models' } : null);
+    } else {
+      if (!data || data.changed !== false) exInvalidateHeldForModelChange();
+      const loaded = patch.detector !== undefined
+        ? (patch.detector || t('ex.det.unloaded'))
+        : (patch.depth ? patch.depth : `${t('ex.models.depth')}: ${t('ex.det.unloaded')}`);
+      toast(t('ex.det.ok', { name: loaded }), 'ok');
+    }
+  } catch (e) {
+    const code = e && e.name === 'AbortError' ? 'VISION_TIMEOUT' : 'VISION_DOWN';
+    EX.err = t(EC_KEYS[code]);
+    toast(t('ex.det.fail'), 'err', code);
+  } finally {
+    EX.busy = false;
+    await vmRefresh();
+    renderExpertVision();
+    renderSVis();
+    gsetTasksRender();
+  }
+  if (unlock && await opRequire('/api/v1/vision/models')) return exModelSwitch(patch, true);
+}
+
+function renderExpertLive(live, dets, detAge) {
+  if (S.ui !== 'expert') return;
+  const lv = $('ex-live'), lvt = $('ex-live-txt');
+  if (lv && lvt) {
+    lv.classList.toggle('ok', !!V.playing);
+    if (V.playing) {
+      const fps = V.fps == null ? '--' : V.fps;
+      const ms = V.lat == null ? '--' : Math.round(V.lat);
+      setText(lvt, V.mode === 'mjpeg' ? `${t('v.live')} · MJPEG` : `${t('v.live')} · ${fps} fps · ${ms} ms`);
+    } else {
+      setText(lvt, t('v.chip.connecting'));
+    }
+  }
+  const lk = $('ex-link');
+  if (lk) setText(lk, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : t('no_telemetry'));
+  const ph = $('ex-ph-status');
+  if (ph) {
+    const lsTxt = $('lease-status-txt')?.textContent?.trim() || t('st.Offline');
+    const isOwn = $('lease-status')?.classList.contains('is-own');
+    const isOther = $('lease-status')?.classList.contains('is-other') || $('lease-status')?.classList.contains('is-released');
+    setCls(ph, 'sc-status-badge only-expert ' + (!live ? '' : isOwn ? 'is-ok' : isOther ? 'is-warn' : ''));
+    setText(ph, live ? `${lsTxt} · ${S.hz} Hz` : t('st.Offline'));
+  }
+  // Empty object card state
+  const detOn = !!DET.avail && svOn();
+  const held = detHeld();
+  const n = (dets || []).filter((d) => !d.aruco).length;
+  const et = $('ex-empty-title'), eon = $('ex-empty-on'), esnap = $('ex-empty-snap');
+  if (et) {
+    if (!detOn && !(held && n > 0)) setText(et, t('ex.empty.off'));
+    else setText(et, n > 0 && (held || detAge <= 2000) ? t('ex.empty.on_n', { n }) : t('ex.empty.on0'));
+  }
+  if (eon) { eon.hidden = detOn; eon.disabled = !DET.avail || VM.busy || DET.busy; }
+  if (esnap) { esnap.hidden = detOn; esnap.disabled = !DET.avail || DET.busy || DET.snap; }
+  exSyncCtx();
+  exUpdateSafeBot();
+}
+
+function initExpertMode() {
+  $('ex-vis-on')?.addEventListener('click', () => simpleVisSet(!svOn()));
+  $('ex-empty-on')?.addEventListener('click', () => simpleVisSet(true));
+  $('ex-empty-snap')?.addEventListener('click', () => triggerDet());
+  $('ex-vpop-snap')?.addEventListener('click', () => triggerDet());
+  $('ex-vpop-gset')?.addEventListener('click', () => { exVpopOpen(false); gsetOpen(true); });
+  $('ex-model-chip')?.addEventListener('click', () => {
+    if (exIsPhone()) exPhoneTab(EX.ptab === 'vision' ? 'move' : 'vision');
+    else exVpopOpen(!EX.popOpen);
+  });
+  $('ex-vpop-x')?.addEventListener('click', () => exVpopOpen(false));
+  $('ex-depth-sw')?.addEventListener('click', () => {
+    const sw = $('ex-depth-sw');
+    if (sw.disabled) return;
+    const on = sw.getAttribute('aria-checked') === 'true';
+    const target = sw.dataset.targetDep || '';
+    if (!on && !target) return;
+    exModelSwitch({ depth: on ? null : target });
+  });
+  $('ex-ovl')?.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-ex-ovl]');
+    if (!b || b.disabled) return;
+    const k = b.dataset.exOvl;
+    if (k === 'box' || k === 'contour' || k === 'label') {
+      EX_SHOW[k] = !EX_SHOW[k];
+      store('rebot.ex.show', JSON.stringify(EX_SHOW));
+      renderExpertVision();
+    } else if (k === 'aruco') {
+      if (VM.state === 'ok') { const c = vmSel(); setVisionMode(vmModeOf(c.yolo, !c.aruco)); }
+    } else if (k === 'depth') {
+      vmToggle('depth');
+    }
+  });
+  document.addEventListener('pointerdown', (e) => {
+    if (!EX.popOpen || exIsPhone()) return;
+    if (e.target.closest && e.target.closest('#ex-vpop, #ex-model-chip')) return;
+    exVpopOpen(false);
+  }, true);
+
+  $('ex-ptabs')?.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-ptab]');
+    if (b) exPhoneTab(b.dataset.ptab);
+  });
+  $('ex-speed-btn')?.addEventListener('click', () => setSpeed((S.speedIdx + 1) % CFG.speeds.length));
+  for (const b of document.querySelectorAll('.ex-pre-btn[data-ex-preset]')) {
+    b.addEventListener('click', () => runPreset(b.dataset.exPreset));
+  }
+  $('ex-ph-open-teach')?.addEventListener('click', () => $('btn-pset')?.click());
+  $('ex-ph-open-diag')?.addEventListener('click', () => exDiagOpen(true, 'tele'));
+  $('ex-ph-open-gset')?.addEventListener('click', () => gsetOpen(true));
+
+  $('btn-ex-more')?.addEventListener('click', () => exMoreOpen($('ex-more').hidden));
+  $('ex-more-close')?.addEventListener('click', () => exMoreOpen(false));
+  $('ex-more')?.addEventListener('click', (e) => { if (e.target === e.currentTarget) exMoreOpen(false); });
+  $('ex-m-diag')?.addEventListener('click', () => exDiagOpen(true, 'tele'));
+  $('ex-m-task')?.addEventListener('click', () => { exMoreOpen(false); $('btn-task')?.click(); });
+  $('ex-m-teach')?.addEventListener('click', () => { exMoreOpen(false); $('btn-pset')?.click(); });
+  $('ex-m-gset')?.addEventListener('click', () => { exMoreOpen(false); gsetOpen(true); });
+  $('ex-m-calib')?.addEventListener('click', () => { exMoreOpen(false); $('btn-calib')?.click(); });
+  $('ex-m-sset')?.addEventListener('click', () => { exMoreOpen(false); $('btn-sset')?.click(); });
+  $('ex-m-simple')?.addEventListener('click', () => { exMoreOpen(false); S.uiUserSet = true; setUi('simple'); });
+  $('ex-m-fs')?.addEventListener('click', () => { exMoreOpen(false); $('btn-fs')?.click(); });
+
+  $('ex-diag-close')?.addEventListener('click', () => exDiagOpen(false));
+  $('ex-diag')?.addEventListener('click', (e) => { if (e.target === e.currentTarget) exDiagOpen(false); });
+  $('ex-diag-tabs')?.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-dtab]');
+    if (b) exDiagTab(b.dataset.dtab);
+  });
+
+  EX.phoneMq.addEventListener('change', () => { if (S.ui === 'expert') exPlaceDom(); });
+  window.addEventListener('resize', () => { if (exIsPhone()) exUpdateSafeBot(); });
+  i18nHooks.push(() => {
+    renderExpertVision();
+    const exSp = $('ex-speed-btn');
+    if (exSp) exSp.textContent = t('ex.speed.btn', { p: Math.round(CFG.speeds[S.speedIdx] * 100) });
+  });
+  exPlaceDom();
+}
+
 /* Outline fallback for older rebot-vision builds whose /results WebSocket carries boxes only; when WS frames lack
    `contours`, read `contour` from GET /api/v1/detection/latest for the selected object at most every 500 ms. */
 const CT = { busy: false, at: 0 };
@@ -12512,10 +13755,17 @@ function placeObjCard(rect) {
 /* stacked layouts: the slot under the video holds the hint, the object card and the measurement card (page flow, the video
    stays clear); the recognition panel is a bottom sheet whose top edge stays below the safety card (svSheetPlace) */
 function placeSlot() {
+  if (S.ui === 'expert') {
+    document.body.classList.remove('oc-slot');
+    if (typeof exPlaceDom === 'function') exPlaceDom();
+    return;
+  }
   const slot = S.ui === 'simple' && !OC_MQ.matches;
   document.body.classList.toggle('oc-slot', slot);
   const host = slot ? $('s-slot') : $('video-box');
   for (const id of ['s-objhint', 'grasp-bar', 'meas-card']) { const el = $(id); if (el.parentElement !== host) host.appendChild(el); }
+  const dp = $('depth-panel');
+  if (dp && dp.parentElement !== $('video-box')) $('video-box').appendChild(dp);
   svSheetPlace();
 }
 function svSheetPlace() {
@@ -12591,7 +13841,15 @@ function gsetTasksRender() {
   let hidden = 0;
   for (const n of names) {
     if (!taskUsable(tasks[n])) { hidden++; continue; }
-    add(n, n, tasks[n].description || '');
+    let desc = tasks[n].description || '';
+    if (S.ui === 'expert') {
+      const reqDet = tasks[n].models && tasks[n].models.detector;
+      const reqKind = tasks[n].requires && tasks[n].requires.model_kind;
+      const resident = VM.models && VM.models.resident ? VM.models.resident.detector : null;
+      const willLoad = (reqDet && reqDet !== resident) ? reqDet : (reqKind && reqKind !== VM.kind) ? reqKind : null;
+      if (willLoad) desc = (desc ? desc + ' · ' : '') + t('ex.task.loads', { m: willLoad });
+    }
+    add(n, n, desc);
   }
   const note = $('gset-tasks-note');
   note.hidden = !hidden;
@@ -15244,7 +16502,10 @@ function frame(ts) {
     hint.hidden = !showHint;
     if (showHint) setText(hint, (dets || []).some((d) => !d.aruco) && detAge <= 2000 ? t('sv.hint') : t('sv.hint0'));
     renderSVisMeta();
-  } else $('s-objhint').hidden = true;
+  } else {
+    $('s-objhint').hidden = true;
+    if (typeof renderExpertLive === 'function') renderExpertLive(live, dets, detAge);
+  }
 
   // telemetry
   const vel = S.obs ? S.obs.velocities || [] : [];
@@ -16392,6 +17653,7 @@ function opReasonKey(path, body) {
   if (p === 'lease.force') return 'op.why.take';
   if (p === 'calib.open') return 'op.why.calib_open';
   if (p === 'op.renew') return 'op.why.renew';
+  if (p === '/api/v1/vision/models' || p === '/api/v1/vision/detector') return 'op.why.models';
   if (p === '/api/v1/vision/mode' || p === '/api/v1/vision/subscribe') return 'op.why.vision';
   if (p === '/api/v1/mode/gravity_comp') return 'op.why.gc';
   if (p === '/api/v1/safety/clear_fault') return S.state === 'EStop' ? 'op.why.estop' : hasCarriedOverMotorErrors() ? 'op.why.motor_err' : 'op.why.fault';
@@ -16408,7 +17670,7 @@ function opReasonKey(path, body) {
 // Run again after the unlock: only these user-initiated, repeatable requests; never a motion.
 function opCanRetry(path, body) {
   return (path === '/api/v1/mode/gravity_comp' && !!body && body.enable === true)
-    || path === '/api/v1/detection/trigger' || path === '/api/v1/vision/depth' || path === '/api/v1/safety/clear_fault' || path === '/api/v1/calibration/apply';
+    || path === '/api/v1/detection/trigger' || path === '/api/v1/vision/depth' || path === '/api/v1/vision/models' || path === '/api/v1/vision/detector' || path === '/api/v1/safety/clear_fault' || path === '/api/v1/calibration/apply';
 }
 /* Ask for the operator PIN because `path` was refused (or is about to be: a [data-op] control). Resolves true
    after an unlock, false on cancel. opt.retry: the dialog says the action continues after the unlock (default:
@@ -16718,6 +17980,7 @@ initDetToggle();
 initVisionMode();
 initDepth();
 initSVis();
+initExpertMode();
 initCalib();
 initCwiz();
 videoStart();

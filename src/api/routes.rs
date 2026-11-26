@@ -389,6 +389,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/vision/mode",               proxy::get_vision_mode,             OwnerAgnostic,   None,      None,              Allowed),
     rr!(POST   "/api/v1/vision/mode",               proxy::post_vision_mode,            OwnerAgnostic,   Required,  None,              Fenced),
     rr!(POST   crate::vision_detector::PATH,        rest::post_vision_detector,         ExecutorRequest, Required,  None,              Fenced),
+    rr!(POST   crate::vision_detector::MODELS_PATH, rest::post_vision_models,           ExecutorRequest, Required,  None,              Fenced),
     rr!(POST   "/api/v1/vision/subscribe",          proxy::post_vision_subscribe,       OwnerAgnostic,   Required,  None,              Fenced),
     rr!(DELETE "/api/v1/vision/subscribe/{id}",     proxy::delete_vision_subscribe,     OwnerAgnostic,   Required,  None,              Fenced),
     rr!(POST   "/api/v1/vision/subscribe/{id}/keepalive", proxy::post_vision_keepalive, OwnerAgnostic,   Required,  None,              Fenced),

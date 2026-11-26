@@ -3192,6 +3192,7 @@ fn switching_models() -> grasp::ProviderModels {
         swap_state: "idle".into(),
         swap_error: None,
         catalogue: [("detect", 8.5), ("segment", 19.5), ("depth", 20.5)].into_iter().map(|(n, mb)| (n.to_string(), Some(mb))).collect(),
+        catalogue_kinds: [("detect", "detect"), ("segment", "segment"), ("depth", "depth")].into_iter().map(|(n, k)| (n.to_string(), k.to_string())).collect(),
         ion: Some([21.5, 62.9, 8.0]),
     }
 }
