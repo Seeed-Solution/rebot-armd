@@ -1726,18 +1726,6 @@ enum PersistCmd {
         action_id: u64,
         outcome: PersistPublishOutcome,
     },
-    FinishReconcile {
-        proposal: ConfigProposal,
-        auth: super::requests::config::ConfigAuthContext,
-        base_revision: u64,
-        offset_rad: f32,
-        new_policy: GripperPolicy,
-        new_jaw: Option<JawOpening>,
-        operator_revoked: bool,
-    },
-    LatchConfigReconcileFault {
-        message: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
-    },
 }
 
 // Zero-allocation RT reply enum; boxing `Reserved` would heap-allocate on `armd-control`.
@@ -6196,6 +6184,7 @@ pub(crate) fn spawn_executor(
     let estop_overflow_gen = Arc::new(AtomicU64::new(0));
     let control_stop = Arc::new(AtomicBool::new(false));
     let persist_stop = Arc::new(AtomicBool::new(false));
+    let persist_official_untouched = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
     let (urgent_stop_client, urgent_stop_intake) =
         urgent_stop_channel(URGENT_STOP_CAPACITY, exited.clone());
@@ -6305,6 +6294,7 @@ pub(crate) fn spawn_executor(
         config_write_mutex,
         Arc::clone(&published_config),
         persist_stop.clone(),
+        persist_official_untouched.clone(),
         exited.clone(),
         persist_worker_exited.clone(),
         persist_exited_cv.clone(),
@@ -6339,6 +6329,7 @@ pub(crate) fn spawn_executor(
         let estop_overflow_gen = estop_overflow_gen.clone();
         let hub_clone = hub.clone();
         let persist_wake = persist_park_thread.clone();
+        let persist_official_untouched_ctrl = persist_official_untouched.clone();
         let hooks = hooks.clone();
         let stop_requests_ctrl = stop_requests.clone();
         let closed_bitset_ctrl = Arc::clone(&closed_bitset);
@@ -6390,6 +6381,7 @@ pub(crate) fn spawn_executor(
                     watchdog_plan_rx,
                     offload_reclaim_tx,
                     persist_wake,
+                    persist_official_untouched_ctrl,
                     estop_state,
                     hub_clone,
                     hooks,
@@ -6646,9 +6638,11 @@ struct ControlState {
     /// Action whose live policy activated on `armd-control` while `.pending` awaits publication
     /// onto the official path (`PersistCmd::Published`).
     persist_awaiting_publish: Option<u64>,
-    /// Operator grant of the zero-check whose dir fsync failed, kept for the owner-side
-    /// validation in `FinishReconcile` (the session settle clears `zero_check_persisting_grant`).
-    reconcile_operator_grant: Option<crate::auth::OperatorGrant>,
+    /// True from reservation / `.pending` staging until `armd-persist` begins the official
+    /// rename (`<official>.pending` -> `<official>`) or the pre-activation hold is released.
+    /// Tracked independently of `core.zero_check_persisting` so pre-activation failures and
+    /// handback never leave a `Reconciling` hold for an untouched official file.
+    persist_official_untouched: Arc<AtomicBool>,
     next_persist_req: u64,
     disconnect_code_buf: Option<String>,
     disconnect_msg_buf: Option<String>,
@@ -7413,26 +7407,6 @@ impl ControlState {
                         _returned_probe: self.take_reply_probe(),
                     }
                 }
-                PersistCmd::FinishReconcile {
-                    new_policy,
-                    new_jaw,
-                    ..
-                } => PersistReply::Done {
-                    _returned_policy: Some(new_policy),
-                    _returned_jaw: new_jaw,
-                    _returned_code: None,
-                    _returned_msg: None,
-                    _returned_warning: None,
-                    _returned_probe: self.take_reply_probe(),
-                },
-                PersistCmd::LatchConfigReconcileFault { .. } => PersistReply::Done {
-                    _returned_policy: None,
-                    _returned_jaw: None,
-                    _returned_code: None,
-                    _returned_msg: None,
-                    _returned_warning: None,
-                    _returned_probe: self.take_reply_probe(),
-                },
             };
             self.push_persist_reply_or_offload(reply);
             woke = true;
@@ -7484,8 +7458,16 @@ impl ControlState {
             && !self.persist_rep_tx.is_full()
         {
             if let Some((action_id, domain)) = self.persist_granted.take() {
-                let active_rev = ConfigAuthority::revision(core, domain);
-                core.core.config_mut().force_reconcile(domain, active_rev);
+                if domain == ConfigDomain::GripperCalibration
+                    && self.persist_official_untouched.swap(false, Ordering::AcqRel)
+                {
+                    core.core
+                        .config_mut()
+                        .clear_orphaned_staged_hold(ConfigDomain::GripperCalibration);
+                } else {
+                    let active_rev = ConfigAuthority::revision(core, domain);
+                    core.core.config_mut().force_reconcile(domain, active_rev);
+                }
                 if core.zero_check_persisting == Some(action_id) {
                     core.zero_check_persisting = None;
                 }
@@ -7837,6 +7819,7 @@ impl ControlState {
                 ) {
                     Ok((reservation, proposal, auth, ret_code, ret_msg)) => {
                         self.persist_granted = Some((action_id, ConfigDomain::GripperCalibration));
+                        self.persist_official_untouched.store(true, Ordering::Release);
                         self.push_persist_reply_or_retain(
                             PersistReply::Reserved {
                                 reservation: Some((reservation, proposal, auth)),
@@ -7911,6 +7894,7 @@ impl ControlState {
                     }
                     Err((old_code, old_msg)) => {
                         self.persist_granted = None;
+                        self.persist_official_untouched.store(false, Ordering::Release);
                         let static_code = Self::zero_check_static_code(
                             core.last_action
                                 .as_ref()
@@ -7938,6 +7922,7 @@ impl ControlState {
             }
             PersistCmd::Abort { action_id, reservation, code, message, unused_policy, unused_jaw } => {
                 self.persist_granted = None;
+                self.persist_official_untouched.store(false, Ordering::Release);
                 let _ = ConfigAuthority::release(core, reservation);
                 if core.zero_check_persisting == Some(action_id) {
                     core.zero_check_persisting = None;
@@ -7975,12 +7960,14 @@ impl ControlState {
                     .fail_persisted_once
                     .as_ref()
                     .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+                let official_untouched = self.persist_official_untouched.load(Ordering::Acquire);
                 let probe = self.take_reply_probe();
                 match super::requests::config::zero_check_owner_persisted(
                     core,
                     action_id,
                     reservation,
                     simulated_err,
+                    official_untouched,
                     Some(code_buf),
                     Some(msg_buf),
                 ) {
@@ -7997,6 +7984,7 @@ impl ControlState {
                     }
                     Err((old_code, old_msg)) => {
                         self.persist_granted = None;
+                        self.persist_official_untouched.store(false, Ordering::Release);
                         Self::settle_zero_check_session_on_persist_end(
                             core,
                             action_id,
@@ -8025,17 +8013,14 @@ impl ControlState {
                 msg_buf,
             } => {
                 self.persist_granted = None;
-                // Carry the grant itself into reconciliation; settling the session below clears it.
-                self.reconcile_operator_grant = core
-                    .zero_check_persisting_grant
-                    .filter(|(gid, _)| *gid == action_id)
-                    .map(|(_, g)| g);
+                let official_untouched = self.persist_official_untouched.swap(false, Ordering::AcqRel);
                 let (old_msg, old_warn) =
                     super::requests::config::zero_check_owner_reconcile_dir_sync_failed(
                         core,
                         action_id,
                         reservation,
                         warning,
+                        official_untouched,
                         Some(msg_buf),
                     );
                 Self::settle_zero_check_session_on_persist_end(
@@ -8108,6 +8093,7 @@ impl ControlState {
                         );
                     }
                     Err((ret_policy, ret_jaw, old_code, old_msg)) => {
+                        self.persist_official_untouched.store(false, Ordering::Release);
                         let static_code = Self::zero_check_static_code(
                             core.last_action
                                 .as_ref()
@@ -8218,83 +8204,6 @@ impl ControlState {
                     core,
                 );
             }
-            PersistCmd::FinishReconcile {
-                proposal,
-                auth,
-                base_revision,
-                offset_rad,
-                new_policy,
-                new_jaw,
-                operator_revoked,
-            } => {
-                let probe = self.take_reply_probe();
-                let operator_grant = Some(
-                    self.reconcile_operator_grant
-                        .take()
-                        .unwrap_or(crate::auth::OperatorGrant::DENIED),
-                );
-                match super::requests::config::zero_check_owner_finish_reconcile(
-                    core,
-                    ctx,
-                    &proposal,
-                    &auth,
-                    base_revision,
-                    offset_rad,
-                    new_policy,
-                    new_jaw,
-                    operator_revoked,
-                    operator_grant,
-                ) {
-                    Ok((old_policy, old_jaw)) => {
-                        let activated_revision = core.gripper_calib_revision;
-                        self.push_persist_reply_or_retain(
-                            PersistReply::Activated {
-                                activated_revision,
-                                _returned_policy: old_policy,
-                                _returned_jaw: old_jaw,
-                                _returned_code: None,
-                                _returned_msg: None,
-                                _returned_warning: None,
-                                _returned_probe: probe,
-                            },
-                            core,
-                        );
-                    }
-                    Err((_code, ret_policy, ret_jaw)) => {
-                        self.push_persist_reply_or_retain(
-                            PersistReply::Done {
-                                _returned_policy: ret_policy,
-                                _returned_jaw: ret_jaw,
-                                _returned_code: None,
-                                _returned_msg: None,
-                                _returned_warning: None,
-                                _returned_probe: probe,
-                            },
-                            core,
-                        );
-                    }
-                }
-            }
-            PersistCmd::LatchConfigReconcileFault { message } => {
-                self.reconcile_operator_grant = None;
-                super::requests::config::install_latch_config_reconcile_fault(
-                    core,
-                    ConfigDomain::GripperCalibration,
-                    message,
-                );
-                let probe = self.take_reply_probe();
-                self.push_persist_reply_or_retain(
-                    PersistReply::Done {
-                        _returned_policy: None,
-                        _returned_jaw: None,
-                        _returned_code: None,
-                        _returned_msg: None,
-                        _returned_warning: None,
-                        _returned_probe: probe,
-                    },
-                    core,
-                );
-            }
         }
     }
 }
@@ -8310,6 +8219,7 @@ fn spawn_persist_worker(
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
     published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
+    persist_official_untouched: Arc<AtomicBool>,
     control_exited: Arc<AtomicBool>,
     persist_worker_exited: Arc<AtomicBool>,
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
@@ -8592,12 +8502,11 @@ fn spawn_persist_worker(
             let mut backend = ExecutorPersistBackend {
                 cmd_tx: &mut cmd_tx,
                 rep_rx: &rep_rx,
-                config_write_mutex: &config_write_mutex,
-                cw_guard: Some(_cw),
                 published_config: &published_config,
                 hub: &hub_for_refresh,
                 terminal_capture: terminal_capture.as_deref(),
                 persist_stop: &persist_stop,
+                official_file_untouched: &persist_official_untouched,
                 control_exited: &control_exited,
                 hooks: &hooks,
                 job,
@@ -8608,15 +8517,24 @@ fn spawn_persist_worker(
                 proposal: None,
                 auth: None,
                 official_path: None,
+                activated: false,
                 published: false,
             };
             let res = super::requests::config::run_common_commit_sync(&mut backend);
+            drop(_cw);
             // FOLLOW-UP: other config domains (and legacy) still rename the candidate over the
             // official path before activation; propose the same `.pending` + rename-after-activate
             // ordering for them so a refused candidate never loads on restart.
-            if !backend.published
-                && !matches!(res, Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected))
-            {
+            // Unlink `.pending` on any pre-activation failure or handback stop while the official
+            // file is untouched; only an injected post-activation worker crash (`activated &&
+            // !persist_stop`) leaves `.pending` behind for startup cleanup verification.
+            let post_activation_crash = backend.activated
+                && matches!(
+                    res,
+                    Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected)
+                )
+                && !persist_stop.load(Ordering::Acquire);
+            if !backend.published && !post_activation_crash {
                 backend.discard_pending();
             }
             if matches!(res, Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected))
@@ -8631,12 +8549,11 @@ fn spawn_persist_worker(
 struct ExecutorPersistBackend<'a> {
     cmd_tx: &'a mut Producer<PersistCmd>,
     rep_rx: &'a Arc<Mutex<Consumer<PersistReply>>>,
-    config_write_mutex: &'a Arc<tokio::sync::Mutex<()>>,
-    cw_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
     hub: &'a Arc<StateHub>,
     terminal_capture: Option<&'a crate::supervisor::terminal_capture::TerminalCaptureChannel>,
     persist_stop: &'a Arc<AtomicBool>,
+    official_file_untouched: &'a Arc<AtomicBool>,
     control_exited: &'a Arc<AtomicBool>,
     hooks: &'a PersistTestHooks,
     job: PendingZeroCheckPersist,
@@ -8648,6 +8565,8 @@ struct ExecutorPersistBackend<'a> {
     auth: Option<super::requests::config::ConfigAuthContext>,
     /// Official calibration path while the candidate sits at its `.pending` sibling.
     official_path: Option<std::path::PathBuf>,
+    /// Live activation succeeded on `armd-control`.
+    activated: bool,
     /// The candidate was renamed over `official_path` after activation.
     published: bool,
 }
@@ -8673,6 +8592,7 @@ impl ExecutorPersistBackend<'_> {
             return PublishPendingResult::WorkerDisconnected;
         }
         let Some(official) = self.official_path.clone() else {
+            self.official_file_untouched.store(false, Ordering::Release);
             if !self.push_cmd_inner(
                 PersistCmd::Published {
                     action_id: self.job.action_id,
@@ -8690,6 +8610,8 @@ impl ExecutorPersistBackend<'_> {
             return PublishPendingResult::Published;
         };
         let pending = crate::gripper_calib::pending_path_for(&official);
+        // Official rename is about to start: the official file is no longer guaranteed untouched.
+        self.official_file_untouched.store(false, Ordering::Release);
         let rename_res = if self
             .hooks
             .fail_publish_rename_once
@@ -8944,6 +8866,7 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
         // the owner's live activation check succeeded (see `publish_pending`).
         let pending = crate::gripper_calib::pending_path_for(&pw.path);
         self.official_path = Some(std::mem::replace(&mut pw.path, pending));
+        self.official_file_untouched.store(true, Ordering::Release);
         Ok(Some(pw))
     }
 
@@ -9038,177 +8961,27 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
 
     async fn reconcile_after_dir_sync_failure(
         &mut self,
-        target_path: std::path::PathBuf,
+        _target_path: std::path::PathBuf,
         warn: String,
     ) -> Self::Err {
-        use super::requests::config::{
-            ZeroCheckCommitStop, DEFAULT_RECONCILE_MAX_ATTEMPTS, DEFAULT_RECONCILE_RETRY_INTERVAL,
-        };
+        use super::requests::config::ZeroCheckCommitStop;
+        // Staging dir-fsync failed before activation while the official file is untouched:
+        // unlink `.pending` and release the GripperCalibration hold (`Cleared`) without leaving
+        // a `Reconciling` hold or background retry loop.
+        self.discard_pending();
         if let Some(reservation) = self.reservation.take() {
-            let keep_for_retry = !self.hooks.leave_final_reply_queued && !self.hooks.exit_after_first_job;
-            let (unused_policy, unused_jaw) = if keep_for_retry {
-                (None, None)
-            } else {
-                (self.new_policy.take(), self.new_jaw.take())
-            };
+            let unused_policy = self.new_policy.take();
+            let unused_jaw = self.new_jaw.take();
             let _ = self.push_cmd(PersistCmd::DirSyncFailed {
                 action_id: self.job.action_id,
                 reservation,
-                warning: warn.clone(),
+                warning: warn,
                 unused_policy,
                 unused_jaw,
                 msg_buf: String::with_capacity(160),
             });
             if !self.hooks.leave_final_reply_queued {
                 let _ = self.wait_reply();
-            }
-            if keep_for_retry {
-                if let (Some(proposal), Some(auth), Some(new_policy)) = (
-                    self.proposal,
-                    self.auth,
-                    self.new_policy.take(),
-                ) {
-                    let new_jaw = self.new_jaw.take();
-                    let interval = self
-                        .hooks
-                        .reconcile_retry_interval
-                        .unwrap_or(DEFAULT_RECONCILE_RETRY_INTERVAL);
-                    let max_attempts = self
-                        .hooks
-                        .reconcile_max_attempts
-                        .unwrap_or(DEFAULT_RECONCILE_MAX_ATTEMPTS)
-                        .max(1);
-                    let file_name = target_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| target_path.display().to_string());
-                    let mut last_warn = warn;
-                    let mut policy_opt = Some(new_policy);
-                    let mut jaw_opt = new_jaw;
-                    // Release `config_write_mutex` during reconciliation retry backoff so
-                    // concurrent config writes immediately observe `HoldState::Reconciling`
-                    // (`CONFIG_BUSY`) rather than stalling behind the sleep.
-                    drop(self.cw_guard.take());
-                    for attempt in 1..=max_attempts {
-                        let wake_at = Instant::now() + interval;
-                        while Instant::now() < wake_at {
-                            if self.persist_stop.load(Ordering::Acquire)
-                                || self.control_exited.load(Ordering::Acquire)
-                            {
-                                return ZeroCheckCommitStop::WorkerDisconnected;
-                            }
-                            let rem = wake_at.saturating_duration_since(Instant::now());
-                            thread::park_timeout(rem.min(Duration::from_millis(5)));
-                        }
-                        if self.persist_stop.load(Ordering::Acquire)
-                            || self.control_exited.load(Ordering::Acquire)
-                        {
-                            return ZeroCheckCommitStop::WorkerDisconnected;
-                        }
-                        let pds = crate::persist::PendingDirSync::for_path(&target_path);
-                        let outcome = match self.hooks.dir_sync_override.as_ref() {
-                            Some(f) => pds.sync_with(|dir| f(dir)),
-                            None => pds.sync_parent_dir(),
-                        };
-                        match outcome {
-                            crate::persist::PublishOutcome::Published => {}
-                            crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
-                                last_warn = w;
-                                tracing::warn!(
-                                    "Executor zero_check reconciliation retry {attempt}/{max_attempts} for {file_name} failed dir fsync: {last_warn}"
-                                );
-                                continue;
-                            }
-                        }
-                        let _cw_reconcile = loop {
-                            if self.persist_stop.load(Ordering::Acquire)
-                                || self.control_exited.load(Ordering::Acquire)
-                            {
-                                return ZeroCheckCommitStop::WorkerDisconnected;
-                            }
-                            match self.config_write_mutex.try_lock() {
-                                Ok(guard) => break guard,
-                                Err(_) => thread::park_timeout(Duration::from_millis(2)),
-                            }
-                        };
-                        let operator_revoked = !self.op_auth_ok();
-                        if let Some(h) = self.hooks.before_finish_reconcile.as_ref() {
-                            h();
-                        }
-                        let Some(pol) = policy_opt.take() else {
-                            return ZeroCheckCommitStop::Aborted;
-                        };
-                        let pub_pol = pol.clone();
-                        let jaw = jaw_opt.take();
-                        let pub_jaw = jaw.clone();
-                        if !self.push_cmd(PersistCmd::FinishReconcile {
-                            proposal,
-                            auth,
-                            base_revision: self.job.base_revision,
-                            offset_rad: self.job.offset_rad,
-                            new_policy: pol,
-                            new_jaw: jaw,
-                            operator_revoked,
-                        }) {
-                            return ZeroCheckCommitStop::WorkerDisconnected;
-                        }
-                        match self.wait_reply() {
-                            Some(PersistReply::Activated { activated_revision, .. }) => {
-                                if self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h()) {
-                                    return ZeroCheckCommitStop::WorkerDisconnected;
-                                }
-                                let prep_pol = pub_pol.clone();
-                                self.published_config.apply_zero_check_commit(
-                                    self.job.offset_rad,
-                                    pub_pol,
-                                    pub_jaw,
-                                    activated_revision,
-                                );
-                                if let Some(cur) = self.hub.prep_env() {
-                                    let mut next = (*cur).clone();
-                                    next.config.gripper_policy = Some(prep_pol);
-                                    next.gripper_calib_revision = activated_revision;
-                                    self.hub.update_prep_env(Arc::new(next));
-                                }
-                                // Rename after the published config is current (no stale window).
-                                match self.publish_pending(false) {
-                                    PublishPendingResult::Published => {
-                                        tracing::info!(
-                                            "Executor zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
-                                        );
-                                    }
-                                    PublishPendingResult::ReportedFailure => {}
-                                    PublishPendingResult::WorkerDisconnected => {
-                                        return ZeroCheckCommitStop::WorkerDisconnected;
-                                    }
-                                }
-                                return ZeroCheckCommitStop::Aborted;
-                            }
-                            Some(_) => {
-                                let msg = format!(
-                                    "Configuration persistence failed for {file_name}: post-rename reconciliation rejected"
-                                );
-                                tracing::error!("{msg}");
-                                if self.push_cmd(PersistCmd::LatchConfigReconcileFault {
-                                    message: crate::safety::BoundedText::new(&msg),
-                                }) {
-                                    let _ = self.wait_reply();
-                                }
-                                return ZeroCheckCommitStop::Aborted;
-                            }
-                            None => return ZeroCheckCommitStop::WorkerDisconnected,
-                        }
-                    }
-                    let msg = format!(
-                        "Configuration persistence failed for {file_name} after {max_attempts} reconciliation attempts: {last_warn}"
-                    );
-                    tracing::error!("{msg}");
-                    if self.push_cmd(PersistCmd::LatchConfigReconcileFault {
-                        message: crate::safety::BoundedText::new(&msg),
-                    }) {
-                        let _ = self.wait_reply();
-                    }
-                }
             }
         }
         ZeroCheckCommitStop::Aborted
@@ -9248,10 +9021,11 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
         let Some(reply) = self.wait_reply() else {
             return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
         };
-        if matches!(reply, PersistReply::Activated { .. })
-            && self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h())
-        {
-            return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
+        if matches!(reply, PersistReply::Activated { .. }) {
+            self.activated = true;
+            if self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h()) {
+                return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
+            }
         }
         let activated = if let PersistReply::Activated { activated_revision, .. } = reply {
             let prep_pol = pub_policy.clone();
@@ -9985,6 +9759,7 @@ fn control_thread_main(
     watchdog_plan_rx: Consumer<WatchdogParkPlan>,
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
+    persist_official_untouched: Arc<AtomicBool>,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
@@ -10057,6 +9832,7 @@ fn control_thread_main(
             watchdog_plan_rx,
             offload_reclaim_tx,
             persist_wake,
+            persist_official_untouched,
             estop_state,
             hub,
             hooks,
@@ -10192,6 +9968,7 @@ fn control_thread_main_inner(
     watchdog_plan_rx: Consumer<WatchdogParkPlan>,
     mut offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
+    persist_official_untouched: Arc<AtomicBool>,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
@@ -10562,7 +10339,7 @@ fn control_thread_main_inner(
         persist_wake,
         persist_granted: None,
         persist_awaiting_publish: None,
-        reconcile_operator_grant: None,
+        persist_official_untouched,
         next_persist_req: 0,
         disconnect_code_buf: Some(String::with_capacity(64)),
         disconnect_msg_buf: Some(String::with_capacity(160)),
@@ -11723,14 +11500,18 @@ fn control_thread_main_inner(
             {
                 return false;
             }
-            if let Some(action_id) = core_ref.zero_check_persisting.take() {
-                // `armd-persist` is stopping with this executor; do not hand back a running
-                // action, `zero_check_persisting` marker, or pre-activation `.pending` hold that
-                // Legacy cannot settle (0 alloc).
+            // Track "official file untouched" independently of `zero_check_persisting`: if the
+            // official file was never touched (pre-activation staging or before official rename),
+            // clear any GripperCalibration hold so Legacy never inherits a stranded hold (0 alloc).
+            if state.persist_official_untouched.swap(false, Ordering::AcqRel) {
                 core_ref
                     .core
                     .config_mut()
                     .clear_orphaned_staged_hold(ConfigDomain::GripperCalibration);
+            }
+            if let Some(action_id) = core_ref.zero_check_persisting.take() {
+                // `armd-persist` is stopping with this executor; do not hand back a running
+                // action or `zero_check_persisting` marker that Legacy cannot settle (0 alloc).
                 if let Some(a) = core_ref
                     .last_action
                     .as_mut()
@@ -12912,7 +12693,7 @@ mod tests {
             persist_wake: thread::current(),
             persist_granted: Some((action_id, ConfigDomain::GripperCalibration)),
             persist_awaiting_publish: None,
-            reconcile_operator_grant: None,
+            persist_official_untouched: Arc::new(AtomicBool::new(false)),
             next_persist_req: 1,
             disconnect_code_buf: Some(String::from("buf")),
             disconnect_msg_buf: Some(String::from("msg")),
@@ -13022,7 +12803,7 @@ mod tests {
             persist_wake: thread::current(),
             persist_granted: None,
             persist_awaiting_publish: None,
-            reconcile_operator_grant: None,
+            persist_official_untouched: Arc::new(AtomicBool::new(false)),
             next_persist_req: 1,
             disconnect_code_buf: None,
             disconnect_msg_buf: None,
@@ -13280,7 +13061,7 @@ mod tests {
             persist_wake: thread::current(),
             persist_granted: None,
             persist_awaiting_publish: None,
-            reconcile_operator_grant: None,
+            persist_official_untouched: Arc::new(AtomicBool::new(false)),
             next_persist_req: 0,
             disconnect_code_buf: None,
             disconnect_msg_buf: None,
@@ -13457,7 +13238,7 @@ mod tests {
             persist_wake: thread::current(),
             persist_granted: None,
             persist_awaiting_publish: None,
-            reconcile_operator_grant: None,
+            persist_official_untouched: Arc::new(AtomicBool::new(false)),
             next_persist_req: 0,
             disconnect_code_buf: Some(String::with_capacity(64)),
             disconnect_msg_buf: Some(String::with_capacity(160)),

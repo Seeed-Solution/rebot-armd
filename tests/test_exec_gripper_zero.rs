@@ -45,7 +45,7 @@ use armd::driver::{
     TorqueProgress,
 };
 use armd::model::{ArmConfig, JointState};
-use armd::rt_core::config_iface::{ConfigDomain, HoldState};
+use armd::rt_core::config_iface::ConfigDomain;
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks, RtOwner};
 use armd::rt_core::ops::PlanSlot;
 use armd::rt_core::requests::config::{ConfigReply, ConfigRequest};
@@ -1696,7 +1696,8 @@ async fn executor_zero_check_prc_revocation_before_rename_dir_sync_retry_and_wor
         rig.shutdown().await;
     }
 
-    // (b) Dir-fsync EIO once -> PERSIST_FAILED + durability_confirmed=false + warning + Reconciling -> retry succeeds
+    // (b) Staging dir-fsync EIO -> PERSIST_FAILED + durability_confirmed=false + warning +
+    //     hold Cleared (official file untouched) + `.pending` unlinked
     {
         let sync_calls = Arc::new(AtomicUsize::new(0));
         let sync_calls_h = Arc::clone(&sync_calls);
@@ -1709,8 +1710,6 @@ async fn executor_zero_check_prc_revocation_before_rename_dir_sync_retry_and_wor
                     Ok(())
                 }
             })),
-            reconcile_retry_interval: Some(Duration::from_millis(20)),
-            reconcile_max_attempts: Some(5),
             ..Default::default()
         };
         let rig = DualRig::start(
@@ -1747,30 +1746,30 @@ async fn executor_zero_check_prc_revocation_before_rename_dir_sync_retry_and_wor
             "expected non-empty durability_warning: {term}"
         );
 
-        // Background reconciliation retries dir-fsync and clears HoldState::Reconciling.
-        let dl = Instant::now() + Duration::from_secs(4);
-        loop {
-            let reply = rig
-                .sup
-                .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
-                .await
-                .unwrap();
-            if let ConfigReply::HoldInspected { state: None, .. } = reply {
-                break;
-            }
-            assert!(
-                Instant::now() < dl,
-                "GripperCalibration did not reconcile after dir_sync retry"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // Official file is untouched: hold is released (Cleared), never left Reconciling.
+        let reply = rig
+            .sup
+            .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, ConfigReply::HoldInspected { state: None, .. }),
+            "staging dir-fsync failure must clear GripperCalibration hold"
+        );
+        assert_eq!(sync_calls.load(Ordering::Acquire), 1);
+        assert!(!rig.calib_path.exists(), "official file must stay untouched");
+        let pending = armd::gripper_calib::pending_path_for(&rig.calib_path);
+        let dl = Instant::now() + Duration::from_secs(2);
+        while pending.exists() {
+            assert!(Instant::now() < dl, "staged .pending file must be unlinked on staging dir-fsync failure");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(sync_calls.load(Ordering::Acquire) >= 2);
         rig.wait_zero_check_ctx_empty("dir_sync_retry").await;
         rig.assert_zero_rt_allocs("dir_sync_retry");
         rig.shutdown().await;
     }
 
-    // (c) Worker crash after reservation -> PERSIST_FAILED + HoldState::Reconciling + 0 leak + 0 RT alloc
+    // (c) Worker crash after reservation (before official rename) -> PERSIST_FAILED + hold Cleared + 0 leak + 0 RT alloc
     {
         let hooks = PersistTestHooks {
             after_grant_before_rename: Some(Arc::new(|| true)),
@@ -1811,30 +1810,24 @@ async fn executor_zero_check_prc_revocation_before_rename_dir_sync_retry_and_wor
             .await
             .unwrap();
         match reply {
-            ConfigReply::HoldInspected {
-                state: Some(HoldState::Reconciling),
-                ..
-            } => {}
-            _ => panic!("expected HoldState::Reconciling after worker crash"),
+            ConfigReply::HoldInspected { state: None, .. } => {}
+            _ => panic!("expected Cleared hold (state: None) after pre-activation worker crash"),
         }
+        assert!(!rig.calib_path.exists());
+        assert!(!armd::gripper_calib::pending_path_for(&rig.calib_path).exists());
         rig.wait_zero_check_ctx_empty("worker_crash").await;
         rig.assert_zero_rt_allocs("worker_crash");
         rig.shutdown().await;
     }
 }
 
-/// Dir-fsync failure settles the action and its session; the background reconciliation must not
-/// activate the stored offset once the operator grant of that action is no longer valid, even
-/// when the worker sampled the operator session as valid just before queueing `FinishReconcile`.
+/// Staging dir-fsync failure settles the action and releases the GripperCalibration hold (Cleared)
+/// without leaving a `Reconciling` retry or activating the stored offset, even when the operator
+/// session is revoked afterward.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked() {
     let client = reqwest::Client::new();
     let auth = OperatorAuth::enforced("123456", 1800);
-    let auth_hook = auth.clone();
-    let tok_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let tok_hook = Arc::clone(&tok_slot);
-    let revoked = Arc::new(AtomicBool::new(false));
-    let revoked_h = Arc::clone(&revoked);
     let sync_calls = Arc::new(AtomicUsize::new(0));
     let sync_calls_h = Arc::clone(&sync_calls);
     let hooks = PersistTestHooks {
@@ -1845,20 +1838,11 @@ async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked
                 Ok(())
             }
         })),
-        reconcile_retry_interval: Some(Duration::from_millis(20)),
-        reconcile_max_attempts: Some(5),
-        // Revoke strictly after the worker sampled the session as valid.
-        before_finish_reconcile: Some(Arc::new(move || {
-            if let Some(tok) = tok_hook.lock().unwrap().as_deref() {
-                auth_hook.lock(Some(tok));
-                revoked_h.store(true, Ordering::Release);
-            }
-        })),
         ..Default::default()
     };
     let rig = DualRig::start(
         RtOwner::Executor,
-        auth,
+        auth.clone(),
         |_| {},
         |inner| {
             inner.set_mock_gripper_stall_offset(Some(0.05));
@@ -1877,7 +1861,6 @@ async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked
         .await
         .unwrap();
     let token = unlock["token"].as_str().unwrap().to_string();
-    *tok_slot.lock().unwrap() = Some(token.clone());
     let cal_rev = || async {
         let v: Value = client
             .get(format!("{base}/api/v1/gripper/calibration"))
@@ -1909,17 +1892,14 @@ async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked
     assert_eq!(term["state"], "failed", "{term}");
     assert_eq!(term["code"], "PERSIST_FAILED", "{term}");
 
-    let dl = Instant::now() + Duration::from_secs(4);
-    while !revoked.load(Ordering::Acquire) {
-        assert!(Instant::now() < dl, "reconciliation never reached FinishReconcile");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // Give the owner time to process FinishReconcile and the worker to publish any activation.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Lock operator session and verify no background reconciliation activates the offset and
+    // no Reconciling hold was left stranded for the untouched official file.
+    auth.lock(Some(&token));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         cal_rev().await,
         rev_before,
-        "reconciliation activated the offset after the operator grant was revoked"
+        "staging dir-fsync failure must not activate the offset"
     );
     let reply = rig
         .sup
@@ -1927,9 +1907,11 @@ async fn executor_zero_check_reconcile_refuses_activation_after_operator_revoked
         .await
         .unwrap();
     assert!(
-        matches!(reply, ConfigReply::HoldInspected { state: Some(_), .. }),
-        "GripperCalibration must stay held (reconciliation refused)"
+        matches!(reply, ConfigReply::HoldInspected { state: None, .. }),
+        "GripperCalibration hold must be Cleared (not Reconciling) when official file is untouched"
     );
+    assert!(!rig.calib_path.exists());
+    assert!(!armd::gripper_calib::pending_path_for(&rig.calib_path).exists());
     rig.wait_zero_check_ctx_empty("reconcile_revoked").await;
     rig.shutdown().await;
 }

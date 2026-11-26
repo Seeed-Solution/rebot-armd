@@ -2007,8 +2007,9 @@ async fn two_phase_persistence_success_and_dir_sync_unconfirmed() {
     assert!(!h.planning_snapshot().unwrap().config_inhibited);
     h.stop_and_join();
 
-    // (b) Dir-sync EIO -> MUST NOT activate: keeps OLD policy active, enters Reconciling
-    //     (motion stays inhibited), fails action with PERSIST_FAILED + durability_warning.
+    // (b) Staging dir-sync EIO -> MUST NOT activate: keeps OLD policy active, releases hold
+    //     (Cleared, never Reconciling because official file is untouched), unlinks `.pending`,
+    //     and fails action with PERSIST_FAILED + durability_warning.
     let dir2 = tempfile::tempdir().unwrap();
     let path2 = dir2.path().join("gripper_calib.json");
     let (sup2, id2) = prepare_zero_check_supervisor(path2.clone()).await;
@@ -2028,8 +2029,16 @@ async fn two_phase_persistence_success_and_dir_sync_unconfirmed() {
     // The candidate is staged at `.pending`; it never reaches the official path unactivated.
     assert!(!path2.exists(), "dir-sync failure must not publish the official file");
     assert!(
-        h2.planning_snapshot().unwrap().config_inhibited,
-        "dir-sync failure must enter Reconciling and keep motion inhibited"
+        !h2.planning_snapshot().unwrap().config_inhibited,
+        "staging dir-sync failure with untouched official file must clear hold, never leave Reconciling"
+    );
+    wait_until_async(Duration::from_secs(2), || {
+        !armd::gripper_calib::pending_path_for(&path2).exists()
+    })
+    .await;
+    assert!(
+        !armd::gripper_calib::pending_path_for(&path2).exists(),
+        "staging dir-sync failure must unlink .pending"
     );
     let pub2 = sup2.published_config().await.unwrap();
     assert_eq!(pub2.gripper_calib_offset, None, "old policy must remain active after dir-sync failure");
@@ -2139,7 +2148,8 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     assert!(!armd::gripper_calib::pending_path_for(&path_d2).exists(), "refused candidate must be unlinked");
     h_d2.stop_and_join();
 
-    // (e) Worker disconnect BEFORE rename -> hold enters Reconciling, action fails PERSIST_FAILED.
+    // (e) Worker disconnect BEFORE staging rename (official file untouched) -> hold Cleared,
+    // action fails PERSIST_FAILED.
     let dir_e = tempfile::tempdir().unwrap();
     let path_e = dir_e.path().join("gripper_calib.json");
     let (sup_e, id_e) = prepare_zero_check_supervisor(path_e.clone()).await;
@@ -2154,13 +2164,16 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     let a_e = wait_action_terminal(&h_e, id_e).await;
     assert_eq!(a_e.state, "failed", "{a_e:?}");
     assert_eq!(a_e.code.as_deref(), Some("PERSIST_FAILED"));
-    assert!(h_e.planning_snapshot().unwrap().config_inhibited);
+    assert!(
+        !h_e.planning_snapshot().unwrap().config_inhibited,
+        "pre-activation worker disconnect must release GripperCalibration hold"
+    );
     assert!(!path_e.exists());
+    assert!(!armd::gripper_calib::pending_path_for(&path_e).exists());
     h_e.stop_and_join();
 
-    // (f) Worker disconnect AFTER `.pending` staging before `Activate` -> worker abandons
-    // `persist_granted` without calling `zero_check_owner_activate`, so `service_persistence`
-    // enters `Reconciling` conservatively (same as (e)) and fails the action with PERSIST_FAILED.
+    // (f) Worker disconnect AFTER `.pending` staging before `Activate` (official file untouched)
+    // -> hold Cleared, `.pending` unlinked, action fails with PERSIST_FAILED.
     let dir_f = tempfile::tempdir().unwrap();
     let path_f = dir_f.path().join("gripper_calib.json");
     let (sup_f, id_f) = prepare_zero_check_supervisor(path_f.clone()).await;
@@ -2175,9 +2188,19 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     let a_f = wait_action_terminal(&h_f, id_f).await;
     assert_eq!(a_f.state, "failed", "{a_f:?}");
     assert_eq!(a_f.code.as_deref(), Some("PERSIST_FAILED"));
-    assert!(h_f.planning_snapshot().unwrap().config_inhibited);
+    assert!(
+        !h_f.planning_snapshot().unwrap().config_inhibited,
+        "pre-activation worker disconnect after .pending staging must clear GripperCalibration hold"
+    );
     assert!(!path_f.exists(), "unactivated candidate must not reach the official path");
-    assert!(armd::gripper_calib::pending_path_for(&path_f).exists(), "worker exit leaves the staged candidate for startup cleanup");
+    wait_until_async(Duration::from_secs(2), || {
+        !armd::gripper_calib::pending_path_for(&path_f).exists()
+    })
+    .await;
+    assert!(
+        !armd::gripper_calib::pending_path_for(&path_f).exists(),
+        "pre-activation worker disconnect must unlink .pending"
+    );
     h_f.stop_and_join();
 }
 
@@ -2251,10 +2274,11 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     assert!(!h_g2.planning_snapshot().unwrap().config_inhibited, "Abort before rename must release hold cleanly");
     h_g2.stop_and_join();
 
-    // (h) Persistence #5 (`fail_persisted_once`) + off-thread drop of unused reply payload!
+    // (h) `fail_persisted_once` on untouched `.pending` staging -> hold Cleared, `.pending`
+    //     unlinked, + off-thread drop of unused reply payload!
     let dir_h = tempfile::tempdir().unwrap();
     let path_h = dir_h.path().join("gripper_calib.json");
-    let (sup_h, id_h) = prepare_zero_check_supervisor(path_h).await;
+    let (sup_h, id_h) = prepare_zero_check_supervisor(path_h.clone()).await;
     let dropped_on = Arc::new(Mutex::new(Vec::new()));
     let probe: Box<dyn std::any::Any + Send> = Box::new(DropProbe { dropped_on: dropped_on.clone() });
     let hooks_h = PersistTestHooks {
@@ -2272,7 +2296,16 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     let a_h = wait_action_terminal(&h_h, id_h).await;
     assert_eq!(a_h.state, "failed", "{a_h:?}");
     assert_eq!(a_h.code.as_deref(), Some("PERSIST_FAILED"));
-    assert!(h_h.planning_snapshot().unwrap().config_inhibited, "Persistence #5 must enter Reconciling");
+    assert!(
+        !h_h.planning_snapshot().unwrap().config_inhibited,
+        "pre-activation Persisted failure with untouched official file must clear hold"
+    );
+    wait_until_async(Duration::from_secs(2), || {
+        !armd::gripper_calib::pending_path_for(&path_h).exists()
+    })
+    .await;
+    assert!(!path_h.exists());
+    assert!(!armd::gripper_calib::pending_path_for(&path_h).exists());
     // Orphaned reply (left queued when worker exited) is drained & dropped off-thread by dispatcher/teardown!
     wait_until_async(Duration::from_secs(2), || !dropped_on.lock().unwrap().is_empty()).await;
     let tids = dropped_on.lock().unwrap().clone();
@@ -2431,9 +2464,177 @@ async fn handback_while_awaiting_publish_clears_zero_check_persisting_and_fails_
         assert_eq!(a.code.as_deref(), Some("PERSIST_FAILED"), "{a:?}");
     }
     assert!(!path_b.exists(), "unactivated candidate must never reach the official path");
+    assert!(
+        !armd::gripper_calib::pending_path_for(&path_b).exists(),
+        "pre-activation handback must unlink .pending"
+    );
 
     legacy_stop_b.store(true, Ordering::Release);
     let _ = legacy_join_b.join();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_activation_failures_and_handback_never_strand_reconciling_hold_for_untouched_file() {
+    const OLD_CALIB: &str = "{\"offset_rad\":0.02}";
+
+    // (a) Staging dir-fsync failure followed by handback to Legacy: hold is Cleared (never
+    //     Reconciling), `.pending` is unlinked, official file is untouched, and Legacy inherits
+    //     no motion-inhibiting hold.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gripper_calib_dirsync_hb.json");
+        std::fs::write(&path, OLD_CALIB).unwrap();
+        let (sup, action_id) = prepare_zero_check_supervisor(path.clone()).await;
+        let hooks = PersistTestHooks {
+            dir_sync_override: Some(Arc::new(|_| Err(std::io::Error::other("simulated staging EIO")))),
+            ..Default::default()
+        };
+        let h = sup
+            .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+            .await
+            .unwrap();
+        let a = wait_action_terminal(&h, action_id).await;
+        assert_eq!(a.state, "failed", "{a:?}");
+        assert_eq!(a.code.as_deref(), Some("PERSIST_FAILED"), "{a:?}");
+        assert_eq!(a.durability_confirmed, Some(false), "{a:?}");
+        assert!(
+            !h.planning_snapshot().unwrap().config_inhibited,
+            "staging dir-fsync failure must clear GripperCalibration hold"
+        );
+
+        let (legacy_stop, legacy_join) = sup
+            .handback_to_legacy_with_live_loop(Duration::from_secs(3), Duration::from_millis(5))
+            .await
+            .expect("handback after staging dir-fsync failure must succeed");
+        h.stop_and_join();
+
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.zero_check_persisting.is_none());
+            assert!(
+                !inner.core.motion_inhibited_by_config(),
+                "Legacy must not inherit a motion-inhibiting hold after staging dir-fsync failure"
+            );
+            assert!(inner.core.config_held(ConfigDomain::GripperCalibration).is_none());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CALIB);
+        assert!(
+            !armd::gripper_calib::pending_path_for(&path).exists(),
+            "staging dir-fsync failure must unlink .pending"
+        );
+        legacy_stop.store(true, Ordering::Release);
+        let _ = legacy_join.join();
+    }
+
+    // (b) Pre-activation worker abandonment after `.pending` is staged followed by handback to
+    //     Legacy: hold is Cleared, `.pending` is unlinked, official file is untouched, and Legacy
+    //     inherits no motion-inhibiting hold.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gripper_calib_abandon_hb.json");
+        std::fs::write(&path, OLD_CALIB).unwrap();
+        let (sup, action_id) = prepare_zero_check_supervisor(path.clone()).await;
+        let hooks = PersistTestHooks {
+            after_rename_before_activate: Some(Arc::new(|| true)),
+            ..Default::default()
+        };
+        let h = sup
+            .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+            .await
+            .unwrap();
+        let a = wait_action_terminal(&h, action_id).await;
+        assert_eq!(a.state, "failed", "{a:?}");
+        assert_eq!(a.code.as_deref(), Some("PERSIST_FAILED"), "{a:?}");
+        assert!(
+            !h.planning_snapshot().unwrap().config_inhibited,
+            "pre-activation worker abandonment must clear GripperCalibration hold"
+        );
+
+        let (legacy_stop, legacy_join) = sup
+            .handback_to_legacy_with_live_loop(Duration::from_secs(3), Duration::from_millis(5))
+            .await
+            .expect("handback after pre-activation worker abandonment must succeed");
+        h.stop_and_join();
+
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.zero_check_persisting.is_none());
+            assert!(
+                !inner.core.motion_inhibited_by_config(),
+                "Legacy must not inherit a motion-inhibiting hold after pre-activation abandonment"
+            );
+            assert!(inner.core.config_held(ConfigDomain::GripperCalibration).is_none());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CALIB);
+        assert!(
+            !armd::gripper_calib::pending_path_for(&path).exists(),
+            "pre-activation worker abandonment must unlink .pending"
+        );
+        legacy_stop.store(true, Ordering::Release);
+        let _ = legacy_join.join();
+    }
+
+    // (c) Handback interrupting an in-flight staging dir-fsync (barrier inside `dir_sync_override`
+    //     that returns EIO once released): Legacy inherits no hold, `.pending` is unlinked, and
+    //     the official file is untouched.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gripper_calib_hb_during_dirsync.json");
+        std::fs::write(&path, OLD_CALIB).unwrap();
+        let (sup, action_id) = prepare_zero_check_supervisor(path.clone()).await;
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let hooks = PersistTestHooks {
+            dir_sync_override: Some(Arc::new(move |_| {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                Err(std::io::Error::other("simulated staging EIO during handback"))
+            })),
+            ..Default::default()
+        };
+        let h = sup
+            .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .await
+            .unwrap();
+        let rel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = release_tx.send(());
+        });
+        let (legacy_stop, legacy_join) = sup
+            .handback_to_legacy_with_live_loop(Duration::from_secs(3), Duration::from_millis(5))
+            .await
+            .expect("handback during staging dir-fsync must succeed");
+        rel_task.await.unwrap();
+        h.stop_and_join();
+
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.zero_check_persisting.is_none());
+            assert!(
+                !inner.core.motion_inhibited_by_config(),
+                "Legacy must not inherit a motion-inhibiting hold when handback interrupts staging dir-fsync"
+            );
+            assert!(inner.core.config_held(ConfigDomain::GripperCalibration).is_none());
+            let a = inner.last_action.as_ref().expect("last_action present");
+            assert_eq!(a.id, action_id);
+            assert_eq!(a.state, "failed", "{a:?}");
+            assert_eq!(a.code.as_deref(), Some("PERSIST_FAILED"), "{a:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CALIB);
+        assert!(
+            !armd::gripper_calib::pending_path_for(&path).exists(),
+            "handback during staging dir-fsync must unlink .pending"
+        );
+        legacy_stop.store(true, Ordering::Release);
+        let _ = legacy_join.join();
+    }
 }
 
 // ============================================================================

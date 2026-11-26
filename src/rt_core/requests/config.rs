@@ -6201,12 +6201,14 @@ pub(crate) fn zero_check_owner_verify_authority(
 }
 
 /// Phase 4b (owner-side, zero-alloc on `armd-control`): mark reservation persisted after
-/// `rename_only()`. On refusal, unconditionally enters `Reconciling`.
+/// `rename_only()`. On refusal, releases the hold (`Cleared`) when `official_file_untouched` is
+/// `true` (executor `.pending` staging); otherwise unconditionally enters `Reconciling`.
 pub(crate) fn zero_check_owner_persisted(
     core: &mut SupervisorInner,
     action_id: u64,
     reservation: Reservation,
     simulated_err: bool,
+    official_file_untouched: bool,
     code_buf: Option<String>,
     msg_buf: Option<String>,
 ) -> Result<(Reservation, Option<String>, Option<String>), (Option<String>, Option<String>)> {
@@ -6218,10 +6220,21 @@ pub(crate) fn zero_check_owner_persisted(
     if res.is_ok() {
         Ok((reservation, code_buf, msg_buf))
     } else {
-        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-        core.core
-            .config_mut()
-            .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+        if official_file_untouched {
+            if !matches!(
+                core.core.config_mut().release_staged_unactivated(reservation),
+                Released::Cleared
+            ) {
+                core.core
+                    .config_mut()
+                    .clear_orphaned_staged_hold(ConfigDomain::GripperCalibration);
+            }
+        } else {
+            let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+            core.core
+                .config_mut()
+                .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+        }
         if core.zero_check_persisting == Some(action_id) {
             core.zero_check_persisting = None;
             if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
@@ -6232,7 +6245,11 @@ pub(crate) fn zero_check_owner_persisted(
             action_id,
             "failed",
             "PERSIST_FAILED",
-            "Failed to record post-rename persistence state; reconciling required",
+            if official_file_untouched {
+                "Failed to record pre-activation staging state"
+            } else {
+                "Failed to record post-rename persistence state; reconciling required"
+            },
             code_buf,
             msg_buf,
         );
@@ -6241,16 +6258,28 @@ pub(crate) fn zero_check_owner_persisted(
 }
 
 /// Phase 5-error (owner-side, zero-alloc on `armd-control`): parent-directory fsync failed after
-/// `rename_only()`. Keeps the OLD policy active, enters `HoldState::Reconciling` (motion stays
-/// inhibited), and fails the action with `PERSIST_FAILED` + durability warning.
+/// `rename_only()`. Keeps the OLD policy active and fails the action with `PERSIST_FAILED` +
+/// durability warning. When `official_file_untouched` is `true` (executor `.pending` staging),
+/// releases the hold (`Cleared`) so an untouched official file never leaves `HoldState::Reconciling`;
+/// otherwise enters `HoldState::Reconciling` (motion stays inhibited) for legacy/sync callers.
 pub(crate) fn zero_check_owner_reconcile_dir_sync_failed(
     core: &mut SupervisorInner,
     action_id: u64,
     reservation: Reservation,
     warning: String,
+    official_file_untouched: bool,
     msg_buf: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    if !matches!(
+    if official_file_untouched {
+        if !matches!(
+            core.core.config_mut().release_staged_unactivated(reservation),
+            Released::Cleared
+        ) {
+            core.core
+                .config_mut()
+                .clear_orphaned_staged_hold(ConfigDomain::GripperCalibration);
+        }
+    } else if !matches!(
         ConfigAuthority::release(core, reservation),
         Released::Reconciling
     ) {
@@ -6261,6 +6290,9 @@ pub(crate) fn zero_check_owner_reconcile_dir_sync_failed(
     }
     if core.zero_check_persisting == Some(action_id) {
         core.zero_check_persisting = None;
+        if core.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == action_id) {
+            core.zero_check_persisting_grant = None;
+        }
     }
     core.fail_zero_check_dir_sync_in_place(action_id, warning, msg_buf)
 }
@@ -6594,6 +6626,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
             self.job.action_id,
             r,
             sim_persisted_fail,
+            false,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         ) {
@@ -6617,6 +6650,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                 self.job.action_id,
                 r,
                 warn.clone(),
+                false,
                 Some(String::with_capacity(160)),
             );
         }
@@ -6850,6 +6884,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
                 self.job.action_id,
                 r,
                 true,
+                false,
                 Some(String::with_capacity(64)),
                 Some(String::with_capacity(160)),
             );
@@ -7034,6 +7069,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             self.action_id,
             r,
             false,
+            false,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         ) {
@@ -7056,6 +7092,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
                 self.action_id,
                 r,
                 warn.clone(),
+                false,
                 Some(String::with_capacity(160)),
             );
         }
