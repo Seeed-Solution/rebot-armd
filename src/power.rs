@@ -1283,6 +1283,7 @@ impl SupervisorInner {
                     "push": h.push[..budget.joints.len().min(MAX_JOINTS)].to_vec()})),
             },
             "idle_a": r3(budget.idle_a()),
+            "torque_backoff": self.torque_guard.backoff_history.to_diagnostics(),
             "budget": budget,
         })
     }

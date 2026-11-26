@@ -1335,6 +1335,18 @@ impl crate::supervisor::SupervisorInner {
         if let Some(intent) = computed_j7_intent {
             self.j7_intent = Some(intent);
         }
+        if matches!(res, TickOutput::Complete { .. }) {
+            if let Some(rec) = self.torque_guard.backoff_history.latest() {
+                if rec.transmitted_q.is_none() {
+                    let j = usize::from(rec.joint);
+                    if let Some(t) = targets.get(j) {
+                        self.torque_guard
+                            .backoff_history
+                            .record_transmitted(j, t.position);
+                    }
+                }
+            }
+        }
         if let Some((ff, dof)) = ff {
             match &res {
                 TickOutput::Complete { .. } => {

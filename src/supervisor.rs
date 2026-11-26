@@ -4622,6 +4622,7 @@ impl SupervisorInner {
             holding_after_clear: self.holding_after_clear(),
             watchdog_park_pending_gen: wd_gen,
             watchdog_park_pending_attempt: wd_attempt,
+            torque_backoff: self.torque_guard.backoff_history,
         };
         crate::rt_core::publish::Snapshot {
             meta: crate::rt_core::publish::SampleMeta {
@@ -4672,6 +4673,7 @@ impl SupervisorInner {
             holding_after_clear: self.holding_after_clear(),
             watchdog_park_pending_gen: wd_gen,
             watchdog_park_pending_attempt: wd_attempt,
+            torque_backoff: self.torque_guard.backoff_history,
         };
         self.sync_motion_generation_for_publish();
         let owner = self.published_owner_meta();
@@ -16617,6 +16619,19 @@ impl ArmSupervisor {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {
         self.torque_shadow.snapshot()
+    }
+
+    /// Off-thread bounded torque back-off diagnostics read from [`StateHub`] without taking
+    /// `SupervisorLock`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn torque_backoff_diagnostics(&self) -> crate::torque_guard::TorqueBackoffDiagnostics {
+        if let Some(snap) = self.hub().latest() {
+            return snap.rt.torque_backoff.to_diagnostics();
+        }
+        self.inner()
+            .try_read()
+            .map(|g| g.torque_guard.backoff_history.to_diagnostics())
+            .unwrap_or_else(|_| crate::torque_guard::TorqueBackoffHistory::default().to_diagnostics())
     }
 
     /// Shared handle to the off-thread shadow comparator/diagnostics hub.

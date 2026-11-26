@@ -34,6 +34,7 @@ pub async fn get_diagnostics(
             "effective_owner": supervisor.effective_owner().as_str(),
             "owner_reason": supervisor.owner_reason().as_str(),
             "torque_shadow": supervisor.torque_shadow_diagnostics(),
+            "torque_backoff": supervisor.torque_backoff_diagnostics(),
         }))
         .into_response()
     }

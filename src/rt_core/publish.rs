@@ -185,7 +185,7 @@ pub struct SampleMeta {
 }
 
 /// Scalar motion/authority metadata published alongside [`RtSample`] (Copy, 0 alloc on RT).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RtMotionMeta {
     pub boot_id: super::broker::BootId,
     pub clock_now: Option<Instant>,
@@ -198,6 +198,7 @@ pub struct RtMotionMeta {
     pub holding_after_clear: bool,
     pub watchdog_park_pending_gen: u64,
     pub watchdog_park_pending_attempt: u8,
+    pub torque_backoff: crate::torque_guard::TorqueBackoffHistory,
 }
 
 impl Default for RtMotionMeta {
@@ -214,6 +215,7 @@ impl Default for RtMotionMeta {
             holding_after_clear: false,
             watchdog_park_pending_gen: 0,
             watchdog_park_pending_attempt: 0,
+            torque_backoff: crate::torque_guard::TorqueBackoffHistory::default(),
         }
     }
 }
@@ -869,6 +871,7 @@ pub struct RtSample {
     pub holding_after_clear: bool,
     pub watchdog_park_pending_gen: u64,
     pub watchdog_park_pending_attempt: u8,
+    pub torque_backoff: crate::torque_guard::TorqueBackoffHistory,
 }
 
 impl Default for RtSample {
@@ -897,6 +900,7 @@ impl RtSample {
             holding_after_clear: false,
             watchdog_park_pending_gen: 0,
             watchdog_park_pending_attempt: 0,
+            torque_backoff: crate::torque_guard::TorqueBackoffHistory::default(),
         }
     }
 
@@ -1121,6 +1125,7 @@ impl StatePublisher {
         slot.rt.holding_after_clear = rt.meta.holding_after_clear;
         slot.rt.watchdog_park_pending_gen = rt.meta.watchdog_park_pending_gen;
         slot.rt.watchdog_park_pending_attempt = rt.meta.watchdog_park_pending_attempt;
+        slot.rt.torque_backoff = rt.meta.torque_backoff;
         let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();

@@ -167,6 +167,159 @@ pub enum Retreat {
     Spent,
 }
 
+/// Number of recent torque-guard back-off records kept in fixed, zero-allocation storage.
+pub const TORQUE_BACKOFF_DIAG_CAPACITY: usize = 8;
+/// Number of fresh post-trip feedback ticks sampled to measure post-trip position & torque.
+pub const TORQUE_BACKOFF_POST_SAMPLES: u16 = 5;
+
+/// Bounded per-trip back-off measurement record captured in fixed storage on the RT thread
+/// and published off-thread via [`crate::rt_core::publish::StateHub`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TorqueBackoffRecord {
+    pub trip_seq: u64,
+    pub joint: u8,
+    pub since_s: f64,
+    pub sign: f32,
+    pub torque_at_trip_nm: f32,
+    pub threshold_nm: f32,
+    pub anchor_q: f32,
+    pub measured_at_trip_q: f32,
+    /// Backed-off target position requested by `torque_trip` (clamped to joint limits).
+    pub requested_q: f32,
+    /// Wire position actually transmitted for the tripped joint on the first completed TX after the trip.
+    pub transmitted_q: Option<f32>,
+    /// Post-trip measured position observed on subsequent fresh feedback ticks.
+    pub post_trip_measured_q: Option<f32>,
+    /// Post-trip measured torque (N·m) observed on subsequent fresh feedback ticks.
+    pub post_trip_torque_nm: Option<f32>,
+    /// Count of fresh post-trip feedback samples observed (capped at [`TORQUE_BACKOFF_POST_SAMPLES`]).
+    pub post_trip_samples: u16,
+    pub push_in: bool,
+}
+
+/// Fixed-capacity, `Copy`, zero-allocation ring buffer of recent [`TorqueBackoffRecord`]s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TorqueBackoffHistory {
+    records: [Option<TorqueBackoffRecord>; TORQUE_BACKOFF_DIAG_CAPACITY],
+    head: usize,
+    len: usize,
+    pub trips_total: u64,
+}
+
+impl Default for TorqueBackoffHistory {
+    fn default() -> Self {
+        Self {
+            records: [None; TORQUE_BACKOFF_DIAG_CAPACITY],
+            head: 0,
+            len: 0,
+            trips_total: 0,
+        }
+    }
+}
+
+impl TorqueBackoffHistory {
+    #[inline]
+    pub fn push(&mut self, record: TorqueBackoffRecord) {
+        self.records[self.head] = Some(record);
+        self.head = (self.head + 1) % TORQUE_BACKOFF_DIAG_CAPACITY;
+        if self.len < TORQUE_BACKOFF_DIAG_CAPACITY {
+            self.len += 1;
+        }
+        self.trips_total = record.trip_seq;
+    }
+
+    #[inline]
+    pub fn latest(&self) -> Option<&TorqueBackoffRecord> {
+        if self.len == 0 {
+            return None;
+        }
+        let idx = (self.head + TORQUE_BACKOFF_DIAG_CAPACITY - 1) % TORQUE_BACKOFF_DIAG_CAPACITY;
+        self.records[idx].as_ref()
+    }
+
+    #[inline]
+    pub fn latest_mut(&mut self) -> Option<&mut TorqueBackoffRecord> {
+        if self.len == 0 {
+            return None;
+        }
+        let idx = (self.head + TORQUE_BACKOFF_DIAG_CAPACITY - 1) % TORQUE_BACKOFF_DIAG_CAPACITY;
+        self.records[idx].as_mut()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Records the first transmitted wire position for the most recent trip on `joint`.
+    #[inline]
+    pub fn record_transmitted(&mut self, joint: usize, transmitted_q: f32) {
+        if !transmitted_q.is_finite() {
+            return;
+        }
+        if let Some(rec) = self.latest_mut() {
+            if usize::from(rec.joint) == joint && rec.transmitted_q.is_none() {
+                rec.transmitted_q = Some(transmitted_q);
+            }
+        }
+    }
+
+    /// Updates post-trip measured position and torque for the most recent trip up to
+    /// [`TORQUE_BACKOFF_POST_SAMPLES`] fresh feedback ticks.
+    #[inline]
+    pub fn record_post_trip_feedback(&mut self, joint: usize, measured_q: f32, torque_nm: f32) {
+        if let Some(rec) = self.latest_mut() {
+            if usize::from(rec.joint) == joint
+                && rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES
+            {
+                if measured_q.is_finite() {
+                    rec.post_trip_measured_q = Some(measured_q);
+                }
+                if torque_nm.is_finite() {
+                    rec.post_trip_torque_nm = Some(torque_nm);
+                }
+                rec.post_trip_samples = rec.post_trip_samples.saturating_add(1);
+            }
+        }
+    }
+
+    /// Off-thread snapshot for diagnostics JSON publication.
+    pub fn to_diagnostics(&self) -> TorqueBackoffDiagnostics {
+        let mut recent = Vec::with_capacity(self.len);
+        let start = if self.len == TORQUE_BACKOFF_DIAG_CAPACITY {
+            self.head
+        } else {
+            0
+        };
+        for offset in 0..self.len {
+            let idx = (start + offset) % TORQUE_BACKOFF_DIAG_CAPACITY;
+            if let Some(rec) = self.records[idx] {
+                recent.push(rec);
+            }
+        }
+        TorqueBackoffDiagnostics {
+            backoff_rad: TORQUE_HOLD_BACKOFF_RAD,
+            trips_total: self.trips_total,
+            latest: self.latest().copied(),
+            recent,
+        }
+    }
+}
+
+/// Off-thread serializable view of [`TorqueBackoffHistory`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TorqueBackoffDiagnostics {
+    pub backoff_rad: f32,
+    pub trips_total: u64,
+    pub latest: Option<TorqueBackoffRecord>,
+    pub recent: Vec<TorqueBackoffRecord>,
+}
+
 impl TorqueHold {
     /// Relief coordinate of `q`: (q - hold_q) x sign; negative = away from the load.
     pub fn relief(&self, q: f32) -> f32 { (q - self.hold_q) * self.sign }
@@ -189,6 +342,8 @@ pub struct TorqueGuard {
     pub hold: Option<TorqueHold>,
     /// Trips since start (logs).
     pub trips_total: u64,
+    /// Bounded fixed-storage back-off diagnostics captured at trip/TX/post-trip ticks (0 alloc).
+    pub backoff_history: TorqueBackoffHistory,
 }
 
 impl TorqueGuard {
@@ -308,6 +463,20 @@ impl SupervisorInner {
         let settling = self.pending_normal_unload && self.active_trajectory.is_none();
         let watching = operational && !settling && self.driver.is_some() && self.collision.torque_feedback
             && self.feedback_numeric_valid && self.hardware_feedback_fresh(std::time::Duration::from_millis(100));
+        if watching {
+            if let Some(rec) = self.torque_guard.backoff_history.latest() {
+                if rec.post_trip_samples < TORQUE_BACKOFF_POST_SAMPLES {
+                    let j = usize::from(rec.joint);
+                    if let (Some(&q_meas), Some(&tau)) =
+                        (self.measured_positions.get(j), self.torques.get(j))
+                    {
+                        self.torque_guard
+                            .backoff_history
+                            .record_post_trip_feedback(j, q_meas, tau);
+                    }
+                }
+            }
+        }
         let now = self.start_time.elapsed().as_secs_f64();
         let previous_hold = self.torque_guard.hold;
         let had_hold = previous_hold.is_some();
@@ -369,6 +538,23 @@ impl SupervisorInner {
                 self.target_positions[j] = self.commanded_positions[j];
             }
             h.hold_q = self.commanded_positions[j];
+            let rec = TorqueBackoffRecord {
+                trip_seq: self.torque_guard.trips_total,
+                joint: j as u8,
+                since_s: h.since_s,
+                sign: h.sign,
+                torque_at_trip_nm: torque,
+                threshold_nm: threshold,
+                anchor_q: h.anchor_q,
+                measured_at_trip_q: q,
+                requested_q: self.commanded_positions[j],
+                transmitted_q: None,
+                post_trip_measured_q: None,
+                post_trip_torque_nm: None,
+                post_trip_samples: 0,
+                push_in,
+            };
+            self.torque_guard.backoff_history.push(rec);
         }
         // A watchdog park stopped by the guard: the park path loads the held joint (it pushes
         // into the load, or the retreat allowance ended). Hold torque at the backed-off pose
