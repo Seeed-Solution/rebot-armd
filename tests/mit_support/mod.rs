@@ -200,6 +200,8 @@ pub struct FakeBusState {
     pub stall_step: Duration,
     /// The next `n` transmits succeed, then every transmit fails (partial batch).
     pub fail_tx_after: Option<usize>,
+    /// The next `n` transmits succeed, then ONE transmit returns `WouldBlock` and clears.
+    pub fail_tx_once_after: Option<usize>,
     /// Transmits to these command CAN IDs fail.
     pub fail_tx_ids: Vec<u32>,
     /// Transmits to these command CAN IDs report ENOBUFS backpressure.
@@ -469,6 +471,7 @@ impl FakeBus {
             stall_reg_writes: false,
             stall_step: Duration::from_millis(1),
             fail_tx_after: None,
+            fail_tx_once_after: None,
             fail_tx_ids: Vec::new(),
             backpressure_tx_ids: Vec::new(),
             rx_step: Duration::ZERO,
@@ -531,6 +534,13 @@ impl CanTransport for FakeBus {
         if let Some(n) = s.fail_tx_after.as_mut() {
             if *n == 0 { return Err(TransportError::Can("injected transmit error (partial batch)".into())); }
             *n -= 1;
+        }
+        if let Some(n) = s.fail_tx_once_after {
+            if n == 0 {
+                s.fail_tx_once_after = None;
+                return Err(TransportError::WouldBlock);
+            }
+            s.fail_tx_once_after = Some(n - 1);
         }
         if frame.data == damiao::CMD_DISABLE {
             if let Some(h) = s.on_disable.clone() { h(); }

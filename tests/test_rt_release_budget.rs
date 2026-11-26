@@ -569,6 +569,9 @@ async fn dual_owner_parity_under_tight_release_budget() {
             }
         }
 
+        // Detach TX observer before `stop_and_join`, which transitions an energized executor into
+        // SAFE-HOLD (where `stats.steps` stops advancing while SAFE-HOLD runs its own release loop).
+        bus.with(|s| s.on_tx = None);
         let motors_enabled = all_motors_enabled(&bus);
         if let Some(h) = exec {
             tokio::task::spawn_blocking(move || h.stop_and_join())
@@ -603,7 +606,7 @@ async fn dual_owner_parity_under_tight_release_budget() {
 }
 
 #[test]
-fn armed_mit_fence_temporary_release_tx_exhaustion_defers_and_resumes_without_tripping_fence() {
+fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_releases() {
     use armd::driver::{JointMode, JointTarget, TxBatchOutcome};
 
     let clock = MockClock::new();
@@ -636,82 +639,191 @@ fn armed_mit_fence_temporary_release_tx_exhaustion_defers_and_resumes_without_tr
     ];
     drv.set_joint_modes(&modes, &targets)
         .expect("set MIT modes");
-    drv.set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
+    // 41 ms MIT deadline fence at 50 Hz (20 ms releases): even ONE skipped release produces
+    // a 40 ms nominal gap + TX jitter and trips the fence; consecutive skipped releases ALWAYS trip.
+    drv.set_mit_deadline_fence(Some(Duration::from_millis(41)), Duration::from_millis(300));
 
-    // Establish an initial valid MIT batch on release 1 so the fence is actively armed.
+    let mut last_axis_tx: [Option<Instant>; 6] = [None; 6];
+    let mut max_axis_gap: [Duration; 6] = [Duration::ZERO; 6];
+    let record_release_frames = |release_id: u64,
+                                 at: Instant,
+                                 last: &mut [Option<Instant>; 6],
+                                 max_gap: &mut [Duration; 6]| {
+        let seen_mask = bus.with(|s| {
+            let mut mask = 0u8;
+            for f in &s.tx_log {
+                if (1..=6).contains(&f.id) {
+                    mask |= 1u8 << (f.id - 1);
+                }
+            }
+            mask
+        });
+        assert_eq!(
+            seen_mask, 0x3F,
+            "release {release_id}: every armed MIT axis (J1..J6) must receive a continuity frame (mask=0x{seen_mask:02x})"
+        );
+        for axis in 0..6 {
+            if let Some(prev) = last[axis] {
+                let gap = at.saturating_duration_since(prev);
+                if gap > max_gap[axis] {
+                    max_gap[axis] = gap;
+                }
+            }
+            last[axis] = Some(at);
+        }
+    };
+
+    // Release 1 (t = 0 ms): full cap establishes initial armed MIT batch.
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
     let t1 = clock.now();
     drv.begin_control_release(1);
     drv.set_tx_release_deadline(Some(t1 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 16);
     assert_eq!(
         drv.write_joint_targets_bounded(&targets).unwrap(),
         TxBatchOutcome::Complete
     );
     drv.set_tx_release_deadline(None);
     assert!(drv.mit_fence_trip().is_none());
+    record_release_frames(1, t1, &mut last_axis_tx, &mut max_axis_gap);
 
-    // Release 2: temporarily tighten the per-release TX budget below the 6-frame MIT batch size
-    // while driver's own `tx_budget.max_frames` (16) is sufficient -> must defer cleanly on all
-    // three MIT paths without tripping the fence!
-    clock.advance(Duration::from_millis(10));
+    // Consecutive 50 Hz releases (release_id = 2, 3, 4) with tightened ledger caps (3, 0, 2):
+    // watchdog-continuity frames are NEVER deferrable by the ledger. Each release must send
+    // valid holds for all 6 armed axes (plus J7) without tripping the fence, keeping every
+    // per-axis gap <= 40 ms.
+    for (release_id, tight_cap) in [(2u64, 3u16), (3, 0), (4, 2)] {
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.push_all_feedback();
+        });
+        let _ = drv.read_joint_states();
+        let tr = clock.now();
+        drv.begin_control_release(release_id);
+        drv.set_tx_release_deadline(Some(tr + Duration::from_millis(10)));
+        drv.sync_release_budget_limits(64, tight_cap);
+
+        let r_target = drv.write_joint_targets_bounded(&targets).unwrap();
+        assert!(
+            matches!(r_target, TxBatchOutcome::Deferred { pending } if pending >= 6),
+            "release {release_id}: tightened ledger defers motion target while sending holds, got {r_target:?}"
+        );
+        assert!(
+            drv.mit_fence_trip().is_none(),
+            "release {release_id}: tightened ledger must not trip MIT fence: {:?}",
+            drv.mit_fence_trip()
+        );
+        drv.set_tx_release_deadline(None);
+        record_release_frames(release_id, tr, &mut last_axis_tx, &mut max_axis_gap);
+    }
+
+    // Release 5 (t = 80 ms): stopped-hold and measured-hold paths under tightened cap also send
+    // complete continuity holds for all armed axes without tripping the fence.
+    clock.advance(Duration::from_millis(20));
     bus.with(|s| {
         s.tx_log.clear();
         s.push_all_feedback();
     });
-    let t2 = clock.now();
-    drv.begin_control_release(2);
-    drv.set_tx_release_deadline(Some(t2 + Duration::from_millis(10)));
-    drv.sync_release_budget_limits(64, 3);
+    let _ = drv.read_joint_states();
+    let t5 = clock.now();
+    drv.begin_control_release(5);
+    drv.set_tx_release_deadline(Some(t5 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 1);
+    let r_mhold = drv.write_measured_hold_masked(0x7F, &targets).unwrap();
+    assert_eq!(r_mhold.outcome, TxBatchOutcome::Complete);
+    assert!(r_mhold.sent_any);
+    assert!(drv.mit_fence_trip().is_none());
+    drv.set_tx_release_deadline(None);
+    record_release_frames(5, t5, &mut last_axis_tx, &mut max_axis_gap);
 
-    // 1) Target path defers without tripping fence.
-    let r_target = drv.write_joint_targets_bounded(&targets).unwrap();
+    // Release 6 (t = 100 ms): Step 5 skipped -> `service_release_watchdog_fallback` must cover
+    // armed MIT axes in the same release rather than declining while fenced.
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    let _ = drv.read_joint_states();
+    let t6 = clock.now();
+    drv.begin_control_release(6);
+    drv.set_tx_release_deadline(Some(t6 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 0);
+    drv.service_release_watchdog_fallback(0x3F, None);
+    let _ = drv.emit_pos_force_j7(
+        armd::driver::PosForceIntent::hold(armd::driver::PosForceIntentStamp::default()),
+        armd::driver::PosForceIntentStamp::default(),
+    );
+    assert!(drv.mit_fence_trip().is_none());
+    drv.set_tx_release_deadline(None);
+    record_release_frames(6, t6, &mut last_axis_tx, &mut max_axis_gap);
+
+    // Release 7 (t = 120 ms): partial batch mid-send deadline expiry (release deadline expires
+    // after 2 frames) must fall back to holds for the uncovered axes without tripping the fence.
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+        s.tx_step = Duration::from_millis(1);
+    });
+    let _ = drv.read_joint_states();
+    let t7 = clock.now();
+    drv.begin_control_release(7);
+    // 2.5 ms release deadline with 1 ms/frame -> frames 0,1,2 transmit, frame 3 crosses release deadline.
+    drv.set_tx_release_deadline(Some(t7 + Duration::from_micros(2_500)));
+    drv.sync_release_budget_limits(64, 16);
+    let r_partial_dl = drv.write_joint_targets_bounded(&targets).unwrap();
     assert!(
-        matches!(r_target, TxBatchOutcome::Deferred { pending } if pending >= 6),
-        "{r_target:?}"
+        matches!(r_partial_dl, TxBatchOutcome::Deferred { .. }),
+        "partial deadline fallback should report deferred targets while covering all axes: {r_partial_dl:?}"
     );
     assert!(
         drv.mit_fence_trip().is_none(),
-        "temporary ledger exhaustion must not trip MIT fence"
-    );
-
-    // 2) Stopped-hold path defers without tripping fence.
-    let r_hold = drv.write_estop_hold_bounded(&targets).unwrap();
-    assert!(
-        matches!(r_hold, TxBatchOutcome::Deferred { pending } if pending >= 6),
-        "{r_hold:?}"
-    );
-    assert!(
-        drv.mit_fence_trip().is_none(),
-        "temporary ledger exhaustion on stopped hold must not trip MIT fence"
-    );
-
-    // 3) Measured-hold path defers without tripping fence.
-    let r_mhold = drv.write_measured_hold_masked(0x3F, &targets).unwrap();
-    assert!(
-        matches!(r_mhold.outcome, TxBatchOutcome::Deferred { pending } if pending >= 6),
-        "{:?}",
-        r_mhold.outcome
-    );
-    assert!(!r_mhold.sent_any);
-    assert!(
-        drv.mit_fence_trip().is_none(),
-        "temporary ledger exhaustion on measured hold must not trip MIT fence"
-    );
-    assert!(
-        bus.with(|s| s.tx_log.iter().all(|f| f.id == 0x307) && s.tx_log.len() <= 3),
-        "deferred MIT batches must emit 0 MIT arm frames and stay within tx_limit=3: {:?}",
-        bus.with(|s| s.tx_log.clone())
+        "mid-batch release deadline expiry must not leave partial batch or trip fence: {:?}",
+        drv.mit_fence_trip()
     );
     drv.set_tx_release_deadline(None);
+    record_release_frames(7, t7, &mut last_axis_tx, &mut max_axis_gap);
 
-    // Release 3: next eligible release with full TX allowance resumes cleanly!
-    clock.advance(Duration::from_millis(10));
+    // Release 8 (t = 140 ms): transient transport error after first send (axis 3 fails once)
+    // must fall back to holds for uncovered axes without tripping the fence.
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+        s.tx_step = Duration::from_micros(200);
+        s.fail_tx_once_after = Some(2);
+    });
+    let _ = drv.read_joint_states();
+    let t8 = clock.now();
+    drv.begin_control_release(8);
+    drv.set_tx_release_deadline(Some(t8 + Duration::from_millis(10)));
+    drv.sync_release_budget_limits(64, 16);
+    let r_partial_tx = drv.write_joint_targets_bounded(&targets).unwrap();
+    assert!(
+        matches!(r_partial_tx, TxBatchOutcome::Deferred { .. }),
+        "partial transport fallback should report deferred targets while covering all axes: {r_partial_tx:?}"
+    );
+    assert!(
+        drv.mit_fence_trip().is_none(),
+        "mid-batch transient transport error must fall back to holds without tripping fence: {:?}",
+        drv.mit_fence_trip()
+    );
+    drv.set_tx_release_deadline(None);
+    record_release_frames(8, t8, &mut last_axis_tx, &mut max_axis_gap);
+
+    // Release 9 (t = 160 ms): full cap resumes full MIT target batch cleanly.
+    clock.advance(Duration::from_millis(20));
     bus.with(|s| {
         s.tx_log.clear();
         s.push_all_feedback();
     });
-    let t3 = clock.now();
-    drv.begin_control_release(3);
-    drv.set_tx_release_deadline(Some(t3 + Duration::from_millis(10)));
+    let _ = drv.read_joint_states();
+    let t9 = clock.now();
+    drv.begin_control_release(9);
+    drv.set_tx_release_deadline(Some(t9 + Duration::from_millis(10)));
     drv.sync_release_budget_limits(64, 16);
     assert_eq!(
         drv.write_joint_targets_bounded(&targets).unwrap(),
@@ -720,6 +832,16 @@ fn armed_mit_fence_temporary_release_tx_exhaustion_defers_and_resumes_without_tr
     );
     drv.set_tx_release_deadline(None);
     assert!(drv.mit_fence_trip().is_none());
+    record_release_frames(9, t9, &mut last_axis_tx, &mut max_axis_gap);
+
+    for (axis, gap) in max_axis_gap.iter().enumerate() {
+        assert!(
+            *gap <= Duration::from_millis(40),
+            "axis {} exceeded 40 ms watchdog gap: {:?}",
+            axis + 1,
+            gap
+        );
+    }
 }
 
 #[test]
