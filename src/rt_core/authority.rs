@@ -283,8 +283,10 @@ impl SupervisorInner {
         }
     }
 
-    /// Like [`Self::check_operator_requirement`], failing closed when `operator_auth_enforced`
-    /// is enabled and a protected operation passed [`OperatorRequirement::NotRequired`].
+    /// Like [`Self::check_operator_requirement`], preserving protected-operation policy regardless
+    /// of current enforcement state: [`OperatorRequirement::NotRequired`] is normalized to
+    /// `Required(OperatorGrant::unenforced())` so it succeeds only while `operator_auth_enforced`
+    /// is `false` and fails closed with `"OPERATOR_REQUIRED"` whenever enforcement is enabled.
     #[inline]
     pub fn check_protected_operator_requirement(
         &self,
@@ -292,8 +294,8 @@ impl SupervisorInner {
         now: Instant,
     ) -> Result<(), &'static str> {
         let effective = match requirement {
-            OperatorRequirement::NotRequired if self.operator_auth_enforced => {
-                OperatorRequirement::Required(OperatorGrant::DENIED)
+            OperatorRequirement::NotRequired => {
+                OperatorRequirement::Required(OperatorGrant::unenforced())
             }
             other => other,
         };

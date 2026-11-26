@@ -12754,13 +12754,22 @@ impl SupervisorInner {
     pub(crate) fn start_mode_switch_rt(
         &mut self,
         req: crate::rt_core::requests::config::ModeSwitchStartRequest,
-        terminal: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+        mut terminal: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+        retired: &mut crate::rt_core::requests::config::ConfigRetiredPayloads,
         owner_now: Instant,
     ) -> Result<u64, crate::rt_core::requests::config::ConfigError> {
         use crate::rt_core::requests::config::ConfigError;
         use crate::rt_core::session::{
-            admit_internal, admit_routed, PreparedSession, SessionAdmitError, SessionKind,
+            admit_internal, admit_routed_retiring, PreparedSession, SessionAdmitError, SessionKind,
         };
+        let retire_terminal =
+            |term: &mut Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+             ret: &mut crate::rt_core::requests::config::ConfigRetiredPayloads| {
+                if let Some(res) = term.take() {
+                    let (_, handoff) = res.into_parts();
+                    ret.session_terminal_handoff = Some(handoff);
+                }
+            };
         if self.rt_executor_owned && req.client.0 != 0 && terminal.is_none() {
             return Err(ConfigError::CalibPrecondition {
                 status: 409,
@@ -12769,12 +12778,15 @@ impl SupervisorInner {
             });
         }
         if !self.rt_executor_owned && terminal.is_some() {
+            retire_terminal(&mut terminal, retired);
             return Err(ConfigError::OwnerStopped);
         }
         if self.mode_switch.active_session.is_some() {
+            retire_terminal(&mut terminal, retired);
             return Err(ConfigError::Busy("a mode-switch session is already active"));
         }
         if req.plan.validate().is_err() {
+            retire_terminal(&mut terminal, retired);
             return Err(ConfigError::CalibPrecondition {
                 status: 400,
                 code: "INVALID_COMMAND",
@@ -12786,6 +12798,7 @@ impl SupervisorInner {
         if req.plan.max_watchdog_gap
             < period.saturating_add(crate::motor_mode::DEFAULT_HOLD_DELIVERY_MARGIN)
         {
+            retire_terminal(&mut terminal, retired);
             return Err(ConfigError::CalibPrecondition {
                 status: 400,
                 code: "WATCHDOG_GAP_INFEASIBLE",
@@ -12793,32 +12806,44 @@ impl SupervisorInner {
             });
         }
         let cur_epoch = self.safety.epoch_id();
-        let admitted = self.check_admission(req.admission).map_err(|e| match e {
-            SafetyError::StampAlreadyConsumed => ConfigError::StampConsumed,
-            SafetyError::LeaseLost => ConfigError::LeaseLost,
-            SafetyError::Stopped => ConfigError::Stopped,
-            SafetyError::EpochMismatch { .. } => ConfigError::EpochMismatch {
-                current_epoch: cur_epoch,
-            },
-            SafetyError::EStopActive => ConfigError::CalibPrecondition {
-                status: 409,
-                code: "ESTOP_ACTIVE",
-                message: "e-stop active",
-            },
-            _ => ConfigError::CalibPrecondition {
-                status: 409,
-                code: "REJECTED",
-                message: "mode-switch admission rejected",
-            },
-        })?;
+        let admitted = match self.check_admission(req.admission) {
+            Ok(a) => a,
+            Err(e) => {
+                retire_terminal(&mut terminal, retired);
+                return Err(match e {
+                    SafetyError::StampAlreadyConsumed => ConfigError::StampConsumed,
+                    SafetyError::LeaseLost => ConfigError::LeaseLost,
+                    SafetyError::Stopped => ConfigError::Stopped,
+                    SafetyError::EpochMismatch { .. } => ConfigError::EpochMismatch {
+                        current_epoch: cur_epoch,
+                    },
+                    SafetyError::EStopActive => ConfigError::CalibPrecondition {
+                        status: 409,
+                        code: "ESTOP_ACTIVE",
+                        message: "e-stop active",
+                    },
+                    _ => ConfigError::CalibPrecondition {
+                        status: 409,
+                        code: "REJECTED",
+                        message: "mode-switch admission rejected",
+                    },
+                });
+            }
+        };
         let mut prepared = PreparedSession::exclusive(SessionKind::ModeSwitch, req.client);
         prepared.deadline = Some(req.deadline);
         prepared.timeout_code = "TIMEOUT";
         prepared.operator = req.operator;
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
-        let admit_res = match terminal {
-            Some(reservation) => admit_routed(admitted, prepared, reservation, owner_now),
+        let admit_res = match terminal.take() {
+            Some(reservation) => admit_routed_retiring(
+                admitted,
+                prepared,
+                reservation,
+                &mut retired.session_terminal_handoff,
+                owner_now,
+            ),
             None => admit_internal(admitted, prepared, owner_now),
         };
         let sid = admit_res.map_err(|err| match err {
@@ -12840,6 +12865,10 @@ impl SupervisorInner {
                 code: "NO_DESTINATION",
                 message: "invalid or missing mode-switch terminal reservation",
             },
+            SessionAdmitError::ReservationCancelled => ConfigError::Busy("CANCELLED"),
+            SessionAdmitError::AuthorityRejected("CONNECTION_CLOSED") => {
+                ConfigError::ConnectionClosed
+            }
             SessionAdmitError::AuthorityRejected("LEASE_LOST") => ConfigError::LeaseLost,
             SessionAdmitError::AuthorityRejected("EPOCH_MISMATCH") => ConfigError::EpochMismatch {
                 current_epoch: self.safety.epoch_id(),
@@ -16518,6 +16547,16 @@ impl ArmSupervisor {
                 self.published_config.publish(snap, gen);
                 return;
             }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.owner_mode() == OWNER_EXECUTOR {
+            let _ = self
+                .dispatch_config_request_reliable(|| {
+                    crate::rt_core::requests::config::ConfigRequest::SetOperatorAuthEnforced(
+                        enforced,
+                    )
+                })
+                .await;
         }
         self.published_config
             .update(|cfg| cfg.operator_auth_enforced = enforced);

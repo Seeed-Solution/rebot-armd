@@ -198,6 +198,7 @@ pub enum SessionAdmitError {
     DeadlineExpired,
     InvalidSlotKind,
     InvalidReservation,
+    ReservationCancelled,
     AuthorityRejected(&'static str),
 }
 
@@ -209,6 +210,7 @@ impl SessionAdmitError {
             Self::DeadlineExpired => "DEADLINE_EXPIRED",
             Self::InvalidSlotKind => "INVALID_COMMAND",
             Self::InvalidReservation => "NO_DESTINATION",
+            Self::ReservationCancelled => "CANCELLED",
         }
     }
 
@@ -486,6 +488,25 @@ impl SessionDriver {
         now: Instant,
         reject_expired_at_admit: bool,
     ) -> Result<SessionId, SessionAdmitError> {
+        self.admit_with_authority_handoff(
+            prepared,
+            authority,
+            terminal,
+            None,
+            now,
+            reject_expired_at_admit,
+        )
+    }
+
+    pub(crate) fn admit_with_authority_handoff(
+        &mut self,
+        prepared: PreparedSession,
+        authority: SessionAuthority,
+        terminal: SessionTerminalBinding,
+        handoff: Option<&super::reply_router::SessionTerminalHandoff>,
+        now: Instant,
+        reject_expired_at_admit: bool,
+    ) -> Result<SessionId, SessionAdmitError> {
         let invalid = (prepared.slot == SessionSlot::Recorder && prepared.kind != SessionKind::Recorder)
             || (prepared.slot == SessionSlot::ExclusiveOutput && prepared.kind == SessionKind::Recorder);
         if invalid { return Err(SessionAdmitError::InvalidSlotKind); }
@@ -512,6 +533,13 @@ impl SessionDriver {
                 || prepared.child_deadline.is_some_and(|dl| now >= dl))
         {
             return Err(SessionAdmitError::DeadlineExpired);
+        }
+        // Single atomic ownership-handoff barrier: executed strictly AFTER every admission
+        // precondition succeeds and strictly BEFORE making the session slot live.
+        if let Some(h) = handoff {
+            if !h.try_claim_admitted() {
+                return Err(SessionAdmitError::ReservationCancelled);
+            }
         }
         let id = SessionId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -856,8 +884,8 @@ impl SessionDriver {
 /// Admits a routed session by consuming a verified A1 [`Admitted`] token and a move-only
 /// [`super::reply_router::SessionTerminalReservation`] obtained before enqueue.
 ///
-/// Validates authority, deadlines, slot occupancy, and exclusive output conflicts BEFORE binding
-/// the reservation and making the slot live.
+/// Validates authority, deadlines, slot occupancy, and exclusive output conflicts BEFORE atomically
+/// claiming the reservation handoff (`PENDING -> ADMITTED`) and making the slot live.
 pub fn admit_routed(
     admitted: Admitted<'_>,
     prepared: PreparedSession,
@@ -865,7 +893,21 @@ pub fn admit_routed(
     now: Instant,
 ) -> Result<SessionId, SessionAdmitError> {
     let (inner, proof) = admitted.consume().map_err(SessionAdmitError::from_safety)?;
-    inner.admit_routed_with_proof(prepared, reservation, &proof, now)
+    inner.admit_routed_with_proof(prepared, reservation, &proof, None, now)
+}
+
+/// RT-safe variant of [`admit_routed`] that parks the reservation's atomic handoff token in
+/// `retired_handoff` so `armd-control` executes 0 heap frees even if the dispatcher dropped its
+/// guard concurrently.
+pub(crate) fn admit_routed_retiring(
+    admitted: Admitted<'_>,
+    prepared: PreparedSession,
+    reservation: super::reply_router::SessionTerminalReservation,
+    retired_handoff: &mut Option<super::reply_router::SessionTerminalHandoff>,
+    now: Instant,
+) -> Result<SessionId, SessionAdmitError> {
+    let (inner, proof) = admitted.consume().map_err(SessionAdmitError::from_safety)?;
+    inner.admit_routed_with_proof(prepared, reservation, &proof, Some(retired_handoff), now)
 }
 
 /// Admits an explicit internal session (autonomous cleanup, recorder, Legacy polling-only session,
@@ -891,16 +933,21 @@ impl SupervisorInner {
         prepared: PreparedSession,
         reservation: super::reply_router::SessionTerminalReservation,
         proof: &AdmittedProof,
+        retired_handoff: Option<&mut Option<super::reply_router::SessionTerminalHandoff>>,
         now: Instant,
     ) -> Result<SessionId, SessionAdmitError> {
-        let ticket = reservation.into_ticket();
+        let (ticket, handoff) = reservation.into_parts();
         let terminal = SessionTerminalBinding::Routed {
             request: ticket.request(),
             route_gen: ticket.route_gen(),
             client: ticket.client(),
             action_id: ticket.action_id(),
         };
-        self.admit_session_inner(prepared, terminal, proof, now)
+        let res = self.admit_session_inner(prepared, terminal, Some(&handoff), proof, now);
+        if let Some(slot) = retired_handoff {
+            *slot = Some(handoff);
+        }
+        res
     }
 
     pub(crate) fn admit_internal_with_proof(
@@ -909,13 +956,14 @@ impl SupervisorInner {
         proof: &AdmittedProof,
         now: Instant,
     ) -> Result<SessionId, SessionAdmitError> {
-        self.admit_session_inner(prepared, SessionTerminalBinding::Internal, proof, now)
+        self.admit_session_inner(prepared, SessionTerminalBinding::Internal, None, proof, now)
     }
 
     fn admit_session_inner(
         &mut self,
         prepared: PreparedSession,
         terminal: SessionTerminalBinding,
+        handoff: Option<&super::reply_router::SessionTerminalHandoff>,
         proof: &AdmittedProof,
         now: Instant,
     ) -> Result<SessionId, SessionAdmitError> {
@@ -925,15 +973,18 @@ impl SupervisorInner {
             }
         }
         let stamp = proof.stamp();
+        // Preserve protected-operation policy independently of current enforcement state:
+        // normalizing `NotRequired` -> `Required(OperatorGrant::unenforced())` admits while
+        // `operator_auth_enforced == false` and automatically fails closed both at admission and
+        // on every live step/TX check if enforcement is enabled later.
         let operator = if prepared.slot == SessionSlot::ExclusiveOutput
             && !matches!(
                 prepared.kind,
                 SessionKind::GripperZeroCheck | SessionKind::MacroBacked
             )
-            && self.operator_auth_enforced
             && matches!(prepared.operator, crate::auth::OperatorRequirement::NotRequired)
         {
-            crate::auth::OperatorRequirement::Required(crate::auth::OperatorGrant::DENIED)
+            crate::auth::OperatorRequirement::Required(crate::auth::OperatorGrant::unenforced())
         } else {
             prepared.operator
         };
@@ -948,6 +999,11 @@ impl SupervisorInner {
             revoke_on_stop: prepared.revoke_on_stop,
             revoke_on_epoch_change: prepared.revoke_on_epoch_change,
         };
+        if let SessionTerminalBinding::Routed { client, .. } = terminal {
+            if self.is_connection_closed(client.0) {
+                return Err(SessionAdmitError::AuthorityRejected("CONNECTION_CLOSED"));
+            }
+        }
         if authority.require_lease
             && !self.is_session_lease_valid_at(authority.connection_id, authority.lease_generation, now)
         {
@@ -958,7 +1014,7 @@ impl SupervisorInner {
         }
         let id = self
             .sessions
-            .admit_with_authority(prepared, authority, terminal, now, true)?;
+            .admit_with_authority_handoff(prepared, authority, terminal, handoff, now, true)?;
         if prepared.slot == SessionSlot::ExclusiveOutput && prepared.kind != SessionKind::MacroBacked {
             self.release_servo_target();
             self.servo_stream_active = false;

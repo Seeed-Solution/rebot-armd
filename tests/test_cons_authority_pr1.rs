@@ -1364,3 +1364,220 @@ async fn routed_session_admission_terminal_credit_invariants_and_slot_reuse() {
     assert_eq!(h.sup.inner().control_thread_attempts(), 0);
     h.shutdown(false).await;
 }
+
+/// R1 Major 1 regression test: atomic handoff protocol prevents cancellation/admission races
+/// both BEFORE owner admission (cancel prevents admission, credit released immediately, 0 RT
+/// alloc/free) and AFTER owner admission before `commit_transferred()` (guard drop preserves
+/// live session's route & credit until terminal delivery, blocking premature capacity reuse).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_reservation_cancellation_before_and_after_owner_admission() {
+    let h = DualOwnerRig::start_damiao(OwnerKind::Executor, true, false, false).await;
+    let exec = h.exec.as_ref().unwrap();
+    let delivered = h.register_routed_client(910, 1).unwrap();
+    let plan = ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap();
+
+    // Case A: Caller cancels AFTER staging/enqueueing and BEFORE the owner processes the request.
+    // Dropping the guard transitions PENDING -> CANCELLED and immediately releases the credit.
+    // When the already-queued request reaches the owner, admission MUST fail closed (`CANCELLED`),
+    // leave the slot idle, perform 0 RT allocs/frees, and keep credits at exact 0.
+    let mut guard_pre = exec
+        .reserve_session_terminal(
+            ClientId(910),
+            ActionId(301),
+            ExternalDestinationPolicy::ConnectionOnly,
+        )
+        .unwrap();
+    let staged_pre = guard_pre.stage_for_admission().unwrap();
+    assert_eq!(exec.router_global_reserved(), 1);
+    assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(1));
+    drop(guard_pre);
+    assert_eq!(exec.router_global_reserved(), 0);
+    assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(0));
+
+    let pre_rep = h
+        .sup
+        .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(
+            ModeSwitchStartRequest {
+                plan,
+                admission: h.sup.capture_admission_stamp(),
+                operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
+                deadline: Instant::now() + Duration::from_secs(2),
+                client: ClientId(910),
+            },
+            Some(staged_pre),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        pre_rep,
+        ConfigReply::ModeSwitchStarted(Err(ConfigError::Busy("CANCELLED")))
+    ));
+    assert_eq!(exec.router_global_reserved(), 0);
+    assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(0));
+    assert_eq!(delivered.lock().unwrap().len(), 0);
+
+    // Case B: Caller cancels AFTER the owner commits admission (`PENDING -> ADMITTED`) and BEFORE
+    // `commit_transferred()` runs on the caller side.
+    // Dropping the guard MUST NOT release the credit or delete the live route; cap=1 capacity
+    // remains occupied until the live session finishes and delivers its 1 terminal.
+    h.bus.as_ref().unwrap().with(|s| s.motors[6].silent = true);
+    let mut slow_plan = plan;
+    slow_plan.per_axis_timeout = Duration::from_secs(3);
+
+    let mut guard_post = exec
+        .reserve_session_terminal(
+            ClientId(910),
+            ActionId(302),
+            ExternalDestinationPolicy::ConnectionOnly,
+        )
+        .unwrap();
+    let staged_post = guard_post.stage_for_admission().unwrap();
+    let sid = match h
+        .sup
+        .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(
+            ModeSwitchStartRequest {
+                plan: slow_plan,
+                admission: h.sup.capture_admission_stamp(),
+                operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
+                deadline: Instant::now() + Duration::from_secs(4),
+                client: ClientId(910),
+            },
+            Some(staged_post),
+        ))
+        .await
+        .unwrap()
+    {
+        ConfigReply::ModeSwitchStarted(Ok(id)) => id,
+        ConfigReply::ModeSwitchStarted(Err(e)) => panic!("expected Ok admission, got {e:?}"),
+        _ => panic!("unexpected reply"),
+    };
+    // Simulate future cancellation before `commit_transferred()`!
+    assert!(!guard_post.release_now(), "admitted handoff must block guard release");
+    drop(guard_post);
+    assert_eq!(exec.router_global_reserved(), 1);
+    assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(1));
+
+    // Capacity (cap=1) MUST NOT be reusable while the admitted session is still live.
+    let err_full = h
+        .sup
+        .start_mode_switch_session(ModeSwitchStartRequest {
+            plan,
+            admission: h.sup.capture_admission_stamp(),
+            operator: OperatorRequirement::Required(OperatorGrant::unenforced()),
+            deadline: Instant::now() + Duration::from_secs(2),
+            client: ClientId(910),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err_full, ConfigError::Busy("REPLIES_FULL")), "{err_full:?}");
+    assert_eq!(exec.router_global_reserved(), 1);
+
+    // Unmute J7 and deliver its pending CTRL_MODE read reply so the live session completes
+    // (`Confirmed`) and delivers its 1 routed terminal cleanly.
+    h.bus.as_ref().unwrap().with(|s| {
+        s.motors[6].silent = false;
+        let [lo, hi] = s.motors[6].id.to_le_bytes();
+        let val = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+        let reply = armd::transport::CanFrame::new_standard(
+            s.motors[6].reply_id,
+            &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, val[0], val[1], val[2], val[3]],
+        )
+        .unwrap();
+        s.rx.push_back(reply);
+    });
+    let dl = Instant::now() + Duration::from_secs(2);
+    let snap = loop {
+        if let Some(s) = h.sup.poll_mode_switch_session(sid).await.unwrap() {
+            if !s.running {
+                break s;
+            }
+        }
+        assert!(Instant::now() < dl, "live session did not complete");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(snap.progress, ModeProgress::Confirmed);
+    let dl = Instant::now() + Duration::from_secs(2);
+    while delivered.lock().unwrap().is_empty() || exec.router_global_reserved() != 0 {
+        let _ = exec.pump_broker_replies();
+        assert!(Instant::now() < dl, "routed terminal delivery or credit release timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert_eq!(exec.router_global_reserved(), 0);
+    assert_eq!(exec.router_connection_reserved(ClientId(910)), Some(0));
+    assert_eq!(exec.stats().total_allocs(), AllocCounts::ZERO);
+    assert_eq!(h.sup.inner().control_thread_attempts(), 0);
+    h.shutdown(false).await;
+}
+
+/// R1 Major 2 regression test: a protected `ModeSwitch` admitted with `OperatorRequirement::NotRequired`
+/// while operator auth enforcement is disabled MUST fail closed and revoke immediately on BOTH
+/// `Legacy` and `Executor` if operator auth enforcement is enabled while the session is live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_owner_enabling_operator_auth_mid_not_required_mode_switch_revokes() {
+    let mut outcomes = Vec::new();
+    for owner in [OwnerKind::Legacy, OwnerKind::Executor] {
+        let h = DualOwnerRig::start_damiao(owner, true, false, false).await;
+        let _sink = h.register_routed_client(520, 4);
+        // Keep J7 silent so the ModeSwitch session stays live after admission.
+        h.bus.as_ref().unwrap().with(|s| s.motors[6].silent = true);
+        let mut plan = ModeSwitchPlan::confirm_gripper(6, ControlMode::PositionForce).unwrap();
+        plan.per_axis_timeout = Duration::from_secs(3);
+
+        // Admit protected ModeSwitch with `NotRequired` while enforcement is disabled -> succeeds.
+        let sid = h
+            .sup
+            .start_mode_switch_session(ModeSwitchStartRequest {
+                plan,
+                admission: h.sup.capture_admission_stamp(),
+                operator: OperatorRequirement::NotRequired,
+                deadline: Instant::now() + Duration::from_secs(4),
+                client: ClientId(520),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            h.sup.poll_mode_switch_session(sid).await.unwrap().unwrap().running,
+            "{owner:?}: session should still be running while enforcement is off"
+        );
+
+        // Enable operator auth enforcement while the session is live!
+        h.sup.set_operator_auth_enforced(true).await;
+
+        let dl = Instant::now() + Duration::from_secs(2);
+        let snap = loop {
+            if let Some(s) = h.sup.poll_mode_switch_session(sid).await.unwrap() {
+                if !s.running {
+                    break s;
+                }
+            }
+            assert!(
+                Instant::now() < dl,
+                "{owner:?}: enabling operator auth enforcement mid-session MUST revoke NotRequired ModeSwitch"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(
+            snap.progress,
+            ModeProgress::StoppedRecovered {
+                reason: ModeSwitchFailure::Revoked
+            },
+            "{owner:?}: expected revocation on enforcement enable, got {:?}",
+            snap.progress
+        );
+        if let Some(exec) = h.exec.as_ref() {
+            let dl = Instant::now() + Duration::from_secs(2);
+            while exec.router_global_reserved() != 0 {
+                let _ = exec.pump_broker_replies();
+                assert!(Instant::now() < dl);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(exec.stats().total_allocs(), AllocCounts::ZERO);
+            assert_eq!(h.sup.inner().control_thread_attempts(), 0);
+        }
+        outcomes.push(snap.progress);
+        h.shutdown(false).await;
+    }
+    assert_eq!(outcomes[0], outcomes[1], "Legacy and Executor enforcement-toggle revocation parity");
+}

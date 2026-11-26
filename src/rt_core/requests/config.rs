@@ -1529,6 +1529,8 @@ pub enum ConfigRequest {
         expected_txn_id: u64,
         operator_grant: crate::auth::OperatorGrant,
     },
+    /// Updates `SupervisorInner::operator_auth_enforced` on the active owner (0 alloc, 0 lock).
+    SetOperatorAuthEnforced(bool),
 }
 
 impl ConfigRequest {
@@ -1562,6 +1564,7 @@ impl ConfigRequest {
             Self::InstallSequenceRunPins(_) | Self::ClearSequenceRunPins { .. } => {
                 "/api/v1/action/run_sequence"
             }
+            Self::SetOperatorAuthEnforced(_) => "/api/v1/auth/enforced",
         }
     }
 }
@@ -1595,6 +1598,7 @@ pub enum ConfigReply {
     ModeSwitchCancelled(Option<crate::motor_mode::ModeSwitchSnapshot>),
     ModeSwitchCleared(bool),
     IntermediateCalibrationCommitted(Result<(Reservation, u64), ConfigError>),
+    OperatorAuthEnforced(bool),
 }
 
 /// Inline, `Copy`, zero-allocation request to admit a PR0C `ModeSwitch` session on the active owner.
@@ -1633,6 +1637,7 @@ pub struct ConfigRetiredPayloads {
     pub(crate) tracking: crate::tracking::TrackingRetiredBuffers,
     pub gravity_comp_policy: Option<crate::model::GravityCompPolicy>,
     pub unused_candidate: Option<ConfigCandidate>,
+    pub session_terminal_handoff: Option<crate::rt_core::reply_router::SessionTerminalHandoff>,
 }
 
 /// Single heap allocation carrying a config request into `armd-control` and its reply +
@@ -1801,13 +1806,22 @@ pub(crate) fn handle_config_exchange(
             force_reconcile,
         )),
         ConfigRequest::StartModeSwitch(req, terminal) => {
-            ConfigReply::ModeSwitchStarted(core.start_mode_switch_rt(req, terminal, ctx.now))
+            ConfigReply::ModeSwitchStarted(core.start_mode_switch_rt(
+                req,
+                terminal,
+                &mut ex.retired,
+                ctx.now,
+            ))
         }
         ConfigRequest::CancelModeSwitch { session_id, reason } => {
             ConfigReply::ModeSwitchCancelled(core.cancel_mode_switch_rt(session_id, reason))
         }
         ConfigRequest::ClearModeSwitch { session_id } => {
             ConfigReply::ModeSwitchCleared(core.clear_mode_switch_rt(session_id))
+        }
+        ConfigRequest::SetOperatorAuthEnforced(enforced) => {
+            core.operator_auth_enforced = enforced;
+            ConfigReply::OperatorAuthEnforced(enforced)
         }
         ConfigRequest::CommitIntermediateCalibration {
             mut reservation,
