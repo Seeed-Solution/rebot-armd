@@ -2140,7 +2140,9 @@ impl ReleaseEngine {
     /// without waiting for optional-work margins.
     pub fn has_pending_urgent<O: CoreOps>(&self, core: &O) -> bool {
         self.stop.current() != self.stop.applied()
+            || self.urgent_stops.as_ref().is_some_and(UrgentStopIntake::has_pending_requests)
             || self.has_pending_urgent_stop_replies()
+            || self.conn_lifecycle.as_ref().is_some_and(super::requests::lease::ConnLifecycleIntake::has_pending_requests)
             || self.has_pending_lifecycle_replies()
             || core.has_pending_urgent()
     }
@@ -2837,7 +2839,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
         // - Watchdog-required holds (`urgent_wake`) and pending stop/E-stop/disconnect work remain
         //   eligible up to `urgent_cutoff` (never deferred by optional-work margins).
         let period = Duration::from_secs_f64(self.dt);
-        let wake_margin = crate::driver::OPTIONAL_WORK_RELEASE_MARGIN.min(period / 2);
+        let wake_margin = crate::driver::OPTIONAL_WAKE_RELEASE_MARGIN.min(period / 2);
         let optional_cutoff = release_deadline.checked_sub(wake_margin).unwrap_or(started);
         let urgent_cutoff = release_deadline
             .checked_sub(crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN)

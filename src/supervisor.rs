@@ -11684,6 +11684,7 @@ impl SupervisorInner {
             && !disconnect_fenced_mid_tick
             && !self.urgent_stop_unapplied()
             && !output_tx_cap_expired
+            && !matches!(tick_output, TickOutput::ActionDeadlineRefused { .. })
             && self.stopped_hold_eligible()
             && (self.is_torqued || is_stopped_or_failed_hold_fb || pending_disable_hold_fb)
         {
@@ -11691,19 +11692,12 @@ impl SupervisorInner {
             let use_owner_hold_targets = is_stopped_or_failed_hold_fb || pending_disable_hold_fb;
             let mut owner_hold_targets = [None; crate::rt_core::mailbox::MAX_DOF];
             let authorized_mask = if use_owner_hold_targets {
-                let mut mask = 0u64;
+                let mask = self.measured_hold.owner_hold_mask;
                 for j in 0..dof {
-                    if let Some(pos) = self.measured_hold.captured_positions[j] {
-                        if pos.is_finite()
-                            && !matches!(
-                                self.measured_hold.joint_status[j],
-                                crate::driver::JointHoldStatus::UnheldNoFreshFeedback
-                                    | crate::driver::JointHoldStatus::UnheldNoVerifiedMode
-                                    | crate::driver::JointHoldStatus::SkippedOff
-                            )
-                        {
+                    if (mask & (1u64 << j)) != 0 {
+                        let pos = self.measured_hold.owner_hold_targets[j];
+                        if pos.is_finite() {
                             owner_hold_targets[j] = Some(pos);
-                            mask |= 1u64 << j;
                         }
                     }
                 }

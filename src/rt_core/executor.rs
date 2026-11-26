@@ -9873,8 +9873,10 @@ fn control_thread_main_inner(
                     );
                     let shadow_flush_ns = now_ns_fn().saturating_sub(shadow_t0_ns);
 
+                    let optional_wake_margin = crate::driver::OPTIONAL_WAKE_RELEASE_MARGIN
+                        .min(Duration::from_nanos(release_period_ns / 2));
                     let optional_wake_cutoff = release_deadline
-                        .checked_sub(optional_margin)
+                        .checked_sub(optional_wake_margin)
                         .unwrap_or(release_start);
                     let urgent_wake_cutoff = release_deadline
                         .checked_sub(crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN)

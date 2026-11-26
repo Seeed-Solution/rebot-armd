@@ -1969,6 +1969,10 @@ impl ConnLifecycleIntake {
         mutated
     }
 
+    pub fn has_pending_requests(&self) -> bool {
+        !self.req_rx.is_empty()
+    }
+
     pub fn has_pending_replies(&self) -> bool {
         !self.pending.is_empty()
     }
