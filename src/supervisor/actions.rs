@@ -762,16 +762,27 @@ impl SupervisorInner {
     ///
     /// Combined ONCE per tick with the control-release deadline (`effective_cutoff = min(...)`)
     /// and installed at the driver TX choke point.
-    pub(crate) fn active_action_deadline(&self) -> Option<Instant> {
-        let m = self.macro_run.as_ref()?;
-        if m.stop_requested || m.finishing {
-            return None;
-        }
-        let child_dl = (m.sub == SubState::Running).then_some(m.child.deadline).flatten();
-        match (m.deadline, child_dl) {
-            (Some(p), Some(c)) => Some(p.min(c)),
-            (Some(p), None) => Some(p),
-            (None, Some(c)) => Some(c),
+    pub fn active_action_deadline(&self) -> Option<Instant> {
+        let macro_dl = self.macro_run.as_ref().and_then(|m| {
+            if m.stop_requested || m.finishing {
+                return None;
+            }
+            let child_dl = (m.sub == SubState::Running).then_some(m.child.deadline).flatten();
+            match (m.deadline, child_dl) {
+                (Some(p), Some(c)) => Some(p.min(c)),
+                (Some(p), None) => Some(p),
+                (None, Some(c)) => Some(c),
+                (None, None) => None,
+            }
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        let session_dl = self.sessions.earliest_output_deadline();
+        #[cfg(target_arch = "wasm32")]
+        let session_dl: Option<Instant> = None;
+        match (macro_dl, session_dl) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
             (None, None) => None,
         }
     }

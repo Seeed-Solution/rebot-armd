@@ -1531,8 +1531,12 @@ pub fn install_lease_preempt(
     }
     if old_gen != 0 {
         #[cfg(not(target_arch = "wasm32"))]
-        if evicted.is_some() {
+        if let Some((ev_handle, _)) = evicted {
             inner.cancel_active_commissioning_on_stop("LEASE_LOST");
+            let _ = inner.sessions.revoke_for_connection(
+                ev_handle.id(),
+                crate::rt_core::session::SessionTerminalReason::Revoked("LEASE_LOST"),
+            );
         }
         inner.fence_displaced_lease_generation(old_gen, needs_stop);
     } else if needs_stop {
@@ -1602,7 +1606,13 @@ pub fn install_lease_release(
         );
     }
     #[cfg(not(target_arch = "wasm32"))]
-    inner.cancel_active_commissioning_on_stop("LEASE_LOST");
+    {
+        inner.cancel_active_commissioning_on_stop("LEASE_LOST");
+        let _ = inner.sessions.revoke_for_connection(
+            req.connection.id(),
+            crate::rt_core::session::SessionTerminalReason::Revoked("LEASE_LOST"),
+        );
+    }
     // Fence and stop active motion when valid OR when this release first observes expiry while
     // no autonomous watchdog park is active (preserving any running watchdog park explicitly).
     let stop_client_motion = valid
@@ -1651,8 +1661,19 @@ pub fn install_lease_disconnect(
     });
 
     #[cfg(not(target_arch = "wasm32"))]
-    if matches_owner.is_some() {
-        inner.cancel_active_commissioning_on_stop("LEASE_LOST");
+    {
+        if matches_owner.is_some() {
+            inner.cancel_active_commissioning_on_stop("LEASE_LOST");
+        }
+        let reason = if matches_owner.is_some() {
+            "LEASE_LOST"
+        } else {
+            "DISCONNECTED"
+        };
+        let _ = inner.sessions.revoke_for_connection(
+            req.connection.id(),
+            crate::rt_core::session::SessionTerminalReason::Revoked(reason),
+        );
     }
     let Some((gen, valid)) = matches_owner else {
         return LeaseOutcome::Disconnected {

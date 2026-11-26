@@ -43,6 +43,12 @@ use crate::supervisor::{
     AdmissionStamp, Admitted, ArmError, ArmSupervisor, GripperBaselineCmd, HeldObject,
     JointGoalSnapshot, PreparedQuintic, SupervisorInner, OWNER_EXECUTOR,
 };
+pub use crate::rt_core::session::{
+    admit_session, ActiveSession, PhaseStepOutcome, PreparedSession, ReleaseCtx, SessionAdmitError,
+    SessionAuthority, SessionDriver, SessionDriverStats, SessionId, SessionKind, SessionOutcome,
+    SessionSlot, SessionState, SessionStep, SessionTerminalReason, SessionTerminalRecord,
+    WorkerReply, WorkerReplyError, WorkerTicket,
+};
 use crate::trajectory::TrajectoryPlanner;
 
 /// Default prepare-to-install deadline window when a caller does not supply an explicit deadline.
@@ -906,6 +912,12 @@ fn check_action_authority_ex(
     }
     if !is_stop_finish && inner.core.motion_inhibited_by_config() {
         return Err(ActionRefusal::new("CONFIG_BUSY"));
+    }
+    if !is_stop_finish {
+        let parent_id = (stamp.parent_generation != 0).then_some(ActionId(stamp.parent_generation));
+        if inner.sessions.blocks_ordinary_output(parent_id) {
+            return Err(ActionRefusal::new("MOTION_BUSY"));
+        }
     }
     if !is_stop_finish && ctx.require_rt_feedback && !inner.commit_feedback_valid() {
         return Err(ActionRefusal::new("FEEDBACK_STALE"));

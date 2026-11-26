@@ -642,6 +642,8 @@ pub fn verify_slot_authority(
 
 fn check_common_blockers(inner: &SupervisorInner) -> Result<(), MotionInstallError> {
     if inner.calibration_busy || !inner.can_replace_active_trajectory() || inner.gravity_comp.is_some() { return Err(MotionInstallError::MotionBusy); }
+    #[cfg(not(target_arch = "wasm32"))]
+    if inner.sessions.blocks_ordinary_output(None) { return Err(MotionInstallError::MotionBusy); }
     if inner.core.motion_inhibited_by_config() { return Err(MotionInstallError::ConfigBusy); }
     if inner.collision.hold.is_some() { return Err(MotionInstallError::CollisionHold); }
     if inner.handover_settling_since.is_some() { return Err(MotionInstallError::HandoverSettling); }
@@ -996,6 +998,7 @@ pub fn install_watchdog_park(
     if !inner.is_torqued || inner.pending_rearm || inner.disable_pending || inner.torque_transition.is_some()
         || inner.mit_active() || inner.handover_settling_since.is_some() || inner.collision.hold.is_some()
         || inner.core.motion_inhibited_by_config() || inner.calibration_busy
+        || inner.sessions.blocks_ordinary_output(None)
     {
         return Err(MotionInstallError::MotionBusy);
     }

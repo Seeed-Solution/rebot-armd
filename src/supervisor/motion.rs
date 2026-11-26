@@ -442,7 +442,7 @@ impl SupervisorInner {
                 StopPolicy::EStopLatch => "ESTOP_ACTIVE",
                 _ => "STOPPED",
             };
-            self.cancel_active_commissioning_on_stop(reason);
+            self.revoke_sessions_on_stop(reason);
         }
         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
         if self.policy_load_reservation.take().is_some() {

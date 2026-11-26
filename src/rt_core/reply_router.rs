@@ -383,9 +383,37 @@ enum ExternalRouteState {
     },
 }
 
+/// Disjoint high-bit namespace for P-F1 session terminal credits allocated directly by
+/// [`ActionReplyRouter`] (never collides with ascending `Broker` `RequestId`s).
+pub const SESSION_REQUEST_ID_BIT: u64 = 1u64 << 63;
+
+/// Generation-tagged reservation ticket proving 1 P-F1 terminal credit was reserved for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTerminalTicket {
+    pub request: RequestId,
+    pub client: ClientId,
+    pub action_id: ActionId,
+    route_gen: u64,
+}
+
+/// Result of attempting to emit a session terminal through [`ActionReplyRouter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTerminalEmit {
+    /// Terminal accepted and queued on the bound destination (retaining its 1 reserved credit).
+    Enqueued,
+    /// Destination closed/detached before delivery; credit recovered.
+    Abandoned,
+    /// Route was already consumed by an earlier terminal (duplicate suppressed, 0 credit leak).
+    DuplicateSuppressed,
+    /// Supplied ticket/record did not match the active route identity; rejected fail-closed.
+    IdentityMismatch,
+}
+
 struct ExternalActionRoute {
     client: ClientId,
     target: ReplyTarget,
+    /// Strictly monotonic route generation validating direct session ticket emit/rollback.
+    route_gen: u64,
     /// Single-owner credit flag: true iff this route currently owns 1 reservation credit
     /// in `global_reserved` (and in `slot.reserved` when `target` is `Connection`).
     reserved_held: bool,
@@ -704,6 +732,10 @@ pub(crate) struct ActionReplyRouter {
     client_to_slot: HashMap<ClientId, usize>,
     /// Strictly monotonic generation assigned to every registered `ConnSlot`.
     next_slot_gen: u64,
+    /// Strictly monotonic sequence for router-allocated session `RequestId`s (`SESSION_REQUEST_ID_BIT | seq`).
+    next_session_req: u64,
+    /// Strictly monotonic generation assigned to every inserted `ExternalActionRoute`.
+    next_route_gen: u64,
     /// Round-robin cursor across `slots` so no single backpressured connection starves others.
     rr_cursor: usize,
     /// Bounded compact durable set of closed `ClientId`s (prevents re-admission via
@@ -749,6 +781,8 @@ impl ActionReplyRouter {
             slots,
             client_to_slot: HashMap::with_capacity(MAX_LIVE_CONNECTIONS),
             next_slot_gen: 0,
+            next_session_req: 0,
+            next_route_gen: 0,
             rr_cursor: 0,
             closed_clients: ClosedClients::default(),
             global_sink: None,
@@ -855,6 +889,10 @@ impl ActionReplyRouter {
             .map(|s| s.pending.len())
             .sum();
         slot_pending + self.global_pending.len() + self.unrouted_external.len()
+    }
+
+    pub(crate) fn global_reserved(&self) -> usize {
+        self.global_reserved
     }
 
     /// Registers a per-connection reply sink in a free fixed slot with a strictly monotonic
@@ -1157,11 +1195,14 @@ impl ActionReplyRouter {
                 slot.reserved += 1;
             }
         }
+        self.next_route_gen = self.next_route_gen.wrapping_add(1).max(1);
+        let route_gen = self.next_route_gen;
         self.external_routes.insert(
             request,
             ExternalActionRoute {
                 client,
                 target,
+                route_gen,
                 reserved_held: true,
                 state: ExternalRouteState::AwaitingAck {
                     ack_tx: Some(ack_tx),
@@ -1170,6 +1211,167 @@ impl ActionReplyRouter {
                 },
             },
         );
+    }
+
+    fn alloc_session_request_id(&mut self) -> RequestId {
+        self.next_session_req = self.next_session_req.wrapping_add(1).max(1);
+        RequestId(SESSION_REQUEST_ID_BIT | (self.next_session_req & !SESSION_REQUEST_ID_BIT))
+    }
+
+    /// Reserves 1 bounded P-F1 terminal credit for a direct/no-wire-ACK session (whose ACK is
+    /// already committed or unnecessary, e.g. non-WS session lifecycle flows). Allocates a
+    /// collision-free `RequestId` from `SESSION_REQUEST_ID_BIT` and binds `(request, client,
+    /// action_id, route_gen)` in `AckCommitted`.
+    pub(crate) fn reserve_session_terminal_direct(
+        &mut self,
+        client: ClientId,
+        action_id: ActionId,
+        policy: ExternalDestinationPolicy,
+    ) -> Result<SessionTerminalTicket, ExternalSubmitError> {
+        let target = self.check_external_admission(client, policy)?;
+        let request = self.alloc_session_request_id();
+        self.next_route_gen = self.next_route_gen.wrapping_add(1).max(1);
+        let route_gen = self.next_route_gen;
+        self.global_reserved += 1;
+        if let ReplyTarget::Connection {
+            slot_idx,
+            slot_gen,
+            ..
+        } = target
+        {
+            if let Some(slot) = self.slots[slot_idx].as_mut() {
+                debug_assert_eq!(slot.slot_gen, slot_gen);
+                slot.reserved += 1;
+            }
+        }
+        self.external_routes.insert(
+            request,
+            ExternalActionRoute {
+                client,
+                target,
+                route_gen,
+                reserved_held: true,
+                state: ExternalRouteState::AckCommitted { action_id },
+            },
+        );
+        Ok(SessionTerminalTicket {
+            request,
+            client,
+            action_id,
+            route_gen,
+        })
+    }
+
+    /// Reserves 1 bounded P-F1 terminal credit for an ACK-bearing session, preserving the full
+    /// `AwaitingAck -> (AwaitingAckCommit ->) AckCommitted` wire-ACK barrier.
+    #[allow(dead_code)]
+    pub(crate) fn reserve_session_terminal_with_ack(
+        &mut self,
+        client: ClientId,
+        action_id: ActionId,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+    ) -> Result<(SessionTerminalTicket, oneshot::Receiver<Result<Reply, OwnerError>>), ExternalSubmitError>
+    {
+        let target = self.check_external_admission(client, policy)?;
+        let request = self.alloc_session_request_id();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.commit_external_route(
+            request,
+            client,
+            target,
+            ack_tx,
+            require_ack_commit,
+            wire_tracker,
+        );
+        let route_gen = self
+            .external_routes
+            .get(&request)
+            .map_or(0, |r| r.route_gen);
+        Ok((
+            SessionTerminalTicket {
+                request,
+                client,
+                action_id,
+                route_gen,
+            },
+            ack_rx,
+        ))
+    }
+
+    /// Releases a reserved session terminal credit on admission rollback (exact `(request, client,
+    /// route_gen)` match required; idempotent after consumption or close).
+    pub(crate) fn release_session_terminal(&mut self, ticket: &SessionTerminalTicket) -> bool {
+        let matches = self.external_routes.get(&ticket.request).is_some_and(|r| {
+            r.client == ticket.client && r.route_gen == ticket.route_gen
+        });
+        if !matches {
+            return false;
+        }
+        if let Some(mut route) = self.external_routes.remove(&ticket.request) {
+            if route.reserved_held {
+                route.reserved_held = false;
+                self.release_target_credit(route.target);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Emits a terminal for a validated [`SessionTerminalTicket`]. First call consumes the route
+    /// and enqueues `Reply::Terminal` using the reserved credit; duplicate calls are suppressed
+    /// without double delivery or credit leaks.
+    pub(crate) fn emit_session_terminal(
+        &mut self,
+        ticket: &SessionTerminalTicket,
+        outcome: super::broker::Outcome,
+        children: u32,
+    ) -> SessionTerminalEmit {
+        let Some(route) = self.external_routes.get(&ticket.request) else {
+            self.protocol_anomalies += 1;
+            return SessionTerminalEmit::DuplicateSuppressed;
+        };
+        if route.client != ticket.client || route.route_gen != ticket.route_gen {
+            self.mapping_mismatches += 1;
+            return SessionTerminalEmit::IdentityMismatch;
+        }
+        let reply = Reply::Terminal {
+            request: ticket.request,
+            action: ticket.action_id,
+            outcome,
+            children,
+        };
+        match self.route_broker_reply(ticket.client, reply) {
+            DeliveryDecision::Delivered => SessionTerminalEmit::Enqueued,
+            DeliveryDecision::Abandoned | DeliveryDecision::Backpressured => {
+                SessionTerminalEmit::Abandoned
+            }
+        }
+    }
+
+    /// Routes an RT-emitted [`super::session::SessionTerminalRecord`] drained from the bounded
+    /// SPSC terminal ring into the reserved P-F1 route (suppressing duplicates cleanly).
+    pub(crate) fn route_session_terminal_record(
+        &mut self,
+        rec: super::session::SessionTerminalRecord,
+    ) -> SessionTerminalEmit {
+        if !self.external_routes.contains_key(&rec.request) {
+            self.protocol_anomalies += 1;
+            return SessionTerminalEmit::DuplicateSuppressed;
+        }
+        let reply = Reply::Terminal {
+            request: rec.request,
+            action: rec.action_id,
+            outcome: rec.outcome.reason.to_broker_outcome(),
+            children: 0,
+        };
+        match self.route_broker_reply(rec.client, reply) {
+            DeliveryDecision::Delivered => SessionTerminalEmit::Enqueued,
+            DeliveryDecision::Abandoned | DeliveryDecision::Backpressured => {
+                SessionTerminalEmit::Abandoned
+            }
+        }
     }
 
     /// Releases 1 reservation credit held by `target` (only decrementing `slot.reserved` if
