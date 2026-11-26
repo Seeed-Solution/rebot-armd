@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -470,21 +469,58 @@ impl DetectorDefaults {
     }
 }
 
-/// Single-view depth measurements (`POST /api/v1/grasp/measure`) in flight: they trigger the
-/// detector, so a switch waits until they are done.
-static MEASURES: AtomicUsize = AtomicUsize::new(0);
+/// Single-view depth measurements (`POST /api/v1/grasp/measure`) and detector kind switches
+/// (`POST /api/v1/vision/detector`) share the vision provider and mutually exclude each other
+/// through a single non-blocking state gate (never held across `.await`).
+#[derive(Default)]
+struct VisionUseState {
+    measures: usize,
+    switching: bool,
+}
 
-/// Held by a running depth measurement ([`measure_in_flight`]).
+static VISION_USE: Mutex<VisionUseState> = Mutex::new(VisionUseState {
+    measures: 0,
+    switching: false,
+});
+
+/// Held by a running depth measurement ([`measure_in_flight`] / [`try_begin_measure`]).
 pub struct MeasureGuard(());
 
 impl Drop for MeasureGuard {
-    fn drop(&mut self) { MEASURES.fetch_sub(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+        st.measures = st.measures.saturating_sub(1);
+    }
+}
+
+struct SwitchGuard(());
+
+impl Drop for SwitchGuard {
+    fn drop(&mut self) {
+        let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+        st.switching = false;
+    }
 }
 
 /// Marks a depth measurement as running until the guard is dropped.
 pub fn measure_in_flight() -> MeasureGuard {
-    MEASURES.fetch_add(1, Ordering::SeqCst);
+    let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+    st.measures = st.measures.saturating_add(1);
     MeasureGuard(())
+}
+
+/// Atomically registers an in-flight depth measurement if no detector model switch is active,
+/// refusing with `409 VISION_BUSY` if a switch holds the provider.
+pub fn try_begin_measure() -> Result<MeasureGuard, ArmError> {
+    let _probe = crate::grasp::MODEL_SWITCH
+        .try_lock()
+        .map_err(|_| busy("a model switch is in progress"))?;
+    let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+    if st.switching {
+        return Err(busy("a model switch is in progress"));
+    }
+    st.measures = st.measures.saturating_add(1);
+    Ok(MeasureGuard(()))
 }
 
 /// Why an action of `kind` in `state` blocks a switch (None: it does not).
@@ -526,14 +562,41 @@ pub fn parse_kind(body: &Value) -> Result<&'static str, ArmError> {
 /// `{kind, model, changed, generation}`.
 pub async fn switch(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
     let kind = parse_kind(body)?;
-    let defaults = supervisor.inner().read().await.config.vision_detectors.clone().unwrap_or_default();
-    if let Some(a) = supervisor.hub().latest().and_then(|s| s.obs.action.as_ref().and_then(|a| busy_action(&a.kind, &a.state))) {
+    let svc = supervisor
+        .read_services(crate::rt_core::publish::ReadRequirements {
+            require_prep_env: true,
+            ..crate::rt_core::publish::ReadRequirements::default()
+        })
+        .await?;
+    let defaults = svc
+        .prep_env
+        .as_ref()
+        .and_then(|env| env.config.vision_detectors.clone())
+        .unwrap_or_default();
+    if let Some(a) = svc
+        .snapshot
+        .obs
+        .action
+        .as_ref()
+        .and_then(|a| busy_action(&a.kind, &a.state))
+    {
         return Err(busy(a));
     }
-    if MEASURES.load(Ordering::SeqCst) > 0 { return Err(busy("a depth measurement is running")); }
-    // one model change at a time (grasp task preflights take the same lock)
+    // Acquire MODEL_SWITCH first, then check VISION_USE so a concurrent `depth_measure` cannot
+    // race past admission into provider I/O.
     let Ok(_serial) = crate::grasp::MODEL_SWITCH.try_lock() else {
         return Err(busy("another model switch is in progress"));
+    };
+    let _switch_guard = {
+        let mut st = VISION_USE.lock().unwrap_or_else(|e| e.into_inner());
+        if st.measures > 0 {
+            return Err(busy("a depth measurement is running"));
+        }
+        if st.switching {
+            return Err(busy("another model switch is in progress"));
+        }
+        st.switching = true;
+        SwitchGuard(())
     };
     let unreachable = |e: String| rejected(503, "DETECTION_UNAVAILABLE", format!("Cannot reach the vision service ({e}). Check that the camera app (rebot-vision) is running, then try again."));
     let mode = source.mode_info().await.map_err(unreachable)?;

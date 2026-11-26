@@ -1064,15 +1064,15 @@ async fn run(
     persist(&dir, &job).await;
 }
 
-/// Live arm state for a reconnecting client (from published snapshot on `OWNER_EXECUTOR`).
+/// Live arm state for a reconnecting client (from a coherent `ServiceSnapshot`).
 fn arm_state_from_snapshot(snap: &crate::rt_core::publish::Snapshot) -> Value {
     json!({
         "is_torqued": snap.obs.is_torqued,
         "safety_state": snap.obs.safety_state,
         "fault": snap.obs.fault,
-        "watchdog_park": snap.obs.action.as_ref().is_some_and(|a| a.kind == "park" && a.is_running()),
+        "watchdog_park": snap.rt.owner.watchdog_park_active,
         "pending_normal_unload": snap.rt.owner.pending_normal_unload,
-        "lease_held": snap.rt.owner.authority.lease_generation != 0,
+        "lease_held": snap.rt.owner.active_lease_present,
         "at": now(),
     })
 }
@@ -1090,17 +1090,15 @@ fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
 
 /// `GET /api/v1/calibration/hover`: `{jobs: [{id, state, code, created_at, updated_at, points, done}], arm}`.
 pub async fn get_jobs(axum::extract::State(sup): axum::extract::State<Arc<ArmSupervisor>>) -> Response {
-    let (all_jobs, arm) = if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
-        let jobs = sup.hover_jobs_snapshot().await;
-        let arm = sup
-            .hub()
-            .latest()
-            .map_or(Value::Null, |s| arm_state_from_snapshot(&s));
-        (jobs, arm)
-    } else {
-        let inner = sup.inner().read().await;
-        (inner.hover_jobs.clone(), arm_state(&inner))
+    let svc = match sup
+        .read_services(crate::rt_core::publish::ReadRequirements::default())
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return crate::api::rest::ApiError::from(e).into_response(),
     };
+    let all_jobs = sup.hover_jobs_snapshot().await;
+    let arm = arm_state_from_snapshot(&svc.snapshot);
     let jobs: Vec<Value> = all_jobs.iter().rev().map(|j| json!({"id": j.id, "state": j.state, "code": j.code, "created_at": j.created_at,
         "updated_at": j.updated_at, "candidate_fingerprint": j.candidate_fingerprint, "points": j.points.len(),
         "done": j.points.iter().filter(|p| p.state == "done").count()})).collect();
@@ -1111,17 +1109,19 @@ pub async fn get_jobs(axum::extract::State(sup): axum::extract::State<Arc<ArmSup
 pub async fn get_job(axum::extract::State(sup): axum::extract::State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::calibration::CalibrationDeps>, UrlPath(id): UrlPath<String>) -> Response {
     if !valid_job_id(&id) { return err(StatusCode::BAD_REQUEST, "INVALID", "invalid job id"); }
-    let (job, arm) = if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
-        let jobs = sup.hover_jobs_snapshot().await;
-        let arm = sup
-            .hub()
-            .latest()
-            .map_or(Value::Null, |s| arm_state_from_snapshot(&s));
-        (jobs.into_iter().find(|j| j.id == id), arm)
-    } else {
-        let inner = sup.inner().read().await;
-        (inner.hover_jobs.iter().find(|j| j.id == id).cloned(), arm_state(&inner))
+    let svc = match sup
+        .read_services(crate::rt_core::publish::ReadRequirements::default())
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return crate::api::rest::ApiError::from(e).into_response(),
     };
+    let arm = arm_state_from_snapshot(&svc.snapshot);
+    let job = sup
+        .hover_jobs_snapshot()
+        .await
+        .into_iter()
+        .find(|j| j.id == id);
     let job = match job {
         Some(j) => serde_json::to_value(j).unwrap_or_default(),
         None => {

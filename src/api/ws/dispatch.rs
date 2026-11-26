@@ -558,6 +558,8 @@ pub(super) enum ExecutorWsRoute {
     Motion,
     /// Direct dispatch to `actions::handle_executor_ws_action`.
     Action,
+    /// Direct dispatch to lease-free off-RT handler (`DispatchHandler::LeaseFree`).
+    LeaseFree,
     /// Direct dispatch to `policy::handle_executor_ws_policy`.
     #[cfg(feature = "policy-runtime")]
     Policy,
@@ -746,7 +748,14 @@ fn validate_entry(entry: &DispatchEntry) {
             assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);
             assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::CommandDeferred, "{:?}", entry.key);
-            assert_eq!(entry.executor_route, ExecutorWsRoute::None, "{:?}", entry.key);
+            assert!(
+                matches!(
+                    entry.executor_route,
+                    ExecutorWsRoute::None | ExecutorWsRoute::LeaseFree
+                ),
+                "LeaseFree handler must use None (LegacyOnly) or LeaseFree executor route: {:?}",
+                entry.key
+            );
         }
         DispatchHandler::Owner(_) => {
             assert!(

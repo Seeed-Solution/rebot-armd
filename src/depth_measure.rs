@@ -9,14 +9,15 @@
 //! written; the reply adds the fit's residuals and the calibration in effect so an evaluation
 //! can tell which calibration a number came from.
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
 use crate::grasp::{self, CamModel, DetectionFrame, DetectionSource, GraspSetup};
 use crate::kinematics::{self, Pose};
 use crate::motion::MotionError;
-use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
+use crate::rt_core::publish::{ReadRequirements, ServiceReadError, ServiceSnapshot};
+use crate::supervisor::{ArmError, ArmSupervisor};
 
 /// Path of the REST route and the WS command.
 pub const PATH: &str = "/api/v1/grasp/measure";
@@ -27,6 +28,10 @@ const MOVED_RAD: f64 = 1e-3;
 /// Relative depth error of a table sample that counts as an inlier (the RANSAC criterion of
 /// `fit_oblique_ransac`).
 const INLIER_REL: f64 = 0.08;
+/// Maximum allowed hardware feedback age for driver-backed captures (matches `feedback_valid`).
+const MAX_FEEDBACK_AGE: Duration = Duration::from_millis(250);
+/// Bounded wait for a causally post-capture published snapshot on a ticking owner.
+const POST_CAPTURE_WAIT: Duration = Duration::from_millis(250);
 
 const YOLO_DEPTH: &[&str] = &["yolo", "depth"];
 const DEPTH_ONLY: &[&str] = &["depth"];
@@ -84,7 +89,7 @@ pub fn parse_request(body: &Value) -> Result<MeasureRequest, ArmError> {
     Ok(MeasureRequest { label, min_score, pipelines })
 }
 
-/// What the measurement needs from the supervisor, taken under the read lock.
+/// What the measurement needs from the supervisor, taken from a coherent [`ServiceSnapshot`].
 struct Snapshot {
     setup: GraspSetup,
     cam: CamModel,
@@ -96,34 +101,81 @@ struct Snapshot {
     calibration: Value,
 }
 
-/// `ARM_MOVING` when a trajectory or servo stream runs or a joint (J1..J6) is faster than
-/// [`MAX_JOINT_SPEED`].
-fn check_still(inner: &SupervisorInner) -> Result<(), ArmError> {
-    let arm_dof = inner.config.arm_dof();
-    if inner.active_trajectory.is_some() || inner.servo_target.is_some() {
-        return Err(rejected(409, "ARM_MOVING", "A motion is running; measure at rest"));
+/// For driver-backed arms, enforce live feedback validity and freshness (no-driver mock arms
+/// do not stamp hardware RX instants).
+fn check_driver_feedback(svc: &ServiceSnapshot, now: Instant) -> Result<(), ArmError> {
+    let Some(env) = svc.prep_env.as_ref() else {
+        return Err(ArmError::from(ServiceReadError::PrepEnvUnavailable));
+    };
+    if !env.driver_present {
+        return Ok(());
     }
-    if let Some((i, v)) = inner.measured_velocities.iter().take(arm_dof).enumerate().find(|(_, v)| f64::from(v.abs()) > MAX_JOINT_SPEED) {
-        return Err(rejected(409, "ARM_MOVING", format!("Joint {} moves at {:.3} rad/s (limit {MAX_JOINT_SPEED})", i + 1, v.abs())));
+    if !svc.feedback_valid {
+        return Err(ArmError::from(ServiceReadError::FeedbackInvalid));
+    }
+    let arm_dof = svc.identity.arm_dof;
+    if arm_dof == 0 || svc.snapshot.rt.feedback_instants.len() < arm_dof {
+        return Err(ArmError::from(ServiceReadError::FeedbackStale { joint: 0 }));
+    }
+    for (joint, slot) in svc.snapshot.rt.feedback_instants[..arm_dof].iter().enumerate() {
+        let Some(rx) = *slot else {
+            return Err(ArmError::from(ServiceReadError::FeedbackStale { joint }));
+        };
+        if now.saturating_duration_since(rx) > MAX_FEEDBACK_AGE {
+            return Err(ArmError::from(ServiceReadError::FeedbackStale { joint }));
+        }
     }
     Ok(())
 }
 
-fn snapshot(inner: &SupervisorInner) -> Result<Snapshot, ArmError> {
-    let Some(setup) = inner.grasp_setup() else {
+/// `ARM_MOVING` when a trajectory or servo stream runs or a joint (J1..J6) is faster than
+/// [`MAX_JOINT_SPEED`] (or has non-finite measured velocity).
+fn check_still(svc: &ServiceSnapshot) -> Result<(), ArmError> {
+    let arm_dof = svc.identity.arm_dof;
+    if svc.motion_active {
+        return Err(rejected(409, "ARM_MOVING", "A motion is running; measure at rest"));
+    }
+    if let Some((i, v)) = svc
+        .snapshot
+        .rt
+        .velocities
+        .iter()
+        .take(arm_dof)
+        .enumerate()
+        .find(|(_, v)| !v.is_finite() || f64::from(v.abs()) > MAX_JOINT_SPEED)
+    {
+        return Err(rejected(
+            409,
+            "ARM_MOVING",
+            format!("Joint {} moves at {:.3} rad/s (limit {MAX_JOINT_SPEED})", i + 1, v.abs()),
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_from_service(svc: &ServiceSnapshot) -> Result<Snapshot, ArmError> {
+    let env = svc
+        .prep_env
+        .as_ref()
+        .ok_or_else(|| ArmError::from(ServiceReadError::PrepEnvUnavailable))?;
+    let Some(setup) = env.grasp_setup.clone() else {
         return Err(MotionError::Unsupported("Depth measurement needs a profile with kinematics, a gripper policy and a grasp setup".into()).into());
     };
-    check_still(inner)?;
-    let arm = &inner.config.arm_model;
-    let cam = CamModel::assumed(arm, &setup, &inner.config.camera_mount);
-    let pose = arm.fk_f32(&inner.commanded_positions).ok_or_else(|| ArmError::Internal("no FK pose for the commanded positions".into()))?;
+    check_driver_feedback(svc, Instant::now())?;
+    check_still(svc)?;
+    let arm = &env.config.arm_model;
+    let cam = CamModel::assumed(arm, &setup, &env.config.camera_mount);
+    let pose = arm
+        .fk_f32(&svc.snapshot.rt.commanded_positions)
+        .ok_or_else(|| ArmError::Internal("no FK pose for the commanded positions".into()))?;
     Ok(Snapshot {
-        cam, pose,
-        tcp_offset: inner.config.tcp_offset,
-        commanded: inner.commanded_positions.clone(),
-        measured: inner.measured_positions.clone(),
-        lens_known: inner.config.camera_mount.offset_m.is_some(),
-        calibration: fingerprint(inner, &setup),
+        cam,
+        pose,
+        tcp_offset: env.config.tcp_offset,
+        commanded: svc.snapshot.rt.commanded_positions.clone(),
+        measured: svc.snapshot.rt.positions.clone(),
+        lens_known: env.config.camera_mount.offset_m.is_some(),
+        calibration: fingerprint(svc, &setup),
         setup,
     })
 }
@@ -138,22 +190,26 @@ fn fnv64(v: &Value) -> String {
 /// The calibration a measurement used: the stored file's identity (`solved_at`, intrinsics and
 /// their hash, stale), the live camera mount, the grasp setup's intrinsics and table, the
 /// kinematic correction and its model level (`kinematics.fit.level`).
-fn fingerprint(inner: &SupervisorInner, setup: &GraspSetup) -> Value {
-    let file = inner.calibration.as_ref();
+fn fingerprint(svc: &ServiceSnapshot, setup: &GraspSetup) -> Value {
+    let env = svc
+        .prep_env
+        .as_ref()
+        .expect("fingerprint requires ActionPrepEnv");
+    let file = env.calibration.as_ref();
     let intrinsics = file.and_then(|c| c.intrinsics.clone());
     let kin = file.and_then(|c| c.kinematics.as_ref());
     json!({
-        "calibrated": inner.camera_calibrated(),
+        "calibrated": env.camera_calibrated,
         "solved_at": file.and_then(|c| c.solved_at.clone()),
         "stale": file.and_then(|c| c.stale.as_ref()).map(|s| json!({"reason": s.reason, "at": s.at})),
         "intrinsics_hash": intrinsics.as_ref().map(fnv64),
         "intrinsics": intrinsics,
-        "camera_mount": crate::calibration::mount_summary(&inner.config.camera_mount),
+        "camera_mount": crate::calibration::mount_summary(&env.config.camera_mount),
         "grasp": crate::calibration::grasp_fields(setup),
         "table_z_m": setup.table_z_m,
-        "kinematics_corrected": inner.config.arm_model.correction().is_some(),
+        "kinematics_corrected": env.config.arm_model.correction().is_some(),
         "kinematics_level": kin.and_then(|k| k.fit.as_ref()).and_then(|f| f.get("level")).cloned(),
-        "calibration_revision": inner.calibration_revision,
+        "calibration_revision": svc.revisions.calibration,
         // CamModel is a pinhole: k1 / k2 of the stored intrinsics are not applied to the samples
         "distortion_modelled": false,
     })
@@ -280,13 +336,63 @@ fn reply(snap: &Snapshot, req: &MeasureRequest, frame: &DetectionFrame) -> Value
     })
 }
 
+async fn read_post_capture_service(
+    supervisor: &Arc<ArmSupervisor>,
+    svc0: &ServiceSnapshot,
+    capture_done_at: Instant,
+) -> Result<Arc<ServiceSnapshot>, ArmError> {
+    let base_req = ReadRequirements {
+        require_within_valid_until: true,
+        require_prep_env: true,
+        ..ReadRequirements::default()
+    };
+    if svc0.publish_seq == 0 && supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+        // No-ticker legacy owner: read_services synthesizes a fresh snapshot directly under the
+        // supervisor read lock at `Instant::now() >= capture_done_at`.
+        return supervisor.read_services(base_req).await;
+    }
+    let deadline = Instant::now() + POST_CAPTURE_WAIT;
+    let mut want_seq = svc0.publish_seq.saturating_add(1);
+    loop {
+        let req = ReadRequirements {
+            min_publish_seq: Some(want_seq),
+            ..base_req
+        };
+        match supervisor.read_services(req).await {
+            Ok(svc1) => {
+                if svc1.captured_at >= capture_done_at {
+                    return Ok(svc1);
+                }
+                want_seq = svc1.publish_seq.saturating_add(1);
+            }
+            Err(ArmError::Rejected { status: 503, ref code, .. })
+                if code == "OBSERVATION_UNAVAILABLE" && Instant::now() < deadline => {}
+            Err(e) => return Err(e),
+        }
+        if Instant::now() >= deadline {
+            return Err(ArmError::from(ServiceReadError::SequenceNotReached {
+                required: want_seq,
+                actual: supervisor.hub().published_seq(),
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 /// One measurement: refuse when the arm moves, trigger the request's pipelines once, refuse when
-/// the commanded positions changed meanwhile, then fit and measure. No lease, no motion.
+/// the commanded positions or calibration changed meanwhile, then fit and measure. No lease, no motion.
 pub async fn measure(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> Result<Value, ArmError> {
     let req = parse_request(body)?;
-    // the detector stays as it is until the measurement is done (`POST /api/v1/vision/detector`)
-    let _in_flight = crate::vision_detector::measure_in_flight();
-    let snap = snapshot(&*supervisor.inner().read().await)?;
+    // Mutually exclude detector switches (`POST /api/v1/vision/detector`) for the full capture.
+    let _in_flight = crate::vision_detector::try_begin_measure()?;
+    let svc0 = supervisor
+        .read_services(ReadRequirements {
+            require_within_valid_until: true,
+            require_prep_env: true,
+            ..ReadRequirements::default()
+        })
+        .await?;
+    let snap = snapshot_from_service(&svc0)?;
     match source.per_request_pipelines().await {
         Ok(true) => {}
         Ok(false) => return Err(rejected(422, "UNSUPPORTED", "The vision provider does not take per-request pipelines (perception API 2)")),
@@ -297,11 +403,32 @@ pub async fn measure(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSour
         Ok(None) => return Err(rejected(504, "DETECTION_UNAVAILABLE", "The vision provider returned no frame")),
         Err(e) => return Err(rejected(503, "DETECTION_UNAVAILABLE", format!("Trigger failed: {e}"))),
     };
+    let capture_done_at = Instant::now();
+    let svc1 = read_post_capture_service(supervisor, &svc0, capture_done_at).await?;
+    check_driver_feedback(&svc1, Instant::now())?;
+    check_still(&svc1)?;
+    if svc1.boot != svc0.boot
+        || svc1.revisions.calibration != svc0.revisions.calibration
+        || svc1.revisions.grasp_setup != svc0.revisions.grasp_setup
+        || svc1.revisions.tool_digest_hash != svc0.revisions.tool_digest_hash
     {
-        let inner = supervisor.inner().read().await;
-        check_still(&inner)?;
-        let moved = inner.commanded_positions.iter().zip(&snap.commanded).take(inner.config.arm_dof()).any(|(a, b)| f64::from((a - b).abs()) > MOVED_RAD);
-        if moved { return Err(rejected(409, "ARM_MOVING", "The arm moved during the capture")); }
+        return Err(rejected(
+            409,
+            "SNAPSHOT_STALE",
+            "Arm calibration or configuration changed during the capture",
+        ));
+    }
+    let moved = svc1.motion_generation != svc0.motion_generation
+        || svc1
+            .snapshot
+            .rt
+            .commanded_positions
+            .iter()
+            .zip(&snap.commanded)
+            .take(svc1.identity.arm_dof)
+            .any(|(a, b)| f64::from((a - b).abs()) > MOVED_RAD);
+    if moved {
+        return Err(rejected(409, "ARM_MOVING", "The arm moved during the capture"));
     }
     grasp::rescale_frame_to_cam(&mut frame, &snap.cam);
     Ok(reply(&snap, &req, &frame))

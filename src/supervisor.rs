@@ -6768,6 +6768,8 @@ impl SupervisorInner {
             policy_busy,
             zero_check_persisting: self.zero_check_persisting.is_some(),
             torque_or_power_hold: self.torque_guard.hold.is_some() || self.power.gov.hold.is_some(),
+            watchdog_park_active: self.watchdog_park.is_some(),
+            active_lease_present: self.active_lease.is_some(),
             held,
             macro_state,
         }
@@ -13865,41 +13867,66 @@ impl ArmSupervisor {
     }
 
     /// Owner-aware storage of a `calib_hover` job record (never touches `SupervisorLock` in
-    /// `OWNER_EXECUTOR` mode).
+    /// `OWNER_EXECUTOR` mode, and re-checks detachment if a handoff lands while waiting on the
+    /// legacy write lock).
     pub async fn put_hover_job(&self, job: crate::calib_hover::HoverJob) {
         if self.owner_mode() == OWNER_EXECUTOR {
-            let mut jobs = self
-                .executor_hover_jobs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            jobs.retain(|j| j.id != job.id);
-            jobs.push(job);
-            let n = jobs.len();
-            if n > crate::calib_hover::KEEP_JOBS {
-                jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+            self.put_executor_hover_job(job);
+            return;
+        }
+        let mut inner = self.inner().write().await;
+        if inner.detached {
+            drop(inner);
+            if self.owner_mode() == OWNER_EXECUTOR {
+                self.put_executor_hover_job(job);
             }
-        } else {
-            let mut inner = self.inner().write().await;
-            inner.hover_jobs.retain(|j| j.id != job.id);
-            inner.hover_jobs.push(job);
-            let n = inner.hover_jobs.len();
-            if n > crate::calib_hover::KEEP_JOBS {
-                inner.hover_jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
-            }
+            return;
+        }
+        inner.hover_jobs.retain(|j| j.id != job.id);
+        inner.hover_jobs.push(job);
+        let n = inner.hover_jobs.len();
+        if n > crate::calib_hover::KEEP_JOBS {
+            inner.hover_jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+        }
+    }
+
+    fn put_executor_hover_job(&self, job: crate::calib_hover::HoverJob) {
+        let mut jobs = self
+            .executor_hover_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|j| j.id != job.id);
+        jobs.push(job);
+        let n = jobs.len();
+        if n > crate::calib_hover::KEEP_JOBS {
+            jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
         }
     }
 
     /// Owner-aware snapshot of stored `calib_hover` jobs (never touches `SupervisorLock` in
-    /// `OWNER_EXECUTOR` mode).
+    /// `OWNER_EXECUTOR` mode, and re-checks detachment if a handoff lands while waiting on the
+    /// legacy read lock).
     pub async fn hover_jobs_snapshot(&self) -> Vec<crate::calib_hover::HoverJob> {
         if self.owner_mode() == OWNER_EXECUTOR {
-            self.executor_hover_jobs
+            return self
+                .executor_hover_jobs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        } else {
-            self.inner().read().await.hover_jobs.clone()
+                .clone();
         }
+        let inner = self.inner().read().await;
+        if inner.detached {
+            drop(inner);
+            if self.owner_mode() == OWNER_EXECUTOR {
+                return self
+                    .executor_hover_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+            }
+            return Vec::new();
+        }
+        inner.hover_jobs.clone()
     }
 
     /// Current live `SequenceStore::revision` mirror used to linearize episode deletes against
@@ -14267,6 +14294,7 @@ impl ArmSupervisor {
 
         let initial_gen = self.inner.generation();
         let candidate_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&guard);
+        let staged_hover_jobs = guard.hover_jobs.clone();
         let staged_service_identity = Arc::new(
             crate::rt_core::publish::ServiceIdentity::from_published_config(
                 guard.core.id(),
@@ -14417,6 +14445,10 @@ impl ArmSupervisor {
                     crate::rt_core::sched::set_readiness(readiness);
                 }
                 self.published_config.publish(candidate_pub_cfg, initial_gen);
+                *self
+                    .executor_hover_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = staged_hover_jobs;
                 *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
                 self.executor_base_gen.store(initial_gen, Ordering::Release);
                 {

@@ -285,6 +285,8 @@ pub struct PublishedOwnerMeta {
     pub policy_busy: bool,
     pub zero_check_persisting: bool,
     pub torque_or_power_hold: bool,
+    pub watchdog_park_active: bool,
+    pub active_lease_present: bool,
     pub held: Option<PublishedHeld>,
     pub macro_state: PublishedMacroState,
 }
@@ -319,6 +321,8 @@ impl Default for PublishedOwnerMeta {
             policy_busy: false,
             zero_check_persisting: false,
             torque_or_power_hold: false,
+            watchdog_park_active: false,
+            active_lease_present: false,
             held: None,
             macro_state: PublishedMacroState::default(),
         }

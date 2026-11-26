@@ -2252,6 +2252,8 @@ pub(crate) async fn run_motor_executor_with_guard(
                                             sup_w.hub().update_service_identity_from_config(&cfg);
                                             if let Some(cur) = sup_w.hub().prep_env() {
                                                 let mut next = (*cur).clone();
+                                                next.grasp_setup = cfg.grasp_setup();
+                                                next.calibration = cfg.calibration.clone();
                                                 next.camera_calibrated = cfg.camera_calibrated();
                                                 next.calibration_revision = cfg.calibration_revision;
                                                 sup_w.hub().update_prep_env(Arc::new(next));
