@@ -251,6 +251,115 @@ impl Default for PublishedMacroState {
     }
 }
 
+/// Compact `Copy` projection of [`crate::motor_mode::ModeProgress`] without `Option<Instant>`
+/// for publication in [`PublishedOwnerMeta`] (3 bytes vs 32 bytes).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishedModeProgress {
+    Pending,
+    Confirmed,
+    RolledBack {
+        failed_joint: u8,
+        reason: crate::motor_mode::ModeSwitchFailure,
+    },
+    StoppedRecovered {
+        reason: crate::motor_mode::ModeSwitchFailure,
+    },
+    FailedClean {
+        failed_joint: u8,
+        reason: crate::motor_mode::ModeSwitchFailure,
+    },
+    Ambiguous {
+        failed_joint: u8,
+        reason: crate::motor_mode::ModeSwitchFailure,
+    },
+}
+
+/// Compact `Copy` snapshot of a PR0C `ModeSwitch` session for [`PublishedOwnerMeta`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedModeSwitch {
+    pub session_id: u64,
+    pub confirmed_mask: u32,
+    pub uncertain_mask: u32,
+    pub steps: u32,
+    pub intent: crate::motor_mode::ModeSwitchIntent,
+    pub running: bool,
+    pub recovering: bool,
+    pub axis_count: u8,
+    pub progress: PublishedModeProgress,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::motor_mode::ModeSwitchSnapshot> for PublishedModeSwitch {
+    #[inline]
+    fn from(s: crate::motor_mode::ModeSwitchSnapshot) -> Self {
+        use crate::motor_mode::ModeProgress;
+        let progress = match s.progress {
+            ModeProgress::Pending { .. } => PublishedModeProgress::Pending,
+            ModeProgress::Confirmed => PublishedModeProgress::Confirmed,
+            ModeProgress::RolledBack { failed_joint, reason } => {
+                PublishedModeProgress::RolledBack { failed_joint, reason }
+            }
+            ModeProgress::StoppedRecovered { reason } => {
+                PublishedModeProgress::StoppedRecovered { reason }
+            }
+            ModeProgress::FailedClean { failed_joint, reason } => {
+                PublishedModeProgress::FailedClean { failed_joint, reason }
+            }
+            ModeProgress::Ambiguous { failed_joint, reason } => {
+                PublishedModeProgress::Ambiguous { failed_joint, reason }
+            }
+        };
+        Self {
+            session_id: s.session_id,
+            confirmed_mask: s.confirmed_mask,
+            uncertain_mask: s.uncertain_mask,
+            steps: s.steps,
+            intent: s.intent,
+            running: s.running,
+            recovering: s.recovering,
+            axis_count: s.axis_count,
+            progress,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<PublishedModeSwitch> for crate::motor_mode::ModeSwitchSnapshot {
+    #[inline]
+    fn from(s: PublishedModeSwitch) -> Self {
+        use crate::motor_mode::ModeProgress;
+        let progress = match s.progress {
+            PublishedModeProgress::Pending => ModeProgress::Pending { wake: None },
+            PublishedModeProgress::Confirmed => ModeProgress::Confirmed,
+            PublishedModeProgress::RolledBack { failed_joint, reason } => {
+                ModeProgress::RolledBack { failed_joint, reason }
+            }
+            PublishedModeProgress::StoppedRecovered { reason } => {
+                ModeProgress::StoppedRecovered { reason }
+            }
+            PublishedModeProgress::FailedClean { failed_joint, reason } => {
+                ModeProgress::FailedClean { failed_joint, reason }
+            }
+            PublishedModeProgress::Ambiguous { failed_joint, reason } => {
+                ModeProgress::Ambiguous { failed_joint, reason }
+            }
+        };
+        Self {
+            session_id: s.session_id,
+            intent: s.intent,
+            running: s.running,
+            recovering: s.recovering,
+            progress,
+            axis_count: s.axis_count,
+            confirmed_mask: s.confirmed_mask,
+            uncertain_mask: s.uncertain_mask,
+            steps: s.steps,
+        }
+    }
+}
+
 /// Zero-alloc `Copy` owner metadata published every tick alongside `RtSample`, enabling
 /// off-thread prepared-action and macro-orchestrator reads without acquiring `SupervisorLock`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -289,6 +398,13 @@ pub struct PublishedOwnerMeta {
     pub active_lease_present: bool,
     pub held: Option<PublishedHeld>,
     pub macro_state: PublishedMacroState,
+    /// Coherent snapshot of the active or latest terminal PR0C `ModeSwitch` session (`Copy`, 0 alloc).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub mode_switch: Option<PublishedModeSwitch>,
+    /// Previous terminal `ModeSwitch` snapshot retained alongside a newly started active session
+    /// so owner-side slot retirement never loses a terminal result before its waiter polls.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub prev_mode_switch_terminal: Option<PublishedModeSwitch>,
 }
 
 impl Default for PublishedOwnerMeta {
@@ -325,6 +441,10 @@ impl Default for PublishedOwnerMeta {
             active_lease_present: false,
             held: None,
             macro_state: PublishedMacroState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            mode_switch: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            prev_mode_switch_terminal: None,
         }
     }
 }

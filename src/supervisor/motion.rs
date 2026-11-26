@@ -1900,6 +1900,7 @@ impl SupervisorInner {
             .filter(|a| a.is_running() && a.kind == "park")
             .map(|a| a.id);
         self.stop_motion();
+        self.applied_general_stop_seq = self.applied_general_stop_seq.saturating_add(1);
         if !disable_in_flight {
             if let Some(id) = running_park_id {
                 if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {

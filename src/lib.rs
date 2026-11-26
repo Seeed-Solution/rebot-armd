@@ -72,6 +72,11 @@ pub use motor_mode::{
     PositionLimits, PositionVelocityLimits, ResolvedJointMode, VendorBinding, VendorCapability,
     VENDOR_CAPABILITIES,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use motor_mode::{
+    AxisTarget, ModeProgress, ModeSwitch, ModeSwitchEvent, ModeSwitchEventKind, ModeSwitchFailure,
+    ModeSwitchIntent, ModeSwitchPlan, ModeSwitchRecovery, ModeSwitchSnapshot, ReleaseBudget,
+};
 #[cfg(not(target_arch = "wasm32"))] pub use recording::{
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,

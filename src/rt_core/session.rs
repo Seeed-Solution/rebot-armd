@@ -57,6 +57,7 @@ impl SessionSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionKind {
     Commissioning,
+    ModeSwitch,
     Recorder,
     MacroBacked,
     Custom(u16),
@@ -998,6 +999,9 @@ impl SupervisorInner {
                     SessionKind::Commissioning => {
                         self.service_commissioning_release(ctx, release_deadline, owner_now_fn);
                     }
+                    SessionKind::ModeSwitch => {
+                        self.service_mode_switch_release(ctx, release_deadline, owner_now_fn);
+                    }
                     _ => {
                         let now = owner_now_fn();
                         let total_span = release_deadline.saturating_duration_since(now);
@@ -1064,6 +1068,7 @@ impl SupervisorInner {
 
     pub(crate) fn on_safe_hold_enter(&mut self, reason: &'static str) {
         self.cancel_active_commissioning_on_stop(reason);
+        self.reconcile_mode_switch_on_revocation(reason);
         let outcomes = self.sessions.revoke_live_sessions_by_scope(
             SessionTerminalReason::Revoked(reason),
             RevocationScope::FatalOrTeardown,
@@ -1081,6 +1086,22 @@ impl SupervisorInner {
             .slot(SessionSlot::ExclusiveOutput)
             .is_some_and(|s| s.escalate_safe_hold_on_uncertain);
         let scope = RevocationScope::from_stop_reason(reason);
+        if self
+            .sessions
+            .slot(SessionSlot::ExclusiveOutput)
+            .is_some_and(|s| {
+                s.kind == SessionKind::ModeSwitch
+                    && s.is_live()
+                    && match scope {
+                        RevocationScope::FatalOrTeardown => true,
+                        RevocationScope::MotionStop => s.authority.revoke_on_stop,
+                        RevocationScope::EpochOrEStop => s.authority.revoke_on_epoch_change,
+                        RevocationScope::LeaseLoss => s.authority.require_lease,
+                    }
+            })
+        {
+            self.reconcile_mode_switch_on_revocation(reason);
+        }
         let outcomes = self
             .sessions
             .revoke_live_sessions_by_scope(SessionTerminalReason::Revoked(reason), scope);
@@ -1098,6 +1119,18 @@ impl SupervisorInner {
             .sessions
             .slot(SessionSlot::ExclusiveOutput)
             .is_some_and(|s| s.escalate_safe_hold_on_uncertain);
+        if conn_id != 0
+            && self
+                .sessions
+                .slot(SessionSlot::ExclusiveOutput)
+                .is_some_and(|s| {
+                    s.kind == SessionKind::ModeSwitch
+                        && s.is_live()
+                        && s.authority.connection_id == conn_id
+                })
+        {
+            self.reconcile_mode_switch_on_revocation(reason);
+        }
         let outcomes = self
             .sessions
             .revoke_for_connection(conn_id, SessionTerminalReason::Revoked(reason));
@@ -1305,7 +1338,17 @@ impl SupervisorInner {
     }
 
     pub(crate) fn flush_published_session_terminals(&mut self) -> usize {
-        self.sessions.flush_published_terminals()
+        self.mode_switch.flush_events();
+        let flushed = self.sessions.flush_published_terminals();
+        if let Some(slot) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() {
+            if slot.kind == SessionKind::ModeSwitch
+                && matches!(slot.state, SessionState::Terminal(_))
+                && self.sessions.clear_terminal_slot(SessionSlot::ExclusiveOutput, slot.id)
+            {
+                self.mode_switch.retire_if_session(slot.id);
+            }
+        }
+        flushed
     }
 }
 
