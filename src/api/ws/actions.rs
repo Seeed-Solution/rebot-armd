@@ -518,28 +518,33 @@ async fn submit_prepared_executor_ws(
         code: "EXECUTOR_UNAVAILABLE".into(),
         message: "RT executor is not active".into(),
     })?;
-    struct ZeroCheckCtxGuard {
+    // Ownership of `persist_ctx_id` stays with this guard ONLY until `submit_external_action`
+    // succeeds; once admitted to the broker, `BrokerDispatcher` owns refusal reclamation and
+    // `armd-control` / `armd-persist` owns post-ACK reclamation so dropping this WS future
+    // mid-await can never delete a live action's context.
+    struct ZeroCheckPreSubmitGuard {
         handle: crate::rt_core::executor::RtExecutorHandle,
         ctx_id: u64,
     }
-    impl ZeroCheckCtxGuard {
+    impl ZeroCheckPreSubmitGuard {
         fn disarm(&mut self) {
             self.ctx_id = 0;
         }
     }
-    impl Drop for ZeroCheckCtxGuard {
+    impl Drop for ZeroCheckPreSubmitGuard {
         fn drop(&mut self) {
             if self.ctx_id != 0 {
                 self.handle.remove_zero_check_context(self.ctx_id);
             }
         }
     }
-    let mut zc_guard = ZeroCheckCtxGuard {
+    let persist_ctx_id = match &prepared {
+        PreparedWsAction::GripperZeroCheck { persist_ctx_id, .. } => *persist_ctx_id,
+        _ => 0,
+    };
+    let mut zc_guard = ZeroCheckPreSubmitGuard {
         handle: handle.clone(),
-        ctx_id: match &prepared {
-            PreparedWsAction::GripperZeroCheck { persist_ctx_id, .. } => *persist_ctx_id,
-            _ => 0,
-        },
+        ctx_id: persist_ctx_id,
     };
     let (
         slot,
@@ -646,7 +651,7 @@ async fn submit_prepared_executor_ws(
 
     let (_req_id, mut rx, ack_guard) = loop {
         let write = |dst: &mut PlanSlot| *dst = slot.clone();
-        match handle.submit_external_action(
+        match handle.submit_external_action_with_zero_check_ctx(
             client,
             0,
             auth,
@@ -665,8 +670,13 @@ async fn submit_prepared_executor_ws(
             ExternalDestinationPolicy::ConnectionOnly,
             true,
             Some(Arc::clone(&wire_tracker)),
+            persist_ctx_id,
         ) {
-            Ok(triple) => break triple,
+            Ok(triple) => {
+                // Ownership transferred atomically to BrokerDispatcher -> RT owner / PR C.
+                zc_guard.disarm();
+                break triple;
+            }
             Err(ExternalSubmitError::NoDestination) => {
                 return Err(ArmError::Rejected {
                     status: 503,
@@ -725,7 +735,6 @@ async fn submit_prepared_executor_ws(
         let step = remaining.min(Duration::from_millis(2));
         match tokio::time::timeout(step, &mut rx).await {
             Ok(Ok(Ok(Reply::Ack { action: Some(id), .. }))) => {
-                zc_guard.disarm();
                 return Ok(((id.0, expected_duration_s), ack_guard));
             }
             Ok(Ok(Ok(Reply::Ack { action: None, .. }))) => {
@@ -995,21 +1004,6 @@ pub(super) async fn handle_executor_ws_action(
         } else {
             0
         };
-        struct StagedZeroCheckGuard {
-            handle: crate::rt_core::executor::RtExecutorHandle,
-            ctx_id: u64,
-        }
-        impl Drop for StagedZeroCheckGuard {
-            fn drop(&mut self) {
-                if self.ctx_id != 0 {
-                    self.handle.remove_zero_check_context(self.ctx_id);
-                }
-            }
-        }
-        let mut staged_guard = StagedZeroCheckGuard {
-            handle,
-            ctx_id: persist_ctx_id,
-        };
         let cur_epoch = recv_supervisor
             .hub()
             .latest()
@@ -1031,7 +1025,6 @@ pub(super) async fn handle_executor_ws_action(
         .await
         {
             Ok((started, ack_guard)) => {
-                staged_guard.ctx_id = 0;
                 let reply = off_lock_action_ack(recv_supervisor, &request_id_val, Some(started), cur_epoch);
                 return Some(ExecutorActionDispatch::Reply {
                     reply,
@@ -1040,7 +1033,6 @@ pub(super) async fn handle_executor_ws_action(
                 });
             }
             Err(error) => {
-                drop(staged_guard);
                 drop(gate);
                 let post_ep = recv_supervisor
                     .hub()

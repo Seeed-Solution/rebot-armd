@@ -515,10 +515,57 @@ impl SupervisorInner {
         (returned_policy, old_jaw)
     }
 
+    /// Writes `text` into `last_action`'s `message` (or `durability_warning` when `is_warning`)
+    /// using ONLY RT-owned `action_msg_spares` (bounded to capacity on a UTF-8 char boundary,
+    /// zero alloc / zero realloc / zero dealloc on `armd-control`).
+    fn write_action_spare_text(&mut self, action_id: u64, is_warning: bool, text: &str) {
+        let existing = self
+            .last_action
+            .as_mut()
+            .filter(|a| a.id == action_id)
+            .and_then(|a| {
+                if is_warning {
+                    a.durability_warning.take()
+                } else {
+                    a.message.take()
+                }
+            });
+        // Pass `0` so `take_action_msg_buf` draws strictly from `action_msg_spares` and never
+        // steals `last_action.message` when `is_warning == true`.
+        let mut buf = match existing {
+            Some(b) if b.capacity() >= 256 => b,
+            Some(b) => {
+                self.recycle_action_msg_spare(b);
+                self.take_action_msg_buf(0, 256)
+            }
+            None => self.take_action_msg_buf(0, 256),
+        };
+        buf.clear();
+        let cap = buf.capacity();
+        if cap > 0 {
+            let mut end = text.len().min(cap);
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            buf.push_str(&text[..end]);
+            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+                let displaced = if is_warning {
+                    a.durability_warning.replace(buf)
+                } else {
+                    a.message.replace(buf)
+                };
+                if let Some(old) = displaced {
+                    self.recycle_action_msg_spare(old);
+                }
+            } else {
+                self.recycle_action_msg_spare(buf);
+            }
+        }
+    }
+
     /// In-place terminal update for a failed or cancelled zero-check action on `armd-control`:
-    /// writes inline [`HolderLabel`] `state`/`code` without allocation and reuses preallocated
-    /// `msg_buf` (or worker-provided strings), returning any replaced/unused `(code_buf, old_msg)`
-    /// for off-thread reclamation.
+    /// writes inline [`HolderLabel`] `state`/`code` and copies `message` into an RT-owned spare,
+    /// returning any worker-allocated `(code_buf, msg_buf)` untouched for off-thread reclamation.
     pub(crate) fn finish_zero_check_action_in_place(
         &mut self,
         action_id: u64,
@@ -529,36 +576,22 @@ impl SupervisorInner {
         msg_buf: Option<String>,
     ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
-        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
-            a.state = crate::model::HolderLabel::new(terminal_state);
-            a.code = Some(crate::model::HolderLabel::new(code));
-            let old_msg = match msg_buf {
-                Some(mut buf) => {
-                    buf.clear();
-                    buf.push_str(message);
-                    a.message.replace(buf)
-                }
-                None => {
-                    if let Some(existing) = a.message.as_mut() {
-                        existing.clear();
-                        existing.push_str(message);
-                        None
-                    } else {
-                        a.message = Some(message.into());
-                        None
-                    }
-                }
-            };
-            a.finished_at = Some(now);
+        if self.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running()) {
+            if let Some(a) = self.last_action.as_mut() {
+                a.state = crate::model::HolderLabel::new(terminal_state);
+                a.code = Some(crate::model::HolderLabel::new(code));
+                a.finished_at = Some(now);
+            }
+            self.write_action_spare_text(action_id, false, message);
             self.record_terminal_transition_by_id(action_id);
-            return (code_buf, old_msg);
         }
+        // Always return worker-allocated buffers so `armd-persist` drops them off-RT.
         (code_buf, msg_buf)
     }
 
-    /// In-place terminal update writing inline [`HolderLabel`] `state`/`code` and moving
-    /// worker-allocated `message` into `ActionStatus` without allocating or freeing on
-    /// `armd-control`, returning `(Some(code), old_msg)` for off-thread reclamation.
+    /// In-place terminal update writing inline [`HolderLabel`] `state`/`code` and copying
+    /// `message` into an RT-owned spare (bounded to 256 bytes, 0 alloc / 0 free on `armd-control`),
+    /// returning `(Some(code), Some(message))` for off-thread reclamation.
     pub(crate) fn fail_zero_check_action_owned(
         &mut self,
         action_id: u64,
@@ -566,13 +599,14 @@ impl SupervisorInner {
         message: String,
     ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
-        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
-            a.state = crate::model::HolderLabel::new("failed");
-            a.code = Some(crate::model::HolderLabel::new(&code));
-            let old_msg = a.message.replace(message);
-            a.finished_at = Some(now);
+        if self.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running()) {
+            if let Some(a) = self.last_action.as_mut() {
+                a.state = crate::model::HolderLabel::new("failed");
+                a.code = Some(crate::model::HolderLabel::new(&code));
+                a.finished_at = Some(now);
+            }
+            self.write_action_spare_text(action_id, false, &message);
             self.record_terminal_transition_by_id(action_id);
-            return (Some(code), old_msg);
         }
         (Some(code), Some(message))
     }
@@ -585,7 +619,8 @@ impl SupervisorInner {
     ) -> Option<String> {
         let now = self.now_s();
         let mut transitioned_terminal = false;
-        let ret = if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+        let mut recycle_prev_warn = None;
+        let found = if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("done");
                 a.progress = 1.0;
@@ -595,43 +630,51 @@ impl SupervisorInner {
             match durability {
                 crate::rt_core::config_iface::Durability::Durable => {
                     a.durability_confirmed = Some(true);
-                    let prev = a.durability_warning.take();
-                    warning.or(prev)
+                    recycle_prev_warn = a.durability_warning.take();
                 }
                 crate::rt_core::config_iface::Durability::DurableUnconfirmed => {
                     a.durability_confirmed = Some(false);
-                    match warning {
-                        Some(w) => a.durability_warning.replace(w),
-                        None => a.durability_warning.take(),
+                    if warning.is_none() {
+                        recycle_prev_warn = a.durability_warning.take();
                     }
                 }
                 crate::rt_core::config_iface::Durability::Volatile => {
                     a.durability_confirmed = Some(false);
-                    warning
                 }
             }
+            true
         } else {
-            return warning;
+            false
         };
-        if transitioned_terminal {
+        if let Some(prev) = recycle_prev_warn {
+            self.recycle_action_msg_spare(prev);
+        }
+        if found && matches!(durability, crate::rt_core::config_iface::Durability::DurableUnconfirmed) {
+            if let Some(w) = warning.as_deref() {
+                self.write_action_spare_text(action_id, true, w);
+            }
+        }
+        if found && transitioned_terminal {
             self.record_terminal_transition_by_id(action_id);
         }
-        ret
+        // Always return any worker-allocated warning buffer for off-RT drop.
+        warning
     }
 
     /// Zero-allocation terminal update when parent-directory fsync fails after `rename_only()`
     /// for `gripper_zero_check(store_offset=true)`: marks action failed (`PERSIST_FAILED`),
-    /// records `durability_confirmed = Some(false)` and the worker-allocated `warning`, and
-    /// returns any displaced buffers for off-thread reclamation.
+    /// records `durability_confirmed = Some(false)` and copies `warning` + message into RT-owned
+    /// spares (0 alloc / 0 realloc / 0 dealloc on `armd-control`), returning worker-allocated
+    /// buffers for off-thread reclamation.
     pub(crate) fn fail_zero_check_dir_sync_in_place(
         &mut self,
         action_id: u64,
         warning: String,
-        mut msg_buf: Option<String>,
+        msg_buf: Option<String>,
     ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
         let mut transitioned_terminal = false;
-        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+        let found = if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("failed");
                 a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
@@ -639,24 +682,17 @@ impl SupervisorInner {
                 transitioned_terminal = true;
             }
             a.durability_confirmed = Some(false);
-            let old_warn = a.durability_warning.replace(warning);
-            let old_msg = match msg_buf.take() {
-                Some(mut b) => {
-                    b.clear();
-                    const MSG: &str = "Parent directory fsync failed after rename; reconciliation required";
-                    if b.capacity() >= MSG.len() {
-                        b.push_str(MSG);
-                        a.message.replace(b)
-                    } else {
-                        Some(b)
-                    }
-                }
-                None => None,
-            };
+            true
+        } else {
+            false
+        };
+        if found {
+            const MSG: &str = "Parent directory fsync failed after rename; reconciliation required";
+            self.write_action_spare_text(action_id, false, MSG);
+            self.write_action_spare_text(action_id, true, &warning);
             if transitioned_terminal {
                 self.record_terminal_transition_by_id(action_id);
             }
-            return (old_msg, old_warn);
         }
         (msg_buf, Some(warning))
     }

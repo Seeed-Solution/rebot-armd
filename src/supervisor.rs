@@ -1678,12 +1678,24 @@ fn sync_action_obs(
             }
             (false, true) => {
                 if let Some(old) = dst_field.take() {
-                    if old.capacity() > sp.capacity() {
+                    if sp.capacity() == 0 {
                         *sp = old;
                     }
                 }
             }
             _ => {}
+        }
+    };
+    let copy_bounded_no_alloc = |dst_str: &mut String, src_str: &str| {
+        dst_str.clear();
+        if src_str.len() <= dst_str.capacity() {
+            dst_str.push_str(src_str);
+        } else {
+            let mut end = dst_str.capacity();
+            while end > 0 && !src_str.is_char_boundary(end) {
+                end -= 1;
+            }
+            dst_str.push_str(&src_str[..end]);
         }
     };
     match (src, dst.as_mut()) {
@@ -1695,43 +1707,69 @@ fn sync_action_obs(
                     &mut d.durability_warning,
                     sp_warn,
                 );
+                let msg_overflow = s
+                    .message
+                    .as_deref()
+                    .zip(d.message.as_ref())
+                    .is_some_and(|(src_m, dst_m)| src_m.len() > dst_m.capacity());
+                let warn_overflow = s
+                    .durability_warning
+                    .as_deref()
+                    .zip(d.durability_warning.as_ref())
+                    .is_some_and(|(src_w, dst_w)| src_w.len() > dst_w.capacity());
+                if msg_overflow || warn_overflow {
+                    let mut saved_msg = d.message.take();
+                    let mut saved_warn = d.durability_warning.take();
+                    let s_msg = s.message.as_deref();
+                    let s_warn = s.durability_warning.as_deref();
+                    // Clone scalar/bounded fields without letting `clone_from` reallocate `message`
+                    // or `durability_warning` on `armd-control`; full text lives in `terminal_capture`.
+                    d.clone_from_without_msg_warn(s);
+                    if let (Some(dst_m), Some(src_m)) = (saved_msg.as_mut(), s_msg) {
+                        copy_bounded_no_alloc(dst_m, src_m);
+                    }
+                    if let (Some(dst_w), Some(src_w)) = (saved_warn.as_mut(), s_warn) {
+                        copy_bounded_no_alloc(dst_w, src_w);
+                    }
+                    d.message = saved_msg;
+                    d.durability_warning = saved_warn;
+                    return;
+                }
             }
             d.clone_from(s);
         }
         (Some(s), None) => {
             if let Some((sp_msg, sp_warn)) = spare {
-                let msg_fits = s
-                    .message
-                    .as_deref()
-                    .is_none_or(|m| sp_msg.capacity() >= m.len());
-                let warn_fits = s
-                    .durability_warning
-                    .as_deref()
-                    .is_none_or(|w| sp_warn.capacity() >= w.len());
-                if msg_fits && warn_fits && (s.message.is_some() || s.durability_warning.is_some()) {
-                    let mut blank = ActionStatus::blank();
-                    if s.message.is_some() {
-                        blank.message = Some(std::mem::take(sp_msg));
+                let mut blank = ActionStatus::blank();
+                if let Some(src_m) = s.message.as_deref() {
+                    if sp_msg.capacity() > 0 {
+                        let mut buf = std::mem::take(sp_msg);
+                        copy_bounded_no_alloc(&mut buf, src_m);
+                        blank.message = Some(buf);
                     }
-                    if s.durability_warning.is_some() {
-                        blank.durability_warning = Some(std::mem::take(sp_warn));
-                    }
-                    blank.clone_from(s);
-                    *dst = Some(blank);
-                    return;
                 }
+                if let Some(src_w) = s.durability_warning.as_deref() {
+                    if sp_warn.capacity() > 0 {
+                        let mut buf = std::mem::take(sp_warn);
+                        copy_bounded_no_alloc(&mut buf, src_w);
+                        blank.durability_warning = Some(buf);
+                    }
+                }
+                blank.clone_from_without_msg_warn(s);
+                *dst = Some(blank);
+                return;
             }
             *dst = Some(s.clone());
         }
         (None, Some(d)) => {
             if let Some((sp_msg, sp_warn)) = spare {
                 if let Some(old) = d.message.take() {
-                    if old.capacity() > sp_msg.capacity() {
+                    if sp_msg.capacity() == 0 {
                         *sp_msg = old;
                     }
                 }
                 if let Some(old) = d.durability_warning.take() {
-                    if old.capacity() > sp_warn.capacity() {
+                    if sp_warn.capacity() == 0 {
                         *sp_warn = old;
                     }
                 }
@@ -1970,18 +2008,22 @@ pub struct ZeroCheckParams {
     pub persist_ctx_id: u64,
     /// Bound PR0B `SessionId` when driven by `SessionDriver` (`SessionKind::GripperZeroCheck`).
     pub session_id: Option<crate::rt_core::session::SessionId>,
+    /// Owning WS connection ID (`0` when submitted outside a tracked connection).
+    pub connection_id: u64,
     /// Live lock-free operator grant bound at executor admission (when `store_offset == true`).
     pub operator_grant: Option<crate::auth::OperatorGrant>,
 }
 
 /// `Copy` off-RT handoff event emitted over `rt_core::stream` from `armd-control` to `armd-persist`
 /// for executor-admitted `gripper_zero_check` sessions (0 RT heap allocs/frees).
+#[allow(clippy::large_enum_variant)] // inline Copy event on lock-free SPSC stream; boxing would allocate on RT
 #[derive(Debug, Clone, Copy)]
 pub enum ZeroCheckStreamEvent {
     Persist {
         action_id: u64,
         offset_rad: f32,
         base_revision: u64,
+        connection_id: u64,
         lease_owner: Option<(crate::model::HolderLabel, u64)>,
         estop_epoch: u64,
         stop_gen: u64,
@@ -2000,6 +2042,7 @@ pub struct PendingZeroCheckPersist {
     pub action_id: u64,
     pub offset_rad: f32,
     pub base_revision: u64,
+    pub connection_id: u64,
     pub lease_owner: Option<(crate::model::HolderLabel, u64)>,
     pub estop_epoch: u64,
     pub stop_gen: u64,
@@ -2762,8 +2805,8 @@ impl SupervisorInner {
             action_msg_spares: [
                 Some(String::with_capacity(256)),
                 Some(String::with_capacity(256)),
-                None,
-                None,
+                Some(String::with_capacity(256)),
+                Some(String::with_capacity(256)),
             ],
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             retired_macro_runs: std::collections::VecDeque::with_capacity(8),

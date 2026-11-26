@@ -4107,6 +4107,7 @@ fn install_gripper_zero_check_rt(
         persist_ctx: None,
         persist_ctx_id,
         session_id: Some(sid),
+        connection_id: proof.stamp().connection_id,
         operator_grant: store_offset.then_some(operator_grant),
     });
     Ok((id, duration))

@@ -5950,11 +5950,28 @@ pub(crate) fn check_zero_check_authority(
         ));
     }
     if core.safety.state().is_stopped() {
-        return Err((
-            "cancelled",
-            "STOPPED",
-            "Safety stop intervened before gripper calibration persisted",
-        ));
+        return Err(match core.safety.state() {
+            crate::safety::SafetyState::EStop => (
+                "failed",
+                "ESTOP_ACTIVE",
+                "Emergency stop intervened before gripper calibration persisted",
+            ),
+            crate::safety::SafetyState::Fault(crate::safety::FaultReason::ThermalTrip { .. }) => (
+                "failed",
+                "THERMAL_TRIP",
+                "Thermal trip intervened before gripper calibration persisted",
+            ),
+            crate::safety::SafetyState::Fault(crate::safety::FaultReason::BusLoss) => (
+                "failed",
+                "BUS_LOSS",
+                "Bus loss intervened before gripper calibration persisted",
+            ),
+            _ => (
+                "cancelled",
+                "STOPPED",
+                "Safety stop intervened before gripper calibration persisted",
+            ),
+        });
     }
     if let Some((gid, grant)) = core.zero_check_persisting_grant {
         if gid == action_id && !grant.is_valid_at(ctx.now, core.operator_auth_enforced) {
@@ -6030,6 +6047,7 @@ pub(crate) fn zero_check_owner_reserve(
     ctx: &CommitCtx,
     action_id: u64,
     base_revision: u64,
+    connection_id: u64,
     lease_owner: Option<(HolderLabel, u64)>,
     estop_epoch: u64,
     stop_gen: u64,
@@ -6051,7 +6069,7 @@ pub(crate) fn zero_check_owner_reserve(
             arm: ctx.arm,
             boot: ctx.boot,
             request: RequestId(req_seq),
-            client: ClientId(0),
+            client: ClientId(connection_id),
             client_seq: req_seq,
             authority: Authority {
                 lease_generation: lease_gen,
@@ -6068,7 +6086,7 @@ pub(crate) fn zero_check_owner_reserve(
             stop_gen,
             estop_epoch,
             lease_gen,
-            connection_id: 0,
+            connection_id,
             request_id: req_seq,
         },
         lease_holder: lease_owner,
@@ -6459,6 +6477,7 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
             &ctx,
             self.job.action_id,
             self.job.base_revision,
+            self.job.connection_id,
             self.job.lease_owner,
             self.job.estop_epoch,
             self.job.stop_gen,
@@ -6914,6 +6933,7 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
             &commit_ctx,
             self.action_id,
             self.base_revision,
+            0,
             self.lease_owner,
             self.estop_epoch,
             self.stop_gen,

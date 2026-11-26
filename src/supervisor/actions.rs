@@ -163,6 +163,9 @@ impl SupervisorInner {
                 if let Some(msg) = prev.message.take() {
                     self.recycle_action_msg_spare(msg);
                 }
+                if let Some(warn) = prev.durability_warning.take() {
+                    self.recycle_action_msg_spare(warn);
+                }
             }
         }
         if format_superseded_msg {
@@ -362,11 +365,16 @@ impl SupervisorInner {
     /// Retires only the matching trajectory/params, delivers any optional worker reply (never
     /// gating cleanup on reply acceptance), and clears `SessionSlot::ExclusiveOutput` even if
     /// another path already transitioned the slot to `SessionState::Terminal`.
+    ///
+    /// When `preserve_safety_hold` is `true` (E-stop / thermal trip / bus loss), retires ONLY
+    /// the matching trajectory without overwriting `commanded_positions` or `target_positions`
+    /// so the safety stop policy's freshness-gated hold capture owns the hold target.
     pub(crate) fn teardown_gripper_zero_check_session_rt(
         &mut self,
         action_id: u64,
         sid: Option<crate::rt_core::session::SessionId>,
         stop_motion_if_matching: bool,
+        preserve_safety_hold: bool,
         worker_reply: Option<crate::rt_core::session::WorkerReply>,
         reason: crate::rt_core::session::SessionTerminalReason,
         now: Instant,
@@ -374,31 +382,15 @@ impl SupervisorInner {
         use crate::rt_core::broker::ActionId;
         use crate::rt_core::session::{SessionKind, SessionSlot};
 
-        if stop_motion_if_matching
-            && self
-                .active_trajectory
-                .as_ref()
-                .is_some_and(|t| t.action_id == Some(action_id))
-        {
-            self.stop_motion();
-            if let Some(g) = self.config.gripper_index() {
-                if g < self.measured_positions.len()
-                    && g < self.commanded_positions.len()
-                    && g < self.target_positions.len()
-                {
-                    let m = self.measured_positions[g];
-                    if m.is_finite() {
-                        let clamped = m.clamp(
-                            self.config.limits[g].min_position,
-                            self.config.limits[g].max_position,
-                        );
-                        self.commanded_positions[g] = clamped;
-                        self.target_positions[g] = clamped;
-                        if g < self.commanded_velocities.len() {
-                            self.commanded_velocities[g] = 0.0;
-                        }
-                    }
-                }
+        let matching_traj = self
+            .active_trajectory
+            .as_ref()
+            .is_some_and(|t| t.action_id == Some(action_id));
+        if matching_traj {
+            if preserve_safety_hold {
+                self.replace_active_trajectory(None);
+            } else if stop_motion_if_matching {
+                self.stop_motion();
             }
         }
         if self
@@ -486,6 +478,7 @@ impl SupervisorInner {
                     action_id,
                     Some(active.id),
                     true,
+                    false,
                     None,
                     outcome.reason,
                     now,
@@ -505,6 +498,7 @@ impl SupervisorInner {
                         action_id,
                         Some(active.id),
                         false,
+                        false,
                         None,
                         SessionTerminalReason::Completed,
                         now,
@@ -520,6 +514,7 @@ impl SupervisorInner {
                     self.teardown_gripper_zero_check_session_rt(
                         action_id,
                         Some(active.id),
+                        false,
                         false,
                         None,
                         SessionTerminalReason::Completed,
@@ -588,6 +583,7 @@ impl SupervisorInner {
                         action_id,
                         Some(active.id),
                         true,
+                        rctx.estop_latched,
                         None,
                         outcome.reason,
                         now,
@@ -603,6 +599,8 @@ impl SupervisorInner {
             "LEASE_LOST" => ("cancelled", "LEASE_LOST", "Control lease lost or released"),
             "DISCONNECTED" => ("cancelled", "DISCONNECTED", "Client connection closed"),
             "ESTOP_ACTIVE" => ("failed", "ESTOP_ACTIVE", "E-stop latched"),
+            "THERMAL_TRIP" => ("failed", "THERMAL_TRIP", "Thermal trip"),
+            "BUS_LOSS" => ("failed", "BUS_LOSS", "CAN feedback lost"),
             "INTERNAL_FAULT" => ("failed", "INTERNAL_FAULT", "Internal fault latched"),
             "OPERATOR_REQUIRED" => ("failed", "OPERATOR_REQUIRED", "Operator session expired or locked"),
             other => ("cancelled", other, "Gripper zero check cancelled"),
@@ -626,12 +624,14 @@ impl SupervisorInner {
         if self.zero_check_persisting == Some(action_id) {
             return;
         }
+        let preserve_safety_hold = matches!(reason, "ESTOP_ACTIVE" | "THERMAL_TRIP" | "BUS_LOSS");
         let (t_state, t_code, t_msg) = Self::zero_check_revoke_terminal(reason);
         self.finish_zero_check_session_abort_rt(action_id, t_state, t_code, t_msg);
         self.teardown_gripper_zero_check_session_rt(
             action_id,
             Some(active.id),
-            true,
+            !preserve_safety_hold,
+            preserve_safety_hold,
             None,
             SessionTerminalReason::Revoked(reason),
             Instant::now(),
@@ -669,6 +669,7 @@ impl SupervisorInner {
             action_id,
             Some(active.id),
             true,
+            false,
             None,
             SessionTerminalReason::Revoked(reason),
             Instant::now(),
@@ -678,9 +679,10 @@ impl SupervisorInner {
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
-        let mut store_offset_req: Option<(f32, Box<ZeroCheckPersistContext>)> = None;
+        let mut store_offset_req: Option<(f32, u64, Box<ZeroCheckPersistContext>)> = None;
         let mut store_offset_stream_req: Option<(
             f32,
+            u64,
             u64,
             Option<crate::rt_core::session::SessionId>,
             Option<crate::auth::OperatorGrant>,
@@ -726,10 +728,15 @@ impl SupervisorInner {
                     if params.store_offset {
                         if offset_rad.abs() <= 0.5 {
                             if let Some(ctx) = unused_ctx.take() {
-                                store_offset_req = Some((offset_rad, ctx));
+                                store_offset_req = Some((offset_rad, params.connection_id, ctx));
                             } else if unused_ctx_id != 0 {
-                                store_offset_stream_req =
-                                    Some((offset_rad, unused_ctx_id, sess_id, params.operator_grant));
+                                store_offset_stream_req = Some((
+                                    offset_rad,
+                                    params.connection_id,
+                                    unused_ctx_id,
+                                    sess_id,
+                                    params.operator_grant,
+                                ));
                                 unused_ctx_id = 0;
                                 handed_off_stream = true;
                             }
@@ -788,13 +795,16 @@ impl SupervisorInner {
                     id,
                     Some(sid),
                     false,
+                    false,
                     None,
                     reason,
                     Instant::now(),
                 );
             }
         }
-        if let Some((offset_rad, persist_ctx_id, sess_id, op_grant)) = store_offset_stream_req {
+        if let Some((offset_rad, connection_id, persist_ctx_id, sess_id, op_grant)) =
+            store_offset_stream_req
+        {
             let stream_ready = self
                 .zero_check_stream_tx
                 .as_ref()
@@ -830,6 +840,7 @@ impl SupervisorInner {
                         id,
                         Some(sid),
                         false,
+                        false,
                         None,
                         crate::rt_core::session::SessionTerminalReason::Failed("PERSIST_FAILED"),
                         Instant::now(),
@@ -861,6 +872,7 @@ impl SupervisorInner {
                         action_id: id,
                         offset_rad,
                         base_revision: self.gripper_calib_revision,
+                        connection_id,
                         lease_owner,
                         estop_epoch: self.safety.epoch_id(),
                         stop_gen: self.current_stop_gen(),
@@ -870,7 +882,7 @@ impl SupervisorInner {
                     });
             }
         }
-        if let Some((offset_rad, mut ctx)) = store_offset_req {
+        if let Some((offset_rad, connection_id, mut ctx)) = store_offset_req {
             if self.defer_zero_check_persist {
                 // Zero-allocation RT path: candidate validation and JSON serialization run
                 // completely off `armd-control` (on `armd-persist` or the legacy async worker).
@@ -902,6 +914,7 @@ impl SupervisorInner {
                         action_id: id,
                         offset_rad,
                         base_revision: self.gripper_calib_revision,
+                        connection_id,
                         lease_owner,
                         estop_epoch: self.safety.epoch_id(),
                         stop_gen: self.current_stop_gen(),
@@ -2318,6 +2331,7 @@ impl SupervisorInner {
             persist_ctx,
             persist_ctx_id: 0,
             session_id: None,
+            connection_id: 0,
             operator_grant: None,
         });
         Ok((id, duration))
@@ -2415,6 +2429,12 @@ impl SupervisorInner {
                 self.notify_park_continuation();
             }
             self.pending_deferred_done = None;
+            if self.rt_executor_owned && self.zero_check_persisting == Some(id) {
+                // On `OWNER_EXECUTOR`, PR C owns post-handoff persistence settlement, authority
+                // recheck, and `SessionSlot::ExclusiveOutput` teardown (hardware safety stop/E-stop
+                // has already taken effect); do not overwrite `last_action` or drop the grant early.
+                return;
+            }
             if self.zero_check_persisting == Some(id) {
                 self.zero_check_persisting = None;
                 if self.zero_check_persisting_grant.is_some_and(|(gid, _)| gid == id) {
@@ -2424,6 +2444,7 @@ impl SupervisorInner {
             self.teardown_gripper_zero_check_session_rt(
                 id,
                 None,
+                false,
                 false,
                 None,
                 crate::rt_core::session::SessionTerminalReason::Revoked(code),

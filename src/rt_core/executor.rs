@@ -1641,6 +1641,7 @@ enum PersistCmd {
     Reserve {
         action_id: u64,
         base_revision: u64,
+        connection_id: u64,
         lease_owner: Option<(crate::model::HolderLabel, u64)>,
         estop_epoch: u64,
         stop_gen: u64,
@@ -1790,8 +1791,14 @@ enum OffloadReclaim {
 /// heap contexts live exclusively off-RT and are reclaimed on persist, discard, refusal, or exit.
 const ZERO_CHECK_CTX_CAPACITY: usize = 16;
 
+enum ZeroCheckStageError {
+    Full,
+    Closed,
+}
+
 struct ZeroCheckContextStore {
     next_id: u64,
+    closed: bool,
     entries: HashMap<u64, Box<crate::supervisor::ZeroCheckPersistContext>>,
 }
 
@@ -1799,6 +1806,7 @@ impl ZeroCheckContextStore {
     fn new() -> Self {
         Self {
             next_id: 1,
+            closed: false,
             entries: HashMap::with_capacity(ZERO_CHECK_CTX_CAPACITY),
         }
     }
@@ -1806,9 +1814,12 @@ impl ZeroCheckContextStore {
     fn stage(
         &mut self,
         ctx: Box<crate::supervisor::ZeroCheckPersistContext>,
-    ) -> Result<u64, Box<crate::supervisor::ZeroCheckPersistContext>> {
+    ) -> Result<u64, ZeroCheckStageError> {
+        if self.closed {
+            return Err(ZeroCheckStageError::Closed);
+        }
         if self.entries.len() >= ZERO_CHECK_CTX_CAPACITY {
-            return Err(ctx);
+            return Err(ZeroCheckStageError::Full);
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -1829,13 +1840,28 @@ impl ZeroCheckContextStore {
         }
     }
 
-    fn clear(&mut self) {
+    fn close_and_clear(&mut self) {
+        self.closed = true;
         self.entries.clear();
     }
 
     fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Truncates an off-RT diagnostic string to at most `max_bytes` on a UTF-8 char boundary so
+/// `armd-control` never allocates or reallocates when mirroring it into preallocated 256-byte
+/// `ObservationSpares` (full untruncated diagnostics stay in `TerminalCaptureChannel`).
+fn truncate_rt_diagnostic(mut s: String, max_bytes: usize) -> String {
+    if s.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 /// Off-thread broker dispatcher coordinating `Broker<PlanSlot>` submissions, connection-liveness
@@ -1858,6 +1884,7 @@ pub(crate) struct BrokerDispatcher {
         Arc<crate::model::ArmObservation>,
     )>,
     session_terminal_rx: Mutex<super::stream::StreamConsumer<super::session::SessionTerminalRecord>>,
+    zero_check_contexts: Arc<Mutex<ZeroCheckContextStore>>,
     broker_discarded: AtomicBool,
     state: Mutex<BrokerDispatcherState>,
 }
@@ -1878,6 +1905,10 @@ enum ManagedWaiter {
 
 struct BrokerDispatcherState {
     managed: HashMap<super::broker::RequestId, ManagedEntry>,
+    /// Off-RT `persist_ctx_id` bindings for submitted external `GripperZeroCheck` requests.
+    /// Transferred to RT/PR C on `Reply::Ack { action: Some(_) }` or reclaimed immediately on
+    /// `Reply::Refused` (even if the submitting WS future was dropped after broker admission).
+    pending_zero_check_ctx: HashMap<super::broker::RequestId, u64>,
     /// True after a client with in-flight managed requests disconnects so `drain_replies`
     /// continues polling `broker` until every abandoned reservation/plan slot is reclaimed.
     draining_disconnected: bool,
@@ -1903,6 +1934,7 @@ impl BrokerDispatcher {
             Arc<crate::model::ArmObservation>,
         )>,
         session_terminal_rx: super::stream::StreamConsumer<super::session::SessionTerminalRecord>,
+        zero_check_contexts: Arc<Mutex<ZeroCheckContextStore>>,
         exited: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -1913,9 +1945,11 @@ impl BrokerDispatcher {
             hub,
             terminal_capture_drain,
             session_terminal_rx: Mutex::new(session_terminal_rx),
+            zero_check_contexts,
             broker_discarded: AtomicBool::new(false),
             state: Mutex::new(BrokerDispatcherState {
                 managed: HashMap::with_capacity(super::broker::REPLY_CAPACITY),
+                pending_zero_check_ctx: HashMap::with_capacity(ZERO_CHECK_CTX_CAPACITY),
                 draining_disconnected: false,
                 exited,
             }),
@@ -2024,10 +2058,43 @@ impl BrokerDispatcher {
         ),
         ExternalSubmitError,
     > {
+        self.submit_external_action_with_zero_check_ctx(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            sub,
+            policy,
+            require_ack_commit,
+            wire_tracker,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_external_action_with_zero_check_ctx<'a>(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+        zero_check_ctx_id: u64,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
         if !sub.starts_action() {
             return Err(ExternalSubmitError::NotAnExternalAction);
         }
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.exited.load(Ordering::Acquire) {
             return Err(ExternalSubmitError::Stopped);
         }
@@ -2051,6 +2118,9 @@ impl BrokerDispatcher {
                 super::broker::Submit::Action(sub),
             )
             .map_err(ExternalSubmitError::Admit)?;
+        if zero_check_ctx_id != 0 {
+            st.pending_zero_check_ctx.insert(req_id, zero_check_ctx_id);
+        }
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         router.commit_external_route(
             req_id,
@@ -2475,6 +2545,7 @@ impl BrokerDispatcher {
         st: &mut BrokerDispatcherState,
         broker: &Mutex<Broker<PlanSlot>>,
         reply_router: &Mutex<ActionReplyRouter>,
+        zero_check_contexts: &Mutex<ZeroCheckContextStore>,
         force_poll: bool,
     ) -> usize {
         use super::broker::DeliveryDecision;
@@ -2482,13 +2553,28 @@ impl BrokerDispatcher {
         let mut router = reply_router.lock().unwrap_or_else(|e| e.into_inner());
         let has_consumers = force_poll
             || !st.managed.is_empty()
+            || !st.pending_zero_check_ctx.is_empty()
             || st.draining_disconnected
             || router.has_external_consumers();
         if !has_consumers {
             return 0;
         }
+        let mut discard_ctx_ids: Vec<u64> = Vec::new();
         let n = guard.try_poll(|client, reply| {
             let req = reply.request();
+            match reply {
+                super::broker::Reply::Ack { action: Some(_), .. } => {
+                    // Ownership transferred to RT session / PR C.
+                    st.pending_zero_check_ctx.remove(&req);
+                }
+                super::broker::Reply::Refused { .. }
+                | super::broker::Reply::Ack { action: None, .. } => {
+                    if let Some(ctx_id) = st.pending_zero_check_ctx.remove(&req) {
+                        discard_ctx_ids.push(ctx_id);
+                    }
+                }
+                _ => {}
+            }
             if let Some(entry) = st.managed.get_mut(&req) {
                 let delivered = match &mut entry.waiter {
                     ManagedWaiter::OneShot(slot) => {
@@ -2532,8 +2618,19 @@ impl BrokerDispatcher {
             }
         });
         guard.reclaim_plans();
-        if guard.outstanding() == 0 && st.managed.is_empty() {
-            st.draining_disconnected = false;
+        drop(router);
+        drop(guard);
+        if !discard_ctx_ids.is_empty() {
+            let mut zc = zero_check_contexts.lock().unwrap_or_else(|e| e.into_inner());
+            for id in discard_ctx_ids {
+                zc.remove(id);
+            }
+        }
+        if st.managed.is_empty() && st.pending_zero_check_ctx.is_empty() {
+            let guard2 = broker.lock().unwrap_or_else(|e| e.into_inner());
+            if guard2.outstanding() == 0 {
+                st.draining_disconnected = false;
+            }
         }
         n
     }
@@ -2568,7 +2665,13 @@ impl BrokerDispatcher {
         loop {
             let polled = {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, force_poll)
+                Self::poll_all_locked(
+                    &mut st,
+                    &self.broker,
+                    &self.reply_router,
+                    &self.zero_check_contexts,
+                    force_poll,
+                )
             };
             let session_polled = {
                 let mut srx = self.session_terminal_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -2671,17 +2774,33 @@ impl BrokerDispatcher {
             return;
         };
         let _ = self.deliver_ready_under_gate(false);
-        let exited = {
+        let (exited, orphaned_zc_ctx): (bool, Vec<u64>) = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.exited.load(Ordering::Acquire) {
-                let _ = Self::poll_all_locked(&mut st, &self.broker, &self.reply_router, false);
+                let _ = Self::poll_all_locked(
+                    &mut st,
+                    &self.broker,
+                    &self.reply_router,
+                    &self.zero_check_contexts,
+                    false,
+                );
                 Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+                let orphaned = st.pending_zero_check_ctx.drain().map(|(_, id)| id).collect();
                 st.draining_disconnected = false;
-                true
+                (true, orphaned)
             } else {
-                false
+                (false, Vec::new())
             }
         };
+        if !orphaned_zc_ctx.is_empty() {
+            let mut zc = self
+                .zero_check_contexts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for id in orphaned_zc_ctx {
+                zc.remove(id);
+            }
+        }
         if exited {
             let _ = self.deliver_ready_under_gate(false);
             self.reply_router
@@ -2791,14 +2910,25 @@ impl BrokerDispatcher {
 
     fn finish_stopped_inner(&self, emergency_bound: Option<Duration>, rt_joined: bool) {
         // Step 1 (lock-only, NEVER waits on SerialDrainGate): wake all waiting callers immediately.
-        {
+        let orphaned_zc_ctx: Vec<u64> = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             Self::fail_remaining(&mut st.managed, OwnerError::Stopped);
+            let orphaned = st.pending_zero_check_ctx.drain().map(|(_, id)| id).collect();
             st.draining_disconnected = false;
             self.reply_router
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .fail_pending_waiters_on_stop();
+            orphaned
+        };
+        if !orphaned_zc_ctx.is_empty() {
+            let mut zc = self
+                .zero_check_contexts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for id in orphaned_zc_ctx {
+                zc.remove(id);
+            }
         }
         // Step 2: acquire SerialDrainGate (bounded for emergency teardown; deferred on same-thread
         // re-entry or emergency timeout so teardown never deadlocks or hangs behind a slow sink).
@@ -4656,7 +4786,7 @@ impl RtExecutorShared {
         self.zero_check_contexts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .close_and_clear();
     }
 
     fn default_teardown_deadline(&self) -> Instant {
@@ -4708,10 +4838,17 @@ impl RtExecutorHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .stage(ctx)
-            .map_err(|_| ArmError::Rejected {
-                status: 503,
-                code: "MOTION_BUSY".into(),
-                message: "Gripper zero-check persistence staging table is full".into(),
+            .map_err(|err| match err {
+                ZeroCheckStageError::Closed => ArmError::Rejected {
+                    status: 503,
+                    code: "PERSIST_FAILED".into(),
+                    message: "Gripper zero-check persistence worker is unavailable".into(),
+                },
+                ZeroCheckStageError::Full => ArmError::Rejected {
+                    status: 503,
+                    code: "MOTION_BUSY".into(),
+                    message: "Gripper zero-check persistence staging table is full".into(),
+                },
             })
     }
 
@@ -4765,6 +4902,41 @@ impl RtExecutorHandle {
             require_ack_commit,
             wire_tracker,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_external_action_with_zero_check_ctx<'a>(
+        &self,
+        client: ClientId,
+        seq: u64,
+        auth: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+        policy: ExternalDestinationPolicy,
+        require_ack_commit: bool,
+        wire_tracker: Option<Arc<WsWireAckTracker>>,
+        zero_check_ctx_id: u64,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<Result<super::broker::Reply, OwnerError>>,
+            AckCommitGuard,
+        ),
+        ExternalSubmitError,
+    > {
+        self.shared
+            .broker_dispatcher
+            .submit_external_action_with_zero_check_ctx(
+                client,
+                seq,
+                auth,
+                deadline,
+                sub,
+                policy,
+                require_ack_commit,
+                wire_tracker,
+                zero_check_ctx_id,
+            )
     }
 
     /// Atomically verifies connection liveness, reserves bounded per-connection + global reply
@@ -6041,6 +6213,7 @@ pub(crate) fn spawn_executor(
         Arc::clone(&hub),
         core.terminal_capture_drain_handles(),
         session_terminal_rx,
+        Arc::clone(&zero_check_contexts),
         exited.clone(),
     ));
     let control_exited_cv = Arc::new((Mutex::new(ControlExitState), Condvar::new()));
@@ -7380,6 +7553,7 @@ impl ControlState {
             action_id,
             None,
             false,
+            false,
             worker_reply,
             reason,
             now,
@@ -7534,6 +7708,7 @@ impl ControlState {
             PersistCmd::Reserve {
                 action_id,
                 base_revision,
+                connection_id,
                 lease_owner,
                 estop_epoch,
                 stop_gen,
@@ -7551,6 +7726,7 @@ impl ControlState {
                     ctx,
                     action_id,
                     base_revision,
+                    connection_id,
                     lease_owner,
                     estop_epoch,
                     stop_gen,
@@ -7979,7 +8155,7 @@ fn spawn_persist_worker(
     );
     impl Drop for ExitFlag {
         fn drop(&mut self) {
-            self.3.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.3.lock().unwrap_or_else(|e| e.into_inner()).close_and_clear();
             self.0.store(true, Ordering::Release);
             *self.1 .0.lock().unwrap_or_else(|e| e.into_inner()) = true;
             self.1 .1.notify_all();
@@ -7998,8 +8174,17 @@ fn spawn_persist_worker(
             zero_check_contexts,
         );
         let mut last_sent_watchdog_park: Option<(u64, u8)> = None;
-        let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
+        let push_cmd = |tx: &mut Producer<PersistCmd>, mut cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             mirror_persist_cmd_text(terminal_capture.as_deref(), &cmd);
+            match &mut cmd {
+                PersistCmd::Fail { message, .. } | PersistCmd::Abort { message, .. } => {
+                    *message = truncate_rt_diagnostic(std::mem::take(message), 256);
+                }
+                PersistCmd::DirSyncFailed { warning, .. } => {
+                    *warning = truncate_rt_diagnostic(std::mem::take(warning), 256);
+                }
+                _ => {}
+            }
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
                 if stop.load(Ordering::Acquire) || dead.load(Ordering::Acquire) || tx.is_abandoned() {
@@ -8072,6 +8257,7 @@ fn spawn_persist_worker(
                         action_id,
                         offset_rad,
                         base_revision,
+                        connection_id,
                         lease_owner,
                         estop_epoch,
                         stop_gen,
@@ -8088,6 +8274,7 @@ fn spawn_persist_worker(
                                 action_id,
                                 offset_rad,
                                 base_revision,
+                                connection_id,
                                 lease_owner,
                                 estop_epoch,
                                 stop_gen,
@@ -8125,17 +8312,43 @@ fn spawn_persist_worker(
                     }
                 },
             };
-            // Stop-aware config write lock acquisition: teardown unparks this thread and sets
-            // `persist_stop`, preventing deadlock even if the caller holds `config_write_mutex`.
+            // Stop-aware AND deadline-bounded config write lock acquisition: teardown unparks
+            // this thread and sets `persist_stop`, and exceeding `job.deadline` before reservation
+            // settles the action + PR0B session cleanly as `DEADLINE_EXPIRED` without touching disk.
+            let mut deadline_expired = false;
             let _cw = loop {
                 if persist_stop.load(Ordering::Acquire) || control_exited.load(Ordering::Acquire) {
                     return;
                 }
+                if Instant::now() > job.deadline {
+                    deadline_expired = true;
+                    break None;
+                }
                 match config_write_mutex.try_lock() {
-                    Ok(guard) => break guard,
+                    Ok(guard) => break Some(guard),
                     Err(_) => thread::park_timeout(Duration::from_millis(2)),
                 }
             };
+            if deadline_expired {
+                let _ = push_cmd(
+                    &mut cmd_tx,
+                    PersistCmd::Fail {
+                        action_id: job.action_id,
+                        code: "DEADLINE_EXPIRED".into(),
+                        message: "Gripper calibration persistence deadline expired before reservation".into(),
+                        unused_policy: None,
+                        unused_jaw: job.ctx.jaw_opening,
+                    },
+                    &persist_stop,
+                    &control_exited,
+                );
+                let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                if hooks.exit_after_first_job {
+                    break;
+                }
+                continue;
+            }
+            let _cw = _cw.expect("mutex guard acquired when deadline not expired");
             let auth_ok = job
                 .ctx
                 .operator_auth
@@ -8235,7 +8448,7 @@ struct ExecutorPersistBackend<'a> {
 }
 
 impl ExecutorPersistBackend<'_> {
-    fn push_cmd(&mut self, cmd: PersistCmd) -> bool {
+    fn push_cmd(&mut self, mut cmd: PersistCmd) -> bool {
         if let Some(ch) = self.terminal_capture {
             match &cmd {
                 PersistCmd::Fail { action_id, message, .. }
@@ -8249,6 +8462,15 @@ impl ExecutorPersistBackend<'_> {
                 }
                 _ => {}
             }
+        }
+        match &mut cmd {
+            PersistCmd::Fail { message, .. } | PersistCmd::Abort { message, .. } => {
+                *message = truncate_rt_diagnostic(std::mem::take(message), 256);
+            }
+            PersistCmd::DirSyncFailed { warning, .. } => {
+                *warning = truncate_rt_diagnostic(std::mem::take(warning), 256);
+            }
+            _ => {}
         }
         let mut pending = Some(cmd);
         while let Some(c) = pending.take() {
@@ -8313,6 +8535,7 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
         if !self.push_cmd(PersistCmd::Reserve {
             action_id: self.job.action_id,
             base_revision: self.job.base_revision,
+            connection_id: self.job.connection_id,
             lease_owner: self.job.lease_owner,
             estop_epoch: self.job.estop_epoch,
             stop_gen: self.job.stop_gen,
@@ -10229,15 +10452,13 @@ fn control_thread_main_inner(
                             }
                         }
                     }
-                    if let Some(mut ev) = core.pending_zero_check_stream_persist.take() {
+                    if let Some(ev) = core.pending_zero_check_stream_persist.take() {
                         if let crate::supervisor::ZeroCheckStreamEvent::Persist {
                             action_id,
-                            ref mut stop_gen,
                             persist_ctx_id,
                             ..
                         } = ev
                         {
-                            *stop_gen = state.stop_requests.current();
                             let inject_fail = state
                                 .hooks
                                 .fail_zero_check_stream_push_once
@@ -12756,6 +12977,7 @@ mod tests {
             action_id: 1,
             base_revision: 0,
             lease_owner: None,
+            connection_id: 0,
             estop_epoch: 1,
             stop_gen: 0,
             deadline: Instant::now() + Duration::from_secs(5),
@@ -12819,6 +13041,7 @@ mod tests {
             action_id: 7,
             offset_rad: 0.01,
             base_revision: 0,
+            connection_id: 0,
             lease_owner: None,
             estop_epoch: 1,
             stop_gen: 0,

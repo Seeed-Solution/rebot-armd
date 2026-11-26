@@ -462,6 +462,7 @@ async fn test_zero_check_store_offset_limit_rejection_marks_action_failed() {
         persist_ctx,
         persist_ctx_id: 0,
         session_id: None,
+        connection_id: 0,
         operator_grant: None,
     });
     // Measured position 0.4 rad (offset = 0.4 rad <= threshold 0.5 rad, so mechanical check passes)

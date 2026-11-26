@@ -438,6 +438,7 @@ fn sample_persist_job(action_id: u64, dir: &std::path::Path) -> PendingZeroCheck
         action_id,
         offset_rad: 0.01,
         base_revision: 1,
+        connection_id: 0,
         lease_owner: None,
         estop_epoch: 1,
         stop_gen: 0,
