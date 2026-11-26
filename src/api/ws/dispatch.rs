@@ -610,6 +610,7 @@ impl DispatchEntry {
             operator,
             lease,
             fault: self.fault,
+            owner_unavailable: crate::api::routes::OwnerUnavailableAvailability::Fenced,
         }
     }
 }

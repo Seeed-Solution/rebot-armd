@@ -111,9 +111,9 @@ impl SupervisorInner {
         self.config.gravity_comp.as_ref().filter(|_| self.config.six_plus_gripper() && self.config.gravity_model.is_some())
     }
 
-    /// The profile and driver support the mode (independent of the current state).
+    /// Profile and driver support for gravity compensation (independent of owner routing).
     #[allow(clippy::result_large_err)] // inline ModeReason keeps fill_observation zero-alloc on RT
-    pub fn gravity_comp_support(&self) -> Result<(), ModeReason> {
+    fn gravity_comp_driver_support(&self) -> Result<(), ModeReason> {
         if self.gravity_comp_policy().is_none() {
             return Err(reason("UNSUPPORTED", "Gravity compensation needs a 7-DOF profile with a gravity model and a gravity_comp section"));
         }
@@ -134,6 +134,26 @@ impl SupervisorInner {
             if !caps.velocity_feedback || !caps.torque_feedback || !caps.enable_feedback {
                 return Err(reason("UNSUPPORTED", "Gravity compensation needs velocity, torque and enable feedback"));
             }
+        }
+        Ok(())
+    }
+
+    /// The profile, driver, and active control owner support the mode (independent of the current
+    /// runtime state). Matches the WS/config entry gate (`OWNER_EXECUTOR && driver.is_some()`).
+    #[allow(clippy::result_large_err)] // inline ModeReason keeps fill_observation zero-alloc on RT
+    pub fn gravity_comp_support(&self) -> Result<(), ModeReason> {
+        self.gravity_comp_support_for_owner(self.rt_executor_owned)
+    }
+
+    /// Evaluates gravity-compensation support for a specific owner (`rt_executor_owned`).
+    #[allow(clippy::result_large_err)]
+    pub fn gravity_comp_support_for_owner(&self, rt_executor_owned: bool) -> Result<(), ModeReason> {
+        self.gravity_comp_driver_support()?;
+        if rt_executor_owned && self.driver.is_some() {
+            return Err(reason(
+                "EXECUTOR_CAPABILITY_UNSUPPORTED",
+                "Gravity compensation hardware MIT mode-switch is not supported on the RT executor; set arm.armd_owner to legacy and restart armd",
+            ));
         }
         Ok(())
     }
@@ -173,7 +193,16 @@ impl SupervisorInner {
 
     /// Why entering is refused now; None when it is allowed (or the mode is already on).
     pub fn gravity_comp_blocker(&self) -> Option<ModeReason> {
-        if let Err(r) = self.gravity_comp_support() { return Some(r); }
+        self.gravity_comp_blocker_with_owner_gate(true)
+    }
+
+    fn gravity_comp_blocker_with_owner_gate(&self, enforce_executor_gate: bool) -> Option<ModeReason> {
+        let support = if enforce_executor_gate {
+            self.gravity_comp_support()
+        } else {
+            self.gravity_comp_driver_support()
+        };
+        if let Err(r) = support { return Some(r); }
         if self.gravity_comp.is_some() { return None; }
         // MIT torque commands are only as right as the mapping ranges: require the
         // startup range check to have passed when the driver ran one.
@@ -378,7 +407,12 @@ impl SupervisorInner {
 
     fn enter_gravity_comp_inner(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
         if self.gravity_comp.is_some() { return Ok(()); }
-        if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(r.code.as_str(), r.message.to_string())); }
+        // Legacy WS calls reach this only on OWNER_LEGACY; direct in-core RT tick harnesses also
+        // call `enter_gravity_comp` directly to test the underlying tick engine independently of the
+        // owner-routed WS capability gate (`requests::config::gravity_comp_command`).
+        if let Some(r) = self.gravity_comp_blocker_with_owner_gate(false) {
+            return Err(Self::reject(r.code.as_str(), r.message.to_string()));
+        }
         let policy = self.gravity_comp_policy().cloned().ok_or_else(|| Self::reject("UNSUPPORTED", "no policy".into()))?;
         let [lo, hi] = policy.scale_range;
         let scale = request.scale.unwrap_or(policy.scale);
