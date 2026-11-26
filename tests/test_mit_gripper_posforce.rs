@@ -5065,3 +5065,260 @@ fn pos_force_freeze_cache_rejects_150ms_queued_sample_and_boot_fallback_no_outpu
     );
     assert_eq!(d2.pos_force_last_fresh_position(), None);
 }
+
+/// Regression (B601-DM rc4 step4-gripper 2026-11-26): after closing empty jaws to a stall in
+/// pos_force mode (current_ceiling_raw = 460, close_speed_rad_s = 0.30), static closing preload
+/// (+0.47 N·m > GRIPPER_STALL_LATCH_NM 0.444 N·m) remains while the opening command unwinds off
+/// the closed stop. Opening (`move(0.5)` and `open`) immediately after a closed stall must
+/// complete cleanly, while a real obstruction during opening must still stop with GRIPPER_TIMEOUT.
+#[test]
+fn pos_force_open_and_move_succeed_immediately_after_closed_stall() {
+    use std::sync::{Arc, Mutex};
+    use armd::motion::{GripperCommand, GripperRequest};
+    use armd::supervisor::SupervisorInner;
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    const DT: f64 = 0.02;
+    const RAW_460: u16 = 460;
+    const CLOSED_STOP: f32 = -0.1015;
+    const UNLOAD_REST: f32 = -0.132;
+    const UNWIND_THRESHOLD: f32 = -0.150;
+    const PRELOAD_HOLD_NM: f32 = 0.4713;
+
+    #[derive(Clone)]
+    struct PlantCfg {
+        open_block: Option<f32>,
+    }
+
+    #[derive(Clone)]
+    struct PreloadedPosForceBus {
+        inner: FakeBus,
+        cfg: Arc<Mutex<PlantCfg>>,
+    }
+
+    impl CanTransport for PreloadedPosForceBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let prev_q = self.inner.with(|s| s.motors[J7].q);
+            self.inner.transmit(frame)?;
+            if frame.id == 0x307 {
+                let open_block = self.cfg.lock().unwrap().open_block;
+                self.inner.with(|s| {
+                    let m = &mut s.motors[J7];
+                    if !m.enabled { return; }
+                    let target_p = f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+                    let vel_raw = u16::from_le_bytes([frame.data[4], frame.data[5]]);
+                    let cur_raw = u16::from_le_bytes([frame.data[6], frame.data[7]]);
+                    let cap = f32::from(cur_raw) * 0.0019;
+                    let wire_v = f32::from(vel_raw) * 0.01;
+                    let max_step = wire_v * DT as f32;
+
+                    if prev_q >= UNLOAD_REST && target_p > UNWIND_THRESHOLD {
+                        // Compliant closed stop with elastic preload: while the command has not
+                        // unwound past the preload + deadband, the jaw stays pressed near the
+                        // closed stop with residual closing torque >= +0.47 N·m.
+                        let next_q = (prev_q + (target_p - prev_q).clamp(-max_step, max_step))
+                            .clamp(CLOSED_STOP - 0.0015, CLOSED_STOP);
+                        m.q = next_q;
+                        m.v = 0.0;
+                        let extra = ((target_p - CLOSED_STOP).max(0.0) * 15.0).min(cap);
+                        m.tau = (PRELOAD_HOLD_NM + extra).min(cap);
+                    } else if target_p >= CLOSED_STOP {
+                        let next_q = (prev_q + (target_p - prev_q).clamp(-max_step, max_step)).min(CLOSED_STOP);
+                        m.q = next_q;
+                        if next_q >= CLOSED_STOP - 1e-4 {
+                            m.v = 0.0;
+                            m.tau = (PRELOAD_HOLD_NM + (target_p - CLOSED_STOP).max(0.0) * 15.0).min(cap);
+                        } else {
+                            m.v = (next_q - prev_q) / DT as f32;
+                            m.tau = 0.25;
+                        }
+                    } else {
+                        let mut next_q = prev_q + (target_p - prev_q).clamp(-max_step, max_step);
+                        if let Some(block) = open_block {
+                            if next_q <= block {
+                                next_q = block;
+                                m.q = next_q;
+                                m.v = 0.0;
+                                // Real opening obstruction: motor pushes open (negative torque).
+                                m.tau = -((block - target_p).max(0.0) * 120.0).min(cap);
+                                let updated = m.feedback_frame();
+                                if let Some(last) = s.pending.back_mut().filter(|f| f.id == updated.id) {
+                                    *last = updated;
+                                } else if let Some(last) = s.rx.back_mut().filter(|f| f.id == updated.id) {
+                                    *last = updated;
+                                }
+                                return;
+                            }
+                        }
+                        m.q = next_q;
+                        m.v = (next_q - prev_q) / DT as f32;
+                        m.tau = if (next_q - prev_q).abs() > 1e-5 { -0.27 } else { 0.0 };
+                    }
+                    let updated = m.feedback_frame();
+                    if let Some(last) = s.pending.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    } else if let Some(last) = s.rx.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    }
+                });
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+        fn flush_is_noop(&self) -> bool { self.inner.flush_is_noop() }
+    }
+
+    let clock = MockClock::new();
+    let raw_bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    raw_bus.with(|s| {
+        s.immediate_replies = true;
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = if i == J7 { -0.60 } else { 0.0 };
+        }
+    });
+    let plant_cfg = Arc::new(Mutex::new(PlantCfg { open_block: None }));
+    let bus = PreloadedPosForceBus { inner: raw_bus.clone(), cfg: plant_cfg.clone() };
+    let pf_460 = GripperPosForce { current_raw: RAW_460, close_speed_rad_s: 0.30, ..pf() };
+    let d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits())
+        .unwrap()
+        .with_gripper_pos_force(pf_460)
+        .unwrap();
+
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    inner.follower = Some("damiao".into());
+    inner.tick(DT);
+    raw_bus.with(|s| s.push_all_feedback());
+    clock.advance(Duration::from_millis(20));
+    inner.tick(DT);
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    clock.advance(Duration::from_millis(20));
+    inner.tick(DT);
+
+    let step_action = |inner: &mut SupervisorInner, clock: &MockClock, id: u64, max_ticks: usize| {
+        for _ in 0..max_ticks {
+            clock.advance(Duration::from_millis(20));
+            inner.tick(DT);
+            let a = inner.last_action.clone().unwrap();
+            assert_eq!(a.id, id);
+            if !a.is_running() {
+                return a;
+            }
+        }
+        panic!("action {id} did not finish: {:?}", inner.last_action);
+    };
+
+    let epoch = inner.safety.epoch_id();
+
+    // 1. Close empty gripper to a stall against the closed mechanical stop.
+    let (id_close, _) = {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::start_gripper(
+            a,
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
+            epoch,
+        )
+    }
+    .unwrap();
+    let close_res = step_action(&mut inner, &clock, id_close, 400);
+    assert_eq!((close_res.state.as_str(), close_res.holding), ("done", Some(false)), "{close_res:?}");
+    assert!(inner.gripper_stalled, "empty close against closed stop must latch stall");
+    assert!(inner.gripper_stall_sign > 0.0, "stall sign must be closing (+1)");
+
+    // Let post-close hold_gripper_at_measured() settle onto the preloaded closed stop (~+0.47 N·m).
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(20));
+        inner.tick(DT);
+    }
+    assert!(inner.gripper_stalled, "stall latch stays active under +0.47 N·m closing preload");
+    assert!(inner.torques[J7] >= armd::supervisor::GRIPPER_STALL_LATCH_NM, "expected closing preload >= 0.444 N·m, got {}", inner.torques[J7]);
+
+    // 2. Immediately move(0.5) right after the closed stall: must reach -2.85 rad, NOT GRIPPER_TIMEOUT.
+    let (id_move, _) = {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::start_gripper(
+            a,
+            GripperRequest { command: GripperCommand::Move, fraction: Some(0.5), grasp: false, speed: 1.0, timeout_s: None, tag: None },
+            epoch,
+        )
+    }
+    .unwrap();
+    let move_res = step_action(&mut inner, &clock, id_move, 400);
+    assert_eq!(move_res.state.as_str(), "done", "move(0.5) right after closed stall failed: {move_res:?}");
+    assert!((inner.measured_positions[J7] - (-2.85)).abs() < 0.05, "J7 at {}", inner.measured_positions[J7]);
+
+    // 3. Close to a stall again, then immediately open with 0 idle ticks: must reach -5.70 rad.
+    let (id_close2, _) = {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::start_gripper(
+            a,
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
+            epoch,
+        )
+    }
+    .unwrap();
+    let close2_res = step_action(&mut inner, &clock, id_close2, 800);
+    assert_eq!((close2_res.state.as_str(), close2_res.holding), ("done", Some(false)), "{close2_res:?}");
+    assert!(inner.gripper_stalled);
+
+    let (id_open, _) = {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::start_gripper(
+            a,
+            GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None },
+            epoch,
+        )
+    }
+    .unwrap();
+    let open_res = step_action(&mut inner, &clock, id_open, 500);
+    assert_eq!(open_res.state.as_str(), "done", "open right after closed stall failed: {open_res:?}");
+    assert!((inner.measured_positions[J7] - (-5.70)).abs() < 0.05, "J7 at {}", inner.measured_positions[J7]);
+
+    // 4. A real obstruction while opening MUST still stop with GRIPPER_TIMEOUT and latch stall.
+    let (id_close3, _) = {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::start_gripper(
+            a,
+            GripperRequest { command: GripperCommand::Move, fraction: Some(0.1), grasp: false, speed: 1.0, timeout_s: None, tag: None },
+            epoch,
+        )
+    }
+    .unwrap();
+    let _ = step_action(&mut inner, &clock, id_close3, 1200);
+    plant_cfg.lock().unwrap().open_block = Some(-2.0);
+    let (id_open_blocked, _) = {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::start_gripper(
+            a,
+            GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None },
+            epoch,
+        )
+    }
+    .unwrap();
+    let blocked_res = step_action(&mut inner, &clock, id_open_blocked, 400);
+    assert_eq!(
+        (blocked_res.state.as_str(), blocked_res.code.as_deref()),
+        ("failed", Some("GRIPPER_TIMEOUT")),
+        "real opening obstruction must fail with GRIPPER_TIMEOUT: {blocked_res:?}"
+    );
+    assert!(inner.gripper_stalled && inner.gripper_stall_sign < 0.0, "opening obstruction must latch opening stall");
+    assert!((inner.measured_positions[J7] - (-2.0)).abs() < 0.05, "J7 at {}", inner.measured_positions[J7]);
+}

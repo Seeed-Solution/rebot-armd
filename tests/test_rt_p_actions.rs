@@ -5107,3 +5107,220 @@ async fn r4_m3_single_effective_cutoff_blocks_tx_critical_section_on_both_owners
         );
     }
 }
+
+/// RT Executor owner parity for B601-DM pos_force open/move immediately after a closed stall:
+/// standalone `prepare_gripper` -> `install_gripper` on `OWNER_EXECUTOR` with `DamiaoArmDriver<FakeBus>`
+/// (current_ceiling_raw 460, close_speed 0.30) must complete `move(0.5)` and `open` after a
+/// stalled empty close with +0.47 N·m residual closing preload, while still failing with
+/// `GRIPPER_TIMEOUT` on a real opening obstruction.
+#[test]
+fn rt_executor_pos_force_gripper_open_and_move_after_closed_stall() {
+    use armd::driver::{ArmDriver, DamiaoArmDriver, GripperPosForce, TxBudget};
+    use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
+    use mit_support::FakeBus;
+
+    const J7: usize = 6;
+    const RAW_460: u16 = 460;
+    const CLOSED_STOP: f32 = -0.1015;
+    const UNLOAD_REST: f32 = -0.132;
+    const UNWIND_THRESHOLD: f32 = -0.150;
+    const PRELOAD_HOLD_NM: f32 = 0.4713;
+
+    #[derive(Clone)]
+    struct PreloadedPosForceBus {
+        inner: FakeBus,
+        open_block: Arc<Mutex<Option<f32>>>,
+    }
+
+    impl CanTransport for PreloadedPosForceBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let prev_q = self.inner.with(|s| s.motors[J7].q);
+            self.inner.transmit(frame)?;
+            if frame.id == 0x307 {
+                let open_block = *self.open_block.lock().unwrap();
+                self.inner.with(|s| {
+                    let m = &mut s.motors[J7];
+                    if !m.enabled { return; }
+                    let target_p = f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+                    let vel_raw = u16::from_le_bytes([frame.data[4], frame.data[5]]);
+                    let cur_raw = u16::from_le_bytes([frame.data[6], frame.data[7]]);
+                    let cap = f32::from(cur_raw) * 0.0019;
+                    let max_step = f32::from(vel_raw) * 0.01 * DT as f32;
+
+                    if prev_q >= UNLOAD_REST && target_p > UNWIND_THRESHOLD {
+                        let next_q = (prev_q + (target_p - prev_q).clamp(-max_step, max_step))
+                            .clamp(CLOSED_STOP - 0.0015, CLOSED_STOP);
+                        m.q = next_q;
+                        m.v = 0.0;
+                        m.tau = (PRELOAD_HOLD_NM + (target_p - CLOSED_STOP).max(0.0) * 15.0).min(cap);
+                    } else if target_p >= CLOSED_STOP {
+                        let next_q = (prev_q + (target_p - prev_q).clamp(-max_step, max_step)).min(CLOSED_STOP);
+                        m.q = next_q;
+                        if next_q >= CLOSED_STOP - 1e-4 {
+                            m.v = 0.0;
+                            m.tau = (PRELOAD_HOLD_NM + (target_p - CLOSED_STOP).max(0.0) * 15.0).min(cap);
+                        } else {
+                            m.v = (next_q - prev_q) / DT as f32;
+                            m.tau = 0.25;
+                        }
+                    } else {
+                        let mut next_q = prev_q + (target_p - prev_q).clamp(-max_step, max_step);
+                        if let Some(block) = open_block {
+                            if next_q <= block {
+                                next_q = block;
+                                m.q = next_q;
+                                m.v = 0.0;
+                                m.tau = -((block - target_p).max(0.0) * 120.0).min(cap);
+                                let updated = m.feedback_frame();
+                                if let Some(last) = s.pending.back_mut().filter(|f| f.id == updated.id) {
+                                    *last = updated;
+                                } else if let Some(last) = s.rx.back_mut().filter(|f| f.id == updated.id) {
+                                    *last = updated;
+                                }
+                                return;
+                            }
+                        }
+                        m.q = next_q;
+                        m.v = (next_q - prev_q) / DT as f32;
+                        m.tau = if (next_q - prev_q).abs() > 1e-5 { -0.27 } else { 0.0 };
+                    }
+                    let updated = m.feedback_frame();
+                    if let Some(last) = s.pending.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    } else if let Some(last) = s.rx.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    }
+                });
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+        fn flush_is_noop(&self) -> bool { self.inner.flush_is_noop() }
+    }
+
+    let limits: Vec<_> = ArmConfig::rebot_dm()
+        .damiao_ranges
+        .unwrap()
+        .iter()
+        .map(|r| r.limits())
+        .collect();
+    let clock = MockClock::new();
+    let raw_bus = FakeBus::with_clock(&limits, clock.clone());
+    raw_bus.with(|s| {
+        s.immediate_replies = true;
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = if i == J7 { -0.60 } else { 0.0 };
+        }
+    });
+    let open_block = Arc::new(Mutex::new(None));
+    let bus = PreloadedPosForceBus { inner: raw_bus.clone(), open_block: Arc::clone(&open_block) };
+    let pf_cfg = GripperPosForce {
+        joint: J7,
+        current_raw: RAW_460,
+        close_speed_rad_s: 0.30,
+        closed_rad: 0.0,
+        open_rad: -5.7,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    };
+    let mut drv = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(pf_cfg)
+        .unwrap()
+        .with_tx_budget(TxBudget::default());
+    drv.read_joint_states().unwrap();
+    raw_bus.with(|s| s.push_all_feedback());
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+
+    let cfg = ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.follower = Some("damiao".into());
+    inner.tick(DT);
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    clock.advance(Duration::from_millis(20));
+    inner.tick(DT);
+    assert!(inner.safety.state().is_operational());
+    inner.register_live_connection(1).unwrap();
+    inner.rt_executor_owned = true;
+
+    let vclock = VirtualClock::from_mock_clock(clock);
+    let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
+        inner,
+        BOOT,
+        Capacities { commands: 8, plans: 4, replies: 32 },
+        vclock,
+    );
+    fx.step();
+
+    let mut next_seq = 1u64;
+    let mut run_gripper = |fx: &mut Fx, b: &mut Broker<PlanSlot>, body: serde_json::Value, max_ticks: usize| -> Outcome {
+        let snap = snap_of(fx);
+        let prep = prepare_gripper(&snap, &body, GripperBaselineCmd::None).unwrap();
+        let slot = prep.to_plan_slot(None).unwrap();
+        let seq = next_seq;
+        next_seq += 1;
+        let req = submit_slot_prepared(
+            b,
+            ClientId(1),
+            seq,
+            auth(fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            PreparedActionKind::Gripper,
+            BOOT,
+            slot,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let rep = fx.step();
+        assert!(matches!(rep.command, Some((r, Ok(_))) if r == req), "{rep:?}");
+        let act = fx.active().unwrap();
+        let (ended_id, outcome) = step_until_ended(fx, max_ticks);
+        assert_eq!(ended_id, act);
+        let _ = drain_all(b);
+        outcome
+    };
+
+    // 1. Close empty jaws to a stall on RT Executor.
+    let close_out = run_gripper(&mut fx, &mut b, json!({"command": "close", "grasp": true, "speed": 1.0}), 400);
+    assert_eq!(close_out, Outcome::Completed, "close failed: {close_out:?}");
+    assert!(fx.core.gripper_stalled && fx.core.gripper_stall_sign > 0.0);
+    // Let post-close hold settle onto preloaded closed stop (~+0.47 N·m).
+    for _ in 0..3 { fx.step(); }
+    assert!(fx.core.gripper_stalled);
+
+    // 2. Immediately move(0.5) right after closed stall: must complete at -2.85 rad.
+    let move_out = run_gripper(&mut fx, &mut b, json!({"command": "move", "fraction": 0.5, "speed": 1.0}), 400);
+    assert_eq!(move_out, Outcome::Completed, "RT executor move(0.5) after stall failed: {move_out:?}");
+    assert!((fx.core.measured_positions[J7] - (-2.85)).abs() < 0.05, "J7 at {}", fx.core.measured_positions[J7]);
+
+    // 3. Real obstruction while opening still fails with GRIPPER_TIMEOUT on RT Executor.
+    let _ = run_gripper(&mut fx, &mut b, json!({"command": "move", "fraction": 0.1, "speed": 1.0}), 800);
+    *open_block.lock().unwrap() = Some(-2.0);
+    let blocked_out = run_gripper(&mut fx, &mut b, json!({"command": "open", "speed": 1.0}), 400);
+    assert!(
+        matches!(blocked_out, Outcome::Failed("GRIPPER_TIMEOUT")),
+        "RT executor real opening obstruction must fail with GRIPPER_TIMEOUT: {blocked_out:?}"
+    );
+    assert!(fx.core.gripper_stalled && fx.core.gripper_stall_sign < 0.0);
+}
