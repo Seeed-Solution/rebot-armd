@@ -627,8 +627,6 @@ impl SafeHoldBuffers {
                     });
                 }
             }
-        } else {
-            ctrl.holding_unconfirmed.store(false, Ordering::Release);
         }
 
         // 6. Masked measured-position hold TX (zero planner calls; only joints with captured
@@ -694,6 +692,11 @@ impl SafeHoldBuffers {
             if let Some(ref mut sh) = shadow {
                 sh.drain_from_driver(drv);
             }
+        }
+        if all_bus_fresh {
+            // Fresh feedback confirms holding only when no required axis is left without verified
+            // hold output (`UnheldNoVerifiedMode`); set once per tick, never cleared then re-set.
+            ctrl.holding_unconfirmed.store(unverified_mask != 0, Ordering::Release);
         }
         if let Some(ref mut sh) = shadow {
             sh.enqueue(crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {

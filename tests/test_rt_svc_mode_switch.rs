@@ -2176,3 +2176,53 @@ async fn mode_switch_terminal_reaches_caller_that_falls_behind_via_router_credit
     assert_eq!(exec.router_global_reserved(), 0, "terminal credit recovered after delivery");
     h.shutdown(false).await;
 }
+
+/// Minor: SAFE-HOLD with fresh feedback but an axis that has no verified mode (unheld) must keep
+/// `holding_unconfirmed` set.
+#[test]
+fn safe_hold_keeps_holding_unconfirmed_while_axis_unheld_without_verified_mode() {
+    use armd::rt_core::safe_hold::{SafeHoldBuffers, SafeHoldControl};
+    use armd::supervisor::SupervisorInner;
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(200), true, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 16);
+    enable_driver_sync(&mut drv, &bus, Some(&clock));
+    let mut core = SupervisorInner::new(cfg.clone());
+    core.lease_enabled = false;
+    core.measured_positions = vec![0.30, -0.25, 0.40, 0.15, -0.15, 0.10, -0.14];
+    core.feedback_numeric_valid = true;
+    let period = PERIOD_50HZ;
+    let mut bufs = SafeHoldBuffers::from_config(&cfg, period);
+    bufs.mirror_from_core(&core);
+    bufs.seed_on_entry(&core);
+    bufs.prepare_driver_on_entry(&mut drv);
+    let ctrl = SafeHoldControl::new();
+    ctrl.mark_active(SafeHoldReason::ControlPanic);
+    // J1's mode is unknown (e.g. lost REG_WRITE ACK) and its CTRL_MODE probe is never answered.
+    drv.latch_axis_mode_uncertain(0);
+    bus.with(|s| s.motors[0].ignore_reg_writes = true);
+    for _ in 0..3 {
+        clock.advance(period);
+        bus.with(|s| {
+            s.push_all_feedback();
+            // Drop any CTRL_MODE read reply for J1 so it stays unverified.
+            let is_j1_mode_reply = |f: &CanFrame| {
+                f.dlc == 8
+                    && f.data[0] == 1
+                    && f.data[2] == damiao::REG_READ
+                    && f.data[3] == damiao::RID_CTRL_MODE
+            };
+            s.rx.retain(|f| !is_j1_mode_reply(f));
+            s.pending.retain(|f| !is_j1_mode_reply(f));
+        });
+        let mut now_fn = || clock.now();
+        let dl = clock.now() + period;
+        bufs.step_driver(&mut drv, &ctrl, dl, &mut now_fn);
+        assert_ne!(drv.mode_write_uncertain_mask() & 1, 0, "J1 must stay unverified");
+        assert!(
+            ctrl.holding_unconfirmed(),
+            "SAFE-HOLD must not report confirmed holding while J1 is unheld"
+        );
+    }
+}
