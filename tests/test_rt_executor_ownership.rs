@@ -1937,14 +1937,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
 
     let legacy_resp = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/action/gripper_zero_check")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{}"#))
-                .unwrap(),
-        )
+        .oneshot(armd::api::routes::build_legacy_only_rest_probe_request())
         .await
         .unwrap();
     assert_eq!(legacy_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2962,13 +2955,12 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
     assert_eq!(jog_resp.status(), reqwest::StatusCode::CONFLICT);
     assert!(jog_resp.text().await.unwrap().contains("LEASE_REQUIRED"));
 
-    let legacy_zero_check_url = format!("http://127.0.0.1:{port}/api/v1/action/gripper_zero_check");
-    let legacy_resp = client
-        .post(&legacy_zero_check_url)
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap();
+    let legacy_resp = common::send_legacy_only_rest_probe(
+        &client,
+        &format!("http://127.0.0.1:{port}"),
+        None,
+    )
+    .await;
     assert_eq!(legacy_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert!(legacy_resp.text().await.unwrap().contains("EXECUTOR_ROUTING_PENDING"));
 

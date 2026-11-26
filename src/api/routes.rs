@@ -43,6 +43,36 @@ impl RestMethod {
             _ => None,
         }
     }
+
+    pub fn to_http(self) -> Method {
+        match self {
+            Self::Get => Method::GET,
+            Self::Post => Method::POST,
+            Self::Delete => Method::DELETE,
+        }
+    }
+}
+
+/// Canonical remaining `RouteOwnership::LegacyOnly` REST route probe (`(method, path)`).
+/// Centralized so future executor migrations update a single location.
+pub const LEGACY_ONLY_REST_PROBE: (RestMethod, &str) =
+    (RestMethod::Get, "/api/v1/diagnostics/power");
+
+/// Canonical remaining `RouteOwnership::LegacyOnly` WS command probe.
+/// Centralized so future executor migrations update a single location.
+pub const LEGACY_ONLY_WS_PROBE: &str = crate::gripper_calib::CALIBRATE_PATH;
+
+/// Builds an Axum HTTP request targeting [`LEGACY_ONLY_REST_PROBE`] with a method-appropriate body.
+pub fn build_legacy_only_rest_probe_request() -> Request<Body> {
+    let (method, path) = LEGACY_ONLY_REST_PROBE;
+    let builder = Request::builder().method(method.to_http()).uri(path);
+    match method {
+        RestMethod::Post => builder
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+        RestMethod::Get | RestMethod::Delete => builder.body(Body::empty()).unwrap(),
+    }
 }
 
 /// Primary lookup key in the unified REST + WS route capability registry.
@@ -765,7 +795,7 @@ mod tests {
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(
-            lookup(RouteKey::rest(RestMethod::Post, "/api/v1/action/gripper_zero_check")).unwrap().ownership,
+            lookup(RouteKey::rest(LEGACY_ONLY_REST_PROBE.0, LEGACY_ONLY_REST_PROBE.1)).unwrap().ownership,
             RouteOwnership::LegacyOnly
         );
         assert_eq!(
@@ -789,7 +819,7 @@ mod tests {
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(
-            lookup(RouteKey::ws_command("/api/v1/action/gripper_zero_check")).unwrap().ownership,
+            lookup(RouteKey::ws_command(LEGACY_ONLY_WS_PROBE)).unwrap().ownership,
             RouteOwnership::LegacyOnly
         );
         assert_eq!(
@@ -914,24 +944,18 @@ mod tests {
             .unwrap();
         assert_eq!(post_mode.status(), StatusCode::FORBIDDEN);
 
-        // Unmigrated LegacyOnly route (POST /api/v1/action/gripper_zero_check) still returns 503 EXECUTOR_ROUTING_PENDING.
+        // Unmigrated LegacyOnly route (`LEGACY_ONLY_REST_PROBE`) still returns 503 EXECUTOR_ROUTING_PENDING.
         let legacy_rec = router
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/v1/action/gripper_zero_check")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
+            .oneshot(build_legacy_only_rest_probe_request())
             .await
             .unwrap();
         assert_eq!(legacy_rec.status(), StatusCode::SERVICE_UNAVAILABLE);
         let legacy_body = axum::body::to_bytes(legacy_rec.into_body(), 4096).await.unwrap();
         assert!(
             String::from_utf8_lossy(&legacy_body).contains("EXECUTOR_ROUTING_PENDING"),
-            "POST /api/v1/action/gripper_zero_check must remain LegacyOnly: {legacy_body:?}"
+            "{} must remain LegacyOnly: {legacy_body:?}",
+            LEGACY_ONLY_REST_PROBE.1
         );
 
         // Executor: OPTIONS /api/v1/observation fails closed with 503 EXECUTOR_ROUTING_PENDING.

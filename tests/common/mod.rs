@@ -38,6 +38,27 @@ pub async fn spawn_server(config: ArmConfig) -> (SocketAddr, Arc<ArmSupervisor>)
     (addr, supervisor)
 }
 
+/// Sends an HTTP request to `armd::api::routes::LEGACY_ONLY_REST_PROBE` against `base_url`
+/// (e.g. `http://127.0.0.1:12345`), choosing the HTTP verb and body from the centralized constant.
+pub async fn send_legacy_only_rest_probe(
+    http: &reqwest::Client,
+    base_url: &str,
+    bearer: Option<&str>,
+) -> reqwest::Response {
+    use armd::api::routes::{RestMethod, LEGACY_ONLY_REST_PROBE};
+    let (method, path) = LEGACY_ONLY_REST_PROBE;
+    let url = format!("{base_url}{path}");
+    let mut req = match method {
+        RestMethod::Get => http.get(&url),
+        RestMethod::Post => http.post(&url).json(&serde_json::json!({})),
+        RestMethod::Delete => http.delete(&url),
+    };
+    if let Some(tok) = bearer {
+        req = req.bearer_auth(tok);
+    }
+    req.send().await.unwrap()
+}
+
 pub async fn send(ws: &mut TestSocket, message: serde_json::Value) {
     ws.send(Message::Text(message.to_string().into())).await.unwrap();
 }

@@ -499,10 +499,10 @@ async fn pf1_mock_ws_replay_success_reject_cancel_stop_and_handover() {
     req_id += 1;
     assert_ne!(rec_rej["code"].as_str(), Some("EXECUTOR_ROUTING_PENDING"), "{rec_rej}");
 
-    // Unmigrated gripper_zero_check stays at 503 EXECUTOR_ROUTING_PENDING.
+    // Unmigrated `LEGACY_ONLY_WS_PROBE` stays at 503 EXECUTOR_ROUTING_PENDING.
     let unmig_rej = ws_reply(
         &mut ws_ctrl,
-        json!({"type": "command", "request_id": req_id, "generation": gen_ctrl, "epoch_id": ep, "path": "/api/v1/action/gripper_zero_check", "body": {}}),
+        json!({"type": "command", "request_id": req_id, "generation": gen_ctrl, "epoch_id": ep, "path": armd::api::routes::LEGACY_ONLY_WS_PROBE, "body": {}}),
         &["command_reject"],
     )
     .await;

@@ -1457,20 +1457,16 @@ async fn dual_owner_multiview_and_motion_action_rest_stubs_lease_contract() {
             with_lease.push((*path, v["code"].as_str().unwrap().to_string()));
         }
 
-        // 3) Remaining LegacyOnly routes stay 503 EXECUTOR_ROUTING_PENDING on Executor.
+        // 3) Remaining LegacyOnly REST route stays 503 EXECUTOR_ROUTING_PENDING on Executor.
         if owner == OwnerKind::Executor {
-            for (method, path) in [
-                ("POST", "/api/v1/action/gripper_zero_check"),
-                ("GET", "/api/v1/diagnostics/power"),
-            ] {
-                let r = if method == "POST" {
-                    http.post(format!("{base}{path}")).bearer_auth(&tok).json(&json!({})).send().await.unwrap()
-                } else {
-                    http.get(format!("{base}{path}")).send().await.unwrap()
-                };
-                assert_eq!(r.status().as_u16(), 503, "{path} must stay LegacyOnly");
-                assert_eq!(r.json::<Value>().await.unwrap()["code"], "EXECUTOR_ROUTING_PENDING");
-            }
+            let r = common::send_legacy_only_rest_probe(&http, &base, Some(&tok)).await;
+            assert_eq!(
+                r.status().as_u16(),
+                503,
+                "{} must stay LegacyOnly",
+                armd::api::routes::LEGACY_ONLY_REST_PROBE.1
+            );
+            assert_eq!(r.json::<Value>().await.unwrap()["code"], "EXECUTOR_ROUTING_PENDING");
         }
 
         results.push((without_lease, with_lease));

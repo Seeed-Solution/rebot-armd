@@ -2128,7 +2128,7 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
 
-    // 1. Unmigrated path (`/api/v1/action/gripper_zero_check`) MUST still return 503 EXECUTOR_ROUTING_PENDING,
+    // 1. Unmigrated path (`LEGACY_ONLY_WS_PROBE`) MUST still return 503 EXECUTOR_ROUTING_PENDING,
     // while migrated `/api/v1/torque` without lease returns 409 LEASE_LOST.
     let unmig_rej = ws_send_recv(
         &mut ws,
@@ -2137,7 +2137,7 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
             "request_id": 1,
             "generation": 1,
             "epoch_id": 1,
-            "path": "/api/v1/action/gripper_zero_check",
+            "path": armd::api::routes::LEGACY_ONLY_WS_PROBE,
             "body": {}
         }),
     )
