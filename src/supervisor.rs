@@ -6781,6 +6781,8 @@ impl SupervisorInner {
             macro_state,
             #[cfg(not(target_arch = "wasm32"))]
             mode_switch: self.current_mode_switch_snapshot(),
+            #[cfg(not(target_arch = "wasm32"))]
+            recent_mode_switch_terminals: self.mode_switch.recent_terminals(),
         }
     }
 
@@ -11291,7 +11293,7 @@ impl SupervisorInner {
             self.torque_transition,
             Some(driver_transitions::TorqueTransition::Enable(_))
         ) || mode_switch_owns_bus;
-        if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
+        if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && !mode_switch_owns_bus && self.gravity_comp.is_some() {
             let gc_stamp = self.current_j7_intent_stamp();
             self.j7_intent = Some(if self.safety.state().is_stopped() {
                 crate::driver::PosForceIntent::stop(gc_stamp)
@@ -12182,7 +12184,8 @@ pub(crate) struct ModeSwitchRunner {
     event_tx: Option<crate::rt_core::stream::StreamProducer<crate::motor_mode::ModeSwitchEvent>>,
     retained_events: [Option<crate::motor_mode::ModeSwitchEvent>; 16],
     retained_len: usize,
-    last_terminal_snapshot: Option<crate::motor_mode::ModeSwitchSnapshot>,
+    recent_terminals: [Option<crate::motor_mode::ModeSwitchSnapshot>; 4],
+    recent_terminal_cursor: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -12194,7 +12197,8 @@ impl ModeSwitchRunner {
             event_tx: None,
             retained_events: [None; 16],
             retained_len: 0,
-            last_terminal_snapshot: None,
+            recent_terminals: [None; 4],
+            recent_terminal_cursor: 0,
         }
     }
 
@@ -12212,6 +12216,42 @@ impl ModeSwitchRunner {
         self.machine
             .as_ref()
             .is_some_and(crate::motor_mode::ModeSwitch::is_running)
+    }
+
+    pub(crate) fn record_terminal(&mut self, snap: crate::motor_mode::ModeSwitchSnapshot) {
+        for slot in &mut self.recent_terminals {
+            if slot.is_some_and(|s| s.session_id == snap.session_id) {
+                *slot = Some(snap);
+                return;
+            }
+        }
+        let idx = self.recent_terminal_cursor % self.recent_terminals.len();
+        self.recent_terminals[idx] = Some(snap);
+        self.recent_terminal_cursor = self.recent_terminal_cursor.wrapping_add(1);
+    }
+
+    pub(crate) fn find_terminal(
+        &self,
+        session_id: u64,
+    ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
+        self.recent_terminals
+            .iter()
+            .flatten()
+            .copied()
+            .find(|s| s.session_id == session_id)
+    }
+
+    pub(crate) fn latest_terminal(&self) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
+        if self.recent_terminal_cursor == 0 {
+            return self.recent_terminals[0];
+        }
+        let idx = self.recent_terminal_cursor.wrapping_sub(1) % self.recent_terminals.len();
+        self.recent_terminals[idx]
+    }
+
+    #[inline]
+    pub(crate) fn recent_terminals(&self) -> [Option<crate::motor_mode::ModeSwitchSnapshot>; 4] {
+        self.recent_terminals
     }
 
     pub(crate) fn retire_if_session(&mut self, sid: crate::rt_core::session::SessionId) {
@@ -12283,7 +12323,19 @@ impl SupervisorInner {
         {
             return Some(machine.snapshot(sid.0, drv_uncertain));
         }
-        self.mode_switch.last_terminal_snapshot
+        self.mode_switch.latest_terminal()
+    }
+
+    /// True when any exclusive PR0B session (e.g. `ModeSwitch` or `Commissioning`) owns output
+    /// OR a session has requested SAFE-HOLD (mutual exclusion against legacy gravity-comp & MIT).
+    #[inline]
+    pub(crate) fn exclusive_session_owns_output(&self) -> bool {
+        self.sessions.is_safe_hold_requested()
+            || self.mode_switch.is_running()
+            || self
+                .sessions
+                .slot(crate::rt_core::session::SessionSlot::ExclusiveOutput)
+                .is_some_and(|s| s.is_live())
     }
 
     #[inline]
@@ -12376,9 +12428,20 @@ impl SupervisorInner {
                 message: "mode-switch authority rejected",
             },
         })?;
+        // R2 Major 3: Assert `mode_switch_active_mask` immediately at admission (BEFORE the
+        // opening release's Step 2 RX runs) so optional Step 2 refresh/recovery cannot spend
+        // release TX slots ahead of ModeSwitch.
+        let mut plan_mask = 0u32;
+        for target in req.plan.axis_slice() {
+            if usize::from(target.joint) < crate::motor_mode::MAX_MODE_SWITCH_AXES {
+                plan_mask |= 1u32 << target.joint;
+            }
+        }
+        if let Some(slot) = self.driver.as_mut() {
+            let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(plan_mask));
+        }
         self.mode_switch.active_session = Some(sid);
         self.mode_switch.machine = Some(crate::motor_mode::ModeSwitch::new(req.plan));
-        self.mode_switch.last_terminal_snapshot = None;
         Ok(sid.0)
     }
 
@@ -12386,8 +12449,19 @@ impl SupervisorInner {
         &self,
         session_id: u64,
     ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
-        self.current_mode_switch_snapshot()
-            .filter(|s| s.session_id == session_id)
+        let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
+            let mut m = 0u32;
+            let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+            m
+        });
+        if let (Some(sid), Some(machine)) =
+            (self.mode_switch.active_session, self.mode_switch.machine.as_ref())
+        {
+            if sid.0 == session_id {
+                return Some(machine.snapshot(sid.0, drv_uncertain));
+            }
+        }
+        self.mode_switch.find_terminal(session_id)
     }
 
     /// Reconciles active `ModeSwitch` state and driver `mode_write_uncertain_mask` /
@@ -12416,7 +12490,7 @@ impl SupervisorInner {
         let snap = machine.snapshot(sid.0, drv_uncertain);
         self.mode_switch.machine = Some(machine);
         self.mode_switch.stage_events_from_machine(sid);
-        self.mode_switch.last_terminal_snapshot = Some(snap);
+        self.mode_switch.record_terminal(snap);
         let _ = self.sessions.set_hw_state_uncertain(
             crate::rt_core::session::SessionSlot::ExclusiveOutput,
             sid,
@@ -12454,10 +12528,7 @@ impl SupervisorInner {
     pub(crate) fn clear_mode_switch_rt(&mut self, session_id: u64) -> bool {
         use crate::rt_core::session::SessionSlot;
         let Some(sid) = self.mode_switch.active_session else {
-            return self
-                .mode_switch
-                .last_terminal_snapshot
-                .is_some_and(|s| s.session_id == session_id);
+            return self.mode_switch.find_terminal(session_id).is_some();
         };
         if sid.0 != session_id {
             return false;
@@ -12645,7 +12716,7 @@ impl SupervisorInner {
         self.mode_switch.machine = Some(machine);
         self.mode_switch.stage_events_from_machine(sid);
         if progress.is_terminal() {
-            self.mode_switch.last_terminal_snapshot = Some(snap);
+            self.mode_switch.record_terminal(snap);
         }
 
         if let Some(SessionStep::Terminal(outcome)) = self.sessions.step_slot(
@@ -16428,32 +16499,33 @@ impl ArmSupervisor {
 
     /// Polls the authoritative [`crate::motor_mode::ModeSwitchSnapshot`] for `session_id`
     /// directly via [`Self::read_services`] (no config exchange, no write lock, no command label
-    /// mutation, and unaffected by off-RT event stream saturation). Falls back to the latest
-    /// published `StateHub` snapshot if the owner just transitioned to SAFE-HOLD.
+    /// mutation, and unaffected by off-RT event stream saturation). Checks both the active slot
+    /// and the bounded recent-terminal ring, and falls back to the latest published `StateHub`
+    /// snapshot if the owner just transitioned to SAFE-HOLD.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn poll_mode_switch_session(
         &self,
         session_id: u64,
     ) -> Result<Option<crate::motor_mode::ModeSwitchSnapshot>, crate::rt_core::requests::config::ConfigError>
     {
+        let lookup = |meta: &crate::rt_core::publish::PublishedOwnerMeta| {
+            meta.mode_switch
+                .filter(|s| s.session_id == session_id)
+                .or_else(|| {
+                    meta.recent_mode_switch_terminals
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .find(|s| s.session_id == session_id)
+                })
+        };
         if let Ok(svc) = self
             .read_services(crate::rt_core::publish::ReadRequirements::identity())
             .await
         {
-            return Ok(svc
-                .snapshot
-                .rt
-                .owner
-                .mode_switch
-                .filter(|s| s.session_id == session_id));
+            return Ok(lookup(&svc.snapshot.rt.owner));
         }
-        if let Some(snap) = self.hub.latest().and_then(|latest| {
-            latest
-                .rt
-                .owner
-                .mode_switch
-                .filter(|s| s.session_id == session_id)
-        }) {
+        if let Some(snap) = self.hub.latest().and_then(|latest| lookup(&latest.rt.owner)) {
             return Ok(Some(snap));
         }
         Err(crate::rt_core::requests::config::ConfigError::OwnerStopped)
@@ -16508,8 +16580,15 @@ impl ArmSupervisor {
     ) -> Result<crate::motor_mode::ModeSwitchSnapshot, crate::rt_core::requests::config::ConfigError>
     {
         use crate::rt_core::requests::config::ConfigError;
+        // R2 Major 8: validate deadline arithmetic BEFORE admitting the session!
+        let Some(wait_deadline) = Instant::now().checked_add(poll_timeout) else {
+            return Err(ConfigError::CalibPrecondition {
+                status: 400,
+                code: "INVALID_COMMAND",
+                message: "mode-switch poll timeout overflows monotonic clock",
+            });
+        };
         let session_id = self.start_mode_switch_session(req).await?;
-        let wait_deadline = Instant::now() + poll_timeout;
         loop {
             match self.poll_mode_switch_session(session_id).await {
                 Ok(Some(snap)) if !snap.running => {
@@ -16543,23 +16622,39 @@ impl ArmSupervisor {
         timeout: Duration,
     ) -> Result<crate::motor_mode::ModeSwitchSnapshot, crate::rt_core::requests::config::ConfigError>
     {
+        use crate::rt_core::requests::config::ConfigError;
         let plan = crate::motor_mode::ModeSwitchPlan::confirm_gripper(joint, mode).map_err(|_| {
-            crate::rt_core::requests::config::ConfigError::CalibPrecondition {
+            ConfigError::CalibPrecondition {
                 status: 400,
                 code: "INVALID_COMMAND",
                 message: "invalid gripper joint index",
             }
         })?;
+        // R2 Major 8: checked deadline & grace arithmetic BEFORE admission!
+        let now = Instant::now();
+        let Some(deadline) = now.checked_add(timeout) else {
+            return Err(ConfigError::CalibPrecondition {
+                status: 400,
+                code: "INVALID_COMMAND",
+                message: "gripper mode confirmation timeout overflows clock",
+            });
+        };
+        let Some(poll_timeout) = timeout.checked_add(Duration::from_millis(250)) else {
+            return Err(ConfigError::CalibPrecondition {
+                status: 400,
+                code: "INVALID_COMMAND",
+                message: "gripper mode confirmation poll timeout overflows clock",
+            });
+        };
         let req = crate::rt_core::requests::config::ModeSwitchStartRequest {
             plan,
             admission,
             operator_required: false,
             operator_grant,
-            deadline: Instant::now() + timeout,
+            deadline,
             client: crate::rt_core::broker::ClientId(admission.connection_id),
         };
-        self.run_mode_switch_session(req, timeout + Duration::from_millis(250))
-            .await
+        self.run_mode_switch_session(req, poll_timeout).await
     }
 
     /// Coherent control frequency for WS upgrade (`?obs_hz=...`).
@@ -19561,27 +19656,24 @@ impl ArmSupervisor {
                             .take()
                             .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold)
                         {
-                            inner.detached = true;
-                            let disabled =
-                                crate::torque::shadow::ShadowRuntime::disabled(&inner.config);
-                            let sh = std::mem::replace(&mut inner.torque_shadow, disabled);
-                            {
-                                let mut slot =
-                                    self.owner.lock().unwrap_or_else(|e| e.into_inner());
-                                *slot = OwnerSlot::Failed;
-                                self.owner_mode.store(OWNER_FAILED, Ordering::Release);
-                            }
-                            {
-                                let mut w = self
-                                    .active_writer
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                *w = WriterEndpoint::DetachedSafeHold {
-                                    safe_hold: Arc::clone(&self.legacy_safe_hold),
-                                    control_stop: Arc::clone(control_stop),
-                                };
-                            }
-                            **out = Some((drv, Some(sh), reason));
+                        inner.detached = true;
+                        let disabled =
+                            crate::torque::shadow::ShadowRuntime::disabled(&inner.config);
+                        let sh = std::mem::replace(&mut inner.torque_shadow, disabled);
+                        // R2 Major 4: publish atomic `OWNER_FAILED` lock-freely and update
+                        // `owner`/`active_writer` via non-blocking `try_lock()` so a contending
+                        // off-thread mutex holder can NEVER delay the first SAFE-HOLD hold frame!
+                        self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                        if let Ok(mut slot) = self.owner.try_lock() {
+                            *slot = OwnerSlot::Failed;
+                        }
+                        if let Ok(mut w) = self.active_writer.try_lock() {
+                            *w = WriterEndpoint::DetachedSafeHold {
+                                safe_hold: Arc::clone(&self.legacy_safe_hold),
+                                control_stop: Arc::clone(control_stop),
+                            };
+                        }
+                        **out = Some((drv, Some(sh), reason));
                         }
                     }
                 }

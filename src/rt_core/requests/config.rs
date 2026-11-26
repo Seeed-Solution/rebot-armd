@@ -1547,7 +1547,7 @@ impl ConfigRequest {
             | Self::CommitIntermediateCalibration { .. } => "/api/v1/calibration",
             Self::StartModeSwitch(_)
             | Self::CancelModeSwitch { .. }
-            | Self::ClearModeSwitch { .. } => "/api/v1/mode/switch",
+            | Self::ClearModeSwitch { .. } => "mode_switch",
             Self::InstallSequenceRunPins(_) | Self::ClearSequenceRunPins { .. } => {
                 "/api/v1/action/run_sequence"
             }

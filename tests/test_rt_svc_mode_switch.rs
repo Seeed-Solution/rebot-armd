@@ -627,7 +627,7 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     let mut ex_drv = ExclusiveDriver::new(Box::new(raw_drv));
     let mut seq = 100u64;
 
-    // Minor 1 & Major 7: typed plan construction errors & overflowing timeout rejected fail-closed!
+    // Minor 1 & Major 7: typed plan construction errors, empty direct plan, & overflowing timeout!
     assert_eq!(
         ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance), (99, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed),
         Err(ModeSwitchFailure::InvalidPlan)
@@ -639,6 +639,17 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     assert_eq!(
         ModeSwitchPlan::confirm_gripper(99, ControlMode::PositionForce),
         Err(ModeSwitchFailure::InvalidPlan)
+    );
+    let mut ms_empty = ModeSwitch::new(ModeSwitchPlan::empty(ModeSwitchIntent::Switch));
+    clock.advance(PERIOD_50HZ);
+    seq += 1;
+    assert_eq!(
+        step_release_on_exclusive(&mut ex_drv, &mut ms_empty, &clock, PERIOD_50HZ, 8, seq),
+        ModeProgress::FailedClean {
+            failed_joint: 0,
+            reason: ModeSwitchFailure::InvalidPlan,
+        },
+        "direct runner must reject empty plan with InvalidPlan (never Confirmed)"
     );
     let mut bad_timeout_plan =
         ModeSwitchPlan::switch_axes(&[(0, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
@@ -960,6 +971,33 @@ async fn session_stream_saturation_stale_cancel_clear_and_inflight_revocation() 
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     assert!(live2.running, "stale cancel/clear must never disturb active sid2");
+    // R2 Major 6 proof: even AFTER sid2 started, sid1's terminal snapshot remains readable from
+    // StateHub's 4-slot recent_mode_switch_terminals ring!
+    let retained_s1 = sup
+        .poll_mode_switch_session(sid1)
+        .await
+        .unwrap()
+        .expect("sid1 terminal result must remain readable after sid2 starts");
+    assert_eq!(retained_s1.progress, ModeProgress::Confirmed);
+
+    // R2 Major 8 proof: overflowing wrapper timeout is rejected BEFORE admitting any session!
+    let err_overflow = sup
+        .confirm_gripper_mode_session(
+            6,
+            ControlMode::PositionVelocity,
+            sup.capture_admission_stamp(),
+            OperatorGrant::unenforced(),
+            Duration::MAX,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err_overflow,
+        ConfigError::CalibPrecondition {
+            code: "INVALID_COMMAND",
+            ..
+        }
+    ));
 
     // Clean cancel & clear of sid2.
     let c2 = sup.cancel_mode_switch_session(sid2, "STOPPED").await.unwrap().unwrap();
@@ -1509,9 +1547,28 @@ async fn dual_owner_mode_switch_authority_and_ambiguity_safe_hold_parity() {
             OwnerKind::Executor => h.exec.as_ref().unwrap().safe_hold_control(),
             OwnerKind::Legacy => h.sup.legacy_safe_hold_control(),
         };
+        // R2 Major 4 proof: on Legacy, contend `sup.inner().read()` off-thread while SAFE-HOLD
+        // activates so we prove zero-contention single-guard handoff without post-tick lock stalls!
+        let contend_stop = Arc::new(AtomicBool::new(false));
+        let contend_task = if owner == OwnerKind::Legacy {
+            let sup_c = Arc::clone(&h.sup);
+            let stop_c = Arc::clone(&contend_stop);
+            Some(tokio::spawn(async move {
+                while !stop_c.load(std::sync::atomic::Ordering::Acquire) {
+                    let _g = sup_c.inner().read().await;
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }))
+        } else {
+            None
+        };
         let dl = Instant::now() + Duration::from_secs(3);
         while (!sh.is_active() || sh.ticks() < 4) && Instant::now() < dl {
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        contend_stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(t) = contend_task {
+            let _ = t.await;
         }
         assert!(sh.is_active(), "{owner:?}: energized ambiguity must enter SAFE-HOLD");
         assert_eq!(

@@ -722,6 +722,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<crate::motor_mode::ControlMode>) {
         self.inner.set_axis_confirmed_mode(joint, mode);
     }
+    fn latch_axis_mode_uncertain(&mut self, joint: usize) {
+        self.inner.latch_axis_mode_uncertain(joint);
+    }
     fn mode_write_uncertain_mask(&self) -> u32 {
         self.inner.mode_write_uncertain_mask()
     }

@@ -290,6 +290,10 @@ pub struct PublishedOwnerMeta {
     /// Coherent snapshot of the active or latest terminal PR0C `ModeSwitch` session (`Copy`, 0 alloc).
     #[cfg(not(target_arch = "wasm32"))]
     pub mode_switch: Option<crate::motor_mode::ModeSwitchSnapshot>,
+    /// Bounded fixed ring of recent terminal `ModeSwitch` snapshots retained by `session_id` so
+    /// owner-side slot retirement never loses a terminal result when a newer session starts.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub recent_mode_switch_terminals: [Option<crate::motor_mode::ModeSwitchSnapshot>; 4],
 }
 
 impl Default for PublishedOwnerMeta {
@@ -326,6 +330,8 @@ impl Default for PublishedOwnerMeta {
             macro_state: PublishedMacroState::default(),
             #[cfg(not(target_arch = "wasm32"))]
             mode_switch: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            recent_mode_switch_terminals: [None; 4],
         }
     }
 }

@@ -217,6 +217,10 @@ impl SupervisorInner {
             || self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {
             return Some(reason("MOTION_BUSY", "Wait until the arm has stopped"));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.exclusive_session_owns_output() {
+            return Some(reason("SESSION_BUSY", "An exclusive output session is active"));
+        }
         if self.lease_enabled && !self.is_lease_active() { return Some(reason("LEASE_REQUIRED", "The control lease is required")); }
         if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) || !self.feedback_numeric_valid {
             return Some(reason_fmt("FEEDBACK_STALE", |msg| {

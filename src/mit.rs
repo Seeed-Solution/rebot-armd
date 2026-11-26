@@ -1556,7 +1556,8 @@ impl crate::supervisor::SupervisorInner {
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
             || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
             || self.collision.hold.is_some() || self.torque_guard.hold.is_some() || self.servo_blocked_hold
-            || self.commanded_velocities.iter().any(|v| *v != 0.0) {
+            || self.commanded_velocities.iter().any(|v| *v != 0.0)
+            || self.exclusive_session_owns_output() {
             return;
         }
         let joints = mit_joints(&self.config);
