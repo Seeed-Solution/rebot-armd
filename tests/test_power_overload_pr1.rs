@@ -707,7 +707,7 @@ fn b1_deferred_tx_stale_reply_and_spoofed_reply_id_rejected() {
         }
         assert!(injected);
         let msg = err.expect("spoofed reply ID must fail").to_string();
-        assert!(msg.contains("joint 1 TIMEOUT readback: ambiguous"), "got: {msg}");
+        assert!(msg.contains("joint 1 TIMEOUT readback: no fresh reply"), "got: {msg}");
     }
 }
 

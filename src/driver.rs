@@ -9531,7 +9531,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return None;
         }
         let base = u32::from(self.motor_ids.get(idx).copied()?);
-        if frame.id == 0x100 + base || frame.id == u32::from(damiao::POS_FORCE_BASE_ID) + base {
+        if frame.id == 0x100 + base || self.frame_pos_force_joint(frame) == Some(idx) {
             let pos = f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
             return pos.is_finite().then_some(pos);
         }
@@ -14898,6 +14898,70 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake: now })
     }
 
+    /// Causal, zero-allocation register-read reply matcher for `DamiaoTorque::Readback`
+    /// (`RID_CTRL_MODE` and `RID_TIMEOUT`). Filters strictly by `valid_register_reply_id`,
+    /// per-axis `after_tx_seq`, `min_rx_at` (rejecting delayed pre-TX traffic as `Ambiguous`),
+    /// clock-offset drift, and `< max_rx_at`; conflicting values in one window fail closed as
+    /// `Ambiguous` while identical timely read-only values are accepted.
+    #[allow(clippy::too_many_arguments)]
+    fn find_enable_readback_reply(
+        &self,
+        joint: usize,
+        rid: u8,
+        after_tx_seq: u64,
+        min_rx_at: Instant,
+        max_rx_at: Option<Instant>,
+        tx_offset_ns: Option<i128>,
+    ) -> crate::mit::CommissioningRegMatch {
+        let Some(&id) = self.motor_ids.get(joint) else {
+            return crate::mit::CommissioningRegMatch::Pending;
+        };
+        if self.comm_reg_reply_overflow {
+            return crate::mit::CommissioningRegMatch::Ambiguous;
+        }
+        let mut matched: Option<crate::mit::CommissioningRegReply> = None;
+        for slot in &self.comm_reg_replies[..self.comm_reg_reply_len] {
+            let Some(rep) = *slot else { continue };
+            if rep.motor_id != id
+                || rep.write
+                || rep.rid != rid
+                || !self.valid_register_reply_id(joint, rep.reply_id)
+            {
+                continue;
+            }
+            if rep.rx_seq <= after_tx_seq {
+                continue;
+            }
+            if rep.rx_at < min_rx_at {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            let offset_ok = match (tx_offset_ns, rep.decode_offset_ns) {
+                (Some(w_off), Some(d_off)) => {
+                    (d_off - w_off).abs() <= MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if !offset_ok {
+                return crate::mit::CommissioningRegMatch::Ambiguous;
+            }
+            if max_rx_at.is_some_and(|dl| rep.rx_at >= dl) {
+                continue;
+            }
+            if let Some(prev) = matched {
+                if prev.value != rep.value {
+                    return crate::mit::CommissioningRegMatch::Ambiguous;
+                }
+            } else {
+                matched = Some(rep);
+            }
+        }
+        match matched {
+            Some(rep) => crate::mit::CommissioningRegMatch::Matched(rep),
+            None => crate::mit::CommissioningRegMatch::Pending,
+        }
+    }
+
     /// Valid reply CAN arbitration ID for a register readback on joint `j`:
     /// PosForce axes and profiles with an explicit `configured_master_id` require exact
     /// `expected_reply_id(j)`; ordinary axes without an explicit `configured_master_id` accept
@@ -15056,7 +15120,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                 }
             }
-            if r.log_cleared && self.last_read_drained {
+            if r.log_cleared {
                 let awaiting = r.remaining_mask & r.sent_mask;
                 for j in handshake::mask_joints(awaiting) {
                     let Some((after_tx_seq, tx_at, tx_offset_ns)) =
@@ -15065,9 +15129,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         continue;
                     };
                     let base_mode = self.base_mode(j);
-                    let reg_match = self.commissioning_find_register_reply(
+                    let reg_match = self.find_enable_readback_reply(
                         j,
-                        false,
                         rid,
                         after_tx_seq,
                         tx_at,
@@ -15089,18 +15152,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             };
                         }
                         crate::mit::CommissioningRegMatch::Matched(rep) => {
-                            if !self.valid_register_reply_id(j, rep.reply_id) {
-                                return match r.stage {
-                                    ReadbackStage::CtrlMode => self.readback_failed_err(
-                                        j,
-                                        ArmDriverError::CtrlModeReadbackAmbiguous { joint: j },
-                                    ),
-                                    ReadbackStage::Timeout => {
-                                        self.enable_failed();
-                                        Err(ArmDriverError::TimeoutReadbackAmbiguous { joint: j })
-                                    }
-                                };
-                            }
                             Some(u32::from_le_bytes(rep.value))
                         }
                     };
@@ -15223,7 +15274,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                 };
             }
-            let wake = if sent_any || (r.remaining_mask & !r.sent_mask) != 0 {
+            let wake = if !r.log_cleared || (r.remaining_mask & !r.sent_mask) != 0 {
                 self.now().min(r.deadline.at)
             } else {
                 r.deadline.at
