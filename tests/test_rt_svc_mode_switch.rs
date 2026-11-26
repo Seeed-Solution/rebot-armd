@@ -2318,3 +2318,67 @@ async fn ordinary_applied_stop_mid_switch_is_stopped_recovered_via_production_pr
         "an ordinary applied STOP must not end the switch Ambiguous (spurious SAFE-HOLD)"
     );
 }
+
+/// Round 6 M1: a plan whose watchdog gap is shorter than one release period plus the delivery
+/// margin is infeasible and is refused before any hardware TX.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn infeasible_watchdog_gap_is_rejected_at_admission() {
+    // Machine preflight.
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(200), false, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 8);
+    enable_driver_sync(&mut drv, &bus, Some(&clock));
+    let mut plan = ModeSwitchPlan::empty(ModeSwitchIntent::ConfirmOnly);
+    plan.axes[0] = AxisTarget::new(6, ControlMode::PositionVelocity);
+    plan.len = 1;
+    plan.max_watchdog_gap = Duration::from_millis(15);
+    let mut ms = ModeSwitch::new(plan);
+    bus.clear_log();
+    let mut allow = || Ok(());
+    let mut prog = ModeProgress::Pending { wake: None };
+    for seq in 2..8u64 {
+        clock.advance(PERIOD_50HZ);
+        prog = step_raw_with_gate(
+            &mut drv,
+            &mut ms,
+            &clock,
+            |now, cutoff| ReleaseBudget::new(now, cutoff, PERIOD_50HZ, 8),
+            PERIOD_50HZ,
+            seq,
+            &mut allow,
+        );
+        if prog.is_terminal() {
+            break;
+        }
+    }
+    assert!(
+        matches!(prog, ModeProgress::FailedClean { reason, .. } if reason.code() == "WATCHDOG_GAP_INFEASIBLE"),
+        "15 ms gap at a 20 ms release must be refused, got {prog:?}"
+    );
+    let reg_tx = bus.with(|s| s.tx_log.iter().filter(|f| f.id == 0x7FF).count());
+    assert_eq!(reg_tx, 0, "no register TX for an infeasible plan");
+
+    // Owner admission returns the same code.
+    let mut cfg2 = ArmConfig::rebot_dm();
+    cfg2.control_frequency_hz = 50;
+    let bus2 = configure_damiao_bus(None, Duration::ZERO, false, TIMEOUT_2000_COUNTS);
+    let drv2 = build_damiao_driver(bus2.clone(), &cfg2, 8);
+    let sup = ArmSupervisor::new(cfg2).with_driver(Box::new(drv2));
+    sup.set_lease_enabled(false).await;
+    let err = sup
+        .start_mode_switch_session(ModeSwitchStartRequest {
+            plan,
+            admission: sup.capture_admission_stamp(),
+            operator_required: false,
+            operator_grant: OperatorGrant::unenforced(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            client: ClientId(32),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ConfigError::CalibPrecondition { code: "WATCHDOG_GAP_INFEASIBLE", .. }),
+        "{err:?}"
+    );
+}

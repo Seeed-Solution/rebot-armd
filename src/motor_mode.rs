@@ -1068,6 +1068,9 @@ pub mod switch {
         Revoked,
         DeadlineExpired,
         NoConfirmedMode,
+        /// The plan's watchdog gap is shorter than one release period plus the hold delivery
+        /// margin, so no hold schedule can keep it.
+        WatchdogGapInfeasible,
     }
 
     impl ModeSwitchFailure {
@@ -1090,6 +1093,7 @@ pub mod switch {
                 Self::Revoked => "REVOKED",
                 Self::DeadlineExpired => "TIMEOUT",
                 Self::NoConfirmedMode => "MODE_UNVERIFIED",
+                Self::WatchdogGapInfeasible => "WATCHDOG_GAP_INFEASIBLE",
             }
         }
 
@@ -2224,6 +2228,14 @@ pub mod switch {
             let vendor = drv.vendor();
             let mut seen_mask = 0u32;
             let effective_gap = self.effective_max_watchdog_gap(budget);
+            // Major M1 (R6): refuse an infeasible gap before any TX; holds would come due on
+            // every release and the overrun check could not catch the breach.
+            if effective_gap < budget.period.saturating_add(budget.hold_delivery_margin) {
+                return Err(ModeProgress::FailedClean {
+                    failed_joint: self.slots[0].target.joint,
+                    reason: ModeSwitchFailure::WatchdogGapInfeasible,
+                });
+            }
 
             for i in 0..len {
                 let mut target = self.slots[i].target;

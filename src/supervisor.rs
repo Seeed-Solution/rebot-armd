@@ -12492,6 +12492,17 @@ impl SupervisorInner {
                 message: "invalid mode-switch plan",
             });
         }
+        let period =
+            Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+        if req.plan.max_watchdog_gap
+            < period.saturating_add(crate::motor_mode::DEFAULT_HOLD_DELIVERY_MARGIN)
+        {
+            return Err(ConfigError::CalibPrecondition {
+                status: 400,
+                code: "WATCHDOG_GAP_INFEASIBLE",
+                message: "mode-switch watchdog gap is shorter than one control period plus the hold delivery margin",
+            });
+        }
         let cur_epoch = self.safety.epoch_id();
         let admitted = self.check_admission(req.admission).map_err(|e| match e {
             SafetyError::StampAlreadyConsumed => ConfigError::StampConsumed,
