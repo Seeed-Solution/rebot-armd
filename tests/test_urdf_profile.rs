@@ -106,6 +106,7 @@ fn urdf_profile_without_gripper() {
     c.grasp = None;
     c.gravity_comp = None;
     c.damiao_ranges.as_mut().unwrap().truncate(6);
+    if let Some(t) = c.expected_timeout_counts.as_mut() { t.truncate(6); }
     c.servo_max_velocity.as_mut().unwrap().truncate(6);
     if let Some(r) = c.resting_pose.as_mut() { r.joint_max_velocities.truncate(6); }
     if let Some(p) = c.power_budget.as_mut() { p.joints.truncate(6); }

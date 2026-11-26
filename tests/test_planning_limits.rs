@@ -704,6 +704,7 @@ fn commit_time_velocity_drift_refused_dual_owner() {
                 kind,
                 dof,
                 start,
+                v0,
                 target,
                 duration_s,
                 max_velocity,
@@ -725,6 +726,7 @@ fn commit_time_velocity_drift_refused_dual_owner() {
                     kind,
                     dof: usize::from(dof),
                     start,
+                    v0,
                     target,
                     duration_s,
                     max_velocity,
@@ -1093,6 +1095,7 @@ fn rt_broker_interleaved_refusals_preserve_per_request_diagnostics() {
             kind: PreparedActionKind::MoveToJoint,
             dof: 7,
             start: s,
+            v0: [0.0; MAX_DOF],
             target: t,
             duration_s: 0.5,
             max_velocity: [2.0; MAX_DOF],
@@ -1113,6 +1116,7 @@ fn rt_broker_interleaved_refusals_preserve_per_request_diagnostics() {
             kind: PreparedActionKind::MoveToJoint,
             dof: 7,
             start: s,
+            v0: [0.0; MAX_DOF],
             target: t,
             duration_s: 0.5,
             max_velocity: [2.0; MAX_DOF],
@@ -1293,7 +1297,7 @@ fn post_prepare_hold_preserves_leg2_continuity_and_clamp_bookkeeping_dual_owner(
     rt.torque_guard.hold = Some(hold);
     let slot = prep_rt.to_plan_slot(None).unwrap();
     let armd::rt_core::ops::Primitive::Action(armd::rt_core::requests::actions::StagedAction::Joint {
-        kind, dof, start, target, duration_s, max_velocity, power_scale, settle, approach_then, checked_joints, ..
+        kind, dof, start, v0, target, duration_s, max_velocity, power_scale, settle, approach_then, checked_joints, ..
     }) = slot.primitive else {
         panic!("expected StagedAction::Joint");
     };
@@ -1303,7 +1307,7 @@ fn post_prepare_hold_preserves_leg2_continuity_and_clamp_bookkeeping_dual_owner(
         &prep_rt.stamp,
         &ctx_rt,
         JointInstallPayload::Rt {
-            kind, dof: usize::from(dof), start, target, duration_s, max_velocity, power_scale, settle, approach_then, checked_joints,
+            kind, dof: usize::from(dof), start, v0, target, duration_s, max_velocity, power_scale, settle, approach_then, checked_joints,
         },
     )
     .unwrap();

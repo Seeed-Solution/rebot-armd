@@ -1335,6 +1335,25 @@ impl crate::supervisor::SupervisorInner {
         if let Some(intent) = computed_j7_intent {
             self.j7_intent = Some(intent);
         }
+        if let Some(j) = self
+            .torque_guard
+            .backoff_history
+            .latest()
+            .filter(|rec| rec.transmitted_q.is_none() && !rec.capture_closed)
+            .map(|rec| usize::from(rec.joint))
+        {
+            let committed = self
+                .driver
+                .as_ref()
+                .and_then(|d| d.try_with_ref(|drv| drv.last_committed_wire_position(j)).ok())
+                .flatten();
+            if let Some((tx_seq, tx_at, wire_user_q)) = committed {
+                let fb_seq = self.core.feedback().seqs().get(j).copied().unwrap_or(0);
+                self.torque_guard
+                    .backoff_history
+                    .record_transmitted(j, tx_seq, Some(tx_at), wire_user_q, fb_seq);
+            }
+        }
         if let Some((ff, dof)) = ff {
             match &res {
                 TickOutput::Complete { .. } => {
@@ -1430,6 +1449,9 @@ impl crate::supervisor::SupervisorInner {
                 );
             }),
         );
+        if code == crate::safety::FaultCode::BusLoss {
+            self.notify_driver_bus_loss();
+        }
     }
 
     /// Cancel the group: no further output, latched fault, history and caches dropped.
@@ -1479,6 +1501,7 @@ impl crate::supervisor::SupervisorInner {
                         );
                     }),
                 );
+                self.notify_driver_bus_loss();
             }
             return;
         }

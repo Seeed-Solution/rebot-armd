@@ -217,6 +217,8 @@ pub struct PlanSlot {
     pub motion: Option<super::requests::motion::PreparedMotionSlot>,
     #[cfg(not(target_arch = "wasm32"))]
     pub replay_approach: Option<crate::replay::PreparedReplayApproach>,
+    /// True when this slot's motion plan was validated under active static-overload restriction.
+    pub static_restricted: bool,
 }
 
 impl Default for PlanSlot {
@@ -232,6 +234,7 @@ impl PlanSlot {
             motion: None,
             #[cfg(not(target_arch = "wasm32"))]
             replay_approach: None,
+            static_restricted: false,
         }
     }
 
@@ -247,6 +250,7 @@ impl PlanSlot {
         {
             self.replay_approach = None;
         }
+        self.static_restricted = false;
     }
 
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
@@ -257,6 +261,7 @@ impl PlanSlot {
         {
             self.replay_approach = None;
         }
+        self.static_restricted = false;
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
         self.motion = other.motion;
@@ -264,6 +269,7 @@ impl PlanSlot {
         {
             self.replay_approach = other.replay_approach;
         }
+        self.static_restricted = other.static_restricted;
         Ok(())
     }
 }
@@ -362,7 +368,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
     "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "HOVER_TIMEOUT", "MEASURE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
-    "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "INVALID_CALIBRATION", "POLICY_REVISION_MISMATCH", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
+    "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "INVALID_CALIBRATION", "POLICY_REVISION_MISMATCH", "POLICY_NOT_ACTIVE", "POWER_LIMIT", "STATIC_LOAD_LIMIT",
     "LIFT_TORQUE", "INSUFFICIENT_EVIDENCE", "BUDGET_EXHAUSTED",
     "VISION_STALE", "INFERENCE_ERROR", "POLICY_REVOKED", "POLICY_FAILED", "MODEL_CHANGED", "HANDSHAKE_EXPIRED",
 ];
@@ -1426,6 +1432,11 @@ impl CoreOps for SupervisorInner {
                 if primitive.child().is_none() {
                     return Err("UNSUPPORTED");
                 }
+                if !matches!(primitive, Primitive::Gripper { .. })
+                    && self.power.is_static_restricted()
+                {
+                    return Err("PLAN_STALE");
+                }
                 let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                 SupervisorInner::commit_macro_child(admitted, primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
             }
@@ -1466,6 +1477,9 @@ impl CoreOps for SupervisorInner {
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = *primitive else {
             return Err("INVALID_COMMAND");
         };
+        if self.power.is_static_restricted() {
+            return Err("PLAN_STALE");
+        }
         let n = usize::from(dof);
         if n == 0 || n > MAX_DOF {
             return Err("INVALID_COMMAND");
@@ -1541,6 +1555,9 @@ impl CoreOps for SupervisorInner {
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = primitive else {
             return Err(CommitRefusal::code("INVALID_COMMAND"));
         };
+        if self.power.is_static_restricted() && !slot.static_restricted {
+            return Err(CommitRefusal::code("PLAN_STALE"));
+        }
         let n = usize::from(dof);
         if n == 0 || n > MAX_DOF {
             return Err(CommitRefusal::code("INVALID_COMMAND"));

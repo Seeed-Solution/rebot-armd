@@ -962,6 +962,12 @@ body.stopped .lock-note { color: var(--sc-status-danger-fg); background: var(--s
 .pwr.warn .pwr-pct { color: #ad6800; }
 .pwr.over .pwr-pct { color: var(--sc-status-danger-fg); }
 .pwr.na .pwr-pct { color: var(--sc-color-text-tertiary); font-weight: 400; }
+.pwr-alarm { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: var(--sc-radius-md); font-size: 12px; line-height: 1.35; border: 1px solid transparent; }
+.pwr-alarm[hidden] { display: none; }
+.pwr-alarm.warn { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border-color: rgba(150,104,12,0.22); }
+.pwr-alarm.trip { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); border-color: rgba(199,60,62,0.28); }
+.pwr-alarm b { font-weight: 600; }
+.pwr-alarm small { opacity: 0.92; font-size: 11px; }
 
 /* ---------- simple mode: integrated cockpit ---------- */
 .cockpit {
@@ -2913,6 +2919,11 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
           <span class="pwr-bar"><i class="pwr-fill" id="pwr-fill"></i><i class="pwr-tick" id="pwr-soft"></i><i class="pwr-tick" id="pwr-hard"></i><i class="pwr-peak" id="pwr-peak"></i></span>
           <b class="pwr-pct" id="pwr-pct">--</b>
         </div>
+        <!-- independent static supply overload alarm (observation.power.severity): cannot be hidden by motion_limit -->
+        <div class="pwr-alarm" id="pwr-alarm" role="alert" aria-live="assertive" hidden>
+          <b id="pwr-alarm-title"></b>
+          <small id="pwr-alarm-sub"></small>
+        </div>
         <button class="sw gc-sw" id="btn-gc" role="switch" aria-checked="false" hidden>
           <span class="sw-track"><i class="fill"></i><i class="thumb"></i></span>
           <span class="sw-text"><b data-i18n="gc.title" class="gc-long" data-op-mark>重力补偿 / 拖动示教</b><b data-i18n="gc.chip" class="gc-short" data-op-mark>拖动示教</b><small id="gc-sub" data-i18n="gc.hold">按住 0.6 秒进入</small></span>
@@ -3655,6 +3666,9 @@ const I18N = {
     'pwr.label': '电源负载', 'pwr.aria': '电源负载（估算，额定电流的百分比）',
     'pwr.title': '估算电源电流 {a} A / 额定 {r} A（{pct}%），5 秒峰值 {pk} A。由电机力矩和速度估算，非实测。',
     'pwr.na': '无力矩反馈，无法估算电源电流',
+    'pwr.alarm.warn': '静态电源负载预警：保持力矩，仅允许降载运动',
+    'pwr.alarm.trip': '静态电源负载超限：保持力矩，已禁止增载运动',
+    'pwr.alarm.sub': '请沿无障碍路径折回机械臂以降低负载。',
     'ik.blocked': 'IK 拦截', 'ik.stream': 'IK 流式 {hz}Hz', 'ik.ready': 'IK 就绪', 'ik.per_solve': ' µs/次',
     'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
     'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
@@ -3926,6 +3940,9 @@ const I18N = {
     'pwr.label': 'Supply load', 'pwr.aria': 'Supply load (estimate, percent of the rated current)',
     'pwr.title': 'Estimated supply current {a} A of {r} A rated ({pct}%), 5 s peak {pk} A. Estimated from motor torque and speed, not measured.',
     'pwr.na': 'No torque feedback: supply current cannot be estimated',
+    'pwr.alarm.warn': 'Static supply overload warning: holding torque, load-lowering motion only',
+    'pwr.alarm.trip': 'Static supply overload trip: holding torque, load-increasing motion inhibited',
+    'pwr.alarm.sub': 'Fold the arm back along a clear path to reduce load.',
     'ik.blocked': 'IK blocked', 'ik.stream': 'IK stream {hz} Hz', 'ik.ready': 'IK ready', 'ik.per_solve': ' µs/solve',
     'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
@@ -10012,11 +10029,27 @@ function cartHoldStill() {
 const ML = { key: '', j: '', until: 0, blocked: false, gripTrips: null };
 // Supply load meter: o.power (estimate) in % of the rating; ticks at the governor's soft / hard
 // fractions (schema.power_budget.governor, defaults 0.8 / 0.95), peak marker = 5 s peak.
-var PWR = { key: "" };
+var PWR = { key: "", alarmKey: "" };
 function renderPower(o) {
   const el = $('pwr');
-  if (!el) return;
+  const alarmEl = $('pwr-alarm');
   const p = o.power;
+  if (alarmEl) {
+    const sev = p && (p.severity === 'trip' || p.severity === 'warning') ? p.severity : 'none';
+    const aKey = sev + '|' + LANG;
+    if (aKey !== PWR.alarmKey) {
+      PWR.alarmKey = aKey;
+      const show = sev !== 'none';
+      alarmEl.hidden = !show;
+      alarmEl.classList.toggle('warn', sev === 'warning');
+      alarmEl.classList.toggle('trip', sev === 'trip');
+      if (show) {
+        setText($('pwr-alarm-title'), t(sev === 'trip' ? 'pwr.alarm.trip' : 'pwr.alarm.warn'));
+        setText($('pwr-alarm-sub'), t('pwr.alarm.sub'));
+      }
+    }
+  }
+  if (!el) return;
   if (!p || !(p.rated_a > 0)) { if (!el.hidden) el.hidden = true; return; }
   if (el.hidden) el.hidden = false;
   const span = 120, pctOf = (a) => Math.max(0, Math.min(span, 100 * a / p.rated_a)) / span * 100;

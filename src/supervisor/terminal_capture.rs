@@ -90,7 +90,7 @@ impl CapturedSafetyState {
                     temperature,
                     limit,
                 },
-                BoundedFaultReason::BusLoss => FaultReason::BusLoss,
+                BoundedFaultReason::BusLoss | BoundedFaultReason::BusLossAnnotated(_) => FaultReason::BusLoss,
                 BoundedFaultReason::WatchdogTimeout => FaultReason::WatchdogTimeout,
                 BoundedFaultReason::CanTxStalled(_) => FaultReason::CanTxStalled,
                 BoundedFaultReason::J7FeedbackStale(_) => FaultReason::J7FeedbackStale,

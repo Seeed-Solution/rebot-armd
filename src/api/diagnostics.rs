@@ -34,6 +34,7 @@ pub async fn get_diagnostics(
             "effective_owner": supervisor.effective_owner().as_str(),
             "owner_reason": supervisor.owner_reason().as_str(),
             "torque_shadow": supervisor.torque_shadow_diagnostics(),
+            "torque_backoff": supervisor.torque_backoff_diagnostics(),
         }))
         .into_response()
     }
@@ -86,5 +87,5 @@ pub async fn post_tick_mark(
 /// `GET /api/v1/diagnostics/power`: supply-current estimate, recent peaks and the budget in
 /// force (`{"enabled": false}` without one).
 pub async fn get_power(axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>) -> Response {
-    axum::Json(supervisor.inner().read().await.power_diagnostics()).into_response()
+    axum::Json(supervisor.power_diagnostics().await).into_response()
 }

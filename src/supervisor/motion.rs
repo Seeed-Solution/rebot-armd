@@ -552,9 +552,18 @@ impl SupervisorInner {
                         Some(1.5),
                         &self.planning_limits(),
                     ) {
-                        // power budget: slowed to fit, never refused
+                        // dynamic power budget: slowed to fit, never refused; static overload
+                        // restriction MUST still refuse load-increasing park paths and keep hold.
                         let traj = match self.power_fit_quintic(traj.clone(), &clamped_start, &self.commanded_velocities, &home, &self.planning_limits(), false) {
                             Ok((t, _)) => t,
+                            Err(ArmError::Motion(crate::motion::MotionError::StaticLoadLimit)) => {
+                                tracing::warn!("Park path refused by static load restriction; maintaining safe hold");
+                                self.pending_normal_unload = false;
+                                self.unload_settle = None;
+                                self.replace_active_trajectory(None);
+                                self.note_motion_limit(MotionLimitReason::Power, None);
+                                return;
+                            }
                             Err(e) => { tracing::warn!("Park power planning failed ({e}); parking as planned"); traj }
                         };
                         // Park checks all enabled workspace constraints: destination resting pose
@@ -712,7 +721,12 @@ impl SupervisorInner {
                 if self.bus_loss_instant.is_none() {
                     self.bus_loss_instant = Some(Instant::now());
                 }
-                self.safety.latch(crate::safety::FaultKind::BusLoss, crate::safety::FaultDetail::BusLoss);
+                let fault_detail = match self.classify_bus_loss_detail() {
+                    Some(d) => crate::safety::FaultDetail::BusLossAnnotated(d),
+                    None => crate::safety::FaultDetail::BusLoss,
+                };
+                self.safety.latch(crate::safety::FaultKind::BusLoss, fault_detail);
+                self.notify_driver_bus_loss();
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let multi_device_gap = self
@@ -1465,6 +1479,7 @@ impl SupervisorInner {
                 && p.workspace_revision == self.workspace_revision
                 && p.tcp_offset == self.config.tcp_offset
                 && p.power.as_ref() == self.power_budget()
+                && (!self.power.is_static_restricted() || p.static_restricted)
                 && p.checked_workspace == self.workspace_policy().is_some()
         });
         let (traj, power_scale) = if let Some(exact) = exact_traj {
@@ -1623,6 +1638,7 @@ impl SupervisorInner {
             epoch: self.safety.epoch_id(),
             workspace_revision: self.workspace_revision,
             power: self.power_budget().cloned(),
+            static_restricted: self.power.is_static_restricted(),
             tcp_offset: self.config.tcp_offset,
             goal_frame,
         })
@@ -1854,6 +1870,9 @@ impl SupervisorInner {
         }
         if self.workspace_revision != input.workspace_revision {
             return Err(MotionError::PlanStale("workspace or keep-out boxes changed while planning".into()).into());
+        }
+        if self.power.is_static_restricted() && !input.static_restricted {
+            return Err(MotionError::PlanStale("static overload restriction activated while planning".into()).into());
         }
         match self.action_preconditions() {
             Err(ArmError::Motion(MotionError::MotionBusy(reason))) => {

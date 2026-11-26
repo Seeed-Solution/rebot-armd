@@ -253,6 +253,36 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation RT static-load refusal hold for `armd-control`: keeps the last accepted
+    /// reference pose without committing a worsening intermediate step, drops any active servo
+    /// target, and ends a live policy stream with `STATIC_LOAD_LIMIT`.
+    pub(super) fn enter_servo_static_load_hold_rt(&mut self) {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() {
+            self.terminate_policy_run_static(
+                "STATIC_LOAD_LIMIT",
+                "failed",
+                Some("STATIC_LOAD_LIMIT"),
+                Some(crate::power::STATIC_LOAD_LIMIT_MSG),
+            );
+        }
+        self.release_servo_target();
+        self.servo_settled_ticks.fill(0);
+        self.commanded_velocities.fill(0.0);
+        copy_into(&mut self.target_positions, &self.commanded_positions);
+        self.safety.mark_motion_finished();
+        self.note_motion_limit(MotionLimitReason::Power, None);
+    }
+
+    /// Ensure a refused static-load update never leaves an active servo target worsening the load.
+    pub(super) fn drop_worsening_servo_target_on_static_refusal(&mut self) {
+        if self.servo_target.is_some() {
+            self.release_servo_target();
+            self.servo_settled_ticks.fill(0);
+            copy_into(&mut self.target_positions, &self.commanded_positions);
+        }
+    }
+
     /// Joint-space step from the commanded position to `next` (linear in joint space)
     /// against the full workspace (floor, outer box, reach, keep-out boxes, link capsules),
     /// using the persistent per-constraint monotonic escape rule and up to [`MAX_KEEPOUT_EVALS_PER_TICK`]
@@ -286,11 +316,16 @@ impl SupervisorInner {
     /// uses pre-sized clearance slices and sweep slab from `self.ws_eval_bufs` (zero heap ops
     /// for any legal workspace size, including 32 end points + multiple keep-out boxes and
     /// refusal / budget-exceeded paths).
+    ///
+    /// Does NOT commit `self.servo_ws_min_depths`: returns `Ok(Some(updated_len))` when candidate
+    /// clearance depths were computed into `self.ws_eval_bufs.scratch_cand_min_d[..updated_len]`,
+    /// and the caller must invoke [`Self::commit_servo_ws_min_depths_rt`] ONLY after all sibling
+    /// step gates (including static-load admission) also pass.
     pub(super) fn servo_step_workspace_rt(
         &mut self,
         next: &[f32],
         phase: &'static str,
-    ) -> Result<(), crate::chain::WorkspaceFailureRt> {
+    ) -> Result<Option<usize>, crate::chain::WorkspaceFailureRt> {
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let mut updated_len = 0usize;
         let result = (|| {
@@ -372,9 +407,16 @@ impl SupervisorInner {
             eval.recycle(&mut bufs);
             checked
         })();
+        self.ws_eval_bufs = bufs;
+        result.map(|updated| updated.then_some(updated_len))
+    }
+
+    /// Commit candidate workspace clearance depths computed by [`Self::servo_step_workspace_rt`]
+    /// into `self.servo_ws_min_depths` (0 heap ops) atomically alongside the accepted step.
+    pub(super) fn commit_servo_ws_min_depths_rt(&mut self, updated_len: usize) {
         let rev = self.workspace_revision;
-        if result.as_ref().is_ok_and(|&updated| updated) {
-            // Update `servo_ws_min_depths` in place (or from `bufs.min_depths_spare`) with 0 heap ops.
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        if updated_len <= bufs.scratch_cand_min_d.len() {
             let src = &bufs.scratch_cand_min_d[..updated_len];
             let updated_in_place = match self.servo_ws_min_depths.as_mut() {
                 Some((cur_rev, dst)) if dst.as_slice().len() == updated_len => {
@@ -412,7 +454,6 @@ impl SupervisorInner {
             }
         }
         self.ws_eval_bufs = bufs;
-        result.map(|_| ())
     }
 
     /// `check_workspace_path(commanded, [target])` with the evaluator's reused vectors (no
@@ -708,6 +749,11 @@ impl SupervisorInner {
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
         self.clamp_j7_if_stale(targets, j7_gate);
+        if self.check_static_load_admission(targets).is_err() {
+            self.note_motion_limit(MotionLimitReason::Power, None);
+            self.drop_worsening_servo_target_on_static_refusal();
+            return Err(SafetyError::StaticLoadLimit);
+        }
         Ok(())
     }
 
@@ -766,6 +812,11 @@ impl SupervisorInner {
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
         self.clamp_j7_if_stale(targets, j7_gate);
+        if self.check_static_load_admission(targets).is_err() {
+            self.note_motion_limit(MotionLimitReason::Power, None);
+            self.drop_worsening_servo_target_on_static_refusal();
+            return Err(Refusal::code("STATIC_LOAD_LIMIT"));
+        }
         Ok(())
     }
 
@@ -1083,6 +1134,50 @@ impl SupervisorInner {
         let crate::tracking::PendingFallback { step, ramp, other_depths } = pending;
         match step {
             Ok(fb) => {
+                if self.check_static_load_tracking_output(&fb.positions, true).is_err() {
+                    if self.scratch.fallback_prev_confirmed_valid
+                        && self.scratch.fallback_prev_confirmed.len() == self.commanded_positions.len()
+                    {
+                        let gripper_idx = self.config.gripper_index();
+                        for (i, (c, &p)) in self
+                            .commanded_positions
+                            .iter_mut()
+                            .zip(self.scratch.fallback_prev_confirmed.iter())
+                            .enumerate()
+                        {
+                            if Some(i) != gripper_idx {
+                                *c = p;
+                            }
+                        }
+                    }
+                    crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+                    self.commanded_velocities.fill(0.0);
+                    self.commanded_accelerations.fill(0.0);
+                    self.tracking.invalidate();
+                    self.tracking.holding_fallback_pose = true;
+                    self.note_motion_limit(MotionLimitReason::Power, None);
+                    let mut targets = std::mem::take(&mut self.scratch.targets);
+                    targets.clear();
+                    targets.extend(
+                        self.commanded_positions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &p)| JointTarget {
+                                position: p,
+                                velocity: Some(0.0),
+                                torque: if gravity_output_enabled {
+                                    self.gravity_torques_ramped.get(i).copied()
+                                } else {
+                                    Some(0.0)
+                                },
+                                kp: None,
+                                kd: None,
+                            }),
+                    );
+                    self.scratch.targets = targets;
+                    let dt = 1.0 / f64::from(self.config.control_frequency_hz.max(1));
+                    return self.write_output_scratch(dt);
+                }
                 crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &fb.positions);
                 crate::rt_core::scratch::copy_into(&mut self.target_positions, &fb.positions);
                 crate::rt_core::scratch::copy_into(&mut self.commanded_velocities, &fb.velocities);
@@ -1933,6 +2028,7 @@ impl SupervisorInner {
                 SafetyError::CollisionHold(_) => ("COLLISION_HOLD", "cancelled", "COLLISION_HOLD"),
                 SafetyError::SoftLimitExceeded { .. } => ("SOFT_LIMIT_EXCEEDED", "failed", "SOFT_LIMIT_EXCEEDED"),
                 SafetyError::WorkspaceViolation { .. } => ("WORKSPACE_VIOLATION", "failed", "WORKSPACE_VIOLATION"),
+                SafetyError::StaticLoadLimit => ("STATIC_LOAD_LIMIT", "failed", "STATIC_LOAD_LIMIT"),
                 SafetyError::NotArmed(_) => ("NOT_ARMED", "failed", "NOT_ARMED"),
                 _ => ("SAFETY_REJECTED", "failed", "SAFETY_ERROR"),
             };
@@ -2237,6 +2333,7 @@ impl SupervisorInner {
                 "COLLISION_HOLD" => ("COLLISION_HOLD", "cancelled", "COLLISION_HOLD", "Collision hold active"),
                 "SOFT_LIMIT_EXCEEDED" => ("SOFT_LIMIT_EXCEEDED", "failed", "SOFT_LIMIT_EXCEEDED", "Policy target exceeded joint soft limits"),
                 "WORKSPACE_VIOLATION" => ("WORKSPACE_VIOLATION", "failed", "WORKSPACE_VIOLATION", "Policy target violated workspace bounds"),
+                "STATIC_LOAD_LIMIT" => ("STATIC_LOAD_LIMIT", "failed", "STATIC_LOAD_LIMIT", crate::power::STATIC_LOAD_LIMIT_MSG),
                 "NOT_ARMED" => ("NOT_ARMED", "failed", "NOT_ARMED", "Arm is not armed"),
                 "COMMISSIONING_REQUIRED" => ("COMMISSIONING_REQUIRED", "failed", "COMMISSIONING_REQUIRED", "Tool commissioning required"),
                 _ => ("SAFETY_REJECTED", "failed", "SAFETY_ERROR", "Policy target rejected by safety filter"),
@@ -2628,9 +2725,8 @@ impl SupervisorInner {
         run.authorization.revoke();
         self.record_pending_policy_close(action_id);
         self.end_policy_stream(action_id);
-        self.set_action_policy_stats(action_id, final_stats.unwrap_or_else(|| run.step_stats.report()));
-        run.stop_reason = Some(stop_reason.to_string());
-        self.record_policy_qualification(&run, stop_reason, action_state);
+        let stats_report = final_stats.unwrap_or_else(|| run.step_stats.report());
+        self.set_action_policy_stats(action_id, stats_report);
         if run.mode == crate::policy_runtime::PolicyMode::Live {
             self.release_servo_target();
             self.servo_settled_ticks.fill(0);
@@ -2638,8 +2734,11 @@ impl SupervisorInner {
             self.j7_admitted_stamp = None;
             copy_into(&mut self.target_positions, &self.commanded_positions);
         }
+        if self.last_policy_obs.is_none() {
+            self.last_policy_obs = self.last_policy_obs_spare.take();
+        }
         if let Some(obs) = self.last_policy_obs.as_mut() {
-            run.to_observation_into(false, obs);
+            run.to_observation_into_with_vec_spare(false, obs, &mut self.last_policy_obs_vec_spare);
             obs.stop_reason = Some(crate::model::HolderLabel::new(stop_reason));
         } else {
             let mut obs = run.to_observation(false);
@@ -2655,7 +2754,29 @@ impl SupervisorInner {
             None,
             None,
         );
-        self.retire_policy_run(run);
+        if self.defer_zero_check_persist {
+            // Defer supervised_first_run ledger I/O (open/write/sync_all) off the Legacy control
+            // release lock without allocating on the control path (B4).
+            let needs_qual = run.mode == crate::policy_runtime::PolicyMode::Live
+                && !self.policy_live_allowed()
+                && self.policy_ledger_path.is_some()
+                && run.verified_release_gate.as_ref().is_some_and(|g| {
+                    g.authorization_tier() == crate::policy_runtime::AuthorizationTier::SupervisedFirstRun
+                });
+            if needs_qual {
+                self.pending_policy_qual_persist = Some((
+                    run,
+                    crate::model::HolderLabel::new(stop_reason),
+                    crate::model::HolderLabel::new(action_state),
+                ));
+            } else {
+                self.retire_policy_run(run);
+            }
+        } else {
+            run.stop_reason = Some(stop_reason.to_string());
+            self.record_policy_qualification(&run, stop_reason, action_state);
+            self.retire_policy_run(run);
+        }
     }
 
     pub(crate) fn terminate_policy_run(
@@ -2747,6 +2868,7 @@ pub mod targets {
             SafetyError::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
             SafetyError::MotionBusy => "MOTION_BUSY",
             SafetyError::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
+            SafetyError::StaticLoadLimit => "STATIC_LOAD_LIMIT",
             SafetyError::EpochMismatch { .. } => "EPOCH_MISMATCH",
             SafetyError::SoftLimitExceeded { .. } => "SOFT_LIMIT_EXCEEDED",
             SafetyError::FaultActive(_) => "FAULT_ACTIVE",
@@ -2780,7 +2902,7 @@ pub mod targets {
             "MOTION_FORBIDDEN_IN_FAULT_STATE" => (409, "MotionForbiddenInFaultState", Some("Fault")),
             "TORQUE_OFF_WOULD_DROP" => (409, code, None),
             "CLEAR_FAULT_REJECTED" => (409, "ClearFaultRejected", Some("Fault")),
-            "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" => (422, code, None),
+            "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" | "STATIC_LOAD_LIMIT" => (422, code, None),
             "SOFT_LIMIT_EXCEEDED" | "SAFETY_ERROR" | "INVALID_COMMAND" => (400, code, None),
             "NOT_ARMED" => (412, code, None),
             "OPERATOR_CONFIRMATION_REQUIRED" | "RELEASE_GATE_REQUIRED" => (403, code, None),
@@ -2827,6 +2949,7 @@ pub mod targets {
             }
             "EPOCH_MISMATCH" => json!({"type":"epoch_sync", "epoch_id":ctx.epoch_id, "safety_state":ctx.safety_state}),
             "CALIBRATION_BUSY" => json!({"type":"servo_reject", "reason":"calibration_busy"}),
+            "STATIC_LOAD_LIMIT" => servo_reject("STATIC_LOAD_LIMIT", crate::power::STATIC_LOAD_LIMIT_MSG, ctx.epoch_id),
             code => {
                 let mut v = servo_reject(code, "servo target refused when the control loop applied it", ctx.epoch_id);
                 if let RefusalDetail::CurrentRevision(rev) = refusal.detail {

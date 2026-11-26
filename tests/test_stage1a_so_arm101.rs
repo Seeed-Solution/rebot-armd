@@ -75,6 +75,7 @@ fn so_arm101_config() -> ArmConfig {
     c.gravity_comp = None;
     c.torque_guard = None;
     c.damiao_ranges = None;
+    c.expected_timeout_counts = None;
     c.servo_max_velocity = None;
     c.resting_pose = None;
     c.power_budget = None;
@@ -119,6 +120,7 @@ fn config_6_plus_0() -> ArmConfig {
     c.gravity_comp = None;
     c.torque_guard = None;
     c.damiao_ranges = None;
+    c.expected_timeout_counts = None;
     c.servo_max_velocity = None;
     c.resting_pose = None;
     c.power_budget = None;
@@ -296,6 +298,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],
@@ -331,6 +334,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],
@@ -418,6 +422,7 @@ fn test_profile_id_pose_and_replay_rejection() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],
@@ -523,6 +528,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],
@@ -555,6 +561,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],
@@ -585,6 +592,7 @@ fn test_parquet_metadata_error_propagation() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],
@@ -622,6 +630,7 @@ fn test_parquet_metadata_error_propagation() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],
@@ -656,6 +665,7 @@ fn test_parquet_metadata_error_propagation() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        static_restricted: false,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
         tcp_offset: [0.0; 3],

@@ -5185,6 +5185,7 @@ fn dual_owner_stale_j7_gates_replay_sequence_policy_macros_and_never_sends_stale
             epoch: inner.safety.epoch_id(),
             workspace_revision: inner.workspace_revision,
             power: None,
+            static_restricted: false,
             store: store.clone(),
             zero_offsets: inner.joint_zero_offsets.clone(),
             tcp_offset: inner.config.tcp_offset,

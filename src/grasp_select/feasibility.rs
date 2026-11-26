@@ -1192,7 +1192,7 @@ mod tests {
         let c = ArmConfig::rebot_dm();
         PlanInput {
             q0: [0.0, -1.167, -1.565, 1.435, 0.0, 0.0], j7: 0.0, limits: c.limits.clone(), speed_cap: None, ws: c.workspace.clone(),
-            cam: c.camera_mount.clone(), arm: c.arm_model.clone(), epoch: 0, workspace_revision: 0, power: None, tcp_offset: c.tcp_offset,
+            cam: c.camera_mount.clone(), arm: c.arm_model.clone(), epoch: 0, workspace_revision: 0, power: None, static_restricted: false, tcp_offset: c.tcp_offset,
             goal_frame: GoalFrame::Tcp,
         }
     }

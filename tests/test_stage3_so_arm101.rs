@@ -112,6 +112,7 @@ fn plan_input_at_home(config: &ArmConfig) -> PlanInput {
         ws: config.workspace.clone(),
         cam: config.camera_mount.clone(),
         power: None,
+        static_restricted: false,
         tcp_offset: config.tcp_offset,
         goal_frame: armd::motion::GoalFrame::EndLink,
     }

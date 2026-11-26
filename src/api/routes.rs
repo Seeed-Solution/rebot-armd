@@ -53,10 +53,12 @@ impl RestMethod {
     }
 }
 
-/// Canonical remaining `RouteOwnership::LegacyOnly` REST route probe (`(method, path)`).
-/// Centralized so future executor migrations update a single location.
+/// Canonical fail-closed REST probe rejected with `503 EXECUTOR_ROUTING_PENDING` on
+/// `OWNER_EXECUTOR` (`(method, path)`). All registered REST routes are migrated
+/// (`OwnerAgnostic` / `ExecutorRequest`), so this targets an unregistered REST path
+/// matching [`LEGACY_ONLY_WS_PROBE`].
 pub const LEGACY_ONLY_REST_PROBE: (RestMethod, &str) =
-    (RestMethod::Get, "/api/v1/diagnostics/power");
+    (RestMethod::Post, crate::gripper_calib::CALIBRATE_PATH);
 
 /// Canonical remaining `RouteOwnership::LegacyOnly` WS command probe.
 /// Centralized so future executor migrations update a single location.
@@ -405,7 +407,7 @@ static REST_ROUTES: &[RestRouteEntry] = &[
     rr!(GET    "/api/v1/diagnostics/blackbox",      diagnostics::get_blackbox,          OwnerAgnostic,   None,      None,              Allowed),
     rr!(GET    "/api/v1/diagnostics/tick",          diagnostics::get_tick,              ExecutorRequest, None,      None,              Allowed),
     rr!(POST   "/api/v1/diagnostics/tick/mark",     diagnostics::post_tick_mark,        ExecutorRequest, Required,  None,              Fenced),
-    rr!(GET    "/api/v1/diagnostics/power",         diagnostics::get_power,             LegacyOnly,      None,      None,              Allowed),
+    rr!(GET    "/api/v1/diagnostics/power",         diagnostics::get_power,             ExecutorRequest, None,      None,              Allowed),
     rr!(GET    "/api/v1/ws",                        super::ws::ws_handler,              ExecutorRequest, None,      None,              Allowed),
     // Reverse proxy & vision routes
     rr!(GET    "/api/v1/detection/ws",              proxy::proxy_detection_ws,          OwnerAgnostic,   None,      None,              Allowed),
@@ -796,8 +798,20 @@ mod tests {
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(
-            lookup(RouteKey::rest(LEGACY_ONLY_REST_PROBE.0, LEGACY_ONLY_REST_PROBE.1)).unwrap().ownership,
-            RouteOwnership::LegacyOnly
+            lookup(RouteKey::rest(RestMethod::Get, "/api/v1/diagnostics/power"))
+                .unwrap()
+                .ownership,
+            RouteOwnership::ExecutorRequest
+        );
+        assert!(
+            REST_ROUTES
+                .iter()
+                .all(|e| e.spec.ownership != RouteOwnership::LegacyOnly),
+            "all registered REST routes are migrated off LegacyOnly"
+        );
+        assert!(
+            lookup(RouteKey::rest(LEGACY_ONLY_REST_PROBE.0, LEGACY_ONLY_REST_PROBE.1)).is_none(),
+            "LEGACY_ONLY_REST_PROBE must fail closed on OWNER_EXECUTOR"
         );
         assert_eq!(
             lookup(RouteKey::ws_command("/api/v1/mode/gravity_comp")).unwrap().ownership,

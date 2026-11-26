@@ -905,6 +905,7 @@ fn b2_r2_m4_mit_motion_blocker_is_zero_alloc() {
         kind: PreparedActionKind::MoveToJoint,
         dof: INSPECT.len() as u8,
         start: s_arr,
+        v0: [0.0; MAX_DOF],
         target: t_arr,
         duration_s: 0.2,
         max_velocity: mv_arr,

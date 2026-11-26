@@ -337,6 +337,9 @@ impl From<ArmError> for ApiError {
                     api.workspace_violation = Some(detail.clone());
                     api
                 }
+                crate::safety::SafetyError::StaticLoadLimit => {
+                    ApiError(StatusCode::UNPROCESSABLE_ENTITY, safety_err.to_string(), "STATIC_LOAD_LIMIT".to_string())
+                }
                 crate::safety::SafetyError::EpochMismatch { .. } => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "EPOCH_MISMATCH".to_string())
                 }

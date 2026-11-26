@@ -57,6 +57,9 @@ pub enum MotionError {
     /// Power budget planning (`src/power_plan.rs`): even the slowest allowed speed exceeds it.
     #[error("Power budget: {0}")]
     PowerBudget(String),
+    /// Predicted static holding current exceeds the configured static admission cap (`src/power.rs`).
+    #[error("Estimated holding current too high. Fold the arm back along a clear path.")]
+    StaticLoadLimit,
 }
 
 fn format_motion_workspace_violation(
@@ -91,6 +94,7 @@ impl MotionError {
             Self::InvalidCommand(_) => "INVALID_COMMAND",
             Self::Unsupported(_) => "UNSUPPORTED",
             Self::PowerBudget(_) => "POWER_BUDGET",
+            Self::StaticLoadLimit => "STATIC_LOAD_LIMIT",
         }
     }
 }
@@ -586,6 +590,8 @@ pub struct PlanInput {
     pub workspace_revision: u64,
     /// Power budget whose `planning` section time-scales the path; None = none.
     pub power: Option<crate::power::PowerBudget>,
+    /// True when static overload restriction (load-lowering motion only) is active.
+    pub static_restricted: bool,
     /// Active tool TCP offset in `end_link` frame (m).
     pub tcp_offset: [f64; 3],
     /// Coordinate frame of `goal` and `resolve_goal*` outputs (`EndLink` or `Tcp`).
@@ -948,6 +954,17 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
     let dof = input.limits.len();
     let arm_dof = input.arm.arm_dof();
     let mut path = JointPath { dof, arm_dof, q: q_samples, s: s_samples, duration, power_scale: 1.0 };
+    if let Some(b) = input.power.as_ref().filter(|b| b.enabled) {
+        let start_q: [f32; 7] = std::array::from_fn(|i| if i < 6 { input.q0[i] as f32 } else { input.j7 });
+        let n_arm = arm_dof.min(7);
+        crate::power::check_static_load_poses(
+            b,
+            &input.arm,
+            &start_q[..n_arm],
+            path.q.iter().skip(1).map(|q| &q[..n_arm]),
+            input.static_restricted,
+        )?;
+    }
     if let Some(b) = input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
         #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
@@ -3583,6 +3600,7 @@ mod tests {
             ws: config.workspace.clone(),
             cam: config.camera_mount.clone(),
             power: None,
+            static_restricted: false,
             tcp_offset,
             goal_frame: GoalFrame::Tcp,
         }

@@ -1723,6 +1723,7 @@ fn terminal_capture_lock_proof_action_completion_dwell_saturation_and_positive_c
                 measured_positions: from,
                 torque_hold: None,
                 power_hold: None,
+                static_restricted: false,
                 holding_after_clear: false,
                 mit_active: false,
                 authority: armd::rt_core::requests::motion::PlanAuthority {

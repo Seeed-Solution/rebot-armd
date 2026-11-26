@@ -1957,6 +1957,7 @@ fn rt_round5_b1_m1_m2_m3_paths_zero_alloc_and_zero_free() {
             epoch: inner.safety.epoch_id(),
             workspace_revision: inner.workspace_revision,
             power: None,
+            static_restricted: false,
             store,
             zero_offsets: inner.joint_zero_offsets.clone(),
             tcp_offset: inner.config.tcp_offset,

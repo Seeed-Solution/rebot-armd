@@ -80,6 +80,8 @@ pub struct ReplayInput {
     pub workspace_revision: u64,
     /// Power budget whose `planning` section time-scales the playback; None = none.
     pub power: Option<crate::power::PowerBudget>,
+    /// True when static overload restriction (load-lowering motion only) is active.
+    pub static_restricted: bool,
     /// Episode store the episode is read from, and the joint zero in effect (stale check).
     pub store: crate::recording::EpisodeStore,
     pub zero_offsets: Vec<f32>,
@@ -519,6 +521,18 @@ fn plan_frames_with_provenance(
             input.request.episode, recorded_tool_id, recorded_tool_digest, input.active_tool.id, input.active_tool.config_digest
         )));
     }
+    if let Some(b) = input.power.as_ref().filter(|b| b.enabled) {
+        let arm_n = input.arm.arm_dof().min(input.dof);
+        let first_q = &samples[0][..arm_n.min(samples[0].len())];
+        crate::power::check_static_load_poses(
+            b,
+            &input.arm,
+            first_q,
+            samples.iter().skip(1).map(|s| &s[..arm_n.min(s.len())]),
+            input.static_restricted,
+        )
+        .map_err(|e| rejected(422, e.code(), format!("episode '{}': {e}", input.request.episode)))?;
+    }
     // power budget: the playback (at the chosen speed) is slowed to fit, or refused
     let power_scale = match input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
         None => None,
@@ -602,6 +616,7 @@ fn plan_replay_approach_off_lock(
         &input.speed_limits,
         input.power.as_ref(),
         &input.arm,
+        input.static_restricted,
     )?;
     let workspace_swept = if let Some((ws, cam)) = input.ws.as_ref() {
         crate::rt_core::requests::actions::check_quintic_workspace_off_lock(
@@ -893,6 +908,7 @@ impl SupervisorInner {
             epoch,
             workspace_revision: self.workspace_revision,
             power: self.power_budget().cloned(),
+            static_restricted: self.power.is_static_restricted(),
             store: self.episodes.clone(),
             zero_offsets: self.joint_zero_offsets.clone(),
             tcp_offset: self.config.tcp_offset,
@@ -909,6 +925,9 @@ impl SupervisorInner {
     }
 
     fn install_replay_inner(&mut self, proof: &crate::supervisor::AdmittedProof, plan: ReplayPlan) -> Result<(u64, f64), ArmError> {
+        if self.power.is_static_restricted() && !plan.input.static_restricted {
+            return Err(MotionError::PlanStale("static overload restriction activated while planning".into()).into());
+        }
         let (motion, first, scales) = self.replay_motion(plan)?;
         self.install_replay_motion_inner(proof, motion, &first, scales, true)
     }
@@ -942,6 +961,9 @@ impl SupervisorInner {
 
     pub(crate) fn install_macro_replay_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, plan: ReplayPlan) -> Result<f64, ArmError> {
         self.macro_sub_ready_pub(id)?;
+        if self.power.is_static_restricted() && !plan.input.static_restricted {
+            return Err(MotionError::PlanStale("static overload restriction activated while planning".into()).into());
+        }
         let (motion, first, scales) = self.replay_motion(plan)?;
         self.install_macro_replay_motion_inner(proof, id, motion, &first, scales)
     }
@@ -1410,6 +1432,7 @@ mod tests {
             epoch: 0,
             workspace_revision: 0,
             power: None,
+            static_restricted: false,
             store: store.clone(),
             zero_offsets: vec![0.0; c.dof],
             tcp_offset: c.tcp_offset,
@@ -1478,6 +1501,7 @@ mod tests {
             epoch: recv_epoch,
             workspace_revision: 0,
             power: None,
+            static_restricted: false,
             store,
             zero_offsets: vec![0.0; stock_cfg.dof],
             tcp_offset: stock_cfg.tcp_offset,
@@ -1540,6 +1564,7 @@ mod tests {
             epoch: recv_epoch,
             workspace_revision: 0,
             power: None,
+            static_restricted: false,
             store,
             zero_offsets: vec![0.0; stock_cfg.dof],
             tcp_offset: stock_cfg.tcp_offset,
