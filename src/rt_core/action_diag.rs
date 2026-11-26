@@ -690,10 +690,11 @@ impl ActionDiagEntry {
     }
 
     /// Overlays accumulated diagnostics onto `action` without ever overwriting authoritative RT
-    /// terminal fields (`state`, `code`, `message`, `holding`, `finished_at`, or terminal
-    /// `phase`/`progress`).
+    /// terminal fields (`state`, `code`, `message`, `holding`, `finished_at`, or `done`
+    /// `phase`/`progress`). On `failed`/`cancelled`, the last running `phase`/`progress` is
+    /// preserved just as on Legacy.
     pub(crate) fn apply_to_action(&self, a: &mut ActionStatus) {
-        if a.is_running() {
+        if a.state.as_str() != "done" {
             if let Some(p) = self.phase {
                 a.phase = Some(p);
             }
