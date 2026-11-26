@@ -8876,7 +8876,6 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                                 if self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h()) {
                                     return ZeroCheckCommitStop::WorkerDisconnected;
                                 }
-                                self.publish_pending();
                                 let prep_pol = pub_pol.clone();
                                 self.published_config.apply_zero_check_commit(
                                     self.job.offset_rad,
@@ -8890,6 +8889,8 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                                     next.gripper_calib_revision = activated_revision;
                                     self.hub.update_prep_env(Arc::new(next));
                                 }
+                                // Rename after the published config is current (no stale window).
+                                self.publish_pending();
                                 tracing::info!(
                                     "Executor zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
                                 );
@@ -8954,14 +8955,15 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
             code_buf: String::with_capacity(64),
             msg_buf: String::with_capacity(160),
         });
+        let mut activated = false;
         if !self.hooks.leave_final_reply_queued {
             let reply = self.wait_reply();
-            if matches!(reply, Some(PersistReply::Activated { .. })) {
-                if self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h()) {
-                    return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
-                }
-                self.publish_pending();
+            if matches!(reply, Some(PersistReply::Activated { .. }))
+                && self.hooks.after_activate_before_publish.as_ref().is_some_and(|h| h())
+            {
+                return Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected);
             }
+            activated = matches!(reply, Some(PersistReply::Activated { .. }));
             if let Some(PersistReply::Activated { activated_revision, .. }) = reply {
                 let prep_pol = pub_policy.clone();
                 self.published_config.apply_zero_check_commit(
@@ -8977,6 +8979,10 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                     self.hub.update_prep_env(Arc::new(next));
                 }
             }
+        }
+        if activated {
+            // Rename after the published config is current (no stale window).
+            self.publish_pending();
         }
         Ok(())
     }
