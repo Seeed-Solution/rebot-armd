@@ -2947,22 +2947,21 @@ async fn review_m11_m12_m13_m14_production_adapters_detached_shell_and_same_side
         }
     };
 
-    // 1) Major 13: sequences::begin_executor refuses recording BEFORE starting parent macro!
+    // 1) Adapter 2: sequences::prepare_run_from_snapshot refuses a missing recording dataset
+    //    (404 DATASET_NOT_FOUND) BEFORE starting any parent macro on executor!
     {
         let mut adm = sup.capture_admission_stamp();
         adm.connection_id = 31;
         let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
-        let plan_with_rec = armd::sequences::prepare_run_from_snapshot(
+        let err = armd::sequences::prepare_run_from_snapshot(
             &snap,
-            &json!({"id": seq_id, "record": {"dataset": "demo"}}),
+            &json!({"id": seq_id, "record": {"dataset": "missing_demo"}}),
             snap.owner.authority.epoch,
-            false,
+            true,
         )
-        .unwrap();
-        let err = armd::sequences::begin_executor(&sup, adm, plan_with_rec)
-            .await
-            .expect_err("recording-enabled sequence must be refused BEFORE BeginMacro on executor");
-        assert!(matches!(err, armd::ArmError::Motion(armd::motion::MotionError::Unsupported(_))), "{err:?}");
+        .expect_err("missing recording dataset must be refused BEFORE BeginMacro on executor");
+        let api = armd::api::rest::ApiError::from(err);
+        assert_eq!(api.code.as_deref(), Some("DATASET_NOT_FOUND"), "{api:?}");
         assert!(!sup.hub().latest().unwrap().rt.owner.macro_state.alive, "no parent macro may start");
     }
 
