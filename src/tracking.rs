@@ -2440,7 +2440,7 @@ impl crate::supervisor::SupervisorInner {
                 .map_err(|_| FallbackStepErr::WorkspaceMeasuredViolation(legacy_err()))?;
         }
         let mut min_d_meas = eval.init_min_depths(&c_meas);
-        if let (true, Some(stack)) = (use_rt_sweep, sweep_stack.as_deref_mut()) {
+        if let (true, Some(stack)) = (use_rt_sweep, sweep_stack) {
             eval.sweep_linear_step_slotbuf_rt(
                 &self.measured_positions,
                 q,
