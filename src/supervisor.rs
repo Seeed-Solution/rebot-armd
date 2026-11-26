@@ -12476,15 +12476,16 @@ impl SupervisorInner {
         };
         let reason = crate::motor_mode::ModeSwitchFailure::from_revoke_code(reason_code);
         let mut drv_uncertain = 0u32;
+        let stop_applied = self.safety.state().is_stopped();
         let progress = if let Some(slot) = self.driver.as_mut() {
             let mut p = None;
             let _ = slot.try_with_mut(|drv| {
-                p = Some(machine.reconcile_external_revocation(Some(drv), reason));
+                p = Some(machine.reconcile_external_revocation(Some(drv), reason, stop_applied));
                 drv_uncertain = drv.mode_write_uncertain_mask();
             });
-            p.unwrap_or_else(|| machine.reconcile_external_revocation(None, reason))
+            p.unwrap_or_else(|| machine.reconcile_external_revocation(None, reason, stop_applied))
         } else {
-            machine.reconcile_external_revocation(None, reason)
+            machine.reconcile_external_revocation(None, reason, stop_applied)
         };
         let uncertain = progress.is_ambiguous() || drv_uncertain != 0;
         let snap = machine.snapshot(sid.0, drv_uncertain);
@@ -14144,6 +14145,8 @@ impl ArmSupervisor {
             );
         }
         let safe_hold_ctrl = Arc::clone(&self.legacy_safe_hold);
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut disabled_shadow_spare = Some(crate::torque::shadow::ShadowRuntime::disabled(&cfg));
         let mut step_counter: u64 = 0;
         let mut panicked = false;
         let mut handoff_driver: Option<Box<dyn ArmDriver>> = None;
@@ -14173,7 +14176,12 @@ impl ArmSupervisor {
                         dt,
                         false,
                         Some(release_deadline),
-                        Some((&mut safe_hold_bufs, &control_stop, &mut extracted)),
+                        Some((
+                            &mut safe_hold_bufs,
+                            &control_stop,
+                            &mut disabled_shadow_spare,
+                            &mut extracted,
+                        )),
                     ));
                 }));
                 match tick_res {
@@ -16627,9 +16635,21 @@ impl ArmSupervisor {
             ConfigError::CalibPrecondition {
                 status: 400,
                 code: "INVALID_COMMAND",
-                message: "invalid gripper joint index",
+                message: "invalid gripper joint index or control mode",
             }
         })?;
+        // R3 Minor 1: validate against the configured gripper joint via `read_services`.
+        let svc = self
+            .read_services(crate::rt_core::publish::ReadRequirements::identity())
+            .await
+            .map_err(|_| ConfigError::OwnerStopped)?;
+        if svc.identity.dof <= svc.identity.arm_dof || joint != svc.identity.arm_dof {
+            return Err(ConfigError::CalibPrecondition {
+                status: 400,
+                code: "INVALID_COMMAND",
+                message: "joint is not the configured gripper axis",
+            });
+        }
         // R2 Major 8: checked deadline & grace arithmetic BEFORE admission!
         let now = Instant::now();
         let Some(deadline) = now.checked_add(timeout) else {
@@ -19535,6 +19555,7 @@ impl ArmSupervisor {
         mut legacy_safe_hold_handoff: Option<(
             &mut crate::rt_core::safe_hold::SafeHoldBuffers,
             &Arc<AtomicBool>,
+            &mut Option<crate::torque::shadow::ShadowRuntime>,
             &mut Option<(
                 Box<dyn ArmDriver>,
                 Option<crate::torque::shadow::ShadowRuntime>,
@@ -19625,7 +19646,9 @@ impl ArmSupervisor {
             // Blocker 7: Mirror SAFE-HOLD buffers AND perform atomic zero-contention driver
             // extraction directly inside the single tick write guard when a session requests
             // SAFE-HOLD — eliminating post-tick `try_read()` and `try_write()` contention.
-            if let Some((bufs, control_stop, out)) = legacy_safe_hold_handoff.as_mut() {
+            if let Some((bufs, control_stop, disabled_shadow_spare, out)) =
+                legacy_safe_hold_handoff.as_mut()
+            {
                 if !inner.detached {
                     bufs.mirror_from_core(&inner);
                     #[cfg(not(target_arch = "wasm32"))]
@@ -19656,24 +19679,26 @@ impl ArmSupervisor {
                             .take()
                             .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold)
                         {
-                        inner.detached = true;
-                        let disabled =
-                            crate::torque::shadow::ShadowRuntime::disabled(&inner.config);
-                        let sh = std::mem::replace(&mut inner.torque_shadow, disabled);
-                        // R2 Major 4: publish atomic `OWNER_FAILED` lock-freely and update
-                        // `owner`/`active_writer` via non-blocking `try_lock()` so a contending
-                        // off-thread mutex holder can NEVER delay the first SAFE-HOLD hold frame!
-                        self.owner_mode.store(OWNER_FAILED, Ordering::Release);
-                        if let Ok(mut slot) = self.owner.try_lock() {
-                            *slot = OwnerSlot::Failed;
-                        }
-                        if let Ok(mut w) = self.active_writer.try_lock() {
-                            *w = WriterEndpoint::DetachedSafeHold {
-                                safe_hold: Arc::clone(&self.legacy_safe_hold),
-                                control_stop: Arc::clone(control_stop),
-                            };
-                        }
-                        **out = Some((drv, Some(sh), reason));
+                            inner.detached = true;
+                            // R3 Major 7: swap in the preconstructed disabled shadow runtime
+                            // (zero heap allocations on armd-control during SAFE-HOLD handoff!).
+                            let sh = disabled_shadow_spare
+                                .take()
+                                .map(|spare| std::mem::replace(&mut inner.torque_shadow, spare));
+                            // R2 Major 4: publish atomic `OWNER_FAILED` lock-freely and update
+                            // `owner`/`active_writer` via non-blocking `try_lock()` so a contending
+                            // off-thread mutex holder can NEVER delay the first SAFE-HOLD hold frame!
+                            self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                            if let Ok(mut slot) = self.owner.try_lock() {
+                                *slot = OwnerSlot::Failed;
+                            }
+                            if let Ok(mut w) = self.active_writer.try_lock() {
+                                *w = WriterEndpoint::DetachedSafeHold {
+                                    safe_hold: Arc::clone(&self.legacy_safe_hold),
+                                    control_stop: Arc::clone(control_stop),
+                                };
+                            }
+                            **out = Some((drv, sh, reason));
                         }
                     }
                 }

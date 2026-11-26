@@ -1192,9 +1192,12 @@ pub mod switch {
         }
 
         /// Reference adapter plan: read-only causal J7 gripper mode confirmation (`PositionVelocity`
-        /// or `PositionForce`). Rejects out-of-range joints with [`ModeSwitchFailure::InvalidPlan`].
+        /// or `PositionForce`). Rejects out-of-range joints or non-gripper modes with
+        /// [`ModeSwitchFailure::InvalidPlan`].
         pub fn confirm_gripper(joint: usize, mode: ControlMode) -> Result<Self, ModeSwitchFailure> {
-            if joint >= MAX_MODE_SWITCH_AXES {
+            if joint >= MAX_MODE_SWITCH_AXES
+                || !matches!(mode, ControlMode::PositionVelocity | ControlMode::PositionForce)
+            {
                 return Err(ModeSwitchFailure::InvalidPlan);
             }
             let mut plan = Self::empty(ModeSwitchIntent::ConfirmOnly);
@@ -1703,6 +1706,7 @@ pub mod switch {
         active_goal: ControlMode,
         previous_mode: Option<ControlMode>,
         switched_forward: bool,
+        started_energized: bool,
         phase: AxisPhase,
     }
 
@@ -1713,6 +1717,7 @@ pub mod switch {
                 active_goal: ControlMode::PositionVelocity,
                 previous_mode: None,
                 switched_forward: false,
+                started_energized: false,
                 phase: AxisPhase::Pending,
             }
         }
@@ -1761,6 +1766,7 @@ pub mod switch {
                     active_goal: target.target_mode,
                     previous_mode: None,
                     switched_forward: false,
+                    started_energized: false,
                     phase: AxisPhase::Pending,
                 };
             }
@@ -1843,15 +1849,26 @@ pub mod switch {
             }
         }
 
+        fn first_switched_forward_joint(&self) -> Option<u8> {
+            let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
+            for i in 0..len {
+                if self.slots[i].switched_forward {
+                    return Some(self.slots[i].target.joint);
+                }
+            }
+            None
+        }
+
         /// Reconciles an external revocation (stop, cancel, disconnect, deadline expiry, epoch or
         /// operator revocation, fault, SAFE-HOLD, handback) even if `step` does not run again.
         ///
-        /// Checks both runner state and the driver's authoritative `mode_write_uncertain_mask`
-        /// (which is set at the exact `REG_WRITE` transmit boundary, including failed flush).
+        /// Checks runner state, the driver's authoritative `mode_write_uncertain_mask`, and
+        /// whether an energized partial switch has already committed without an applied stop.
         pub fn reconcile_external_revocation(
             &mut self,
             drv: Option<&mut dyn crate::driver::ArmDriver>,
             reason: ModeSwitchFailure,
+            stop_applied: bool,
         ) -> ModeProgress {
             if let RunnerPhase::Done(p) = self.phase {
                 if let Some(d) = drv {
@@ -1868,11 +1885,7 @@ pub mod switch {
             };
             let len = usize::from(self.plan.len).min(MAX_MODE_SWITCH_AXES);
             let mut in_flight_write_joint: Option<u8> = None;
-            let mut switched_any_joint: Option<u8> = None;
             for i in 0..len {
-                if self.slots[i].switched_forward {
-                    switched_any_joint.get_or_insert(self.slots[i].target.joint);
-                }
                 match self.slots[i].phase {
                     AxisPhase::AwaitingWriteAck { .. }
                     | AxisPhase::NeedReadback { from_write: true, .. }
@@ -1893,12 +1906,11 @@ pub mod switch {
                     _ => {}
                 }
             }
-            // R2 Major 5: if an energized multi-axis switch already committed >= 1 axis and is
-            // cancelled/revoked WITHOUT stopping (so ordinary motion could resume in a partially
-            // switched mixed-mode configuration), escalate to Ambiguous (SAFE-HOLD) instead of
-            // reporting StoppedRecovered! (An actual stop keeps stopped holds in per-axis verified modes.)
-            if reason != ModeSwitchFailure::Stopped && drv_energized {
-                if let Some(j) = switched_any_joint {
+            // R3 Blocker 1: NEVER release an energized partial switch back to ordinary output
+            // unless an actual stop is applied (`stop_applied == true`); never trust a caller
+            // reason string like `"STOPPED"` without an applied stop!
+            if !stop_applied && drv_energized {
+                if let Some(j) = self.first_switched_forward_joint() {
                     self.ambiguous_mask |= 1u32 << j;
                     in_flight_write_joint.get_or_insert(j);
                 }
@@ -1953,6 +1965,59 @@ pub mod switch {
             self.step_driver(&mut adapter, budget)
         }
 
+        /// Evaluates final watchdog holds on an energized terminal transition and commits the
+        /// SINGLE terminal outcome via [`Self::finish`] (R3 Major 4: never emits two contradictory
+        /// terminal events for one session).
+        fn finalize_with_watchdog_check(
+            &mut self,
+            drv: &mut dyn ModeSwitchDriver,
+            budget: ReleaseBudget,
+            candidate: ModeProgress,
+        ) -> ModeProgress {
+            if !candidate.is_ambiguous() && drv.any_axis_energized() {
+                let exclude_mask = drv.mode_write_uncertain_mask();
+                let effective_gap = self.effective_max_watchdog_gap(budget);
+                match drv.service_watchdog_holds(
+                    budget.watchdog_proactive_interval,
+                    exclude_mask,
+                    0,
+                    budget.cutoff,
+                    budget.max_tx_frames,
+                ) {
+                    Ok(wd) => {
+                        if !wd.all_due_serviced
+                            && wd
+                                .max_energized_age
+                                .saturating_add(budget.period)
+                                .saturating_add(budget.hold_delivery_margin)
+                                > effective_gap
+                        {
+                            let fj = wd.oldest_joint.unwrap_or_else(|| self.current_joint());
+                            self.ambiguous_mask |= 1u32 << fj;
+                            return self.finish(
+                                drv,
+                                ModeProgress::Ambiguous {
+                                    failed_joint: fj,
+                                    reason: ModeSwitchFailure::WatchdogBudgetBreached,
+                                },
+                            );
+                        }
+                    }
+                    Err(reason) => {
+                        let fj = self.current_joint();
+                        return self.finish(
+                            drv,
+                            ModeProgress::Ambiguous {
+                                failed_joint: fj,
+                                reason,
+                            },
+                        );
+                    }
+                }
+            }
+            self.finish(drv, candidate)
+        }
+
         /// Advances the mode switch by one bounded release tick against any [`ModeSwitchDriver`].
         pub fn step_driver(
             &mut self,
@@ -1995,7 +2060,7 @@ pub mod switch {
                 self.phase = RunnerPhase::Forward;
                 self.advance_completed_slots(drv);
                 if self.active_idx >= len {
-                    return self.finish(drv, ModeProgress::Confirmed);
+                    return self.finalize_with_watchdog_check(drv, budget, ModeProgress::Confirmed);
                 }
             }
 
@@ -2012,52 +2077,11 @@ pub mod switch {
             // 2. Evaluate causal replies and post-write deadlines for the active in-flight axis
             //    BEFORE watchdog holds, so a newly confirmed axis immediately receives its first
             //    hold in its new mode on THIS tick (keeping watchdog gap <= 1 period = 20 ms at 50 Hz).
-            let terminal_from_poll = self.poll_active_inflight(drv, budget);
-            if let Some(term) = terminal_from_poll {
-                // R2 Major 2: On clean non-ambiguous terminal completion while energized, service
-                // due watchdog holds AND evaluate the hold outcome before committing `Confirmed`!
-                if !term.is_ambiguous() && drv.any_axis_energized() {
-                    let exclude_mask = drv.mode_write_uncertain_mask();
-                    let effective_gap = self.effective_max_watchdog_gap(budget);
-                    match drv.service_watchdog_holds(
-                        budget.watchdog_proactive_interval,
-                        exclude_mask,
-                        0,
-                        budget.cutoff,
-                        budget.max_tx_frames,
-                    ) {
-                        Ok(wd) => {
-                            if !wd.all_due_serviced
-                                && wd
-                                    .max_energized_age
-                                    .saturating_add(budget.period)
-                                    .saturating_add(budget.hold_delivery_margin)
-                                    > effective_gap
-                            {
-                                let fj = wd.oldest_joint.unwrap_or_else(|| self.current_joint());
-                                self.ambiguous_mask |= 1u32 << fj;
-                                return self.finish(
-                                    drv,
-                                    ModeProgress::Ambiguous {
-                                        failed_joint: fj,
-                                        reason: ModeSwitchFailure::WatchdogBudgetBreached,
-                                    },
-                                );
-                            }
-                        }
-                        Err(reason) => {
-                            let fj = self.current_joint();
-                            return self.finish(
-                                drv,
-                                ModeProgress::Ambiguous {
-                                    failed_joint: fj,
-                                    reason,
-                                },
-                            );
-                        }
-                    }
+            if let Some(candidate) = self.poll_active_inflight(drv, budget) {
+                if matches!(self.phase, RunnerPhase::Done(_)) || !candidate.is_terminal() {
+                    return candidate;
                 }
-                return term;
+                return self.finalize_with_watchdog_check(drv, budget, candidate);
             }
             if matches!(self.phase, RunnerPhase::Done(_)) {
                 return self.progress();
@@ -2189,6 +2213,7 @@ pub mod switch {
                 self.slots[i].previous_mode = prev;
                 self.slots[i].active_goal = target.target_mode;
                 self.slots[i].switched_forward = false;
+                self.slots[i].started_energized = energized;
 
                 match self.plan.intent {
                     ModeSwitchIntent::ConfirmOnly => {
@@ -2739,11 +2764,12 @@ pub mod switch {
                     fenced_pending_feedback,
                     ..
                 } => {
-                    // Major 3: check phase deadline BEFORE accepting feedback, and enforce
-                    // `rx_at < deadline` + clock-offset drift inside `post_confirm_feedback`.
+                    // R3 Blocker 2: evaluate disarmed/stationary against `slot.started_energized`
+                    // captured BEFORE feedback RX, so a contradictory sample reporting `state == 1`
+                    // cannot flip `axis_is_energized(j)` and bypass its own disarmed/stationary gate!
                     let disarmed_stat = (slot.target.require_disarmed_stationary
                         || confirmed_mode == ControlMode::PositionForce)
-                        && !drv.axis_is_energized(j);
+                        && !slot.started_energized;
                     let fb = if now >= deadline {
                         ModeFeedbackMatch::Pending
                     } else {
@@ -3112,7 +3138,9 @@ pub mod switch {
                     },
                     _ => ModeProgress::Confirmed,
                 };
-                return Some(self.finish(drv, term));
+                // R3 Major 4: return candidate terminal to `step_driver` so final watchdog holds
+                // are evaluated BEFORE `self.finish(...)` commits and stages the single terminal event.
+                return Some(term);
             }
             None
         }
@@ -3125,6 +3153,16 @@ pub mod switch {
             let reason = ModeSwitchFailure::from_revoke_code(code);
             let drv_uncertain = drv.mode_write_uncertain_mask() & self.active_mask;
             self.ambiguous_mask |= drv_uncertain;
+            // R3 Blocker 1: unified energized partial-switch guard across pre-TX revocations too!
+            // Only an actually applied stop/E-stop from the pre-TX gate permits `StoppedRecovered`
+            // after `>= 1` axis has already switched forward; lease/operator/timeout revocation on
+            // an energized partial switch escalates to `Ambiguous` (SAFE-HOLD).
+            let stop_applied = matches!(code, "STOPPED" | "ESTOP_ACTIVE");
+            if !stop_applied && drv.any_axis_energized() {
+                if let Some(j) = self.first_switched_forward_joint() {
+                    self.ambiguous_mask |= 1u32 << j;
+                }
+            }
             if self.ambiguous_mask != 0 {
                 let fj = self.ambiguous_mask.trailing_zeros() as u8;
                 self.finish(
@@ -3217,10 +3255,13 @@ pub mod switch {
                 }
             }
 
-            // If we failed cleanly while already in `Recovering` (e.g. range check or refused
-            // write before sending), axes remain in mixed/unrestored state; if any write failed
-            // or rollback couldn't finish on an energized axis, mark Ambiguous.
-            if matches!(self.phase, RunnerPhase::Recovering { .. }) && drv.any_axis_energized() {
+            // R3 Blocker 1: NEVER release an energized partial switch back to ordinary output!
+            // If `>= 1` axis already switched forward and we did not roll back (e.g. `FailClosed`
+            // policy or a failure while already in `Recovering`), escalate to `Ambiguous`!
+            if drv.any_axis_energized()
+                && (matches!(self.phase, RunnerPhase::Recovering { .. })
+                    || self.first_switched_forward_joint().is_some())
+            {
                 self.ambiguous_mask |= 1u32 << failed_joint;
                 return self.finish(
                     drv,

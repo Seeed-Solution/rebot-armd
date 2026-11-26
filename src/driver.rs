@@ -7881,9 +7881,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     release_rx_frames: u16,
     /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
     last_feedback_decode_offset_ns: Vec<Option<i128>>,
-    /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary `(after_seq, tx_at, tx_offset_ns)`
+    /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary `(after_seq, tx_at, deadline, tx_offset_ns)`
     /// used by SAFE-HOLD / stopped recovery for joints in `mode_write_uncertain_mask` (0 alloc).
-    uncertain_readback_probe: [Option<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS],
+    uncertain_readback_probe: [Option<(u64, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS],
     /// PMAX / VMAX / TMAX read back from the motor and equal to `limits[i]`.
     mit_limits_verified: Vec<bool>,
     /// Register replies seen by `read_joint_states` since the last clear.
@@ -11553,9 +11553,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.is_axis_mode_uncertain(i) {
             return Ok(([None, None], None));
         }
-        if self.control_mode == DamiaoControlMode::Mit && self.base_mode(i) != DamiaoControlMode::PosForce {
-            return Ok(([Some(self.mit_frame(i, target)), None], None));
-        }
         match self.joint_modes[i] {
             Some(DamiaoControlMode::PosVel) => Ok(([Some(self.pos_vel_frame(i, target.position)), None], None)),
             Some(DamiaoControlMode::Mit) => {
@@ -11606,21 +11603,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok([None, None]);
         }
         let id = self.motor_ids[i];
-        if self.control_mode == DamiaoControlMode::Mit && self.base_mode(i) != DamiaoControlMode::PosForce {
-            return Ok([
-                Some((
-                    u32::from(id),
-                    PendingTargetCmd::Mit {
-                        position: target.position,
-                        velocity: target.velocity,
-                        kp: target.kp,
-                        kd: target.kd,
-                        torque: target.torque,
-                    },
-                )),
-                None,
-            ]);
-        }
         match self.joint_modes[i] {
             Some(DamiaoControlMode::PosVel) => Ok([
                 Some((0x100 + u32::from(id), PendingTargetCmd::PosVel { position: target.position })),
@@ -18101,17 +18083,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         let mut sent_any = false;
         let mut cleared_comm_log = false;
-        let mut staged_uncertain = [None::<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS];
+        let mut staged_uncertain = [None::<(u64, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS];
         let dof = self.motor_ids.len().min(64);
         for i in 0..dof {
             if (unverified_mask & (1u64 << i)) == 0 || self.verified_hold_mode(i).is_some() {
                 continue;
             }
             let uncertain = self.is_axis_mode_uncertain(i);
+            let tx_started = self.now();
             if uncertain
                 && i < MAX_MODE_JOINTS
-                && self.uncertain_readback_probe[i]
-                    .is_some_and(|(_, t, _)| self.since(t) < REGISTER_REPLY_TIMEOUT)
+                && self.uncertain_readback_probe[i].is_some_and(|(_, _, dl, _)| tx_started < dl)
             {
                 // Avoid sending duplicate in-flight REG_READ probes while awaiting the current
                 // probe's causal reply window.
@@ -18124,14 +18106,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             let id = self.motor_ids[i];
             let seq_before = self.rx_seq;
-            let tx_started = self.now();
             let (_, tx_offset_ns) = self.capture_rx_clock_sample(tx_started);
+            let probe_deadline = tx_started
+                .checked_add(REGISTER_REPLY_TIMEOUT)
+                .unwrap_or(tx_started);
             match self.send_plain(TxKind::Refresh, None, None, false, |_| {
                 Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE))
             }) {
                 Ok(_) => {
                     if uncertain && i < MAX_MODE_JOINTS {
-                        staged_uncertain[i] = Some((seq_before, tx_started, tx_offset_ns));
+                        staged_uncertain[i] = Some((seq_before, tx_started, probe_deadline, tx_offset_ns));
                     } else {
                         self.mode_readback_boundary[i].get_or_insert(seq_before);
                     }
@@ -23383,16 +23367,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if !self.is_axis_mode_uncertain(j) {
                     continue;
                 }
-                let Some((after_seq, tx_at, tx_offset_ns)) = self.uncertain_readback_probe[j] else {
+                let Some((after_seq, tx_at, probe_deadline, tx_offset_ns)) =
+                    self.uncertain_readback_probe[j]
+                else {
                     continue;
                 };
-                let max_rx_at = now.checked_add(Duration::from_millis(1)).unwrap_or(now);
+                // R3 Major 2: expire probe BEFORE matching so delayed replies outside the
+                // original `REGISTER_REPLY_TIMEOUT` window can never clear uncertainty.
+                if now >= probe_deadline {
+                    self.uncertain_readback_probe[j] = None;
+                    continue;
+                }
                 match self.mode_switch_find_ctrl_mode_reply(
                     j,
                     false,
                     after_seq,
                     tx_at,
-                    max_rx_at,
+                    probe_deadline,
                     tx_offset_ns,
                     true,
                 ) {
