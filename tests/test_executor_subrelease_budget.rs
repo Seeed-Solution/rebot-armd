@@ -1595,6 +1595,7 @@ fn sub_release_budget_configurable_margin_and_single_wake_bound() {
 ///   runs at `t = 27 ms` (when J2..J6 age is only `17 ms < 18 ms`!).
 /// - Window 2 defers 100% of wakes (`sub_release_margin = 20 ms`).
 /// - Release 2 (`t = 40 ms`): next normal output runs late at `t = 51 ms`.
+///
 /// Without `Duration::ZERO` + Window-1 fallback reservation, J2..J6 would suffer a `51 - 10 = 41 ms`
 /// watchdog expiry. With the fix, fallback refreshes J2..J6 at `t = 27 ms` (gap `17 ms << 40 ms`).
 #[test]
@@ -2234,7 +2235,7 @@ async fn production_executor_urgent_stop_bypass_zero_alloc_and_zero_locks() {
             "{label}: targeted release must have completed (target_rel={target_rel}, completed={completed_after})"
         );
         assert!(
-            wakes_after >= wakes_before + 1,
+            wakes_after > wakes_before,
             "{label}: urgent event must execute in Window 2 even with sub_release_margin = 20 ms (wakes={wakes_after} before={wakes_before})"
         );
         if mode == 1 {
