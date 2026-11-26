@@ -1688,6 +1688,14 @@ pub(crate) fn recipient_passes_gate(
     if matches!(rec.role, JointRole::LoadBearing) && !rec.rest_evidence_qualified {
         return false;
     }
+    if now_us < dev_rt.poisoned_until_us {
+        return false;
+    }
+    // LegacyJ7 gripper never gates rest-pose disable (matches all live hardware drivers'
+    // `evaluate_rest_pose_gate` / `probe_unconfirmed_rest_windows`, which evaluate arm joints only).
+    if matches!(rec.role, JointRole::Gripper(GripperReleasePolicy::LegacyJ7)) {
+        return true;
+    }
     if win.count < REST_WINDOW_SAMPLES {
         return false;
     }

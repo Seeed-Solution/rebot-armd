@@ -127,6 +127,13 @@ fn indep_recipient_passes(
     if matches!(rec.role, JointRole::LoadBearing) && !rec.rest_evidence_qualified {
         return false;
     }
+    if now_us < dev.poisoned_until_us {
+        return false;
+    }
+    // LegacyJ7 gripper never gates rest-pose disable (matches live arm drivers' arm-joint-only rest gate).
+    if matches!(rec.role, JointRole::Gripper(GripperReleasePolicy::LegacyJ7)) {
+        return true;
+    }
     if win.count != REST_WINDOW_SAMPLES {
         return false;
     }
