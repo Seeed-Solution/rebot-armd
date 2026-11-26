@@ -1439,6 +1439,8 @@ pub struct SupervisorInner {
     /// True once ownership has been transferred to the synchronous RT executor thread
     /// (`armd-control`); internal driver disable paths stay non-blocking and budgeted.
     pub rt_executor_owned: bool,
+    /// Why the daemon is running under its current effective control-loop owner (0 alloc Copy).
+    pub owner_reason: crate::model::OwnerReason,
     /// Irreversibly set by [`Self::commit_shutdown`] under the owner's authority once final
     /// shutdown readiness is confirmed; permanently blocks `clear_fault`, torque enable, and
     /// actuator motion admission while keeping hardware disable paths permitted.
@@ -2626,6 +2628,7 @@ impl SupervisorInner {
             detached: false,
             persist_capacity_available: true,
             rt_executor_owned: false,
+            owner_reason: crate::model::OwnerReason::Default,
             shutdown_committed: false,
             shutdown_refused_unknown: false,
             internal_fault_lane: Arc::new(crate::panic_coord::InternalFaultLane::new()),
@@ -4920,6 +4923,12 @@ impl SupervisorInner {
         { out.policy = None; }
         out.watchdog_park_blocked_reason = self.watchdog_park_blocked_reason;
         out.safety_log_dropped = self.safety.log_dropped().saturating_add(self.safety_log_ring_dropped);
+        out.effective_owner = if self.rt_executor_owned {
+            crate::model::EffectiveOwner::Executor
+        } else {
+            crate::model::EffectiveOwner::Legacy
+        };
+        out.owner_reason = self.owner_reason;
     }
 
     pub fn is_at_safe_resting_pose(&self) -> bool {
@@ -12554,6 +12563,8 @@ pub struct ArmSupervisor {
     /// Lock order: always `self.inner` before `self.owner`.
     owner: std::sync::Mutex<OwnerSlot>,
     owner_mode: Arc<AtomicU8>,
+    /// Lock-free mirror of why the current effective owner was selected (`OwnerReason as u8`).
+    owner_reason: Arc<AtomicU8>,
     /// `self.inner.generation()` captured at the moment ownership transfers to the RT executor.
     /// In `OWNER_EXECUTOR` mode `fresh()` requires `s.meta.generation >= executor_base_gen + 1`
     /// so rejected legacy lock attempts on the detached shell cannot skew observation freshness.
@@ -13223,6 +13234,7 @@ impl ArmSupervisor {
             sequences_revision: Arc::new(AtomicU64::new(0)),
             owner: std::sync::Mutex::new(OwnerSlot::Legacy),
             owner_mode: Arc::new(AtomicU8::new(OWNER_LEGACY)),
+            owner_reason: Arc::new(AtomicU8::new(crate::model::OwnerReason::Default as u8)),
             executor_base_gen: AtomicU64::new(0),
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
@@ -13887,6 +13899,32 @@ impl ArmSupervisor {
             OWNER_EXECUTOR => "executor",
             OWNER_FAILED => "failed",
             _ => "unknown",
+        }
+    }
+
+    /// Effective control-loop owner (`Legacy` or `Executor`, lock-free).
+    pub fn effective_owner(&self) -> crate::model::EffectiveOwner {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            crate::model::EffectiveOwner::Executor
+        } else {
+            crate::model::EffectiveOwner::Legacy
+        }
+    }
+
+    /// Why the daemon is running under its current effective owner (lock-free).
+    pub fn owner_reason(&self) -> crate::model::OwnerReason {
+        crate::model::OwnerReason::from_u8(self.owner_reason.load(Ordering::Acquire))
+    }
+
+    /// Records the startup owner selection reason before ownership transfer or after a recoverable
+    /// DRV-F1 handback to legacy.
+    pub async fn set_owner_reason(&self, reason: crate::model::OwnerReason) {
+        self.owner_reason.store(reason as u8, Ordering::Release);
+        if self.owner_mode() == OWNER_LEGACY {
+            let mut inner = self.inner.write().await;
+            if !inner.detached {
+                inner.owner_reason = reason;
+            }
         }
     }
 
@@ -18863,6 +18901,8 @@ impl ArmSupervisor {
         snap.boot_id = ident.boot_id.clone();
         snap.process_start_unix_ns = ident.process_start_unix_ns;
         snap.owner_mode = self.owner_mode_name();
+        snap.effective_owner = self.effective_owner().as_str();
+        snap.owner_reason = self.owner_reason().as_str();
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),

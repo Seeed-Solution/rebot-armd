@@ -66,7 +66,10 @@ pub mod wasm_api;
 pub use gravity::{compute_gravity_torques, GravityError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use gravity::verify_urdf_sha256;
-pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, JointState, ObservationSchema};
+pub use model::{
+    ArmConfig, ArmObservation, EffectiveOwner, JointLimit, JointState, ObservationSchema,
+    OwnerReason, ARM_PROFILE_VERSION,
+};
 pub use motor_mode::{
     ControlMode, ImpedanceLimits, JointControlModeConfig, ModeLimits, PositionForceLimits,
     PositionLimits, PositionVelocityLimits, ResolvedJointMode, VendorBinding, VendorCapability,

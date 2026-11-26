@@ -3688,6 +3688,92 @@ impl Clone for WorkspaceViolationSpare {
     fn clone_from(&mut self, _source: &Self) {}
 }
 
+/// Effective control-loop owner reported in observations and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveOwner {
+    /// Legacy supervisor-lock control loop.
+    #[default]
+    Legacy,
+    /// Synchronous RT executor (`armd-control`) owning `ArmCore` and the actuator bus.
+    Executor,
+}
+
+impl EffectiveOwner {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Executor => "executor",
+        }
+    }
+}
+
+/// Why the daemon is running under its current `effective_owner`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum OwnerReason {
+    /// Default / test supervisor constructed directly without startup owner resolution.
+    #[default]
+    Default = 0,
+    /// Selected explicitly via CLI `--owner`.
+    ExplicitCli = 1,
+    /// Selected explicitly via `ARMD_RT_OWNER`.
+    ExplicitEnv = 2,
+    /// Selected explicitly via config (`arm.armd_owner`).
+    ExplicitConfig = 3,
+    /// Automatic selection chose `executor` for a qualified follower and profile (`rebot-dm` or `mock`).
+    AutoQualified = 4,
+    /// Automatic selection fell back to `legacy` because the follower is not qualified for the RT executor.
+    AutoFallbackUnqualifiedFollower = 5,
+    /// Automatic selection fell back to `legacy` because the profile enables MIT joint tracking.
+    AutoFallbackMitProfile = 6,
+    /// Automatic selection fell back to `legacy` because the profile DOF exceeds the RT executor limit.
+    AutoFallbackDofLimit = 7,
+    /// Executor startup failed recoverably on real hardware and handed back to `legacy` holding (DRV-F1).
+    StartupFallbackToLegacy = 8,
+}
+
+impl OwnerReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ExplicitCli => "explicit_cli",
+            Self::ExplicitEnv => "explicit_env",
+            Self::ExplicitConfig => "explicit_config",
+            Self::AutoQualified => "auto_qualified",
+            Self::AutoFallbackUnqualifiedFollower => "auto_fallback_unqualified_follower",
+            Self::AutoFallbackMitProfile => "auto_fallback_mit_profile",
+            Self::AutoFallbackDofLimit => "auto_fallback_dof_limit",
+            Self::StartupFallbackToLegacy => "startup_fallback_to_legacy",
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ExplicitCli,
+            2 => Self::ExplicitEnv,
+            3 => Self::ExplicitConfig,
+            4 => Self::AutoQualified,
+            5 => Self::AutoFallbackUnqualifiedFollower,
+            6 => Self::AutoFallbackMitProfile,
+            7 => Self::AutoFallbackDofLimit,
+            8 => Self::StartupFallbackToLegacy,
+            _ => Self::Default,
+        }
+    }
+
+    pub const fn is_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::AutoFallbackUnqualifiedFollower
+                | Self::AutoFallbackMitProfile
+                | Self::AutoFallbackDofLimit
+                | Self::StartupFallbackToLegacy
+        )
+    }
+}
+
 /// Full arm telemetry / observation
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArmObservation {
@@ -3784,6 +3870,12 @@ pub struct ArmObservation {
     /// Monotonic count of deferred safety log events dropped on overflow (never reset); omitted while zero.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub safety_log_dropped: u64,
+    /// Effective control-loop owner currently driving the arm (`"legacy"` or `"executor"`).
+    #[serde(default)]
+    pub effective_owner: EffectiveOwner,
+    /// Why the daemon is running under `effective_owner` (explicit override, auto-qualified, or fallback).
+    #[serde(default)]
+    pub owner_reason: OwnerReason,
     /// Preallocated string buffer moved into/out of `safety_state` (`FaultReason::Other` /
     /// `JointLimitExceeded`) so RT `fill_observation` transitions perform 0 heap allocations or drops.
     #[serde(skip)]
@@ -3808,6 +3900,8 @@ impl ArmObservation {
             driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
             loads: None, policy: None, watchdog_park_blocked_reason: None, safety_log_dropped: 0,
+            effective_owner: EffectiveOwner::Legacy,
+            owner_reason: OwnerReason::Default,
             safety_text_spare: SafetyTextSpare(String::new()),
             workspace_violation_spare: WorkspaceViolationSpare(None),
         }
@@ -3948,7 +4042,7 @@ impl ArmObservation {
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, safety_text_spare, workspace_violation_spare });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, effective_owner, owner_reason, safety_text_spare, workspace_violation_spare });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
