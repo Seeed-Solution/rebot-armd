@@ -1500,6 +1500,14 @@ pub enum ConfigRequest {
         clean_complete: bool,
         force_reconcile: bool,
     },
+    /// Starts one tick-driven PR0C `ModeSwitch` session on `SessionSlot::ExclusiveOutput` (0 alloc).
+    StartModeSwitch(ModeSwitchStartRequest),
+    /// Polls authoritative snapshot of `ModeSwitch` session `session_id` (0 alloc).
+    PollModeSwitch { session_id: u64 },
+    /// Cancels active `ModeSwitch` session matching `session_id` (stale IDs ignored; 0 alloc).
+    CancelModeSwitch { session_id: u64, reason: &'static str },
+    /// Clears terminal `ModeSwitch` session slot matching `session_id` once terminal flush completes.
+    ClearModeSwitch { session_id: u64 },
     /// Commits an intermediate durable `calibration.json` update (e.g. pre-hardware MIT
     /// qualification invalidation during `motor_zero`) on the single held `Calibration`
     /// reservation without releasing it, advancing `reservation.from` in lockstep (0 alloc/free).
@@ -1539,6 +1547,10 @@ impl ConfigRequest {
             | Self::CancelCommissioning { .. }
             | Self::ClearCommissioning { .. }
             | Self::CommitIntermediateCalibration { .. } => "/api/v1/calibration",
+            Self::StartModeSwitch(_)
+            | Self::PollModeSwitch { .. }
+            | Self::CancelModeSwitch { .. }
+            | Self::ClearModeSwitch { .. } => "/api/v1/mode/switch",
             Self::InstallSequenceRunPins(_) | Self::ClearSequenceRunPins { .. } => {
                 "/api/v1/action/run_sequence"
             }
@@ -1571,7 +1583,25 @@ pub enum ConfigReply {
     CommissioningPolled(Option<crate::mit::CommissioningSnapshot>),
     CommissioningCancelled(Option<crate::mit::CommissioningSnapshot>),
     CommissioningCleared(bool),
+    ModeSwitchStarted(Result<u64, ConfigError>),
+    ModeSwitchPolled(Option<crate::motor_mode::ModeSwitchSnapshot>),
+    ModeSwitchCancelled(Option<crate::motor_mode::ModeSwitchSnapshot>),
+    ModeSwitchCleared(bool),
     IntermediateCalibrationCommitted(Result<(Reservation, u64), ConfigError>),
+}
+
+/// Inline, `Copy`, zero-allocation request to admit a PR0C `ModeSwitch` session on the active owner.
+#[derive(Debug, Clone, Copy)]
+pub struct ModeSwitchStartRequest {
+    pub plan: crate::motor_mode::ModeSwitchPlan,
+    pub admission: AdmissionStamp,
+    pub operator_required: bool,
+    pub operator_grant: crate::auth::OperatorGrant,
+    pub deadline: Instant,
+    pub client: ClientId,
+    /// Optional P-F1 terminal reservation `(request_id, action_id, route_gen)` from
+    /// [`crate::rt_core::reply_router::SessionTerminalTicket`].
+    pub terminal_ticket: Option<(RequestId, crate::rt_core::broker::ActionId, u64)>,
 }
 
 /// Displaced or unused heap payloads carried back inside the SAME `Box<ConfigExchange>`
@@ -1767,6 +1797,18 @@ pub(crate) fn handle_config_exchange(
             clean_complete,
             force_reconcile,
         )),
+        ConfigRequest::StartModeSwitch(req) => {
+            ConfigReply::ModeSwitchStarted(core.start_mode_switch_rt(req, ctx.now))
+        }
+        ConfigRequest::PollModeSwitch { session_id } => {
+            ConfigReply::ModeSwitchPolled(core.poll_mode_switch_rt(session_id))
+        }
+        ConfigRequest::CancelModeSwitch { session_id, reason } => {
+            ConfigReply::ModeSwitchCancelled(core.cancel_mode_switch_rt(session_id, reason))
+        }
+        ConfigRequest::ClearModeSwitch { session_id } => {
+            ConfigReply::ModeSwitchCleared(core.clear_mode_switch_rt(session_id))
+        }
         ConfigRequest::CommitIntermediateCalibration {
             mut reservation,
             auth,

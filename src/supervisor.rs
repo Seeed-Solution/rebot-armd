@@ -1245,6 +1245,9 @@ pub struct SupervisorInner {
     /// Release-side session lifecycle driver (`ExclusiveOutput` + singleton `Recorder`).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) sessions: crate::rt_core::session::SessionDriver,
+    /// Preallocated tick-driven PR0C `ModeSwitch` session runner (0 RT allocs).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) mode_switch: ModeSwitchRunner,
     /// True when startup found an incomplete or unreadable pending calibration commit marker.
     pub(crate) calibration_quarantined: bool,
     /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
@@ -2538,6 +2541,8 @@ impl SupervisorInner {
             commissioning: crate::mit::CommissioningMachine::default(),
             #[cfg(not(target_arch = "wasm32"))]
             sessions: crate::rt_core::session::SessionDriver::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            mode_switch: ModeSwitchRunner::new(),
             calibration_quarantined: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
@@ -4697,6 +4702,10 @@ impl SupervisorInner {
         self.nonblocking_driver_release = keep_nb;
         let published = self.publish_at(timestamp, generation, keep);
         self.nonblocking_driver_release = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.flush_published_session_terminals();
+        }
         published
     }
 
@@ -9584,6 +9593,29 @@ impl SupervisorInner {
                 self.poll_hardware_rx_with_clock(None, None, None, now_fn)
             }
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        if !was_step2_poll
+            && !self.rt_executor_owned
+            && !self.detached
+            && !self.shutdown_committed
+            && !self.internal_fault_lane.is_fenced()
+            && self
+                .sessions
+                .slot(crate::rt_core::session::SessionSlot::ExclusiveOutput)
+                .is_some_and(|s| {
+                    s.kind == crate::rt_core::session::SessionKind::ModeSwitch && s.is_live()
+                })
+        {
+            let ms_now = now_fn();
+            let ms_rd = release_deadline.unwrap_or(ms_now + period_tick);
+            let ms_ctx = crate::rt_core::ops::CommitCtx {
+                arm: self.core.id(),
+                boot: crate::rt_core::broker::BootId::process(),
+                now: ms_now,
+                stop_generation: self.current_stop_gen(),
+            };
+            self.service_mode_switch_release_with_clock(&ms_ctx, ms_rd, now_fn);
+        }
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
         let driver_enable_confirmed_ok = rx.driver_enable_confirmed_ok;
@@ -11248,10 +11280,15 @@ impl SupervisorInner {
         // motion, while stationary holds continue until a disable is accepted (`torque_intent == Off`,
         // i.e. rest gate passed and the first disable frame has been dispatched).
         let transition_owns_bus = self.torque_transition.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let mode_switch_owns_bus =
+            self.mode_switch_owns_bus() || self.sessions.is_safe_hold_requested();
+        #[cfg(target_arch = "wasm32")]
+        let mode_switch_owns_bus = false;
         let enable_transition_owns_bus = matches!(
             self.torque_transition,
             Some(driver_transitions::TorqueTransition::Enable(_))
-        );
+        ) || mode_switch_owns_bus;
         if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
             let gc_stamp = self.current_j7_intent_stamp();
             self.j7_intent = Some(if self.safety.state().is_stopped() {
@@ -12131,6 +12168,484 @@ impl SupervisorInner {
         self.nonblocking_driver_release = false;
 
         timestamp
+    }
+}
+
+/// Preallocated, zero-allocation inline holder for one PR0C `ModeSwitch` session inside
+/// [`SupervisorInner`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ModeSwitchRunner {
+    active_session: Option<crate::rt_core::session::SessionId>,
+    machine: Option<crate::motor_mode::ModeSwitch>,
+    event_tx: Option<crate::rt_core::stream::StreamProducer<crate::motor_mode::ModeSwitchEvent>>,
+    retained_events: [Option<crate::motor_mode::ModeSwitchEvent>; 16],
+    retained_len: usize,
+    last_terminal_snapshot: Option<crate::motor_mode::ModeSwitchSnapshot>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ModeSwitchRunner {
+    pub(crate) fn new() -> Self {
+        Self {
+            active_session: None,
+            machine: None,
+            event_tx: None,
+            retained_events: [None; 16],
+            retained_len: 0,
+            last_terminal_snapshot: None,
+        }
+    }
+
+    pub(crate) fn attach_event_channel(
+        &mut self,
+        capacity: usize,
+    ) -> crate::rt_core::stream::StreamConsumer<crate::motor_mode::ModeSwitchEvent> {
+        let (tx, rx) = crate::rt_core::stream::channel(capacity.max(1));
+        self.event_tx = Some(tx);
+        rx
+    }
+
+    #[inline]
+    pub(crate) fn is_running(&self) -> bool {
+        self.machine
+            .as_ref()
+            .is_some_and(crate::motor_mode::ModeSwitch::is_running)
+    }
+
+    fn stage_events_from_machine(&mut self, sid: crate::rt_core::session::SessionId) {
+        let Some(m) = self.machine.as_mut() else { return };
+        let retained = &mut self.retained_events;
+        let len = &mut self.retained_len;
+        m.drain_events(sid.0, |ev| {
+            if *len < retained.len() {
+                retained[*len] = Some(ev);
+                *len += 1;
+            }
+        });
+    }
+
+    /// Flushes staged observational events strictly AFTER publication into the preallocated
+    /// `rt_core/stream` SPSC ring (drop-newest on saturation; never blocks RT or terminals).
+    pub(crate) fn flush_events(&mut self) -> usize {
+        let n = self.retained_len;
+        if n == 0 {
+            return 0;
+        }
+        let mut pushed = 0usize;
+        if let Some(tx) = self.event_tx.as_mut() {
+            for slot in &mut self.retained_events[..n] {
+                if let Some(ev) = slot.take() {
+                    if tx.try_push(ev).is_ok() {
+                        pushed += 1;
+                    }
+                }
+            }
+        } else {
+            for slot in &mut self.retained_events[..n] {
+                *slot = None;
+            }
+        }
+        self.retained_len = 0;
+        pushed
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SupervisorInner {
+    /// Attaches a preallocated off-RT [`crate::rt_core::stream`] consumer for `ModeSwitchEvent`s.
+    pub fn attach_mode_switch_event_stream(
+        &mut self,
+        capacity: usize,
+    ) -> crate::rt_core::stream::StreamConsumer<crate::motor_mode::ModeSwitchEvent> {
+        self.mode_switch.attach_event_channel(capacity)
+    }
+
+    #[inline]
+    pub(crate) fn mode_switch_owns_bus(&self) -> bool {
+        !self.safety.state().is_stopped()
+            && self.mode_switch.is_running()
+            && self
+                .sessions
+                .slot(crate::rt_core::session::SessionSlot::ExclusiveOutput)
+                .is_some_and(|s| {
+                    s.kind == crate::rt_core::session::SessionKind::ModeSwitch && s.is_live()
+                })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn start_mode_switch_rt(
+        &mut self,
+        req: crate::rt_core::requests::config::ModeSwitchStartRequest,
+        owner_now: Instant,
+    ) -> Result<u64, crate::rt_core::requests::config::ConfigError> {
+        use crate::rt_core::requests::config::ConfigError;
+        use crate::rt_core::session::{
+            admit_session, PreparedSession, SessionAdmitError, SessionKind,
+        };
+        if self.mode_switch.active_session.is_some() {
+            return Err(ConfigError::Busy("a mode-switch session is already active"));
+        }
+        if req.plan.len == 0 || usize::from(req.plan.len) > crate::motor_mode::MAX_MODE_SWITCH_AXES {
+            return Err(ConfigError::CalibPrecondition {
+                status: 400,
+                code: "INVALID_COMMAND",
+                message: "invalid mode-switch plan axis count",
+            });
+        }
+        let cur_epoch = self.safety.epoch_id();
+        let admitted = self.check_admission(req.admission).map_err(|e| match e {
+            SafetyError::StampAlreadyConsumed => ConfigError::StampConsumed,
+            SafetyError::LeaseLost => ConfigError::LeaseLost,
+            SafetyError::Stopped => ConfigError::Stopped,
+            SafetyError::EpochMismatch { .. } => ConfigError::EpochMismatch {
+                current_epoch: cur_epoch,
+            },
+            SafetyError::EStopActive => ConfigError::CalibPrecondition {
+                status: 409,
+                code: "ESTOP_ACTIVE",
+                message: "e-stop active",
+            },
+            _ => ConfigError::CalibPrecondition {
+                status: 409,
+                code: "REJECTED",
+                message: "mode-switch admission rejected",
+            },
+        })?;
+        let mut prepared = PreparedSession::exclusive(SessionKind::ModeSwitch, req.client);
+        prepared.deadline = Some(req.deadline);
+        prepared.timeout_code = "TIMEOUT";
+        prepared.operator_required = req.operator_required;
+        prepared.operator_grant = Some(req.operator_grant);
+        prepared.revoke_on_stop = true;
+        prepared.escalate_safe_hold_on_uncertain = true;
+        if let Some((request_id, action_id, route_gen)) = req.terminal_ticket {
+            prepared.request_id = Some(request_id);
+            prepared.action_id = Some(action_id);
+            prepared.route_gen = route_gen;
+        }
+        let sid = admit_session(admitted, prepared, owner_now).map_err(|err| match err {
+            SessionAdmitError::SlotBusy | SessionAdmitError::OutputBusy(_) => {
+                ConfigError::Busy(err.code())
+            }
+            SessionAdmitError::DeadlineExpired => ConfigError::CalibPrecondition {
+                status: 408,
+                code: "DEADLINE_EXPIRED",
+                message: "mode-switch deadline already expired",
+            },
+            SessionAdmitError::InvalidSlotKind => ConfigError::CalibPrecondition {
+                status: 400,
+                code: "INVALID_COMMAND",
+                message: "invalid mode-switch session slot",
+            },
+            SessionAdmitError::AuthorityRejected("LEASE_LOST") => ConfigError::LeaseLost,
+            SessionAdmitError::AuthorityRejected("EPOCH_MISMATCH") => ConfigError::EpochMismatch {
+                current_epoch: self.safety.epoch_id(),
+            },
+            SessionAdmitError::AuthorityRejected("STOPPED") => ConfigError::Stopped,
+            SessionAdmitError::AuthorityRejected("OPERATOR_REQUIRED") => {
+                ConfigError::CalibPrecondition {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED",
+                    message: "operator authorization required",
+                }
+            }
+            SessionAdmitError::AuthorityRejected(code) => ConfigError::CalibPrecondition {
+                status: 409,
+                code,
+                message: "mode-switch authority rejected",
+            },
+        })?;
+        self.mode_switch.active_session = Some(sid);
+        self.mode_switch.machine = Some(crate::motor_mode::ModeSwitch::new(req.plan));
+        self.mode_switch.last_terminal_snapshot = None;
+        Ok(sid.0)
+    }
+
+    pub(crate) fn poll_mode_switch_rt(
+        &self,
+        session_id: u64,
+    ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
+        let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
+            let mut m = 0u32;
+            let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+            m
+        });
+        if self.mode_switch.active_session.map(|s| s.0) == Some(session_id) {
+            if let Some(ref machine) = self.mode_switch.machine {
+                return Some(machine.snapshot(session_id, drv_uncertain));
+            }
+        }
+        self.mode_switch
+            .last_terminal_snapshot
+            .filter(|s| s.session_id == session_id)
+    }
+
+    /// Reconciles active `ModeSwitch` state and driver `mode_write_uncertain_mask` /
+    /// `mode_switch_active_mask` on ANY revocation path (stop, E-stop, disconnect, expiry,
+    /// cancel, fault, SAFE-HOLD, handback), syncing `hw_state_uncertain` into `SessionDriver`.
+    pub(crate) fn reconcile_mode_switch_on_revocation(&mut self, reason_code: &'static str) -> bool {
+        let Some(sid) = self.mode_switch.active_session else {
+            return false;
+        };
+        let Some(mut machine) = self.mode_switch.machine.take() else {
+            return false;
+        };
+        let reason = crate::motor_mode::ModeSwitchFailure::from_revoke_code(reason_code);
+        let mut drv_uncertain = 0u32;
+        let progress = if let Some(slot) = self.driver.as_mut() {
+            let mut p = None;
+            let _ = slot.try_with_mut(|drv| {
+                p = Some(machine.reconcile_external_revocation(Some(drv), reason));
+                drv_uncertain = drv.mode_write_uncertain_mask();
+            });
+            p.unwrap_or_else(|| machine.reconcile_external_revocation(None, reason))
+        } else {
+            machine.reconcile_external_revocation(None, reason)
+        };
+        let uncertain = progress.is_ambiguous() || drv_uncertain != 0;
+        let snap = machine.snapshot(sid.0, drv_uncertain);
+        self.mode_switch.machine = Some(machine);
+        self.mode_switch.stage_events_from_machine(sid);
+        self.mode_switch.last_terminal_snapshot = Some(snap);
+        let _ = self.sessions.set_hw_state_uncertain(
+            crate::rt_core::session::SessionSlot::ExclusiveOutput,
+            sid,
+            uncertain,
+        );
+        uncertain
+    }
+
+    pub(crate) fn cancel_mode_switch_rt(
+        &mut self,
+        session_id: u64,
+        reason_code: &'static str,
+    ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
+        use crate::rt_core::session::{SessionSlot, SessionTerminalReason};
+        let sid = self.mode_switch.active_session?;
+        if sid.0 != session_id {
+            return None;
+        }
+        let escalate = self
+            .sessions
+            .slot(SessionSlot::ExclusiveOutput)
+            .is_some_and(|s| s.id == sid && s.escalate_safe_hold_on_uncertain);
+        let uncertain = self.reconcile_mode_switch_on_revocation(reason_code);
+        if let Some(outcome) = self.sessions.cancel_slot(
+            SessionSlot::ExclusiveOutput,
+            sid,
+            SessionTerminalReason::Cancelled(reason_code),
+            uncertain,
+        ) {
+            self.maybe_escalate_session_safe_hold(outcome, escalate);
+        }
+        self.poll_mode_switch_rt(session_id)
+    }
+
+    pub(crate) fn clear_mode_switch_rt(&mut self, session_id: u64) -> bool {
+        use crate::rt_core::session::SessionSlot;
+        let Some(sid) = self.mode_switch.active_session else {
+            return false;
+        };
+        if sid.0 != session_id {
+            return false;
+        }
+        if self.mode_switch.is_running() {
+            let _ = self.cancel_mode_switch_rt(session_id, "CANCELLED");
+        }
+        if !self.sessions.clear_terminal_slot(SessionSlot::ExclusiveOutput, sid) {
+            return false;
+        }
+        self.mode_switch.active_session = None;
+        self.mode_switch.machine = None;
+        true
+    }
+
+    pub(crate) fn service_mode_switch_release(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        release_deadline: Instant,
+        owner_now_fn: &dyn Fn() -> Instant,
+    ) {
+        let mut f = || owner_now_fn();
+        self.service_mode_switch_release_with_clock(ctx, release_deadline, &mut f);
+    }
+
+    pub(crate) fn service_mode_switch_release_with_clock(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        release_deadline: Instant,
+        owner_now_fn: &mut dyn FnMut() -> Instant,
+    ) {
+        use crate::motor_mode::{ModeProgress, ModeSwitchFailure, ReleaseBudget};
+        use crate::rt_core::session::{
+            PhaseStepOutcome, SessionKind, SessionSlot, SessionStep, SessionTerminalReason,
+        };
+        let Some(active) = self.sessions.slot(SessionSlot::ExclusiveOutput).copied() else {
+            return;
+        };
+        if !active.is_live() || active.kind != SessionKind::ModeSwitch {
+            return;
+        }
+        let sid = active.id;
+        let now = owner_now_fn();
+        let total_span = release_deadline.saturating_duration_since(now);
+        let margin = self.tx_release_publish_margin().min(total_span / 2);
+        let base_cutoff = release_deadline.checked_sub(margin).unwrap_or(now);
+        let rctx = self.build_session_release_ctx(
+            &crate::rt_core::ops::CommitCtx { now, ..*ctx },
+            release_deadline,
+            base_cutoff,
+        );
+        let conn_closed = active.authority.connection_id != 0
+            && self.is_connection_closed(active.authority.connection_id);
+        let lease_ok = !active.authority.require_lease
+            || self.is_session_lease_valid_at(
+                active.authority.connection_id,
+                active.authority.lease_generation,
+                now,
+            );
+        let op_ok = !active.authority.operator_required
+            || self.is_session_operator_valid_at(active.authority.operator_grant, now);
+
+        // Pre-phase live authority check via SessionDriver.
+        if let Err(reason) = self.sessions.check_live_authority(
+            SessionSlot::ExclusiveOutput,
+            sid,
+            &rctx,
+            |_| conn_closed,
+            |_, _, _| lease_ok,
+            |_| op_ok,
+        ) {
+            let uncertain = self.reconcile_mode_switch_on_revocation(reason.code());
+            if let Some(outcome) =
+                self.sessions
+                    .finish_slot(SessionSlot::ExclusiveOutput, sid, reason, uncertain)
+            {
+                self.maybe_escalate_session_safe_hold(outcome, active.escalate_safe_hold_on_uncertain);
+            }
+            return;
+        }
+
+        let effective_cutoff = self
+            .sessions
+            .effective_tx_cutoff(SessionSlot::ExclusiveOutput, base_cutoff);
+        let Some(mut machine) = self.mode_switch.machine.take() else {
+            if let Some(outcome) = self.sessions.finish_slot(
+                SessionSlot::ExclusiveOutput,
+                sid,
+                SessionTerminalReason::Failed("INTERNAL"),
+                false,
+            ) {
+                self.maybe_escalate_session_safe_hold(outcome, active.escalate_safe_hold_on_uncertain);
+            }
+            return;
+        };
+
+        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+        let max_tx_frames = self
+            .config
+            .damiao_tx_budget()
+            .max_frames
+            .min(u8::MAX as usize) as u8;
+
+        // Temporarily take driver out (restored unconditionally even on unwind) so the live
+        // pre-TX gate closure can borrow `&*self` right before `can.transmit` (0 alloc).
+        let mut taken_drv = self.driver.take();
+        let mut drv_uncertain = 0u32;
+        let step_progress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(slot) = taken_drv.as_mut() else {
+                return ModeProgress::FailedClean {
+                    failed_joint: 0,
+                    reason: ModeSwitchFailure::UnsupportedMode,
+                };
+            };
+            let mut out = ModeProgress::Pending { wake: None };
+            let locked = slot.try_with_mut(|drv| {
+                let Ok((drv_now, _, drv_cutoff)) =
+                    translate_driver_cutoff_conservative(drv, effective_cutoff, &mut *owner_now_fn)
+                else {
+                    out = ModeProgress::Pending { wake: None };
+                    drv_uncertain = drv.mode_write_uncertain_mask();
+                    return;
+                };
+                let mut budget = ReleaseBudget::new(drv_now, drv_cutoff, period, max_tx_frames);
+                budget.max_rx_frames = crate::rt_core::ops::RX_FRAME_BUDGET;
+                let mut gate = || -> Result<(), &'static str> {
+                    let gate_now = owner_now_fn();
+                    self.check_session_pre_tx(
+                        SessionSlot::ExclusiveOutput,
+                        sid,
+                        gate_now,
+                        base_cutoff,
+                    )
+                    .map(|_| ())
+                };
+                out = machine.step_with_gate(drv, &mut gate, budget);
+                drv_uncertain = drv.mode_write_uncertain_mask();
+            });
+            if locked.is_err() {
+                ModeProgress::Pending { wake: None }
+            } else {
+                out
+            }
+        }));
+        self.driver = taken_drv;
+
+        let progress = match step_progress {
+            Ok(p) => p,
+            Err(payload) => {
+                self.mode_switch.machine = Some(machine);
+                std::panic::resume_unwind(payload);
+            }
+        };
+
+        let uncertain_now = progress.is_ambiguous() || drv_uncertain != 0;
+        let _ = self
+            .sessions
+            .set_hw_state_uncertain(SessionSlot::ExclusiveOutput, sid, uncertain_now);
+
+        let phase_out = match progress {
+            ModeProgress::Pending { .. } => PhaseStepOutcome::Pending,
+            ModeProgress::Confirmed => PhaseStepOutcome::Terminal {
+                reason: SessionTerminalReason::Completed,
+                uncertain_hw_state: false,
+            },
+            ModeProgress::RolledBack { reason, .. } => PhaseStepOutcome::Terminal {
+                reason: SessionTerminalReason::Failed(reason.code()),
+                uncertain_hw_state: false,
+            },
+            ModeProgress::StoppedRecovered { reason } => PhaseStepOutcome::Terminal {
+                reason: SessionTerminalReason::Cancelled(reason.code()),
+                uncertain_hw_state: false,
+            },
+            ModeProgress::FailedClean { reason, .. } => PhaseStepOutcome::Terminal {
+                reason: SessionTerminalReason::Failed(reason.code()),
+                uncertain_hw_state: false,
+            },
+            ModeProgress::Ambiguous { reason, .. } => PhaseStepOutcome::Terminal {
+                reason: SessionTerminalReason::SafeHoldUncertain(reason.code()),
+                uncertain_hw_state: true,
+            },
+        };
+
+        let snap = machine.snapshot(sid.0, drv_uncertain);
+        self.mode_switch.machine = Some(machine);
+        self.mode_switch.stage_events_from_machine(sid);
+        if progress.is_terminal() {
+            self.mode_switch.last_terminal_snapshot = Some(snap);
+        }
+
+        if let Some(SessionStep::Terminal(outcome)) = self.sessions.step_slot(
+            SessionSlot::ExclusiveOutput,
+            &rctx,
+            |_| false,
+            |_, _, _| true,
+            |_| true,
+            |_, _| uncertain_now,
+            |_, _, _| phase_out,
+        ) {
+            self.maybe_escalate_session_safe_hold(outcome, active.escalate_safe_hold_on_uncertain);
+        }
     }
 }
 
@@ -13547,6 +14062,7 @@ impl ArmSupervisor {
         let safe_hold_ctrl = Arc::clone(&self.legacy_safe_hold);
         let mut step_counter: u64 = 0;
         let mut panicked = false;
+        let mut session_uncertain_safe_hold = false;
 
         crate::rt_core::executor::run_periodic_with_deadline(
             period,
@@ -13568,6 +14084,11 @@ impl ArmSupervisor {
                         if let Ok(guard) = self.inner.try_read() {
                             if !guard.detached {
                                 safe_hold_bufs.mirror_from_core(&guard);
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if guard.sessions.is_safe_hold_requested() {
+                                    session_uncertain_safe_hold = true;
+                                    control_stop.store(true, Ordering::Release);
+                                }
                             }
                         }
                     }
@@ -13597,6 +14118,8 @@ impl ArmSupervisor {
         {
             let reason = if panicked {
                 crate::rt_core::safe_hold::SafeHoldReason::ControlPanic
+            } else if session_uncertain_safe_hold {
+                crate::rt_core::safe_hold::SafeHoldReason::SessionUncertainState
             } else {
                 crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized
             };
@@ -15833,6 +16356,146 @@ impl ArmSupervisor {
             }
             _ => Err(executor_unavailable()),
         }
+    }
+
+    // ---- PR0C: Dual-owner ModeSwitch session orchestrator (PR0A/PR0B shared layer) ----
+
+    /// Admits a PR0C `ModeSwitch` session on the active owner (`OWNER_LEGACY` or `OWNER_EXECUTOR`)
+    /// after verifying live service coherence via [`Self::read_services`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn start_mode_switch_session(
+        &self,
+        req: crate::rt_core::requests::config::ModeSwitchStartRequest,
+    ) -> Result<u64, crate::rt_core::requests::config::ConfigError> {
+        use crate::rt_core::requests::config::{ConfigError, ConfigReply, ConfigRequest};
+        let _svc = self
+            .read_services(crate::rt_core::publish::ReadRequirements::identity())
+            .await
+            .map_err(|_| ConfigError::OwnerStopped)?;
+        match self
+            .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(req))
+            .await?
+        {
+            ConfigReply::ModeSwitchStarted(res) => res,
+            _ => Err(ConfigError::OwnerStopped),
+        }
+    }
+
+    /// Polls the authoritative [`crate::motor_mode::ModeSwitchSnapshot`] for `session_id`
+    /// (unaffected by off-RT event stream saturation).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn poll_mode_switch_session(
+        &self,
+        session_id: u64,
+    ) -> Result<Option<crate::motor_mode::ModeSwitchSnapshot>, crate::rt_core::requests::config::ConfigError>
+    {
+        use crate::rt_core::requests::config::{ConfigError, ConfigReply, ConfigRequest};
+        match self
+            .dispatch_config_request_owned_reliable(ConfigRequest::PollModeSwitch { session_id })
+            .await?
+        {
+            ConfigReply::ModeSwitchPolled(snap) => Ok(snap),
+            _ => Err(ConfigError::OwnerStopped),
+        }
+    }
+
+    /// Cancels an active `ModeSwitch` session matching `session_id` (stale IDs return `Ok(None)`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn cancel_mode_switch_session(
+        &self,
+        session_id: u64,
+        reason: &'static str,
+    ) -> Result<Option<crate::motor_mode::ModeSwitchSnapshot>, crate::rt_core::requests::config::ConfigError>
+    {
+        use crate::rt_core::requests::config::{ConfigError, ConfigReply, ConfigRequest};
+        match self
+            .dispatch_config_request_owned_reliable(ConfigRequest::CancelModeSwitch {
+                session_id,
+                reason,
+            })
+            .await?
+        {
+            ConfigReply::ModeSwitchCancelled(snap) => Ok(snap),
+            _ => Err(ConfigError::OwnerStopped),
+        }
+    }
+
+    /// Clears a terminal `ModeSwitch` slot matching `session_id` (returns `false` for stale IDs
+    /// or while a router-bound terminal is still pending flush).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn clear_mode_switch_session(
+        &self,
+        session_id: u64,
+    ) -> Result<bool, crate::rt_core::requests::config::ConfigError> {
+        use crate::rt_core::requests::config::{ConfigError, ConfigReply, ConfigRequest};
+        match self
+            .dispatch_config_request_owned_reliable(ConfigRequest::ClearModeSwitch { session_id })
+            .await?
+        {
+            ConfigReply::ModeSwitchCleared(cleared) => Ok(cleared),
+            _ => Err(ConfigError::OwnerStopped),
+        }
+    }
+
+    /// Runs a `ModeSwitch` session to completion on the active owner (`OWNER_LEGACY` or
+    /// `OWNER_EXECUTOR`), polling until terminal and clearing the slot before returning the final
+    /// authoritative snapshot.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn run_mode_switch_session(
+        &self,
+        req: crate::rt_core::requests::config::ModeSwitchStartRequest,
+        poll_timeout: Duration,
+    ) -> Result<crate::motor_mode::ModeSwitchSnapshot, crate::rt_core::requests::config::ConfigError>
+    {
+        use crate::rt_core::requests::config::ConfigError;
+        let session_id = self.start_mode_switch_session(req).await?;
+        let wait_deadline = Instant::now() + poll_timeout;
+        loop {
+            match self.poll_mode_switch_session(session_id).await {
+                Ok(Some(snap)) if !snap.running => {
+                    let _ = self.clear_mode_switch_session(session_id).await;
+                    return Ok(snap);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(ConfigError::OwnerStopped),
+                Err(e) => return Err(e),
+            }
+            if Instant::now() >= wait_deadline {
+                if let Ok(Some(snap)) = self.cancel_mode_switch_session(session_id, "TIMEOUT").await
+                {
+                    let _ = self.clear_mode_switch_session(session_id).await;
+                    return Ok(snap);
+                }
+                return Err(ConfigError::OwnerStopped);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Reference adapter (PR0C): runs causal J7 gripper mode confirmation (`PositionVelocity` or
+    /// `PositionForce`) as a PR0B `SessionKind::ModeSwitch` session on either owner.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn confirm_gripper_mode_session(
+        &self,
+        joint: usize,
+        mode: crate::motor_mode::ControlMode,
+        admission: AdmissionStamp,
+        operator_grant: crate::auth::OperatorGrant,
+        timeout: Duration,
+    ) -> Result<crate::motor_mode::ModeSwitchSnapshot, crate::rt_core::requests::config::ConfigError>
+    {
+        let plan = crate::motor_mode::ModeSwitchPlan::confirm_gripper(joint, mode);
+        let req = crate::rt_core::requests::config::ModeSwitchStartRequest {
+            plan,
+            admission,
+            operator_required: false,
+            operator_grant,
+            deadline: Instant::now() + timeout,
+            client: crate::rt_core::broker::ClientId(admission.connection_id),
+            terminal_ticket: None,
+        };
+        self.run_mode_switch_session(req, timeout + Duration::from_millis(250))
+            .await
     }
 
     /// Coherent control frequency for WS upgrade (`?obs_hz=...`).
