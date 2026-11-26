@@ -10341,6 +10341,7 @@ impl SupervisorInner {
 
     /// Zero-allocation rest-pose verification on fresh feedback for J1–J6 (`config.arm_joints()`)
     /// before clearing carried-over motor hardware errors on a disarmed arm.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     fn check_carryover_rest_pose_with_driver(
         config: &crate::model::ArmConfig,
         drv: &dyn crate::driver::ArmDriver,
