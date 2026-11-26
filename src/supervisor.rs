@@ -13983,17 +13983,17 @@ impl ArmSupervisor {
     }
 
     /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
-    /// live owner and removes it from the `EpisodeStore` catalog. Returns `Ok(true)` if removed,
-    /// `Ok(false)` if absent, or `Err(409 IN_USE)` if referenced or pinned by a sequence save.
-    pub async fn take_episode_for_delete(&self, id: &str) -> Result<bool, ArmError> {
+    /// live owner, removes it from the `EpisodeStore` catalog, and returns its unique deletion
+    /// claim token (`Some(claim)`) if removed, `None` if absent, or `Err(409 IN_USE)` if referenced.
+    pub async fn take_episode_for_delete_claim(&self, id: &str) -> Result<Option<u64>, ArmError> {
         use crate::recording::store::TakeEpisodeOutcome;
         loop {
             let rev0 = self.sequences_revision();
             self.check_episode_delete_allowed(id).await?;
             let store = self.try_episode_store().await?;
             match store.take_if_unpinned_and_rev_matches(id, &self.sequences_revision, rev0) {
-                TakeEpisodeOutcome::Removed => return Ok(true),
-                TakeEpisodeOutcome::NotFound => return Ok(false),
+                TakeEpisodeOutcome::Removed(claim) => return Ok(Some(claim)),
+                TakeEpisodeOutcome::NotFound => return Ok(None),
                 TakeEpisodeOutcome::Pinned => {
                     let mut users = self
                         .published_config()
@@ -14015,13 +14015,23 @@ impl ArmSupervisor {
         }
     }
 
+    /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
+    /// live owner and removes it from the `EpisodeStore` catalog. Returns `Ok(true)` if removed,
+    /// `Ok(false)` if absent, or `Err(409 IN_USE)` if referenced or pinned by a sequence save.
+    pub async fn take_episode_for_delete(&self, id: &str) -> Result<bool, ArmError> {
+        self.take_episode_for_delete_claim(id)
+            .await
+            .map(|opt| opt.is_some())
+    }
+
     /// Linearizably verifies every episode in `dataset` is unreferenced (saved, running, or
     /// reserved) and no recording/import pins `dataset`, then atomically removes all of them from
-    /// the `EpisodeStore` catalog while returning a [`DatasetDeleteGuard`] blocking new pins.
+    /// the `EpisodeStore` catalog while returning their deletion claim tokens and a
+    /// [`DatasetDeleteGuard`] blocking new pins.
     pub async fn take_dataset_episodes_for_delete(
         &self,
         dataset: &str,
-    ) -> Result<(Vec<String>, crate::recording::store::DatasetDeleteGuard), ArmError> {
+    ) -> Result<(Vec<(String, u64)>, crate::recording::store::DatasetDeleteGuard), ArmError> {
         use crate::recording::store::TakeDatasetOutcome;
         loop {
             let rev0 = self.sequences_revision();
@@ -19437,7 +19447,7 @@ fn dispatch_loop(
     // and emit any final safety overflow summary. Drain `terminal_capture` BEFORE
     // `flush_and_report_shutdown` so final broker reply routing sees every captured entry.
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    terminal_capture.wait_or_defer_shutdown_drain(Duration::from_secs(5), terminals, template_obs);
+    terminal_capture.wait_for_sequence_commit_idle();
     let final_snap = hub.latest().or(latest_snap);
     terminal_capture.drain_into(
         terminals,
@@ -19644,7 +19654,12 @@ mod observation_snapshot_tests {
         }
         assert_eq!(sup.get_recording_state().await.1, 300);
         let (tx, rx) = std::sync::mpsc::channel();
-        sup.save_recording_with(move |_, frames| { tx.send(frames.to_vec()).unwrap(); Ok(()) }).await.unwrap();
+        sup.save_recording_with(move |path, frames| {
+            tx.send(frames.to_vec()).unwrap();
+            crate::recording::write_episode_parquet(path, frames, None, &[])
+        })
+        .await
+        .unwrap();
         // a tick after the stop fence records nothing
         sup.tick(0.02).await;
         let frames = rx.recv().unwrap();

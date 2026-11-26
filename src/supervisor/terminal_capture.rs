@@ -979,11 +979,6 @@ struct CachedRichEntry {
     durability_warning: Option<String>,
 }
 
-struct DeferredShutdownDrain {
-    terminals: Arc<TerminalBroadcaster>,
-    template_obs: ArmObservation,
-}
-
 /// Shared off-thread consumer and lock-free atomic accounting for terminal capture.
 /// `rx` and `rich_action_cache` are NEVER locked on `armd-control`; lock order is strictly
 /// `channel.rx -> terminals.inner` (and `rich_action_cache` is a leaf mutex).
@@ -1012,10 +1007,10 @@ pub(crate) struct TerminalCaptureChannel {
     /// whose RT-committed repeat episode is still finishing disk/catalog publication so terminal
     /// delivery waits until `episodes` and `EpisodeStore` are finalized (never touched on RT).
     sequence_commit_inflight: AtomicU64,
-    /// Condvar + optional deferred shutdown drain handoff: if normal shutdown reaches its wait
-    /// bound while a commit is still running, shutdown installs its drain target here under the
-    /// mutex so `SequenceCommitGuard::drop` delivers all queued terminals upon commit completion.
-    sequence_commit_wait: (Mutex<Option<DeferredShutdownDrain>>, std::sync::Condvar),
+    /// Condvar signaled when `sequence_commit_inflight` clears so normal shutdown drains and
+    /// delivers every originating WS terminal and observer broadcast with the committed episode ID
+    /// before broker/router finalization runs.
+    sequence_commit_wait: (Mutex<()>, std::sync::Condvar),
 }
 
 /// Off-RT RAII guard holding [`TerminalCaptureChannel::sequence_commit_inflight`] while an
@@ -1029,45 +1024,21 @@ pub(crate) struct SequenceCommitGuard {
 impl Drop for SequenceCommitGuard {
     fn drop(&mut self) {
         if self.action_id != 0 {
-            let deferred = {
-                let mut g = self
-                    .channel
-                    .sequence_commit_wait
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let _ = self.channel.sequence_commit_inflight.compare_exchange(
-                    self.action_id,
-                    0,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
-                self.channel.sequence_commit_wait.1.notify_all();
-                if self.channel.sequence_commit_inflight.load(Ordering::Acquire) == 0 {
-                    g.take()
-                } else {
-                    None
-                }
-            };
+            let _g = self
+                .channel
+                .sequence_commit_wait
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = self.channel.sequence_commit_inflight.compare_exchange(
+                self.action_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.channel.sequence_commit_wait.1.notify_all();
+            drop(_g);
             self.hub.wake();
-            if let Some(d) = deferred {
-                let final_snap = self.hub.latest();
-                let _ = self.channel.drain_into(
-                    &d.terminals,
-                    &self.hub,
-                    final_snap.as_deref(),
-                    &[],
-                    &d.template_obs,
-                    false,
-                );
-                if d.terminals.has_pending() {
-                    let final_seq = final_snap.as_ref().map_or(0, |s| s.meta.seq);
-                    let _ = d.terminals.drain_all(
-                        final_snap.as_ref().map_or(&d.template_obs, |s| &s.obs),
-                        final_seq,
-                    );
-                }
-            }
         }
     }
 }
@@ -1089,7 +1060,7 @@ impl TerminalCaptureChannel {
             test_push_cap: AtomicUsize::new(TERMINAL_CAPTURE_RING_CAPACITY),
             drain_paused: AtomicBool::new(false),
             sequence_commit_inflight: AtomicU64::new(0),
-            sequence_commit_wait: (Mutex::new(None), std::sync::Condvar::new()),
+            sequence_commit_wait: (Mutex::new(()), std::sync::Condvar::new()),
         });
         let tx = TerminalCaptureTx {
             producer,
@@ -1123,45 +1094,25 @@ impl TerminalCaptureChannel {
         action_id != 0 && self.sequence_commit_inflight.load(Ordering::Acquire) == action_id
     }
 
-    /// Bounded off-RT wait used by normal shutdown drain: waits up to `timeout` for any
-    /// RT-committed sequence repeat to finish publishing into `rich_action_cache`; if still
-    /// in-flight at `timeout`, atomically hands off final terminal drainage to
-    /// `SequenceCommitGuard::drop` so queued terminals are NEVER emitted early and NEVER stranded.
-    pub(crate) fn wait_or_defer_shutdown_drain(
-        &self,
-        timeout: std::time::Duration,
-        terminals: &Arc<TerminalBroadcaster>,
-        template_obs: &ArmObservation,
-    ) {
+    /// Off-RT wait used by normal (non-emergency) shutdown finalization so any in-flight
+    /// RT-committed sequence repeat finishes local disk publication and updates `rich_action_cache`
+    /// BEFORE `drain_into` and `deliver_ready_under_gate` run (never called on emergency shutdown
+    /// and never holds any lock depended upon by the publisher).
+    pub(crate) fn wait_for_sequence_commit_idle(&self) {
         if self.sequence_commit_inflight.load(Ordering::Acquire) == 0 {
             return;
         }
-        let deadline = std::time::Instant::now() + timeout;
         let mut g = self
             .sequence_commit_wait
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         while self.sequence_commit_inflight.load(Ordering::Acquire) != 0 {
-            let rem = deadline.saturating_duration_since(std::time::Instant::now());
-            if rem.is_zero() {
-                break;
-            }
-            let (ng, res) = self
+            g = self
                 .sequence_commit_wait
                 .1
-                .wait_timeout(g, rem)
+                .wait(g)
                 .unwrap_or_else(|e| e.into_inner());
-            g = ng;
-            if res.timed_out() && self.sequence_commit_inflight.load(Ordering::Acquire) != 0 {
-                break;
-            }
-        }
-        if self.sequence_commit_inflight.load(Ordering::Acquire) != 0 {
-            *g = Some(DeferredShutdownDrain {
-                terminals: Arc::clone(terminals),
-                template_obs: template_obs.clone(),
-            });
         }
     }
 

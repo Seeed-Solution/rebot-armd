@@ -1023,6 +1023,15 @@ async fn executor_idempotent_publish_delayed_writer_config_interleaving_and_auth
         store.new_episode(Some("dg_ep_1"), None).unwrap_err().status_code(),
         (409, "EPISODE_EXISTS")
     );
+    // Unclaimed raw delete_files MUST NOT steal or unlink a claimed episode, and a wrong claim
+    // token MUST NOT unlink it either (B2/B3).
+    assert_eq!(
+        store.delete_files("dg_ep_1").unwrap_err().status_code(),
+        (404, "EPISODE_NOT_FOUND")
+    );
+    assert!(store.path_of("dg_ep_1").unwrap().is_file());
+    store.delete_files_with_claim("dg_ep_1", u64::MAX).unwrap();
+    assert!(store.path_of("dg_ep_1").unwrap().is_file(), "stale claim token must not unlink");
     store.delete_dataset_taken_files("del_guard_ds", &taken_dg, dg_guard).unwrap();
     assert!(!store.has_dataset("del_guard_ds"));
 

@@ -2720,7 +2720,7 @@ impl BrokerDispatcher {
         //    callbacks so a slow or stalled sink cannot defeat the emergency deadline.
         if allow_callbacks {
             if let Some((ch, terminals, template_obs)) = self.terminal_capture_drain.as_ref() {
-                ch.wait_or_defer_shutdown_drain(Duration::from_secs(5), terminals, template_obs);
+                ch.wait_for_sequence_commit_idle();
                 let final_snap = self.hub.latest();
                 let _ = ch.drain_into(
                     terminals,

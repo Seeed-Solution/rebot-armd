@@ -689,11 +689,15 @@ pub async fn dataset_episode_delete(
     supervisor.ensure_episodes_loaded().await?;
     let store = supervisor.try_episode_store().await?;
     store.path_of(&id).map_err(ArmError::from)?;
-    supervisor.take_episode_for_delete(&id).await?;
+    let claim = supervisor.take_episode_for_delete_claim(&id).await?;
     let id2 = id.clone();
-    tokio::task::spawn_blocking(move || store.delete_files(&id2)).await
-        .map_err(|e| ArmError::Internal(format!("episode delete failed: {e}")))?
-        .map_err(ArmError::from)?;
+    tokio::task::spawn_blocking(move || match claim {
+        Some(tok) => store.delete_files_with_claim(&id2, tok),
+        None => store.delete_files(&id2),
+    })
+    .await
+    .map_err(|e| ArmError::Internal(format!("episode delete failed: {e}")))?
+    .map_err(ArmError::from)?;
     Ok(Json(serde_json::json!({"status": "deleted", "episode_id": id})))
 }
 
