@@ -58,6 +58,7 @@ pub mod session;
 pub mod stream;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod action_diag;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod recorder;
 
 #[cfg(not(target_arch = "wasm32"))]
