@@ -9882,7 +9882,7 @@ fn control_thread_main_inner(
                         .checked_sub(crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN)
                         .unwrap_or(release_start);
                     let next_wake = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
-                        Some(now_inst())
+                        Some((now_inst(), true))
                     } else {
                         report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
                     };
@@ -9949,17 +9949,22 @@ fn control_thread_main_inner(
                 step_shadow_flush_ns = shadow_ns;
                 let mut wakes = 0u32;
                 let mut next_wake = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
-                    Some(now_inst())
+                    Some((now_inst(), true))
                 } else {
                     report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
                 };
                 let mut wake_err: Option<Box<dyn Any + Send>> = None;
-                while let Some(wake) = next_wake {
+                while let Some((wake, is_urgent)) = next_wake {
                     if wakes >= MAX_SERVICE_WAKES || control_stop.load(Ordering::Acquire) {
                         break;
                     }
                     let now = now_inst();
-                    if now >= urgent_wake_cutoff || wake > urgent_wake_cutoff {
+                    let exec_cutoff = if is_urgent || engine.has_pending_urgent(&*core) {
+                        urgent_wake_cutoff
+                    } else {
+                        optional_wake_cutoff
+                    };
+                    if now >= exec_cutoff || wake > exec_cutoff {
                         break;
                     }
                     if wake > now {
@@ -9973,7 +9978,12 @@ fn control_thread_main_inner(
                         step_wake_sleep_ns = step_wake_sleep_ns
                             .saturating_add(now_ns_fn().saturating_sub(sleep_t0_ns));
                     }
-                    if control_stop.load(Ordering::Acquire) || now_inst() >= urgent_wake_cutoff {
+                    let post_cutoff = if is_urgent || engine.has_pending_urgent(&*core) {
+                        urgent_wake_cutoff
+                    } else {
+                        optional_wake_cutoff
+                    };
+                    if control_stop.load(Ordering::Acquire) || now_inst() >= post_cutoff {
                         break;
                     }
                     wakes += 1;
@@ -9981,7 +9991,7 @@ fn control_thread_main_inner(
                     let wake_res = {
                         // Declared FIRST -> drops LAST, after ALL wake locals drop!
                         let _wake_alloc_scope = WholeReleaseAllocGuard::enter(&stats, true);
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (Option<Instant>, u64) {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (Option<(Instant, bool)>, u64) {
                             stats.wakes.fetch_add(1, Ordering::Relaxed);
                             let _wake_guard = ReleaseGuard::enter();
                             assert!(
@@ -10032,7 +10042,7 @@ fn control_thread_main_inner(
                             let _wake_tail_local =
                                 state.run_tail_alloc_probe(&state.hooks.inject_wake_tail_once);
                             let next = if engine.has_pending_urgent(&*core) && now_inst() < urgent_wake_cutoff {
-                                Some(now_inst())
+                                Some((now_inst(), true))
                             } else {
                                 report.poll.admitted_wake_before(optional_wake_cutoff, urgent_wake_cutoff)
                             };

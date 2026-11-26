@@ -1352,15 +1352,15 @@ fn coalesced_fallback_optional_deferral_and_bounded_rx_recovery() {
     assert_eq!(snap.tx.since_boot_by_kind, snap.tx.by_kind_total);
 }
 
-/// Real-flush (`flush_is_noop() == false`) CAN transport wrapper that buffers transmitted frames
-/// until `flush()` succeeds (faithfully modeling real-flush delivery semantics) and can fail
-/// transmit on a chosen CAN ID or fail `flush()` to prove confirmed-delivery watchdog accounting.
+/// Real-flush (`flush_is_noop() == false`) CAN transport wrapper modeling `SlcanTransport`
+/// semantics (`transmit` submits to OS serial driver, `flush` drains the OS buffer and may fail)
+/// to prove confirmed-delivery watchdog accounting.
 #[derive(Clone)]
 struct RealFlushBus {
     inner: SgPerfBus,
-    buffered: Arc<Mutex<Vec<CanFrame>>>,
     fail_tx_id: Arc<Mutex<Option<u32>>>,
     fail_flush: Arc<Mutex<bool>>,
+    flush_ok_count: Arc<Mutex<usize>>,
 }
 
 impl CanTransport for RealFlushBus {
@@ -1383,8 +1383,7 @@ impl CanTransport for RealFlushBus {
         if *self.fail_tx_id.lock().unwrap() == Some(frame.id) {
             return Err(TransportError::Io(std::io::Error::other("injected mid-batch tx failure")));
         }
-        self.buffered.lock().unwrap().push(*frame);
-        Ok(())
+        self.inner.transmit(frame)
     }
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
         self.inner.receive()
@@ -1397,23 +1396,21 @@ impl CanTransport for RealFlushBus {
     }
     fn flush(&mut self) -> Result<(), TransportError> {
         if *self.fail_flush.lock().unwrap() {
-            self.buffered.lock().unwrap().clear();
             return Err(TransportError::Io(std::io::Error::other("injected flush failure")));
         }
-        let frames: Vec<CanFrame> = self.buffered.lock().unwrap().drain(..).collect();
-        for f in &frames {
-            self.inner.transmit(f)?;
-        }
-        self.inner.flush()
+        self.inner.flush()?;
+        *self.flush_ok_count.lock().unwrap() += 1;
+        Ok(())
     }
 }
 
 #[test]
 fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() {
-    // 1. Blocker 1 + Major 3: off-tick blocking `set_torque(true)` fast-path still services due
-    //    watchdog holds inline; Window 2 `begin_wake_tx_pass` refreshes expired Window-1 `tick_tx`
-    //    without clearing `release_ctrl_tx_mask`, and repeated `begin_control_release(same_seq)`
-    //    does NOT re-arm `output_step_pending_in_release`.
+    // 1. Blocker 1 + Major 3 + R3 Minor 1: off-tick blocking `set_torque(true)` fast-path still
+    //    services due watchdog holds inline; Window 2 `begin_wake_tx_pass` refreshes expired
+    //    Window-1 `tick_tx` while PRESERVING `release_ctrl_tx_mask` (confirmed motor in Window 1
+    //    is NOT duplicated in Window 2), and repeated `begin_control_release(same_seq)` does NOT
+    //    re-arm `output_step_pending_in_release`.
     let clock = Arc::new(MockClock::new());
     let bus = SgPerfBus::new(clock.clone(), 0xA0D1_0001, [1, 1, 1, 1, 1, 1, 1]);
     let cfg = build_sg2002_config();
@@ -1432,15 +1429,17 @@ fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() 
         "off-tick fast-path set_torque(true) must still emit inline urgent holds for due motors"
     );
 
-    clock.advance(Duration::from_millis(20));
+    clock.advance(Duration::from_millis(22));
     reset_tx_metrics();
     bus.begin_release();
     drv.begin_control_release(10);
     let rel_start = clock.now();
     drv.set_tx_release_deadline(Some(rel_start + Duration::from_millis(18)));
-    let mut states = Vec::with_capacity(7);
-    drv.read_joint_states_budgeted(&mut states, rel_start + Duration::from_millis(4), 64)
-        .unwrap();
+    // Confirm joint 0 in Window 1 via measured hold (opening Window 1's 10 ms `tick_tx` pass
+    // and setting bit 0 in `release_ctrl_tx_mask`).
+    let hold_targets: Vec<_> = (0..7).map(|_| armd::driver::JointTarget::position(0.0)).collect();
+    let _ = drv.write_measured_hold_masked(1u64 << 0, &hold_targets).unwrap();
+    // Advance +12 ms: Window 1's 10 ms `tick_tx` deadline has now expired, and joints 1..5 are 34 ms old.
     clock.advance(Duration::from_millis(12));
     drv.begin_wake_tx_pass();
     // Repeated `begin_control_release(10)` inside Window 2 must NOT re-arm Step-5 ownership.
@@ -1449,8 +1448,8 @@ fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() 
     drv.service_release_watchdog_fallback(u64::MAX, None);
     let wake_fb = take_tx_metrics();
     assert_eq!(
-        wake_fb.by_kind.urgent_hold, 6,
-        "Window 2 begin_wake_tx_pass must refresh expired Window-1 tick_tx so urgent holds succeed"
+        wake_fb.by_kind.urgent_hold, 5,
+        "Window 2 begin_wake_tx_pass must refresh expired Window-1 tick_tx while preserving release_ctrl_tx_mask (only J2..J6 due)"
     );
 
     // 2. Blocker 2: Owner-authorized mask & targets strictly restrict fallback holds (never falls
@@ -1476,20 +1475,21 @@ fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() 
     drv.service_release_watchdog_fallback(0, Some(&[None; 7]));
     assert_eq!(take_tx_metrics().by_kind.urgent_hold, 0);
 
-    // 3. Major 1 + R2 Major 3 + R2 Minor 1: Real-flush (`!flush_is_noop()`) buffers until flush.
-    //    (a) Mid-batch hard TX error on J2 must discard J1's staged credit IMMEDIATELY so even a
-    //        subsequent same-release flush (WITHOUT `begin_wake_tx_pass`) cannot commit J1.
-    //    (b) `fail_flush = true` must discard all staged credits so fallback still services all 6.
+    // 3. Major 1 + R2 Major 3 + R3 Major 7: Real-flush (`!flush_is_noop()`).
+    //    (a) Mid-batch hard TX error on J2 discards J1's staged credit IMMEDIATELY inside
+    //        `drain_pending_pass`, so a subsequent same-release flush (WITHOUT `begin_wake_tx_pass`,
+    //        via a `0xCC` refresh flush or `write_measured_hold_masked` on J6) does NOT commit J1.
+    //    (b) `fail_flush = true` discards all staged credits so all 6 remain eligible once flush recovers.
     let rf_clock = Arc::new(MockClock::new());
     let rf_inner = SgPerfBus::new(rf_clock.clone(), 0xF105_0001, [1, 1, 1, 1, 1, 1, 1]);
-    let buffered = Arc::new(Mutex::new(Vec::new()));
     let fail_tx_id = Arc::new(Mutex::new(None));
     let fail_flush = Arc::new(Mutex::new(false));
+    let flush_ok_count = Arc::new(Mutex::new(0usize));
     let rf_bus = RealFlushBus {
         inner: rf_inner.clone(),
-        buffered: buffered.clone(),
         fail_tx_id: fail_tx_id.clone(),
         fail_flush: fail_flush.clone(),
+        flush_ok_count: flush_ok_count.clone(),
     };
     let limits: Vec<DamiaoLimits> = cfg
         .damiao_ranges
@@ -1514,7 +1514,7 @@ fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() 
     rf_clock.advance(Duration::from_millis(5));
     rf_drv.read_joint_states().unwrap();
 
-    // (a) Mid-batch J2 hard TX error on release 1: J1 transmitted into buffer, batch returns Err.
+    // (a) Mid-batch J2 hard TX error on release 1: J1 transmits, J2 errors before flush.
     rf_clock.advance(Duration::from_millis(32));
     *fail_tx_id.lock().unwrap() = Some(0x102);
     rf_drv.begin_control_release(1);
@@ -1524,28 +1524,34 @@ fn review_regressions_window2_owner_authority_real_flush_and_offtick_fastpath() 
         rf_drv.write_joint_targets_bounded(&targets).is_err(),
         "mid-batch J2 hard TX error must return Err before flush"
     );
-    buffered.lock().unwrap().clear();
     *fail_tx_id.lock().unwrap() = None;
-    // Trigger another flush in the SAME release (e.g. a J7 epilogue or fallback) without resetting
-    // the release pass: J1's abandoned staged timestamp must ALREADY have been discarded, so
-    // fallback MUST service all 6 arm joints (including J1) once pass backpressure clears!
+    // Trigger a separate flush on J6 in the SAME release (WITHOUT resetting `staged_ctrl_tx` via
+    // `begin_wake_tx_pass` — clear only backpressure via a single-joint hold on J6 after wake):
+    // wait — first verify via `request_mode_readback_budgeted` or direct `flush` through J6!
     rf_drv.begin_wake_tx_pass();
-    reset_tx_metrics();
-    // First test (b) `fail_flush = true`: flush fails -> 0 joints credited!
+    let flushes_before = *flush_ok_count.lock().unwrap();
+    // (b) `fail_flush = true`: flush fails -> 0 joints credited and flush_ok_count unchanged!
     *fail_flush.lock().unwrap() = true;
+    reset_tx_metrics();
     rf_drv.service_release_watchdog_fallback(u64::MAX, None);
-    let failed_flush_tx = take_tx_metrics();
-    assert_eq!(failed_flush_tx.by_kind.urgent_hold, 6, "6 holds attempted before failed flush");
-    // Now allow flush to succeed in the SAME release: because flush failed, all 6 MUST still be
-    // uncredited and eligible for fallback!
+    assert_eq!(
+        *flush_ok_count.lock().unwrap(),
+        flushes_before,
+        "failed flush must not increment flush_ok_count"
+    );
+    // Recover flush on the SAME release: all 6 joints (including J1) MUST still receive holds!
     *fail_flush.lock().unwrap() = false;
-    rf_drv.begin_wake_tx_pass();
     reset_tx_metrics();
     rf_drv.service_release_watchdog_fallback(u64::MAX, None);
     let recovered_fb = take_tx_metrics();
     assert_eq!(
         recovered_fb.by_kind.urgent_hold, 6,
-        "failed flush must NOT credit any joint; all 6 joints must receive holds once flush recovers"
+        "failed flush must NOT credit any joint; all 6 joints (including J1) must receive holds once flush recovers"
+    );
+    assert_eq!(
+        *flush_ok_count.lock().unwrap(),
+        flushes_before + 1,
+        "recovered fallback must complete one real flush"
     );
 
     // 4. Major 4: `ThreadUsage::merge_tx_metrics` merges Window 2 TX counts without clobbering

@@ -505,19 +505,27 @@ impl HardwarePoll {
     /// transition's wake when it comes before the release (None: serve it at the release).
     pub fn wake_before(&self, release: Instant) -> Option<Instant> { self.wake().filter(|w| *w < release) }
 
-    /// Next sub-release wake admitted for Window 2:
+    /// Next sub-release wake admitted for Window 2 as `(wake_at, is_urgent)`:
     /// - Optional transition polls (`wake()`) are deferred to the next release past `optional_cutoff`.
     /// - Watchdog-required holds (`urgent_wake`) remain eligible up to `urgent_cutoff`.
     pub fn admitted_wake_before(
         &self,
         optional_cutoff: Instant,
         urgent_cutoff: Instant,
-    ) -> Option<Instant> {
+    ) -> Option<(Instant, bool)> {
         let opt = self.wake().filter(|w| *w < optional_cutoff);
         let urg = self.urgent_wake.filter(|w| *w < urgent_cutoff);
         match (opt, urg) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+            (Some(a), Some(b)) => {
+                if b <= a {
+                    Some((b, true))
+                } else {
+                    Some((a, false))
+                }
+            }
+            (Some(a), None) => Some((a, false)),
+            (None, Some(b)) => Some((b, true)),
+            (None, None) => None,
         }
     }
 }
@@ -2136,14 +2144,14 @@ impl ReleaseEngine {
             .is_some_and(UrgentStopIntake::has_applied_pending)
     }
 
-    /// True when urgent E-stop, stop, or connection-lifecycle work requires immediate service
-    /// without waiting for optional-work margins.
+    /// True when NEW incoming urgent E-stop, stop, or connection-lifecycle requests require
+    /// immediate service without waiting for optional-work margins. Intentionally excludes
+    /// already-staged outbound replies waiting on a full reply ring so blocked consumers cannot
+    /// exhaust the Window 2 wake quota.
     pub fn has_pending_urgent<O: CoreOps>(&self, core: &O) -> bool {
         self.stop.current() != self.stop.applied()
             || self.urgent_stops.as_ref().is_some_and(UrgentStopIntake::has_pending_requests)
-            || self.has_pending_urgent_stop_replies()
             || self.conn_lifecycle.as_ref().is_some_and(super::requests::lease::ConnLifecycleIntake::has_pending_requests)
-            || self.has_pending_lifecycle_replies()
             || core.has_pending_urgent()
     }
 
@@ -2845,18 +2853,28 @@ impl<O: CoreOps> ReleaseFixture<O> {
             .checked_sub(crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN)
             .unwrap_or(started);
         let mut next = if self.engine.has_pending_urgent(&self.core) && self.clock.now() < urgent_cutoff {
-            Some(self.clock.now())
+            Some((self.clock.now(), true))
         } else {
             report.poll.admitted_wake_before(optional_cutoff, urgent_cutoff)
         };
-        while let Some(wake) = next {
-            if report.wakes == MAX_SERVICE_WAKES || self.clock.now() >= urgent_cutoff { break; }
+        while let Some((wake, is_urgent)) = next {
+            let exec_cutoff = if is_urgent || self.engine.has_pending_urgent(&self.core) {
+                urgent_cutoff
+            } else {
+                optional_cutoff
+            };
+            if report.wakes == MAX_SERVICE_WAKES || self.clock.now() >= exec_cutoff { break; }
             report.wakes += 1;
             self.clock.advance(wake.saturating_duration_since(self.clock.now()));
-            if self.clock.now() >= urgent_cutoff { break; }
+            let post_cutoff = if is_urgent || self.engine.has_pending_urgent(&self.core) {
+                urgent_cutoff
+            } else {
+                optional_cutoff
+            };
+            if self.clock.now() >= post_cutoff { break; }
             self.engine.service_wake_with_clock(&mut self.core, &mut now_fn, release_deadline, next_gen, &mut report);
             next = if self.engine.has_pending_urgent(&self.core) && self.clock.now() < urgent_cutoff {
-                Some(self.clock.now())
+                Some((self.clock.now(), true))
             } else {
                 report.poll.admitted_wake_before(optional_cutoff, urgent_cutoff)
             };

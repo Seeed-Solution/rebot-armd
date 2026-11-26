@@ -14718,6 +14718,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// `0xCC` refresh slot instead of failing closed before trying a refresh.
     fn send_enable_masked(
         &mut self,
+        mask: u32,
+        fail_on_error: bool,
+        deadline: Option<Deadline>,
+        tx_cursor: &mut u8,
+        prioritize_joint: Option<usize>,
+        defer_stale_pf: bool,
+    ) -> Result<u32, ArmDriverError> {
+        let res = self.send_enable_masked_inner(
+            mask,
+            fail_on_error,
+            deadline,
+            tx_cursor,
+            prioritize_joint,
+            defer_stale_pf,
+        );
+        if res.is_err() {
+            self.discard_staged_ctrl_tx();
+        }
+        res
+    }
+
+    fn send_enable_masked_inner(
+        &mut self,
         mut mask: u32,
         fail_on_error: bool,
         deadline: Option<Deadline>,
@@ -14725,6 +14748,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         prioritize_joint: Option<usize>,
         defer_stale_pf: bool,
     ) -> Result<u32, ArmDriverError> {
+        let orig_mask = mask;
+        self.discard_staged_ctrl_tx();
         self.enable_estop_inhibited()?;
         self.check_enable_tx_authority()?;
         let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
@@ -14866,12 +14891,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     return Err(TransportError::Timeout.into());
                 }
                 tracing::warn!("Retry flush cutoff exceeded");
+                return Ok(orig_mask);
             } else if let Err(e) = self.flush_can_and_commit() {
                 if fail_on_error {
                     self.enable_failed();
                     return Err(e.into());
                 }
                 tracing::warn!("Retry flush failed: {:?}", e);
+                return Ok(orig_mask);
             }
         }
         Ok(mask)
@@ -22975,7 +23002,10 @@ mod pos_force_emitter {
             && driver.poll_tx_allowed()
             && driver.can_start_tick_tx()
         {
-            let _ = driver.try_send_pf_refresh(start_stamp)?;
+            if let Err(e) = driver.try_send_pf_refresh(start_stamp) {
+                driver.discard_staged_ctrl_tx();
+                return Err(e);
+            }
         }
 
         let stop_check = |d: &DamiaoArmDriver<C>| {
@@ -24026,6 +24056,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
             };
             crate::diagnostics::tick::record_tx_attempt(kind, wall_ns, cpu_ns);
+            if res.is_ok() {
+                crate::diagnostics::tick::record_tx_frame_kind(
+                    crate::diagnostics::tick::TxFrameKind::Hold,
+                );
+            }
             res?;
             if is_stale {
                 stale_mask |= 1u64 << i;
@@ -24114,6 +24149,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
             };
             crate::diagnostics::tick::record_tx_attempt(kind, wall_ns, cpu_ns);
+            if res.is_ok() {
+                crate::diagnostics::tick::record_tx_frame_kind(
+                    crate::diagnostics::tick::TxFrameKind::Normal,
+                );
+            }
             res?;
             let (write_done_rx_clock, write_done_offset_ns) =
                 self.capture_rx_clock_sample(write_done);
