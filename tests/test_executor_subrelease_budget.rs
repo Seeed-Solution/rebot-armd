@@ -1605,6 +1605,20 @@ fn phase_offset_missed_refresh_under_full_deferral_and_tx_cap_stays_under_40ms()
     let cfg = build_sg2002_config();
     let mut drv = build_sg2002_driver(bus.clone(), &cfg);
 
+    // Install StoppedDisableGate with rest pose [0.0; 6] so `begin_torque_budgeted(false, ...)`
+    // enters `AwaitRestGate` (unconfirmed K=3 rest window) rather than failing closed without a gate.
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for (i, slot) in arm_joints.iter_mut().take(6).enumerate() {
+        *slot = i;
+    }
+    drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(true)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     // Bootstrap & enable all motors cleanly.
     drv.read_joint_states().unwrap();
     bus.with(|s| s.push_all_feedback_now());
@@ -1631,28 +1645,28 @@ fn phase_offset_missed_refresh_under_full_deferral_and_tx_cap_stays_under_40ms()
         }
     });
 
-    // Release 1 (t = 20 ms): advance to t = 27 ms (17 ms since t = 10 ms refresh!),
-    // exhaust the motion TX frame cap (12 frames) with 0xCC refreshes/holds on J1 only,
-    // leaving J2..J6 unrefreshed in release 1 with age = 17 ms (< 18 ms).
+    // Release 1 (t = 20 ms): start an active pre-dispatch rest-disable transition (`AwaitRestGate`,
+    // where Window 2 may defer all sub-release wakes), refresh ONLY J1 in Step 5, and advance to
+    // t = 27 ms (17 ms since t = 10 ms refresh, past `tx_budget.max_duration` = 6 ms while
+    // `tx_release_deadline` = t1 + 18 ms still has headroom).
     let t1 = t0 + RELEASE_PERIOD;
     clock.advance(t1.saturating_duration_since(clock.now()));
-    let mut tight_budget = cfg.damiao_tx_budget();
-    tight_budget.max_frames = 1;
-    drv.set_tx_budget(tight_budget);
     bus.begin_release();
     drv.begin_control_release(2);
     drv.set_tx_release_deadline(Some(t1 + Duration::from_millis(18)));
-    // Refresh ONLY J1 (consuming the 1 motion TX frame slot!).
+    let _ = drv.begin_torque_budgeted(false, 64).unwrap();
+    assert!(drv.torque_transition_pending());
+    // Refresh ONLY J1, leaving J2..J6 unrefreshed with age = 17 ms (< 18 ms).
     let _ = drv.write_measured_hold_masked(1u64 << 0, &zeros).unwrap();
     clock.advance((t1 + Duration::from_millis(7)).saturating_duration_since(clock.now()));
 
-    // Fallback runs at t = 27 ms: MUST refresh J2..J6 immediately despite age = 17 ms and max_frames = 1!
+    // Fallback runs at t = 27 ms: MUST refresh J2..J6 immediately despite age = 17 ms and expired pass.deadline!
     reset_tx_metrics();
     drv.service_release_watchdog_fallback(u64::MAX, None);
     let fb = take_tx_metrics();
     assert_eq!(
         fb.by_kind.urgent_hold, 5,
-        "phase-offset missed joints (age 17 ms) must be refreshed in Window 1 fallback even when motion tx_budget.max_frames is exhausted"
+        "phase-offset missed joints (age 17 ms) during active transition must be refreshed in Window 1 fallback"
     );
 
     // Calling fallback again in the SAME release must still coalesce to 0 frames.
@@ -1660,14 +1674,13 @@ fn phase_offset_missed_refresh_under_full_deferral_and_tx_cap_stays_under_40ms()
     drv.service_release_watchdog_fallback(u64::MAX, None);
     assert_eq!(take_tx_metrics().by_kind.urgent_hold, 0);
 
-    // Window 2 defers completely; Release 2 runs late normal output at t = 51 ms.
+    // Window 2 defers completely; Release 2 runs late stopped-hold output at t = 51 ms.
     let t2_late = t0 + Duration::from_millis(51);
     clock.advance(t2_late.saturating_duration_since(clock.now()));
-    drv.set_tx_budget(cfg.damiao_tx_budget());
     bus.begin_release();
     drv.begin_control_release(3);
     drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(58)));
-    drv.write_joint_targets_bounded(&zeros).unwrap();
+    let _ = drv.write_measured_hold_masked(u64::MAX, &zeros).unwrap();
 
     let (max_gap, expiries) = (bus.max_arm_ctrl_gap(), bus.total_expiries());
     assert!(

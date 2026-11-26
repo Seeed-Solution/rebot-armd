@@ -7984,7 +7984,6 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Diagnostic tag distinguishing urgent watchdog continuity holds (`TxFrameKind::UrgentHold`)
     /// from normal stopped / SAFE-HOLD / FailedHold holds (`TxFrameKind::Hold`).
     in_urgent_watchdog_hold: bool,
-    in_release_watchdog_fallback: bool,
 }
 
 /// Transmit priority classes (lower value = higher priority):
@@ -9119,7 +9118,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             release_recovery_tx_count: 0,
             recovery_cursor: 0,
             in_urgent_watchdog_hold: false,
-            in_release_watchdog_fallback: false,
         }
     }
 
@@ -10020,12 +10018,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 break 'send_body Err(TxRefusal::DeadlinePassed);
             }
 
-            // 2. Tick TX budget check (DisableRequested / ClientParkDisable / DisableProtective / DisableProbe
-            // and Window-1 `service_release_watchdog_fallback` holds exempt from motion TX frame/duration caps;
-            // fallback holds still strictly obey `tx_release_deadline` and backpressure).
-            let urgent_wd_fallback = self.in_release_watchdog_fallback
-                && matches!(kind, TxKind::MeasuredHold(_));
-            let budgeted = !Self::is_disable_tx_kind(kind) && !urgent_wd_fallback;
+            // 2. Tick TX budget check (DisableRequested / ClientParkDisable / DisableProtective / DisableProbe exempt from motion TX budget).
+            let budgeted = !Self::is_disable_tx_kind(kind);
             if budgeted {
                 let _ = self.ensure_tx_pass();
                 if !self.can_start_tick_tx() {
@@ -17833,27 +17827,33 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return;
         }
         let exclude_mask = !(authorized_mask as u32);
-        // Use `Duration::ZERO` as `min_age`: `release_ctrl_tx_mask` already excludes every joint
-        // that received a confirmed control/hold frame during THIS release (0 extra frames on
-        // normal ticks). Any authorized energized arm joint that missed Step 5 in this release —
-        // even with a phase-offset age < 18 ms (e.g. last refreshed at t=10 ms, fallback at
-        // t=27 ms) — is refreshed now before `tx_release_deadline` so deferring Window 2 can
-        // never create a > 40 ms gap on the next release.
+        // During an active torque transition (where Window 2 may defer sub-release watchdog wakes),
+        // use `Duration::ZERO` so any authorized energized arm joint missed in Step 5 — even with
+        // a phase-offset age < 18 ms (e.g. last refreshed at t=10 ms, fallback at t=27 ms) — is
+        // refreshed inside Window 1 before `tx_release_deadline` (`release_ctrl_tx_mask` excludes
+        // joints already refreshed in this release, so normal ticks emit 0 extra frames). Outside
+        // torque transitions, preserve `WATCHDOG_DISABLE_FALLBACK_INTERVAL` (30 ms) so single-tick
+        // recovery/invalid-target suppression contracts emit 0 unexpected arm holds.
+        let min_age = if self.torque_hs.is_some() {
+            Duration::ZERO
+        } else {
+            WATCHDOG_DISABLE_FALLBACK_INTERVAL
+        };
         let deadline = self.tx_release_deadline.map(|at| Deadline { at });
-        if let (Some(pass), Some(cap)) = (self.tick_tx.as_mut(), self.tx_release_deadline) {
-            if pass.deadline < cap {
-                pass.deadline = cap;
+        if self.torque_hs.is_some() {
+            if let (Some(pass), Some(cap)) = (self.tick_tx.as_mut(), self.tx_release_deadline) {
+                if pass.deadline < cap {
+                    pass.deadline = cap;
+                }
             }
         }
-        self.in_release_watchdog_fallback = true;
         let _ = self.service_energized_watchdog_holds_with_targets(
-            Duration::ZERO,
+            min_age,
             deadline,
             exclude_mask,
             hold_targets,
             false,
         );
-        self.in_release_watchdog_fallback = false;
     }
 
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
