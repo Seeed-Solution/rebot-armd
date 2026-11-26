@@ -11635,7 +11635,12 @@ fn control_thread_main_inner(
             .hooks
             .post_publish_delay_once
             .as_ref()
-            .and_then(|d| d.lock().ok().and_then(|mut g| g.take()))
+            .and_then(|d| {
+                if on_rt_control_thread() || in_rt_release() {
+                    crate::rt_core::rt_gate::record_rt_lock_attempt();
+                }
+                d.lock().ok().and_then(|mut g| g.take())
+            })
         {
             sleep_dur(delay);
         }

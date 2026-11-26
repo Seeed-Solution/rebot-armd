@@ -2782,3 +2782,47 @@ async fn rt_gate_tracking_position_lead_and_ramp_out_zero_alloc_zero_lock() {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rt_gate_counts_enabled_post_publish_delay_once_hook_lock() {
+    use armd::rt_core::rt_gate::RtReleaseGate;
+    let clock = ScriptedClock::new();
+    let (drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    let period_ns = 10_000_000u64;
+    let delay_hook = Arc::new(Mutex::new(Some(Duration::from_micros(50))));
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                post_publish_delay_once: Some(Arc::clone(&delay_hook)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let gate = RtReleaseGate::new(&sup, &handle);
+    let guard = gate.begin_phase("post_publish_delay_once_enabled");
+    clock.run_steps(period_ns, 2);
+    let delta = guard.finish();
+    assert!(
+        !delta.is_clean(),
+        "enabled post_publish_delay_once test-hook mutex must be caught by RT gate"
+    );
+    assert!(
+        delta.rt_lock_attempts >= 2,
+        "expected >= 2 recorded RT lock attempts across 2 releases with enabled hook, got {}",
+        delta.rt_lock_attempts
+    );
+    assert!(
+        handle.stats().rt_lock_attempts.load(Ordering::Acquire) >= 2,
+        "executor stats must record RT lock attempts when post_publish_delay_once is enabled"
+    );
+
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+}
