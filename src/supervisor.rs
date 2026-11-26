@@ -13122,14 +13122,33 @@ impl SupervisorInner {
 
     #[inline]
     pub(crate) fn mode_switch_owns_bus(&self) -> bool {
-        !self.safety.state().is_stopped()
-            && self.mode_switch.is_running()
-            && self
-                .sessions
-                .slot(crate::rt_core::session::SessionSlot::ExclusiveOutput)
-                .is_some_and(|s| {
-                    s.kind == crate::rt_core::session::SessionKind::ModeSwitch && s.is_live()
-                })
+        let Some(slot) = self
+            .sessions
+            .slot(crate::rt_core::session::SessionSlot::ExclusiveOutput)
+        else {
+            return false;
+        };
+        if !self.mode_switch.is_running()
+            || slot.kind != crate::rt_core::session::SessionKind::ModeSwitch
+            || !slot.is_live()
+        {
+            return false;
+        }
+        if !self.safety.state().is_stopped() {
+            return true;
+        }
+        // Owner-internal stop-direction MIT -> POS_VEL handback in non-E-stop Fault may own
+        // the bus exclusively ONLY when no E-stop is pending or latched (never bypassing
+        // Damiao's TxKind::ModeWrite E-stop gate).
+        matches!(
+            slot.authority.mode,
+            crate::rt_core::session::SessionAuthorityMode::PosVelHandback {
+                allow_in_fault: true,
+                ..
+            }
+        ) && !self.estop_pending()
+            && !self.urgent_stop_unapplied()
+            && !matches!(self.safety.state(), crate::safety::SafetyState::EStop)
     }
 
     #[allow(clippy::result_large_err)]
@@ -15883,14 +15902,15 @@ impl ArmSupervisor {
             || guard.zero_check_persisting.is_some()
             || guard.gravity_comp.is_some()
             || guard.macro_run.is_some()
-            || guard.mit_active()
+            || guard.mit.owner != crate::mit::MitOwner::Off
             || guard.mit.revoke_pending
+            || guard.mode_switch.active_session.is_some()
         {
             restore_legacy(&mut rollback);
             return Err(ArmError::Rejected {
                 status: 409,
                 code: "TRANSFER_BLOCKED".into(),
-                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, macro action, or MIT tracking is active".into(),
+                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, macro action, or MIT tracking (active or lost) is active".into(),
             });
         }
         #[cfg(feature = "policy-runtime")]
@@ -15900,14 +15920,6 @@ impl ArmSupervisor {
                 status: 409,
                 code: "TRANSFER_BLOCKED".into(),
                 message: "Cannot transfer ownership while policy runtime is active or loading".into(),
-            });
-        }
-        if crate::mit::mit_joint_mask(&guard.config) != 0 {
-            restore_legacy(&mut rollback);
-            return Err(ArmError::Rejected {
-                status: 503,
-                code: "UNSUPPORTED_RT_CONFIG".into(),
-                message: "MIT-configured profiles require synchronous qualification/handover and are not supported under synchronous RT executor step 1".into(),
             });
         }
         if guard.config.dof > crate::rt_core::mailbox::MAX_DOF {
@@ -15921,6 +15933,16 @@ impl ArmSupervisor {
                     crate::rt_core::mailbox::MAX_DOF
                 ),
             });
+        }
+        // Pre-allocate MIT runtime vectors before handing ownership to `armd-control` so
+        // activation and handback perform zero heap allocations on RT.
+        let j_len = guard.mit.joints.len();
+        if guard.mit.joints.capacity() < crate::rt_core::mailbox::MAX_DOF {
+            guard.mit.joints.reserve(crate::rt_core::mailbox::MAX_DOF.saturating_sub(j_len));
+        }
+        let ff_len = guard.mit.last_ff.len();
+        if guard.mit.last_ff.capacity() < crate::rt_core::mailbox::MAX_DOF {
+            guard.mit.last_ff.reserve(crate::rt_core::mailbox::MAX_DOF.saturating_sub(ff_len));
         }
         // Flush any legacy E-stop acks already applied before handoff so waiting callers
         // receive their exact recorded (state, epoch) instead of stalling after transfer,

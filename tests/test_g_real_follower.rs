@@ -259,7 +259,8 @@ async fn damiao_fakebus_executor_keeps_driver_admission_mit_refusal_and_qualific
     );
     assert_eq!(sup_nonrt.owner_mode(), armd::supervisor::OWNER_LEGACY);
 
-    // 3. MIT handover refusal: MIT-configured Damiao profile stays legacy-only unless qualified.
+    // 3. MIT-configured Damiao profile hands over cleanly to OWNER_EXECUTOR (Adapter 4),
+    //    while qualification record checks remain enforced before arming.
     let bus = FakeBus::new(&dm_limits());
     bus.with(|s| {
         s.tx_log.reserve(8192);
@@ -278,16 +279,14 @@ async fn damiao_fakebus_executor_keeps_driver_admission_mit_refusal_and_qualific
     }
     let sup_mit = Arc::new(ArmSupervisor::new(mit_cfg).with_driver(Box::new(drv)));
     sup_mit.start_dispatcher().unwrap();
-    let err_mit = sup_mit
+    let exec_mit = sup_mit
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
         .await
-        .err()
-        .expect("MIT-configured profile must stay refused on executor");
-    assert!(
-        matches!(err_mit, ArmError::Rejected { status: 503, ref code, .. } if code == "UNSUPPORTED_RT_CONFIG"),
-        "unexpected MIT refusal err: {err_mit:?}"
-    );
-    assert_eq!(sup_mit.owner_mode(), armd::supervisor::OWNER_LEGACY);
+        .expect("MIT-configured Damiao profile must hand over to executor (Adapter 4)");
+    assert_eq!(sup_mit.owner_mode(), armd::supervisor::OWNER_EXECUTOR);
+    tokio::task::spawn_blocking(move || exec_mit.stop_and_join())
+        .await
+        .expect("clean executor stop after MIT handoff");
 
     // 4. Qualification record checks remain enforced (missing/invalid record rejected).
     let mut inner = sup_mit.inner().write().await;

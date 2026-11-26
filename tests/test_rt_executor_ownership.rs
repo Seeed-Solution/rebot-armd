@@ -3963,7 +3963,7 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
     );
     assert_eq!(sup_blk.owner_mode(), OWNER_LEGACY, "rejected handoff must keep OWNER_LEGACY intact");
 
-    // (b1) MIT-configured profile rejected at handoff with `503 UNSUPPORTED_RT_CONFIG`, keeping OWNER_LEGACY.
+    // (b1) MIT-configured profile hands over cleanly to OWNER_EXECUTOR (Adapter 4) and stops cleanly.
     let mut mit_cfg = ArmConfig::rebot_dm();
     let mut jt = armd::tracking::JointTrackingConfig::rebot_dm();
     jt.enabled = true;
@@ -3975,15 +3975,14 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
     jt.joints[0].hold_kd = Some(0.5);
     mit_cfg.joint_tracking = Some(jt);
     let sup_mit = Arc::new(ArmSupervisor::new(mit_cfg));
-    let err_mit = sup_mit
+    let exec_mit = sup_mit
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
-        .await;
-    assert!(
-        matches!(err_mit, Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "UNSUPPORTED_RT_CONFIG"),
-        "expected 503 UNSUPPORTED_RT_CONFIG, got {:?}",
-        err_mit.as_ref().err()
-    );
-    assert_eq!(sup_mit.owner_mode(), OWNER_LEGACY);
+        .await
+        .expect("MIT-configured profile must hand over to executor (Adapter 4)");
+    assert_eq!(sup_mit.owner_mode(), OWNER_EXECUTOR);
+    tokio::task::spawn_blocking(move || exec_mit.stop_and_join())
+        .await
+        .expect("clean stop after MIT handoff");
 
     // (b2) Active gravity_comp session rejected at handoff with `409 TRANSFER_BLOCKED`, keeping OWNER_LEGACY
     // and leaving `gravity_comp` session state intact.

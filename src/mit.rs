@@ -3346,6 +3346,7 @@ impl crate::supervisor::SupervisorInner {
             operator: op_req,
             revoke_on_stop: true,
             revoke_on_epoch_change: true,
+            mode: crate::rt_core::session::SessionAuthorityMode::ClientControlled,
         };
         let session_id = self
             .sessions

@@ -1052,6 +1052,16 @@ pub trait CoreOps {
     fn attach_closed_bitset(&mut self, _bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {}
     /// Synchronizes the core's published [`BootId`] with the owning executor / fixture.
     fn set_boot_id(&mut self, _boot: BootId) {}
+    /// Advances any active PR0B/PR0C RT session (e.g. `ModeSwitch`) between Step 2 RX and Step 3
+    /// commit when driven by [`ReleaseFixture`] (production `RtExecutor` calls
+    /// `SupervisorInner::service_sessions_release` directly in its pre-commit closure).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn service_fixture_sessions_release(
+        &mut self,
+        _ctx: &CommitCtx,
+        _release_deadline: Instant,
+        _now_fn: &mut dyn FnMut() -> Instant,
+    ) {}
 }
 
 /// Diagnostic fields recorded on the RT thread when an authorized stop arrives during a
@@ -2121,6 +2131,17 @@ impl CoreOps for SupervisorInner {
     fn set_boot_id(&mut self, boot: BootId) {
         self.boot_id = boot;
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn service_fixture_sessions_release(
+        &mut self,
+        ctx: &CommitCtx,
+        release_deadline: Instant,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) {
+        if !self.internal_fault_lane.is_fenced() && self.mode_switch.is_running() {
+            self.service_mode_switch_release_with_clock(ctx, release_deadline, now_fn);
+        }
+    }
 }
 
 /// The supervisor's configuration revisions; holds live in the core.
@@ -2616,11 +2637,30 @@ impl ReleaseEngine {
     pub fn step_with_pre_commit<O: CoreOps>(
         &mut self,
         core: &mut O,
-        mut now_fn: impl FnMut() -> Instant,
+        now_fn: impl FnMut() -> Instant,
         dt: f64,
         release_deadline: Instant,
         publish_generation: u64,
         mut pre_commit: impl FnMut(&mut O, &CommitCtx) -> bool,
+    ) -> ReleaseReport {
+        self.step_with_pre_commit_with_now(
+            core,
+            now_fn,
+            dt,
+            release_deadline,
+            publish_generation,
+            |c, ctx, _now| pre_commit(c, ctx),
+        )
+    }
+
+    fn step_with_pre_commit_with_now<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        mut now_fn: impl FnMut() -> Instant,
+        dt: f64,
+        release_deadline: Instant,
+        publish_generation: u64,
+        mut pre_commit: impl FnMut(&mut O, &CommitCtx, &mut dyn FnMut() -> Instant) -> bool,
     ) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
@@ -2636,7 +2676,7 @@ impl ReleaseEngine {
         // 2b. Owner persistence and bounded maintenance run strictly after Step 2 feedback intake
         // and strictly before Step 3–6 commit, output, and publication.
         let pre_ctx = self.ctx(now_fn());
-        let stopping = pre_commit(core, &pre_ctx);
+        let stopping = pre_commit(core, &pre_ctx, &mut now_fn);
         if stopping {
             let ended_transition = finished_transition
                 .or_else(|| self.take_aborted_transition(core, &mut report));
@@ -3204,6 +3244,19 @@ impl<O: CoreOps> ReleaseFixture<O> {
         let owner_started = now_fn();
         let owner_deadline = owner_started + period;
         let next_gen = self.engine.releases() + 1;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut report = self.engine.step_with_pre_commit_with_now(
+            &mut self.core,
+            &mut now_fn,
+            self.dt,
+            owner_deadline,
+            next_gen,
+            |core, ctx, pre_now| {
+                core.service_fixture_sessions_release(ctx, owner_deadline, pre_now);
+                false
+            },
+        );
+        #[cfg(target_arch = "wasm32")]
         let mut report = self.engine.step(&mut self.core, &mut now_fn, self.dt, owner_deadline, next_gen);
         // Extra sub-release hardware services in Window 2 (bounded to MAX_SERVICE_WAKES = 1):
         // - Transition and watchdog-hold polls run only if sleep + poll + tail can complete before
