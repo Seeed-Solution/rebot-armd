@@ -2458,7 +2458,31 @@ const COMM_REG_QUIET_BOUND: Duration = Duration::from_millis(100);
 const COMM_MAX_FRAME_ATTEMPTS: u8 = 16;
 /// Maximum commissioning register TX attempts per control release.
 #[cfg(not(target_arch = "wasm32"))]
-const COMM_MAX_TX_PER_RELEASE: u8 = 4;
+pub(crate) const COMM_MAX_TX_PER_RELEASE: u8 = 4;
+
+/// Zero-allocation summary of one bounded commissioning step (used by the legacy post-tick
+/// scheduler to split commissioning across short `<= 2 ms` `SupervisorLock::write` guards
+/// inside the remaining release budget).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CommissioningStepProgress {
+    /// Commissioning operation remains `Running` after this step.
+    pub still_running: bool,
+    /// Register read/write (`0x33`/`0x55`) or set-zero TX frames attempted in this step.
+    pub reg_tx_attempted: u8,
+    /// Read-only `0xCC` rest-pose probe TX frames attempted in this step.
+    pub probe_tx_attempted: u8,
+    /// True when a register read or write is currently in flight awaiting a reply.
+    pub awaiting_reply: bool,
+    /// True when `GatherRestEvidence` still has unsent `0xCC` probes in the current release burst.
+    pub rest_probe_pending: bool,
+    /// True when the state machine has immediate non-waiting register work ready without sleeping.
+    pub more_immediate_work: bool,
+    /// True when CAN TX backpressure or driver TX budget refusal stopped this step.
+    pub backpressured: bool,
+    /// True when `DriverSlot::Legacy::try_lock` returned `WouldBlock`.
+    pub contended: bool,
+}
 /// Maximum stationary velocity tolerance (rad/s) for commissioning writes.
 #[cfg(not(target_arch = "wasm32"))]
 const COMM_STATIONARY_VEL_RAD_S: f32 = 0.05;
@@ -3403,8 +3427,44 @@ impl crate::supervisor::SupervisorInner {
         if self.commissioning.state != CommissioningOpState::Running {
             return;
         }
-        self.commissioning.release_step_count =
-            self.commissioning.release_step_count.wrapping_add(1).max(1);
+        let owner_now = owner_now_fn();
+        let total_span = release_deadline.saturating_duration_since(owner_now);
+        let publish_margin = self.tx_release_publish_margin().min(total_span / 2);
+        let owner_cutoff = release_deadline
+            .checked_sub(publish_margin)
+            .unwrap_or(owner_now);
+        let mut now_mut = || owner_now_fn();
+        let _ = self.service_commissioning_step_with_cutoff(
+            ctx,
+            owner_cutoff,
+            COMM_MAX_TX_PER_RELEASE,
+            None,
+            true,
+            &mut now_mut,
+        );
+    }
+
+    /// Advances the single preallocated commissioning state machine by one bounded non-blocking
+    /// step using an already-computed `owner_cutoff` (no second `publish_margin` subtraction)
+    /// and explicit per-step TX bounds (`max_tx` for register I/O, optional `probe_tx_cap` for
+    /// `GatherRestEvidence` `0xCC` bursts). Only increments `release_step_count` when
+    /// `is_new_release` is true so multi-guard legacy post-tick stepping shares one release index.
+    pub(crate) fn service_commissioning_step_with_cutoff(
+        &mut self,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        mut owner_cutoff: std::time::Instant,
+        max_tx: u8,
+        probe_tx_cap: Option<u8>,
+        is_new_release: bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
+    ) -> CommissioningStepProgress {
+        if self.commissioning.state != CommissioningOpState::Running {
+            return CommissioningStepProgress::default();
+        }
+        if is_new_release {
+            self.commissioning.release_step_count =
+                self.commissioning.release_step_count.wrapping_add(1).max(1);
+        }
         let Some(auth) = self.commissioning.authority else {
             self.commissioning.set_error(
                 CommissioningOpState::Failed,
@@ -3412,26 +3472,20 @@ impl crate::supervisor::SupervisorInner {
                 "INTERNAL",
                 "missing commissioning authority",
             );
-            return;
+            return CommissioningStepProgress::default();
         };
         let owner_now = owner_now_fn();
         let kind = self.commissioning.kind;
         if let Err((status, code, msg)) = self.commissioning_live_authority_ok(kind, &auth, owner_now) {
             self.abort_running_commissioning(status, code, msg);
-            return;
+            return CommissioningStepProgress::default();
         }
         if let Err((status, code, msg)) = self.commissioning_txn_deadline_ok(kind, owner_now) {
             self.abort_running_commissioning(status, code, msg);
-            return;
+            return CommissioningStepProgress::default();
         }
 
-        // Compute bounded release cutoff on driver clock, sharing Step 2's remaining RX budget,
-        // and clamp it to the commissioning transaction deadline.
-        let total_span = release_deadline.saturating_duration_since(owner_now);
-        let publish_margin = self.tx_release_publish_margin().min(total_span / 2);
-        let mut owner_cutoff = release_deadline
-            .checked_sub(publish_margin)
-            .unwrap_or(owner_now);
+        // Clamp caller-derived cutoff to the commissioning transaction deadline.
         if let Some(txn_dl) = self.commissioning.txn_deadline {
             owner_cutoff = owner_cutoff.min(txn_dl);
         }
@@ -3441,7 +3495,10 @@ impl crate::supervisor::SupervisorInner {
             {
                 self.abort_running_commissioning(status, code, msg);
             }
-            return;
+            return CommissioningStepProgress {
+                still_running: self.commissioning.state == CommissioningOpState::Running,
+                ..CommissioningStepProgress::default()
+            };
         }
         let remaining_rx = crate::rt_core::ops::RX_FRAME_BUDGET
             .saturating_sub(self.pending_rx_poll.rx_frames)
@@ -3455,14 +3512,14 @@ impl crate::supervisor::SupervisorInner {
         if self.driver.is_none() {
             if kind == CommissioningOpKind::MotorZeroDisable {
                 self.commissioning.state = CommissioningOpState::Done;
-                return;
+                return CommissioningStepProgress::default();
             }
             if kind == CommissioningOpKind::MotorZeroWriteVerify {
                 if let Err((status, code, msg)) =
                     self.commissioning_safety_check_with_driver(kind, &joints[..joint_len], None)
                 {
                     self.abort_running_commissioning(status, code, msg);
-                    return;
+                    return CommissioningStepProgress::default();
                 }
                 let now = owner_now_fn();
                 for k in 0..joint_len {
@@ -3470,12 +3527,15 @@ impl crate::supervisor::SupervisorInner {
                         self.commissioning_live_authority_ok(kind, &auth, owner_now_fn())
                     {
                         self.abort_running_commissioning(status, code, msg);
-                        return;
+                        return CommissioningStepProgress::default();
                     }
                     if k > 0 {
                         if let Some(next_at) = self.commissioning.next_zero_send_at {
                             if now < next_at {
-                                return;
+                                return CommissioningStepProgress {
+                                    still_running: true,
+                                    ..CommissioningStepProgress::default()
+                                };
                             }
                         }
                     }
@@ -3491,15 +3551,21 @@ impl crate::supervisor::SupervisorInner {
                     self.commissioning.outcomes[k].verified = true;
                     self.commissioning.joint_idx = k + 1;
                     self.commissioning.next_zero_send_at = Some(now + crate::motor_zero::COMMAND_SPACING);
-                    return;
+                    return CommissioningStepProgress {
+                        still_running: true,
+                        ..CommissioningStepProgress::default()
+                    };
                 }
                 if self.commissioning.joint_idx >= joint_len {
                     self.commissioning.state = CommissioningOpState::Done;
                 }
-                return;
+                return CommissioningStepProgress {
+                    still_running: self.commissioning.state == CommissioningOpState::Running,
+                    ..CommissioningStepProgress::default()
+                };
             }
             self.abort_running_commissioning(400, "UNSUPPORTED", "no motor driver");
-            return;
+            return CommissioningStepProgress::default();
         }
 
         // Temporarily take driver out so the live submission gate closure can borrow `&*self`
@@ -3523,6 +3589,9 @@ impl crate::supervisor::SupervisorInner {
             Contended,
             Unavailable,
         }
+        let mut reg_tx_attempted = 0u8;
+        let mut probe_tx_attempted = 0u8;
+        let mut backpressured = false;
         let mut taken = self.driver.take();
         let step_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[allow(clippy::result_large_err)] // RT zero-alloc path; BoundedText stays inline
@@ -3533,17 +3602,41 @@ impl crate::supervisor::SupervisorInner {
                 drv.set_tx_release_deadline(Some(drv_cutoff));
 
                 let res = match kind {
-                    CommissioningOpKind::ReadIdentity => {
-                        self.step_read_identity_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                    }
-                    CommissioningOpKind::WriteTimeout => {
-                        self.step_write_timeout_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
-                    }
+                    CommissioningOpKind::ReadIdentity => self.step_read_identity_with_drv(
+                        drv,
+                        &auth,
+                        drv_cutoff,
+                        remaining_rx,
+                        max_tx,
+                        &mut reg_tx_attempted,
+                        &mut backpressured,
+                        owner_now_fn,
+                    ),
+                    CommissioningOpKind::WriteTimeout => self.step_write_timeout_with_drv(
+                        drv,
+                        &auth,
+                        drv_cutoff,
+                        remaining_rx,
+                        max_tx,
+                        probe_tx_cap,
+                        &mut reg_tx_attempted,
+                        &mut probe_tx_attempted,
+                        &mut backpressured,
+                        owner_now_fn,
+                    ),
                     CommissioningOpKind::MotorZeroDisable => {
                         self.step_motor_zero_disable_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
                     }
                     CommissioningOpKind::MotorZeroWriteVerify => {
-                        self.step_motor_zero_write_verify_with_drv(drv, &auth, drv_cutoff, remaining_rx, owner_now_fn)
+                        self.step_motor_zero_write_verify_with_drv(
+                            drv,
+                            &auth,
+                            drv_cutoff,
+                            remaining_rx,
+                            &mut reg_tx_attempted,
+                            &mut backpressured,
+                            owner_now_fn,
+                        )
                     }
                 };
 
@@ -3575,14 +3668,45 @@ impl crate::supervisor::SupervisorInner {
             Err(payload) => std::panic::resume_unwind(payload),
         };
         let _ = ctx;
+        let mut contended = false;
         match step_result {
-            DriverCommStep::Ran(Ok(())) | DriverCommStep::Contended => {}
+            DriverCommStep::Ran(Ok(())) => {}
+            DriverCommStep::Contended => {
+                contended = true;
+            }
             DriverCommStep::Ran(Err((status, code, msg_buf))) => {
                 self.abort_running_commissioning_bounded(status, code, msg_buf);
             }
             DriverCommStep::Unavailable => {
                 self.abort_running_commissioning(500, "DRIVER", "driver unavailable");
             }
+        }
+        let still_running = self.commissioning.state == CommissioningOpState::Running;
+        let rest_probe_pending = still_running
+            && kind == CommissioningOpKind::WriteTimeout
+            && self.commissioning.write_phase == WriteTimeoutPhase::GatherRestEvidence
+            && self.commissioning.rest_probe_pending_mask != 0;
+        let awaiting_reply = still_running && self.commissioning.req_in_flight;
+        let quiet_active = self.commissioning.unmatched_reply_quiet_until.is_some();
+        let more_immediate_work = still_running
+            && !contended
+            && !backpressured
+            && !awaiting_reply
+            && !quiet_active
+            && (rest_probe_pending
+                || (kind == CommissioningOpKind::ReadIdentity
+                    && !matches!(self.commissioning.reg_phase, RegReadPhase::QuietWait))
+                || (kind == CommissioningOpKind::WriteTimeout
+                    && self.commissioning.write_phase != WriteTimeoutPhase::GatherRestEvidence));
+        CommissioningStepProgress {
+            still_running,
+            reg_tx_attempted,
+            probe_tx_attempted,
+            awaiting_reply,
+            rest_probe_pending,
+            more_immediate_work,
+            backpressured,
+            contended,
         }
     }
 
@@ -3694,7 +3818,9 @@ impl crate::supervisor::SupervisorInner {
         drv_cutoff: std::time::Instant,
         remaining_rx: &mut u16,
         tx_budget_left: &mut u8,
-        owner_now_fn: &dyn Fn() -> std::time::Instant,
+        reg_tx_attempted: &mut u8,
+        backpressured: &mut bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> Result<Option<CommissioningIdentity>, (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>)> {
         let Some(motor_id) = drv.commissioning_motor_id(joint) else {
             return Err((
@@ -3760,6 +3886,7 @@ impl crate::supervisor::SupervisorInner {
                         self.commissioning_pre_tx_gate_ok(op_kind, auth, owner_now_fn())
                     };
                     *tx_budget_left = tx_budget_left.saturating_sub(1);
+                    *reg_tx_attempted = reg_tx_attempted.saturating_add(1);
                     match drv.commissioning_try_send_register_read(joint, rid, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
                             tx_seq,
@@ -3783,6 +3910,7 @@ impl crate::supervisor::SupervisorInner {
                             ));
                         }
                         CommissioningTxStatus::Backpressure => {
+                            *backpressured = true;
                             self.commissioning.req_attempts = self.commissioning.req_attempts.saturating_add(1);
                             if self.commissioning.req_attempts >= COMM_MAX_FRAME_ATTEMPTS {
                                 return Err((
@@ -3903,9 +4031,12 @@ impl crate::supervisor::SupervisorInner {
         auth: &CommissioningAuthority,
         drv_cutoff: std::time::Instant,
         mut remaining_rx: u16,
-        owner_now_fn: &dyn Fn() -> std::time::Instant,
+        max_tx: u8,
+        reg_tx_attempted: &mut u8,
+        backpressured: &mut bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> Result<(), (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>)> {
-        let mut tx_budget = COMM_MAX_TX_PER_RELEASE;
+        let mut tx_budget = max_tx;
         while self.commissioning.joint_idx < self.commissioning.joint_len {
             let idx = self.commissioning.joint_idx;
             let joint = self.commissioning.joints[idx];
@@ -3921,6 +4052,8 @@ impl crate::supervisor::SupervisorInner {
                 drv_cutoff,
                 &mut remaining_rx,
                 &mut tx_budget,
+                reg_tx_attempted,
+                backpressured,
                 owner_now_fn,
             )? {
                 Some(ident) => {
@@ -3943,9 +4076,14 @@ impl crate::supervisor::SupervisorInner {
         auth: &CommissioningAuthority,
         drv_cutoff: std::time::Instant,
         mut remaining_rx: u16,
-        owner_now_fn: &dyn Fn() -> std::time::Instant,
+        max_tx: u8,
+        probe_tx_cap: Option<u8>,
+        reg_tx_attempted: &mut u8,
+        probe_tx_attempted: &mut u8,
+        backpressured: &mut bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> Result<(), (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>)> {
-        let mut tx_budget = COMM_MAX_TX_PER_RELEASE;
+        let mut tx_budget = max_tx;
         let counts = self.commissioning.timeout_counts;
         while self.commissioning.joint_idx < self.commissioning.joint_len {
             if let Err((status, code, msg)) = self.commissioning_txn_deadline_ok(
@@ -4113,9 +4251,13 @@ impl crate::supervisor::SupervisorInner {
                     }
                     let probe_dl = drv_cutoff.min(gather_dl);
                     let mut sent_any = false;
+                    let mut probes_sent = 0u8;
                     for i in 0..dof {
                         if (self.commissioning.rest_probe_pending_mask & (1u64 << i)) == 0 {
                             continue;
+                        }
+                        if probe_tx_cap.is_some_and(|cap| probes_sent >= cap) {
+                            break;
                         }
                         if drv.clock_now() >= probe_dl {
                             break;
@@ -4138,6 +4280,8 @@ impl crate::supervisor::SupervisorInner {
                                     self.commissioning.rest_probe_tx_seq[i] = tx_seq;
                                     self.commissioning.rest_probe_tx_at[i] = Some(tx_started);
                                 }
+                                probes_sent = probes_sent.saturating_add(1);
+                                *probe_tx_attempted = probe_tx_attempted.saturating_add(1);
                                 sent_any = true;
                             }
                             CommissioningTxStatus::SentFlushFailed { .. } => {
@@ -4150,6 +4294,7 @@ impl crate::supervisor::SupervisorInner {
                                 ));
                             }
                             CommissioningTxStatus::Backpressure => {
+                                *backpressured = true;
                                 break;
                             }
                             CommissioningTxStatus::Revoked(rc) => {
@@ -4200,6 +4345,8 @@ impl crate::supervisor::SupervisorInner {
                             drv_cutoff,
                             &mut remaining_rx,
                             &mut tx_budget,
+                            reg_tx_attempted,
+                            backpressured,
                             owner_now_fn,
                         )
                         .map_err(|(st, code, m)| {
@@ -4288,6 +4435,7 @@ impl crate::supervisor::SupervisorInner {
                         )
                     };
                     tx_budget = tx_budget.saturating_sub(1);
+                    *reg_tx_attempted = reg_tx_attempted.saturating_add(1);
                     match drv.commissioning_try_send_timeout_write(joint, counts, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
                             tx_seq,
@@ -4320,6 +4468,7 @@ impl crate::supervisor::SupervisorInner {
                             return Err((502, "MIT_TIMEOUT_FAILED", buf));
                         }
                         CommissioningTxStatus::Backpressure => {
+                            *backpressured = true;
                             // Transport did NOT accept: joint remains Unattempted, retry after re-drain
                             // and fresh live authority recheck.
                             self.commissioning.req_attempts = self.commissioning.req_attempts.saturating_add(1);
@@ -4452,6 +4601,8 @@ impl crate::supervisor::SupervisorInner {
                             drv_cutoff,
                             &mut remaining_rx,
                             &mut tx_budget,
+                            reg_tx_attempted,
+                            backpressured,
                             owner_now_fn,
                         )
                         .map_err(|(st, code, m)| {
@@ -4498,7 +4649,7 @@ impl crate::supervisor::SupervisorInner {
         auth: &CommissioningAuthority,
         drv_cutoff: std::time::Instant,
         mut remaining_rx: u16,
-        owner_now_fn: &dyn Fn() -> std::time::Instant,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> Result<(), (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>)> {
         let now = drv.clock_now();
         let first_attempt = self.commissioning.disable_started_at.is_none();
@@ -4619,7 +4770,9 @@ impl crate::supervisor::SupervisorInner {
         auth: &CommissioningAuthority,
         drv_cutoff: std::time::Instant,
         mut remaining_rx: u16,
-        owner_now_fn: &dyn Fn() -> std::time::Instant,
+        reg_tx_attempted: &mut u8,
+        backpressured: &mut bool,
+        owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> Result<(), (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>)> {
         let joint_len = self.commissioning.joint_len;
         match self.commissioning.mz_phase {
@@ -4652,6 +4805,7 @@ impl crate::supervisor::SupervisorInner {
                             owner_now_fn(),
                         )
                     };
+                    *reg_tx_attempted = reg_tx_attempted.saturating_add(1);
                     match drv.commissioning_try_send_set_zero(joint, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
                             tx_seq,
@@ -4696,6 +4850,7 @@ impl crate::supervisor::SupervisorInner {
                             return Err((500, "MOTOR_ZERO_FAILED", buf));
                         }
                         CommissioningTxStatus::Backpressure => {
+                            *backpressured = true;
                             self.commissioning.req_attempts = self.commissioning.req_attempts.saturating_add(1);
                             if self.commissioning.req_attempts >= COMM_MAX_FRAME_ATTEMPTS {
                                 let mut buf = crate::safety::BoundedText::empty();
@@ -4932,10 +5087,11 @@ pub(crate) async fn run_rt_commissioning_op(
     let op_guard = CommissioningOpGuard::new(std::sync::Arc::clone(sup), op_id);
 
     // Legacy headless fallback tracking (matches TQ-LOCK pattern):
-    // When a live 50 Hz legacy control loop is ticking, `tick_control_inner` drives
-    // `service_commissioning_release` with a <= 1 ms step budget and zero headless interference.
+    // When a live 50 Hz legacy control loop is ticking, `tick_shared` services commissioning
+    // strictly after the tick's own output & publish in short `<= 2 ms` write guards bounded by
+    // `release_deadline - publish_margin` with zero headless interference.
     // When no background ticker is running (e.g. headless tests), step every 5 ms after 25 ms
-    // of idle detection while keeping every SupervisorLock write hold <= 1 ms.
+    // of idle detection while keeping every SupervisorLock write hold <= 2 ms.
     const FALLBACK_IDLE_DETECT: std::time::Duration = std::time::Duration::from_millis(25);
     const FALLBACK_HEADLESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
     let legacy_tick_counter = if sup.owner_mode() == crate::supervisor::OWNER_LEGACY {
