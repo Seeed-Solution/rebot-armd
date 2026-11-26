@@ -187,7 +187,8 @@ async fn real_sweep_skips_are_refused_linear_and_reached_with_a_joint_path() {
 async fn lateral_move_at_pitch_15_is_refused_linear_and_reached_with_a_joint_path() {
     let home: [f32; 7] = std::array::from_fn(|i| profile().home_positions.get(i).copied().unwrap_or(0.0));
     let mut r = Rig::new(&home, true).await;
-    let (_, a) = r.move_to(body([0.12, 0.18, 0.30, 15.0], json!({"speed": {"linear": 0.15, "angular": 1.0}}))).await.unwrap();
+    // Move from folded home via path="joint" (straight line from home swings J2 to +0.051 rad, past B601-DM's +0.03 planning limit).
+    let (_, a) = r.move_to(body([0.12, 0.18, 0.30, 15.0], json!({"path": "joint", "speed_scale": 1.0}))).await.unwrap();
     assert_eq!(a.state, "done", "{a:?}");
     let rej = r.rpc("/api/v1/action/move_to", body([0.20, -0.12, 0.30, 15.0], json!({}))).await;
     assert!(rej["message"].as_str().unwrap().starts_with("IK branch flip at s=0.175:"), "{rej}");

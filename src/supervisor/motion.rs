@@ -1243,6 +1243,8 @@ impl SupervisorInner {
             max_position: 0.0,
             max_velocity: 0.0,
             max_acceleration: 0.0,
+            planning_min_position: None,
+            planning_max_position: None,
         });
         for (i, src) in self.config.limits.iter().enumerate() {
             let mut max_velocity = src.max_velocity;
@@ -1263,6 +1265,8 @@ impl SupervisorInner {
                 max_position: src.max_position,
                 max_velocity,
                 max_acceleration: src.max_acceleration,
+                planning_min_position: src.planning_min_position,
+                planning_max_position: src.planning_max_position,
             };
         }
         Some((out, dof))
@@ -1372,7 +1376,17 @@ impl SupervisorInner {
     /// limits, workspace revision, tool offset and power budget; else plans and checks here.
     /// Every other check runs here either way.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn start_quintic_prepared(&mut self, _proof: &crate::supervisor::AdmittedProof, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, tag: Option<String>, limits: &[crate::model::JointLimit], prepared: Option<PreparedQuintic>) -> Result<(u64, u64, f64), ArmError> {
+    pub(crate) fn start_quintic_prepared(&mut self, proof: &crate::supervisor::AdmittedProof, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, tag: Option<String>, limits: &[crate::model::JointLimit], prepared: Option<PreparedQuintic>) -> Result<(u64, u64, f64), ArmError> {
+        self.start_quintic_prepared_scoped(proof, target_positions, duration_secs, epoch_id, kind, tag, limits, prepared, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_quintic_prepared_scoped(&mut self, proof: &crate::supervisor::AdmittedProof, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, tag: Option<String>, limits: &[crate::model::JointLimit], prepared: Option<PreparedQuintic>, planning_scope: Option<crate::model::PlanningScope>) -> Result<(u64, u64, f64), ArmError> {
+        self.start_quintic_exact_scoped(proof, target_positions, duration_secs, epoch_id, kind, tag, limits, prepared, None, planning_scope)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_quintic_exact_scoped(&mut self, _proof: &crate::supervisor::AdmittedProof, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, tag: Option<String>, limits: &[crate::model::JointLimit], prepared: Option<PreparedQuintic>, exact_traj: Option<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>)>, planning_scope: Option<crate::model::PlanningScope>) -> Result<(u64, u64, f64), ArmError> {
         self.check_terminal_fifo_for_new_action()?;
         let mut target_positions = target_positions;
         self.config_motion_check()?;
@@ -1448,7 +1462,9 @@ impl SupervisorInner {
                 && p.power.as_ref() == self.power_budget()
                 && p.checked_workspace == self.workspace_policy().is_some()
         });
-        let (traj, power_scale) = if let Some(p) = reuse {
+        let (traj, power_scale) = if let Some(exact) = exact_traj {
+            exact
+        } else if let Some(p) = reuse {
             self.prepared_quintics_used += 1;
             (p.traj, p.power_scale)
         } else {
@@ -1472,10 +1488,16 @@ impl SupervisorInner {
             // 2.1 Power budget: slow the move to fit (or refuse with POWER_BUDGET); the workspace
             // check below runs on the trajectory that will be executed
             let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target_positions, limits, true)?;
+            if let Some(scope) = planning_scope {
+                crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, scope)?;
+            }
             let samples = self.workspace_samples(&traj)?;
             self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
             (traj, power_scale)
         };
+        if let Some(scope) = planning_scope {
+            crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, scope)?;
+        }
 
         // 3. Only renew lease AFTER command validation and planning succeed
         self.last_heartbeat = Instant::now();
@@ -1759,9 +1781,10 @@ impl SupervisorInner {
         this.check_plan_fresh(input)?;
         let target = this.joint_goal_target(q);
         let limits = this.joint_goal_limits(speed_scale);
+        let scope = Some(crate::model::PlanningScope::arm_only(&this.config));
         let (_, id, duration) = match same_side {
-            Some(request) => this.start_quintic_same_side(&proof, target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request)?,
-            None => this.start_quintic_prepared(&proof, target, None, Some(input.epoch), kind, tag, &limits, prepared)?,
+            Some(request) => this.start_quintic_same_side_scoped(&proof, target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request, scope)?,
+            None => this.start_quintic_prepared_scoped(&proof, target, None, Some(input.epoch), kind, tag, &limits, prepared, scope)?,
         };
         Ok((id, duration))
     }
@@ -1784,11 +1807,20 @@ impl SupervisorInner {
     pub fn joint_goal_feasible(&self, q: &[f64; 6]) -> bool {
         let target = self.joint_goal_target(q);
         let limits = self.planning_limits();
+        let scope = crate::model::PlanningScope::arm_only(&self.config);
         if target.iter().zip(&self.config.limits).any(|(t, l)| !t.is_finite() || *t < l.min_position || *t > l.max_position) {
+            return false;
+        }
+        if crate::motion::check_planning_limits_f32(&self.commanded_positions, &self.config.limits, scope, Some(0.0)).is_err()
+            || crate::motion::check_planning_limits_f32(&target, &self.config.limits, scope, None).is_err()
+        {
             return false;
         }
         let Ok(traj) = crate::trajectory::TrajectoryPlanner::plan(
             &self.commanded_positions, &vec![0.0; self.config.dof], &target, &vec![0.0; self.config.dof], None, &limits) else { return false; };
+        if crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, scope).is_err() {
+            return false;
+        }
         match self.workspace_samples(&traj) {
             Ok(samples) => self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice)).is_ok(),
             Err(_) => false,

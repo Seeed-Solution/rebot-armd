@@ -2315,11 +2315,17 @@ impl ConsumedStamps {
 
 impl SupervisorInner {
     pub fn new(config: ArmConfig) -> Self {
-        Self::new_inner(config, true)
+        Self::new_inner(config, true, true)
     }
 
-    fn new_inner(mut config: ArmConfig, allow_shadow: bool) -> Self {
-        config.validate().expect("Invalid ArmConfig: invariant violation");
+    fn new_inner(mut config: ArmConfig, allow_shadow: bool, strict_planning: bool) -> Self {
+        if strict_planning {
+            config.validate().expect("Invalid ArmConfig: invariant violation");
+        } else {
+            config
+                .validate_runtime_narrowed()
+                .expect("Invalid ArmConfig: invariant violation");
+        }
         let dof = config.dof;
         let collision_policy = config.collision.unwrap_or_default();
         // power planning: build the dynamics chain now (the built-in model parses the embedded
@@ -2824,7 +2830,7 @@ impl SupervisorInner {
         atomic_fenced_lease_gen: Arc<AtomicU64>,
         pending_disconnect_hold: Arc<AtomicU64>,
     ) -> Self {
-        let mut shell = Self::new_inner(config.clone(), false);
+        let mut shell = Self::new_inner(config.clone(), false, false);
         shell.e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
         shell.requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
         shell.estop_state = estop_state;
@@ -3125,6 +3131,8 @@ impl SupervisorInner {
                     max_position: lim.max_position,
                     max_velocity: lim.max_velocity,
                     max_acceleration: lim.max_acceleration,
+                    planning_min_position: lim.planning_min_position,
+                    planning_max_position: lim.planning_max_position,
                 };
                 let req = crate::motion::GripperRequest {
                     command: crate::motion::GripperCommand::Open,

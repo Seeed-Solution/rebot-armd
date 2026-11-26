@@ -750,7 +750,7 @@ async fn b2_pr_p_gripper_refusals_missing_torque_feedback_and_zero_quantized_spe
     clock.run_steps(period_ns, 2);
     let reps = drain(&handle);
     assert!(
-        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "UNSUPPORTED" } if *request == r_a)),
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "UNSUPPORTED", .. } if *request == r_a)),
         "expected UNSUPPORTED for missing torque feedback, got {reps:?}"
     );
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
@@ -844,7 +844,7 @@ async fn b2_pr_p_gripper_refusals_missing_torque_feedback_and_zero_quantized_spe
     clock2.run_steps(period_ns, 2);
     let reps2 = drain(&handle2);
     assert!(
-        reps2.iter().any(|r| matches!(r, Reply::Refused { request, code: "INVALID_COMMAND" } if *request == r_b)),
+        reps2.iter().any(|r| matches!(r, Reply::Refused { request, code: "INVALID_COMMAND", .. } if *request == r_b)),
         "expected INVALID_COMMAND for 0-quantized pos_force close speed, got {reps2:?}"
     );
     assert_eq!(handle2.stats().total_allocs(), AllocCounts::ZERO);
@@ -911,6 +911,7 @@ fn b2_r2_m4_mit_motion_blocker_is_zero_alloc() {
         power_scale: None,
         settle: true,
         approach_then: None,
+        checked_joints: None,
     }));
 
     let (mut fx, mut b, _tw, _stop) = armd::rt_core::ops::ReleaseFixture::new(
@@ -1109,7 +1110,7 @@ async fn b2_r2_m4_prepared_replay_approach_planned_off_thread_is_zero_alloc_on_r
     clock.run_steps(period_ns, 2);
     let reps = drain(&handle);
     assert!(
-        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_drift)),
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE", .. } if *request == r_drift)),
         "expected PLAN_STALE for drifted replay start, got {reps:?}"
     );
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
@@ -1145,7 +1146,7 @@ async fn b2_r2_m4_prepared_replay_approach_planned_off_thread_is_zero_alloc_on_r
     clock.run_steps(period_ns, 2);
     let reps = drain(&handle);
     assert!(
-        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "INVALID_COMMAND" } if *request == r_bad)),
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "INVALID_COMMAND", .. } if *request == r_bad)),
         "expected INVALID_COMMAND for 0 approach duration, got {reps:?}"
     );
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
@@ -1853,7 +1854,7 @@ async fn phase_b_adaptive_macro_fenced_and_j7_locked_is_zero_alloc_on_rt() {
     clock.run_steps(period_ns, 2);
     let reps = drain(&handle);
     assert!(
-        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_stale)),
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE", .. } if *request == r_stale)),
         "stale FinishMacro(Done) must refuse PLAN_STALE: {reps:?}"
     );
     assert!(sup.hub().latest().unwrap().rt.owner.held.is_none(), "refused FinishMacro must NOT set held");

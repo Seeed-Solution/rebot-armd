@@ -1232,7 +1232,7 @@ async fn pf1_races_concurrent_pump_order_mapping_reentry_and_malformed_recovery(
         assert_eq!(b.outstanding(), 0);
         assert!(matches!(
             got.as_slice(),
-            [Reply::Refused { request, code: "PROTOCOL_ERROR" }] if *request == r1
+            [Reply::Refused { request, code: "PROTOCOL_ERROR", .. }] if *request == r1
         ));
 
         // Inject a malformed Ack { action: None } for a starts_action() command -> recovers both credits!

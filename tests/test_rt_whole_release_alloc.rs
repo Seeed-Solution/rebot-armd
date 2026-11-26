@@ -899,9 +899,9 @@ async fn stalled_consumers_normal_refused_commits_urgent_stop_terminal_retiremen
 
     // Poll broker off-thread and verify exact replies + plan-slot reclamation!
     let replies = drain_broker(&handle);
-    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "DEADLINE_EXPIRED" } if *request == r_exp)), "{replies:?}");
-    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "EPOCH_MISMATCH" } if *request == r_ep)), "{replies:?}");
-    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_stale)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "DEADLINE_EXPIRED", .. } if *request == r_exp)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "EPOCH_MISMATCH", .. } if *request == r_ep)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE", .. } if *request == r_stale)), "{replies:?}");
     // Verify post-publish supersession ordering: Terminal(r_cart, Superseded) precedes Ack(r_jog),
     // followed by Terminal(r_jog, Stopped)!
     let idx_sup = replies.iter().position(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Superseded, .. } if *request == r_cart))

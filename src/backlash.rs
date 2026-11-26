@@ -148,15 +148,34 @@ pub enum Resolved {
 }
 
 /// Pre-target of `target` (armd joint angles): `q_pre[j] = target[j] - delta * s[j]` for the
-/// listed joints, `s[j] = +1`, or -1 when `target[j] - delta` is below the joint's lower soft
-/// limit. Returns (q_pre, s per joint (0 = not listed)). Err when the joint range is narrower
-/// than delta on both sides.
+/// listed joints, `s[j] = +1`, or -1 when `target[j] - delta` is below the joint's lower limit.
+/// Uses hard bounds for explicit joint-space callers (`scope = None`).
 pub fn pre_target(target: &[f32], joints: &[usize], delta: f32, limits: &[JointLimit]) -> Result<(Vec<f32>, Vec<i8>), String> {
+    pre_target_scoped(target, joints, delta, limits, None)
+}
+
+/// Scope-aware [`pre_target`]: joints in `scope` use `effective_planning_range()`; joints outside
+/// `scope` (or when `scope` is `None`, e.g., explicit saved poses) use hard bounds.
+pub fn pre_target_scoped(
+    target: &[f32],
+    joints: &[usize],
+    delta: f32,
+    limits: &[JointLimit],
+    scope: Option<crate::model::PlanningScope>,
+) -> Result<(Vec<f32>, Vec<i8>), String> {
     let mut pre = target.to_vec();
     let mut signs = vec![0i8; target.len()];
     for &j in joints {
         let (Some(l), Some(&t)) = (limits.get(j), target.get(j)) else { continue };
-        let s: i8 = if t - delta >= l.min_position { 1 } else if t + delta <= l.max_position { -1 } else {
+        let (pmin, pmax) = if scope.is_some_and(|sc| sc.contains(j)) {
+            let Some(r) = l.effective_planning_range() else {
+                return Err(format!("joint {} has no room for the pre-target", l.name));
+            };
+            r
+        } else {
+            (l.min_position, l.max_position)
+        };
+        let s: i8 = if t - delta >= pmin { 1 } else if t + delta <= pmax { -1 } else {
             return Err(format!("joint {} has no room for the pre-target", l.name));
         };
         pre[j] = t - delta * f32::from(s);
@@ -181,7 +200,10 @@ pub fn keep_from_above(target: &[f32], pre: &mut [f32], signs: &mut [i8], delta:
             let s = -signs[j];
             let qj = target[j] - delta * f32::from(s);
             let l = &limits[j];
-            if qj < l.min_position || qj > l.max_position {
+            let Some((pmin, pmax)) = l.effective_planning_range() else {
+                return Err(format!("from_below: {} cannot approach from above within its limits", l.name));
+            };
+            if qj < pmin || qj > pmax {
                 return Err(format!("from_below: {} cannot approach from above within its limits", l.name));
             }
             q[j] = qj;
@@ -410,7 +432,8 @@ fn plan_cartesian_pre_inner(input: &crate::motion::PlanInput, direct: &crate::mo
     rules: Option<&DescentRules>, speed: crate::motion::Speed, opts: crate::motion::PathOpts) -> Result<CartesianPre, String> {
     let target = direct.last_slice().to_vec();
     let delta = plan.policy.delta_rad();
-    let (mut pre, mut signs) = pre_target(&target, &plan.joints, delta, &input.limits)?;
+    let arm_scope = Some(crate::model::PlanningScope::first_n(input.arm.arm_dof()));
+    let (mut pre, mut signs) = pre_target_scoped(&target, &plan.joints, delta, &input.limits, arm_scope)?;
     let mut flipped = Vec::new();
     if let Some(points) = rules.map(|r| r.from_above.as_slice()).filter(|p| !p.is_empty()) {
         let lowest = |q: &[f32]| lowest_z(&input.arm, points, q);
@@ -472,11 +495,17 @@ mod runtime {
         /// power hold in force, soft limits, power budget, workspace and keep-out sweep.
         /// Under `commissioning_required`, also enforces TCP linear speed <= `0.2 * MAX_LINEAR_MPS`.
         /// Returns it (power-fitted) and its power scale; Err(reason).
-        fn approach_segment(&self, start: &[f32], target: &[f32], seg_limits: &[JointLimit]) -> Result<(MultiJointQuinticTrajectory, Option<f64>), String> {
+        fn approach_segment(&self, start: &[f32], target: &[f32], seg_limits: &[JointLimit], planning_scope: Option<crate::model::PlanningScope>) -> Result<(MultiJointQuinticTrajectory, Option<f64>), String> {
             if self.torque_guard.hold.is_some() || self.power.gov.hold.is_some() { return Err("segment: a torque or power hold is in force".into()); }
             let epoch = Some(self.safety.epoch_id());
             self.safety.validate_motion_command(epoch, start, &self.config.limits).map_err(|e| format!("pre_target: {}", code(e.into())))?;
             self.safety.validate_motion_command(epoch, target, &self.config.limits).map_err(|e| format!("segment: {}", code(e.into())))?;
+            if let Some(scope) = planning_scope {
+                crate::motion::check_planning_limits_f32(start, &self.config.limits, scope, Some(0.0))
+                    .map_err(|e| format!("pre_target: {}", e.code()))?;
+                crate::motion::check_planning_limits_f32(target, &self.config.limits, scope, Some(1.0))
+                    .map_err(|e| format!("segment: {}", e.code()))?;
+            }
             let zeros = vec![0.0; start.len()];
             let mut traj = TrajectoryPlanner::plan(start, &zeros, target, &zeros, Some(MIN_SEGMENT_S), seg_limits)
                 .map_err(|e| format!("segment: {e}"))?;
@@ -490,6 +519,10 @@ mod runtime {
                 }
             }
             let (traj, scale) = self.power_fit_quintic(traj, start, &zeros, target, seg_limits, true).map_err(|e| format!("segment: {}", code(e)))?;
+            if let Some(scope) = planning_scope {
+                crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, scope)
+                    .map_err(|e| format!("segment: {}", e.code()))?;
+            }
             let samples = self.workspace_samples(&traj).map_err(|e| format!("segment: {}", code(e.into())))?;
             self.check_workspace_path(start, samples.iter().map(Vec::as_slice)).map_err(|e| format!("segment: {}", code(e.into())))?;
             Ok((traj, scale))
@@ -539,30 +572,30 @@ mod runtime {
         /// (reason in the action record) when the pre-target or the segment fails a check.
         /// Returns (epoch, action id, planned duration of both legs).
         #[allow(clippy::too_many_arguments)]
-        pub(crate) fn start_quintic_same_side(&mut self, proof: &crate::supervisor::AdmittedProof, target: Vec<f32>, epoch_id: Option<u64>, kind: &str, tag: Option<String>,
-            limits: &[JointLimit], use_: &str, request: Request) -> Result<(u64, u64, f64), ArmError> {
+        pub(crate) fn start_quintic_same_side_scoped(&mut self, proof: &crate::supervisor::AdmittedProof, target: Vec<f32>, epoch_id: Option<u64>, kind: &str, tag: Option<String>,
+            limits: &[JointLimit], use_: &str, request: Request, planning_scope: Option<crate::model::PlanningScope>) -> Result<(u64, u64, f64), ArmError> {
             let plan = match self.approach_plan(use_, request) {
                 Ok(p) => p,
-                Err(None) => return self.start_quintic(proof, target, None, epoch_id, kind, tag, limits),
-                Err(Some(r)) => return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, r.to_string()),
+                Err(None) => return self.start_quintic_prepared_scoped(proof, target, None, epoch_id, kind, tag, limits, None, planning_scope),
+                Err(Some(r)) => return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, r.to_string(), planning_scope),
             };
             let delta = plan.policy.delta_rad();
-            let (pre, signs) = match pre_target(&target, &plan.joints, delta, &self.config.limits) {
+            let (pre, signs) = match pre_target_scoped(&target, &plan.joints, delta, &self.config.limits, planning_scope) {
                 Ok(x) => x,
-                Err(r) => return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, format!("pre_target: {r}")),
+                Err(r) => return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, format!("pre_target: {r}"), planning_scope),
             };
             let mut seg_limits = plan.seg_limits.clone();
             for (seg, lim) in seg_limits.iter_mut().zip(limits) {
                 seg.max_velocity = seg.max_velocity.min(lim.max_velocity);
             }
-            let (seg, seg_scale) = match self.approach_segment(&pre, &target, &seg_limits) {
+            let (seg, seg_scale) = match self.approach_segment(&pre, &target, &seg_limits, planning_scope) {
                 Ok(x) => x,
-                Err(r) => return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, r),
+                Err(r) => return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, r, planning_scope),
             };
-            let (epoch, id, d1) = match self.start_quintic(proof, pre, None, epoch_id, kind, tag.clone(), limits) {
+            let (epoch, id, d1) = match self.start_quintic_prepared_scoped(proof, pre, None, epoch_id, kind, tag.clone(), limits, None, planning_scope) {
                 Ok(x) => x,
                 Err(e) => {
-                    return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, format!("pre_target: {}", code(e)));
+                    return self.start_quintic_direct_inner(proof, target, epoch_id, kind, tag, limits, format!("pre_target: {}", code(e)), planning_scope);
                 }
             };
             let d2 = seg.duration;
@@ -580,8 +613,8 @@ mod runtime {
 
         #[allow(clippy::too_many_arguments)]
         fn start_quintic_direct_inner(&mut self, proof: &crate::supervisor::AdmittedProof, target: Vec<f32>, epoch_id: Option<u64>, kind: &str, tag: Option<String>,
-            limits: &[JointLimit], reason: String) -> Result<(u64, u64, f64), ArmError> {
-            let started = self.start_quintic(proof, target, None, epoch_id, kind, tag, limits)?;
+            limits: &[JointLimit], reason: String, planning_scope: Option<crate::model::PlanningScope>) -> Result<(u64, u64, f64), ArmError> {
+            let started = self.start_quintic_prepared_scoped(proof, target, None, epoch_id, kind, tag, limits, None, planning_scope)?;
             self.record_approach(started.1, &Outcome::direct(reason));
             Ok(started)
         }
@@ -627,7 +660,8 @@ mod runtime {
                     return self.install_path_inner(proof, input, direct, kind, tag);
                 }
             };
-            let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits) {
+            let arm_scope = Some(crate::model::PlanningScope::arm_only(&self.config));
+            let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits, arm_scope) {
                 Ok(x) => x,
                 Err(r) => return self.install_path_same_side_with_rules_inner(proof, input, direct, Pre::Direct(r), None, rules, kind, tag),
             };
@@ -700,7 +734,8 @@ mod runtime {
                     return self.install_macro_path_inner(proof, id, input, direct);
                 }
             };
-            let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits) {
+            let arm_scope = Some(crate::model::PlanningScope::arm_only(&self.config));
+            let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits, arm_scope) {
                 Ok(x) => x,
                 Err(r) => return self.install_macro_path_same_side_with_rules_inner(proof, id, input, direct, Pre::Direct(r), None, rules),
             };

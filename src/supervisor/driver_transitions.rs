@@ -1283,13 +1283,13 @@ impl SupervisorInner {
             }
         }
 
-        if candidate.validate().is_err()
+        if candidate.validate_runtime_narrowed().is_err()
             && self.base_gripper_policy.is_some()
             && (self.gripper_calib_offset.is_some() || self.gripper_calib_jaw_opening.is_some())
         {
             let mut base_test = candidate.clone();
             base_test.gripper_policy = self.base_gripper_policy.clone();
-            if base_test.validate().is_ok() {
+            if base_test.validate_runtime_narrowed().is_ok() {
                 tracing::warn!("Driver limits invalidated outdated calibrated gripper policy; reverting to base uncalibrated policy");
                 self.gripper_calib_invalid = true;
                 self.gripper_calib_offset = None;
@@ -1299,7 +1299,7 @@ impl SupervisorInner {
             }
         }
 
-        if let Err(err) = candidate.validate() {
+        if let Err(err) = candidate.validate_runtime_narrowed() {
             let reason = format!("Driver limits violated config invariants: {err}");
             self.driver_config_error = Some(reason.clone());
             if trigger_fault {
@@ -8991,7 +8991,7 @@ impl SupervisorInner {
             }
         }
         drop(drv);
-        if let Err(err) = candidate.validate() {
+        if let Err(err) = candidate.validate_runtime_narrowed() {
             return Err(BoundedText::new(&format!("Driver limits violated config invariants: {err}")));
         }
         Ok(None)

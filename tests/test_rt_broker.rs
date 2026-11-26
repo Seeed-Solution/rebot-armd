@@ -153,7 +153,7 @@ fn an_authorized_stop_invalidates_queued_and_active_work_regardless_of_capacity(
     assert_eq!(fx.step().command.map(|c| c.1), Some(Err("STOPPED")));
     got.extend(replies(&mut b));
     assert_eq!(got[0], Reply::Ack { request: r1, commit_seq: 1, action: Some(action) });
-    assert!(got.contains(&Reply::Refused { request: r2, code: "STOPPED" }));
+    assert!(got.contains(&Reply::Refused { request: r2, code: "STOPPED", detail: None }));
     assert!(got.contains(&Reply::Terminal { request: r1, action, outcome: Outcome::Stopped, children: 0 }));
     assert_eq!((b.reserved(), b.outstanding(), b.stats().retired), (0, 0, 2));
 }
@@ -251,7 +251,7 @@ fn a_stub_core_never_acknowledges_success() {
     let r2 = b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
     tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, vision_frame_id: None, deadline: later(), dof: 1, q: [0.0; MAX_DOF], replaceable: true });
     for _ in 0..3 { fx.step(); }
-    assert_eq!(replies(&mut b), vec![Reply::Refused { request: r1, code: "NOT_WIRED" }, Reply::Refused { request: r2, code: "NOT_WIRED" }]);
+    assert_eq!(replies(&mut b), vec![Reply::Refused { request: r1, code: "NOT_WIRED", detail: None }, Reply::Refused { request: r2, code: "NOT_WIRED", detail: None }]);
     assert_eq!((fx.core.commits_seen, fx.core.targets_seen, fx.core.releases), (2, 1, 3));
     assert_eq!(b.stats().acked, 0);
 }
@@ -675,7 +675,7 @@ fn a_lease_expiring_before_the_commit_leaves_the_watchdog_park_as_the_active_tra
     assert_eq!((fx.core.target_positions.clone(), fx.active()), (vec![0.0, 0.0], None), "the park, not the install");
     let got = replies(&mut b);
     assert!(matches!(got[0], Reply::Ack { request, .. } if request == r1), "{got:?}");
-    assert_eq!(got.last(), Some(&Reply::Refused { request: r2, code: "LEASE_LOST" }));
+    assert_eq!(got.last(), Some(&Reply::Refused { request: r2, code: "LEASE_LOST", detail: None }));
     assert_eq!((b.reserved(), b.outstanding(), b.stats().retired), (0, 0, 2));
 }
 
@@ -748,10 +748,10 @@ fn saturated_ingress_then_stop_refuses_every_older_command_and_a_fresh_install_c
     let got = replies(&mut b);
     assert_eq!(got[0], Reply::Ack { request: r1, commit_seq: 1, action: Some(action) });
     assert_eq!(&got[1..], &[
-        Reply::Refused { request: r2, code: "STOPPED" },
+        Reply::Refused { request: r2, code: "STOPPED", detail: None },
         Reply::Terminal { request: r1, action, outcome: Outcome::Stopped, children: 0 },
-        Reply::Refused { request: r3, code: "STOPPED" },
-        Reply::Refused { request: r4, code: "STOPPED" },
+        Reply::Refused { request: r3, code: "STOPPED", detail: None },
+        Reply::Refused { request: r4, code: "STOPPED", detail: None },
         Reply::Ack { request: r6, commit_seq: 2, action: fx.active() },
     ]);
     assert_eq!((b.stats().retired, b.reserved()), (3, 1), "r6's terminal stays reserved");
@@ -779,7 +779,7 @@ fn a_motion_between_prepare_and_install_refuses_the_install_and_keeps_the_runnin
     let r3 = submit_install(&mut b, 3, auth(&fx), later(), quintic(&fx, -0.05, 1.0)).unwrap();
     assert!(matches!(fx.step().command, Some((r, Ok(2))) if r == r3));
     let got = replies(&mut b);
-    assert!(got.contains(&Reply::Refused { request: r2, code: "PLAN_STALE" }));
+    assert!(got.contains(&Reply::Refused { request: r2, code: "PLAN_STALE", detail: None }));
     assert!(got.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Superseded, .. } if *request == r1)), "{got:?}");
 }
 

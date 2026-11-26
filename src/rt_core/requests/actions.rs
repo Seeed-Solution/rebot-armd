@@ -33,8 +33,8 @@ use crate::rt_core::config_iface::{ConfigAuthority, ConfigDomain};
 use crate::rt_core::ids::ArmId;
 use crate::rt_core::mailbox::MAX_DOF;
 use crate::rt_core::ops::{
-    static_code, tool_digest_hash, CommitCtx, Committed, EpisodeRef, PathKind, PlanSlot,
-    Primitive, START_TOLERANCE,
+    static_code, tool_digest_hash, CommitCtx, CommitRefusal, Committed, EpisodeRef, PathKind,
+    PlanSlot, Primitive, START_TOLERANCE,
 };
 use crate::rt_core::publish::{PublishedOwnerMeta, Snapshot};
 use crate::safety::{BoundedText, SafetyError, SafetyState};
@@ -296,6 +296,10 @@ pub enum StagedAction {
         power_scale: Option<f64>,
         settle: bool,
         approach_then: Option<StagedQuinticLeg>,
+        /// Optional explicit planning-limit joint mask (`PlanningScope::mask`); `None` disables
+        /// planning-only limit enforcement (explicit joint-space commands such as `move_to_pose`
+        /// and `sequences`, which keep hard limits).
+        checked_joints: Option<u16>,
     },
     /// Prepared standalone or macro-child gripper motion.
     Gripper {
@@ -789,6 +793,11 @@ impl ActionRefusal {
                 code: "TOOL_MISMATCH".into(),
                 message: "Active tool changed since preparation".into(),
             },
+            "IK_UNREACHABLE" => ArmError::Rejected {
+                status: 422,
+                code: "IK_UNREACHABLE".into(),
+                message: "Trajectory exceeds joint planning limits at commit".into(),
+            },
             other => ArmError::Rejected {
                 status: 409,
                 code: other.into(),
@@ -796,6 +805,59 @@ impl ActionRefusal {
             },
         }
     }
+
+    /// Translate an RT refusal code and optional per-request planning-limit diagnostic carried
+    /// directly in [`Reply::Refused`] into an [`ArmError`]. Falls back to indexed joint naming
+    /// (`joint_1`, ...) when `limits` is unavailable so the joint and bounds are never lost.
+    pub fn into_arm_error_with_detail(
+        self,
+        expected_epoch: u64,
+        detail: Option<motion::PlanningLimitViolationRt>,
+        limits: Option<&[JointLimit]>,
+    ) -> ArmError {
+        if self.code == "IK_UNREACHABLE" {
+            if let Some(v) = detail {
+                return ArmError::Motion(v.into_motion_error(limits.unwrap_or(&[]), None));
+            }
+        }
+        self.into_arm_error_with_epoch(expected_epoch)
+    }
+}
+
+pub(crate) fn check_cartesian_path_planning_rt(
+    inner: &SupervisorInner,
+    dof: usize,
+    live_q: &[f32],
+    samples: &[[f32; MAX_DOF]],
+) -> Result<(), CommitRefusal> {
+    let scope = crate::model::PlanningScope::arm_only(&inner.config);
+    motion::check_start_planning_limits_rt(&live_q[..dof], &inner.config.limits, scope)?;
+    if let Some((first, rest)) = samples.split_first() {
+        motion::check_start_planning_limits_rt(&first[..dof], &inner.config.limits, scope)?;
+        for q in rest {
+            motion::check_planning_limits_rt(&q[..dof], &inner.config.limits, scope)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_cartesian_path_planning_legacy(
+    inner: &SupervisorInner,
+    live_q: &[f32],
+    path: &JointPath,
+) -> Result<(), ArmError> {
+    let scope = crate::model::PlanningScope::arm_only(&inner.config);
+    motion::check_start_planning_limits_f32(live_q, &inner.config.limits, scope, Some(0.0))?;
+    let n = path.q.len();
+    for (idx, q) in path.q.iter().enumerate() {
+        let s = path.s.get(idx).copied().unwrap_or(if n <= 1 { 0.0 } else { idx as f64 / (n - 1) as f64 });
+        if idx == 0 {
+            motion::check_start_planning_limits_f32(&q[..path.dof], &inner.config.limits, scope, Some(s))?;
+        } else {
+            motion::check_planning_limits_f32(&q[..path.dof], &inner.config.limits, scope, Some(s))?;
+        }
+    }
+    Ok(())
 }
 
 /// **Single entry point for authority checks** (boot, arm, deadline, stop generation, epoch,
@@ -1633,6 +1695,7 @@ fn validate_approach_segment_off_lock(
     target: &[f32],
     seg_limits: &[JointLimit],
     hard_limits: &[JointLimit],
+    planning_scope: Option<crate::model::PlanningScope>,
     ws: Option<&WorkspacePolicy>,
     cam: &crate::model::CameraMount,
     arm: &crate::chain::ArmModel,
@@ -1651,6 +1714,12 @@ fn validate_approach_segment_off_lock(
                 return Err(format!("{label}: OUT_OF_LIMITS"));
             }
         }
+    }
+    if let Some(scope) = planning_scope {
+        motion::check_planning_limits_f32(start, hard_limits, scope, Some(0.0))
+            .map_err(|e| format!("pre_target: {}", e.code()))?;
+        motion::check_planning_limits_f32(target, hard_limits, scope, Some(1.0))
+            .map_err(|e| format!("segment: {}", e.code()))?;
     }
     let zeros = vec![0.0f32; dof];
     let mut traj = TrajectoryPlanner::plan(
@@ -1681,6 +1750,10 @@ fn validate_approach_segment_off_lock(
         arm,
     )
     .map_err(|e| format!("segment: {}", arm_err_code_str(e)))?;
+    if let Some(scope) = planning_scope {
+        motion::check_quintic_planning_limits(&traj, hard_limits, scope)
+            .map_err(|e| format!("segment: {}", e.code()))?;
+    }
     let seg_samples = if let Some(ws) = ws {
         workspace_samples_and_check_off_lock(&traj, start, ws, cam, arm, tcp_offset)
             .map_err(|e| format!("segment: {}", arm_err_code_str(e)))?
@@ -1753,6 +1826,7 @@ pub fn resolve_cartesian_legs_with_rules(
         &cp.target,
         &plan.seg_limits,
         hard_limits,
+        Some(crate::model::PlanningScope::first_n(input.arm.arm_dof())),
         input.ws.as_ref(),
         &input.cam,
         &input.arm,
@@ -1856,6 +1930,7 @@ pub struct PreparedJointAction {
     pub tag: Option<String>,
     pub expected_duration_s: f64,
     pub settle: bool,
+    pub checked_joints: Option<crate::model::PlanningScope>,
 }
 
 impl PreparedJointAction {
@@ -1892,6 +1967,7 @@ impl PreparedJointAction {
             power_scale,
             settle: self.settle,
             approach_then,
+            checked_joints: self.checked_joints.map(|s| s.mask),
         }));
         Ok(slot)
     }
@@ -2272,7 +2348,7 @@ pub fn prepare_saved_pose(
     }
     let limits = snap.env.planning_limits(Some(speed_scale));
     let (prepared_quintic, approach_leg, approach_outcome, expected_duration_s) =
-        prepare_joint_motion_off_lock(snap, &target, &limits, "move_to_pose", approach)?;
+        prepare_joint_motion_off_lock(snap, &target, &limits, "move_to_pose", approach, None)?;
     let mut stamp = snap.stamp;
     stamp.parent_generation = 0;
     stamp.sequences_revision = None;
@@ -2292,6 +2368,7 @@ pub fn prepare_saved_pose(
         tag,
         expected_duration_s,
         settle: true,
+        checked_joints: None,
     })
 }
 
@@ -2399,10 +2476,16 @@ fn joint_goal_feasible_off_lock(snap: &ActionSnapshot, q: &[f64; 6]) -> bool {
         snap.env.config.gripper_index(),
     );
     let limits = snap.env.planning_limits(None);
+    let scope = crate::model::PlanningScope::arm_only(&snap.env.config);
     if target
         .iter()
         .zip(&snap.env.config.limits)
         .any(|(t, l)| !t.is_finite() || *t < l.min_position || *t > l.max_position)
+    {
+        return false;
+    }
+    if motion::check_planning_limits_f32(&snap.commanded_positions, &snap.env.config.limits, scope, Some(0.0)).is_err()
+        || motion::check_planning_limits_f32(&target, &snap.env.config.limits, scope, None).is_err()
     {
         return false;
     }
@@ -2417,6 +2500,9 @@ fn joint_goal_feasible_off_lock(snap: &ActionSnapshot, q: &[f64; 6]) -> bool {
     ) else {
         return false;
     };
+    if motion::check_quintic_planning_limits(&traj, &snap.env.config.limits, scope).is_err() {
+        return false;
+    }
     if let Some(ws) = snap.env.workspace_policy.as_ref() {
         check_quintic_workspace_off_lock(
             &traj,
@@ -2595,8 +2681,9 @@ fn prepare_move_common(
                 backlash::Request::Profile
             };
             let approach_use = if same_side { "move_to_precise" } else { "" };
+            let scope = Some(crate::model::PlanningScope::arm_only(&snap.env.config));
             let (prepared_quintic, approach_leg, approach_outcome, expected_duration_s) =
-                prepare_joint_motion_off_lock(snap, &target, &jsnap.limits, approach_use, approach_req)
+                prepare_joint_motion_off_lock(snap, &target, &jsnap.limits, approach_use, approach_req, scope)
                     .map_err(no_hint)?;
             Ok(PreparedMoveAction::Joint(PreparedJointAction {
                 kind: if relative {
@@ -2615,6 +2702,7 @@ fn prepare_move_common(
                 tag,
                 expected_duration_s,
                 settle: false,
+                checked_joints: scope,
             }))
         }
     }
@@ -2683,6 +2771,19 @@ pub fn prepare_child_joint_slot(
     power_scale: Option<f64>,
     child: ChildSpec,
 ) -> Result<PlanSlot, &'static str> {
+    prepare_child_joint_slot_scoped(start, target, max_velocity, duration_s, power_scale, child, None)
+}
+
+/// Off-thread helper: stage a prepared joint-quintic macro child with an explicit planning scope.
+pub fn prepare_child_joint_slot_scoped(
+    start: &[f32],
+    target: &[f32],
+    max_velocity: &[f32],
+    duration_s: f64,
+    power_scale: Option<f64>,
+    child: ChildSpec,
+    checked_joints: Option<crate::model::PlanningScope>,
+) -> Result<PlanSlot, &'static str> {
     let dof = start.len();
     if dof == 0 || dof > MAX_DOF || target.len() != dof || max_velocity.len() != dof {
         return Err("INVALID_COMMAND");
@@ -2705,6 +2806,7 @@ pub fn prepare_child_joint_slot(
         power_scale,
         settle: true,
         approach_then: None,
+        checked_joints: checked_joints.map(|c| c.mask),
     }));
     Ok(slot)
 }
@@ -2853,6 +2955,7 @@ pub(crate) fn build_prepared_quintic_off_lock(
     snap: &ActionSnapshot,
     target: &[f32],
     limits: &[JointLimit],
+    scope: Option<crate::model::PlanningScope>,
 ) -> Result<PreparedQuintic, ArmError> {
     let cfg = &snap.env.config;
     for (p, l) in target.iter().zip(&cfg.limits) {
@@ -2868,6 +2971,10 @@ pub(crate) fn build_prepared_quintic_off_lock(
             }
             .into());
         }
+    }
+    if let Some(sc) = scope {
+        motion::check_start_planning_limits_f32(&snap.commanded_positions, &cfg.limits, sc, Some(0.0))?;
+        motion::check_planning_limits_f32(target, &cfg.limits, sc, None)?;
     }
     let zero_v = vec![0.0f32; cfg.dof];
     let traj = TrajectoryPlanner::plan(
@@ -2887,6 +2994,9 @@ pub(crate) fn build_prepared_quintic_off_lock(
         snap.env.power_budget.as_ref(),
         &cfg.arm_model,
     )?;
+    if let Some(sc) = scope {
+        motion::check_quintic_planning_limits(&traj, &cfg.limits, sc)?;
+    }
     if let Some(ws) = snap.env.workspace_policy.as_ref() {
         check_quintic_workspace_off_lock(
             &traj,
@@ -2921,6 +3031,7 @@ fn prepare_joint_motion_off_lock(
     limits: &[JointLimit],
     approach_use: &str,
     request: backlash::Request,
+    scope: Option<crate::model::PlanningScope>,
 ) -> Result<(PreparedQuintic, Option<PreparedApproachLeg>, Option<backlash::Outcome>, f64), ArmError> {
     let cfg = &snap.env.config;
     let approach_plan = if approach_use.is_empty() {
@@ -2929,7 +3040,7 @@ fn prepare_joint_motion_off_lock(
         snap.env.approach_plan(approach_use, request)
     };
     let direct_fallback = |reason: Option<String>| -> Result<_, ArmError> {
-        let pq = build_prepared_quintic_off_lock(snap, target, limits)?;
+        let pq = build_prepared_quintic_off_lock(snap, target, limits, scope)?;
         let dur = pq.traj.duration;
         Ok((pq, None, reason.map(backlash::Outcome::direct), dur))
     };
@@ -2942,7 +3053,7 @@ fn prepare_joint_motion_off_lock(
         return direct_fallback(Some("segment: a torque or power hold is in force".into()));
     }
     let delta = plan.policy.delta_rad();
-    let (pre, signs) = match backlash::pre_target(target, &plan.joints, delta, &cfg.limits) {
+    let (pre, signs) = match backlash::pre_target_scoped(target, &plan.joints, delta, &cfg.limits, scope) {
         Ok(x) => x,
         Err(r) => return direct_fallback(Some(format!("pre_target: {r}"))),
     };
@@ -2955,6 +3066,7 @@ fn prepare_joint_motion_off_lock(
         target,
         &seg_limits,
         &cfg.limits,
+        scope,
         snap.env.workspace_policy.as_ref(),
         &cfg.camera_mount,
         &cfg.arm_model,
@@ -2966,7 +3078,7 @@ fn prepare_joint_motion_off_lock(
         Ok(x) => x,
         Err(r) => return direct_fallback(Some(r)),
     };
-    let leg1 = match build_prepared_quintic_off_lock(snap, &pre, limits) {
+    let leg1 = match build_prepared_quintic_off_lock(snap, &pre, limits, scope) {
         Ok(pq) => pq,
         Err(e) => return direct_fallback(Some(format!("pre_target: {}", arm_err_code_str(e)))),
     };
@@ -3013,6 +3125,14 @@ pub fn install_move_cartesian(
         CartesianInstallPayload::Legacy(prep) => {
             check_start_fresh(&inner.commanded_positions, &prep.start)
                 .map_err(|r| r.into_arm_error(inner))?;
+            check_cartesian_path_planning_legacy(inner, &inner.commanded_positions, &prep.resolved.path)?;
+            if let Some(leg) = prep.resolved.approach_leg.as_ref() {
+                motion::check_quintic_planning_limits(
+                    &leg.seg,
+                    &inner.config.limits,
+                    crate::model::PlanningScope::arm_only(&inner.config),
+                )?;
+            }
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
@@ -3050,7 +3170,7 @@ pub fn install_move_cartesian(
             power_scale,
             approach_then,
         )
-        .map_err(|code| ActionRefusal::new(code).into_arm_error(inner)),
+        .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))),
     }
 }
 
@@ -3071,24 +3191,25 @@ pub enum CartesianInstallPayload {
 /// Single zero-alloc RT validator for an optional second-leg same-side approach quintic
 /// (shared by `install_move_cartesian_slot_rt`, `install_move_joint_rt`, and
 /// `install_macro_child_slot_rt`): enforces finite duration/target, safety motion validation,
-/// and inline swept-workspace keepout BEFORE admission consumption.
+/// planning-limit certification, and inline swept-workspace keepout BEFORE admission consumption.
 fn validate_approach_leg_rt(
     inner: &mut SupervisorInner,
     epoch: u64,
     dof: usize,
     leg_start: &[f32],
     leg: StagedQuinticLeg,
-) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, StagedQuinticLeg), &'static str> {
+    scope: Option<crate::model::PlanningScope>,
+) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, StagedQuinticLeg), CommitRefusal> {
     if !leg.duration_s.is_finite()
         || leg.duration_s <= 0.0
         || leg.target[..dof].iter().any(|v| !v.is_finite())
     {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     }
     inner
         .safety
         .validate_motion_command(Some(epoch), &leg.target[..dof], &inner.config.limits)
-        .map_err(|e| static_code(ArmError::Safety(e)))?;
+        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
     let zeros = [0.0f32; MAX_DOF];
     let seg = crate::trajectory::MultiJointQuinticTrajectory::new(
         &leg_start[..dof],
@@ -3097,10 +3218,13 @@ fn validate_approach_leg_rt(
         &zeros[..dof],
         leg.duration_s,
     )
-    .map_err(|_| "INVALID_COMMAND")?;
+    .map_err(|_| CommitRefusal::code("INVALID_COMMAND"))?;
+    if let Some(sc) = scope {
+        motion::check_quintic_planning_limits_rt(&seg, &inner.config.limits, sc)?;
+    }
     inner
         .check_workspace_quintic_inline(&seg)
-        .map_err(|e| static_code(ArmError::Safety(e)))?;
+        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
     Ok((seg, leg))
 }
 
@@ -3116,21 +3240,23 @@ fn install_move_cartesian_slot_rt(
     duration_s: f64,
     power_scale: Option<f64>,
     approach_then: Option<StagedQuinticLeg>,
-) -> Result<InstalledAction, &'static str> {
+) -> Result<InstalledAction, CommitRefusal> {
     if dof == 0 || dof > MAX_DOF {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     }
     let mut post_q = [0.0f32; MAX_DOF];
     let (post_dof, _) = inner.post_quiesce_commanded_positions(&mut post_q);
-    check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| r.code)?;
+    check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
     inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+    check_cartesian_path_planning_rt(inner, dof, &post_q[..post_dof], slot.path.samples())?;
     if inner.gravity_comp.is_some() {
-        return Err("MOTION_BUSY");
+        return Err(CommitRefusal::code("MOTION_BUSY"));
     }
     inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
     let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
     let mut last_buf = [0.0f32; MAX_DOF];
     last_buf[..dof].copy_from_slice(last_slice);
+    let arm_scope = Some(crate::model::PlanningScope::arm_only(&inner.config));
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
             inner,
@@ -3138,19 +3264,23 @@ fn install_move_cartesian_slot_rt(
             dof,
             &last_buf[..dof],
             leg,
+            arm_scope,
         )?),
         None => None,
     };
-    let admitted = consume_action_admission(inner, stamp, ctx.stop_generation).map_err(|r| r.code)?;
-    let (this, proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+    let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
+        .map_err(|r| CommitRefusal::code(r.code))?;
+    let (this, proof) = admitted
+        .consume()
+        .map_err(|e| CommitRefusal::code(static_code(e.into())))?;
     this.check_terminal_fifo_for_new_action()
-        .map_err(|e| static_code(e.into()))?;
+        .map_err(|e| CommitRefusal::code(static_code(e.into())))?;
     if let Some(old_id) = this.macro_run.as_ref().map(|m| m.id) {
         let _ = this.quiesce_macro_children_rt(old_id);
     }
     let duration = this
         .start_path_motion_slice_inner(&proof, stamp.admission.estop_epoch, &last_buf[..dof], duration_s)
-        .map_err(static_code)?;
+        .map_err(|e| CommitRefusal::code(static_code(e)))?;
     let id = this.begin_action_rt(kind.action_kind_str());
     if let Some(s) = power_scale {
         this.note_action_power_scale(id, s);
@@ -3190,19 +3320,112 @@ pub fn install_move_joint(
     check_action_authority(inner, stamp, ctx, true, true)
         .map_err(|r| r.into_arm_error(inner))?;
     match payload {
-        JointInstallPayload::Legacy(prep) => {
+        JointInstallPayload::Legacy(mut prep) => {
             check_start_fresh(&inner.commanded_positions, &prep.start)
                 .map_err(|r| r.into_arm_error(inner))?;
             if prep.kind == PreparedActionKind::MoveToPose {
                 inner.check_commissioning_for_ordinary_motion("move_to_pose")?;
             }
             inner.check_prepared_fresh(stamp.admission.estop_epoch)?;
+            // Pre-certify the exact executable leg1 quintic (accounting for live start/velocity
+            // and side-effect-free torque/power hold preview) and optional leg2 BEFORE admission
+            // consumption when planning limits apply, using the exact same prepared duration and
+            // leg-2 rebuild rules as RT Executor so both owners certify and install identical curves.
+            let mut leg1_target = prep.prepared_quintic.target.clone();
+            let torque_clamped;
+            let power_clamped;
+            let (prepared_for_install, exact_for_install) = if let Some(scope) = prep.checked_joints {
+                inner.safety.validate_motion_command(
+                    Some(stamp.admission.estop_epoch),
+                    &leg1_target,
+                    &inner.config.limits,
+                )?;
+                torque_clamped = inner.preview_torque_hold_filter(&mut leg1_target);
+                power_clamped = inner.preview_power_hold_filter(&mut leg1_target);
+                let target_clamped = leg1_target != prep.prepared_quintic.target;
+                let reuse_ok = prep.prepared_quintic.start == inner.commanded_positions
+                    && prep.prepared_quintic.v0 == inner.commanded_velocities
+                    && !target_clamped
+                    && prep.prepared_quintic.limits.as_slice() == prep.limits.as_slice()
+                    && prep.prepared_quintic.workspace_revision == inner.workspace_revision
+                    && prep.prepared_quintic.tcp_offset == inner.config.tcp_offset
+                    && prep.prepared_quintic.power.as_ref() == inner.power_budget()
+                    && prep.prepared_quintic.checked_workspace == inner.workspace_policy().is_some();
+                let res = if reuse_ok {
+                    motion::check_quintic_planning_limits(&prep.prepared_quintic.traj, &inner.config.limits, scope)?;
+                    (Some(prep.prepared_quintic), None)
+                } else {
+                    let zeros = vec![0.0f32; inner.config.dof];
+                    let rebuilt = crate::trajectory::MultiJointQuinticTrajectory::new(
+                        &inner.commanded_positions,
+                        &inner.commanded_velocities,
+                        &leg1_target,
+                        &zeros,
+                        prep.prepared_quintic.traj.duration,
+                    )?;
+                    motion::check_quintic_planning_limits(&rebuilt, &inner.config.limits, scope)?;
+                    let samples = inner.workspace_samples(&rebuilt)?;
+                    inner.check_workspace_path(&inner.commanded_positions, samples.iter().map(Vec::as_slice))?;
+                    (None, Some((rebuilt, prep.prepared_quintic.power_scale)))
+                };
+                if let Some(leg) = prep.approach_leg.as_mut() {
+                    if target_clamped {
+                        inner.safety.validate_motion_command(
+                            Some(stamp.admission.estop_epoch),
+                            &leg.target,
+                            &inner.config.limits,
+                        )?;
+                        let zeros = vec![0.0f32; inner.config.dof];
+                        let rebuilt_leg2 = crate::trajectory::MultiJointQuinticTrajectory::new(
+                            &leg1_target,
+                            &zeros,
+                            &leg.target,
+                            &zeros,
+                            leg.seg.duration,
+                        )?;
+                        motion::check_quintic_planning_limits(&rebuilt_leg2, &inner.config.limits, scope)?;
+                        let samples = inner.workspace_samples(&rebuilt_leg2)?;
+                        inner.check_workspace_path(&leg1_target, samples.iter().map(Vec::as_slice))?;
+                        leg.seg = rebuilt_leg2;
+                    } else {
+                        motion::check_quintic_planning_limits(&leg.seg, &inner.config.limits, scope)?;
+                    }
+                }
+                res
+            } else {
+                // Unscoped moves with a pre-planned approach leg still rebuild leg 2 if a hold
+                // clamps leg 1 after preparation, preventing a jump between leg 1 and leg 2.
+                let tq = inner.preview_torque_hold_filter(&mut leg1_target);
+                let pw = inner.preview_power_hold_filter(&mut leg1_target);
+                torque_clamped = tq;
+                power_clamped = pw;
+                if let Some(leg) = prep.approach_leg.as_mut() {
+                    if leg1_target != prep.prepared_quintic.target {
+                        inner.safety.validate_motion_command(
+                            Some(stamp.admission.estop_epoch),
+                            &leg.target,
+                            &inner.config.limits,
+                        )?;
+                        let zeros = vec![0.0f32; inner.config.dof];
+                        let rebuilt_leg2 = crate::trajectory::MultiJointQuinticTrajectory::new(
+                            &leg1_target,
+                            &zeros,
+                            &leg.target,
+                            &zeros,
+                            leg.seg.duration,
+                        )?;
+                        let samples = inner.workspace_samples(&rebuilt_leg2)?;
+                        inner.check_workspace_path(&leg1_target, samples.iter().map(Vec::as_slice))?;
+                        leg.seg = rebuilt_leg2;
+                    }
+                }
+                (Some(prep.prepared_quintic), None)
+            };
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
             let (this, proof) = admitted.consume()?;
-            let leg1_target = prep.prepared_quintic.target.clone();
-            let (_, id, d1) = this.start_quintic_prepared(
+            let (_, id, d1) = this.start_quintic_exact_scoped(
                 &proof,
                 leg1_target,
                 None,
@@ -3210,8 +3433,16 @@ pub fn install_move_joint(
                 prep.kind.action_kind_str(),
                 prep.tag,
                 &prep.limits,
-                Some(prep.prepared_quintic),
+                prepared_for_install,
+                exact_for_install,
+                prep.checked_joints,
             )?;
+            if let Some(j) = torque_clamped {
+                this.note_motion_limit(crate::model::MotionLimitReason::Torque, Some(j));
+            }
+            if let Some(j) = power_clamped {
+                this.note_motion_limit(crate::model::MotionLimitReason::Power, Some(j));
+            }
             let duration = if let Some(leg) = prep.approach_leg {
                 let d2 = leg.seg.duration;
                 if let Some(active) = this.active_trajectory.take() {
@@ -3251,6 +3482,7 @@ pub fn install_move_joint(
             power_scale,
             settle,
             approach_then,
+            checked_joints,
         } => install_move_joint_rt(
             inner,
             stamp,
@@ -3264,8 +3496,9 @@ pub fn install_move_joint(
             power_scale,
             settle,
             approach_then,
+            checked_joints,
         )
-        .map_err(|code| ActionRefusal::new(code).into_arm_error(inner)),
+        .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))),
     }
 }
 
@@ -3282,6 +3515,7 @@ pub enum JointInstallPayload {
         power_scale: Option<f64>,
         settle: bool,
         approach_then: Option<StagedQuinticLeg>,
+        checked_joints: Option<u16>,
     },
 }
 
@@ -3299,28 +3533,29 @@ fn install_move_joint_rt(
     power_scale: Option<f64>,
     settle: bool,
     approach_then: Option<StagedQuinticLeg>,
-) -> Result<InstalledAction, &'static str> {
+    checked_joints: Option<u16>,
+) -> Result<InstalledAction, CommitRefusal> {
     if dof == 0 || dof > MAX_DOF || !duration_s.is_finite() || duration_s <= 0.0 {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     }
     if target[..dof].iter().any(|v| !v.is_finite()) {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     }
     let mut post_q = [0.0f32; MAX_DOF];
     let (post_dof, quiesce_macro_gripper) = inner.post_quiesce_commanded_positions(&mut post_q);
-    check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| r.code)?;
+    check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
     if inner.config.active_tool.commissioning_required && kind == PreparedActionKind::MoveToPose {
-        return Err("COMMISSIONING_REQUIRED");
+        return Err(CommitRefusal::code("COMMISSIONING_REQUIRED"));
     }
     if inner.gravity_comp.is_some() {
-        return Err("MOTION_BUSY");
+        return Err(CommitRefusal::code("MOTION_BUSY"));
     }
     inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
     let (mut limits_buf, lim_n) = inner
         .planning_limits_inline(None)
-        .ok_or("INVALID_COMMAND")?;
+        .ok_or(CommitRefusal::code("INVALID_COMMAND"))?;
     if lim_n != dof {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     }
     for i in 0..dof {
         if max_velocity[i].is_finite() && max_velocity[i] > 0.0 {
@@ -3332,7 +3567,7 @@ fn install_move_joint_rt(
     inner
         .safety
         .validate_motion_command(Some(stamp.admission.estop_epoch), &tgt[..dof], &inner.config.limits)
-        .map_err(|e| static_code(ArmError::Safety(e)))?;
+        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
     if inner.config.gripper_index().is_some_and(|g| {
         g < dof
             && ((tgt[g] - post_q[g]).abs() > 1e-4
@@ -3340,8 +3575,8 @@ fn install_move_joint_rt(
     }) {
         inner.check_pos_force_gripper_fresh_static()?;
     }
-    inner.torque_hold_filter(&mut tgt[..dof]);
-    inner.power_hold_filter(&mut tgt[..dof]);
+    let torque_clamped = inner.preview_torque_hold_filter(&mut tgt[..dof]);
+    let power_clamped = inner.preview_power_hold_filter(&mut tgt[..dof]);
     let zeros = [0.0f32; MAX_DOF];
     let mut start_vel = [0.0f32; MAX_DOF];
     start_vel[..dof].copy_from_slice(&inner.commanded_velocities[..dof]);
@@ -3350,6 +3585,7 @@ fn install_move_joint_rt(
             start_vel[g] = 0.0;
         }
     }
+    let scope = checked_joints.map(crate::model::PlanningScope::from_mask);
     // Install with exact prepared timing verbatim (preserves ACK duration parity even within 1e-4 start drift).
     let traj = crate::trajectory::MultiJointQuinticTrajectory::new(
         &post_q[..dof],
@@ -3358,10 +3594,13 @@ fn install_move_joint_rt(
         &zeros[..dof],
         duration_s,
     )
-    .map_err(|_| "INVALID_COMMAND")?;
+    .map_err(|_| CommitRefusal::code("INVALID_COMMAND"))?;
+    if let Some(sc) = scope {
+        motion::check_quintic_planning_limits_rt(&traj, &inner.config.limits, sc)?;
+    }
     inner
         .check_workspace_quintic_inline(&traj)
-        .map_err(|e| static_code(ArmError::Safety(e)))?;
+        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
             inner,
@@ -3369,14 +3608,24 @@ fn install_move_joint_rt(
             dof,
             &tgt[..dof],
             leg,
+            scope,
         )?),
         None => None,
     };
 
-    let admitted = consume_action_admission(inner, stamp, ctx.stop_generation).map_err(|r| r.code)?;
-    let (this, _proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+    let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
+        .map_err(|r| CommitRefusal::code(r.code))?;
+    let (this, _proof) = admitted
+        .consume()
+        .map_err(|e| CommitRefusal::code(static_code(e.into())))?;
     this.check_terminal_fifo_for_new_action()
-        .map_err(|e| static_code(e.into()))?;
+        .map_err(|e| CommitRefusal::code(static_code(e.into())))?;
+    if let Some(j) = torque_clamped {
+        this.note_motion_limit(crate::model::MotionLimitReason::Torque, Some(j));
+    }
+    if let Some(j) = power_clamped {
+        this.note_motion_limit(crate::model::MotionLimitReason::Power, Some(j));
+    }
     if let Some(old_id) = this.macro_run.as_ref().map(|m| m.id) {
         let _ = this.quiesce_macro_children_rt(old_id);
     }
@@ -3393,7 +3642,7 @@ fn install_move_joint_rt(
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &tgt[..dof]);
     this.safety
         .mark_motion_started()
-        .map_err(|e| static_code(ArmError::Safety(e)))?;
+        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
     this.last_heartbeat = ctx.now;
     let id = this.begin_action_rt(kind.action_kind_str());
     if let Some(s) = power_scale {
@@ -3557,6 +3806,8 @@ fn install_gripper_rt(
         max_position: lim.max_position,
         max_velocity: lim.max_velocity,
         max_acceleration: lim.max_acceleration,
+        planning_min_position: lim.planning_min_position,
+        planning_max_position: lim.planning_max_position,
     };
     let baseline_data = inner.gripper_baseline_data_rt();
     let mut motion = GripperMotion::try_with_close_speed_limit_static(
@@ -3955,6 +4206,7 @@ pub enum MacroChildPayload {
         target: Vec<f32>,
         limits: Vec<JointLimit>,
         prepared: Option<PreparedQuintic>,
+        checked_joints: Option<crate::model::PlanningScope>,
     },
     /// Legacy prepared gripper child.
     LegacyGripper {
@@ -4009,7 +4261,7 @@ pub fn install_macro_child(
     match payload {
         MacroChildPayload::Slot(slot) => {
             install_macro_child_slot_rt(inner, stamp, ctx, slot)
-                .map_err(|code| ActionRefusal::new(code).into_arm_error(inner))
+                .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits)))
         }
         MacroChildPayload::LegacyCartesian {
             spec,
@@ -4020,6 +4272,14 @@ pub fn install_macro_child(
         } => {
             let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start)
                 .map_err(|r| r.into_arm_error(inner))?;
+            check_cartesian_path_planning_legacy(inner, &inner.commanded_positions, &resolved.path)?;
+            if let Some(leg) = resolved.approach_leg.as_ref() {
+                motion::check_quintic_planning_limits(
+                    &leg.seg,
+                    &inner.config.limits,
+                    crate::model::PlanningScope::arm_only(&inner.config),
+                )?;
+            }
             if lock_j7_hold {
                 if resolved.approach_leg.is_some() {
                     return Err(ActionRefusal::new("INVALID_COMMAND").into_arm_error(inner));
@@ -4089,12 +4349,81 @@ pub fn install_macro_child(
         MacroChildPayload::LegacyJoint {
             spec,
             start,
-            target,
+            mut target,
             limits,
             prepared,
+            checked_joints,
         } => {
             let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start)
                 .map_err(|r| r.into_arm_error(inner))?;
+            // Pre-certify the exact executable quintic BEFORE consuming A1 admission or mutating
+            // state when planning limits apply, using the same prepared duration rule as RT Executor.
+            let mut torque_clamped = None;
+            let mut power_clamped = None;
+            let (prepared_for_install, exact_for_install) = if let Some(scope) = checked_joints {
+                let epoch = inner.macro_sub_ready(parent_id)?;
+                if epoch != inner.safety.epoch_id() {
+                    return Err(MotionError::PlanStale("epoch changed during the action".into()).into());
+                }
+                inner.action_preconditions()?;
+                inner.gravity_comp_motion_busy()?;
+                inner.safety.validate_motion_command(Some(epoch), &target, &inner.config.limits)?;
+                let mut filtered_target = target.clone();
+                torque_clamped = inner.preview_torque_hold_filter(&mut filtered_target);
+                power_clamped = inner.preview_power_hold_filter(&mut filtered_target);
+                let reuse_ok = prepared.as_ref().is_some_and(|p| {
+                    p.start == inner.commanded_positions
+                        && p.v0 == inner.commanded_velocities
+                        && p.target == filtered_target
+                        && p.limits.as_slice() == limits.as_slice()
+                        && p.workspace_revision == inner.workspace_revision
+                        && p.tcp_offset == inner.config.tcp_offset
+                        && p.power.as_ref() == inner.power_budget()
+                        && p.checked_workspace == inner.workspace_policy().is_some()
+                });
+                if reuse_ok {
+                    if let Some(p) = prepared.as_ref() {
+                        motion::check_quintic_planning_limits(&p.traj, &inner.config.limits, scope)?;
+                    }
+                    (prepared, None)
+                } else {
+                    let zeros = vec![0.0f32; inner.config.dof];
+                    let (rebuilt, pscale) = if let Some(p) = prepared.as_ref() {
+                        let r = crate::trajectory::MultiJointQuinticTrajectory::new(
+                            &inner.commanded_positions,
+                            &inner.commanded_velocities,
+                            &filtered_target,
+                            &zeros,
+                            p.traj.duration,
+                        )?;
+                        (r, p.power_scale)
+                    } else {
+                        let r = TrajectoryPlanner::plan(
+                            &inner.commanded_positions,
+                            &inner.commanded_velocities,
+                            &filtered_target,
+                            &zeros,
+                            None,
+                            &limits,
+                        )?;
+                        inner.power_fit_quintic(
+                            r,
+                            &inner.commanded_positions,
+                            &inner.commanded_velocities,
+                            &filtered_target,
+                            &limits,
+                            true,
+                        )?
+                    };
+                    motion::check_quintic_planning_limits(&rebuilt, &inner.config.limits, scope)?;
+                    let samples = inner.workspace_samples(&rebuilt)?;
+                    inner.check_workspace_path(&inner.commanded_positions, samples.iter().map(Vec::as_slice))?;
+                    target = filtered_target;
+                    (None, Some((rebuilt, pscale)))
+                }
+            } else {
+                (prepared, None)
+            };
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,
@@ -4103,12 +4432,14 @@ pub fn install_macro_child(
                     return Err(r.into_arm_error(inner));
                 }
             };
-            let dur = match SupervisorInner::install_macro_quintic_prepared(
+            let dur = match SupervisorInner::install_macro_quintic_prepared_scoped(
                 admitted,
                 parent_id,
                 target,
                 &limits,
-                prepared,
+                prepared_for_install,
+                exact_for_install,
+                checked_joints,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -4116,6 +4447,12 @@ pub fn install_macro_child(
                     return Err(e);
                 }
             };
+            if let Some(j) = torque_clamped {
+                inner.note_motion_limit(crate::model::MotionLimitReason::Torque, Some(j));
+            }
+            if let Some(j) = power_clamped {
+                inner.note_motion_limit(crate::model::MotionLimitReason::Power, Some(j));
+            }
             let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, Some((dur * 2.0 + 5.0).min(spec.timeout_s)))
                 .ok_or_else(|| ActionRefusal::new("PARENT_REPLACED").into_arm_error(inner))?;
             Ok(InstalledMacroChild {
@@ -4308,19 +4645,19 @@ fn install_macro_child_slot_rt(
     stamp: &ActionStamp,
     ctx: &OwnerCheckCtx,
     slot: PlanSlotRef<PlanSlot>,
-) -> Result<InstalledMacroChild, &'static str> {
+) -> Result<InstalledMacroChild, CommitRefusal> {
     let Primitive::Action(staged) = slot.primitive else {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     };
     let Some(spec) = staged.child().copied() else {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     };
     let (dof, start_arr) = staged.dof_and_start();
     if dof == 0 || dof > MAX_DOF {
-        return Err("INVALID_COMMAND");
+        return Err(CommitRefusal::code("INVALID_COMMAND"));
     }
     let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start_arr[..dof])
-        .map_err(|r| r.code)?;
+        .map_err(|r| CommitRefusal::code(r.code))?;
 
     match staged {
         StagedAction::Cartesian {
@@ -4331,33 +4668,35 @@ fn install_macro_child_slot_rt(
             ..
         } => {
             inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+            check_cartesian_path_planning_rt(inner, dof, &inner.commanded_positions, slot.path.samples())?;
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
             if lock_j7_hold {
                 if approach_then.is_some() {
-                    return Err("INVALID_COMMAND");
+                    return Err(CommitRefusal::code("INVALID_COMMAND"));
                 }
                 if inner.torque_guard.hold.is_some() || inner.power.gov.hold.is_some() {
-                    return Err("PLAN_STALE");
+                    return Err(CommitRefusal::code("PLAN_STALE"));
                 }
                 if inner.commanded_velocities[..dof].iter().any(|v| v.abs() >= 1e-3) {
-                    return Err("PLAN_STALE");
+                    return Err(CommitRefusal::code("PLAN_STALE"));
                 }
                 let first = &slot.path.samples()[0][..dof];
                 if check_start_fresh(&inner.commanded_positions[..dof], first).is_err() {
-                    return Err("PLAN_STALE");
+                    return Err(CommitRefusal::code("PLAN_STALE"));
                 }
                 if let Some(g) = inner.config.gripper_index().filter(|&g| g < dof) {
                     let live_g = inner.commanded_positions[g];
                     if (first[g] - live_g).abs() > 1e-6
                         || slot.path.samples().iter().any(|s| (s[g] - live_g).abs() > 1e-6)
                     {
-                        return Err("PLAN_STALE");
+                        return Err(CommitRefusal::code("PLAN_STALE"));
                     }
                 }
             }
             let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
             let mut last_buf = [0.0f32; MAX_DOF];
             last_buf[..dof].copy_from_slice(last_slice);
+            let arm_scope = Some(crate::model::PlanningScope::arm_only(&inner.config));
             let then_traj = match approach_then {
                 Some(leg) => Some(validate_approach_leg_rt(
                     inner,
@@ -4365,6 +4704,7 @@ fn install_macro_child_slot_rt(
                     dof,
                     &last_buf[..dof],
                     leg,
+                    arm_scope,
                 )?),
                 None => None,
             };
@@ -4373,10 +4713,12 @@ fn install_macro_child_slot_rt(
                 Ok(a) => a,
                 Err(r) => {
                     inner.guard_next_macro_child(parent_id, None);
-                    return Err(r.code);
+                    return Err(CommitRefusal::code(r.code));
                 }
             };
-            let (this, proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+            let (this, proof) = admitted
+                .consume()
+                .map_err(|e| CommitRefusal::code(static_code(e.into())))?;
             if lock_j7_hold || this.macro_run.as_ref().is_some_and(|m| m.j7_intent_only) {
                 this.j7_admitted_stamp = None;
             }
@@ -4389,7 +4731,7 @@ fn install_macro_child_slot_rt(
                 Ok(d) => d,
                 Err(e) => {
                     this.guard_next_macro_child(parent_id, None);
-                    return Err(static_code(e));
+                    return Err(CommitRefusal::code(static_code(e)));
                 }
             };
             if let Some(s) = power_scale {
@@ -4422,7 +4764,7 @@ fn install_macro_child_slot_rt(
             };
             this.set_macro_sub_running(parent_id);
             let ticket = arm_child_deadline_clamped(this, parent_id, &spec, ctx.now, None)
-                .ok_or("PARENT_REPLACED")?;
+                .ok_or(CommitRefusal::code("PARENT_REPLACED"))?;
             Ok(InstalledMacroChild {
                 parent: ActionId(parent_id),
                 ticket,
@@ -4436,17 +4778,18 @@ fn install_macro_child_slot_rt(
             duration_s,
             max_velocity,
             power_scale,
+            checked_joints,
             ..
         } => {
             if !duration_s.is_finite() || duration_s <= 0.0 || target[..dof].iter().any(|v| !v.is_finite()) {
-                return Err("INVALID_COMMAND");
+                return Err(CommitRefusal::code("INVALID_COMMAND"));
             }
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
             let (mut limits_buf, lim_n) = inner
                 .planning_limits_inline(None)
-                .ok_or("INVALID_COMMAND")?;
+                .ok_or(CommitRefusal::code("INVALID_COMMAND"))?;
             if lim_n != dof {
-                return Err("INVALID_COMMAND");
+                return Err(CommitRefusal::code("INVALID_COMMAND"));
             }
             for i in 0..dof {
                 if max_velocity[i].is_finite() && max_velocity[i] > 0.0 {
@@ -4462,7 +4805,7 @@ fn install_macro_child_slot_rt(
                     &tgt[..dof],
                     &inner.config.limits,
                 )
-                .map_err(|e| static_code(ArmError::Safety(e)))?;
+                .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
             if inner.config.gripper_index().is_some_and(|g| {
                 g < dof
                     && g < inner.commanded_positions.len()
@@ -4470,8 +4813,9 @@ fn install_macro_child_slot_rt(
             }) {
                 inner.check_pos_force_gripper_fresh_static()?;
             }
-            inner.torque_hold_filter(&mut tgt[..dof]);
-            inner.power_hold_filter(&mut tgt[..dof]);
+            let torque_clamped = inner.preview_torque_hold_filter(&mut tgt[..dof]);
+            let power_clamped = inner.preview_power_hold_filter(&mut tgt[..dof]);
+            let scope = checked_joints.map(crate::model::PlanningScope::from_mask);
             let zeros = [0.0f32; MAX_DOF];
             let traj = crate::trajectory::MultiJointQuinticTrajectory::new(
                 &inner.commanded_positions[..dof],
@@ -4480,25 +4824,36 @@ fn install_macro_child_slot_rt(
                 &zeros[..dof],
                 duration_s,
             )
-            .map_err(|_| "INVALID_COMMAND")?;
+            .map_err(|_| CommitRefusal::code("INVALID_COMMAND"))?;
+            if let Some(sc) = scope {
+                motion::check_quintic_planning_limits_rt(&traj, &inner.config.limits, sc)?;
+            }
             inner
                 .check_workspace_quintic_inline(&traj)
-                .map_err(|e| static_code(ArmError::Safety(e)))?;
+                .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,
                 Err(r) => {
                     inner.guard_next_macro_child(parent_id, None);
-                    return Err(r.code);
+                    return Err(CommitRefusal::code(r.code));
                 }
             };
-            let (this, _proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+            let (this, _proof) = admitted
+                .consume()
+                .map_err(|e| CommitRefusal::code(static_code(e.into())))?;
+            if let Some(j) = torque_clamped {
+                this.note_motion_limit(crate::model::MotionLimitReason::Torque, Some(j));
+            }
+            if let Some(j) = power_clamped {
+                this.note_motion_limit(crate::model::MotionLimitReason::Power, Some(j));
+            }
             this.release_servo_target();
             this.servo_settled_ticks.fill(0);
             crate::rt_core::scratch::copy_into(&mut this.target_positions, &tgt[..dof]);
             if let Err(e) = this.safety.mark_motion_started() {
                 this.guard_next_macro_child(parent_id, None);
-                return Err(static_code(ArmError::Safety(e)));
+                return Err(CommitRefusal::code(static_code(ArmError::Safety(e))));
             }
             this.last_heartbeat = ctx.now;
             if let Some(s) = power_scale {
@@ -4514,7 +4869,7 @@ fn install_macro_child_slot_rt(
             ));
             this.set_macro_sub_running(parent_id);
             let ticket = arm_child_deadline_clamped(this, parent_id, &spec, ctx.now, None)
-                .ok_or("PARENT_REPLACED")?;
+                .ok_or(CommitRefusal::code("PARENT_REPLACED"))?;
             Ok(InstalledMacroChild {
                 parent: ActionId(parent_id),
                 ticket,
@@ -4534,14 +4889,14 @@ fn install_macro_child_slot_rt(
             ..
         } => {
             if !speed.is_finite() || speed <= 0.0 {
-                return Err("INVALID_COMMAND");
+                return Err(CommitRefusal::code("INVALID_COMMAND"));
             }
-            let gripper_idx = inner.config.gripper_index().ok_or("UNSUPPORTED")?;
+            let gripper_idx = inner.config.gripper_index().ok_or(CommitRefusal::code("UNSUPPORTED"))?;
             let policy = inner
                 .config
                 .gripper_policy
                 .as_ref()
-                .ok_or("UNSUPPORTED")?
+                .ok_or(CommitRefusal::code("UNSUPPORTED"))?
                 .clone_without_jaw_opening();
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
             inner.check_pos_force_gripper_fresh_static()?;
@@ -4570,6 +4925,8 @@ fn install_macro_child_slot_rt(
                 max_position: lim.max_position,
                 max_velocity: lim.max_velocity,
                 max_acceleration: lim.max_acceleration,
+                planning_min_position: lim.planning_min_position,
+                planning_max_position: lim.planning_max_position,
             };
             let baseline_data = inner.gripper_baseline_data_rt();
             let mut motion = GripperMotion::try_with_close_speed_limit_static(
@@ -4589,7 +4946,7 @@ fn install_macro_child_slot_rt(
             let mot_timeout_s = motion.timeout_s;
             if let Some(budget_s) = max_budget_s {
                 if !(budget_s.is_finite() && budget_s > 0.0) || (is_pf && dur > budget_s) {
-                    return Err("INVALID_COMMAND");
+                    return Err(CommitRefusal::code("INVALID_COMMAND"));
                 }
             }
             let target_g = motion.target;
@@ -4600,19 +4957,21 @@ fn install_macro_child_slot_rt(
                 Ok(a) => a,
                 Err(r) => {
                     inner.guard_next_macro_child(parent_id, None);
-                    return Err(r.code);
+                    return Err(CommitRefusal::code(r.code));
                 }
             };
-            let (this, _proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
+            let (this, _proof) = admitted
+                .consume()
+                .map_err(|e| CommitRefusal::code(static_code(e.into())))?;
             if let Err(e) = this.safety.mark_motion_started() {
                 this.guard_next_macro_child(parent_id, None);
-                return Err(static_code(ArmError::Safety(e)));
+                return Err(CommitRefusal::code(static_code(ArmError::Safety(e))));
             }
             this.set_macro_sub_running(parent_id);
             let override_s = is_pf.then_some(mot_timeout_s + 10.0);
             let Some(ticket) = arm_child_deadline_clamped(this, parent_id, &spec, ctx.now, override_s) else {
                 this.guard_next_macro_child(parent_id, None);
-                return Err("PARENT_REPLACED");
+                return Err(CommitRefusal::code("PARENT_REPLACED"));
             };
             // Infallible commit tail: take and attach a learning-buffer spare ONLY after final
             // admission, motion-start, and parent-child checks all succeed.
@@ -4684,7 +5043,7 @@ fn install_macro_child_slot_rt(
                 Ok(a) => a,
                 Err(r) => {
                     inner.guard_next_macro_child(parent_id, None);
-                    return Err(r.code);
+                    return Err(CommitRefusal::code(r.code));
                 }
             };
             let dur = match SupervisorInner::install_macro_prepared_replay(admitted, parent_id, prepared)
@@ -4692,11 +5051,11 @@ fn install_macro_child_slot_rt(
                 Ok(d) => d,
                 Err(e) => {
                     inner.guard_next_macro_child(parent_id, None);
-                    return Err(static_code(e));
+                    return Err(CommitRefusal::code(static_code(e)));
                 }
             };
             let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, None)
-                .ok_or("PARENT_REPLACED")?;
+                .ok_or(CommitRefusal::code("PARENT_REPLACED"))?;
             Ok(InstalledMacroChild {
                 parent: ActionId(parent_id),
                 ticket,
@@ -4802,7 +5161,7 @@ pub fn commit_action(
     cmd: ActionCommand,
     slot: Option<PlanSlotRef<PlanSlot>>,
     ctx: &CommitCtx,
-) -> Result<Committed, &'static str> {
+) -> Result<Committed, CommitRefusal> {
     let owner_ctx = OwnerCheckCtx::from_commit_ctx(ctx);
     match cmd {
         ActionCommand::InstallPrepared {
@@ -4816,7 +5175,7 @@ pub fn commit_action(
             power_budget_revision,
             ..
         } => {
-            let slot = slot.ok_or("PLAN_RETIRED")?;
+            let slot = slot.ok_or(CommitRefusal::code("PLAN_RETIRED"))?;
             let stamp = ActionStamp::from_descriptor(
                 d,
                 prepared_boot,
@@ -4829,12 +5188,12 @@ pub fn commit_action(
                 power_budget_revision,
             );
             check_action_authority(inner, &stamp, &owner_ctx, check_workspace_revision, true)
-                .map_err(|r| r.code)?;
+                .map_err(|r| CommitRefusal::code(r.code))?;
             let Primitive::Action(staged) = slot.primitive else {
-                return Err("INVALID_COMMAND");
+                return Err(CommitRefusal::code("INVALID_COMMAND"));
             };
             if staged.child().is_some() {
-                return Err("INVALID_COMMAND");
+                return Err(CommitRefusal::code("INVALID_COMMAND"));
             }
             let (id, _) = match staged {
                 StagedAction::Cartesian {
@@ -4865,6 +5224,7 @@ pub fn commit_action(
                     power_scale,
                     settle,
                     approach_then,
+                    checked_joints,
                     ..
                 } => install_move_joint_rt(
                     inner,
@@ -4879,6 +5239,7 @@ pub fn commit_action(
                     power_scale,
                     settle,
                     approach_then,
+                    checked_joints,
                 )?,
                 StagedAction::Gripper {
                     dof,
@@ -4953,7 +5314,7 @@ pub fn commit_action(
                 spec.power_budget_revision,
             );
             let id = install_begin_macro(inner, &stamp, &owner_ctx, &spec, None, None)
-                .map_err(|r| r.code)?;
+                .map_err(|r| CommitRefusal::code(r.code))?;
             Ok(Committed::for_action(d, Some(ActionId(id))))
         }
         ActionCommand::InstallChild {
@@ -4965,7 +5326,7 @@ pub fn commit_action(
             power_budget_revision,
             ..
         } => {
-            let slot = slot.ok_or("PLAN_RETIRED")?;
+            let slot = slot.ok_or(CommitRefusal::code("PLAN_RETIRED"))?;
             let stamp = ActionStamp::from_descriptor(
                 d,
                 prepared_boot,
@@ -4978,7 +5339,7 @@ pub fn commit_action(
                 power_budget_revision,
             );
             check_action_authority(inner, &stamp, &owner_ctx, check_workspace_revision, true)
-                .map_err(|r| r.code)?;
+                .map_err(|r| CommitRefusal::code(r.code))?;
             let installed = install_macro_child_slot_rt(inner, &stamp, &owner_ctx, slot)?;
             Ok(Committed::for_action(d, Some(installed.parent)))
         }
@@ -4995,7 +5356,7 @@ pub fn commit_action(
                 spec.power_budget_revision,
             );
             let parent = install_finish_macro(inner, &stamp, &owner_ctx, &spec, None)
-                .map_err(|r| r.code)?;
+                .map_err(|r| CommitRefusal::code(r.code))?;
             Ok(Committed::for_action(d, Some(parent)))
         }
     }

@@ -670,10 +670,10 @@ impl SupervisorInner {
         }
     }
 
-    /// While a power hold is in force: a servo / jog target that moves a joint that was
-    /// pushing further in its push direction is clamped to the hold position.
-    pub(crate) fn power_hold_filter(&mut self, targets: &mut [f32]) {
-        let Some(h) = self.power.gov.hold else { return; };
+    /// Side-effect-free preview of [`Self::power_hold_filter`]: clamps `targets` to the active
+    /// power hold without mutating `motion_limit` or clearing `workspace_violation`.
+    pub(crate) fn preview_power_hold_filter(&self, targets: &mut [f32]) -> Option<usize> {
+        let h = self.power.gov.hold?;
         let mut clamped = None;
         for (j, t) in targets.iter_mut().enumerate().take(MAX_JOINTS) {
             if h.push[j] != 0.0 && (*t - h.hold_q[j]) * h.push[j] > 0.0 {
@@ -681,7 +681,15 @@ impl SupervisorInner {
                 clamped.get_or_insert(j);
             }
         }
-        if let Some(j) = clamped { self.note_motion_limit(MotionLimitReason::Power, Some(j)); }
+        clamped
+    }
+
+    /// While a power hold is in force: a servo / jog target that moves a joint that was
+    /// pushing further in its push direction is clamped to the hold position.
+    pub(crate) fn power_hold_filter(&mut self, targets: &mut [f32]) {
+        if let Some(j) = self.preview_power_hold_filter(targets) {
+            self.note_motion_limit(MotionLimitReason::Power, Some(j));
+        }
     }
 
     /// Record the power-budget time scale of a planned motion on action `id` (the smallest

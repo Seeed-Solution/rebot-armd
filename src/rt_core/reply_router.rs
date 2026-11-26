@@ -2554,6 +2554,7 @@ mod tests {
                 Reply::Refused {
                     request: RequestId(13),
                     code: "WRONG_TARGET",
+                    detail: None,
                 }
             ),
             DeliveryDecision::Delivered
@@ -2564,6 +2565,7 @@ mod tests {
                 Reply::Refused {
                     request: RequestId(14),
                     code: "WRONG_TARGET",
+                    detail: None,
                 }
             ),
             DeliveryDecision::Delivered

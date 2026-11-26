@@ -2669,7 +2669,7 @@ async fn review_m10_reply_router_interleaved_external_and_backpressure() {
     assert_eq!(drained.len(), 4, "expected 3 external Refused + 1 BeginMacro Terminal, got {drained:?}");
     for (idx, req_id) in ext_reqs.iter().enumerate() {
         assert!(
-            matches!(drained[idx], (ClientId(99), Reply::Refused { request, code: "WRONG_TARGET" }) if request == *req_id),
+            matches!(drained[idx], (ClientId(99), Reply::Refused { request, code: "WRONG_TARGET", .. }) if request == *req_id),
             "FIFO mismatch at index {idx}: {:?}",
             drained[idx]
         );

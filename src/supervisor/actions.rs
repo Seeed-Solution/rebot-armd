@@ -682,7 +682,7 @@ impl SupervisorInner {
         true
     }
 
-    pub(super) fn macro_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
+    pub(crate) fn macro_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
         let run = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id))
             .ok_or_else(|| ArmError::Internal("the action is no longer running".into()))?;
         if run.sub == SubState::Running {
@@ -1431,25 +1431,42 @@ impl SupervisorInner {
     }
 
     /// [`Self::install_macro_quintic`] reusing an off-lock [`crate::supervisor::PreparedQuintic`]
-    /// when start, target, limits, workspace revision, tool offset and power budget still match.
-    pub(crate) fn install_macro_quintic_prepared(
+    /// when start, target, limits, workspace revision, tool offset and power budget still match,
+    /// or installing an already-certified exact trajectory on accepted drift.
+    pub(crate) fn install_macro_quintic_prepared_scoped(
         admitted: Admitted<'_>,
         id: u64,
         target: Vec<f32>,
         limits: &[crate::model::JointLimit],
         prepared: Option<crate::supervisor::PreparedQuintic>,
+        exact_traj: Option<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>)>,
+        scope: Option<crate::model::PlanningScope>,
     ) -> Result<f64, ArmError> {
         let (this, proof) = admitted.consume()?;
-        this.install_macro_quintic_inner(&proof, id, target, limits, prepared)
+        this.install_macro_quintic_inner_scoped(&proof, id, target, limits, prepared, exact_traj, scope)
     }
 
     pub(crate) fn install_macro_quintic_inner(
+        &mut self,
+        proof: &crate::supervisor::AdmittedProof,
+        id: u64,
+        target: Vec<f32>,
+        limits: &[crate::model::JointLimit],
+        prepared: Option<crate::supervisor::PreparedQuintic>,
+    ) -> Result<f64, ArmError> {
+        self.install_macro_quintic_inner_scoped(proof, id, target, limits, prepared, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_macro_quintic_inner_scoped(
         &mut self,
         _proof: &crate::supervisor::AdmittedProof,
         id: u64,
         target: Vec<f32>,
         limits: &[crate::model::JointLimit],
         prepared: Option<crate::supervisor::PreparedQuintic>,
+        exact_traj: Option<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>)>,
+        scope: Option<crate::model::PlanningScope>,
     ) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if epoch != self.safety.epoch_id() { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
@@ -1473,17 +1490,25 @@ impl SupervisorInner {
                 && p.power.as_ref() == self.power_budget()
                 && p.checked_workspace == self.workspace_policy().is_some()
         });
-        let (traj, power_scale) = if let Some(p) = reuse {
+        let (traj, power_scale) = if let Some(exact) = exact_traj {
+            exact
+        } else if let Some(p) = reuse {
             self.prepared_quintics_used += 1;
             (p.traj, p.power_scale)
         } else {
             let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &target,
                 &vec![0.0; self.config.dof], None, limits)?;
             let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
+            if let Some(sc) = scope {
+                crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, sc)?;
+            }
             let samples = self.workspace_samples(&traj)?;
             self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
             (traj, power_scale)
         };
+        if let Some(sc) = scope {
+            crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, sc)?;
+        }
         if moves_gripper {
             self.gripper_hold_vel_ceiling = None;
         }

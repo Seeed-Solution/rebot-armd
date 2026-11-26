@@ -1556,7 +1556,7 @@ fn apply_tool_overlay_with_details(
         commissioning_required: !is_stock,
     };
 
-    candidate.validate()?;
+    candidate.validate_runtime_narrowed()?;
     Ok((candidate, canonical_json))
 }
 

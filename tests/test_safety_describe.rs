@@ -60,7 +60,13 @@ async fn describe_route_has_the_v1_shape_without_a_lease() {
         assert!(d["timing"][key].is_u64(), "timing.{key}: {d}");
     }
     let joint = &d["limits"]["joints"][0];
-    for key in ["name", "min", "max", "max_velocity", "max_acceleration"] { assert!(!joint[key].is_null(), "{key}"); }
+    for key in ["name", "min", "max", "planning_min", "planning_max", "max_velocity", "max_acceleration"] {
+        assert!(!joint[key].is_null(), "{key}");
+    }
+    assert!((d["limits"]["joints"][1]["max"].as_f64().unwrap() - 2.0944).abs() < 1e-5);
+    assert!((d["limits"]["joints"][1]["planning_max"].as_f64().unwrap() - 0.03).abs() < 1e-6);
+    assert!((d["limits"]["joints"][2]["max"].as_f64().unwrap() - 2.61799).abs() < 1e-5);
+    assert!((d["limits"]["joints"][2]["planning_max"].as_f64().unwrap() - 0.04).abs() < 1e-6);
     assert!(d["limits"]["workspace"].is_object() && d["limits"]["keepout_boxes"].is_array());
     assert!(d["limits"]["action_speed_max"]["linear_mps"].is_f64());
 

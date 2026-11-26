@@ -2531,7 +2531,7 @@ async fn phase_b_pos_force_j7_intent_only_and_approach_lock_refusal_both_owners(
                 while Instant::now() < dl {
                     h.pump_broker_replies();
                     if let Some(c) = rig.sink_replies.lock().unwrap().iter().find_map(|(_, r)| match r {
-                        Reply::Refused { request, code } if *request == req_id => Some(*code),
+                        Reply::Refused { request, code, .. } if *request == req_id => Some(*code),
                         _ => None,
                     }) {
                         refused_code = Some(c);
