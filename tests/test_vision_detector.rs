@@ -340,3 +340,174 @@ async fn vision_models_async_lifecycle_busy_and_mismatch() {
     let (s_mis, v_mis) = post_models(addr, json!({"detector": DET}), None).await;
     assert_eq!((s_mis, v_mis["code"].as_str()), (409, Some("MODEL_SWITCH_FAILED")), "{v_mis}");
 }
+
+#[tokio::test]
+async fn ambiguous_post_pending_swap_blocks_measure_and_reconciles_when_settled() {
+    let _serial = SERIAL.lock().await;
+    let p = Provider::new(&[DET, SEG384, DEPTH], DET);
+    let addr = serve(p.clone(), OperatorAuth::disabled(), ArmConfig::rebot_dm()).await;
+
+    // 1. Ambiguous 202 reply without `generation` must retain PendingSwap::Unknown so capture
+    // cannot sneak past without reconciling with the provider.
+    *p.reply.lock().unwrap() = Some((202, json!({"ok": true})));
+    let (s, v) = post_models(addr, json!({"detector": SEG384}), None).await;
+    assert_eq!((s, v["code"].as_str()), (502, Some("DETECTION_UNAVAILABLE")), "{v}");
+
+    // Synchronous admission fails closed while pending swap is unsettled.
+    let err = armd::vision_detector::try_measure_in_flight()
+        .err()
+        .expect("try_measure_in_flight must fail closed after ambiguous POST");
+    assert!(format!("{err:?}").contains("VISION_BUSY"), "{err:?}");
+
+    // While provider reports running, begin_measure refuses with VISION_BUSY.
+    p.mode.lock().unwrap()["models"]["swap"]["state"] = json!("running");
+    let err = armd::vision_detector::begin_measure(p.as_ref())
+        .await
+        .err()
+        .expect("begin_measure must reject while provider swap is running");
+    assert!(format!("{err:?}").contains("VISION_BUSY"), "{err:?}");
+
+    // Once provider settles idle, begin_measure reconciles and admits capture.
+    p.mode.lock().unwrap()["models"]["swap"]["state"] = json!("idle");
+    let _guard = armd::vision_detector::begin_measure(p.as_ref())
+        .await
+        .expect("begin_measure must succeed after provider settles idle");
+    drop(_guard);
+
+    // 2. Definitive 422 refusal clears PendingSwap::Unknown immediately (no extra reconciliation block).
+    *p.reply.lock().unwrap() = Some((400, json!({"error": "BAD_SLOT"})));
+    let (s_ref, v_ref) = post_models(addr, json!({"detector": SEG384}), None).await;
+    assert_eq!((s_ref, v_ref["code"].as_str()), (422, Some("MODEL_SWITCH_REFUSED")), "{v_ref}");
+    let _g2 = armd::vision_detector::try_measure_in_flight()
+        .expect("definitive 4xx refusal must not leave pending swap latched");
+}
+
+#[tokio::test]
+async fn vision_action_reservation_and_model_switch_mutually_exclude_both_directions() {
+    let _serial = SERIAL.lock().await;
+    let p = Provider::new(&[DET, SEG384, DEPTH], DET);
+    let addr = serve(p.clone(), OperatorAuth::disabled(), ArmConfig::rebot_dm()).await;
+
+    // 1. Active VisionActionGuard blocks both POST /api/v1/vision/models and /api/v1/vision/detector.
+    let action_guard = armd::vision_detector::try_begin_vision_action()
+        .expect("vision action reservation should succeed when idle");
+    let (s1, v1) = post_models(addr, json!({"detector": SEG384}), None).await;
+    assert_eq!((s1, v1["code"].as_str()), (409, Some("VISION_BUSY")), "{v1}");
+    let (s2, v2) = post(addr, json!({"kind": "segment"}), None).await;
+    assert_eq!((s2, v2["code"].as_str()), (409, Some("VISION_BUSY")), "{v2}");
+    assert!(p.calls.lock().unwrap().is_empty());
+    drop(action_guard);
+
+    // 2. Active model switch blocks new vision action reservation in reverse direction.
+    *p.reply.lock().unwrap() = Some((202, json!({"generation": 5})));
+    p.mode.lock().unwrap()["models"]["swap"]["state"] = json!("idle");
+    let p_bg = p.clone();
+    let req_task = tokio::spawn(async move {
+        post_models(addr, json!({"detector": SEG384}), None).await
+    });
+    for _ in 0..40 {
+        if !p_bg.calls.lock().unwrap().is_empty() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(p_bg.calls.lock().unwrap().len(), 1);
+    let err = armd::vision_detector::try_begin_vision_action()
+        .err()
+        .expect("vision action must be blocked while model switch is in progress");
+    assert!(format!("{err:?}").contains("VISION_BUSY"), "{err:?}");
+
+    {
+        let mut m = p_bg.mode.lock().unwrap();
+        m["models"]["generation"] = json!(5);
+        m["models"]["swap"]["state"] = json!("idle");
+        m["models"]["resident"]["detector"] = json!(SEG384);
+    }
+    let (s_ok, v_ok) = req_task.await.unwrap();
+    assert_eq!((s_ok, v_ok["generation"].as_u64()), (200, Some(5)), "{v_ok}");
+}
+
+#[tokio::test]
+async fn unsettled_pending_generation_blocks_grasp_preflight_even_when_old_resident_matches() {
+    let _serial = SERIAL.lock().await;
+    let p = Provider::new(&[DET, SEG384, DEPTH], DET);
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    // Leave an unsettled generation=7 swap by cancelling switch_models mid-poll.
+    *p.reply.lock().unwrap() = Some((202, json!({"generation": 7})));
+    let p_bg = p.clone();
+    let sup_bg = sup.clone();
+    let handle = tokio::spawn(async move {
+        armd::vision_detector::switch_models(&sup_bg, p_bg.as_ref(), &json!({"detector": SEG384})).await
+    });
+    for _ in 0..40 {
+        if !p.calls.lock().unwrap().is_empty() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(p.calls.lock().unwrap().len(), 1);
+    // Let execute_swap record PendingSwap::Generation(7) and enter its poll sleep before aborting.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    handle.abort();
+    let _ = handle.await;
+
+    // Provider still reports generation=0, swap=idle, resident=DET (matching the grasp request!).
+    // Grasp preflight MUST still reject with VISION_BUSY until generation >= 7 settles.
+    let mut cfg = ArmConfig::rebot_dm();
+    let setup = armd::grasp::GraspSetup::default();
+    cfg.camera_mount = armd::model::CameraMount {
+        tilt_deg: setup.camera_tilt_deg as f32,
+        ..armd::model::CameraMount::default()
+    };
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
+    let inspect = [0.0_f64, -1.167, -1.565, 1.435, 0.0, 0.0];
+    let fk0 = arm.fk(&inspect);
+    let target = armd::kinematics::Pose::new(
+        armd::grasp::look_down(&fk0.r),
+        [fk0.p[0], fk0.p[1], 0.24],
+    );
+    let lo = [-3.1, -2.05, -2.6, -3.1, -2.05, -6.2];
+    let hi = [3.1, 2.05, 2.6, 3.1, 2.05, 6.2];
+    let mut q6 = inspect;
+    for _ in 0..20 {
+        let sol = arm.solve_dls(&target, &q6, &lo, &hi, armd::kinematics::PAR.w);
+        q6 = sol.q;
+        if sol.ok { break; }
+    }
+    let start_q = vec![q6[0] as f32, q6[1] as f32, q6[2] as f32, q6[3] as f32, q6[4] as f32, q6[5] as f32, 0.0];
+    let sup_g = Arc::new(ArmSupervisor::new(cfg));
+    {
+        let mut inner = sup_g.inner().write().await;
+        inner.measured_positions = start_q.clone();
+        inner.commanded_positions = start_q;
+        let s = inner.current_admission_stamp();
+        inner.check_admission(s).and_then(armd::SupervisorInner::enable_torque).unwrap();
+        let mut setup = setup;
+        setup.tasks = serde_json::from_value(json!({
+            "pick_cube": { "models": { "detector": DET } }
+        })).unwrap();
+        setup.validate().unwrap();
+        inner.set_grasp_setup(setup);
+    }
+    let grasp_body = json!({
+        "label": "cube",
+        "box_norm": [0.45, 0.45, 0.55, 0.55],
+        "task": "pick_cube",
+    });
+    let pending = {
+        let inner = sup_g.inner().read().await;
+        armd::grasp::prepare(&inner, &grasp_body, inner.safety.epoch_id()).unwrap()
+    };
+    let mut planned = armd::grasp::plan(pending).unwrap();
+    let err = armd::grasp::preflight(p.as_ref(), &mut planned)
+        .await
+        .expect_err("grasp preflight must reject while generation=7 swap is unsettled");
+    assert!(format!("{err:?}").contains("VISION_BUSY"), "{err:?}");
+
+    // Once provider settles at generation=7 with DET resident, preflight reconciles and succeeds.
+    {
+        let mut m = p.mode.lock().unwrap();
+        m["models"]["generation"] = json!(7);
+        m["models"]["swap"]["state"] = json!("idle");
+        m["models"]["resident"]["detector"] = json!(DET);
+    }
+    armd::grasp::preflight(p.as_ref(), &mut planned)
+        .await
+        .expect("grasp preflight must succeed once generation=7 settles");
+}
