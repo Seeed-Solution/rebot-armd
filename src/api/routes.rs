@@ -767,7 +767,7 @@ mod tests {
             RouteOwnership::ExecutorRequest
         );
         assert_eq!(
-            lookup(RouteKey::ws_command("/api/v1/grasp/measure")).unwrap().ownership,
+            lookup(RouteKey::ws_command("/api/v1/action/gripper_zero_check")).unwrap().ownership,
             RouteOwnership::LegacyOnly
         );
         assert_eq!(

@@ -268,7 +268,7 @@ async fn stale_and_foreign_callers_rest_restrictions_and_legacy_semantics() {
     // with `503 EXECUTOR_ROUTING_PENDING`.
     let acq = ws_reply(&mut ws_foreign, json!({"type": "acquire_lease", "client_id": "intruder", "seq": 1}), &["lease_rejected"]).await;
     assert_eq!(acq["error"].as_str(), Some("controller_busy"), "{acq}");
-    let unmigrated = ws_reply(&mut ws_foreign, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/grasp/measure", "body": {}}), &["command_reject"]).await;
+    let unmigrated = ws_reply(&mut ws_foreign, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/action/gripper_zero_check", "body": {}}), &["command_reject"]).await;
     assert_eq!((unmigrated["status"].as_u64(), unmigrated["code"].as_str()), (Some(503), Some("EXECUTOR_ROUTING_PENDING")), "{unmigrated}");
     let spoof = ws_reply(&mut ws_foreign, json!({"type": "command", "request_id": 1, "generation": gen, "client_id": "test_controller", "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}}), &["command_reject"]).await;
     assert_eq!((spoof["status"].as_u64(), spoof["code"].as_str(), spoof["epoch_id"].as_u64()), (Some(409), Some("LEASE_LOST"), Some(ep)), "{spoof}");
