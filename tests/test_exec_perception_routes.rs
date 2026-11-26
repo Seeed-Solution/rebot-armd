@@ -746,9 +746,34 @@ async fn dual_owner_sandbox_routes_and_policy_use_exclusion() {
         assert_eq!(deact.status().as_u16(), 200);
 
         // On Executor, exercise the PolicyPackUseGate load pin + atomic transition to active run pin:
-        // deleting while loading OR while running MUST fail with 409 POLICY_IN_USE, and once the
-        // runner drops its guard, delete succeeds.
+        // - deleting while loading MUST fail with 409 POLICY_IN_USE (blocks any pack, matching legacy
+        //   `policy_loading`);
+        // - deleting the active running pack MUST fail with 409 POLICY_IN_USE, while deleting an
+        //   UNRELATED inactive pack (`pol_unrelated_2`) MUST succeed with 200 (exact Legacy parity);
+        // - once the runner drops its guard, deleting `pol_dual_1` succeeds.
         if owner == OwnerKind::Executor {
+            let unrelated_up = http
+                .post(format!("{base}/api/v1/sandbox/policies"))
+                .bearer_auth(&tok)
+                .json(&json!({
+                    "id": "pol_unrelated_2",
+                    "policy_json": {
+                        "format": "rebot-onnx-policy/v1",
+                        "id": "pol_unrelated_2",
+                        "name": "Unrelated Policy",
+                        "robot": "b601dm",
+                        "action_dim": 7,
+                        "inputs": {},
+                        "outputs": {},
+                        "model_file": "model.onnx"
+                    },
+                    "model_onnx_base64": "cG9saWN5"
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unrelated_up.status().as_u16(), 200);
+
             let load_guard = sb.try_begin_policy_load("pol_dual_1").expect("pin load");
             let del_loading = http
                 .delete(format!("{base}/api/v1/sandbox/policies/pol_dual_1"))
@@ -769,6 +794,16 @@ async fn dual_owner_sandbox_routes_and_policy_use_exclusion() {
                 .unwrap();
             assert_eq!(del_running.status().as_u16(), 409);
             assert_eq!(del_running.json::<Value>().await.unwrap()["code"], "POLICY_IN_USE");
+
+            // Unrelated inactive pack B MUST remain deletable while pack A runs (Legacy parity).
+            let del_unrelated = http
+                .delete(format!("{base}/api/v1/sandbox/policies/pol_unrelated_2"))
+                .bearer_auth(&tok)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(del_unrelated.status().as_u16(), 200);
+            assert_eq!(del_unrelated.json::<Value>().await.unwrap()["deleted"], json!(true));
             drop(run_guard);
         }
 
@@ -935,6 +970,80 @@ async fn dual_owner_calibration_sessions_and_hover_reads_with_handoff() {
             .unwrap();
         let mut arm_with_lease = hover_job_lease["arm"].clone();
         arm_with_lease.as_object_mut().unwrap().remove("at");
+
+        // On Executor: verify an executor-side hover job update survives handback to Legacy AND a
+        // second handoff back to Executor without disappearing or reverting.
+        if owner == OwnerKind::Executor {
+            drop(_ws);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let exec_job: armd::calib_hover::HoverJob = serde_json::from_value(json!({
+                "id": "exec-hover-job-2",
+                "state": "done",
+                "code": null,
+                "message": null,
+                "created_at": "2026-11-26T00:01:00.000Z",
+                "updated_at": "2026-11-26T00:01:05.000Z",
+                "candidate_fingerprint": "fp-exec",
+                "params": {
+                    "approach_speed_mps": 0.1,
+                    "descent_speed_mps": 0.05,
+                    "settle_s": 0.2,
+                    "frames": 3,
+                    "discard": 1
+                },
+                "points": [],
+                "runs": 1,
+                "end": null,
+                "action_id": null
+            }))
+            .unwrap();
+            run.sup.put_hover_job(exec_job).await;
+            run.sup
+                .handback_to_legacy(Duration::from_secs(2))
+                .await
+                .expect("handback to legacy");
+            let legacy_after: Value = http
+                .get(format!("{base}/api/v1/calibration/hover"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let ids_leg: Vec<&str> = legacy_after["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|j| j["id"].as_str())
+                .collect();
+            assert!(ids_leg.contains(&"pre-handoff-job-1"), "{ids_leg:?}");
+            assert!(ids_leg.contains(&"exec-hover-job-2"), "{ids_leg:?}");
+
+            // Second handoff back to Executor preserves both jobs.
+            let h2 = run
+                .sup
+                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+                .await
+                .expect("second start_executor");
+            wait_for_service_ready(&run.sup).await;
+            let exec_after: Value = http
+                .get(format!("{base}/api/v1/calibration/hover"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let ids_exec: Vec<&str> = exec_after["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|j| j["id"].as_str())
+                .collect();
+            assert!(ids_exec.contains(&"pre-handoff-job-1"), "{ids_exec:?}");
+            assert!(ids_exec.contains(&"exec-hover-job-2"), "{ids_exec:?}");
+            h2.stop_and_join();
+        }
 
         results.push((
             hover_no_lease["jobs"].clone(),
@@ -1243,6 +1352,34 @@ async fn dual_owner_single_view_measure_rest_and_ws_via_read_services() {
     assert_eq!(outputs[0].1["table_fit"], outputs[1].1["table_fit"]);
     assert_eq!(outputs[0].1["detections"], outputs[1].1["detections"]);
     assert_eq!(outputs[0].1["calibration"], outputs[1].1["calibration"]);
+
+    // Legacy compatibility: a legacy supervisor that ticked once manually (publish_seq == 1) with
+    // NO periodic ticker must still satisfy post-capture read_services via fresh synthesis instead
+    // of timing out with 503 OBSERVATION_UNAVAILABLE.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.camera_mount.offset_m = Some([0.0, -0.05, 0.02]);
+        let setup = cfg.grasp.clone().unwrap();
+        let cam = CamModel::assumed(&cfg.arm_model, &setup, &cfg.camera_mount);
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = common::INSPECT.to_vec();
+            inner.measured_positions = common::INSPECT.to_vec();
+            inner.target_positions = common::INSPECT.to_vec();
+        }
+        let _ = sup.tick(0.01).await; // publishes once (publish_seq == 1), no periodic ticker
+        assert!(sup.hub().published_seq() >= 1);
+        let src = SyntheticMeasureSource {
+            sup: sup.clone(),
+            cam,
+            trigger_delay_ms: AtomicU64::new(0),
+        };
+        let res = armd::depth_measure::measure(&sup, &src, &json!({"label": "cup"}))
+            .await
+            .expect("single-manual-tick legacy measure must succeed without timing out");
+        assert_eq!(res["detections"].as_array().unwrap().len(), 1);
+    }
     assert_eq!(outputs[0].1["camera"], outputs[1].1["camera"]);
 }
 
@@ -1861,8 +1998,9 @@ fn action_diag_stream_overflow_atomic_estimates_lossless_strings_and_terminal_se
     hub.drain_action_diag();
 
     hub.set_action_diag_consumer_paused_for_tests(true);
-    let mut full_seen = false;
-    for i in 0..(ACTION_DIAG_STREAM_CAP + 20) {
+    // Fill to cap - 1 so item 0 of the 2-item replacement IS admitted into the ring while item 1
+    // overflows with StreamPushError::Full — proving a partially delivered batch never commits.
+    for i in 0..(ACTION_DIAG_STREAM_CAP - 1) {
         let r = hub.push_action_diag(ActionDiagPatch {
             action_id: 20,
             kind: ActionDiagKind::Phase {
@@ -1873,14 +2011,10 @@ fn action_diag_stream_overflow_atomic_estimates_lossless_strings_and_terminal_se
                 at: Instant::now(),
             },
         });
-        if r == Err(StreamPushError::Full) {
-            full_seen = true;
-            break;
-        }
+        assert!(r.is_ok(), "slot {i} before cap-1 must succeed: {r:?}");
     }
-    assert!(full_seen, "paused consumer must trigger StreamPushError::Full");
-    // Now push a 2-item estimate replacement while ring is full -> dropped, partial batch never commits.
-    let partial_err = hub.push_action_diag(ActionDiagPatch {
+    // Item 0 of 2-item batch fits into the last free slot; item 1 overflows.
+    let item0 = hub.push_action_diag(ActionDiagPatch {
         action_id: 20,
         kind: ActionDiagKind::EstimateBatchItem {
             list: EstimateListKind::Height,
@@ -1894,7 +2028,27 @@ fn action_diag_stream_overflow_atomic_estimates_lossless_strings_and_terminal_se
             reason: None,
         },
     });
-    assert_eq!(partial_err, Err(StreamPushError::Full));
+    assert!(item0.is_ok(), "item 0 must be admitted into the ring: {item0:?}");
+    let item1 = hub.push_action_diag(ActionDiagPatch {
+        action_id: 20,
+        kind: ActionDiagKind::EstimateBatchItem {
+            list: EstimateListKind::Height,
+            batch_gen: 99,
+            index: 1,
+            total_len: 2,
+            source: ShortLabel::new_truncated("prior"),
+            value: Some(0.06),
+            used: false,
+            record_only: false,
+            reason: None,
+        },
+    });
+    assert_eq!(item1, Err(StreamPushError::Full));
+    let extra_drop = hub.push_action_diag(ActionDiagPatch {
+        action_id: 20,
+        kind: ActionDiagKind::CloseHeight { close_height_m: 0.99 },
+    });
+    assert_eq!(extra_drop, Err(StreamPushError::Full));
 
     let stats_mid = hub.action_diag_stats();
     assert!(stats_mid.dropped_full >= 2, "{stats_mid:?}");
@@ -1935,4 +2089,52 @@ fn action_diag_stream_overflow_atomic_estimates_lossless_strings_and_terminal_se
     assert_eq!(a30.approach.as_deref(), Some("direct"));
     assert_eq!(a30.approach_reason.as_deref(), Some("request"));
     assert!(a30.approach_signs.is_none());
+
+    // 5) RT terminal cutoff recorded BEFORE any reader reads:
+    //    - late patch queued after RT termination and before first reader is discarded;
+    //    - final phase timing closes at the RT terminal instant (not reader delay);
+    //    - successful `done` action includes the `"done": 0` phase_ms entry (Legacy parity).
+    let boot = Instant::now();
+    hub.set_boot_instant(boot);
+    assert!(hub
+        .push_action_diag(ActionDiagPatch {
+            action_id: 40,
+            kind: ActionDiagKind::Phase {
+                phase: ShortLabel::new_truncated("descend"),
+                progress: 0.8,
+                iteration: None,
+                error_px: None,
+                at: boot + Duration::from_millis(10),
+            },
+        })
+        .is_ok());
+    assert!(hub
+        .push_action_diag(ActionDiagPatch {
+            action_id: 40,
+            kind: ActionDiagKind::PostLift {
+                kind: PostLiftKind::Held,
+                gripper_gap_rad: None,
+            },
+        })
+        .is_ok());
+    // RT commits terminal at t = 25ms (15ms into "descend") BEFORE any off-RT reader drains!
+    hub.record_action_terminal_cutoff_rt(40, Duration::from_millis(25));
+    // A worker emits a late patch AFTER RT terminal commit and BEFORE the first reader arrives.
+    assert!(hub
+        .push_action_diag(ActionDiagPatch {
+            action_id: 40,
+            kind: ActionDiagKind::PostLift {
+                kind: PostLiftKind::Dropped,
+                gripper_gap_rad: Some(0.42),
+            },
+        })
+        .is_ok());
+    // Simulate a 60ms reader delay before attaching to the terminal ActionStatus.
+    std::thread::sleep(Duration::from_millis(60));
+    let mut a40 = blank_action_status(40, "done");
+    hub.seal_and_attach_action_diag_to_action(&mut a40);
+    assert_eq!(a40.post_lift.as_deref(), Some("held"), "late patch after RT cutoff must be dropped");
+    assert_eq!(a40.gripper_gap_rad, None);
+    assert_eq!(a40.phase_ms.get("descend"), Some(&15), "phase_ms must anchor to RT terminal edge, not reader delay: {:?}", a40.phase_ms);
+    assert_eq!(a40.phase_ms.get("done"), Some(&0), "successful done action must include done phase_ms entry");
 }
