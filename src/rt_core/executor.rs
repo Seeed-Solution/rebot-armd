@@ -1628,6 +1628,12 @@ pub struct PersistTestHooks {
     /// Runs on `armd-persist` after the owner activated a zero-check candidate and before it is
     /// renamed over the official path; `true` exits the worker there (simulated crash).
     pub after_activate_before_publish: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Fault-injection hook: fails the post-activation official rename (`<official>.pending` ->
+    /// `<official>`) once in `publish_pending`.
+    pub fail_publish_rename_once: Option<Arc<AtomicBool>>,
+    /// Fault-injection hook: fails the post-activation parent-directory fsync once in
+    /// `publish_pending` (`DirFsyncUnconfirmed`).
+    pub fail_publish_dir_sync_once: Option<Arc<AtomicBool>>,
     /// Fault-injection hook: panics in `control_thread_main` startup setup BEFORE `init_res`
     /// `catch_unwind` to verify outer unwind ownership retention.
     pub panic_in_startup_setup: bool,
@@ -8674,13 +8680,34 @@ impl ExecutorPersistBackend<'_> {
             return PublishPendingResult::Published;
         };
         let pending = crate::gripper_calib::pending_path_for(&official);
-        let (outcome, result) = match std::fs::rename(&pending, &official) {
+        let rename_res = if self
+            .hooks
+            .fail_publish_rename_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+        {
+            Err(std::io::Error::other("simulated official rename failure"))
+        } else {
+            std::fs::rename(&pending, &official)
+        };
+        let (outcome, result) = match rename_res {
             Ok(()) => {
                 self.published = true;
                 let ds = crate::persist::PendingDirSync::for_path(&official);
-                let dir_outcome = match self.hooks.dir_sync_override.as_ref() {
-                    Some(f) => ds.sync_with(|dir| f(dir)),
-                    None => ds.sync_parent_dir(),
+                let dir_outcome = if self
+                    .hooks
+                    .fail_publish_dir_sync_once
+                    .as_ref()
+                    .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+                {
+                    crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(
+                        "simulated official dir fsync failure".into(),
+                    )
+                } else {
+                    match self.hooks.dir_sync_override.as_ref() {
+                        Some(f) => ds.sync_with(|dir| f(dir)),
+                        None => ds.sync_parent_dir(),
+                    }
                 };
                 match dir_outcome {
                     crate::persist::PublishOutcome::Published => {

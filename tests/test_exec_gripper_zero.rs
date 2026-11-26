@@ -2026,8 +2026,9 @@ async fn executor_zero_check_refused_activation_leaves_official_file_and_restart
     rig.shutdown().await;
 }
 
-/// Crash after activation, before the rename: the candidate stays at `.pending`; a restart loads
-/// the old calibration and removes the stale candidate.
+/// Crash after activation, before the rename: the action fails closed (`PERSIST_FAILED`), the
+/// candidate stays at `.pending`, the hold is released, and a restart loads the old calibration
+/// and removes the stale candidate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_zero_check_crash_after_activation_restarts_with_old_and_removes_pending() {
     let crashed = Arc::new(AtomicBool::new(false));
@@ -2041,13 +2042,132 @@ async fn executor_zero_check_crash_after_activation_restarts_with_old_and_remove
     })
     .await;
     let term = run_store_check(&rig, &token, "c-crash-act").await;
-    assert_eq!(term["state"], "done", "{term}");
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "PERSIST_FAILED", "{term}");
+    assert_eq!(term["durability_confirmed"], json!(false), "{term}");
     assert!(crashed.load(Ordering::Acquire), "worker must stop between activation and rename");
+    let hold = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(hold, ConfigReply::HoldInspected { state: None, .. }),
+        "hold must be released after activation"
+    );
     let pending = armd::gripper_calib::pending_path_for(&rig.calib_path);
     assert!(pending.exists(), "candidate stays staged after the crash");
     assert_eq!(std::fs::read_to_string(&rig.calib_path).unwrap(), OLD_CALIB);
     assert_eq!(policy_after_restart(&rig.calib_path).await, old_policy);
     assert!(!pending.exists(), "startup must remove the stale candidate");
+    rig.shutdown().await;
+}
+
+/// Official rename failure after live activation: action fails closed with `PERSIST_FAILED`
+/// reporting that the old calibration remains on disk, the hold is released, `.pending` is
+/// discarded, and a restart loads the old calibration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_official_rename_failure_fails_closed_and_restart_loads_old() {
+    let (rig, token, old_policy) = old_calib_rig(|_, _| PersistTestHooks {
+        fail_publish_rename_once: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    })
+    .await;
+    let term = run_store_check(&rig, &token, "c-pub-rename-fail").await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "PERSIST_FAILED", "{term}");
+    assert_eq!(term["durability_confirmed"], json!(false), "{term}");
+    let msg = term["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("old calibration remains on disk"),
+        "expected message to state old calibration remains on disk, got: {msg}"
+    );
+    let hold = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(hold, ConfigReply::HoldInspected { state: None, .. }),
+        "hold must be released after official rename failure"
+    );
+    assert_eq!(std::fs::read_to_string(&rig.calib_path).unwrap(), OLD_CALIB);
+    let pending = armd::gripper_calib::pending_path_for(&rig.calib_path);
+    let dl = Instant::now() + Duration::from_secs(2);
+    while pending.exists() {
+        assert!(Instant::now() < dl, "unrenamed candidate must be discarded");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(policy_after_restart(&rig.calib_path).await, old_policy);
+    rig.wait_zero_check_ctx_empty("official_rename_failure").await;
+    rig.assert_zero_rt_allocs("official_rename_failure");
+    rig.shutdown().await;
+}
+
+/// Official parent-directory fsync failure after live activation and rename: action finishes `done`
+/// with `durability_confirmed=false`, warning and message stating the calibration is active but
+/// persistence is unconfirmed, the hold is released, and a restart loads the new calibration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_official_dir_sync_failure_reports_unconfirmed_and_restart_loads_new() {
+    let (rig, token, old_policy) = old_calib_rig(|_, _| PersistTestHooks {
+        fail_publish_dir_sync_once: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    })
+    .await;
+    let term = run_store_check(&rig, &token, "c-pub-dirsync-fail").await;
+    assert_eq!(term["state"], "done", "{term}");
+    assert_eq!(term["durability_confirmed"], json!(false), "{term}");
+    let warn = term["durability_warning"].as_str().unwrap_or("");
+    assert!(
+        warn.contains("active")
+            && warn.contains("unconfirmed")
+            && warn.contains("simulated official dir fsync failure"),
+        "expected unconfirmed persistence warning, got: {warn}"
+    );
+    let msg = term["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("active") && msg.contains("unconfirmed"),
+        "expected message stating value is active but persistence is unconfirmed, got: {msg}"
+    );
+    let hold = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(hold, ConfigReply::HoldInspected { state: None, .. }),
+        "hold must be released after official dir-fsync failure"
+    );
+    assert!(
+        !armd::gripper_calib::pending_path_for(&rig.calib_path).exists(),
+        ".pending must have been renamed over the official file"
+    );
+    let on_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&rig.calib_path).unwrap()).unwrap();
+    assert!(
+        (on_disk["offset_rad"].as_f64().unwrap() - 0.05).abs() < 1e-2,
+        "official file must hold new calibration: {on_disk}"
+    );
+    let restarted_policy = policy_after_restart(&rig.calib_path).await;
+    assert_ne!(restarted_policy, old_policy, "restart must load the new calibration");
+    let live_cal: Value = reqwest::Client::new()
+        .get(format!("http://{}/api/v1/gripper/calibration", rig.addr))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let live_closed = live_cal["policy"]["closed_rad"].as_f64().unwrap() as f32;
+    let live_open = live_cal["policy"]["open_rad"].as_f64().unwrap() as f32;
+    assert!(
+        (restarted_policy.0 - live_closed).abs() < 1e-5
+            && (restarted_policy.1 - live_open).abs() < 1e-5,
+        "restart policy {restarted_policy:?} must match live ({live_closed}, {live_open})"
+    );
+    rig.wait_zero_check_ctx_empty("official_dir_sync_failure").await;
+    rig.assert_zero_rt_allocs("official_dir_sync_failure");
     rig.shutdown().await;
 }
 
