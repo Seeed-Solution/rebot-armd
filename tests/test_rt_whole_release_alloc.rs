@@ -2913,3 +2913,88 @@ async fn rt_gate_tracking_rejection_braking_fallback_ramp_zero_alloc_zero_lock()
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rt_gate_tracking_fallback_error_and_candidate_retry_zero_alloc_zero_lock() {
+    use armd::rt_core::rt_gate::RtReleaseGate;
+    use armd::tracking::{
+        FallbackRamp, JointTrackingConfig, JointTrackingJoint, TrackingHistoryState,
+        TrackingStrategy,
+    };
+
+    let clock = ScriptedClock::new();
+    let (mut drv, _fail) = WakeDriver::new(7, Duration::from_millis(2), Some(clock.clone()));
+    drv.enabled = true;
+    drv.q[0] = 0.10;
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.joint_tracking = Some(JointTrackingConfig {
+        enabled: true,
+        joints: (0..6)
+            .map(|_| JointTrackingJoint {
+                strategy: TrackingStrategy::PositionLead,
+                lag_s: 0.08,
+                max_lead_rad: 0.03,
+                ..Default::default()
+            })
+            .collect(),
+    });
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    // Trigger the error path in `tracking_fallback_step_into` on `armd-control`:
+    // an out-of-limits hold pose with no prior issued positions yields
+    // `Err(FallbackStepErr::HoldOutsideLimits { .. })`, exercising error return, tracing,
+    // and `FaultDetail::formatted(FaultCode::ServoNoBrake, ...)` with zero heap allocation.
+    {
+        let mut inner = sup.inner().write().await;
+        inner.is_torqued = true;
+        inner.torque_intent = armd::supervisor::TorqueIntent::On;
+        let q_start = vec![0.10f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut q_bad_hold = vec![0.0f32; 7];
+        q_bad_hold[0] = cfg.limits[0].max_position + 10.0;
+        inner.commanded_positions = q_start.clone();
+        inner.target_positions = q_start.clone();
+        inner.measured_positions = q_start;
+        inner.tracking.last_issued_positions = None;
+        inner.tracking.last_issued_velocities = None;
+        inner.tracking.history_state = TrackingHistoryState::Unknown;
+        inner.tracking.fallback_ramp = Some(FallbackRamp {
+            hold: q_bad_hold,
+            keepout_only: false,
+            limits: cfg.limits.clone(),
+        });
+    }
+    let period_ns = 20_000_000u64;
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let gate = RtReleaseGate::new(&sup, &handle);
+    let (_, delta) = gate.run_phase("tracking_fallback_error_zero_alloc", || {
+        let mut saw_fault = false;
+        for _ in 0..5 {
+            clock.run_steps(period_ns, 1);
+            if let Some(s) = sup.hub().latest() {
+                if matches!(s.obs.safety_state, armd::safety::SafetyState::Fault(_)) {
+                    saw_fault = true;
+                    break;
+                }
+            }
+        }
+        ((), saw_fault)
+    });
+    assert!(
+        delta.is_clean(),
+        "tracking fallback error path must be zero-alloc/zero-lock: {delta:?}"
+    );
+
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+}

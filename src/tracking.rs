@@ -398,11 +398,64 @@ pub struct ValidatedFallbackScratch {
     pub done: bool,
 }
 
+/// Zero-allocation RT error for [`SupervisorInner::tracking_fallback_step_into`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FallbackStepErr {
+    InvalidInputs,
+    NeedsFreshFeedback,
+    HoldOutsideLimits { joint: u8 },
+    NoBoundedStep { joint: u8 },
+    StepOutsideLimits { joint: u8, q: f32 },
+    ExceedsDynamics { joint: u8, v: f32, max_v: f32, a: f32, max_a: f32 },
+    WorkspaceStartViolation,
+    WorkspaceStepViolation,
+    WorkspaceMeasuredViolation,
+    WorkspaceMeasuredSweepViolation,
+    NoFeasibleStep,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl core::fmt::Display for FallbackStepErr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::InvalidInputs => f.write_str("invalid tracking fallback hold, limits or dt"),
+            Self::NeedsFreshFeedback => {
+                f.write_str("tracking fallback without prior output needs fresh feedback")
+            }
+            Self::HoldOutsideLimits { joint } => {
+                write!(f, "joint {joint} fallback hold outside its limits")
+            }
+            Self::NoBoundedStep { joint } => {
+                write!(f, "joint {joint} has no bounded step toward the fallback hold")
+            }
+            Self::StepOutsideLimits { joint, q } => {
+                write!(f, "joint {joint} fallback step {q:.4} rad outside its limits")
+            }
+            Self::ExceedsDynamics { joint, v, max_v, a, max_a } => {
+                write!(
+                    f,
+                    "joint {joint} fallback step exceeds dynamics (v={v:.3}/{max_v:.3}, a={a:.3}/{max_a:.3})"
+                )
+            }
+            Self::WorkspaceStartViolation => f.write_str("fallback start violates the workspace"),
+            Self::WorkspaceStepViolation => f.write_str("fallback step violates the workspace"),
+            Self::WorkspaceMeasuredViolation => {
+                f.write_str("measured pose violates the workspace")
+            }
+            Self::WorkspaceMeasuredSweepViolation => {
+                f.write_str("fallback step from measured violates the workspace")
+            }
+            Self::NoFeasibleStep => f.write_str("no feasible tracking fallback step"),
+        }
+    }
+}
+
 /// Zero-allocation counterpart to [`PendingFallback`] for `armd-control` rejection braking.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct PendingFallbackScratch {
-    pub step: Result<ValidatedFallbackScratch, String>,
+    pub step: Result<ValidatedFallbackScratch, FallbackStepErr>,
     pub ramp: FallbackRamp,
     pub other_depths: Option<(u64, crate::kinematics::SlotBuf)>,
 }
@@ -2070,7 +2123,7 @@ impl crate::supervisor::SupervisorInner {
         fresh_meas: bool,
         budget: &mut usize,
         scratch: &mut crate::rt_core::scratch::TrackingScratch,
-    ) -> Result<ValidatedFallbackScratch, String> {
+    ) -> Result<ValidatedFallbackScratch, FallbackStepErr> {
         use crate::rt_core::scratch::{copy_into, fill_n};
 
         let dof = self.config.dof;
@@ -2080,7 +2133,7 @@ impl crate::supervisor::SupervisorInner {
             || q_hold.len() != dof
             || !q_hold.iter().all(|q| q.is_finite())
         {
-            return Err("invalid tracking fallback hold, limits or dt".into());
+            return Err(FallbackStepErr::InvalidInputs);
         }
         let arm_indices = self.config.arm_joints();
         let prev_q = prev_confirmed.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite()));
@@ -2091,22 +2144,29 @@ impl crate::supervisor::SupervisorInner {
 
         let Some(pq) = prev_q else {
             if !fresh_meas {
-                return Err("tracking fallback without prior output needs fresh feedback".into());
+                return Err(FallbackStepErr::NeedsFreshFeedback);
             }
             for &j in arm_indices.iter() {
                 let lim = &active_limits[j];
                 if q_hold[j] < lim.min_position - 1e-5 || q_hold[j] > lim.max_position + 1e-5 {
-                    return Err(format!("joint {} fallback hold outside its limits", j + 1));
+                    return Err(FallbackStepErr::HoldOutsideLimits { joint: (j + 1) as u8 });
                 }
             }
-            let ws = self.fallback_workspace_check(None, prev_ws_min_depths, q_hold, keepout_only, true, budget)?;
+            let ws = self.fallback_workspace_check_rt(
+                None,
+                prev_ws_min_depths,
+                q_hold,
+                keepout_only,
+                true,
+                budget,
+            )?;
             copy_into(&mut scratch.out_positions, q_hold);
             fill_n(&mut scratch.out_velocities, 0.0_f32, dof);
             return Ok(ValidatedFallbackScratch { ws_min_depths: ws, done: true });
         };
 
         let candidates: &[bool] = if fresh_meas { &[false, true] } else { &[true] };
-        let mut last_err: Option<String> = None;
+        let mut last_err: Option<FallbackStepErr> = None;
         for &brake_only in candidates {
             copy_into(&mut scratch.out_positions, q_hold);
             let mut feasible = true;
@@ -2121,10 +2181,7 @@ impl crate::supervisor::SupervisorInner {
                     match crate::supervisor::SupervisorInner::bounded_servo_step(pq[j], q_hold[j], pv, dt, lim) {
                         Some((q_s, _, _)) => q_s,
                         None => {
-                            last_err = Some(format!(
-                                "joint {} has no bounded step toward the fallback hold",
-                                j + 1
-                            ));
+                            last_err = Some(FallbackStepErr::NoBoundedStep { joint: (j + 1) as u8 });
                             feasible = false;
                             break;
                         }
@@ -2148,7 +2205,7 @@ impl crate::supervisor::SupervisorInner {
                     }
                 }
             }
-            if let Err(e) = Self::fallback_dynamics_ok(
+            if let Err(e) = Self::fallback_dynamics_ok_rt(
                 &arm_indices,
                 pq,
                 prev_v,
@@ -2163,7 +2220,7 @@ impl crate::supervisor::SupervisorInner {
                 .iter()
                 .any(|&j| scratch.out_positions[j].to_bits() != pq[j].to_bits());
             let check_meas = fresh_meas && (moves || !brake_only);
-            match self.fallback_workspace_check(
+            match self.fallback_workspace_check_rt(
                 Some(pq),
                 prev_ws_min_depths,
                 &scratch.out_positions,
@@ -2187,7 +2244,7 @@ impl crate::supervisor::SupervisorInner {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| String::from("no feasible tracking fallback step")))
+        Err(last_err.unwrap_or(FallbackStepErr::NoFeasibleStep))
     }
 
     /// Zero-allocation RT counterpart to [`Self::tracking_fallback_compute`].
@@ -2231,6 +2288,83 @@ impl crate::supervisor::SupervisorInner {
             ramp,
             other_depths: other_depths.clone(),
         }
+    }
+
+    /// Zero-allocation RT counterpart to [`Self::fallback_dynamics_ok`].
+    fn fallback_dynamics_ok_rt(
+        arm_indices: &[usize],
+        pq: &[f32],
+        pv: &[f32],
+        q: &[f32],
+        dt: f64,
+        active_limits: &[crate::model::JointLimit],
+    ) -> Result<(), FallbackStepErr> {
+        for &j in arm_indices {
+            let lim = &active_limits[j];
+            if !q[j].is_finite() || q[j] < lim.min_position - 1e-5 || q[j] > lim.max_position + 1e-5 {
+                return Err(FallbackStepErr::StepOutsideLimits { joint: (j + 1) as u8, q: q[j] });
+            }
+            let v = (f64::from(q[j]) - f64::from(pq[j])) / dt;
+            let a = (v - f64::from(pv[j])) / dt;
+            if !v.is_finite() || v.abs() > f64::from(lim.max_velocity) + 1e-4
+                || !a.is_finite() || a.abs() > f64::from(lim.max_acceleration) + 1e-3
+            {
+                return Err(FallbackStepErr::ExceedsDynamics {
+                    joint: (j + 1) as u8,
+                    v: v as f32,
+                    max_v: lim.max_velocity,
+                    a: a as f32,
+                    max_a: lim.max_acceleration,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Zero-allocation error-reporting RT counterpart to [`Self::fallback_workspace_check`].
+    fn fallback_workspace_check_rt(
+        &self,
+        prev: Option<&[f32]>,
+        prev_depths: Option<&(u64, crate::kinematics::SlotBuf)>,
+        q: &[f32],
+        keepout_only: bool,
+        fresh_meas: bool,
+        budget: &mut usize,
+    ) -> Result<Option<(u64, crate::kinematics::SlotBuf)>, FallbackStepErr> {
+        use crate::chain::WorkspaceEvaluator;
+        use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+        let Some((ws_full, cam)) = self.workspace_policy() else { return Ok(None) };
+        let keepout_ws = keepout_only.then(|| ws_full.keepout_only());
+        let ws = keepout_ws.as_ref().unwrap_or(ws_full);
+        if keepout_only && ws.keepout_boxes.is_empty() {
+            return Ok(prev_depths.cloned());
+        }
+        let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+        let mut committed = None;
+        if let Some(pq) = prev {
+            let mut c_prev = eval.alloc_buf();
+            eval.eval_into(pq, &mut c_prev, "tracking_fallback")
+                .map_err(|_| FallbackStepErr::WorkspaceStartViolation)?;
+            let mut min_d = match prev_depths {
+                Some((rev, md)) if *rev == self.workspace_revision && md.as_slice().len() == eval.total_slots => md.clone(),
+                _ => eval.init_min_depths(&c_prev),
+            };
+            eval.sweep_linear_step(pq, q, &c_prev, &mut min_d, budget, MAX_KEEPOUT_EVALS_PER_TICK,
+                "tracking_fallback", "tracking_fallback")
+                .map_err(|_| FallbackStepErr::WorkspaceStepViolation)?;
+            committed = Some((self.workspace_revision, min_d));
+        }
+        if !fresh_meas {
+            return Ok(committed);
+        }
+        let mut c_meas = eval.alloc_buf();
+        eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_fallback")
+            .map_err(|_| FallbackStepErr::WorkspaceMeasuredViolation)?;
+        let mut min_d_meas = eval.init_min_depths(&c_meas);
+        eval.sweep_linear_step(&self.measured_positions, q, &c_meas, &mut min_d_meas, budget,
+            MAX_KEEPOUT_EVALS_PER_TICK, "tracking_fallback", "tracking_fallback")
+            .map_err(|_| FallbackStepErr::WorkspaceMeasuredSweepViolation)?;
+        Ok(committed.or(Some((self.workspace_revision, min_d_meas))))
     }
 
     /// Joint limits, velocity and acceleration of `q` issued after `pq` at `pv`.
