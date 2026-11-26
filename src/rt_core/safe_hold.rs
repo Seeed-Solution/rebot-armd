@@ -598,7 +598,6 @@ impl SafeHoldBuffers {
                 }
                 if self.thermal_disable_started
                     && !ctrl.thermal_disable_confirmed.load(Ordering::Acquire)
-                    && ledger.rx_remaining() > 0
                 {
                     drv.sync_release_budget_limits(ledger.rx_remaining(), ledger.tx_remaining());
                     let before_poll = drv.release_budget_consumed();

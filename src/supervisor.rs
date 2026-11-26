@@ -13296,6 +13296,7 @@ impl SupervisorInner {
                     .map(|_| ())
                 };
                 let stop_proof = || self.mode_switch_stop_applied();
+                drv.set_tx_release_deadline(Some(drv_cutoff));
                 out = machine.step_with_gate_and_stop_proof_ledger(
                     drv,
                     &mut gate,
@@ -13303,6 +13304,7 @@ impl SupervisorInner {
                     budget,
                     &mut drv_ledger,
                 );
+                drv.set_tx_release_deadline(None);
                 ms_rx_used = drv_ledger.rx_used();
                 ms_rx_exhausted = drv_ledger.rx_exhausted();
                 ms_tx_used = drv_ledger.tx_used();
@@ -13315,6 +13317,11 @@ impl SupervisorInner {
             }
         }));
         self.driver = taken_drv;
+        if step_progress.is_err() {
+            if let Some(d) = self.driver.as_mut() {
+                let _ = d.try_with_mut(|drv| drv.set_tx_release_deadline(None));
+            }
+        }
         self.charge_driver_budget_after(
             release_budget,
             before_drv,
