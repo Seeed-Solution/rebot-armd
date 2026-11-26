@@ -11990,10 +11990,13 @@ mod panic_disable_tests {
                 inner.torque_transition
             );
             // Flip stub to confirm remaining joints and verify Detached disable completes cleanly.
+            // Use a generous wall-clock budget so CPU contention under parallel test runs cannot
+            // expire `budget.deadline` before `StubPendingDriver::poll_torque_budgeted` runs.
             complete_flag.store(true, Ordering::Release);
+            let now = Instant::now();
             let budget = crate::rt_core::ops::ServiceBudget {
-                now: Instant::now(),
-                deadline: Instant::now() + Duration::from_millis(2),
+                now,
+                deadline: now + Duration::from_secs(1),
                 max_rx_frames: 64,
             };
             let poll = inner
