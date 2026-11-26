@@ -644,13 +644,16 @@ impl SafeHoldBuffers {
         }
         let mut sent_hold_mask = 0u64;
         let mut unverified_mask = 0u64;
+        // A required axis whose hold frame failed (write error or `UnheldTxFailed`).
+        let mut hold_tx_failed = false;
         if hold_mask != 0 || self.gripper_is_pos_force {
             // Acknowledge any pending external E-stop/stop generations while keeping LATCH_BIT set
             // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
             self.acknowledge_stops_for_safe_hold();
             drv.set_pending_pos_force_hold_hint(true);
-            if let Ok(report) = drv.write_measured_hold_masked(hold_mask, &self.hold_targets[..dof])
-            {
+            let hold_res = drv.write_measured_hold_masked(hold_mask, &self.hold_targets[..dof]);
+            hold_tx_failed = hold_res.is_err();
+            if let Ok(report) = hold_res {
                 if report.sent_any {
                     ctrl.hold_tx_count.fetch_add(1, Ordering::Release);
                 }
@@ -662,6 +665,11 @@ impl SafeHoldBuffers {
                         }
                         crate::driver::JointHoldStatus::UnheldNoVerifiedMode if j < 64 => {
                             unverified_mask |= 1u64 << j;
+                        }
+                        crate::driver::JointHoldStatus::UnheldTxFailed
+                            if j < 64 && hold_mask & (1u64 << j) != 0 =>
+                        {
+                            hold_tx_failed = true;
                         }
                         _ => {}
                     }
@@ -696,7 +704,8 @@ impl SafeHoldBuffers {
         if all_bus_fresh {
             // Fresh feedback confirms holding only when no required axis is left without verified
             // hold output (`UnheldNoVerifiedMode`); set once per tick, never cleared then re-set.
-            ctrl.holding_unconfirmed.store(unverified_mask != 0, Ordering::Release);
+            ctrl.holding_unconfirmed
+                .store(unverified_mask != 0 || hold_tx_failed, Ordering::Release);
         }
         if let Some(ref mut sh) = shadow {
             sh.enqueue(crate::torque::shadow::ShadowInputKind::LiveHoldCheckpoint {

@@ -2478,3 +2478,39 @@ async fn mode_switch_terminal_credit_released_on_cancel_reject_close_and_handbac
     assert_eq!(exec.router_global_reserved(), 0, "handback must recover the credit");
     h.shutdown(false).await;
 }
+
+/// Round 6 Minor: fresh feedback must not clear `holding_unconfirmed` when a required axis's hold
+/// frame fails at the transport (hold-write error or `UnheldTxFailed`).
+#[test]
+fn safe_hold_keeps_holding_unconfirmed_after_hold_tx_failure() {
+    use armd::rt_core::safe_hold::{SafeHoldBuffers, SafeHoldControl};
+    use armd::supervisor::SupervisorInner;
+    let clock = MockClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let bus = configure_damiao_bus(Some(clock.clone()), Duration::from_micros(200), true, TIMEOUT_2000_COUNTS);
+    let mut drv = build_damiao_driver(bus.clone(), &cfg, 16);
+    enable_driver_sync(&mut drv, &bus, Some(&clock));
+    let mut core = SupervisorInner::new(cfg.clone());
+    core.lease_enabled = false;
+    core.measured_positions = vec![0.30, -0.25, 0.40, 0.15, -0.15, 0.10, -0.14];
+    core.feedback_numeric_valid = true;
+    let mut bufs = SafeHoldBuffers::from_config(&cfg, PERIOD_50HZ);
+    bufs.mirror_from_core(&core);
+    bufs.seed_on_entry(&core);
+    bufs.prepare_driver_on_entry(&mut drv);
+    let ctrl = SafeHoldControl::new();
+    ctrl.mark_active(SafeHoldReason::ControlPanic);
+    // J1's PosVel hold frame (0x101) fails at the transport.
+    bus.with(|s| s.fail_tx_ids = vec![0x101]);
+    for _ in 0..3 {
+        clock.advance(PERIOD_50HZ);
+        bus.with(|s| s.push_all_feedback());
+        let mut now_fn = || clock.now();
+        let dl = clock.now() + PERIOD_50HZ;
+        bufs.step_driver(&mut drv, &ctrl, dl, &mut now_fn);
+        assert!(
+            ctrl.holding_unconfirmed(),
+            "SAFE-HOLD must not report confirmed holding while J1's hold TX fails"
+        );
+    }
+}
