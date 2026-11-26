@@ -1641,6 +1641,9 @@ pub struct PersistTestHooks {
     /// Overrides [`DEFAULT_HANDBACK_PUBLISH_GATE_TIMEOUT`] for deterministic stuck-filesystem
     /// handback tests.
     pub handback_publish_gate_timeout: Option<Duration>,
+    /// Overrides the owner-side post-activation publication deadline (defaults to
+    /// [`crate::supervisor::config::CONFIG_PROPOSAL_BUDGET`], 5 s) for deterministic tests.
+    pub publish_deadline_budget: Option<Duration>,
     /// Fault-injection hook: panics in `control_thread_main` startup setup BEFORE `init_res`
     /// `catch_unwind` to verify outer unwind ownership retention.
     pub panic_in_startup_setup: bool,
@@ -1806,6 +1809,10 @@ enum OffloadReclaim {
     PolicyRun(crate::policy_runtime::PolicyRun),
     Buf(String),
     LogLegacyJ6(crate::joint_zero::ZeroConvention),
+    LogLatePublished {
+        action_id: u64,
+        outcome: &'static str,
+    },
     Observation(ArmObservation),
 }
 
@@ -3234,6 +3241,11 @@ impl OffThreadSinks {
                         if let Some(msg) = zc.message() {
                             tracing::warn!("Joint zero check: {msg}");
                         }
+                    }
+                    OffloadReclaim::LogLatePublished { action_id, outcome } => {
+                        tracing::warn!(
+                            "Ignoring late gripper calibration Published ({outcome}) for action {action_id} after publication deadline; terminal record unchanged"
+                        );
                     }
                     OffloadReclaim::DiscardZeroCheckCtx(ctx_id) => {
                         self.zero_check_contexts
@@ -6301,6 +6313,7 @@ pub(crate) fn spawn_executor(
     let control_stop = Arc::new(AtomicBool::new(false));
     let persist_stop = Arc::new(AtomicBool::new(false));
     let persist_official_untouched = Arc::new(AtomicBool::new(false));
+    let publish_timed_out_action = Arc::new(AtomicU64::new(0));
     let publish_gate = Arc::new(PublishGate::new());
     let handback_publish_gate_timeout = hooks
         .handback_publish_gate_timeout
@@ -6415,6 +6428,7 @@ pub(crate) fn spawn_executor(
         Arc::clone(&published_config),
         persist_stop.clone(),
         persist_official_untouched.clone(),
+        Arc::clone(&publish_timed_out_action),
         Arc::clone(&publish_gate),
         exited.clone(),
         persist_worker_exited.clone(),
@@ -6451,6 +6465,7 @@ pub(crate) fn spawn_executor(
         let hub_clone = hub.clone();
         let persist_wake = persist_park_thread.clone();
         let persist_official_untouched_ctrl = persist_official_untouched.clone();
+        let publish_timed_out_action_ctrl = Arc::clone(&publish_timed_out_action);
         let hooks = hooks.clone();
         let stop_requests_ctrl = stop_requests.clone();
         let closed_bitset_ctrl = Arc::clone(&closed_bitset);
@@ -6503,6 +6518,7 @@ pub(crate) fn spawn_executor(
                     offload_reclaim_tx,
                     persist_wake,
                     persist_official_untouched_ctrl,
+                    publish_timed_out_action_ctrl,
                     estop_state,
                     hub_clone,
                     hooks,
@@ -6759,13 +6775,17 @@ struct ControlState {
     persist_wake: Thread,
     persist_granted: Option<(u64, ConfigDomain)>,
     /// Action whose live policy activated on `armd-control` while `.pending` awaits publication
-    /// onto the official path (`PersistCmd::Published`).
-    persist_awaiting_publish: Option<u64>,
+    /// onto the official path (`PersistCmd::Published`), paired with its owner-side publication
+    /// deadline (`ctx.now + CONFIG_PROPOSAL_BUDGET`).
+    persist_awaiting_publish: Option<(u64, Instant)>,
     /// True from reservation / `.pending` staging until `armd-persist` begins the official
     /// rename (`<official>.pending` -> `<official>`) or the pre-activation hold is released.
     /// Tracked independently of `core.zero_check_persisting` so pre-activation failures and
     /// handback never leave a `Reconciling` hold for an untouched official file.
     persist_official_untouched: Arc<AtomicBool>,
+    /// Last action ID whose post-activation publication deadline expired on `armd-control`, so a
+    /// late `PersistCmd::Published` does not mirror text into `TerminalCaptureChannel`.
+    publish_timed_out_action: Arc<AtomicU64>,
     next_persist_req: u64,
     disconnect_code_buf: Option<String>,
     disconnect_msg_buf: Option<String>,
@@ -7575,6 +7595,53 @@ impl ControlState {
             let Ok(cmd) = self.persist_cmd_rx.pop() else { break; };
             self.handle_persist_cmd(core, ctx, cmd);
         }
+        // Bounded owner-side publication wait: if the worker stalls in official rename or
+        // parent-dir fsync past the deadline, fail the action closed with durability unconfirmed
+        // and move the GripperCalibration hold to `Reconciling` (0 alloc / 0 lock on RT).
+        if let Some((action_id, publish_deadline)) = self.persist_awaiting_publish {
+            if ctx.now >= publish_deadline {
+                self.persist_awaiting_publish = None;
+                self.persist_official_untouched.store(false, Ordering::Release);
+                self.publish_timed_out_action.store(action_id, Ordering::Release);
+                if core.zero_check_persisting == Some(action_id) {
+                    core.zero_check_persisting = None;
+                    if core
+                        .zero_check_persisting_grant
+                        .is_some_and(|(gid, _)| gid == action_id)
+                    {
+                        core.zero_check_persisting_grant = None;
+                    }
+                }
+                let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                core.core
+                    .config_mut()
+                    .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                if let Some(a) = core
+                    .last_action
+                    .as_mut()
+                    .filter(|a| a.id == action_id && a.is_running())
+                {
+                    a.durability_confirmed = Some(false);
+                }
+                const PUBLISH_TIMEOUT_MSG: &str =
+                    "Gripper calibration is active, but persistence is unconfirmed (publication timed out)";
+                let _ = core.finish_zero_check_action_in_place(
+                    action_id,
+                    "failed",
+                    "PERSIST_FAILED",
+                    PUBLISH_TIMEOUT_MSG,
+                    None,
+                    None,
+                );
+                Self::settle_zero_check_session_on_persist_end(
+                    core,
+                    action_id,
+                    false,
+                    "PERSIST_FAILED",
+                    ctx.now,
+                );
+            }
+        }
         if abandoned
             && self.persist_cmd_rx.is_empty()
             && self.pending_persist_reply.is_none()
@@ -7622,10 +7689,11 @@ impl ControlState {
                         core,
                     );
                 }
-            } else if let Some(action_id) = self.persist_awaiting_publish.take() {
+            } else if let Some((action_id, _)) = self.persist_awaiting_publish.take() {
                 // Worker exited or crashed after live activation before reporting publication:
                 // fail closed so durability is never claimed falsely. The rename may or may not
                 // have run before worker loss, so do not assert which file sits on disk.
+                self.persist_official_untouched.store(false, Ordering::Release);
                 if core.zero_check_persisting == Some(action_id) {
                     core.zero_check_persisting = None;
                 }
@@ -8200,8 +8268,13 @@ impl ControlState {
                     Ok((old_policy, old_jaw, ret_code, ret_msg)) => {
                         let activated_revision = core.gripper_calib_revision;
                         // Keep action and session running until `PersistCmd::Published` confirms
-                        // the post-activation rename and directory fsync.
-                        self.persist_awaiting_publish = Some(action_id);
+                        // the post-activation rename and directory fsync, bounded by the owner's
+                        // publication deadline (`CONFIG_PROPOSAL_BUDGET`, 5 s by default).
+                        let publish_budget = self
+                            .hooks
+                            .publish_deadline_budget
+                            .unwrap_or(crate::supervisor::config::CONFIG_PROPOSAL_BUDGET);
+                        self.persist_awaiting_publish = Some((action_id, ctx.now + publish_budget));
                         self.push_persist_reply_or_retain(
                             PersistReply::Activated {
                                 activated_revision,
@@ -8247,7 +8320,7 @@ impl ControlState {
             PersistCmd::Published { action_id, outcome } => {
                 let probe = self.take_reply_probe();
                 let (returned_msg, returned_warning) =
-                    if self.persist_awaiting_publish == Some(action_id) {
+                    if self.persist_awaiting_publish.is_some_and(|(id, _)| id == action_id) {
                         self.persist_awaiting_publish = None;
                         if core.zero_check_persisting == Some(action_id) {
                             core.zero_check_persisting = None;
@@ -8310,13 +8383,28 @@ impl ControlState {
                             }
                         }
                     } else {
-                        match outcome {
-                            PersistPublishOutcome::Published => (None, None),
-                            PersistPublishOutcome::RenameError { message } => (Some(message), None),
-                            PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
-                                (None, Some(warning))
+                        // Late `Published` after the publication deadline expired (or mismatched
+                        // action): log off-RT and never mutate the terminal record or hold.
+                        let (outcome_label, ret) = match outcome {
+                            PersistPublishOutcome::Published => ("published", (None, None)),
+                            PersistPublishOutcome::RenameError { message } => {
+                                ("rename_error", (Some(message), None))
                             }
+                            PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
+                                ("dir_fsync_unconfirmed", (None, Some(warning)))
+                            }
+                        };
+                        if self
+                            .offload_reclaim_tx
+                            .push(OffloadReclaim::LogLatePublished {
+                                action_id,
+                                outcome: outcome_label,
+                            })
+                            .is_ok()
+                        {
+                            core.core.hub().wake();
                         }
+                        ret
                     };
                 self.push_persist_reply_or_retain(
                     PersistReply::PublishedAck {
@@ -8343,6 +8431,7 @@ fn spawn_persist_worker(
     published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
     persist_official_untouched: Arc<AtomicBool>,
+    publish_timed_out_action: Arc<AtomicU64>,
     publish_gate: Arc<PublishGate>,
     control_exited: Arc<AtomicBool>,
     persist_worker_exited: Arc<AtomicBool>,
@@ -8631,6 +8720,7 @@ fn spawn_persist_worker(
                 terminal_capture: terminal_capture.as_deref(),
                 persist_stop: &persist_stop,
                 official_file_untouched: &persist_official_untouched,
+                publish_timed_out_action: &publish_timed_out_action,
                 publish_gate: &publish_gate,
                 control_exited: &control_exited,
                 hooks: &hooks,
@@ -8679,6 +8769,7 @@ struct ExecutorPersistBackend<'a> {
     terminal_capture: Option<&'a crate::supervisor::terminal_capture::TerminalCaptureChannel>,
     persist_stop: &'a Arc<AtomicBool>,
     official_file_untouched: &'a Arc<AtomicBool>,
+    publish_timed_out_action: &'a Arc<AtomicU64>,
     publish_gate: &'a Arc<PublishGate>,
     control_exited: &'a Arc<AtomicBool>,
     hooks: &'a PersistTestHooks,
@@ -8855,15 +8946,19 @@ impl ExecutorPersistBackend<'_> {
                     } => {
                         ch.mirror_action_durability_warning(*action_id, warning);
                     }
-                    PersistCmd::Published { action_id, outcome } => match outcome {
-                        PersistPublishOutcome::Published => {}
-                        PersistPublishOutcome::RenameError { message } => {
-                            ch.mirror_action_message(*action_id, message);
+                    PersistCmd::Published { action_id, outcome }
+                        if self.publish_timed_out_action.load(Ordering::Acquire) != *action_id =>
+                    {
+                        match outcome {
+                            PersistPublishOutcome::Published => {}
+                            PersistPublishOutcome::RenameError { message } => {
+                                ch.mirror_action_message(*action_id, message);
+                            }
+                            PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
+                                ch.mirror_action_durability_warning(*action_id, warning);
+                            }
                         }
-                        PersistPublishOutcome::DirFsyncUnconfirmed { warning } => {
-                            ch.mirror_action_durability_warning(*action_id, warning);
-                        }
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -9895,6 +9990,7 @@ fn control_thread_main(
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     persist_official_untouched: Arc<AtomicBool>,
+    publish_timed_out_action: Arc<AtomicU64>,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
@@ -9968,6 +10064,7 @@ fn control_thread_main(
             offload_reclaim_tx,
             persist_wake,
             persist_official_untouched,
+            publish_timed_out_action,
             estop_state,
             hub,
             hooks,
@@ -10104,6 +10201,7 @@ fn control_thread_main_inner(
     mut offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     persist_official_untouched: Arc<AtomicBool>,
+    publish_timed_out_action: Arc<AtomicU64>,
     estop_state: Arc<crate::rt_core::urgent::EstopState>,
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
@@ -10475,6 +10573,7 @@ fn control_thread_main_inner(
         persist_granted: None,
         persist_awaiting_publish: None,
         persist_official_untouched,
+        publish_timed_out_action,
         next_persist_req: 0,
         disconnect_code_buf: Some(String::with_capacity(64)),
         disconnect_msg_buf: Some(String::with_capacity(160)),
@@ -12829,6 +12928,7 @@ mod tests {
             persist_granted: Some((action_id, ConfigDomain::GripperCalibration)),
             persist_awaiting_publish: None,
             persist_official_untouched: Arc::new(AtomicBool::new(false)),
+            publish_timed_out_action: Arc::new(AtomicU64::new(0)),
             next_persist_req: 1,
             disconnect_code_buf: Some(String::from("buf")),
             disconnect_msg_buf: Some(String::from("msg")),
@@ -12939,6 +13039,7 @@ mod tests {
             persist_granted: None,
             persist_awaiting_publish: None,
             persist_official_untouched: Arc::new(AtomicBool::new(false)),
+            publish_timed_out_action: Arc::new(AtomicU64::new(0)),
             next_persist_req: 1,
             disconnect_code_buf: None,
             disconnect_msg_buf: None,
@@ -13197,6 +13298,7 @@ mod tests {
             persist_granted: None,
             persist_awaiting_publish: None,
             persist_official_untouched: Arc::new(AtomicBool::new(false)),
+            publish_timed_out_action: Arc::new(AtomicU64::new(0)),
             next_persist_req: 0,
             disconnect_code_buf: None,
             disconnect_msg_buf: None,
@@ -13374,6 +13476,7 @@ mod tests {
             persist_granted: None,
             persist_awaiting_publish: None,
             persist_official_untouched: Arc::new(AtomicBool::new(false)),
+            publish_timed_out_action: Arc::new(AtomicU64::new(0)),
             next_persist_req: 0,
             disconnect_code_buf: Some(String::with_capacity(64)),
             disconnect_msg_buf: Some(String::with_capacity(160)),

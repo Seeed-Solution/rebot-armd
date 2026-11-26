@@ -45,7 +45,7 @@ use armd::driver::{
     TorqueProgress,
 };
 use armd::model::{ArmConfig, JointState};
-use armd::rt_core::config_iface::ConfigDomain;
+use armd::rt_core::config_iface::{ConfigDomain, HoldState};
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks, RtOwner};
 use armd::rt_core::ops::PlanSlot;
 use armd::rt_core::requests::config::{ConfigReply, ConfigRequest};
@@ -3243,4 +3243,137 @@ async fn executor_zero_check_thermal_trip_and_bus_loss_report_failed_codes() {
         rig.assert_zero_rt_allocs("bus_loss");
         rig.shutdown().await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 18. Publication deadline expiry: fails closed, enters Reconciling, ignores late Published
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_zero_check_publication_deadline_expires_reconciles_and_ignores_late_published() {
+    let (at_rename_tx, at_rename_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let resume_rx = Arc::new(Mutex::new(resume_rx));
+    let (rig, token, _old_policy) = old_calib_rig(move |_, _| PersistTestHooks {
+        before_publish_rename: Some(Arc::new(move || {
+            let _ = at_rename_tx.send(());
+            let _ = resume_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+        })),
+        publish_deadline_budget: Some(Duration::from_millis(120)),
+        ..Default::default()
+    })
+    .await;
+
+    let mut ws = connect_ws(rig.addr, Some(&token)).await;
+    let gen = acquire_lease(&mut ws, "c-pub-dl", false).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+    let _ = send_cmd(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    let ep = rig.sup.get_observation().await.epoch_id;
+
+    let req_id = next_req_id();
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": req_id,
+            "generation": gen,
+            "epoch_id": ep,
+            "path": "/api/v1/action/gripper_zero_check",
+            "body": {"store_offset": true},
+        }),
+    )
+    .await;
+    let ack = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v.get("request_id").and_then(Value::as_u64) == Some(req_id) {
+                return v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let action_id = ack["action_id"].as_u64().unwrap();
+
+    // Wait until live activation succeeded and the worker stalled inside `publish_pending`.
+    tokio::task::spawn_blocking(move || at_rename_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+
+    // Without unblocking the stuck rename, the owner publication deadline (120 ms) must fire:
+    // action fails with PERSIST_FAILED + durability_confirmed=false + active/unconfirmed message,
+    // and the GripperCalibration hold moves to HoldState::Reconciling.
+    let term = wait_terminal_for_id(&mut ws, action_id, Duration::from_secs(3)).await;
+    assert_eq!(term["state"], "failed", "{term}");
+    assert_eq!(term["code"], "PERSIST_FAILED", "{term}");
+    assert_eq!(term["durability_confirmed"], json!(false), "{term}");
+    let msg = term["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("active") && msg.contains("unconfirmed"),
+        "expected message saying value is active but persistence is unconfirmed, got: {msg}"
+    );
+    let obs_before = rig.sup.get_observation().await;
+    let act_before = obs_before.action.clone().expect("terminal action present before late publish");
+    assert_eq!(act_before.id, action_id);
+    assert_eq!(act_before.state, "failed", "{act_before:?}");
+    assert_eq!(act_before.code.as_deref(), Some("PERSIST_FAILED"), "{act_before:?}");
+    assert_eq!(act_before.durability_confirmed, Some(false), "{act_before:?}");
+    let hold_before = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            hold_before,
+            ConfigReply::HoldInspected {
+                state: Some(HoldState::Reconciling),
+                ..
+            }
+        ),
+        "publication deadline expiry must move GripperCalibration hold to Reconciling"
+    );
+
+    // Now unblock the stuck worker so official rename + dir-fsync completes and sends a LATE
+    // `PersistCmd::Published` to the owner.
+    resume_tx.send(()).unwrap();
+    let dl = Instant::now() + Duration::from_secs(3);
+    while armd::gripper_calib::pending_path_for(&rig.calib_path).exists() {
+        assert!(Instant::now() < dl, "late worker rename did not complete");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Give the owner time to receive and ignore the late `PersistCmd::Published`.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Late `Published` must NEVER alter the terminal record or clear the `Reconciling` hold.
+    let obs_after = rig.sup.get_observation().await;
+    let act_after = obs_after.action.as_ref().expect("terminal action present");
+    assert_eq!(act_after.id, action_id);
+    assert_eq!(act_after.state, "failed", "{act_after:?}");
+    assert_eq!(act_after.code.as_deref(), Some("PERSIST_FAILED"), "{act_after:?}");
+    assert_eq!(act_after.durability_confirmed, Some(false), "{act_after:?}");
+    assert_eq!(act_after.message, act_before.message, "{act_after:?}");
+    assert_eq!(act_after.finished_at, act_before.finished_at, "{act_after:?}");
+
+    let hold_after = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::GripperCalibration))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            hold_after,
+            ConfigReply::HoldInspected {
+                state: Some(HoldState::Reconciling),
+                ..
+            }
+        ),
+        "late Published must not clear Reconciling hold after publication deadline expiry"
+    );
+
+    rig.wait_zero_check_ctx_empty("publish_deadline_late_published").await;
+    rig.assert_zero_rt_allocs("publish_deadline_late_published");
+    rig.shutdown().await;
 }
