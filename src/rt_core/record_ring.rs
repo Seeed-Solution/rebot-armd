@@ -71,7 +71,7 @@ unsafe impl Sync for RecordRing {}
 unsafe impl Send for RecordRing {}
 
 impl RecordRing {
-    fn new(dof: usize) -> Self {
+    pub(crate) fn new(dof: usize) -> Self {
         let slots = (0..RECORD_RING_CAPACITY)
             .map(|_| UnsafeCell::new(RecSlot { session: 0, tick_seq: 0, timestamp: 0.0, state: Vec::with_capacity(dof), action: Vec::with_capacity(dof) }))
             .collect();
@@ -160,13 +160,26 @@ impl RecordProducer {
     /// Start fence: the next pushed sample is the session's first. Allocates the ring on the
     /// first session (not in the tick); takes no mutex.
     pub fn begin(&mut self) -> u64 {
-        if self.ring.is_none() { self.ring = Some(Arc::new(RecordRing::new(self.dof))); }
+        let (session, _) = self.begin_with_ring(None);
+        session
+    }
+
+    /// Like [`begin`](Self::begin), using a caller-prepared ring allocated off the supervisor
+    /// lock on the first session so the write lock does zero ring allocation. Returns any
+    /// unused prepared ring so the caller can drop it after releasing the lock.
+    pub fn begin_with_ring(&mut self, prepared: Option<Arc<RecordRing>>) -> (u64, Option<Arc<RecordRing>>) {
+        let unused = if self.ring.is_none() {
+            self.ring = Some(prepared.unwrap_or_else(|| Arc::new(RecordRing::new(self.dof))));
+            None
+        } else {
+            prepared
+        };
         let session = self.next_session;
         self.next_session += 1;
         self.session = session;
         self.pushed = 0;
         self.dropped = 0;
-        session
+        (session, unused)
     }
 
     /// True while a session runs.

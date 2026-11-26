@@ -485,6 +485,8 @@ pub async fn load_commissioning_into(
             );
         }
     }
+    drop(inner);
+    supervisor.refresh_motion_config_cache().await;
 }
 
 /// Optional dynamics delta metadata in `tool.json` (`armd.dynamics`).

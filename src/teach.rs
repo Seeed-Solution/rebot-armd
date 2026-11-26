@@ -13,6 +13,7 @@
 //! [`MAX_EPISODE_S`]: crate::recording::store::MAX_EPISODE_S
 //! [`STOP_MIN_FREE_BYTES`]: crate::recording::store::STOP_MIN_FREE_BYTES
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::recording::store::{self, EpisodeSidecar, JointZeroStamp, StoreError};
 use crate::recording::{EpisodeState, ParquetRecordingError, RecordFrame};
+use crate::rt_core::record_ring::RecordRing;
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
 /// A recording whose owner connection closed is discarded after this.
@@ -68,6 +70,64 @@ impl Default for RecordOptions {
     }
 }
 
+/// Lock-free monitor state shared between [`ActiveRecording`] and the background monitor task so
+/// the 200 ms monitor loop never takes `SupervisorLock` during normal recording.
+#[derive(Debug)]
+pub(crate) struct RecordingMonitorState {
+    active: AtomicBool,
+    frames: AtomicUsize,
+    /// `0` = owner connected; `n >= 1` = owner disconnected at `started + (n - 1) us`.
+    owner_lost_us_plus_one: AtomicU64,
+}
+
+impl RecordingMonitorState {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+            frames: AtomicUsize::new(0),
+            owner_lost_us_plus_one: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn mark_stopped(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn note_frames(&self, count: usize) {
+        self.frames.store(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn frames(&self) -> usize {
+        self.frames.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn set_owner_lost(&self, started: Instant, lost_at: Option<Instant>) {
+        let encoded = match lost_at {
+            None => 0,
+            Some(t) => {
+                let us = t.saturating_duration_since(started).as_micros().min(u128::from(u64::MAX - 1)) as u64;
+                us + 1
+            }
+        };
+        self.owner_lost_us_plus_one.store(encoded, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn owner_lost_since(&self, started: Instant) -> Option<Instant> {
+        let encoded = self.owner_lost_us_plus_one.load(Ordering::Acquire);
+        (encoded > 0).then(|| started + Duration::from_micros(encoded - 1))
+    }
+}
+
 /// The running recording (supervisor state; the frames are in `SupervisorInner::recorder`).
 #[derive(Debug, Clone)]
 pub struct ActiveRecording {
@@ -81,6 +141,56 @@ pub struct ActiveRecording {
     pub max_frames: usize,
     /// When the owner's connection closed.
     pub owner_lost_at: Option<Instant>,
+    pub(crate) monitor: Arc<RecordingMonitorState>,
+}
+
+impl ActiveRecording {
+    #[inline]
+    pub(crate) fn note_frame_count(&self, count: usize) {
+        self.monitor.note_frames(count);
+    }
+
+    #[inline]
+    pub(crate) fn set_owner_lost(&mut self, lost_at: Option<Instant>) {
+        self.owner_lost_at = lost_at;
+        self.monitor.set_owner_lost(self.started, lost_at);
+    }
+
+    #[inline]
+    pub(crate) fn mark_stopped(&self) {
+        self.monitor.mark_stopped();
+    }
+}
+
+/// Off-lock snapshot of [`SupervisorInner::recording_status`] so HTTP/WS handlers release
+/// `SupervisorLock` before formatting JSON.
+#[derive(Debug, Clone)]
+pub struct RecordingStatusSnapshot {
+    pub recording_id: String,
+    pub owner: String,
+    pub dataset: String,
+    pub task: String,
+    pub started_at: String,
+    pub source: String,
+    pub frames: usize,
+    pub elapsed_s: f64,
+    pub owner_connected: bool,
+}
+
+impl RecordingStatusSnapshot {
+    pub fn into_json(self) -> Value {
+        json!({
+            "recording_id": self.recording_id,
+            "owner": self.owner,
+            "dataset": self.dataset,
+            "task": self.task,
+            "started_at": self.started_at,
+            "source": self.source,
+            "frames": self.frames,
+            "elapsed_s": self.elapsed_s,
+            "owner_connected": self.owner_connected,
+        })
+    }
 }
 
 /// Who asks to end the recording.
@@ -135,22 +245,72 @@ impl SupervisorInner {
         self.recorder.frame_count() + if self.core.recording_active() { self.core.record_pushed() } else { 0 }
     }
 
+    /// Snapshot of the running recording for off-lock JSON serialization.
+    pub fn recording_status_snapshot(&self) -> Option<RecordingStatusSnapshot> {
+        self.recording.as_ref().map(|r| RecordingStatusSnapshot {
+            recording_id: r.id.clone(),
+            owner: r.owner.label(),
+            dataset: r.options.dataset.clone(),
+            task: r.options.task.clone(),
+            started_at: r.recorded_at.clone(),
+            source: r.options.source.clone(),
+            frames: self.recording_frames(),
+            elapsed_s: r.started.elapsed().as_secs_f64(),
+            owner_connected: r.owner_lost_at.is_none(),
+        })
+    }
+
     /// `recording` field of `GET /api/v1/episodes` and the recorder status.
     pub fn recording_status(&self) -> Value {
-        match &self.recording {
-            None => Value::Null,
-            Some(r) => json!({
-                "recording_id": r.id, "owner": r.owner.label(), "dataset": r.options.dataset, "task": r.options.task, "started_at": r.recorded_at,
-                "source": r.options.source, "frames": self.recording_frames(), "elapsed_s": r.started.elapsed().as_secs_f64(),
-                "owner_connected": r.owner_lost_at.is_none(),
-            }),
-        }
+        self.recording_status_snapshot().map_or(Value::Null, RecordingStatusSnapshot::into_json)
     }
 }
 
 impl ArmSupervisor {
     /// Load the episode catalog (boot recovery) once; later calls do nothing.
     pub async fn ensure_episodes_loaded(&self) -> Result<Option<store::RecoveryReport>, ArmError> {
+        if self.owner_mode() == crate::supervisor::OWNER_LEGACY {
+            let legacy = {
+                let inner = self.inner().read().await;
+                if inner.detached {
+                    None
+                } else {
+                    Some((inner.calibration_quarantined, inner.episodes.clone()))
+                }
+            };
+            if let Some((quarantined, st)) = legacy {
+                if quarantined {
+                    return Err(rejected(
+                        409,
+                        "CONFIG_BUSY",
+                        "calibration is quarantined pending offline recovery; episode adoption is paused",
+                    ));
+                }
+                if !st.enabled() || st.is_loaded() {
+                    return Ok(None);
+                }
+                let (offsets, names, profile, fps) = {
+                    let inner = self.inner().read().await;
+                    if inner.calibration_quarantined {
+                        return Err(rejected(
+                            409,
+                            "CONFIG_BUSY",
+                            "calibration is quarantined pending offline recovery; episode adoption is paused",
+                        ));
+                    }
+                    (
+                        inner.joint_zero_offsets.clone(),
+                        inner.joint_names(),
+                        inner.config.profile_id.clone(),
+                        f64::from(inner.config.control_frequency_hz),
+                    )
+                };
+                let report = tokio::task::spawn_blocking(move || st.load(&offsets, &names, profile.as_deref(), fps))
+                    .await
+                    .map_err(|e| ArmError::Internal(format!("episode load failed: {e}")))??;
+                return Ok(Some(report));
+            }
+        }
         let pub_cfg = self.published_config().await?;
         if pub_cfg.calibration_quarantined {
             return Err(rejected(
@@ -191,37 +351,60 @@ impl ArmSupervisor {
         self.ensure_episodes_loaded().await?;
         // drains the recording ring off the tick: refused when it cannot run
         self.ensure_dispatcher()?;
-        let st = {
+        let (st, need_ring, dof) = {
             let inner = self.inner().read().await;
             inner.recorder_idle()?;
-            inner.episodes.clone()
+            (inner.episodes.clone(), inner.core.record_ring().is_none(), inner.config.dof)
         };
         let dataset = options.dataset.clone();
+        let st_check = st.clone();
         // file system checks without the lock (the control tick needs it)
         let (id, path) = tokio::task::spawn_blocking(move || {
-            let episode = st.new_episode(legacy_id.as_deref(), legacy_path.as_deref())?;
-            if !st.has_dataset(&dataset) { return Err(StoreError::DatasetNotFound(dataset)); }
-            st.check_capacity()?;
-            st.check_free_for_start()?;
+            let episode = st_check.new_episode(legacy_id.as_deref(), legacy_path.as_deref())?;
+            if !st_check.has_dataset(&dataset) { return Err(StoreError::DatasetNotFound(dataset)); }
+            st_check.check_capacity()?;
+            st_check.check_free_for_start()?;
             Ok::<_, StoreError>(episode)
         }).await.map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
+        // Pre-allocate the recording ring (513 heap blocks on first recording) and format the
+        // RFC 3339 start timestamp strictly off the supervisor write lock.
+        let prepared_ring = need_ring.then(|| Arc::new(RecordRing::new(dof)));
+        let recorded_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let label = owner.label();
-        {
+        let monitor_state = Arc::new(RecordingMonitorState::new());
+        let (started, max_frames, max_episode_s, monitor_st, ring_to_publish, unused_ring, prev_frames) = {
             let mut inner = self.inner().write().await;
             inner.recorder_idle()?;
-            inner.recorder.start(Some(id.clone()), Some(path))?;
-            inner.core.begin_recording();
-            let max_frames = (inner.max_episode_s * f64::from(inner.config.control_frequency_hz.max(1))).ceil() as usize + 1;
+            let prev_frames = inner.recorder.start_taking_frames(Some(id.clone()), Some(path))?;
+            let (_, ring_to_publish, unused_ring) = inner.core.begin_recording_with_ring(prepared_ring);
+            let max_episode_s = inner.max_episode_s;
+            let max_frames = (max_episode_s * f64::from(inner.config.control_frequency_hz.max(1))).ceil() as usize + 1;
+            let started = Instant::now();
+            let monitor_st = inner.episodes.clone();
             inner.recording = Some(ActiveRecording {
-                id: id.clone(), owner, options,
-                recorded_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                started: Instant::now(), joint_zero: JointZeroStamp::of(&inner.joint_zero_offsets), max_frames, owner_lost_at: None,
+                id: id.clone(),
+                owner,
+                options,
+                recorded_at,
+                started,
+                joint_zero: JointZeroStamp::of(&inner.joint_zero_offsets),
+                max_frames,
+                owner_lost_at: None,
+                monitor: Arc::clone(&monitor_state),
             });
+            (started, max_frames, max_episode_s, monitor_st, ring_to_publish, unused_ring, prev_frames)
+        };
+        if let Some(ring) = ring_to_publish {
+            self.hub().set_record_ring(ring);
         }
+        drop(unused_ring);
+        drop(prev_frames);
         tracing::info!("Recording {id} started (owner {label})");
         let lock = self.inner().clone();
         let mid = id.clone();
-        tokio::spawn(async move { monitor(lock, mid).await });
+        tokio::spawn(async move {
+            monitor(lock, mid, monitor_st, started, max_frames, max_episode_s, monitor_state).await
+        });
         Ok((id, label))
     }
 
@@ -234,18 +417,31 @@ impl ArmSupervisor {
     /// of a lost owner with the same client id. Anything else is not the owner.
     pub async fn claim_recording(&self, caller: &Caller) -> RecorderOwner {
         let me = RecorderOwner::Client { connection: caller.connection.clone(), client_id: caller.client_id.clone().unwrap_or_default() };
-        let mut inner = self.inner().write().await;
-        let Some(r) = inner.recording.as_mut() else { return me; };
-        if let RecorderOwner::Client { connection, client_id } = &mut r.owner {
-            if *connection == caller.connection { return r.owner.clone(); }
-            if r.owner_lost_at.is_some() && caller.client_id.as_deref() == Some(client_id.as_str()) {
-                *connection = caller.connection.clone();
-                r.owner_lost_at = None;
-                tracing::info!("Recording {} taken back by '{client_id}' on a new connection", r.id);
-                return r.owner.clone();
-            }
+        let (owner, reclaimed) = {
+            let mut inner = self.inner().write().await;
+            let Some(r) = inner.recording.as_mut() else { return me; };
+            let mut reclaimed: Option<(String, String)> = None;
+            let owner = if let RecorderOwner::Client { connection, client_id } = &mut r.owner {
+                if *connection == caller.connection {
+                    r.owner.clone()
+                } else if r.owner_lost_at.is_some() && caller.client_id.as_deref() == Some(client_id.as_str()) {
+                    *connection = caller.connection.clone();
+                    reclaimed = Some((r.id.clone(), client_id.clone()));
+                    let out = r.owner.clone();
+                    r.set_owner_lost(None);
+                    out
+                } else {
+                    me
+                }
+            } else {
+                me
+            };
+            (owner, reclaimed)
+        };
+        if let Some((rid, client_id)) = reclaimed {
+            tracing::info!("Recording {rid} taken back by '{client_id}' on a new connection");
         }
-        me
+        owner
     }
 
     /// A WS connection closed: a recording it owns is discarded after [`OWNER_LOST_DISCARD`]
@@ -254,15 +450,24 @@ impl ArmSupervisor {
         if self.owner_mode() != crate::supervisor::OWNER_LEGACY {
             return;
         }
-        let mut inner = self.inner().write().await;
-        if inner.detached {
-            return;
-        }
-        if let Some(r) = inner.recording.as_mut() {
-            if matches!(&r.owner, RecorderOwner::Client { connection: c, .. } if c == connection) && r.owner_lost_at.is_none() {
-                r.owner_lost_at = Some(Instant::now());
-                tracing::warn!("Owner of recording {} disconnected; discarding in {} s unless it reconnects", r.id, OWNER_LOST_DISCARD.as_secs());
+        let disconnected_id = {
+            let mut inner = self.inner().write().await;
+            if inner.detached {
+                return;
             }
+            if let Some(r) = inner.recording.as_mut() {
+                if matches!(&r.owner, RecorderOwner::Client { connection: c, .. } if c == connection) && r.owner_lost_at.is_none() {
+                    r.set_owner_lost(Some(Instant::now()));
+                    Some(r.id.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(rid) = disconnected_id {
+            tracing::warn!("Owner of recording {rid} disconnected; discarding in {} s unless it reconnects", OWNER_LOST_DISCARD.as_secs());
         }
     }
 
@@ -311,6 +516,12 @@ impl ArmSupervisor {
     }
 
     pub async fn episode_store(&self) -> crate::recording::EpisodeStore {
+        if self.owner_mode() == crate::supervisor::OWNER_LEGACY {
+            let inner = self.inner().read().await;
+            if !inner.detached {
+                return inner.episodes.clone();
+            }
+        }
         if let Ok(pub_cfg) = self.published_config().await {
             return pub_cfg.episodes.clone();
         }
@@ -367,11 +578,13 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                 if recording != &r.id { return Err(rejected(409, "RECORDING_REPLACED", "the monitored recording ended; another one runs")); }
             }
             if !save {
-                inner.recorder.discard()?;
+                let prev_frames = inner.recorder.discard_taking_frames()?;
+                r.mark_stopped();
                 inner.recording = None;
                 // stop fence; the ring's samples are dropped after the guard is released
                 let fence = inner.core.end_recording();
                 drop(inner);
+                drop(prev_frames);
                 if let Err(e) = collect_fence(fence).await { tracing::warn!("{e}"); }
                 tracing::info!("Recording {} discarded", r.id);
                 return Ok(Stopped::Discarded);
@@ -381,6 +594,7 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
             let (path, direct) = inner.recorder.begin_finalize()?;
             // stop fence: the ticks up to here; the frames are collected without the guard
             let fence = inner.core.end_recording();
+            r.mark_stopped();
             inner.recording = None;
             let base = (
                 inner.joint_names(),
@@ -399,7 +613,8 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                 Ok(done) => (done.frames, done.dropped),
                 Err(e) => {
                     // the recorder is finalizing: end it as failed so a new recording can start
-                    lock.write().await.recorder.finish_save(Vec::new(), Err(ParquetRecordingError::Io(std::io::Error::other(e.to_string()))))?;
+                    let err_for_recorder = ParquetRecordingError::Io(std::io::Error::other(e.to_string()));
+                    lock.write().await.recorder.finish_save_count(0, Err(err_for_recorder))?;
                     return Err(e);
                 }
             },
@@ -423,46 +638,62 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
             frames_dropped: (dropped > 0).then_some(dropped),
         };
         let sc = sidecar.clone();
-        let (frames, result) = tokio::task::spawn_blocking(move || {
+        let (frame_count, result) = tokio::task::spawn_blocking(move || {
             let result = st.write_episode(&sc, &frames, writer);
-            (frames, result)
-        }).await.unwrap_or_else(|e| (Vec::new(), Err(StoreError::Io(std::io::Error::other(format!("recording writer panicked: {e}"))))));
+            let frame_count = frames.len();
+            // Drop the frame buffer on the blocking thread so the write lock never frees
+            // thousands of `RecordFrame` allocations on the next start/discard.
+            drop(frames);
+            (frame_count, result)
+        }).await.unwrap_or_else(|e| (0, Err(StoreError::Io(std::io::Error::other(format!("recording writer panicked: {e}"))))));
         let parquet_result = match &result {
             Ok(_) => Ok(()),
             Err(StoreError::Parquet(e)) => Err(ParquetRecordingError::Corrupted(e.to_string())),
             Err(e) => Err(ParquetRecordingError::Io(std::io::Error::other(e.to_string()))),
         };
-        lock.write().await.recorder.finish_save(frames, parquet_result)?;
+        lock.write().await.recorder.finish_save_count(frame_count, parquet_result)?;
         let path = result?;
         tracing::info!("Recording {} saved ({} frames, {:.1} s{})", rec.id, sidecar.frames, sidecar.duration_s, if truncated { ", truncated" } else { "" });
         Ok(Stopped::Saved { sidecar: Box::new(sidecar), path })
     }
 
 /// Stops the recording `id` at the length cap or on low space, discards it after its owner
-/// left. Ends when the recording ends.
-async fn monitor(lock: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>, id: String) {
+/// left. Ends when the recording ends. Polls lock-free atomics instead of `SupervisorLock`
+/// so normal recording never contends with the real-time control tick.
+async fn monitor(
+    lock: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>,
+    id: String,
+    st: store::EpisodeStore,
+    started: Instant,
+    max_frames: usize,
+    max_episode_s: f64,
+    state: Arc<RecordingMonitorState>,
+) {
     let mut last_space: Option<Instant> = None;
     loop {
         tokio::time::sleep(MONITOR_PERIOD).await;
-        let (full, lost, st) = {
-            let inner = lock.read().await;
-            let Some(r) = inner.recording.as_ref().filter(|r| r.id == id) else { return; };
-            let full = inner.recording_frames() >= r.max_frames || r.started.elapsed().as_secs_f64() >= inner.max_episode_s + 1.0;
-            (full, r.owner_lost_at.is_some_and(|t| t.elapsed() >= OWNER_LOST_DISCARD), inner.episodes.clone())
-        };
+        if !state.is_active() || Arc::strong_count(&state) <= 1 {
+            return;
+        }
+        let full = state.frames() >= max_frames || started.elapsed().as_secs_f64() >= max_episode_s + 1.0;
+        let lost = state.owner_lost_since(started).is_some_and(|t| t.elapsed() >= OWNER_LOST_DISCARD);
         let action = if lost {
             Some((false, "owner_lost"))
         } else if full {
             Some((true, "max_duration"))
         } else if last_space.is_none_or(|t| t.elapsed() >= SPACE_CHECK_PERIOD) {
             last_space = Some(Instant::now());
-            let free = tokio::task::spawn_blocking(move || st.free_bytes()).await.ok().flatten();
+            let st_bg = st.clone();
+            let free = tokio::task::spawn_blocking(move || st_bg.free_bytes()).await.ok().flatten();
             free.filter(|f| *f < store::STOP_MIN_FREE_BYTES).map(|_| (true, "low_space"))
-        } else { None };
+        } else {
+            None
+        };
         let Some((save, reason)) = action else { continue; };
-        // only this recording: a newer one is not touched (stop_recording checks it again
-        // under the write guard)
-        if !lock.read().await.recording.as_ref().is_some_and(|r| r.id == id) { return; }
+        if !state.is_active() || Arc::strong_count(&state) <= 1 {
+            return;
+        }
+        // only this recording: stop_recording verifies `recording == &r.id` under the write guard
         match stop_recording(&lock, Stopper::Monitor { reason, recording: id.clone() }, save, None, None).await {
             Ok(_) => tracing::warn!("Recording {id} {} by armd ({reason})", if save { "saved" } else { "discarded" }),
             Err(e) => tracing::warn!("Recording {id}: stop ({reason}) failed: {e}"),
@@ -539,8 +770,8 @@ pub async fn lease_free(sup: &Arc<ArmSupervisor>, caller: &Caller, path: &str, b
             match sup.stop_recording_as(Stopper::Owner(owner), save, outcome.as_deref(), None).await? {
                 Stopped::Discarded => Ok(json!({"discarded": true})),
                 Stopped::Saved { sidecar, .. } => {
-                    let inner = sup.inner().read().await;
-                    Ok(json!({"episode": inner.episodes.view(&sidecar.id, &inner.joint_zero_offsets)}))
+                    let offsets = sup.inner().read().await.joint_zero_offsets.clone();
+                    Ok(json!({"episode": st.view(&sidecar.id, &offsets)}))
                 }
             }
         }

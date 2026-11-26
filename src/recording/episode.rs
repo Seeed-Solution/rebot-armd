@@ -44,6 +44,7 @@ pub struct EpisodeRecorder {
     episode_id: String,
     output_path: PathBuf,
     frames: Vec<RecordFrame>,
+    saved_frame_count: usize,
 }
 
 impl Default for EpisodeRecorder {
@@ -53,6 +54,7 @@ impl Default for EpisodeRecorder {
             episode_id: String::new(),
             output_path: PathBuf::new(),
             frames: Vec::new(),
+            saved_frame_count: 0,
         }
     }
 }
@@ -67,7 +69,7 @@ impl EpisodeRecorder {
     }
 
     pub fn frame_count(&self) -> usize {
-        self.frames.len()
+        self.frames.len() + self.saved_frame_count
     }
 
     pub fn episode_id(&self) -> &str {
@@ -84,6 +86,17 @@ impl EpisodeRecorder {
         episode_id: Option<String>,
         output_path: Option<PathBuf>,
     ) -> Result<(), RecordingError> {
+        let _ = self.start_taking_frames(episode_id, output_path)?;
+        Ok(())
+    }
+
+    /// Start a new recording session, returning any previously buffered frames so the caller
+    /// can drop them after releasing the supervisor write lock.
+    pub fn start_taking_frames(
+        &mut self,
+        episode_id: Option<String>,
+        output_path: Option<PathBuf>,
+    ) -> Result<Vec<RecordFrame>, RecordingError> {
         if self.state == EpisodeState::Recording || self.state == EpisodeState::Finalizing {
             return Err(RecordingError::InvalidState {
                 action: "start".to_string(),
@@ -101,9 +114,10 @@ impl EpisodeRecorder {
 
         self.episode_id = id;
         self.output_path = path;
-        self.frames.clear();
+        let prev = std::mem::take(&mut self.frames);
+        self.saved_frame_count = 0;
         self.state = EpisodeState::Recording;
-        Ok(())
+        Ok(prev)
     }
 
     /// Append a single telemetry/action frame during recording
@@ -136,6 +150,7 @@ impl EpisodeRecorder {
         }
 
         self.state = EpisodeState::Finalizing;
+        self.saved_frame_count = 0;
         Ok((self.output_path.clone(), std::mem::take(&mut self.frames)))
     }
 
@@ -146,6 +161,7 @@ impl EpisodeRecorder {
             return Err(RecordingError::InvalidState { action: "save".to_string(), state: self.state.clone() });
         }
         self.state = EpisodeState::Finalizing;
+        self.saved_frame_count = 0;
         Ok((self.output_path.clone(), std::mem::take(&mut self.frames)))
     }
 
@@ -156,6 +172,28 @@ impl EpisodeRecorder {
         result: Result<(), ParquetRecordingError>,
     ) -> Result<PathBuf, RecordingError> {
         self.frames = frames;
+        self.saved_frame_count = 0;
+        match result {
+            Ok(()) => {
+                self.state = EpisodeState::Committed;
+                Ok(self.output_path.clone())
+            }
+            Err(e) => {
+                self.state = EpisodeState::Discarded;
+                Err(RecordingError::Parquet(e))
+            }
+        }
+    }
+
+    /// Second half of a save when the caller already dropped the frames off-lock: records the
+    /// saved frame count and write outcome without transferring or freeing `Vec<RecordFrame>`
+    /// under the supervisor lock.
+    pub fn finish_save_count(
+        &mut self,
+        frame_count: usize,
+        result: Result<(), ParquetRecordingError>,
+    ) -> Result<PathBuf, RecordingError> {
+        self.saved_frame_count = frame_count;
         match result {
             Ok(()) => {
                 self.state = EpisodeState::Committed;
@@ -170,6 +208,13 @@ impl EpisodeRecorder {
 
     /// Discard the current recording and drop buffered frames
     pub fn discard(&mut self) -> Result<(), RecordingError> {
+        let _ = self.discard_taking_frames()?;
+        Ok(())
+    }
+
+    /// Discard the current recording and return any buffered frames so the caller can drop
+    /// them after releasing the supervisor write lock.
+    pub fn discard_taking_frames(&mut self) -> Result<Vec<RecordFrame>, RecordingError> {
         if self.state != EpisodeState::Recording {
             return Err(RecordingError::InvalidState {
                 action: "discard".to_string(),
@@ -177,8 +222,9 @@ impl EpisodeRecorder {
             });
         }
 
-        self.frames.clear();
+        let prev = std::mem::take(&mut self.frames);
+        self.saved_frame_count = 0;
         self.state = EpisodeState::Discarded;
-        Ok(())
+        Ok(prev)
     }
 }

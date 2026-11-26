@@ -12014,13 +12014,22 @@ impl SupervisorInner {
         if self.recording_frame_room() {
             if self.core.recording_active() {
                 let seq = self.core.published_seq() + 1;
-                self.core.record_sample(seq, timestamp, &self.measured_positions, &self.commanded_positions);
+                if self.core.record_sample(seq, timestamp, &self.measured_positions, &self.commanded_positions) {
+                    let count = self.recording_frames();
+                    if let Some(r) = &self.recording {
+                        r.note_frame_count(count);
+                    }
+                }
             } else {
                 self.recorder.append_frame(RecordFrame {
                     timestamp,
                     observation_state: self.measured_positions.clone(),
                     action: self.commanded_positions.clone(),
                 });
+                let count = self.recording_frames();
+                if let Some(r) = &self.recording {
+                    r.note_frame_count(count);
+                }
             }
         }
 
@@ -13289,6 +13298,7 @@ impl ArmSupervisor {
         #[cfg(feature = "policy-runtime")]
         hub.attach_policy_diag_seal(atomic_diag_sealed_policy_action_id.clone());
         hub.update_prep_env(Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner)));
+        hub.set_legacy_motion_config(Arc::new(crate::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner)));
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
         let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
         static NEXT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -13855,9 +13865,12 @@ impl ArmSupervisor {
     pub async fn check_episode_delete_allowed(&self, id: &str) -> Result<(), ArmError> {
         use crate::rt_core::requests::config::{ConfigReply, ConfigRequest};
         if self.owner_mode() == OWNER_LEGACY {
-            let inner = self.inner.read().await;
-            inner.episode_delete_allowed(id)?;
-            if inner.episodes.is_pinned(id) {
+            let store = {
+                let inner = self.inner.read().await;
+                inner.episode_delete_allowed(id)?;
+                inner.episodes.clone()
+            };
+            if store.is_pinned(id) {
                 return Err(ArmError::detailed(
                     409,
                     "IN_USE",
@@ -15862,6 +15875,9 @@ impl ArmSupervisor {
         inner.install_driver(drv);
         inner.bump_motion_config_revision();
         inner.refresh_schema_cache();
+        let motion_cfg = Arc::new(crate::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner));
+        drop(inner);
+        self.hub.set_legacy_motion_config_if_newer(motion_cfg);
         Ok(())
     }
 
@@ -15870,6 +15886,7 @@ impl ArmSupervisor {
     }
 
     pub fn with_driver(self, mut driver: Box<dyn ArmDriver>) -> Self {
+        let mut motion_cfg = None;
         if let Ok(mut inner) = self.inner.try_write() {
             #[cfg(not(target_arch = "wasm32"))]
             let replaceable = inner.driver.is_none()
@@ -15891,7 +15908,13 @@ impl ArmSupervisor {
                 inner.install_driver(driver);
                 inner.bump_motion_config_revision();
                 inner.refresh_schema_cache();
+                motion_cfg = Some(Arc::new(
+                    crate::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner),
+                ));
             }
+        }
+        if let Some(mc) = motion_cfg {
+            self.hub.set_legacy_motion_config_if_newer(mc);
         }
         self
     }
@@ -17742,6 +17765,83 @@ impl ArmSupervisor {
         }
     }
 
+    /// Refreshes the legacy owner's off-lock [`MotionConfigSnapshot`] cached on `StateHub` after
+    /// startup loaders so the first legacy WS motion command hits the cache without cloning
+    /// `ArmConfig` inside `SupervisorLock::write()`. Never writes to the executor's `motion_config`.
+    pub async fn refresh_motion_config_cache(&self) {
+        if self.owner_mode() != OWNER_LEGACY {
+            return;
+        }
+        let mc = {
+            let inner = self.inner.read().await;
+            if inner.detached {
+                return;
+            }
+            Arc::new(crate::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner))
+        };
+        self.hub.set_legacy_motion_config_if_newer(mc);
+    }
+
+    /// Returns the legacy owner's cached [`MotionConfigSnapshot`], performing a zero-alloc
+    /// stack copy of updated joint limits and revisions off-lock if `motion_config_revision`
+    /// advanced (for example after `commit_driver_limits_bounded`) so Lock #1 never deep-clones
+    /// `ArmConfig`.
+    pub(crate) async fn get_fresh_legacy_motion_config(
+        &self,
+    ) -> Option<Arc<crate::rt_core::requests::motion::MotionConfigSnapshot>> {
+        let cur = self.hub.legacy_motion_config()?;
+        let pub_revs = self
+            .hub
+            .latest()
+            .map(|s| (s.rt.workspace_revision, s.rt.motion_config_revision));
+        let Some((ws_rev, mc_rev)) = pub_revs else {
+            return Some(cur);
+        };
+        if cur.workspace_revision == ws_rev && cur.motion_config_revision == mc_rev {
+            return Some(cur);
+        }
+        if cur.workspace_revision == ws_rev {
+            let stack_patch = {
+                let inner = self.inner.read().await;
+                if inner.detached || inner.workspace_revision != ws_rev {
+                    None
+                } else {
+                    let dof = inner.config.limits.len().min(crate::model::MAX_MOTION_DOF);
+                    let mut lims = [(0.0f32, 0.0f32, 0.0f32); crate::model::MAX_MOTION_DOF];
+                    for (slot, l) in lims.iter_mut().zip(inner.config.limits.iter().take(dof)) {
+                        *slot = (l.min_position, l.max_position, l.max_velocity);
+                    }
+                    Some((
+                        dof,
+                        lims,
+                        inner.motion_config_revision,
+                        inner.driver.is_some(),
+                        inner.driver_caps,
+                        inner.config.active_tool.commissioning_required,
+                    ))
+                }
+            };
+            if let Some((dof, lims, live_mc_rev, driver_present, driver_caps, comm_req)) = stack_patch {
+                let mut next = (*cur).clone();
+                if next.config.limits.len() == dof {
+                    for (l, &(mn, mx, vel)) in next.config.limits.iter_mut().zip(lims.iter().take(dof)) {
+                        l.min_position = mn;
+                        l.max_position = mx;
+                        l.max_velocity = vel;
+                    }
+                }
+                next.motion_config_revision = live_mc_rev;
+                next.driver_present = driver_present;
+                next.driver_caps = driver_caps;
+                next.config.active_tool.commissioning_required = comm_req;
+                let arc = Arc::new(next);
+                self.hub.set_legacy_motion_config_if_newer(Arc::clone(&arc));
+                return Some(arc);
+            }
+        }
+        Some(cur)
+    }
+
     pub async fn set_motion_plan_deadline(&self, deadline: Duration) {
         let mut inner = self.inner.write().await;
         if self.check_legacy_under_guard(&inner).is_ok() {
@@ -17758,11 +17858,23 @@ impl ArmSupervisor {
         use crate::rt_core::requests::motion as req;
         const MAX_RETRIES: usize = 5;
         let request_at = Instant::now();
-        let mut snapshot = {
+        let cached_cfg = self.get_fresh_legacy_motion_config().await;
+        let (mut snapshot, cache_hit) = {
             let inner = self.inner.read().await;
             self.check_legacy_under_guard(&inner)?;
-            req::preflight_motion_request_at(&inner, stamp, &request, epoch_id, request_at)?
+            req::preflight_motion_request_at_with_config(
+                &inner,
+                stamp,
+                &request,
+                epoch_id,
+                request_at,
+                cached_cfg.as_ref(),
+            )?
         };
+        drop(cached_cfg);
+        if !cache_hit {
+            self.hub.set_legacy_motion_config_if_newer(Arc::clone(&snapshot.config));
+        }
         for attempt in 0..MAX_RETRIES {
             let (snap_plan, req_plan) = (snapshot.clone(), request.clone());
             let prepared = tokio::task::spawn_blocking(move || req::prepare_motion(&snap_plan, &req_plan))
@@ -18494,6 +18606,7 @@ impl ArmSupervisor {
 
     async fn run_watchdog_park_off_lock_inner(
         sup_inner: Arc<SupervisorLock<SupervisorInner>>,
+        hub: Arc<crate::rt_core::publish::StateHub>,
         planning_flag: Arc<AtomicBool>,
         generation: u64,
     ) -> bool {
@@ -18505,15 +18618,20 @@ impl ArmSupervisor {
         let _guard = ResetOnDrop(planning_flag);
         const MAX_RETRIES: usize = 5;
         for attempt in 0..MAX_RETRIES {
-            let snap = {
+            let cached_cfg = hub.legacy_motion_config();
+            let (snap, cache_hit) = {
                 let inner = sup_inner.read().await;
                 if inner.detached
                     || !inner.watchdog_park_pending.is_some_and(|p| p.generation == generation && !p.waiting_mit_handback)
                 {
                     return false;
                 }
-                req::MotionPlanSnapshot::from_supervisor(&inner)
+                req::MotionPlanSnapshot::from_supervisor_with_cached_config(&inner, cached_cfg.as_ref())
             };
+            drop(cached_cfg);
+            if !cache_hit {
+                hub.set_legacy_motion_config_if_newer(Arc::clone(&snap.config));
+            }
             let planned = tokio::task::spawn_blocking(move || req::prepare_motion(&snap, &req::MotionRequest::park())).await;
             let mut inner = sup_inner.write().await;
             if inner.detached
@@ -18736,9 +18854,10 @@ impl ArmSupervisor {
         if let Some(wd) = pending_wd {
             if self.watchdog_park_planning.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 let sup_inner = Arc::clone(&self.inner);
+                let hub = Arc::clone(&self.hub);
                 let planning_flag = Arc::clone(&self.watchdog_park_planning);
                 if keep {
-                    if Self::run_watchdog_park_off_lock_inner(sup_inner, planning_flag, wd.generation).await {
+                    if Self::run_watchdog_park_off_lock_inner(sup_inner, hub, planning_flag, wd.generation).await {
                         let inner = self.inner.read().await;
                         if !inner.detached {
                             obs = Some(inner.current_observation());
@@ -18746,7 +18865,7 @@ impl ArmSupervisor {
                     }
                 } else {
                     tokio::spawn(async move {
-                        Self::run_watchdog_park_off_lock_inner(sup_inner, planning_flag, wd.generation).await;
+                        Self::run_watchdog_park_off_lock_inner(sup_inner, hub, planning_flag, wd.generation).await;
                     });
                 }
             }

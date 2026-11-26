@@ -67,6 +67,9 @@ pub struct HoldRecord {
     pub voluntary_csw: u32,
     /// Involuntary context switches (`ru_nivcsw`) while the guard was held (opt-in history on Linux).
     pub involuntary_csw: u32,
+    /// True only for the control tick's own write guard recorded via
+    /// [`SupervisorLock::record_tick_hold_for_history`].
+    pub is_control_tick: bool,
 }
 
 impl HoldRecord {
@@ -386,6 +389,7 @@ impl<T> SupervisorLock<T> {
                     cpu_hold,
                     voluntary_csw,
                     involuntary_csw,
+                    is_control_tick: true,
                 });
         }
     }
@@ -448,6 +452,7 @@ impl Timing {
             cpu_hold,
             voluntary_csw,
             involuntary_csw,
+            is_control_tick: false,
         }
     }
 }

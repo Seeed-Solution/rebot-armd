@@ -67,8 +67,55 @@ pub(super) struct PendingMotion {
     reply_kind: MotionReplyKind,
     request: req::MotionRequest,
     snapshot: req::MotionPlanSnapshot,
+    cache_hit: bool,
     epoch: u64,
     generation: u64,
+}
+
+/// Off-lock parsed motion / preset request carried into Lock #1 so WS JSON parsing and
+/// target vector allocation never execute under `SupervisorLock::write()`.
+pub(super) enum PreparsedMotion {
+    Command(Result<req::MotionRequest, ApiError>),
+    Preset {
+        name: String,
+        parsed: Result<req::MotionRequest, ApiError>,
+    },
+}
+
+/// Parse jog/home/unload/preset frames strictly off `SupervisorLock`.
+pub(super) fn preparse_motion_frame(
+    frame_kind: FrameKind,
+    path: Option<&str>,
+    value: &Value,
+) -> Option<PreparsedMotion> {
+    match frame_kind {
+        FrameKind::Command => {
+            let p = path?;
+            if matches!(p, "/api/v1/motion/jog" | "/api/v1/motion/home" | "/api/v1/motion/unload") {
+                Some(PreparsedMotion::Command(parse_motion_command(p, &value["body"])))
+            } else {
+                None
+            }
+        }
+        FrameKind::Preset => {
+            let name = value.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let parsed = parse_preset_request(name.as_str(), value);
+            Some(PreparsedMotion::Preset { name, parsed })
+        }
+        _ => None,
+    }
+}
+
+fn parse_preset_request(name: &str, value: &Value) -> Result<req::MotionRequest, ApiError> {
+    match name {
+        "home" => Ok(req::MotionRequest::home(None)),
+        "park" | "unload" => Ok(req::MotionRequest::park()),
+        _ => {
+            let speed_scale = crate::motion::num(value, "speed_scale").map_err(ArmError::from)?;
+            let target = positions(value.get("positions"))?;
+            Ok(req::MotionRequest::jog(target, None, speed_scale))
+        }
+    }
 }
 
 fn format_motion_ack_from_snap(snap: &AckSnapshot, kind: &MotionReplyKind, started: Started) -> Value {
@@ -125,37 +172,59 @@ fn dispatch_preset(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     if ctx.inner.calibration_busy {
         return Some(OwnerReply::PresetCalibrationBusy { epoch: ctx.epoch });
     }
-    let name = ctx.value.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-    let parsed = match name.as_str() {
-        "home" => Ok(req::MotionRequest::home(None)),
-        "park" | "unload" => Ok(req::MotionRequest::park()),
-        _ => (|| -> Result<req::MotionRequest, ApiError> {
-            let speed_scale = crate::motion::num(ctx.value, "speed_scale").map_err(ArmError::from)?;
-            let target = positions(ctx.value.get("positions"))?;
-            Ok(req::MotionRequest::jog(target, None, speed_scale))
-        })(),
-    };
-    let request = match parsed {
-        Ok(r) => r,
-        Err(error) => {
-            return Some(OwnerReply::PresetReject {
+    // Borrow `Ok(request)` during preflight so any rejected target vector stays owned outside
+    // `SupervisorLock::write()` and is never freed inside the guard.
+    match ctx.preparsed_motion.as_ref() {
+        Some(PreparsedMotion::Preset { name, parsed: Ok(request) }) => {
+            match req::preflight_motion_request_at_with_config(
+                ctx.inner,
+                ctx.stamp,
+                request,
+                Some(ctx.epoch),
+                ctx.received_at,
+                ctx.cached_motion_cfg,
+            ) {
+                Ok((snapshot, cache_hit)) => {
+                    let Some(PreparsedMotion::Preset { name, parsed: Ok(request) }) = ctx.preparsed_motion.take() else {
+                        unreachable!("preparsed preset request validated above");
+                    };
+                    let reply_kind = MotionReplyKind::Preset { name };
+                    *ctx.pending_motion = Some(PendingMotion {
+                        command_path: "preset",
+                        reply_kind,
+                        request,
+                        snapshot,
+                        cache_hit,
+                        epoch: ctx.epoch,
+                        generation: ctx.local_generation,
+                    });
+                    None
+                }
+                Err(e) => Some(OwnerReply::PresetReject {
+                    epoch: ctx.inner.safety.epoch_id(),
+                    name: name.clone(),
+                    error: e.into(),
+                }),
+            }
+        }
+        Some(PreparsedMotion::Preset { parsed: Err(_), .. }) => {
+            let Some(PreparsedMotion::Preset { name, parsed: Err(error) }) = ctx.preparsed_motion.take() else {
+                unreachable!("preparsed preset error matched above");
+            };
+            Some(OwnerReply::PresetReject {
                 epoch: ctx.inner.safety.epoch_id(),
                 name,
                 error,
-            });
+            })
         }
-    };
-    match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
-        Ok(snapshot) => {
-            let reply_kind = MotionReplyKind::Preset { name };
-            *ctx.pending_motion = Some(PendingMotion { command_path: "preset", reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
-            None
+        _ => {
+            let name = ctx.value.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            Some(OwnerReply::PresetReject {
+                epoch: ctx.inner.safety.epoch_id(),
+                name,
+                error: invalid_command("Missing preparsed preset request"),
+            })
         }
-        Err(e) => Some(OwnerReply::PresetReject {
-            epoch: ctx.inner.safety.epoch_id(),
-            name,
-            error: e.into(),
-        }),
     }
 }
 
@@ -185,30 +254,58 @@ fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply>
             },
         });
     }
-    let request = match parse_motion_command(ctx.path, &ctx.value["body"]) {
-        Ok(r) => r,
-        Err(error) => {
-            return Some(OwnerReply::CommandReject {
-                epoch: ctx.inner.safety.epoch_id(),
-                error,
-            });
-        }
-    };
     let command_path: &'static str = match ctx.path {
         "/api/v1/motion/jog" => "/api/v1/motion/jog",
         "/api/v1/motion/home" => "/api/v1/motion/home",
         "/api/v1/motion/unload" => "/api/v1/motion/unload",
         _ => "command",
     };
-    match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
-        Ok(snapshot) => {
-            let reply_kind = MotionReplyKind::Command { request_id: ctx.value["request_id"].clone() };
-            *ctx.pending_motion = Some(PendingMotion { command_path, reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
-            None
+    // Borrow `Ok(request)` during preflight so any rejected target vector stays owned outside
+    // `SupervisorLock::write()` and is never freed inside the guard.
+    match ctx.preparsed_motion.as_ref() {
+        Some(PreparsedMotion::Command(Ok(request))) => {
+            match req::preflight_motion_request_at_with_config(
+                ctx.inner,
+                ctx.stamp,
+                request,
+                Some(ctx.epoch),
+                ctx.received_at,
+                ctx.cached_motion_cfg,
+            ) {
+                Ok((snapshot, cache_hit)) => {
+                    let Some(PreparsedMotion::Command(Ok(request))) = ctx.preparsed_motion.take() else {
+                        unreachable!("preparsed motion request validated above");
+                    };
+                    let reply_kind = MotionReplyKind::Command { request_id: ctx.value["request_id"].clone() };
+                    *ctx.pending_motion = Some(PendingMotion {
+                        command_path,
+                        reply_kind,
+                        request,
+                        snapshot,
+                        cache_hit,
+                        epoch: ctx.epoch,
+                        generation: ctx.local_generation,
+                    });
+                    None
+                }
+                Err(e) => Some(OwnerReply::CommandReject {
+                    epoch: ctx.inner.safety.epoch_id(),
+                    error: e.into(),
+                }),
+            }
         }
-        Err(e) => Some(OwnerReply::CommandReject {
+        Some(PreparsedMotion::Command(Err(_))) => {
+            let Some(PreparsedMotion::Command(Err(error))) = ctx.preparsed_motion.take() else {
+                unreachable!("preparsed motion error matched above");
+            };
+            Some(OwnerReply::CommandReject {
+                epoch: ctx.inner.safety.epoch_id(),
+                error,
+            })
+        }
+        _ => Some(OwnerReply::CommandReject {
             epoch: ctx.inner.safety.epoch_id(),
-            error: e.into(),
+            error: invalid_command("Missing preparsed motion request"),
         }),
     }
 }
@@ -244,7 +341,10 @@ pub(super) async fn complete_pending_motion(
         RetryDrift(req::MotionPlanSnapshot),
     }
 
-    let PendingMotion { command_path, reply_kind, request, mut snapshot, epoch, generation } = pending;
+    let PendingMotion { command_path, reply_kind, request, mut snapshot, cache_hit, epoch, generation } = pending;
+    if !cache_hit {
+        recv_supervisor.hub().set_legacy_motion_config_if_newer(Arc::clone(&snapshot.config));
+    }
     for attempt in 0..MAX_START_DRIFT_RETRIES {
         let snap_for_plan = snapshot.clone();
         let req_for_plan = request.clone();
@@ -423,26 +523,34 @@ fn spawn_park_continuation(
                 return;
             }
             let notified = notify.notified();
+            let cached_cfg = supervisor.get_fresh_legacy_motion_config().await;
             let ready_snapshot = {
                 let inner = supervisor.inner().read().await;
                 if inner.detached || inner.current_stop_gen() != request_stop_gen { return; }
                 let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id) else { return; };
                 if cont.phase == crate::supervisor::ParkContinuationPhase::ReadyForPlan {
-                    let mut snap = req::MotionPlanSnapshot::from_supervisor(&inner);
+                    let (mut snap, cache_hit) = req::MotionPlanSnapshot::from_supervisor_with_cached_config(
+                        &inner,
+                        cached_cfg.as_ref(),
+                    );
                     snap.authority.stop_generation = request_stop_gen;
                     snap.authority.deadline = cont.deadline;
-                    Some(snap)
+                    Some((snap, cache_hit))
                 } else {
                     None
                 }
             };
-            let Some(snap) = ready_snapshot else {
+            drop(cached_cfg);
+            let Some((snap, cache_hit)) = ready_snapshot else {
                 let wait = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(50));
                 if !wait.is_zero() {
                     let _ = tokio::time::timeout(wait, notified).await;
                 }
                 continue;
             };
+            if !cache_hit {
+                supervisor.hub().set_legacy_motion_config_if_newer(Arc::clone(&snap.config));
+            }
             let cancel = closing.clone();
             let plan_conn = connection_id.clone();
             let planned = tokio::task::spawn_blocking(move || {

@@ -703,9 +703,20 @@ pub async fn get_episodes(
     axum::extract::Query(q): axum::extract::Query<EpisodesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let inner = supervisor.inner().read().await;
-    let episodes = inner.episodes.list_episodes(q.dataset.as_deref(), q.limit, q.before.as_deref(), &inner.joint_zero_offsets);
-    Ok(Json(serde_json::json!({"enabled": inner.episodes.enabled(), "episodes": episodes, "recording": inner.recording_status()})))
+    let (store, offsets, recording) = {
+        let inner = supervisor.inner().read().await;
+        (
+            inner.episodes.clone(),
+            inner.joint_zero_offsets.clone(),
+            inner.recording_status_snapshot(),
+        )
+    };
+    let episodes = store.list_episodes(q.dataset.as_deref(), q.limit, q.before.as_deref(), &offsets);
+    Ok(Json(serde_json::json!({
+        "enabled": store.enabled(),
+        "episodes": episodes,
+        "recording": recording.map_or(serde_json::Value::Null, crate::teach::RecordingStatusSnapshot::into_json),
+    })))
 }
 
 /// `GET /api/v1/episodes/{id}`: the sidecar + `stale` + `bytes`.
@@ -714,8 +725,11 @@ pub async fn get_episode(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<crate::recording::EpisodeView>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let inner = supervisor.inner().read().await;
-    inner.episodes.view(&id, &inner.joint_zero_offsets).map(Json)
+    let (store, offsets) = {
+        let inner = supervisor.inner().read().await;
+        (inner.episodes.clone(), inner.joint_zero_offsets.clone())
+    };
+    store.view(&id, &offsets).map(Json)
         .ok_or_else(|| ArmError::from(crate::recording::StoreError::NotFound(id)).into())
 }
 
