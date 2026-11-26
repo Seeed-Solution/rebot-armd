@@ -5246,7 +5246,7 @@ function connectWS() {
   S.sequenceId = 0;
   ws.onopen = () => {
     if (S.ws !== ws) return;
-    if (wsOpenedOnce) { loadAuthStatus(); loadOwnerDiagnostics(); }
+    if (wsOpenedOnce) { loadAuthStatus(); loadOwnerDiagnostics(); loadSchema(); }
     wsOpenedOnce = true;
   };
   // Never acquire_lease on open: the page connects read-only until explicit Enable or operator confirmation.
@@ -9444,6 +9444,9 @@ async function loadOwnerDiagnostics() {
       };
       renderOwnerStatus();
       if (prevOwner !== S.ownerDiag.effective_owner || prevReason !== S.ownerDiag.owner_reason || prevRoutes !== JSON.stringify(nextRoutes)) {
+        if (prevOwner != null && prevOwner !== S.ownerDiag.effective_owner && (S.ownerDiag.effective_owner === 'executor' || S.ownerDiag.effective_owner === 'legacy') && typeof loadSchema === 'function') {
+          loadSchema();
+        }
         if (typeof renderGc === 'function') renderGc();
         if (typeof gtRender === 'function' && $('gtool') && !$('gtool').hidden) gtRender();
         if (typeof cwRender === 'function' && typeof CWZ !== 'undefined' && CWZ.open) cwRender();
@@ -9537,9 +9540,14 @@ function renderToolStatus() {
   }
 }
 i18nHooks.push(renderToolStatus);
+let schemaLoadSeq = 0;
+let schemaRetryTimer = null;
 async function loadSchema() {
+  const seq = ++schemaLoadSeq;
+  if (schemaRetryTimer) { clearTimeout(schemaRetryTimer); schemaRetryTimer = null; }
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
+    if (seq !== schemaLoadSeq) return;
     const oldProfile = S.profileId;
     const oldClosed = CFG.gripClosed;
     const oldOpen = CFG.gripOpen;
@@ -9585,6 +9593,8 @@ async function loadSchema() {
         if (rmaxEl) rmaxEl.textContent = Math.round(CFG.cart.reachMax * 1000);
       }
       colOnCaps(); posesOnCaps(); epOnCaps(); teachOnCaps(); V3.sceneAt = 0;
+      if (typeof renderGc === 'function') renderGc();
+      if (typeof cwRender === 'function' && typeof CWZ !== 'undefined' && CWZ.open) cwRender();
     }
     if (sc && Array.isArray(sc.model_joint_map) && sc.model_joint_map.length >= 6) applyJointMap(sc.model_joint_map);
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
@@ -9618,7 +9628,11 @@ async function loadSchema() {
       }
       applyFrame();
     }
-  } catch (_) { setTimeout(loadSchema, 3000); }
+  } catch (_) {
+    if (seq === schemaLoadSeq && !schemaRetryTimer) {
+      schemaRetryTimer = setTimeout(() => { schemaRetryTimer = null; loadSchema(); }, 3000);
+    }
+  }
 }
 
 // observation.fault.code -> { title, todo } in the current language; null for an unknown code

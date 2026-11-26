@@ -978,18 +978,54 @@ async function runScenario9OwnerHonesty(browserInst) {
     }
   }
 
-  // --- 9E. Same-page lifecycle: healthy executor -> restart into OWNER_FAILED -> restart into legacy (no reload) ---
+  // --- 9E. Same-page lifecycle: hardware-gated executor -> restart into OWNER_FAILED -> restart into legacy (no reload) ---
   {
     const port = await allocFreePort();
     let proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth']);
-    const { ctx, page, guards } = await newCockpit(browserInst, port, { width: 1024, height: 768, locale: 'en-US' });
+    const { ctx, page, guards, rec } = await newCockpit(browserInst, port, { width: 1024, height: 768, locale: 'en-US' });
+    let simulateHwExecGravity = true;
+    await page.route('**/api/v1/observation/schema', async (route) => {
+      if (!simulateHwExecGravity) return route.continue();
+      const resp = await route.fetch();
+      if (!resp.ok()) return route.fulfill({ response: resp });
+      const body = await resp.json();
+      if (body && body.capabilities) body.capabilities.gravity_comp = false;
+      return route.fulfill({ status: resp.status(), contentType: 'application/json', body: JSON.stringify(body) });
+    });
+    rec.hooks.onServerMsg = (m) => {
+      if (simulateHwExecGravity && m && Array.isArray(m.positions) && m.gravity_comp) {
+        return JSON.stringify({
+          ...m,
+          gravity_comp: {
+            ...m.gravity_comp,
+            supported: false,
+            blocker: {
+              code: 'EXECUTOR_CAPABILITY_UNSUPPORTED',
+              message: 'Gravity compensation hardware MIT mode-switch is not supported on the RT executor; set arm.armd_owner to legacy and restart armd',
+            },
+          },
+        });
+      }
+      return 'forward';
+    };
     try {
       await ctx.addInitScript(() => { try { localStorage.setItem('lang', 'en'); } catch (_) {} });
       await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
       await waitForCockpitLive(page);
-      await waitFn(page, () => S.ownerDiag?.effective_owner === 'executor' && document.getElementById('owner-banner').hidden === true, null, 5000);
+      await waitFn(
+        page,
+        () => S.ownerDiag?.effective_owner === 'executor'
+          && S.caps?.gravity_comp === false
+          && document.getElementById('owner-banner').hidden === true
+          && document.getElementById('btn-gc').hidden === false
+          && document.getElementById('btn-gc').classList.contains('blocked'),
+        null,
+        5000,
+      );
 
       // Restart daemon into OWNER_FAILED on the same port without reloading the page.
+      simulateHwExecGravity = false;
+      rec.hooks.onServerMsg = null;
       await killArmd(proc);
       proc = await spawnArmd(port, ['--config', B601_CONFIG, '--no-operator-auth'], {
         extraEnv: { ARMD_MOCK_TEST_OWNER_MODE: 'failed' },
@@ -1005,20 +1041,37 @@ async function runScenario9OwnerHonesty(browserInst) {
       );
 
       // Restart daemon into legacy on the same port without reloading the page:
-      // failed banner must clear automatically and stroke calibration must become available.
+      // failed banner clears, schema reloads (S.caps.gravity_comp=true), stroke calibration and BOTH
+      // gravity controls (#btn-gc + wizard hand-guide) are restored without a manual page reload.
       await killArmd(proc);
       proc = await spawnArmd(port, ['--config', B601_CONFIG, '--owner', 'legacy', '--no-operator-auth']);
       await waitForCockpitLive(page, 15000);
       await waitFn(
         page,
         () => S.ownerDiag?.effective_owner === 'legacy'
+          && S.caps?.gravity_comp === true
           && document.getElementById('owner-banner').hidden === true
+          && document.getElementById('btn-gc').hidden === false
           && legacyOnlyRouteBlock('/api/v1/action/gripper_calibrate', 'gb.legacy_only') === null,
         null,
         10000,
       );
+      await ensureArmedUnleased(port, page);
+      await waitFn(
+        page,
+        () => document.getElementById('btn-gc').hidden === false
+          && !document.getElementById('btn-gc').classList.contains('blocked')
+          && document.getElementById('btn-gc').getAttribute('aria-disabled') === 'false',
+        null,
+        5000,
+      );
+      await page.evaluate(async () => { cwOpen(true); await cwLoad(); CWZ.step = 'place'; cwRender(); });
+      await waitShown(page, '#cwiz', 3000);
+      await waitFn(page, () => document.getElementById('cwiz-find-hand')?.disabled === false, null, 4000);
+      await page.evaluate(() => cwOpen(false));
+
       guards.assertClean('9E same-page lifecycle');
-      log('PASS Scenario 9E: same-page healthy executor -> OWNER_FAILED -> recovered legacy updated banner and gating without reload.');
+      log('PASS Scenario 9E: same-page hw-gated executor -> OWNER_FAILED -> recovered legacy reloaded schema and restored banner, stroke, and gravity controls without reload.');
     } finally {
       await ctx.close();
       await killArmd(proc);
