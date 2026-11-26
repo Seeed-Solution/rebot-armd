@@ -618,6 +618,8 @@ impl ShadowDriverStaging {
 /// Lock-free atomic loss watermarks & live summary counters shared between producer (`ShadowRuntime`),
 /// off-thread comparator (`TorqueShadowHub`), and `BlackBox` piggyback summary.
 pub struct ShadowOverflowAtomics {
+    /// Monotonic highest input sequence allocated by `ShadowRuntime` (for lock-free contention cutoffs).
+    pub last_allocated_seq: AtomicU64,
     /// Monotonic first input sequence lost to driver/owner staging overflow (`u64::MAX` = none).
     pub first_staging_loss_seq: AtomicU64,
     /// Monotonic first record sequence dropped on full outgoing SPSC ring (`u64::MAX` = none).
@@ -643,6 +645,7 @@ impl Default for ShadowOverflowAtomics {
 impl ShadowOverflowAtomics {
     pub fn new() -> Self {
         Self {
+            last_allocated_seq: AtomicU64::new(0),
             first_staging_loss_seq: AtomicU64::new(u64::MAX),
             first_ring_loss_seq: AtomicU64::new(u64::MAX),
             staging_dropped_records: AtomicU64::new(0),
@@ -728,6 +731,7 @@ pub struct ActionSummary {
     pub disable_kind: Option<DisableKind>,
     pub disable_recipients: ChannelMask,
     pub disable_dispatch_id: u64,
+    pub disable_deadline_us: u64,
     pub disable_repeat_index: u8,
     pub disable_completed: bool,
     pub disable_partial: bool,
@@ -754,10 +758,21 @@ impl ActionSummary {
         }
         let (enable_mask, enable_attempt_id) = actions.enables[0]
             .map_or((ChannelMask::EMPTY, 0), |e| (e.channels, e.attempt_id));
-        let (disable_kind, disable_recipients, disable_dispatch_id, disable_repeat_index) =
-            actions.disables[0].map_or((None, ChannelMask::EMPTY, 0, 0), |d| {
-                (Some(d.kind), d.recipients, d.dispatch_id, d.repeat_index)
-            });
+        let (
+            disable_kind,
+            disable_recipients,
+            disable_dispatch_id,
+            disable_deadline_us,
+            disable_repeat_index,
+        ) = actions.disables[0].map_or((None, ChannelMask::EMPTY, 0, 0, 0), |d| {
+            (
+                Some(d.kind),
+                d.recipients,
+                d.dispatch_id,
+                d.deadline_us,
+                d.repeat_index,
+            )
+        });
         let (disable_completed, disable_partial, disable_timed_out) = actions.disable_completions[0]
             .map_or((false, false, false), |c| {
                 (true, c.partial_or_ambiguous, c.timed_out)
@@ -777,6 +792,7 @@ impl ActionSummary {
             disable_kind,
             disable_recipients,
             disable_dispatch_id,
+            disable_deadline_us,
             disable_repeat_index,
             disable_completed,
             disable_partial,
@@ -816,6 +832,9 @@ pub struct LiveDecisionSummary {
     pub live_is_torqued: bool,
     pub live_stopped: bool,
     pub live_hold_mask: ChannelMask,
+    /// Joints held by live using previously-captured stale targets (`JointHoldStatus::HeldStaleTarget`).
+    #[serde(default)]
+    pub live_stale_held_mask: ChannelMask,
     pub live_enable_started: bool,
     pub live_disable_kind: Option<DisableKind>,
     pub live_disable_recipients: ChannelMask,
@@ -864,6 +883,9 @@ pub enum ReviewedPr2Kind {
     ProcessExitAlreadyDisabled,
     LiveDriftSettleRebase,
     DriverPreflightVsAwaitRestGate,
+    /// Live continued holding a previously-captured joint (`HeldStaleTarget`) while its feedback
+    /// briefly aged beyond `max_capture_age_us`, verified against reducer `had_valid_capture`.
+    LiveHeldStaleTarget,
 }
 
 /// Primary divergence taxonomy from `reducer-pr1-shadow-spec.md`.
@@ -948,9 +970,20 @@ pub enum ShadowInputKind {
         live_is_torqued: bool,
         live_stopped: bool,
     },
+    TransitionWake {
+        live_intent: TorqueIntent,
+        live_is_torqued: bool,
+        live_stopped: bool,
+    },
     EnableStart {
         live_op_id: u64,
         live_refusal: Option<LiveRefusalKind>,
+        live_intent: TorqueIntent,
+        live_is_torqued: bool,
+        live_stopped: bool,
+    },
+    EnableCancelledPreTx {
+        live_op_id: u64,
         live_intent: TorqueIntent,
         live_is_torqued: bool,
         live_stopped: bool,
@@ -1028,6 +1061,7 @@ pub enum ShadowInputKind {
     },
     LiveHoldCheckpoint {
         hold_mask: ChannelMask,
+        stale_held_mask: ChannelMask,
         contended: bool,
         escalated: bool,
         live_intent: TorqueIntent,
@@ -1297,7 +1331,20 @@ impl ShadowRuntime {
         self.deferred_mit_off_mask = ChannelMask::EMPTY;
         m
     }
+}
 
+/// Live supervisor state snapshot synchronized into both inline and off-thread `TorqueState`
+/// when mounting or remounting a driver (`reinit_for_driver_synced`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveBootSync {
+    pub live_is_torqued: bool,
+    pub live_stopped: bool,
+    pub estop_latched: bool,
+    pub has_fault: bool,
+    pub failed_hold: bool,
+}
+
+impl ShadowRuntime {
     /// Re-initialize inline `TorqueState`, clock, and consumer mirror when a driver is mounted.
     ///
     /// Preserves session-wide overflow latches (`first_*_loss_seq`, `interval_unverifiable`),
@@ -1308,6 +1355,20 @@ impl ShadowRuntime {
         cfg: &ArmConfig,
         vendor: VendorKind,
         driver_clock: Option<Arc<dyn DriverClock>>,
+    ) {
+        self.reinit_for_driver_synced(cfg, vendor, driver_clock, LiveBootSync::default());
+    }
+
+    /// Re-initialize inline `TorqueState`, clock, and consumer mirror when a driver is mounted or
+    /// remounted, seeding the initial group state from `sync` so boot/remount starts in sync with
+    /// the live supervisor (cold boot => `SwitchOnDisabled/Off`; remount while armed/stopped/faulted
+    /// => matching state).
+    pub fn reinit_for_driver_synced(
+        &mut self,
+        cfg: &ArmConfig,
+        vendor: VendorKind,
+        driver_clock: Option<Arc<dyn DriverClock>>,
+        sync: LiveBootSync,
     ) {
         self.vendor = vendor;
         self.clock = ShadowClock::new(driver_clock);
@@ -1325,6 +1386,7 @@ impl ShadowRuntime {
         if !has_mode_rb {
             seed_state_native_modes(&mut new_state);
         }
+        apply_live_boot_sync(&mut new_state, sync);
         self.pending_len = 0;
         self.enable_binding = EnableBinding::default();
         self.disable_binding = DisableBinding::default();
@@ -1365,6 +1427,9 @@ impl ShadowRuntime {
         self.next_input_seq = self
             .next_input_seq
             .saturating_add(dropped.saturating_sub(1));
+        self.overflow
+            .last_allocated_seq
+            .fetch_max(self.next_input_seq.saturating_sub(1), Ordering::Release);
         self.overflow.record_staging_loss(first_lost, dropped);
     }
 
@@ -1419,6 +1484,7 @@ impl ShadowRuntime {
     fn alloc_seq(&mut self) -> u64 {
         let s = self.next_input_seq;
         self.next_input_seq = self.next_input_seq.saturating_add(1);
+        self.overflow.last_allocated_seq.fetch_max(s, Ordering::Release);
         s
     }
 
@@ -1485,6 +1551,9 @@ impl ShadowRuntime {
             self.next_input_seq = self
                 .next_input_seq
                 .saturating_add(driver_dropped.saturating_sub(1));
+            self.overflow
+                .last_allocated_seq
+                .fetch_max(self.next_input_seq.saturating_sub(1), Ordering::Release);
             self.overflow.record_staging_loss(first_lost, driver_dropped);
         }
     }
@@ -1628,7 +1697,9 @@ impl ShadowRuntime {
                 channels: ecmd.channels,
             };
         }
-        if self.state_ref().groups[0].drive_state != DriveState::ReadyToSwitchOn {
+        if self.state_ref().groups[0].drive_state != DriveState::ReadyToSwitchOn
+            || self.state_ref().groups[0].enable_tx.is_none()
+        {
             self.enable_binding.active = false;
         }
         if let Some(dcmd) = actions.disables[0] {
@@ -1645,10 +1716,9 @@ impl ShadowRuntime {
                 kind: Some(dcmd.kind),
             };
         }
-        if actions.disable_completions[0].is_some()
-            && self.state_ref().groups[0].disable_tx.is_none()
-            && self.state_ref().groups[0].pending_disable_dispatch.is_none()
-        {
+        // Clear disable_binding immediately once no pending wire disable dispatch is unresolved
+        // so between-repeat unpredicted writes cannot match a stale dispatch_id.
+        if self.state_ref().groups[0].pending_disable_dispatch.is_none() {
             self.disable_binding.active = false;
         }
         if let Some(pcmd) = actions.park_requests[0] {
@@ -1756,6 +1826,37 @@ impl ShadowRuntime {
                     reviewed_pr2,
                 );
             }
+            ShadowInputKind::TransitionWake {
+                live_intent,
+                live_is_torqued,
+                live_stopped,
+            } => {
+                let now_us = self.clock.advance_now_us(input.edge_instant);
+                let event = Event::TransitionWake { now_us };
+                let rt_actions = self.run_step_summarized(event, true, 0, false, true);
+                let gen = self.state_ref().groups[0].stop_generation;
+                self.emit_record(
+                    seq,
+                    now_us,
+                    ShadowRecordKind::Step,
+                    Some(event),
+                    rt_actions,
+                    LiveDecisionSummary {
+                        comparable: false,
+                        live_intent,
+                        live_is_torqued,
+                        live_stopped,
+                        ..LiveDecisionSummary::default()
+                    },
+                    JoinMeta {
+                        capability_id: self.disable_binding.dispatch_id,
+                        generation: gen,
+                        ..JoinMeta::default()
+                    },
+                    None,
+                    None,
+                );
+            }
             ShadowInputKind::EnableStart {
                 live_op_id,
                 live_refusal,
@@ -1796,6 +1897,50 @@ impl ShadowRuntime {
                     },
                     None,
                     reviewed_pr2,
+                );
+            }
+            ShadowInputKind::EnableCancelledPreTx {
+                live_op_id,
+                live_intent,
+                live_is_torqued,
+                live_stopped,
+            } => {
+                let now_us = self.clock.advance_now_us(input.edge_instant);
+                let attempt_id = if self.enable_binding.active
+                    && (live_op_id == 0 || self.enable_binding.live_op_id == live_op_id)
+                {
+                    self.enable_binding.attempt_id
+                } else {
+                    0
+                };
+                let event = Event::EnableCancelledPreTx {
+                    group: 0,
+                    attempt_id,
+                    now_us,
+                };
+                let rt_actions = self.run_step_summarized(event, true, live_op_id, false, false);
+                let gen = self.state_ref().groups[0].stop_generation;
+                self.emit_record(
+                    seq,
+                    now_us,
+                    ShadowRecordKind::Step,
+                    Some(event),
+                    rt_actions,
+                    LiveDecisionSummary {
+                        comparable: false,
+                        live_intent,
+                        live_is_torqued,
+                        live_stopped,
+                        ..LiveDecisionSummary::default()
+                    },
+                    JoinMeta {
+                        live_op_id,
+                        capability_id: attempt_id,
+                        generation: gen,
+                        ..JoinMeta::default()
+                    },
+                    None,
+                    None,
                 );
             }
             ShadowInputKind::HandshakeResult {
@@ -2238,6 +2383,7 @@ impl ShadowRuntime {
             }
             ShadowInputKind::LiveHoldCheckpoint {
                 hold_mask,
+                stale_held_mask,
                 contended,
                 escalated,
                 live_intent,
@@ -2275,6 +2421,7 @@ impl ShadowRuntime {
                             live_is_torqued,
                             live_stopped,
                             live_hold_mask: hold_mask,
+                            live_stale_held_mask: stale_held_mask,
                             live_contention_escalated: escalated,
                             ..LiveDecisionSummary::default()
                         },
@@ -2336,6 +2483,7 @@ impl ShadowRuntime {
                         live_is_torqued,
                         live_stopped,
                         live_hold_mask: hold_mask,
+                        live_stale_held_mask: stale_held_mask,
                         live_contention_escalated: escalated,
                         ..LiveDecisionSummary::default()
                     },
@@ -2359,45 +2507,65 @@ impl ShadowRuntime {
                     && self.park_binding.park_id.is_some()
                 {
                     let park_id = self.park_binding.park_id.unwrap_or(0);
-                    let event = if let Some(succeeded) = settled_ok {
+                    let event_opt = if let Some(succeeded) = settled_ok {
                         self.park_binding.active = false;
-                        Event::ParkSettled {
+                        Some(Event::ParkSettled {
                             group: 0,
                             park_id,
                             succeeded,
                             now_us,
-                        }
+                        })
                     } else if admitted {
-                        Event::ParkAccepted {
+                        Some(Event::ParkAccepted {
                             group: 0,
                             park_id,
                             now_us,
-                        }
+                        })
                     } else {
-                        return;
+                        None
                     };
-                    let rt_actions = self.run_step_summarized(event, false, 0, false, false);
-                    self.emit_record(
-                        seq,
-                        now_us,
-                        ShadowRecordKind::Step,
-                        Some(event),
-                        rt_actions,
-                        LiveDecisionSummary::default(),
-                        JoinMeta {
-                            live_op_id,
-                            capability_id: park_id,
-                            generation: self.park_binding.generation,
-                            ..JoinMeta::default()
-                        },
-                        None,
-                        None,
-                    );
+                    if let Some(event) = event_opt {
+                        let rt_actions = self.run_step_summarized(event, false, 0, false, false);
+                        self.emit_record(
+                            seq,
+                            now_us,
+                            ShadowRecordKind::Step,
+                            Some(event),
+                            rt_actions,
+                            LiveDecisionSummary::default(),
+                            JoinMeta {
+                                live_op_id,
+                                capability_id: park_id,
+                                generation: self.park_binding.generation,
+                                ..JoinMeta::default()
+                            },
+                            None,
+                            None,
+                        );
+                    } else {
+                        // Always emit a sequence-preserving record for every allocated `seq`.
+                        self.emit_record(
+                            seq,
+                            now_us,
+                            ShadowRecordKind::CoverageGapOnly,
+                            None,
+                            ActionSummary::default(),
+                            LiveDecisionSummary::default(),
+                            JoinMeta {
+                                live_op_id,
+                                capability_id: park_id,
+                                generation: self.park_binding.generation,
+                                ..JoinMeta::default()
+                            },
+                            None,
+                            None,
+                        );
+                    }
                 } else {
+                    let gen = self.state_ref().groups[0].stop_generation;
                     if settled_ok.is_some() {
                         self.park_binding.active = false;
                     } else if admitted {
-                        let gen = self.state_ref().groups[0].stop_generation;
                         self.park_binding = ParkBinding {
                             active: true,
                             is_tier1_panic: false,
@@ -2405,6 +2573,23 @@ impl ShadowRuntime {
                             generation: gen,
                         };
                     }
+                    // Always emit a sequence-preserving record for normal park lifecycle markers
+                    // so `expected_seq` never develops a false unverifiable seq gap.
+                    self.emit_record(
+                        seq,
+                        now_us,
+                        ShadowRecordKind::CoverageGapOnly,
+                        None,
+                        ActionSummary::default(),
+                        LiveDecisionSummary::default(),
+                        JoinMeta {
+                            live_op_id,
+                            generation: gen,
+                            ..JoinMeta::default()
+                        },
+                        None,
+                        None,
+                    );
                 }
             }
         }
@@ -2798,6 +2983,42 @@ fn seed_state_native_modes(state: &mut TorqueState) {
     }
 }
 
+fn apply_live_boot_sync(state: &mut TorqueState, sync: LiveBootSync) {
+    if state.config.group_count == 0 {
+        return;
+    }
+    let grp = &mut state.groups[0];
+    if sync.estop_latched {
+        grp.faults.insert(TorqueFaultKind::EStop);
+    } else if sync.has_fault {
+        grp.faults.insert(TorqueFaultKind::Other);
+    }
+    if sync.failed_hold {
+        grp.torque_intent = TorqueIntent::On;
+        grp.drive_state = DriveState::FailedHold;
+        grp.enable_phase = EnablePhase::FailedHold;
+        grp.faults.insert(TorqueFaultKind::EnableFailed);
+    } else if sync.live_is_torqued {
+        grp.torque_intent = TorqueIntent::On;
+        grp.enable_phase = EnablePhase::Armed;
+        grp.drive_state = if !grp.faults.is_empty() {
+            DriveState::Fault
+        } else if sync.live_stopped {
+            DriveState::QuickStopActive
+        } else {
+            DriveState::OperationEnabled
+        };
+    } else if !grp.faults.is_empty() {
+        grp.torque_intent = TorqueIntent::Off;
+        grp.drive_state = DriveState::Fault;
+        grp.enable_phase = EnablePhase::Idle;
+    } else {
+        grp.torque_intent = TorqueIntent::Off;
+        grp.drive_state = DriveState::SwitchOnDisabled;
+        grp.enable_phase = EnablePhase::Idle;
+    }
+}
+
 /// Replayable recalibration reset applied identically on both inline `TorqueState` and off-thread
 /// comparator `TorqueState` when joint zero offsets change (`src/supervisor/config.rs:84`).
 pub fn apply_joint_zero_recalibration(state: &mut TorqueState) {
@@ -2811,6 +3032,7 @@ pub fn apply_joint_zero_recalibration(state: &mut TorqueState) {
         rt.last_measured_vel_rad_s = None;
         rt.last_window_sample_id = None;
         rt.last_window_release_id = None;
+        rt.had_valid_capture = false;
     }
     for r in 0..state.config.recipient_count {
         state.rest_windows[r as usize].reset();
@@ -3097,6 +3319,7 @@ struct PendingDisableExpectation {
     kind: DisableKind,
     generation: u64,
     dispatch_id: u64,
+    deadline_us: u64,
     last_progress_release_id: u64,
     expected_recipients: ChannelMask,
     remaining_recipients: ChannelMask,
@@ -3349,11 +3572,22 @@ impl TorqueShadowConsumer {
             });
         }
 
-        // 2. Expire unresolved predicted disable obligations on a subsequent release boundary.
-        if matches!(rec.event, Some(Event::Release { .. })) {
+        // 2. Expire unresolved predicted disable obligations on release / transition-wake boundaries.
+        if matches!(
+            rec.event,
+            Some(Event::Release { .. } | Event::TransitionWake { .. })
+        ) {
             if let Some(pending) = self.pending_disable {
-                if rec.release_id > pending.last_progress_release_id.saturating_add(1)
-                    && !pending.remaining_recipients.is_empty()
+                let tx_gone = self
+                    .state
+                    .as_ref()
+                    .is_some_and(|st| st.groups[0].disable_tx.is_none());
+                let past_deadline = pending.deadline_us > 0 && rec.now_us >= pending.deadline_us;
+                let stale_after_tx_gone =
+                    tx_gone && rec.release_id > pending.last_progress_release_id.saturating_add(1);
+                let stalled = rec.release_id > pending.last_progress_release_id.saturating_add(3);
+                if !pending.remaining_recipients.is_empty()
+                    && (past_deadline || stale_after_tx_gone || stalled)
                 {
                     self.pending_disable = None;
                     self.push_divergence(
@@ -3454,10 +3688,38 @@ impl TorqueShadowConsumer {
                     )
                 )
             {
+                if let Some(prev_pending) = self.pending_disable {
+                    if prev_pending.dispatch_id != rec.rt_actions.disable_dispatch_id
+                        && !prev_pending.remaining_recipients.is_empty()
+                    {
+                        self.push_divergence(
+                            ShadowDivergenceEntry {
+                                seq: rec.seq,
+                                release_id: rec.release_id,
+                                now_us: rec.now_us,
+                                owner: prev_pending.owner,
+                                category: DivergenceCategory::ExtraAction,
+                                detail: format!(
+                                    "predicted disable {:?} (dispatch_id={}, gen={}) unfulfilled for recipients {:#x} before superseded by dispatch_id={}",
+                                    prev_pending.kind,
+                                    prev_pending.dispatch_id,
+                                    prev_pending.generation,
+                                    prev_pending.remaining_recipients.raw(),
+                                    rec.rt_actions.disable_dispatch_id
+                                ),
+                                violation: None,
+                                coverage_gap: None,
+                                reviewed_pr2: None,
+                            },
+                            atomics,
+                        );
+                    }
+                }
                 self.pending_disable = Some(PendingDisableExpectation {
                     kind: dk,
                     generation: rec.join.generation,
                     dispatch_id: rec.rt_actions.disable_dispatch_id,
+                    deadline_us: rec.rt_actions.disable_deadline_us,
                     last_progress_release_id: rec.release_id,
                     expected_recipients: rec.rt_actions.disable_recipients,
                     remaining_recipients: rec.rt_actions.disable_recipients,
@@ -3821,25 +4083,69 @@ impl TorqueShadowConsumer {
             let pred_hold = rec.predicted_hold_mask;
             let live_hold = live.live_hold_mask;
             if pred_hold != live_hold {
-                let cat = classify_mask_diff(pred_hold, live_hold);
-                self.push_divergence(
-                    ShadowDivergenceEntry {
-                        seq: rec.seq,
-                        release_id: rec.release_id,
-                        now_us: rec.now_us,
-                        owner: rec.owner,
-                        category: cat,
-                        detail: format!(
-                            "hold mask mismatch: pred={:#x} live={:#x}",
-                            pred_hold.raw(),
-                            live_hold.raw()
-                        ),
-                        violation: None,
-                        coverage_gap: None,
-                        reviewed_pr2: None,
-                    },
-                    atomics,
-                );
+                let pred_only = pred_hold.difference(live_hold);
+                let live_only = live_hold.difference(pred_hold);
+                let all_live_only_verified_stale = pred_only.is_empty()
+                    && !live_only.is_empty()
+                    && live_only.is_subset_of(live.live_stale_held_mask)
+                    && self.state.as_ref().is_some_and(|st| {
+                        live_only.iter().all(|c| {
+                            if c >= st.config.channel_count {
+                                return false;
+                            }
+                            let ch_cfg = &st.config.channels[c as usize];
+                            let rt = &st.joints[c as usize];
+                            rt.had_valid_capture
+                                && rt.last_sample_us.is_none_or(|ts| {
+                                    !crate::torque::reducer::is_sample_fresh(
+                                        ts,
+                                        rec.now_us,
+                                        ch_cfg.max_capture_age_us,
+                                    )
+                                })
+                        })
+                    });
+                if all_live_only_verified_stale {
+                    self.push_divergence(
+                        ShadowDivergenceEntry {
+                            seq: rec.seq,
+                            release_id: rec.release_id,
+                            now_us: rec.now_us,
+                            owner: rec.owner,
+                            category: DivergenceCategory::ReviewedPr2Only,
+                            detail: format!(
+                                "reviewed PR2 difference: live held stale target(s) {:#x} beyond capture age (pred={:#x} live={:#x})",
+                                live_only.raw(),
+                                pred_hold.raw(),
+                                live_hold.raw()
+                            ),
+                            violation: None,
+                            coverage_gap: None,
+                            reviewed_pr2: Some(ReviewedPr2Kind::LiveHeldStaleTarget),
+                        },
+                        atomics,
+                    );
+                } else {
+                    let cat = classify_mask_diff(pred_hold, live_hold);
+                    self.push_divergence(
+                        ShadowDivergenceEntry {
+                            seq: rec.seq,
+                            release_id: rec.release_id,
+                            now_us: rec.now_us,
+                            owner: rec.owner,
+                            category: cat,
+                            detail: format!(
+                                "hold mask mismatch: pred={:#x} live={:#x}",
+                                pred_hold.raw(),
+                                live_hold.raw()
+                            ),
+                            violation: None,
+                            coverage_gap: None,
+                            reviewed_pr2: None,
+                        },
+                        atomics,
+                    );
+                }
             }
         }
     }
@@ -4173,6 +4479,22 @@ impl TorqueShadowHub {
     #[inline]
     pub fn overflow_atomics(&self) -> &Arc<ShadowOverflowAtomics> {
         &self.core.overflow
+    }
+
+    /// Lock-free staging-loss latch usable without holding `SupervisorInner` (e.g. when a
+    /// post-panic helper thread cannot acquire `inner.try_write()` or finds `detached`).
+    #[inline]
+    pub fn record_contended_staging_loss(&self, dropped: u64) {
+        if !self.core.enabled || dropped == 0 {
+            return;
+        }
+        let cutoff = self
+            .core
+            .overflow
+            .last_allocated_seq
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        self.core.overflow.record_staging_loss(cutoff, dropped);
     }
 
     /// Rebind consumer SPSC endpoint and reducer `TorqueState` on driver mount/remount while
