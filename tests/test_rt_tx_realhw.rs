@@ -70,10 +70,14 @@ impl DualRig {
             s.push_all_feedback();
         });
         let tx_budget = budget.unwrap_or_else(|| cfg.damiao_tx_budget());
+        let enable_budget = TxBudget {
+            max_frames: tx_budget.max_frames.max(8),
+            ..tx_budget
+        };
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits)
             .unwrap()
-            .with_tx_budget(tx_budget);
+            .with_tx_budget(enable_budget);
         drv.read_joint_states().unwrap();
         drv.check_mapping_ranges();
 
@@ -84,6 +88,9 @@ impl DualRig {
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
         SupervisorInner::enable_torque(admitted).expect("initial arm");
+        if tx_budget.max_frames != enable_budget.max_frames {
+            inner.driver.as_mut().unwrap().with_mut(|d| d.set_tx_budget(tx_budget)).unwrap();
+        }
         // Only run warmup output ticks when the configured budget can complete a full 7-joint batch
         // in one tick; constrained-budget tests (e.g. max_frames = 4) start armed immediately.
         if tx_budget.max_frames >= 7 {
@@ -144,6 +151,68 @@ impl DualRig {
                 fx.step();
             }
         }
+    }
+
+    fn enter_gravity_comp(&mut self) {
+        use armd::auth::OperatorRequirement;
+        use armd::rt_core::ops::CommitCtx;
+        use armd::rt_core::requests::config::{
+            handle_config_exchange, ConfigExchange, ConfigReply, ConfigRequest,
+            GravityCompEnterOutcome,
+        };
+        let now = match &self.owner {
+            RigOwner::Legacy(_) => self.clock.now(),
+            RigOwner::Executor { fx, .. } => fx.now(),
+        };
+        let mut ex = {
+            let inner = self.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let policy = inner.config.gravity_comp.clone();
+            let ctx = CommitCtx {
+                arm: inner.core.id(),
+                boot: BootId(77),
+                now,
+                stop_generation: inner.current_stop_gen(),
+            };
+            let mut ex = ConfigExchange::new(ConfigRequest::StartGravityCompEnter {
+                admission: stamp,
+                lease_holder: None,
+                policy,
+                scale: None,
+                damping_kd: None,
+                operator: OperatorRequirement::NotRequired,
+                deadline: now + Duration::from_secs(5),
+                client: ClientId(0),
+                reservation: None,
+            });
+            handle_config_exchange(inner, &ctx, &mut ex);
+            ex
+        };
+        assert!(
+            matches!(
+                ex.reply.take(),
+                Some(ConfigReply::GravityCompEnterStarted(Ok(
+                    GravityCompEnterOutcome::Session(_) | GravityCompEnterOutcome::Immediate(_)
+                )))
+            ),
+            "StartGravityCompEnter must succeed"
+        );
+        let prev_imm = self.bus.with(|s| {
+            let prev = s.immediate_replies;
+            s.immediate_replies = true;
+            prev
+        });
+        for _ in 0..40 {
+            if self.inner().gravity_comp.is_some() {
+                break;
+            }
+            self.step();
+        }
+        self.bus.with(|s| s.immediate_replies = prev_imm);
+        assert!(
+            self.inner().gravity_comp.is_some(),
+            "gravity_comp ModeSwitch entry must complete within 40 steps"
+        );
     }
 
     fn step(&mut self) {
@@ -596,9 +665,10 @@ fn dual_owner_sustained_deferral_beyond_45ms_latches_single_can_tx_stalled() {
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits)
         .unwrap()
-        .with_tx_budget(TxBudget { max_frames: 4, max_duration: ms(10), frame_max_age: ms(45) });
+        .with_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) });
     drv.read_joint_states().unwrap();
     drv.set_torque(true).unwrap();
+    drv.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(10), frame_max_age: ms(45) });
 
     // Tick 1 (t=0): sends J1..J4, queues J5..J7 with queued_at = 0.
     drv.begin_tx_tick();
@@ -661,14 +731,27 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
         for j in 1u32..=7 {
             assert!(ids.contains(&(0x100 + j)), "{owner:?}: joint {j} starved during partial hold deferral");
         }
-        // In Part (a), `max_frames = 4` stays active (only 4/7 frames per tick): verify
-        // clear_fault transitions to Idle and enable returns to Armed/operational cleanly!
+        // In Part (a), verify re-enable refuses invalid `max_frames = 4` (< 7+1=8), then restore
+        // valid `max_frames = 8` and verify clear_fault + enable returns to Armed/operational cleanly!
         match &mut rig.owner {
             RigOwner::Legacy(inner) => {
                 inner.clear_fault().expect("legacy clear_fault");
                 assert_eq!(*inner.safety.state(), SafetyState::Idle);
                 rig.clock.advance(ms(20));
                 rig.bus.with(|s| s.push_all_feedback());
+                let stamp_refuse = inner.current_admission_stamp();
+                let admitted_refuse = inner.check_admission(stamp_refuse).unwrap();
+                let err = SupervisorInner::enable_torque(admitted_refuse).unwrap_err();
+                assert!(
+                    err.to_string().contains("WATCHDOG_BUDGET_INSUFFICIENT"),
+                    "legacy re-enable under max_frames=4 must refuse with WATCHDOG_BUDGET_INSUFFICIENT, got {err}"
+                );
+                inner
+                    .driver
+                    .as_mut()
+                    .unwrap()
+                    .with_mut(|d| d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) }))
+                    .unwrap();
                 let stamp = inner.current_admission_stamp();
                 let admitted = inner.check_admission(stamp).unwrap();
                 SupervisorInner::enable_torque(admitted).expect("legacy re-enable");
@@ -679,6 +762,12 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
                 let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
                 fx.core.clear_fault_executor(dl).expect("executor clear_fault_executor");
                 assert_eq!(*fx.core.safety.state(), SafetyState::Idle);
+                fx.core
+                    .driver
+                    .as_mut()
+                    .unwrap()
+                    .with_mut(|d| d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) }))
+                    .unwrap();
 
                 rig.bus.with(|s| s.push_all_feedback());
                 let auth = fx.core.authority(&fx.ctx(fx.now()));
@@ -922,9 +1011,10 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits)
         .unwrap()
-        .with_tx_budget(TxBudget { max_frames: 4, max_duration: ms(10), frame_max_age: ms(45) });
+        .with_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) });
     drv.read_joint_states().unwrap();
     drv.set_torque(true).unwrap();
+    drv.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(10), frame_max_age: ms(45) });
     let stops = StopRequests::new();
     let req = Arc::new(AtomicU64::new(0));
     let app = Arc::new(AtomicU64::new(0));
@@ -1023,12 +1113,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
 
         // 2. Gravity-comp Exiting: deferred stiff holds must NOT advance exit_hold or switch back.
         let mut rig_gc = DualRig::new(owner, base_cfg(), None);
-        {
-            let inner = rig_gc.inner_mut();
-            let stamp = inner.current_admission_stamp();
-            let admitted = inner.check_admission(stamp).unwrap();
-            SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
-        }
+        rig_gc.enter_gravity_comp();
         rig_gc.step();
         rig_gc.inner_mut().exit_gravity_comp("REQUESTED", "test");
         assert!(rig_gc.inner().gravity_comp.is_some());
@@ -1045,10 +1130,14 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 other => panic!("{owner:?}: expected Exiting with elapsed_s == 0, got {other:?}"),
             }
         }
-        // Bus clears -> 6 Complete ticks (120 ms > 100 ms exit_hold_ms) complete handback cleanly!
+        // Bus clears -> Complete ticks advance `exit_hold_ms` (100 ms) and drive the shared
+        // PR0C non-blocking MIT -> POS_VEL ModeSwitch handback to completion on both owners!
         rig_gc.bus.with(|s| s.tx_enobufs = false);
-        for _ in 0..6 {
+        for _ in 0..32 {
             rig_gc.step();
+            if rig_gc.inner().gravity_comp.is_none() {
+                break;
+            }
         }
         assert!(rig_gc.inner().gravity_comp.is_none(), "{owner:?}: gravity comp should hand back after Complete ticks");
         assert!(rig_gc.inner().safety.state().is_operational());
@@ -1150,12 +1239,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 ..base_cfg()
             };
             let mut rig_jt = DualRig::new(owner, cfg_jt, None);
-            {
-                let inner = rig_jt.inner_mut();
-                let stamp = inner.current_admission_stamp();
-                let admitted = inner.check_admission(stamp).unwrap();
-                SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
-            }
+            rig_jt.enter_gravity_comp();
             rig_jt.step();
             rig_jt.inner_mut().exit_gravity_comp("REQUESTED", "major2");
             // Keep arm moving for 6 ticks (120 ms > 100 ms exit_hold_ms).
@@ -1178,11 +1262,17 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 "{owner:?}: stationary tick whose stiff hold deferred must NOT start POS_VEL handback"
             );
             assert!(rig_jt.inner().safety.state().is_operational());
-            // Bus clears -> 1 Complete tick arms handback + 1 dedicated transition release completes it.
+            // Bus clears -> 1 Complete tick arms handback; both owners start the shared PR0C
+            // ModeSwitch handback on the scheduled transition release and complete all 6 axes cleanly.
             rig_jt.bus.with(|s| s.tx_enobufs = false);
             rig_jt.step();
             assert!(rig_jt.inner().gravity_comp.is_some(), "{owner:?}: handback waits for scheduled transition release");
-            rig_jt.step();
+            for _ in 0..30 {
+                rig_jt.step();
+                if rig_jt.inner().gravity_comp.is_none() {
+                    break;
+                }
+            }
             assert!(rig_jt.inner().gravity_comp.is_none(), "{owner:?}: scheduled transition release completes handback");
             assert!(rig_jt.inner().safety.state().is_operational());
         }
@@ -1194,12 +1284,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             let mut cfg_s2 = base_cfg();
             cfg_s2.tx_stall_ticks = Some(4); // minimum at 50 Hz = ceil(45/20) + 1
             let mut rig_s2 = DualRig::new(owner, cfg_s2, None);
-            {
-                let inner = rig_s2.inner_mut();
-                let stamp = inner.current_admission_stamp();
-                let admitted = inner.check_admission(stamp).unwrap();
-                SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
-            }
+            rig_s2.enter_gravity_comp();
             rig_s2.step();
             // Inject ENOBUFS during off-tick `exit_gravity_comp` -> immediate write defers,
             // must NOT increment periodic `tx_deferral_streak`!
@@ -1219,8 +1304,11 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             // Bus clears on next tick after discarding aged frames -> recovers cleanly!
             rig_s2.inner_mut().driver.as_mut().unwrap().write().unwrap().discard_pending_tx();
             rig_s2.bus.with(|s| s.tx_enobufs = false);
-            for _ in 0..7 {
+            for _ in 0..32 {
                 rig_s2.step();
+                if rig_s2.inner().gravity_comp.is_none() {
+                    break;
+                }
             }
             assert!(rig_s2.inner().gravity_comp.is_none());
             assert!(rig_s2.inner().safety.state().is_operational());
@@ -2448,12 +2536,16 @@ impl DualRig {
         });
         let tx_budget = budget.unwrap_or_else(|| cfg.damiao_tx_budget());
         let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force gripper drive");
+        let enable_budget = TxBudget {
+            max_frames: tx_budget.max_frames.max(8),
+            ..tx_budget
+        };
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits)
             .unwrap()
             .with_gripper_drive(grip)
             .unwrap()
-            .with_tx_budget(tx_budget);
+            .with_tx_budget(enable_budget);
         drv.read_joint_states().unwrap();
         drv.read_joint_states().unwrap();
         drv.check_mapping_ranges();
@@ -2466,6 +2558,9 @@ impl DualRig {
             let stamp = inner.current_admission_stamp();
             let admitted = inner.check_admission(stamp).expect("admit initial pos-force arm");
             SupervisorInner::enable_torque(admitted).expect("initial pos-force arm");
+        }
+        if tx_budget.max_frames != enable_budget.max_frames {
+            inner.driver.as_mut().unwrap().with_mut(|d| d.set_tx_budget(tx_budget)).unwrap();
         }
         bus.with(|s| {
             s.immediate_replies = false;
@@ -3624,16 +3719,7 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
     }
     let mut rig = DualRig::new_pos_force(Owner::Legacy, cfg, None);
     rig.bus.with(|s| s.immediate_replies = true);
-    {
-        let inner = rig.inner_mut();
-        let stamp = inner.current_admission_stamp();
-        let admitted = inner.check_admission(stamp).expect("admit enter gravity comp");
-        SupervisorInner::enter_gravity_comp(
-            admitted,
-            armd::gravity_comp::GravityCompRequest::default(),
-        )
-        .expect("enter gravity comp");
-    }
+    rig.enter_gravity_comp();
     rig.bus.with(|s| s.immediate_replies = false);
     for _ in 0..5 {
         rig.step();
@@ -3652,13 +3738,16 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
         );
         assert!(rig.inner().gravity_comp.is_some(), "transient J7 staleness must not kick out gravity comp");
     }
-    // Exit gravity comp while J1-J6 are fresh (J7 still transiently stale, total 200 ms < 250 ms):
-    // arm-only handback must complete without wedging or faulting!
+    // Exit gravity comp while J1-J6 are fresh (J7 still transiently stale, total < 250 ms):
+    // arm-only PR0C ModeSwitch handback must complete without wedging or faulting!
     rig.bus.with(|s| s.immediate_replies = true);
     rig.inner_mut().exit_gravity_comp("STOPPED", "operator exit");
-    for _ in 0..4 {
+    for _ in 0..24 {
         rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
-        rig.step_dt(DT, false);
+        rig.step_dt(0.005, false);
+        if rig.inner().gravity_comp.is_none() {
+            break;
+        }
     }
     assert!(rig.inner().gravity_comp.is_none(), "arm-only handback must complete without wedging on stale J7");
     assert!(rig.inner().safety.state().is_operational(), "transient J7 loss (< 250 ms) must stay operational");
@@ -3669,16 +3758,7 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
         s.push_all_feedback();
     });
     rig.step();
-    {
-        let inner = rig.inner_mut();
-        let stamp = inner.current_admission_stamp();
-        let admitted = inner.check_admission(stamp).expect("admit re-enter gravity comp");
-        SupervisorInner::enter_gravity_comp(
-            admitted,
-            armd::gravity_comp::GravityCompRequest::default(),
-        )
-        .expect("re-enter gravity comp");
-    }
+    rig.enter_gravity_comp();
     rig.bus.with(|s| s.immediate_replies = false);
     for _ in 0..4 {
         rig.step();

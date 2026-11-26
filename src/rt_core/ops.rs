@@ -1126,6 +1126,16 @@ pub trait CoreOps {
     fn attach_closed_bitset(&mut self, _bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {}
     /// Synchronizes the core's published [`BootId`] with the owning executor / fixture.
     fn set_boot_id(&mut self, _boot: BootId) {}
+    /// Advances any active PR0B/PR0C RT session (e.g. `ModeSwitch`) between Step 2 RX and Step 3
+    /// commit when driven by [`ReleaseFixture`] (production `RtExecutor` calls
+    /// `SupervisorInner::service_sessions_release` directly in its pre-commit closure).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn service_fixture_sessions_release(
+        &mut self,
+        _ctx: &CommitCtx,
+        _release_budget: &mut ReleaseBudget,
+        _now_fn: &mut dyn FnMut() -> Instant,
+    ) {}
 }
 
 /// Diagnostic fields recorded on the RT thread when an authorized stop arrives during a
@@ -1792,7 +1802,10 @@ impl CoreOps for SupervisorInner {
                 let admitted = self
                     .check_admission(stamp)
                     .map_err(|e| static_code(ArmError::Safety(e)))?;
-                super::requests::lease::install_torque_on_transition(admitted)?
+                super::requests::lease::install_torque_on_transition_with_seq(
+                    admitted,
+                    d.stamp.client_seq,
+                )?
             }
             // Stop-direction action: exempt from stop-generation checks and Admitted.
             TransitionOp::TorqueOff => super::requests::lease::install_torque_off_transition(self)?,
@@ -2290,6 +2303,17 @@ impl CoreOps for SupervisorInner {
     }
     fn set_boot_id(&mut self, boot: BootId) {
         self.boot_id = boot;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn service_fixture_sessions_release(
+        &mut self,
+        ctx: &CommitCtx,
+        release_budget: &mut ReleaseBudget,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) {
+        if !self.internal_fault_lane.is_fenced() && self.mode_switch.is_running() {
+            self.service_mode_switch_release_with_budget(ctx, release_budget, now_fn);
+        }
     }
 }
 
@@ -2813,13 +2837,13 @@ impl ReleaseEngine {
         publish_generation: u64,
         mut pre_commit: impl FnMut(&mut O, &CommitCtx) -> bool,
     ) -> ReleaseReport {
-        self.step_with_pre_commit_budget(
+        self.step_with_pre_commit_budget_with_now(
             core,
             now_fn,
             dt,
             release_deadline,
             publish_generation,
-            |core, ctx, _budget| pre_commit(core, ctx),
+            |core, ctx, _budget, _now| pre_commit(core, ctx),
         )
     }
 
@@ -2829,11 +2853,30 @@ impl ReleaseEngine {
     pub fn step_with_pre_commit_budget<O: CoreOps>(
         &mut self,
         core: &mut O,
-        mut now_fn: impl FnMut() -> Instant,
+        now_fn: impl FnMut() -> Instant,
         dt: f64,
         release_deadline: Instant,
         publish_generation: u64,
         mut pre_commit: impl FnMut(&mut O, &CommitCtx, &mut ReleaseBudget) -> bool,
+    ) -> ReleaseReport {
+        self.step_with_pre_commit_budget_with_now(
+            core,
+            now_fn,
+            dt,
+            release_deadline,
+            publish_generation,
+            |core, ctx, budget, _now| pre_commit(core, ctx, budget),
+        )
+    }
+
+    fn step_with_pre_commit_budget_with_now<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        mut now_fn: impl FnMut() -> Instant,
+        dt: f64,
+        release_deadline: Instant,
+        publish_generation: u64,
+        mut pre_commit: impl FnMut(&mut O, &CommitCtx, &mut ReleaseBudget, &mut dyn FnMut() -> Instant) -> bool,
     ) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
@@ -2858,7 +2901,7 @@ impl ReleaseEngine {
         // 2b. Owner persistence and bounded maintenance/sessions run strictly after Step 2 feedback
         // intake and strictly before Step 3–6 commit, output, and publication, sharing `ledger`.
         let pre_ctx = self.ctx(now_fn());
-        let stopping = pre_commit(core, &pre_ctx, &mut ledger);
+        let stopping = pre_commit(core, &pre_ctx, &mut ledger, &mut now_fn);
         if stopping {
             self.release_budget = Some(ledger);
             let ended_transition = finished_transition
@@ -3448,6 +3491,19 @@ impl<O: CoreOps> ReleaseFixture<O> {
         let owner_started = now_fn();
         let owner_deadline = owner_started + period;
         let next_gen = self.engine.releases() + 1;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut report = self.engine.step_with_pre_commit_budget_with_now(
+            &mut self.core,
+            &mut now_fn,
+            self.dt,
+            owner_deadline,
+            next_gen,
+            |core, ctx, release_budget, pre_now| {
+                core.service_fixture_sessions_release(ctx, release_budget, pre_now);
+                false
+            },
+        );
+        #[cfg(target_arch = "wasm32")]
         let mut report = self.engine.step(&mut self.core, &mut now_fn, self.dt, owner_deadline, next_gen);
         // Extra sub-release hardware services in Window 2 (bounded to MAX_SERVICE_WAKES = 1):
         // - Transition and watchdog-hold polls run only if sleep + poll + tail can complete before

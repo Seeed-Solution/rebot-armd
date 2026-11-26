@@ -75,60 +75,6 @@ pub struct FeedbackScratch {
     pub bounds: Vec<Option<Instant>>,
 }
 
-/// Per-joint hard lead bounds `(upper [(val, rate); 2], upper_len, lower [(val, rate); 2], lower_len)`
-/// used by position-lead tracking with zero heap allocation per tick.
-pub type TrackingBoundsEntry = ([(f64, f64); 2], u8, [(f64, f64); 2], u8);
-
-/// Preallocated scratch buffers for position-lead tracking and residual lead ramp-out on
-/// `armd-control`, sized off-thread from `dof`.
-#[derive(Debug, Default)]
-pub struct TrackingScratch {
-    pub base_lead: Vec<f32>,
-    pub zero_target: Vec<f32>,
-    pub seeded_q: Vec<f32>,
-    pub nom_q_prev: Vec<f64>,
-    pub nom_v_prev: Vec<f64>,
-    pub v_nom: Vec<f64>,
-    pub a_nom: Vec<f64>,
-    pub out_lim: Vec<(f64, f64)>,
-    pub window: Vec<(f64, f64)>,
-    pub lead_prev: Vec<f64>,
-    pub bounds: Vec<TrackingBoundsEntry>,
-    pub cand_lead: Vec<f32>,
-    pub cand_zero: Vec<f32>,
-    pub out_positions: Vec<f32>,
-    pub out_velocities: Vec<f32>,
-    /// Preallocated fixed-capacity DFS subdivision stack for RT tracking fallback sweeps
-    /// (`Some` when constructed via [`Self::with_dof`] off-thread; `None` in `Default` so
-    /// `std::mem::take(&mut self.scratch.tracking)` on `armd-control` performs 0 heap allocations).
-    pub sweep_stack: Option<Box<crate::chain::RtSweepStack>>,
-}
-
-impl TrackingScratch {
-    /// Preallocates all tracking scratch vectors with capacity for `dof` joints.
-    pub fn with_dof(dof: usize) -> Self {
-        let n = dof.max(1);
-        Self {
-            base_lead: Vec::with_capacity(n),
-            zero_target: Vec::with_capacity(n),
-            seeded_q: Vec::with_capacity(n),
-            nom_q_prev: Vec::with_capacity(n),
-            nom_v_prev: Vec::with_capacity(n),
-            v_nom: Vec::with_capacity(n),
-            a_nom: Vec::with_capacity(n),
-            out_lim: Vec::with_capacity(n),
-            window: Vec::with_capacity(n),
-            lead_prev: Vec::with_capacity(n),
-            bounds: Vec::with_capacity(n),
-            cand_lead: Vec::with_capacity(n),
-            cand_zero: Vec::with_capacity(n),
-            out_positions: Vec::with_capacity(n),
-            out_velocities: Vec::with_capacity(n),
-            sweep_stack: Some(Box::new(crate::chain::RtSweepStack::default())),
-        }
-    }
-}
-
 /// The tick's buffers.
 #[derive(Debug, Default)]
 pub struct TickScratch {
@@ -154,7 +100,6 @@ pub struct TickScratch {
     pub hold: Vec<f32>,
     pub point: crate::trajectory::TrajectoryPoint,
     pub step_out: crate::motion::StepOut,
-    pub tracking: TrackingScratch,
 }
 
 impl TickScratch {
@@ -188,7 +133,6 @@ impl TickScratch {
                 accelerations: Vec::with_capacity(n),
             },
             step_out: crate::motion::StepOut { positions: Vec::with_capacity(n), velocities: Vec::with_capacity(n), ..Default::default() },
-            tracking: TrackingScratch::with_dof(n),
         }
     }
 }

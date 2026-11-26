@@ -385,20 +385,26 @@ async fn spawn_mock_vision() -> (
     (addr, state, jh)
 }
 
-/// Minimal zero-alloc RT-capable hardware driver for testing `EXECUTOR_CAPABILITY_UNSUPPORTED` refusals.
+/// Minimal zero-alloc RT-capable hardware driver for testing gravity-comp / executor capability refusals.
 struct MinimalHwDriver {
     positions: Vec<f32>,
     rx_at: Vec<Option<Instant>>,
     seqs: Vec<u64>,
+    nonblocking_mode_switch: bool,
 }
 
 impl MinimalHwDriver {
     fn new(dof: usize) -> Self {
+        Self::with_nonblocking_mode_switch(dof, false)
+    }
+
+    fn with_nonblocking_mode_switch(dof: usize, nonblocking_mode_switch: bool) -> Self {
         let now = Instant::now();
         Self {
             positions: vec![0.0; dof],
             rx_at: vec![Some(now); dof],
             seqs: vec![1; dof],
+            nonblocking_mode_switch,
         }
     }
 }
@@ -416,6 +422,10 @@ impl ArmDriver for MinimalHwDriver {
 
     fn supports_mit_mode_switch(&self) -> bool {
         true
+    }
+
+    fn supports_nonblocking_mode_switch(&self) -> bool {
+        self.nonblocking_mode_switch
     }
 
     fn supports_rt_executor(&self) -> Result<(), &'static str> {
@@ -2052,7 +2062,7 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
         .await
         .unwrap();
 
-    // Part B: Hardware driver attached on Executor -> gravity_comp & hardware motor_zero fail closed 503.
+    // Part B: Hardware driver capability gates on Executor (PR0C non-blocking support vs 422 UNSUPPORTED).
     let sup_hw = Arc::new(
         ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(MinimalHwDriver::new(7))),
     );
@@ -2072,11 +2082,16 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
     }
     let _detached_hw = sup_hw.inner().write().await;
 
-    // On RT executor with hardware driver, observation & schema capabilities must match the single
-    // converged capability predicate (`executor_blocks_hardware_gravity_comp`) and WS gate.
+    // Adapter 4 lifts the executor-level hardware gate: `executor_hardware_gravity_comp_supported()`
+    // is true and `executor_blocks_hardware_gravity_comp(true, true)` is false; instead, drivers
+    // without non-blocking mode switching fail closed with `422 UNSUPPORTED` on Executor.
     assert!(
-        armd::gravity_comp::executor_blocks_hardware_gravity_comp(true, true),
-        "single predicate must refuse hardware gravity_comp on executor"
+        armd::gravity_comp::executor_hardware_gravity_comp_supported(),
+        "executor hardware gravity_comp capability gate must be lifted"
+    );
+    assert!(
+        !armd::gravity_comp::executor_blocks_hardware_gravity_comp(true, true),
+        "single predicate must allow hardware gravity_comp on executor"
     );
     assert!(
         !armd::gravity_comp::executor_blocks_hardware_gravity_comp(true, false),
@@ -2090,20 +2105,20 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
     let exec_schema = sup_hw.schema().await.unwrap();
     assert!(
         !exec_obs.gravity_comp.supported,
-        "executor hardware observation must report gravity_comp.supported = false"
+        "MinimalHwDriver without nonblocking_mode_switch must report gravity_comp.supported = false on executor"
     );
     assert_eq!(
         exec_obs.gravity_comp.blocker.as_ref().map(|b| b.code.as_str()),
-        Some("EXECUTOR_CAPABILITY_UNSUPPORTED"),
-        "executor hardware observation must report EXECUTOR_CAPABILITY_UNSUPPORTED blocker"
+        Some("UNSUPPORTED"),
+        "MinimalHwDriver without nonblocking_mode_switch must report UNSUPPORTED blocker on executor"
     );
     assert!(
         !exec_schema.capabilities.gravity_comp,
-        "executor hardware schema must report capabilities.gravity_comp = false"
+        "MinimalHwDriver without nonblocking_mode_switch schema must report capabilities.gravity_comp = false"
     );
     assert!(
         !sup_hw.published_config().await.unwrap().gravity_comp_supported,
-        "executor hardware published_config must report gravity_comp_supported = false"
+        "MinimalHwDriver without nonblocking_mode_switch published_config must report gravity_comp_supported = false"
     );
 
     let err_enter = gravity_comp_command(
@@ -2118,29 +2133,54 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
     .await
     .unwrap_err();
     assert!(
-        matches!(&err_enter, ArmError::Rejected { status: 503, code, .. } if code == "EXECUTOR_CAPABILITY_UNSUPPORTED"),
-        "expected 503 EXECUTOR_CAPABILITY_UNSUPPORTED, got {err_enter:?}"
-    );
-    let err_exit = gravity_comp_command(
-        &sup_hw,
-        capture_config_admission(&sup_hw, 1, 0, Some(1)),
-        None,
-        armd::auth::OperatorRequirement::NotRequired,
-        false,
-        None,
-        None,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(&err_exit, ArmError::Rejected { status: 503, code, .. } if code == "EXECUTOR_CAPABILITY_UNSUPPORTED"),
-        "expected 503 EXECUTOR_CAPABILITY_UNSUPPORTED on exit, got {err_exit:?}"
+        matches!(&err_enter, ArmError::Rejected { status: 422, code, .. } if code == "UNSUPPORTED"),
+        "expected 422 UNSUPPORTED, got {err_enter:?}"
     );
 
     assert_eq!(handle_hw.stats().total_allocs(), AllocCounts::ZERO);
     assert_eq!(sup_hw.inner().control_thread_attempts(), 0);
     drop(_detached_hw);
     tokio::task::spawn_blocking(move || handle_hw.stop_and_join())
+        .await
+        .unwrap();
+
+    // Non-blocking-capable hardware driver on OWNER_EXECUTOR advertises gravity_comp support.
+    let sup_nb_hw = Arc::new(
+        ArmSupervisor::new(ArmConfig::rebot_dm())
+            .with_driver(Box::new(MinimalHwDriver::with_nonblocking_mode_switch(7, true))),
+    );
+    let mut ecfg_nb = ExecutorConfig::for_tests(Duration::from_millis(2));
+    ecfg_nb.alloc_timing = true;
+    let handle_nb = sup_nb_hw.start_executor(ecfg_nb).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sup_nb_hw.hub().latest().is_none() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _detached_nb = sup_nb_hw.inner().write().await;
+    let nb_obs = sup_nb_hw.observation().await.unwrap();
+    let nb_schema = sup_nb_hw.schema().await.unwrap();
+    assert!(
+        nb_obs.gravity_comp.supported,
+        "non-blocking hardware driver on executor must report gravity_comp.supported = true"
+    );
+    assert_ne!(
+        nb_obs.gravity_comp.blocker.as_ref().map(|b| b.code.as_str()),
+        Some("EXECUTOR_CAPABILITY_UNSUPPORTED"),
+        "non-blocking hardware driver on executor must not report EXECUTOR_CAPABILITY_UNSUPPORTED"
+    );
+    assert!(
+        nb_schema.capabilities.gravity_comp,
+        "non-blocking hardware driver on executor schema must advertise gravity_comp = true"
+    );
+    assert!(
+        sup_nb_hw.published_config().await.unwrap().gravity_comp_supported,
+        "non-blocking hardware driver on executor published_config must report gravity_comp_supported = true"
+    );
+    assert_eq!(handle_nb.stats().total_allocs(), AllocCounts::ZERO);
+    assert_eq!(sup_nb_hw.inner().control_thread_attempts(), 0);
+    drop(_detached_nb);
+    tokio::task::spawn_blocking(move || handle_nb.stop_and_join())
         .await
         .unwrap();
 }

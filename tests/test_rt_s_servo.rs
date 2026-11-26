@@ -1459,12 +1459,13 @@ fn b1_pending_tx_queue_drops_fenced_lease_targets_and_allows_hold_and_disable() 
             Arc::clone(&pending_disc),
         ));
 
-    // Tiny TX budget of 2 frames so a 7-joint batch transmits 2 frames and queues 5 in `pending_tx`.
+    // Enable under valid max_frames=8, then tighten to 2 frames so a 7-joint batch transmits 2
+    // frames and queues 5 in `pending_tx`.
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(limits)
         .unwrap()
         .with_tx_budget(TxBudget {
-            max_frames: 2,
+            max_frames: 8,
             max_duration: Duration::from_secs(1),
             frame_max_age: Duration::from_secs(1),
         });
@@ -1472,6 +1473,11 @@ fn b1_pending_tx_queue_drops_fenced_lease_targets_and_allows_hold_and_disable() 
     drv.read_joint_states().unwrap();
     drv.read_joint_states().unwrap();
     drv.set_torque(true).unwrap();
+    drv.set_tx_budget(TxBudget {
+        max_frames: 2,
+        max_duration: Duration::from_secs(1),
+        frame_max_age: Duration::from_secs(1),
+    });
 
     // Queue a deferred motion batch under lease_gen = 7.
     let moving: Vec<JointTarget> = (0..7)

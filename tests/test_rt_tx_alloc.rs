@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use armd::auth::OperatorRequirement;
 use armd::diagnostics::tick::{
     record_tx_attempt, record_tx_deferred, record_tx_dropped_stale, record_tx_dropped_stopped,
     reset_tx_metrics, thread_usage, TickSample, TickStats, TxAttemptKind, UsageMark,
@@ -15,9 +16,11 @@ use armd::driver::{
     TxBatchOutcome, TxBudget,
 };
 use armd::protocol::damiao::{self, DamiaoLimits};
+use armd::rt_core::broker::ClientId;
+use armd::rt_core::requests::config::{ConfigReply, ConfigRequest, GravityCompEnterOutcome};
 use armd::rt_core::urgent::{EstopGate, StopRequests};
 use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
-use armd::{ArmConfig, SupervisorInner};
+use armd::{ArmConfig, ArmSupervisor, SupervisorInner};
 
 thread_local! {
     static WATCH: Cell<bool> = const { Cell::new(false) };
@@ -1157,26 +1160,108 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     assert_eq!(inner.safety.tx_stall_detail(), Some(stall_detail));
     assert_eq!((a, f), (0, 0), "saturated SafetyManager::latch(CanTxStalled) touched allocator");
 
-    // (e) Active gravity-comp tick on a fresh warmed-up SupervisorInner with DamiaoArmDriver<SharedNoAllocBus>.
-    let (mut gc_inner, _gc_bus) = mk_rt_supervisor();
-    let stamp = gc_inner.current_admission_stamp();
-    let admitted = gc_inner.check_admission(stamp).unwrap();
-    SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
-    // Advance past ramp_in_s (1.0 s) and warm up one Active tick across all triple-buffer slots.
-    for _ in 0..60 {
-        let _ = gc_inner.tick_publish(0.02, 1, false);
+    // (e) Active gravity-comp tick on a fresh warmed-up SupervisorInner with DamiaoArmDriver<SharedNoAllocBus>
+    //     entered through PR0C ModeSwitch (`ConfigRequest::StartGravityCompEnter` -> `start_gravity_comp_enter_mode_switch_with_ticket_rt`).
+    let gc_cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        joint_tracking: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let gc_bus = SharedNoAllocBus::new(&limits);
+    let mut gc_driver = DamiaoArmDriver::new(gc_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits.clone())
+        .unwrap();
+    gc_driver.check_mapping_ranges();
+    gc_driver.set_rt_mode(true);
+    let gc_sup = ArmSupervisor::new(gc_cfg.clone()).with_driver(Box::new(gc_driver));
+    let gc_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    gc_rt.block_on(async {
+        gc_sup.set_lease_enabled(false).await;
+        {
+            let mut init_inner = gc_sup.inner().write().await;
+            init_inner.tick(0.02);
+            let stamp = init_inner.current_admission_stamp();
+            let admitted = init_inner.check_admission(stamp).unwrap();
+            SupervisorInner::enable_torque(admitted).expect("arm");
+            init_inner.safety.set_off_thread_reclaim(true);
+            for _ in 0..4 {
+                {
+                    let mut g = gc_bus.0.lock().unwrap();
+                    g.clock.advance(Duration::from_millis(20));
+                    g.push_all_feedback();
+                }
+                let _ = init_inner.tick_publish(0.02, 1, false);
+                let _ = init_inner.core.hub().latest();
+            }
+        }
+        let stamp = gc_sup.capture_admission_stamp();
+        let enter_rep = gc_sup
+            .dispatch_config_request(ConfigRequest::StartGravityCompEnter {
+                admission: stamp,
+                lease_holder: None,
+                policy: gc_cfg.gravity_comp.clone(),
+                scale: None,
+                damping_kd: None,
+                operator: OperatorRequirement::NotRequired,
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                client: ClientId(0),
+                reservation: None,
+            })
+            .await
+            .expect("start gravity comp mode switch");
+        assert!(matches!(
+            enter_rep,
+            ConfigReply::GravityCompEnterStarted(Ok(GravityCompEnterOutcome::Session(_)))
+        ));
+        let mut gc_inner = gc_sup.inner().write().await;
+        // Drive PR0C ModeSwitch + ramp_in_s (1.0 s) while rt_executor_owned == false so
+        // tick_publish steps `service_mode_switch_release_with_clock`, then switch to RT mode.
+        for _ in 0..100 {
+            {
+                let mut g = gc_bus.0.lock().unwrap();
+                g.clock.advance(Duration::from_millis(20));
+                g.push_all_feedback();
+            }
+            let _ = gc_inner.tick_publish(0.02, 1, false);
+            let _ = gc_inner.core.hub().latest();
+            if matches!(
+                gc_inner.gravity_comp.as_ref().map(|g| &g.phase),
+                Some(GravityCompPhase::Active)
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            gc_inner.gravity_comp.as_ref().map(|g| &g.phase),
+            Some(GravityCompPhase::Active)
+        ));
+        gc_inner.rt_executor_owned = true;
+        for _ in 0..4 {
+            {
+                let mut g = gc_bus.0.lock().unwrap();
+                g.clock.advance(Duration::from_millis(20));
+                g.push_all_feedback();
+            }
+            let _ = gc_inner.tick_publish(0.02, 1, false);
+            let _ = gc_inner.core.hub().latest();
+        }
+        gc_inner.safety.drain_log_events_off_thread();
+        reset_tx_metrics();
+        {
+            let mut g = gc_bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| gc_inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
         let _ = gc_inner.core.hub().latest();
-    }
-    assert!(matches!(
-        gc_inner.gravity_comp.as_ref().map(|g| &g.phase),
-        Some(GravityCompPhase::Active)
-    ));
-    let (published, a, f) = counted(|| gc_inner.tick_publish(0.02, 1, false));
-    assert!(published.kept.is_none());
-    drop(published);
-    let _ = gc_inner.core.hub().latest();
-    assert!(gc_inner.gravity_comp.is_some());
-    assert_eq!((a, f), (0, 0), "Active gravity-comp tick_publish touched allocator");
+        assert!(gc_inner.gravity_comp.is_some());
+        assert_eq!((a, f), (0, 0), "Active gravity-comp tick_publish touched allocator");
+    });
 
     // (f) Major 6A: Running jog action stalls into CAN_TX_STALLED (3 deferred ticks), terminates
     //     the action (`failed` / `CAN_TX_STALLED` with non-empty message) and publishes observation
@@ -2684,9 +2769,10 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
         SupervisorInner::enable_torque(admitted).expect("arm with MIT qualification");
-        inner.rt_executor_owned = true;
         inner.safety.set_off_thread_reclaim(true);
-        // Step stationary ticks until MIT handover completes and triple-buffer slots warm up.
+        // Step stationary ticks until MIT handover completes before switching the test harness
+        // into direct `rt_executor_owned` `tick_publish` mode (without a full `RtExecutor`
+        // `service_sessions_release` loop to drive non-blocking PR0C `ModeSwitch` activation).
         for _ in 0..25 {
             {
                 let mut g = bus.0.lock().unwrap();
@@ -2703,6 +2789,7 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
             inner.mit.handover_error,
             inner.mit.lost_reason
         );
+        inner.rt_executor_owned = true;
         // Disable Phase-1 position-lead tracking (`src/tracking.rs`, out of scope for M3) after
         // real MIT handover completes so `tick_publish` exercises the full MIT `mit_supervise` ->
         // `write_output_scratch` -> `mit_prepare_inline` -> `write_joint_targets_bounded` ->

@@ -37,6 +37,27 @@ pub enum GravityCompPhase {
     ExitFailed { hold: [f32; ARM], retry_in_s: f64 },
 }
 
+/// Stack-only wire/command carrier for `damping_kd` so validation happens on the RT owner
+/// strictly AFTER idempotence (`gravity_comp.is_some()`) and state blockers (`NOT_ARMED`, etc.).
+#[derive(Debug, Clone, Copy)]
+pub struct GravityCompDampingInput {
+    /// Length supplied by caller (`u8::MAX` if > 6). Valid iff `len == 6`.
+    pub len: u8,
+    pub values: [f32; 6],
+}
+
+impl GravityCompDampingInput {
+    pub fn from_slice(v: &[f32]) -> Self {
+        let mut values = [0.0f32; 6];
+        let copy_len = v.len().min(6);
+        values[..copy_len].copy_from_slice(&v[..copy_len]);
+        Self {
+            len: if v.len() <= 6 { v.len() as u8 } else { u8::MAX },
+            values,
+        }
+    }
+}
+
 impl GravityCompPhase {
     pub fn name(&self) -> &'static str {
         match self {
@@ -82,6 +103,27 @@ pub struct GravityCompRequest {
     pub damping_kd: Option<Vec<f32>>,
 }
 
+/// Staged hardware gravity-comp entry payload carried inline across a PR0C `ModeSwitch`
+/// (`POS_VEL -> MIT`) session so confirmation installs `GravityCompRun` with 0 RT allocation.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub struct PendingGravityCompEnter {
+    pub session_id: u64,
+    pub policy: GravityCompPolicy,
+    pub scale: f32,
+    pub damping_kd: [f32; ARM],
+    pub entry_pose: [f32; ARM],
+    pub entry_torque: [f32; ARM],
+    pub lease_generation: Option<u64>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) enum GravityCompEnterRtStart {
+    AlreadyActive(Option<GravityCompPolicy>),
+    ImmediateMock,
+    StartedSession(u64),
+}
+
 fn reason(code: &str, message: &str) -> ModeReason {
     ModeReason {
         code: crate::safety::BoundedText::new(code),
@@ -102,7 +144,7 @@ fn reason_fmt(code: &str, f: impl FnOnce(&mut crate::safety::BoundedText<256>)) 
 /// synchronous RT executor. Lifting this predicate when the RT gravity adapter lands updates
 /// observation, schema capabilities, published config, and WS/config admission in lockstep.
 pub const fn executor_hardware_gravity_comp_supported() -> bool {
-    false
+    true
 }
 
 /// True when `(rt_executor_owned, has_driver)` is refused by the RT executor hardware
@@ -170,6 +212,18 @@ impl SupervisorInner {
                 "EXECUTOR_CAPABILITY_UNSUPPORTED",
                 "Gravity compensation hardware MIT mode-switch is not supported on the RT executor; set arm.armd_owner to legacy and restart armd",
             ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if rt_executor_owned && self.driver.is_some() {
+            let supports_nb = self
+                .read_driver_for_tick()
+                .is_some_and(|drv| drv.supports_nonblocking_mode_switch());
+            if !supports_nb {
+                return Err(reason(
+                    "UNSUPPORTED",
+                    "Gravity compensation on the RT executor requires a driver supporting non-blocking mode switching",
+                ));
+            }
         }
         Ok(())
     }
@@ -312,14 +366,109 @@ impl SupervisorInner {
         this.enter_gravity_comp_inner(request)
     }
 
+    /// Shared zero-allocation parameter & model validation for gravity compensation entry.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_gravity_comp_enter_params(
+        &self,
+        policy: &GravityCompPolicy,
+        scale_override: Option<f32>,
+        damping_override: Option<GravityCompDampingInput>,
+    ) -> Result<(f32, [f32; ARM], [f32; ARM]), ModeReason> {
+        let [lo, hi] = policy.scale_range;
+        let scale = scale_override.unwrap_or(policy.scale);
+        if !scale.is_finite() || !(lo..=hi).contains(&scale) {
+            return Err(reason_fmt("INVALID_COMMAND", |msg| {
+                let _ = core::fmt::write(msg, format_args!("scale must be in [{lo}, {hi}]"));
+            }));
+        }
+        let damping = match damping_override {
+            None => arm6(&policy.damping_kd),
+            Some(inp)
+                if inp.len == 6
+                    && inp
+                        .values
+                        .iter()
+                        .all(|k| k.is_finite() && *k >= 0.0 && *k <= policy.damping_kd_max) =>
+            {
+                inp.values
+            }
+            Some(_) => {
+                return Err(reason_fmt("INVALID_COMMAND", |msg| {
+                    let _ = core::fmt::write(
+                        msg,
+                        format_args!("damping_kd must be 6 values in [0, {}]", policy.damping_kd_max),
+                    );
+                }));
+            }
+        };
+        let Some(model) = self.gravity_comp_model_torque(policy, scale) else {
+            return Err(reason(
+                "GRAVITY_MODEL_UNAVAILABLE",
+                "Gravity torque could not be computed",
+            ));
+        };
+        Ok((scale, damping, model))
+    }
+
+    /// Computes clamped entry torque: measured feedback torque on hardware (matching legacy
+    /// handover without a torque step), falling back to `model` when driverless or non-finite.
+    fn gravity_comp_entry_torque(&self, policy: &GravityCompPolicy, model: [f32; ARM]) -> [f32; ARM] {
+        let mut entry_torque = if self.driver.is_some() { arm6(&self.torques) } else { model };
+        for (i, t) in entry_torque.iter_mut().enumerate() {
+            let lim = policy.torque_limits_nm[i];
+            *t = if t.is_finite() { t.clamp(-lim, lim) } else { model[i] };
+        }
+        entry_torque
+    }
+
+    /// Installs a `GravityCompRun` in `RampIn` (zero alloc; caller already verified mode/preconditions).
+    fn install_gravity_comp_run_rt(
+        &mut self,
+        policy: GravityCompPolicy,
+        scale: f32,
+        damping_kd: [f32; ARM],
+        pose: [f32; ARM],
+        entry_torque: [f32; ARM],
+        lease_generation: Option<u64>,
+    ) {
+        self.retire_servo_ws_min_depths();
+        self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
+        for i in 0..ARM {
+            self.commanded_positions[i] = pose[i];
+            self.commanded_velocities[i] = 0.0;
+        }
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+        self.following_error_since = None;
+        let _ = self.safety.mark_motion_started();
+        self.gravity_comp = Some(GravityCompRun {
+            phase: GravityCompPhase::RampIn,
+            kp: arm6(&policy.hold_kp),
+            kd: arm6(&policy.hold_kd),
+            policy,
+            elapsed_s: 0.0,
+            scale,
+            damping_kd,
+            entry_pose: pose,
+            entry_torque,
+            tau_ff: entry_torque,
+            position: pose,
+            overspeed_count: 0,
+            prev_measured: None,
+            lease_generation,
+        });
+        self.bump_motion_generation();
+        let _ = self.collision.hold.take();
+    }
+
     /// Zero-allocation RT entry into gravity compensation on a driverless (mock) supervisor.
-    /// Hardware drivers with synchronous MIT mode switching are refused fail-closed before calling this.
     #[allow(clippy::result_large_err)]
     pub(crate) fn enter_gravity_comp_rt(
         admitted: crate::supervisor::Admitted<'_>,
         policy: Option<GravityCompPolicy>,
         scale_override: Option<f32>,
-        damping_override: Option<[f32; ARM]>,
+        damping_override: Option<GravityCompDampingInput>,
     ) -> Result<Option<GravityCompPolicy>, (ModeReason, Option<GravityCompPolicy>)> {
         let (this, _proof) = match admitted.consume() {
             Ok(pair) => pair,
@@ -336,66 +485,417 @@ impl SupervisorInner {
         if let Some(r) = this.gravity_comp_blocker() {
             return Err((r, policy));
         }
+        if this.driver.is_some() {
+            return Err((
+                reason(
+                    "UNSUPPORTED",
+                    "Gravity compensation on the RT executor requires a driver supporting non-blocking mode switching",
+                ),
+                policy,
+            ));
+        }
         let Some(policy) = policy else {
             return Err((reason("UNSUPPORTED", "no gravity_comp policy"), None));
         };
-        let [lo, hi] = policy.scale_range;
-        let scale = scale_override.unwrap_or(policy.scale);
-        if !scale.is_finite() || !(lo..=hi).contains(&scale) {
-            return Err((reason("INVALID_COMMAND", "scale is outside policy.scale_range"), Some(policy)));
+        let (scale, damping, model) = match this.validate_gravity_comp_enter_params(&policy, scale_override, damping_override) {
+            Ok(v) => v,
+            Err(r) => return Err((r, Some(policy))),
+        };
+        if this.rt_executor_owned && !this.has_gravity_comp_reclaim_capacity() {
+            return Err((
+                reason("RECLAIM_BACKPRESSURE", "gravity_comp reclaim queue is full; wait for off-thread reclaim"),
+                Some(policy),
+            ));
         }
-        let damping = match damping_override {
-            None => arm6(&policy.damping_kd),
-            Some(v) if v.iter().all(|k| k.is_finite() && *k >= 0.0 && *k <= policy.damping_kd_max) => v,
-            Some(_) => {
+        let pose = arm6(&this.measured_positions);
+        let entry_torque = this.gravity_comp_entry_torque(&policy, model);
+        let lease_gen = this.active_lease.as_ref().map(|l| l.generation);
+        this.install_gravity_comp_run_rt(policy, scale, damping, pose, entry_torque, lease_gen);
+        Ok(None)
+    }
+
+    /// Zero-allocation RT admission for hardware gravity-comp entry (`POS_VEL -> MIT` on J1–J6)
+    /// driven by the shared PR0C `ModeSwitch` service inside a PR0B `ExclusiveOutput` session.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub(crate) fn start_gravity_comp_enter_mode_switch_with_ticket_rt(
+        admitted: crate::supervisor::Admitted<'_>,
+        policy: Option<GravityCompPolicy>,
+        scale_override: Option<f32>,
+        damping_override: Option<GravityCompDampingInput>,
+        operator: crate::auth::OperatorRequirement,
+        deadline: std::time::Instant,
+        client: crate::rt_core::broker::ClientId,
+        ticket: Option<crate::rt_core::reply_router::SessionTerminalTicket>,
+        handoff: Option<&crate::rt_core::reply_router::SessionTerminalHandoff>,
+        owner_now: std::time::Instant,
+    ) -> Result<GravityCompEnterRtStart, (ModeReason, Option<GravityCompPolicy>)> {
+        use crate::driver::ModeSwitchHoldTarget;
+        use crate::motor_mode::{ControlMode, ModeSwitch, ModeSwitchPlan, ModeSwitchRecovery, MAX_MODE_SWITCH_AXES};
+        use crate::rt_core::session::{PreparedSession, SessionKind};
+        use crate::supervisor::ModeSwitchPurpose;
+
+        let (this, proof) = match admitted.consume() {
+            Ok(pair) => pair,
+            Err(_) => {
                 return Err((
-                    reason("INVALID_COMMAND", "damping_kd values must be finite and within [0, damping_kd_max]"),
-                    Some(policy),
+                    reason("STOPPED", "Admission proof invalidated before entering gravity compensation"),
+                    policy,
                 ));
             }
         };
-        let Some(model) = this.gravity_comp_model_torque(&policy, scale) else {
+        if this.gravity_comp.is_some() {
+            return Ok(GravityCompEnterRtStart::AlreadyActive(policy));
+        }
+        if let Some(r) = this.gravity_comp_blocker() {
+            return Err((r, policy));
+        }
+        let Some(policy) = policy else {
+            return Err((reason("UNSUPPORTED", "no gravity_comp policy"), None));
+        };
+        let (scale, damping, model) = match this.validate_gravity_comp_enter_params(&policy, scale_override, damping_override) {
+            Ok(v) => v,
+            Err(r) => return Err((r, Some(policy))),
+        };
+        if this.rt_executor_owned && !this.has_gravity_comp_reclaim_capacity() {
             return Err((
-                reason("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed"),
+                reason("RECLAIM_BACKPRESSURE", "gravity_comp reclaim queue is full; wait for off-thread reclaim"),
                 Some(policy),
             ));
-        };
+        }
+        if this.driver.is_none() {
+            let pose = arm6(&this.measured_positions);
+            let entry_torque = this.gravity_comp_entry_torque(&policy, model);
+            let lease_gen = this.active_lease.as_ref().map(|l| l.generation);
+            this.install_gravity_comp_run_rt(policy, scale, damping, pose, entry_torque, lease_gen);
+            return Ok(GravityCompEnterRtStart::ImmediateMock);
+        }
+        // Match legacy validation precedence: only hand back active MIT tracking AFTER every
+        // entry parameter and precondition has been validated (invalid requests never change owner).
+        if this.mit_active() {
+            return Err((
+                reason("MIT_HAND_BACK_REQUIRED", "MIT tracking must hand back before entering gravity compensation"),
+                Some(policy),
+            ));
+        }
+        if this.rt_executor_owned && client.0 != 0 && ticket.is_none() {
+            return Err((
+                reason("NO_DESTINATION", "routed gravity_comp mode-switch session has no terminal destination"),
+                Some(policy),
+            ));
+        }
+        if !this.rt_executor_owned && ticket.is_some() {
+            return Err((
+                reason("EXECUTOR_STOPPED", "routed terminal reservation passed to legacy owner"),
+                Some(policy),
+            ));
+        }
         let pose = arm6(&this.measured_positions);
-        this.retire_servo_ws_min_depths();
-        let mut entry_torque = model;
-        for (i, t) in entry_torque.iter_mut().enumerate() {
-            let lim = policy.torque_limits_nm[i];
-            *t = if t.is_finite() { t.clamp(-lim, lim) } else { model[i] };
+        let entry_torque = this.gravity_comp_entry_torque(&policy, model);
+        let targets = [
+            (0usize, ControlMode::Impedance),
+            (1, ControlMode::Impedance),
+            (2, ControlMode::Impedance),
+            (3, ControlMode::Impedance),
+            (4, ControlMode::Impedance),
+            (5, ControlMode::Impedance),
+        ];
+        let Ok(plan) = ModeSwitchPlan::switch_axes(&targets, ModeSwitchRecovery::RollbackToPrevious) else {
+            return Err((reason("GRAVITY_COMP_SWITCH_FAILED", "failed to build gravity_comp ModeSwitch plan"), Some(policy)));
+        };
+        if this.check_protected_operator_requirement(operator, owner_now).is_err() {
+            return Err((
+                reason("OPERATOR_REQUIRED", "Operator authentication is required"),
+                Some(policy),
+            ));
         }
-        this.stop_motion();
-        this.servo_stream_active = false;
-        this.tracking.invalidate();
+        if let Some(slot) = this.driver.as_ref() {
+            let mut budget_ok = Ok(());
+            let _ = slot.try_with_ref(|drv| {
+                budget_ok = drv.check_watchdog_tx_budget_for_energized();
+            });
+            if budget_ok.is_err() {
+                return Err((
+                    reason(
+                        "WATCHDOG_BUDGET_INSUFFICIENT",
+                        "tx_budget.max_frames is smaller than energized arm axes + J7 + 1",
+                    ),
+                    Some(policy),
+                ));
+            }
+        }
+        let mut prepared = PreparedSession::exclusive(SessionKind::ModeSwitch, client);
+        prepared.deadline = Some(deadline);
+        prepared.timeout_code = "TIMEOUT";
+        prepared.operator = operator;
+        prepared.revoke_on_stop = true;
+        prepared.escalate_safe_hold_on_uncertain = true;
+        let admit_res = match ticket {
+            Some(t) => this.admit_routed_ticket_with_proof(prepared, t, handoff, &proof, owner_now),
+            None => this.admit_internal_with_proof(prepared, &proof, owner_now),
+        };
+        let sid = match admit_res {
+            Ok(id) => id,
+            Err(err) => {
+                let code = err.code();
+                return Err((reason(code, "gravity_comp mode-switch session rejected"), Some(policy)));
+            }
+        };
+        let mut holds = [None; MAX_MODE_SWITCH_AXES];
         for i in 0..ARM {
-            this.commanded_positions[i] = pose[i];
-            this.commanded_velocities[i] = 0.0;
+            holds[i] = Some(ModeSwitchHoldTarget::mit(
+                pose[i],
+                0.0,
+                policy.hold_kp[i],
+                policy.hold_kd[i],
+                entry_torque[i],
+            ));
         }
-        crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
-        this.following_error_since = None;
-        let _ = this.safety.mark_motion_started();
-        this.gravity_comp = Some(GravityCompRun {
-            phase: GravityCompPhase::RampIn,
-            kp: arm6(&policy.hold_kp),
-            kd: arm6(&policy.hold_kd),
+        if let Some(slot) = this.driver.as_mut() {
+            let _ = slot.try_with_mut(|drv| {
+                drv.set_mode_switch_hold_targets(&holds);
+                drv.set_mode_switch_active_mask(0b11_1111);
+            });
+        }
+        if let Some(stale) = this.pending_gravity_enter.take() {
+            this.retire_gravity_comp_policy(stale.policy);
+        }
+        this.mit.handback_suppress_until = None;
+        this.pending_gravity_enter = Some(PendingGravityCompEnter {
+            session_id: sid.0,
             policy,
-            elapsed_s: 0.0,
             scale,
             damping_kd: damping,
             entry_pose: pose,
             entry_torque,
-            tau_ff: entry_torque,
-            position: pose,
-            overspeed_count: 0,
-            prev_measured: None,
             lease_generation: this.active_lease.as_ref().map(|l| l.generation),
         });
-        this.bump_motion_generation();
-        let _ = this.collision.hold.take();
-        Ok(None)
+        this.install_mode_switch_session(sid, ModeSwitchPurpose::GravityCompEnter, ModeSwitch::new(plan));
+        Ok(GravityCompEnterRtStart::StartedSession(sid.0))
+    }
+
+    /// Single RT completion handler for `ModeSwitchPurpose::GravityCompEnter` (0 alloc, 0 RT free).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn on_gravity_comp_enter_mode_switch_terminal_rt(
+        &mut self,
+        session_id: u64,
+        progress: crate::motor_mode::ModeProgress,
+        uncertain: bool,
+    ) {
+        let Some(pending) = self.pending_gravity_enter.take() else {
+            return;
+        };
+        if pending.session_id != session_id {
+            self.retire_gravity_comp_policy(pending.policy);
+            return;
+        }
+        match progress {
+            crate::motor_mode::ModeProgress::Confirmed => {
+                // Motors J1-J6 are now causally confirmed in MIT mode. If safety is still
+                // operational & torqued, begin RampIn; if a stop/fault raced on the confirm tick,
+                // catch immediately in stiff MIT Exiting hold so the arm never floats or drops.
+                let safe_to_float = !self.safety.state().is_stopped()
+                    && self.is_torqued
+                    && !self.disable_pending
+                    && !self.shutdown_committed
+                    && !self.estop_pending();
+                self.install_gravity_comp_run_rt(
+                    pending.policy,
+                    pending.scale,
+                    pending.damping_kd,
+                    pending.entry_pose,
+                    pending.entry_torque,
+                    pending.lease_generation,
+                );
+                if !safe_to_float {
+                    self.exit_gravity_comp_rt("STOPPED", "Interrupted during gravity_comp entry confirmation");
+                }
+            }
+            _ => {
+                self.retire_gravity_comp_policy(pending.policy);
+                self.tracking.invalidate();
+                if uncertain || progress.is_ambiguous() {
+                    self.safety.latch(
+                        crate::safety::FaultKind::Other,
+                        crate::safety::FaultDetail::formatted(
+                            crate::safety::FaultCode::GravityCompFailed,
+                            |buf| {
+                                let _ = core::fmt::write(
+                                    buf,
+                                    format_args!("GRAVITY_COMP_SWITCH_FAILED: ambiguous mode switch"),
+                                );
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Starts a stop-direction PR0C `ModeSwitch` (`MIT -> POS_VEL`, `FailClosed`) session for
+    /// hardware gravity-comp exit on the RT executor (0 alloc).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_gravity_comp_exit_mode_switch_rt(&mut self, hold: [f32; ARM], now: std::time::Instant) -> bool {
+        use crate::driver::ModeSwitchHoldTarget;
+        use crate::motor_mode::{ControlMode, ModeSwitch, ModeSwitchPlan, ModeSwitchRecovery, MAX_MODE_SWITCH_AXES};
+        use crate::rt_core::broker::ClientId;
+        use crate::rt_core::session::PreparedSession;
+        use crate::supervisor::ModeSwitchPurpose;
+
+        // Never issue ModeWrite while E-stop is pending or latched (keep TxKind::ModeWrite
+        // E-stop safety boundary intact; stiff MIT holds continue in `Exiting` until cleared).
+        if self.estop_pending()
+            || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst)
+            || matches!(self.safety.state(), SafetyState::EStop)
+        {
+            return false;
+        }
+        let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+        let (max_age_ms, max_vel) = self
+            .gravity_comp
+            .as_ref()
+            .map_or((100, 0.05), |r| (r.policy.feedback_max_age_ms, r.policy.entry_max_velocity));
+        let fresh = !tracking_active
+            || (self.feedback_numeric_valid
+                && self.hardware_arm_feedback_fresh(Duration::from_millis(max_age_ms))
+                && self.measured_positions.len() >= ARM
+                && self.measured_positions[..ARM].iter().all(|q| q.is_finite()));
+        let stationary = !tracking_active || self.gravity_comp_is_stationary(max_vel);
+        if !fresh || !stationary {
+            if let Some(run) = self.gravity_comp.as_mut() {
+                run.phase = GravityCompPhase::ExitFailed { hold, retry_in_s: 0.5 };
+            }
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::formatted(
+                    crate::safety::FaultCode::GravityCompFailed,
+                    |buf| {
+                        if !fresh {
+                            let _ = core::fmt::write(
+                                buf,
+                                format_args!("GRAVITY_COMP_EXIT_FAILED: fresh feedback (<= {max_age_ms} ms) required before switching back to POS_VEL"),
+                            );
+                        } else {
+                            let _ = core::fmt::write(
+                                buf,
+                                format_args!("GRAVITY_COMP_EXIT_FAILED: arm not stationary (limit {max_vel} rad/s) before switching back to POS_VEL"),
+                            );
+                        }
+                    },
+                ),
+            );
+            // Return `false` so THIS release still emits stiff MIT hold on J1-J6 instead of
+            // leaving a 40 ms gap while entering `ExitFailed`.
+            return false;
+        }
+
+        let targets = [
+            (0usize, ControlMode::PositionVelocity),
+            (1, ControlMode::PositionVelocity),
+            (2, ControlMode::PositionVelocity),
+            (3, ControlMode::PositionVelocity),
+            (4, ControlMode::PositionVelocity),
+            (5, ControlMode::PositionVelocity),
+        ];
+        // Stop-direction recovery uses FailClosed: never re-write MIT on a failed POS_VEL switch.
+        let Ok(plan) = ModeSwitchPlan::switch_axes(&targets, ModeSwitchRecovery::FailClosed) else {
+            return false;
+        };
+        let mut prepared = PreparedSession::pos_vel_handback(
+            ClientId(0),
+            self.safety.epoch_id(),
+            true,
+        );
+        prepared.deadline = Some(now + Duration::from_secs(2));
+        prepared.timeout_code = "TIMEOUT";
+        let sid = match self.admit_pos_vel_handback_session(prepared, true, false, None, now) {
+            Ok(id) => id,
+            Err(_) => {
+                return false;
+            }
+        };
+        let mut holds = [None; MAX_MODE_SWITCH_AXES];
+        if let Some(run) = self.gravity_comp.as_ref() {
+            for i in 0..ARM {
+                holds[i] = Some(ModeSwitchHoldTarget::mit(
+                    hold[i],
+                    0.0,
+                    run.policy.hold_kp[i],
+                    run.policy.hold_kd[i],
+                    run.tau_ff[i],
+                ));
+            }
+        }
+        if let Some(slot) = self.driver.as_mut() {
+            let _ = slot.try_with_mut(|drv| {
+                drv.set_mode_switch_hold_targets(&holds);
+                drv.set_mode_switch_active_mask(0b11_1111);
+            });
+        }
+        self.install_mode_switch_session(sid, ModeSwitchPurpose::GravityCompExit { hold }, ModeSwitch::new(plan));
+        // Return `false` so THIS release still emits stiff MIT hold (top-of-tick ModeSwitch
+        // already ran for this release and will take over cleanly on the next 20 ms release).
+        false
+    }
+
+    /// Single RT completion handler for `ModeSwitchPurpose::GravityCompExit` (0 alloc, 0 RT free).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn on_gravity_comp_exit_mode_switch_terminal_rt(
+        &mut self,
+        hold: [f32; ARM],
+        progress: crate::motor_mode::ModeProgress,
+        uncertain: bool,
+    ) {
+        match progress {
+            crate::motor_mode::ModeProgress::Confirmed => {
+                if let Some(old) = self.gravity_comp.take() {
+                    if self.rt_executor_owned {
+                        self.retire_gravity_comp_run(old);
+                    }
+                    self.bump_motion_generation();
+                }
+                for i in 0..ARM {
+                    self.commanded_positions[i] = hold[i];
+                    self.commanded_velocities[i] = 0.0;
+                }
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+                self.commanded_accelerations.fill(0.0);
+                self.following_error_since = None;
+                if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+                    self.tracking.seed(&self.commanded_positions);
+                } else {
+                    self.tracking.invalidate();
+                }
+                self.safety.mark_motion_finished();
+            }
+            other => {
+                // If cleanly revoked strictly because E-stop arrived mid-exit (no hardware
+                // ambiguity), keep stiff MIT hold in `Exiting` so clearing E-stop retries cleanly.
+                let clean_estop_defer = !uncertain
+                    && !other.is_ambiguous()
+                    && (self.estop_pending()
+                        || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst)
+                        || matches!(self.safety.state(), SafetyState::EStop));
+                if clean_estop_defer {
+                    return;
+                }
+                if let Some(run) = self.gravity_comp.as_mut() {
+                    run.phase = GravityCompPhase::ExitFailed { hold, retry_in_s: 0.5 };
+                }
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::formatted(
+                        crate::safety::FaultCode::GravityCompFailed,
+                        |buf| {
+                            let _ = core::fmt::write(
+                                buf,
+                                format_args!("GRAVITY_COMP_EXIT_FAILED: mode switch back to POS_VEL not confirmed ({other:?})"),
+                            );
+                        },
+                    ),
+                );
+            }
+        }
     }
 
     /// Zero-allocation RT exit from gravity compensation (does not trace or write synchronously on RT).
@@ -445,6 +945,13 @@ impl SupervisorInner {
         };
         let model = self.gravity_comp_model_torque(&policy, scale)
             .ok_or_else(|| Self::reject("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed".into()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.driver.is_some() && self.driver_supports_nonblocking_mode_switch() {
+            return Err(Self::reject(
+                "UNSUPPORTED",
+                "non-blocking ModeSwitch drivers must enter gravity_comp via StartGravityCompEnter".into(),
+            ));
+        }
         // hand guiding and MIT tracking own the output exclusively: once the request is valid,
         // hand back first (confirmed, at rest); a refused request never changes the owner
         if self.mit_active() {
@@ -862,6 +1369,10 @@ impl SupervisorInner {
     /// `gravity_comp_handback_ready` so the POS_VEL mode switch executes in the next release's
     /// dedicated TX budget without bypassing the current release's cutoff or exceeding 16 frames.
     pub(crate) fn step_gravity_comp_exit(&mut self, dt: f64, stiff_hold_completed: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.mode_switch_owns_bus() {
+            return;
+        }
         let Some(phase) = self.gravity_comp.as_ref().map(|r| r.phase.clone()) else { return; };
         match phase {
             GravityCompPhase::RampIn | GravityCompPhase::Active => {}
@@ -914,7 +1425,10 @@ impl SupervisorInner {
     /// Exempt from `Admitted` (Invariant 1a): stop-direction exit handback transitioning a
     /// gravity-comp exit (`Exiting`/`ExitFailed`) back to stiff `POS_VEL` hold, never starting
     /// new client motion.
-    pub(crate) fn run_scheduled_gravity_comp_handback(&mut self) -> bool {
+    pub(crate) fn run_scheduled_gravity_comp_handback(
+        &mut self,
+        #[cfg(not(target_arch = "wasm32"))] now: std::time::Instant,
+    ) -> bool {
         if !self.gravity_comp_handback_ready {
             return false;
         }
@@ -948,6 +1462,12 @@ impl SupervisorInner {
             }
         }
         self.gravity_comp_handback_ready = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.driver.is_some()
+            && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+        {
+            return self.start_gravity_comp_exit_mode_switch_rt(hold, now);
+        }
         self.gravity_comp_switch_back(hold);
         true
     }
@@ -1004,7 +1524,7 @@ impl SupervisorInner {
             Ok(()) => {
                 if let Some(old) = self.gravity_comp.take() {
                     if self.rt_executor_owned {
-                        self.retired_gravity_comp = Some(old);
+                        self.retire_gravity_comp_run(old);
                     }
                     self.bump_motion_generation();
                 }

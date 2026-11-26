@@ -110,6 +110,25 @@ impl RevocationScope {
     }
 }
 
+/// Narrow owner-internal authority mode for a PR0B session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionAuthorityMode {
+    /// Ordinary client-controlled session: revokes on E-stop, epoch bump, stop (when
+    /// `revoke_on_stop`), disconnect, lease loss, operator revocation, or deadline.
+    #[default]
+    ClientControlled,
+    /// Owner-internal stop-direction `MIT -> POS_VEL` handback (`GravityCompExit` or
+    /// `MitHandBack`). Still revokes immediately on SAFE-HOLD, internal fault fence,
+    /// E-stop latch, epoch mismatch, fresh pending urgent stop, or deadline — and never
+    /// bypasses Damiao's `TxKind::ModeWrite` E-stop gate — while surviving lease loss,
+    /// disconnect, operator lock, already-applied ordinary stop, and (when `allow_in_fault`)
+    /// non-E-stop `SafetyState::Fault`.
+    PosVelHandback {
+        expected_epoch: u64,
+        allow_in_fault: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAuthority {
     pub baseline: super::authority::AuthorityBaseline,
@@ -121,6 +140,7 @@ pub struct SessionAuthority {
     pub operator: crate::auth::OperatorRequirement,
     pub revoke_on_stop: bool,
     pub revoke_on_epoch_change: bool,
+    pub mode: SessionAuthorityMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +171,7 @@ pub struct PreparedSession {
     pub revoke_on_stop: bool,
     pub revoke_on_epoch_change: bool,
     pub escalate_safe_hold_on_uncertain: bool,
+    pub authority_mode: SessionAuthorityMode,
 }
 
 impl PreparedSession {
@@ -169,7 +190,27 @@ impl PreparedSession {
             revoke_on_stop: true,
             revoke_on_epoch_change: true,
             escalate_safe_hold_on_uncertain: true,
+            authority_mode: SessionAuthorityMode::ClientControlled,
         }
+    }
+
+    /// Owner-internal stop-direction `MIT -> POS_VEL` handback session.
+    pub fn pos_vel_handback(
+        client: ClientId,
+        expected_epoch: u64,
+        allow_in_fault: bool,
+    ) -> Self {
+        let mut s = Self::exclusive(SessionKind::ModeSwitch, client);
+        s.require_lease = false;
+        s.operator = crate::auth::OperatorRequirement::NotRequired;
+        s.revoke_on_stop = false;
+        s.revoke_on_epoch_change = true;
+        s.escalate_safe_hold_on_uncertain = true;
+        s.authority_mode = SessionAuthorityMode::PosVelHandback {
+            expected_epoch,
+            allow_in_fault,
+        };
+        s
     }
 
     pub fn recorder(client: ClientId) -> Self {
@@ -187,6 +228,7 @@ impl PreparedSession {
             revoke_on_stop: false,
             revoke_on_epoch_change: false,
             escalate_safe_hold_on_uncertain: false,
+            authority_mode: SessionAuthorityMode::ClientControlled,
         }
     }
 }
@@ -650,20 +692,38 @@ impl SessionDriver {
         {
             return Err(SessionTerminalReason::Revoked("OWNER_CHANGED"));
         }
-        if auth.revoke_on_epoch_change && (ctx.estop_latched || ctx.epoch != auth.epoch) {
-            return Err(SessionTerminalReason::Revoked("EPOCH_MISMATCH"));
-        }
-        if auth.revoke_on_stop && (ctx.urgent_stop_pending || ctx.stop_generation != auth.stop_generation) {
-            return Err(SessionTerminalReason::Revoked("STOPPED"));
-        }
-        if auth.connection_id != 0 && is_conn_closed(auth.connection_id) {
-            return Err(SessionTerminalReason::Revoked(if auth.require_lease { "LEASE_LOST" } else { "DISCONNECTED" }));
-        }
-        if auth.require_lease && !is_lease_valid(auth.connection_id, auth.lease_generation, ctx.now) {
-            return Err(SessionTerminalReason::Revoked("LEASE_LOST"));
-        }
-        if !is_operator_valid(auth.operator, ctx.now) {
-            return Err(SessionTerminalReason::Revoked("OPERATOR_REQUIRED"));
+        match auth.mode {
+            SessionAuthorityMode::PosVelHandback { expected_epoch, .. } => {
+                // Stop-direction MIT->POS_VEL recovery still enforces E-stop latch, epoch match,
+                // fresh pending urgent stop, and session deadline; it never bypasses Damiao's
+                // `TxKind::ModeWrite` E-stop gate.
+                if ctx.estop_latched {
+                    return Err(SessionTerminalReason::Revoked("ESTOP_ACTIVE"));
+                }
+                if ctx.epoch != expected_epoch {
+                    return Err(SessionTerminalReason::Revoked("EPOCH_MISMATCH"));
+                }
+                if ctx.urgent_stop_pending {
+                    return Err(SessionTerminalReason::Revoked("STOPPED"));
+                }
+            }
+            SessionAuthorityMode::ClientControlled => {
+                if auth.revoke_on_epoch_change && (ctx.estop_latched || ctx.epoch != auth.epoch) {
+                    return Err(SessionTerminalReason::Revoked("EPOCH_MISMATCH"));
+                }
+                if auth.revoke_on_stop && (ctx.urgent_stop_pending || ctx.stop_generation != auth.stop_generation) {
+                    return Err(SessionTerminalReason::Revoked("STOPPED"));
+                }
+                if auth.connection_id != 0 && is_conn_closed(auth.connection_id) {
+                    return Err(SessionTerminalReason::Revoked(if auth.require_lease { "LEASE_LOST" } else { "DISCONNECTED" }));
+                }
+                if auth.require_lease && !is_lease_valid(auth.connection_id, auth.lease_generation, ctx.now) {
+                    return Err(SessionTerminalReason::Revoked("LEASE_LOST"));
+                }
+                if !is_operator_valid(auth.operator, ctx.now) {
+                    return Err(SessionTerminalReason::Revoked("OPERATOR_REQUIRED"));
+                }
+            }
         }
         if let Some(code) = active.expired_code(ctx.now) {
             return Err(SessionTerminalReason::DeadlineExpired(code));
@@ -855,6 +915,11 @@ impl SessionDriver {
         out
     }
 
+    #[inline]
+    pub fn has_pending_terminals(&self) -> bool {
+        self.pending_terminals.iter().any(Option::is_some)
+    }
+
     pub fn flush_published_terminals(&mut self) -> usize {
         let Some(tx) = self.terminal_tx.as_mut() else { return 0 };
         let mut pushed = 0usize;
@@ -973,6 +1038,11 @@ impl SupervisorInner {
                 return Err(SessionAdmitError::OutputBusy(code));
             }
         }
+        // Stop-direction `PosVelHandback` sessions are exclusively admissible through
+        // `admit_pos_vel_handback_session`, never via `admit_session_inner`.
+        if prepared.authority_mode != SessionAuthorityMode::ClientControlled {
+            return Err(SessionAdmitError::InvalidSlotKind);
+        }
         let stamp = proof.stamp();
         // Preserve protected-operation policy independently of current enforcement state:
         // normalizing `NotRequired` -> `Required(OperatorGrant::unenforced())` admits while
@@ -999,6 +1069,7 @@ impl SupervisorInner {
             operator,
             revoke_on_stop: prepared.revoke_on_stop,
             revoke_on_epoch_change: prepared.revoke_on_epoch_change,
+            mode: SessionAuthorityMode::ClientControlled,
         };
         if let SessionTerminalBinding::Routed { client, .. } = terminal {
             if self.is_connection_closed(client.0) {
@@ -1021,6 +1092,101 @@ impl SupervisorInner {
             self.servo_stream_active = false;
         }
         Ok(id)
+    }
+
+    /// Admits an owner-internal stop-direction `MIT -> POS_VEL` handback `ModeSwitch` session
+    /// (exempt from `Admitted` per Invariant 1a: transitioning floating gravity-comp or MIT
+    /// tracking back to stiff `POS_VEL` hold, never starting client motion). Still fails closed
+    /// on E-stop latch, pending stop, SAFE-HOLD, internal fault fence, occupied session slot, or
+    /// torque transition in flight, and captures `baseline: self.capture_baseline()` so
+    /// `mode_switch_stop_proof()` / `stop_applied_since(baseline)` natively rejects predating faults.
+    pub(crate) fn admit_pos_vel_handback_session(
+        &mut self,
+        prepared: PreparedSession,
+        allow_gravity_comp_exit: bool,
+        allow_mit_handback: bool,
+        terminal: Option<(
+            super::reply_router::SessionTerminalTicket,
+            Option<&super::reply_router::SessionTerminalHandoff>,
+        )>,
+        now: Instant,
+    ) -> Result<SessionId, SessionAdmitError> {
+        let SessionAuthorityMode::PosVelHandback { expected_epoch, allow_in_fault } = prepared.authority_mode else {
+            return Err(SessionAdmitError::InvalidSlotKind);
+        };
+        if prepared.slot != SessionSlot::ExclusiveOutput || prepared.kind != SessionKind::ModeSwitch {
+            return Err(SessionAdmitError::InvalidSlotKind);
+        }
+        if self.sessions.is_safe_hold_requested() {
+            return Err(SessionAdmitError::AuthorityRejected("SAFE_HOLD"));
+        }
+        if self.internal_fault_lane.is_fenced() {
+            return Err(SessionAdmitError::AuthorityRejected("INTERNAL_FAULT"));
+        }
+        if self.estop_request_unapplied()
+            || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst)
+            || matches!(self.safety.state(), crate::safety::SafetyState::EStop)
+        {
+            return Err(SessionAdmitError::AuthorityRejected("ESTOP_ACTIVE"));
+        }
+        if !allow_in_fault && self.safety.state().is_stopped() {
+            return Err(SessionAdmitError::AuthorityRejected("FAULT_ACTIVE"));
+        }
+        if self.urgent_stop_unapplied() {
+            return Err(SessionAdmitError::AuthorityRejected("STOPPED"));
+        }
+        if self.safety.epoch_id() != expected_epoch {
+            return Err(SessionAdmitError::AuthorityRejected("EPOCH_MISMATCH"));
+        }
+        if self.sessions.is_slot_occupied(SessionSlot::ExclusiveOutput) {
+            return Err(SessionAdmitError::SlotBusy);
+        }
+        if self.torque_transition_pending() {
+            return Err(SessionAdmitError::OutputBusy("TRANSITION_BUSY"));
+        }
+        if !allow_gravity_comp_exit && self.gravity_comp.is_some() {
+            return Err(SessionAdmitError::OutputBusy("MOTION_BUSY"));
+        }
+        if !allow_mit_handback && self.mit_active() {
+            return Err(SessionAdmitError::OutputBusy("MOTION_BUSY"));
+        }
+        let (binding, handoff) = match terminal {
+            Some((ticket, h)) => {
+                if ticket.client().0 != 0 && self.is_connection_closed(ticket.client().0) {
+                    return Err(SessionAdmitError::AuthorityRejected("CONNECTION_CLOSED"));
+                }
+                (
+                    SessionTerminalBinding::Routed {
+                        request: ticket.request(),
+                        route_gen: ticket.route_gen(),
+                        client: ticket.client(),
+                        action_id: ticket.action_id(),
+                    },
+                    h,
+                )
+            }
+            None => (SessionTerminalBinding::Internal, None),
+        };
+        let authority = SessionAuthority {
+            baseline: self.capture_baseline(),
+            connection_id: 0,
+            lease_generation: 0,
+            epoch: expected_epoch,
+            stop_generation: self.current_stop_gen(),
+            require_lease: false,
+            operator: crate::auth::OperatorRequirement::NotRequired,
+            revoke_on_stop: false,
+            revoke_on_epoch_change: true,
+            mode: prepared.authority_mode,
+        };
+        self.sessions.admit_with_authority_handoff(
+            prepared,
+            authority,
+            binding,
+            handoff,
+            now,
+            false,
+        )
     }
 
     #[inline]
@@ -1236,6 +1402,9 @@ impl SupervisorInner {
     pub(crate) fn on_safe_hold_enter(&mut self, reason: &'static str) {
         self.cancel_active_commissioning_on_stop(reason);
         self.reconcile_mode_switch_on_revocation(reason);
+        if let Some(pending) = self.pending_gravity_enter.take() {
+            self.retire_gravity_comp_policy(pending.policy);
+        }
         self.cancel_active_gripper_zero_check_on_stop(reason);
         let outcomes = self.sessions.revoke_live_sessions_by_scope(
             SessionTerminalReason::Revoked(reason),
@@ -1421,6 +1590,7 @@ impl SupervisorInner {
             operator: crate::auth::OperatorRequirement::NotRequired,
             revoke_on_stop: false,
             revoke_on_epoch_change: false,
+            mode: SessionAuthorityMode::ClientControlled,
         };
         let session_id = self
             .sessions

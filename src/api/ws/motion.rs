@@ -66,15 +66,15 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/mode/gravity_comp"),
-        handler: DispatchHandler::Owner(dispatch_motion_command),
-        handler_name: "ws::motion::dispatch_motion_command",
+        handler: DispatchHandler::CommandAsync(dispatch_gravity_comp_async),
+        handler_name: "ws::motion::dispatch_gravity_comp_async",
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator(None),
+        auth: AuthRequirement::OwnerGrant(crate::rt_core::requests::lease::OwnerAuthPolicy::GravityCompEnter),
         reply: ReplyPolicy::CommandImmediate,
         ownership: RouteOwnership::ExecutorRequest,
         fault: FaultAvailability::Fenced,
-        executor_route: ExecutorWsRoute::ConfigOrCalib,
+        executor_route: ExecutorWsRoute::Unified,
     },
 ];
 
@@ -249,43 +249,121 @@ fn dispatch_preset(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     }
 }
 
-fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
-    if ctx.path == "/api/v1/mode/gravity_comp" {
-        let result = (|| -> Result<Started, ApiError> {
-            validate_command_body_common(&ctx.value["body"]).map_err(invalid_command)?;
-            let enable = ctx.value["body"].get("enable").and_then(Value::as_bool)
-                .ok_or_else(|| invalid_command("enable must be boolean"))?;
-            if enable {
-                let g = gravity_comp_request(&ctx.value["body"])?;
-                let grant = ctx.ws_auth.operator_grant();
-                if ctx
-                    .inner
-                    .check_protected_operator_requirement(
-                        crate::auth::OperatorRequirement::Required(grant),
-                        std::time::Instant::now(),
-                    )
-                    .is_err()
-                {
-                    return Err(ApiError::operator_required("/api/v1/mode/gravity_comp"));
-                }
-                let admitted = ctx.inner.check_admission(ctx.stamp).map_err(ArmError::from)?;
-                SupervisorInner::enter_gravity_comp(admitted, g)?;
-            } else {
-                ctx.inner.exit_gravity_comp("REQUESTED", "Exit requested");
+/// Unified table-bound async handler for `/api/v1/mode/gravity_comp` shared identically by
+/// `OWNER_LEGACY` and `OWNER_EXECUTOR` (routes hardware Damiao mode switching through PR0C
+/// `ModeSwitch` + SAFE-HOLD on both owners).
+fn dispatch_gravity_comp_async<'a>(
+    ctx: super::dispatch::CommandAsyncCtx<'a>,
+) -> super::dispatch::CommandAsyncFuture<'a> {
+    Box::pin(async move {
+        let req_id_val = ctx.value.get("request_id").unwrap_or(&Value::Null);
+        let epoch = super::lease::current_reject_epoch(ctx.supervisor).await;
+
+        if ctx.value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
+            return super::lease::format_command_epoch_mismatch(req_id_val, epoch);
+        }
+
+        let parsed_request_id = ctx.value.get("request_id").and_then(Value::as_u64);
+        if parsed_request_id.is_none()
+            || ctx
+                .last_ordinary_request
+                .is_some_and(|last| parsed_request_id.unwrap() <= last)
+        {
+            return super::lease::format_command_invalid_request_id(req_id_val);
+        }
+        *ctx.last_ordinary_request = parsed_request_id;
+
+        let body = &ctx.value["body"];
+        if let Err(msg) = validate_command_body_common(body) {
+            return super::lease::format_command_reject_api(req_id_val, invalid_command(msg), epoch);
+        }
+        let enable = match body.get("enable").and_then(Value::as_bool) {
+            Some(b) => b,
+            None => {
+                return super::lease::format_command_reject_api(
+                    req_id_val,
+                    invalid_command("enable must be boolean"),
+                    epoch,
+                );
             }
-            Ok(None)
-        })();
-        return Some(match result {
-            Ok(started) => OwnerReply::CommandAck {
-                snap: AckSnapshot::from_inner(ctx.inner),
-                started,
-            },
-            Err(error) => OwnerReply::CommandReject {
-                epoch: ctx.inner.safety.epoch_id(),
-                error,
-            },
-        });
-    }
+        };
+        if enable
+            && ctx
+                .supervisor
+                .published_config()
+                .await
+                .is_ok_and(|c| c.operator_auth_enforced)
+            && !ctx.operator.is_valid_at(Instant::now(), true)
+        {
+            return super::lease::format_command_reject_api(
+                req_id_val,
+                ApiError::operator_required("/api/v1/mode/gravity_comp"),
+                epoch,
+            );
+        }
+        let (scale, damping_kd) = if enable {
+            match gravity_comp_request(body) {
+                Ok(req) => (req.scale, req.damping_kd),
+                Err(err) => {
+                    return super::lease::format_command_reject_api(req_id_val, err, epoch);
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let mut gc_stamp = ctx.stamp;
+        gc_stamp.connection_id = ctx.conn_handle.id();
+        gc_stamp.lease_gen = ctx.local_generation;
+        gc_stamp.estop_epoch = epoch;
+        let lease_holder = Some((ctx.conn_handle.to_holder_label(), ctx.local_generation));
+        let client = crate::rt_core::broker::ClientId(ctx.conn_handle.id());
+        let operator = if enable {
+            crate::auth::OperatorRequirement::Required(ctx.operator)
+        } else {
+            crate::auth::OperatorRequirement::NotRequired
+        };
+        match crate::rt_core::requests::config::gravity_comp_command_with_auth(
+            ctx.supervisor,
+            gc_stamp,
+            lease_holder,
+            operator,
+            client,
+            enable,
+            scale,
+            damping_kd,
+        )
+        .await
+        {
+            Ok(rep) => {
+                let control_mode = if rep.active { "gravity_comp" } else { "position" };
+                json!({
+                    "type": "command_ack",
+                    "request_id": req_id_val,
+                    "status": "accepted",
+                    "epoch_id": rep.epoch_id,
+                    "safety_state": rep.safety_state.to_json_with_hub(ctx.supervisor),
+                    "is_torqued": rep.is_torqued,
+                    "control_mode": control_mode,
+                })
+            }
+            Err(ArmError::Rejected { status: 403, code, .. }) if code == "OPERATOR_REQUIRED" => {
+                let cur_epoch = super::lease::current_reject_epoch(ctx.supervisor).await;
+                super::lease::format_command_reject_api(
+                    req_id_val,
+                    ApiError::operator_required("/api/v1/mode/gravity_comp"),
+                    cur_epoch,
+                )
+            }
+            Err(err) => {
+                let cur_epoch = super::lease::current_reject_epoch(ctx.supervisor).await;
+                super::lease::format_command_reject_api(req_id_val, err.into(), cur_epoch)
+            }
+        }
+    })
+}
+
+fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<OwnerReply> {
     let command_path: &'static str = match ctx.path {
         "/api/v1/motion/jog" => "/api/v1/motion/jog",
         "/api/v1/motion/home" => "/api/v1/motion/home",
@@ -664,9 +742,11 @@ enum ExecutorMotionSubmitOutcome {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_prepared_motion_executor_ws(
     sup: &Arc<ArmSupervisor>,
     conn_id: u64,
+    client_seq: u64,
     kind: req::MotionKind,
     plan: &req::PreparedMotionPlan,
     authority: crate::rt_core::broker::Authority,
@@ -711,7 +791,7 @@ async fn submit_prepared_motion_executor_ws(
         };
         match handle.submit_external_motion(
             client,
-            0,
+            client_seq,
             authority,
             submit_deadline,
             sub,
@@ -855,7 +935,7 @@ async fn submit_prepared_motion_executor_ws(
 /// - `/api/v1/motion/jog`, `/api/v1/motion/home`, `/api/v1/motion/unload`
 /// - `preset` frames (`home`, `park`/`unload`, or explicit joint positions)
 ///
-/// Returns `None` for `/api/v1/mode/gravity_comp` (unmigrated) and all non-M frames.
+/// Returns `None` for `/api/v1/mode/gravity_comp` (dispatched via `DispatchHandler::CommandAsync` + `ExecutorWsRoute::Unified` to `ws::motion::dispatch_gravity_comp_async`) and all non-M frames.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_executor_ws_motion(
     frame_kind: FrameKind,
@@ -1093,6 +1173,51 @@ pub(super) async fn handle_executor_ws_motion(
             }
         };
 
+        let mut client_seq = 0u64;
+        if request.kind == req::MotionKind::Park && plan.slot.for_holding_after_clear {
+            let pub_cfg = match recv_supervisor.published_config().await {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    return immediate(format_motion_reject_at(cur_epoch, &reply_kind, e.into()));
+                }
+            };
+            if crate::mit::mit_joint_mask(&pub_cfg.config) != 0 {
+                client_seq = crate::supervisor::next_admission_request_id();
+                let lease_holder = (local_generation != 0).then(|| {
+                    (
+                        crate::model::HolderLabel::new(recv_connection),
+                        local_generation,
+                    )
+                });
+                let qual_stamp = crate::supervisor::AdmissionStamp::from_broker_conn(
+                    stamp.stop_gen,
+                    plan_auth.epoch,
+                    local_generation,
+                    recv_conn_id,
+                    client_seq,
+                );
+                if let Err(err) = crate::mit::run_mit_qualification_for_enable_executor(
+                    recv_supervisor,
+                    qual_stamp,
+                    lease_holder,
+                    crate::auth::OperatorGrant::unenforced(),
+                    crate::rt_core::broker::ClientId(recv_conn_id),
+                )
+                .await
+                {
+                    let ep = recv_supervisor
+                        .hub()
+                        .latest()
+                        .map_or(cur_epoch, |s| s.obs.epoch_id);
+                    return immediate(format_motion_reject_at(
+                        ep,
+                        &reply_kind,
+                        ArmError::Safety(err).into(),
+                    ));
+                }
+            }
+        }
+
         let broker_auth = crate::rt_core::broker::Authority {
             lease_generation: local_generation,
             epoch: plan_auth.epoch,
@@ -1108,6 +1233,7 @@ pub(super) async fn handle_executor_ws_motion(
         match submit_prepared_motion_executor_ws(
             recv_supervisor,
             recv_conn_id,
+            client_seq,
             request.kind,
             &plan,
             broker_auth,

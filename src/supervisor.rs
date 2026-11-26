@@ -7,7 +7,7 @@ use crate::supervisor_lock::SupervisorLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::rt_core::scratch::{copy_into, copy_limits, fill_n};
+use crate::rt_core::scratch::{copy_into, fill_n};
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
 use crate::model::{ArmConfig, ArmObservation, MotionLimit, MotionLimitReason, ObservationSchema, RestingPosePolicy};
 use crate::recording::{EpisodeRecorder, RecordFrame, RecordingError};
@@ -1224,6 +1224,10 @@ pub struct SupervisorInner {
     /// Why the last arm refused MIT tracking (`src/mit.rs` qualification gate); None = passed or
     /// MIT not requested.
     pub mit_gate_error: Option<String>,
+    /// Admission-bound one-shot MIT qualification proof verified off-RT against fresh register
+    /// readback + `mit::check_gate`, consumed atomically at `enable_prepare_rt_precheck`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) mit_gate_proof: Option<crate::rt_core::requests::config::MitGateProof>,
     /// MIT tracking output owner and history (`src/mit.rs`).
     pub mit: crate::mit::MitRuntime,
     /// The profile's `workspace.floor_z_m` (None without a workspace). `config.workspace.floor_z_m`
@@ -1365,8 +1369,13 @@ pub struct SupervisorInner {
     pub handover_settling_since: Option<Instant>,
     /// Running gravity-compensation session (`src/gravity_comp.rs`).
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
-    /// Retired gravity-compensation session waiting for off-thread drop (never dropped on RT).
-    pub(crate) retired_gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
+    /// Bounded queue of retired gravity-compensation runs waiting for off-thread drop (0 RT free).
+    pub(crate) retired_gravity_comp: std::collections::VecDeque<crate::gravity_comp::GravityCompRun>,
+    /// Bounded queue of retired gravity-comp policies waiting for off-thread drop (0 RT free).
+    pub(crate) retired_gravity_comp_policies: std::collections::VecDeque<crate::model::GravityCompPolicy>,
+    /// Staged hardware gravity-comp entry payload awaiting PR0C `ModeSwitch` confirmation (0 RT alloc).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) pending_gravity_enter: Option<crate::gravity_comp::PendingGravityCompEnter>,
     pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
     /// Keep-out source and file (`src/keepout.rs`).
     pub keepout: crate::keepout::Keepout,
@@ -2535,7 +2544,8 @@ impl SupervisorInner {
         };
 
         let mut scratch = crate::rt_core::scratch::TickScratch::with_dof(dof);
-        copy_limits(&mut scratch.step_limits, &config.limits);
+        crate::rt_core::scratch::copy_limits(&mut scratch.step_limits, &config.limits);
+        crate::rt_core::scratch::copy_limits(&mut scratch.fallback_limits, &config.limits);
 
         let mut inner = Self {
             config,
@@ -2696,6 +2706,8 @@ impl SupervisorInner {
             #[cfg(feature = "policy-runtime")]
             calibration_digest: crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
             mit_gate_error: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            mit_gate_proof: None,
             mit: Default::default(),
             profile_floor_z_m,
             floor_source: "profile",
@@ -2766,7 +2778,10 @@ impl SupervisorInner {
             last_evicted: None,
             handover_settling_since: None,
             gravity_comp: None,
-            retired_gravity_comp: None,
+            retired_gravity_comp: std::collections::VecDeque::with_capacity(8),
+            retired_gravity_comp_policies: std::collections::VecDeque::with_capacity(8),
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_gravity_enter: None,
             gravity_comp_last_exit: None,
             keepout: crate::keepout::Keepout::default(),
             poses: crate::poses::PoseStore::default(),
@@ -2965,6 +2980,7 @@ impl SupervisorInner {
         if let Some((ws, cam)) = self.workspace_policy() {
             bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
         }
+        self.tracking.install_ws_depth_spares_from_eval_bufs(&mut bufs, None);
         self.ws_eval_bufs = bufs;
         // Single-buffer workspace spare invariant: at most one heap `SlotBuf` exists across
         // `(self.servo_ws_min_depths, self.ws_eval_bufs.min_depths_spare)`, so
@@ -4450,22 +4466,22 @@ impl SupervisorInner {
         keepout_sweep_with_tcp_tol(&self.config.arm_model, ws, cam, self.config.tcp_offset, escape_tol, at, travel, knots, budget)
     }
 
-    /// The command `hold_measured_pose` holds: the measured pose clamped to the limits
-    /// (the current command when a measurement is not finite), the gripper keeping its command,
-    /// written strictly in place into `dst` (0 heap alloc when `dst.capacity() >= dof`).
-    pub(crate) fn measured_hold_pose_into(&self, dst: &mut Vec<f32>) {
-        crate::rt_core::scratch::copy_into(dst, &self.commanded_positions);
+    /// Zero-allocation stack version of measured hold pose writing into `dst` (up to `dof`).
+    pub(crate) fn measured_hold_pose_into(&self, dst: &mut [f32]) -> usize {
+        let dof = self.commanded_positions.len().min(dst.len());
+        dst[..dof].copy_from_slice(&self.commanded_positions[..dof]);
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            for (i, (c, m)) in dst.iter_mut().zip(&self.measured_positions).enumerate() {
+            for (i, (c, m)) in dst[..dof].iter_mut().zip(&self.measured_positions).enumerate() {
                 let l = &self.config.limits[i];
                 *c = m.clamp(l.min_position, l.max_position);
             }
         }
         if let Some(g) = self.config.gripper_index() {
-            if let (Some(c), Some(&cmd)) = (dst.get_mut(g), self.commanded_positions.get(g)) {
+            if let (Some(c), Some(&cmd)) = (dst[..dof].get_mut(g), self.commanded_positions.get(g)) {
                 *c = cmd;
             }
         }
+        dof
     }
 
     /// End every motion and hold the measured pose (clamped to the limits) with torque on;
@@ -10495,10 +10511,12 @@ impl SupervisorInner {
         // feedback confirms a clean baseline across every joint.
         if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
             if !sc.recovered.is_empty() {
-                tracing::warn!(
-                    "Driver emitted autonomous recovery writes for joints {:?}; suspending tracking compensation until fresh baseline",
-                    sc.recovered.iter().map(|i| i + 1).collect::<Vec<_>>()
-                );
+                if !self.safety.deferred_logging() {
+                    tracing::warn!(
+                        "Driver emitted autonomous recovery writes for joints {:?}; suspending tracking compensation until fresh baseline",
+                        sc.recovered.iter().map(|i| i + 1).collect::<Vec<_>>()
+                    );
+                }
                 self.tracking.suspend_for_recovery(&sc.recovered, Instant::now());
                 self.stop_motion();
                 self.servo_stream_active = false;
@@ -10517,25 +10535,24 @@ impl SupervisorInner {
                     && self.measured_positions.iter().all(|q| q.is_finite());
                 if all_fresh_post_recovery {
                     let gripper_idx = self.config.gripper_index();
-                    let recovered: Vec<usize> = self
-                        .tracking
-                        .recovery_joints
-                        .iter()
-                        .map(|&(j, _)| j)
-                        .collect();
-                    let mut recovered_updates = Vec::with_capacity(recovered.len());
-                    for &j in &recovered {
-                        if j < self.config.dof && Some(j) != gripper_idx {
+                    let mut recovered_updates = [(0usize, 0.0f32); crate::model::MAX_MOTION_DOF];
+                    let mut rec_len = 0usize;
+                    for &(j, _) in &self.tracking.recovery_joints {
+                        if j < self.config.dof
+                            && Some(j) != gripper_idx
+                            && rec_len < recovered_updates.len()
+                        {
                             let l = &self.config.limits[j];
                             let clamped = self.measured_positions[j].clamp(l.min_position, l.max_position);
                             self.commanded_positions[j] = clamped;
                             self.target_positions[j] = clamped;
-                            recovered_updates.push((j, clamped));
+                            recovered_updates[rec_len] = (j, clamped);
+                            rec_len += 1;
                         }
                     }
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.tracking.resume_from_recovery(&recovered_updates);
+                    self.tracking.resume_from_recovery(&recovered_updates[..rec_len]);
                 }
             }
         }
@@ -10550,7 +10567,11 @@ impl SupervisorInner {
                 );
             }
         }
-        if driver_torque_lost && self.is_torqued && !self.disable_pending {
+        if driver_torque_lost
+            && self.is_torqued
+            && !self.disable_pending
+            && self.mit.owner != crate::mit::MitOwner::Lost
+        {
             let policy_running = {
                 #[cfg(feature = "policy-runtime")]
                 {
@@ -12136,9 +12157,34 @@ impl SupervisorInner {
         if self.mit.revoke_pending {
             // a refused rearm revoked MIT: hand back once the brake reached rest
             let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
-            if !self.mit_active() || self.safety.state().is_stopped()
-                || (at_rest && self.mit_hand_back("authorization revoked").is_ok()) {
+            if !self.mit_active() || self.safety.state().is_stopped() {
                 self.mit.revoke_pending = false;
+            } else if at_rest {
+                #[cfg(not(target_arch = "wasm32"))]
+                let handback_done = if self.driver.is_some()
+                    && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+                {
+                    if !self.mode_switch.is_running() {
+                        let now = now_fn();
+                        let _ = self.mit_hand_back_start_rt(
+                            MitHandBackReason::AuthorizationRevoked,
+                            self.safety.epoch_id(),
+                            now + Duration::from_secs(2),
+                            crate::rt_core::broker::ClientId(0),
+                            None,
+                            &mut None,
+                            now,
+                        );
+                    }
+                    false
+                } else {
+                    self.mit_hand_back("authorization revoked").is_ok()
+                };
+                #[cfg(target_arch = "wasm32")]
+                let handback_done = self.mit_hand_back("authorization revoked").is_ok();
+                if handback_done {
+                    self.mit.revoke_pending = false;
+                }
             }
         }
         if self.mit.park_after_hand_back {
@@ -12167,35 +12213,103 @@ impl SupervisorInner {
                     msg.push_str("Park cancelled: MIT tracking lost or a fault");
                     self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
                 }
-            } else if at_rest && self.mit_hand_back("park").is_ok() {
-                self.mit.park_after_hand_back = false;
-                if std::mem::take(&mut self.mit.deferred_park_off_owner) {
-                    if let Some(c) = self.park_continuation.as_mut() {
-                        c.phase = ParkContinuationPhase::ReadyForPlan;
+            } else if at_rest {
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.driver.is_some()
+                    && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+                {
+                    if !self.mode_switch.is_running() {
+                        let now = now_fn();
+                        let _ = self.mit_hand_back_start_rt(
+                            MitHandBackReason::Park,
+                            self.safety.epoch_id(),
+                            now + Duration::from_secs(2),
+                            crate::rt_core::broker::ClientId(0),
+                            None,
+                            &mut None,
+                            now,
+                        );
                     }
-                    if let Some(w) = self.watchdog_park_pending.as_mut() {
-                        w.waiting_mit_handback = false;
+                } else if self.mit_hand_back("park").is_ok() {
+                    self.mit.park_after_hand_back = false;
+                    if std::mem::take(&mut self.mit.deferred_park_off_owner) {
+                        if let Some(c) = self.park_continuation.as_mut() {
+                            c.phase = ParkContinuationPhase::ReadyForPlan;
+                        }
+                        if let Some(w) = self.watchdog_park_pending.as_mut() {
+                            w.waiting_mit_handback = false;
+                        }
+                        self.notify_park_continuation();
+                    } else {
+                        self.apply_stop_policy(StopPolicy::NormalUnload);
+                        if let Some(id) = self.mit.deferred_park_action.take() {
+                            if self.pending_normal_unload {
+                                if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+                            } else {
+                                let mut msg = self.take_action_msg_buf(id, 96);
+                                msg.clear();
+                                msg.push_str("Park could not start after the MIT hand back");
+                                self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
+                            }
+                        }
                     }
-                    self.notify_park_continuation();
-                } else {
-                    self.apply_stop_policy(StopPolicy::NormalUnload);
-                    if let Some(id) = self.mit.deferred_park_action.take() {
-                        if self.pending_normal_unload {
-                            if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
-                        } else {
-                            let mut msg = self.take_action_msg_buf(id, 96);
-                            msg.clear();
-                            msg.push_str("Park could not start after the MIT hand back");
-                            self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
+                }
+                #[cfg(target_arch = "wasm32")]
+                if self.mit_hand_back("park").is_ok() {
+                    self.mit.park_after_hand_back = false;
+                    if std::mem::take(&mut self.mit.deferred_park_off_owner) {
+                        if let Some(c) = self.park_continuation.as_mut() {
+                            c.phase = ParkContinuationPhase::ReadyForPlan;
+                        }
+                        if let Some(w) = self.watchdog_park_pending.as_mut() {
+                            w.waiting_mit_handback = false;
+                        }
+                        self.notify_park_continuation();
+                    } else {
+                        self.apply_stop_policy(StopPolicy::NormalUnload);
+                        if let Some(id) = self.mit.deferred_park_action.take() {
+                            if self.pending_normal_unload {
+                                if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+                            } else {
+                                let mut msg = self.take_action_msg_buf(id, 96);
+                                msg.clear();
+                                msg.push_str("Park could not start after the MIT hand back");
+                                self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
+                            }
                         }
                     }
                 }
             }
         }
         if self.pending_normal_unload && self.mit_active() {
-            let _ = self.mit_hand_back("park");
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.driver.is_some()
+                && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+            {
+                if !self.mode_switch.is_running() {
+                    let now = now_fn();
+                    let _ = self.mit_hand_back_start_rt(
+                        MitHandBackReason::Park,
+                        self.safety.epoch_id(),
+                        now + Duration::from_secs(2),
+                        crate::rt_core::broker::ClientId(0),
+                        None,
+                        &mut None,
+                        now,
+                    );
+                }
+            } else {
+                let _ = self.mit_hand_back("park");
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = self.mit_hand_back("park");
+            }
         }
-        self.mit_maybe_activate();
+        self.mit_maybe_activate(
+            #[cfg(not(target_arch = "wasm32"))]
+            now_fn(),
+        );
         let gravity_output_enabled = self.gravity_output_enabled();
         self.tick_phase(1);
         // Hold only while torque may be active and fresh valid feedback permits output.
@@ -12218,13 +12332,11 @@ impl SupervisorInner {
         let mode_switch_ran_this_release = false;
         #[cfg(not(target_arch = "wasm32"))]
         let safe_hold_inline_fallback = self.sessions.is_safe_hold_requested()
-            && !self.mode_switch_owns_bus()
             && !mode_switch_ran_this_release;
         #[cfg(target_arch = "wasm32")]
         let safe_hold_inline_fallback = false;
         #[cfg(not(target_arch = "wasm32"))]
-        let mode_switch_owns_bus = self.mode_switch_owns_bus()
-            || mode_switch_ran_this_release
+        let mode_switch_owns_bus = mode_switch_ran_this_release
             || self.sessions.is_safe_hold_requested();
         #[cfg(target_arch = "wasm32")]
         let mode_switch_owns_bus = false;
@@ -12243,7 +12355,10 @@ impl SupervisorInner {
             // enabled), execute POS_VEL handback on this dedicated transition release using the
             // active release's TX pass (`set_joint_modes_in_tick`) without first spending 7 frames
             // on stiff MIT holds.
-            if self.run_scheduled_gravity_comp_handback() {
+            if self.run_scheduled_gravity_comp_handback(
+                #[cfg(not(target_arch = "wasm32"))]
+                now_fn(),
+            ) {
                 gravity_handback_ran = true;
                 if self.driver.is_none() {
                     driverless_accepted = true;
@@ -12414,12 +12529,9 @@ impl SupervisorInner {
                     && self.tracking.fallback_ramp.is_some()
                     && (self.active_trajectory.is_some() || self.servo_target.is_some() || self.pending_normal_unload)
                 {
-                    // A new motion or park took over from the issued (braking) state; recycle
-                    // buffers into spare_fallback_ramp to avoid RT deallocation.
-                    if let Some(old_ramp) = self.tracking.fallback_ramp.take() {
-                        if self.tracking.spare_fallback_ramp.is_none() {
-                            self.tracking.spare_fallback_ramp = Some(old_ramp);
-                        }
+                    // A new motion or park took over from the issued (braking) state.
+                    if let Some(old) = self.tracking.fallback_ramp.take() {
+                        self.tracking.recycle_fallback_ramp(old);
                     }
                 }
                 if tracking_active && self.tracking.recovery_suspended {
@@ -12428,66 +12540,106 @@ impl SupervisorInner {
                 } else if tracking_active && self.driver.is_some() && self.tracking.fallback_ramp.is_some() {
                     // Rejection-fallback braking ramp, also while the rejection fault is latched.
                     // The rejected motion's caps (`FallbackRamp::limits`) stay in force, tightened
-                    // by the current power governor limit; the ramp keeps its original caps.
+                    // by the current power governor limit; the ramp keeps its original caps (0 alloc).
                     let mut ramp = self.tracking.fallback_ramp.take().expect("checked above");
-                    let mut governed = std::mem::take(&mut self.scratch.step_limits);
+                    let mut governed = std::mem::take(&mut self.scratch.fallback_limits);
                     self.active_tracking_limits_into(servo_dt, time_scale, &mut governed);
-                    let mut orig_limits = std::mem::take(&mut self.scratch.fallback_limits);
-                    copy_limits(&mut orig_limits, &ramp.limits);
+                    let mut orig_va = [(0.0_f32, 0.0_f32); crate::model::MAX_MOTION_DOF];
+                    let n_lim = ramp.limits.len().min(crate::model::MAX_MOTION_DOF);
+                    for (slot, l) in orig_va[..n_lim].iter_mut().zip(&ramp.limits[..n_lim]) {
+                        *slot = (l.max_velocity, l.max_acceleration);
+                    }
                     for (l, g) in ramp.limits.iter_mut().zip(&governed) {
                         l.max_velocity = l.max_velocity.min(g.max_velocity);
                         l.max_acceleration = l.max_acceleration.min(g.max_acceleration);
                     }
-                    self.scratch.step_limits = governed;
-                    let mut tr_scratch = std::mem::take(&mut self.scratch.tracking);
+                    self.scratch.fallback_limits = governed;
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let mut pending = self.tracking_fallback_compute_into(
-                        ramp,
-                        servo_dt,
-                        &mut tick_sweep_budget,
-                        &mut tr_scratch,
-                    );
-                    std::mem::swap(&mut pending.ramp.limits, &mut orig_limits);
-                    self.scratch.fallback_limits = orig_limits;
-                    tick_output = self.apply_tracking_fallback_step_into(
-                        pending,
-                        &tr_scratch,
-                        gravity_output_enabled,
-                    );
-                    self.scratch.tracking = tr_scratch;
+                    let mut pending = self.tracking_fallback_compute_inline(ramp, servo_dt, &mut tick_sweep_budget);
+                    for (l, &(v, a)) in pending.ramp.limits[..n_lim].iter_mut().zip(&orig_va[..n_lim]) {
+                        l.max_velocity = v;
+                        l.max_acceleration = a;
+                    }
+                    tick_output = self.apply_tracking_fallback_step_inline(pending, gravity_output_enabled);
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else if ramp_out_handover || tracking_owned {
-                    let mut active_limits = std::mem::take(&mut self.scratch.step_limits);
+                    let mut active_limits = std::mem::take(&mut self.scratch.fallback_limits);
                     self.active_tracking_limits_into(servo_dt, time_scale, &mut active_limits);
-                    let mut tr_scratch = std::mem::take(&mut self.scratch.tracking);
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let eval_res = if ramp_out_handover {
-                        self.compute_lead_ramp_out_into(
+                    let use_inline = !ramp_out_handover
+                        && self.handover_settling_since.is_none()
+                        && self.config.dof <= crate::model::MAX_MOTION_DOF;
+                    let eval_res = if use_inline {
+                        self.compute_position_lead_output_inline(
+                            servo_dt,
+                            false,
+                            &active_limits,
+                            &mut tick_sweep_budget,
+                        )
+                    } else if ramp_out_handover && self.config.dof <= crate::model::MAX_MOTION_DOF {
+                        self.compute_lead_ramp_out_inline(
                             servo_dt,
                             &active_limits,
                             self.pending_normal_unload,
                             &mut tick_sweep_budget,
-                            &mut tr_scratch,
                         )
-                    } else {
-                        let jt = self.config.joint_tracking.as_ref().unwrap();
-                        let force_pos_only = self.handover_settling_since.is_some();
-                        self.compute_position_lead_output_into(
+                    } else if ramp_out_handover {
+                        self.compute_lead_ramp_out_with_budget(
                             servo_dt,
-                            jt,
-                            force_pos_only,
+                            &active_limits,
+                            self.pending_normal_unload,
+                            &mut tick_sweep_budget,
+                        )
+                        .map(|o| {
+                            let dof = o.positions.len().min(crate::model::MAX_MOTION_DOF);
+                            let mut positions = [0.0_f32; crate::model::MAX_MOTION_DOF];
+                            let mut velocities = [0.0_f32; crate::model::MAX_MOTION_DOF];
+                            positions[..dof].copy_from_slice(&o.positions[..dof]);
+                            velocities[..dof].copy_from_slice(&o.velocities[..dof]);
+                            let ws_min_depths_rev = o.ws_min_depths.as_ref().map(|(rev, sb)| {
+                                let s = sb.as_slice();
+                                if self.ws_eval_bufs.tracking_staged_ws.len() < s.len() {
+                                    self.ws_eval_bufs.tracking_staged_ws.resize(s.len(), 0.0);
+                                }
+                                self.ws_eval_bufs.tracking_staged_ws[..s.len()].copy_from_slice(s);
+                                (*rev, s.len())
+                            });
+                            let ws_keepout_min_depths_rev = o.ws_keepout_min_depths.as_ref().map(|(rev, sb)| {
+                                let s = sb.as_slice();
+                                if self.ws_eval_bufs.tracking_staged_ws.len() < s.len() {
+                                    self.ws_eval_bufs.tracking_staged_ws.resize(s.len(), 0.0);
+                                }
+                                self.ws_eval_bufs.tracking_staged_ws[..s.len()].copy_from_slice(s);
+                                (*rev, s.len())
+                            });
+                            crate::tracking::TrackingOutputInline {
+                                positions,
+                                velocities,
+                                dof,
+                                multiplier: o.multiplier,
+                                withdrawn: o.withdrawn,
+                                sweep_evals_used: o.sweep_evals_used,
+                                ws_min_depths_rev,
+                                ws_keepout_min_depths_rev,
+                            }
+                        })
+                        .map_err(crate::tracking::TrackingRejectRt::from_tracking_reject)
+                    } else {
+                        self.compute_position_lead_output_inline(
+                            servo_dt,
+                            true,
                             &active_limits,
                             &mut tick_sweep_budget,
-                            &mut tr_scratch,
                         )
                     };
                     match eval_res {
                         Ok(out) => {
-                            if self.check_static_load_tracking_output(&tr_scratch.out_positions, true).is_err() {
+                            self.scratch.fallback_limits = active_limits;
+                            if self.check_static_load_tracking_output(&out.positions[..out.dof], true).is_err() {
                                 // Tracking lead or ramp-out output would worsen static load above
                                 // cap or under active static overload restriction: do not emit
-                                // `tr_scratch.out_positions`; halt worsening motion and emit a safe
+                                // `out.positions`; halt worsening motion and emit a safe
                                 // hold pose. Also cancel any deferred completion captured earlier
                                 // on this tick (e.g. `StepStatus::Done` when `active_trajectory`
                                 // was already retired) or pending from a prior tick so a refused
@@ -12581,8 +12733,7 @@ impl SupervisorInner {
                                 let mut targets = std::mem::take(&mut self.scratch.targets);
                                 targets.clear();
                                 targets.extend(
-                                    tr_scratch
-                                        .out_positions
+                                    out.positions[..out.dof]
                                         .iter()
                                         .zip(self.commanded_velocities.iter())
                                         .enumerate()
@@ -12602,13 +12753,19 @@ impl SupervisorInner {
                                 tick_output = self.write_output_scratch(servo_dt);
                                 match &tick_output {
                                     TickOutput::Complete { .. } => {
-                                        self.tracking.record_issued_and_nominal_in_place(
-                                            &tr_scratch.out_positions,
-                                            &tr_scratch.out_velocities,
+                                        let ws_slice = out
+                                            .ws_min_depths_rev
+                                            .map(|(rev, n)| (rev, &self.ws_eval_bufs.tracking_staged_ws[..n]));
+                                        let keepout_slice = out
+                                            .ws_keepout_min_depths_rev
+                                            .map(|(rev, n)| (rev, &self.ws_eval_bufs.tracking_staged_ws[..n]));
+                                        self.tracking.record_issued_and_nominal_inline(
+                                            &out.positions[..out.dof],
+                                            &out.velocities[..out.dof],
                                             &self.commanded_positions,
                                             servo_dt,
-                                            out.ws_min_depths,
-                                            out.ws_keepout_min_depths,
+                                            ws_slice,
+                                            keepout_slice,
                                         );
                                         if out.withdrawn {
                                             self.tracking.withdrawal_ticks += 1;
@@ -12630,50 +12787,28 @@ impl SupervisorInner {
                         Err(reject) => {
                             let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
                             // Rejection fallback: evaluated from the intact history and park
-                            // state BEFORE the hold below invalidates them. It brakes the issued
-                            // output toward the measured hold within the active limits (continued
-                            // on later ticks by `fallback_ramp`), or latches a fault without
-                            // sending a frame when no step is feasible.
-                            let mut ramp = self.tracking.spare_fallback_ramp.take().unwrap_or_else(|| {
-                                crate::tracking::FallbackRamp {
-                                    hold: Vec::with_capacity(self.config.dof),
-                                    keepout_only: false,
-                                    limits: Vec::with_capacity(self.config.dof),
-                                }
-                            });
-                            self.measured_hold_pose_into(&mut ramp.hold);
-                            ramp.keepout_only = self.pending_normal_unload;
-                            copy_limits(&mut ramp.limits, &active_limits);
-                            let pending = self.tracking_fallback_compute_into(
-                                ramp,
-                                servo_dt,
-                                &mut tick_sweep_budget,
-                                &mut tr_scratch,
+                            // state BEFORE the hold below invalidates them. Reuses preallocated
+                            // `TrackingRuntime` spare buffers (0 RT allocs) and returns
+                            // `active_limits` directly to `self.scratch.fallback_limits`.
+                            let mut hold_buf = [0.0f32; crate::model::MAX_MOTION_DOF];
+                            let hold_len = self.measured_hold_pose_into(&mut hold_buf);
+                            let ramp = self.tracking.build_fallback_ramp(
+                                &hold_buf[..hold_len],
+                                self.pending_normal_unload,
+                                &active_limits,
                             );
+                            self.scratch.fallback_limits = active_limits;
+                            let pending = self.tracking_fallback_compute_inline(ramp, servo_dt, &mut tick_sweep_budget);
                             match reject {
-                                crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
-                                    self.enter_servo_keepout_hold(&ws_err);
+                                crate::tracking::TrackingRejectRt::Workspace(f) if was_streaming => {
+                                    self.enter_servo_keepout_hold_rt(f);
                                 }
-                                crate::tracking::TrackingReject::WorkspaceRt(ws_rt) if was_streaming => {
-                                    self.enter_servo_keepout_hold_rt(ws_rt);
-                                }
-                                crate::tracking::TrackingReject::Workspace(ws_err) => {
-                                    tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
-                                    self.hold_measured_pose();
-                                    self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
-                                    self.safety.latch(
-                                        crate::safety::FaultKind::Other,
-                                        crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
-                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {ws_err}"));
-                                        }),
-                                    );
-                                }
-                                crate::tracking::TrackingReject::WorkspaceRt(ws_rt) => {
+                                crate::tracking::TrackingRejectRt::Workspace(f) => {
                                     if !self.safety.deferred_logging() {
                                         tracing::warn!(
-                                            "Joint tracking output violated workspace ({}: {}): terminating motion",
-                                            ws_rt.code(),
-                                            ws_rt.phase
+                                            "Joint tracking output violated workspace ({} at {}): terminating motion",
+                                            f.code(),
+                                            f.phase
                                         );
                                     }
                                     self.hold_measured_pose();
@@ -12681,44 +12816,40 @@ impl SupervisorInner {
                                     self.safety.latch(
                                         crate::safety::FaultKind::Other,
                                         crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
-                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {} ({})", ws_rt.code(), ws_rt.phase));
+                                            let _ = core::fmt::write(
+                                                buf,
+                                                format_args!(
+                                                    "Joint tracking output rejected: {} ({})",
+                                                    f.code(),
+                                                    f.phase
+                                                ),
+                                            );
                                         }),
                                     );
                                 }
-                                crate::tracking::TrackingReject::JointLimitRt(jl_rt) => {
+                                crate::tracking::TrackingRejectRt::JointLimit(msg) => {
                                     if !self.safety.deferred_logging() {
-                                        tracing::warn!("Joint tracking output exceeded limits ({jl_rt}): terminating motion");
+                                        tracing::warn!(
+                                            "Joint tracking output exceeded limits ({}): terminating motion",
+                                            msg.as_str()
+                                        );
                                     }
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("JOINT_LIMIT"));
                                     self.safety.latch(
                                         crate::safety::FaultKind::JointLimit,
                                         crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
-                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {jl_rt}"));
-                                        }),
-                                    );
-                                }
-                                crate::tracking::TrackingReject::JointLimit(msg) => {
-                                    tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
-                                    self.hold_measured_pose();
-                                    self.drop_macro_run("failed", Some("JOINT_LIMIT"));
-                                    self.safety.latch(
-                                        crate::safety::FaultKind::JointLimit,
-                                        crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
-                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {msg}"));
+                                            let _ = core::fmt::write(
+                                                buf,
+                                                format_args!("Joint tracking output rejected: {}", msg.as_str()),
+                                            );
                                         }),
                                     );
                                 }
                             }
-                            tick_output = self.apply_tracking_fallback_step_into(
-                                pending,
-                                &tr_scratch,
-                                gravity_output_enabled,
-                            );
+                            tick_output = self.apply_tracking_fallback_step_inline(pending, gravity_output_enabled);
                         }
                     }
-                    self.scratch.tracking = tr_scratch;
-                    self.scratch.step_limits = active_limits;
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else {
@@ -13397,11 +13528,51 @@ impl SupervisorInner {
     }
 }
 
+/// Semantic purpose attached to the active PR0C `ModeSwitch` session on [`SupervisorInner`]
+/// (`Copy`, 0 heap alloc). Every terminal transition — normal completion, gate revocation,
+/// or external revocation — flows through a single RT completion handler.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ModeSwitchPurpose {
+    /// Direct PR0C `StartModeSwitch` caller (reference gripper confirm, standalone tests).
+    Standalone,
+    /// Hardware gravity-comp entry (`POS_VEL -> MIT` on J1–J6); payload lives in
+    /// `SupervisorInner::pending_gravity_enter`.
+    GravityCompEnter,
+    /// Stop-direction hardware gravity-comp exit (`MIT -> POS_VEL` on J1–J6).
+    GravityCompExit {
+        hold: [f32; 6],
+    },
+    /// MIT tracking activation (`POS_VEL -> MIT` on configured MIT joints).
+    MitActivate {
+        mask: u64,
+        hold_positions: [f32; crate::rt_core::mailbox::MAX_DOF],
+        ff: [f32; crate::rt_core::mailbox::MAX_DOF],
+    },
+    /// Stop-direction MIT tracking handback (`MIT -> POS_VEL` on active MIT joints).
+    MitHandBack {
+        reason: MitHandBackReason,
+        mask: u64,
+        hold_positions: [f32; crate::rt_core::mailbox::MAX_DOF],
+        ff: [f32; crate::rt_core::mailbox::MAX_DOF],
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MitHandBackReason {
+    Park,
+    AuthorizationRevoked,
+    GravityCompEntry,
+    Rearm,
+}
+
 /// Preallocated, zero-allocation inline holder for one PR0C `ModeSwitch` session inside
 /// [`SupervisorInner`].
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ModeSwitchRunner {
     active_session: Option<crate::rt_core::session::SessionId>,
+    purpose: ModeSwitchPurpose,
     machine: Option<crate::motor_mode::ModeSwitch>,
     event_tx: Option<crate::rt_core::stream::StreamProducer<crate::motor_mode::ModeSwitchEvent>>,
     retained_events: [Option<crate::motor_mode::ModeSwitchEvent>; 16],
@@ -13415,6 +13586,7 @@ impl ModeSwitchRunner {
     pub(crate) fn new() -> Self {
         Self {
             active_session: None,
+            purpose: ModeSwitchPurpose::Standalone,
             machine: None,
             event_tx: None,
             retained_events: [None; 16],
@@ -13484,9 +13656,21 @@ impl ModeSwitchRunner {
         self.active_session.is_none() && self.recent_terminal_cursor == 0
     }
 
+    pub(crate) fn install_session(
+        &mut self,
+        sid: crate::rt_core::session::SessionId,
+        purpose: ModeSwitchPurpose,
+        machine: crate::motor_mode::ModeSwitch,
+    ) {
+        self.active_session = Some(sid);
+        self.purpose = purpose;
+        self.machine = Some(machine);
+    }
+
     pub(crate) fn retire_if_session(&mut self, sid: crate::rt_core::session::SessionId) {
         if self.active_session == Some(sid) {
             self.active_session = None;
+            self.purpose = ModeSwitchPurpose::Standalone;
             self.machine = None;
         }
     }
@@ -13557,6 +13741,71 @@ impl SupervisorInner {
         self.mode_switch.latest_terminal()
     }
 
+    /// True when both bounded gravity-comp retirement queues have headroom for one more
+    /// `GravityCompRun` and/or `PendingGravityCompEnter` policy without exceeding capacity.
+    pub(crate) fn has_gravity_comp_reclaim_capacity(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        let pending_enter = usize::from(self.pending_gravity_enter.is_some());
+        #[cfg(target_arch = "wasm32")]
+        let pending_enter = 0usize;
+        let runs_needed = self.retired_gravity_comp.len()
+            + usize::from(self.gravity_comp.is_some())
+            + pending_enter;
+        let policies_needed = self.retired_gravity_comp_policies.len() + pending_enter;
+        runs_needed < self.retired_gravity_comp.capacity()
+            && policies_needed < self.retired_gravity_comp_policies.capacity()
+    }
+
+    /// Read-only inspection helper returning `(retired_runs_len, retired_policies_len)`.
+    pub fn retired_gravity_comp_queue_lens(&self) -> (usize, usize) {
+        (
+            self.retired_gravity_comp.len(),
+            self.retired_gravity_comp_policies.len(),
+        )
+    }
+
+    /// Queues a retired `GravityCompRun` for off-thread drop without allocating or freeing on RT.
+    pub(crate) fn retire_gravity_comp_run(&mut self, run: crate::gravity_comp::GravityCompRun) {
+        if self.retired_gravity_comp.len() < self.retired_gravity_comp.capacity() {
+            self.retired_gravity_comp.push_back(run);
+        } else {
+            debug_assert!(
+                !self.rt_executor_owned,
+                "retired_gravity_comp capacity exhausted on RT executor despite admission reservation"
+            );
+            drop(run);
+        }
+    }
+
+    pub(crate) fn pop_retired_gravity_comp(&mut self) -> Option<crate::gravity_comp::GravityCompRun> {
+        self.retired_gravity_comp.pop_front()
+    }
+
+    /// Queues a retired `GravityCompPolicy` for off-thread drop without allocating or freeing on RT.
+    pub(crate) fn retire_gravity_comp_policy(&mut self, policy: crate::model::GravityCompPolicy) {
+        if self.retired_gravity_comp_policies.len() < self.retired_gravity_comp_policies.capacity() {
+            self.retired_gravity_comp_policies.push_back(policy);
+        } else {
+            debug_assert!(
+                !self.rt_executor_owned,
+                "retired_gravity_comp_policies capacity exhausted on RT executor despite admission reservation"
+            );
+            drop(policy);
+        }
+    }
+
+    pub(crate) fn pop_retired_gravity_comp_policy(&mut self) -> Option<crate::model::GravityCompPolicy> {
+        self.retired_gravity_comp_policies.pop_front()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    pub(crate) fn driver_supports_nonblocking_mode_switch(&self) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(|d| d.try_with_ref(|drv| drv.supports_nonblocking_mode_switch()).unwrap_or(false))
+    }
+
     /// True when any exclusive PR0B session (e.g. `ModeSwitch` or `Commissioning`) owns output
     /// OR a session has requested SAFE-HOLD (mutual exclusion against legacy gravity-comp & MIT).
     #[inline]
@@ -13571,14 +13820,33 @@ impl SupervisorInner {
 
     #[inline]
     pub(crate) fn mode_switch_owns_bus(&self) -> bool {
-        !self.safety.state().is_stopped()
-            && self.mode_switch.is_running()
-            && self
-                .sessions
-                .slot(crate::rt_core::session::SessionSlot::ExclusiveOutput)
-                .is_some_and(|s| {
-                    s.kind == crate::rt_core::session::SessionKind::ModeSwitch && s.is_live()
-                })
+        let Some(slot) = self
+            .sessions
+            .slot(crate::rt_core::session::SessionSlot::ExclusiveOutput)
+        else {
+            return false;
+        };
+        if !self.mode_switch.is_running()
+            || slot.kind != crate::rt_core::session::SessionKind::ModeSwitch
+            || !slot.is_live()
+        {
+            return false;
+        }
+        if !self.safety.state().is_stopped() {
+            return true;
+        }
+        // Owner-internal stop-direction MIT -> POS_VEL handback in non-E-stop Fault may own
+        // the bus exclusively ONLY when no E-stop is pending or latched (never bypassing
+        // Damiao's TxKind::ModeWrite E-stop gate).
+        matches!(
+            slot.authority.mode,
+            crate::rt_core::session::SessionAuthorityMode::PosVelHandback {
+                allow_in_fault: true,
+                ..
+            }
+        ) && !self.estop_pending()
+            && !self.urgent_stop_unapplied()
+            && !matches!(self.safety.state(), crate::safety::SafetyState::EStop)
     }
 
     #[allow(clippy::result_large_err)]
@@ -13635,6 +13903,20 @@ impl SupervisorInner {
                 code: "WATCHDOG_GAP_INFEASIBLE",
                 message: "mode-switch watchdog gap is shorter than one control period plus the hold delivery margin",
             });
+        }
+        if let Some(slot) = self.driver.as_ref() {
+            let mut budget_ok = Ok(());
+            let _ = slot.try_with_ref(|drv| {
+                budget_ok = drv.check_watchdog_tx_budget_for_energized();
+            });
+            if budget_ok.is_err() {
+                retire_terminal(&mut terminal, retired);
+                return Err(ConfigError::CalibPrecondition {
+                    status: 400,
+                    code: "WATCHDOG_BUDGET_INSUFFICIENT",
+                    message: "tx_budget.max_frames is smaller than energized arm axes + J7 + 1",
+                });
+            }
         }
         let cur_epoch = self.safety.epoch_id();
         let admitted = match self.check_admission(req.admission) {
@@ -13730,9 +14012,22 @@ impl SupervisorInner {
         if let Some(slot) = self.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(plan_mask));
         }
-        self.mode_switch.active_session = Some(sid);
-        self.mode_switch.machine = Some(crate::motor_mode::ModeSwitch::new(req.plan));
+        self.install_mode_switch_session(
+            sid,
+            ModeSwitchPurpose::Standalone,
+            crate::motor_mode::ModeSwitch::new(req.plan),
+        );
         Ok(sid.0)
+    }
+
+    /// Single admission point installing a `ModeSwitch` session into `self.mode_switch` (0 alloc).
+    pub(crate) fn install_mode_switch_session(
+        &mut self,
+        sid: crate::rt_core::session::SessionId,
+        purpose: ModeSwitchPurpose,
+        machine: crate::motor_mode::ModeSwitch,
+    ) {
+        self.mode_switch.install_session(sid, purpose, machine);
     }
 
     pub(crate) fn poll_mode_switch_rt(
@@ -13775,6 +14070,36 @@ impl SupervisorInner {
         self.mode_switch_stop_proof().is_some()
     }
 
+    /// Single RT convergence point invoked ONCE whenever a `ModeSwitch` session reaches a
+    /// terminal state (normal completion, in-step gate revocation, or external revocation).
+    /// Applies purpose-specific state transitions (0 heap alloc, 0 RT dealloc).
+    pub(crate) fn apply_mode_switch_terminal_rt(
+        &mut self,
+        sid: crate::rt_core::session::SessionId,
+        purpose: ModeSwitchPurpose,
+        progress: crate::motor_mode::ModeProgress,
+        uncertain: bool,
+    ) {
+        if let Some(slot) = self.driver.as_mut() {
+            let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(0));
+        }
+        match purpose {
+            ModeSwitchPurpose::Standalone => {}
+            ModeSwitchPurpose::GravityCompEnter => {
+                self.on_gravity_comp_enter_mode_switch_terminal_rt(sid.0, progress, uncertain);
+            }
+            ModeSwitchPurpose::GravityCompExit { hold } => {
+                self.on_gravity_comp_exit_mode_switch_terminal_rt(hold, progress, uncertain);
+            }
+            ModeSwitchPurpose::MitActivate { mask, hold_positions, ff } => {
+                self.on_mit_activate_mode_switch_terminal_rt(mask, &hold_positions, &ff, progress, uncertain);
+            }
+            ModeSwitchPurpose::MitHandBack { reason, mask, hold_positions, ff } => {
+                self.on_mit_handback_mode_switch_terminal_rt(reason, mask, &hold_positions, &ff, progress, uncertain);
+            }
+        }
+    }
+
     /// Reconciles active `ModeSwitch` state and driver `mode_write_uncertain_mask` /
     /// `mode_switch_active_mask` on ANY revocation path (stop, E-stop, disconnect, expiry,
     /// cancel, fault, SAFE-HOLD, handback), syncing `hw_state_uncertain` into `SessionDriver`.
@@ -13785,6 +14110,7 @@ impl SupervisorInner {
         let Some(mut machine) = self.mode_switch.machine.take() else {
             return false;
         };
+        let purpose = self.mode_switch.purpose;
         let reason = crate::motor_mode::ModeSwitchFailure::from_revoke_code(reason_code);
         let mut drv_uncertain = 0u32;
         let stop_applied = self.mode_switch_stop_applied();
@@ -13801,8 +14127,10 @@ impl SupervisorInner {
         let uncertain = progress.is_ambiguous() || drv_uncertain != 0;
         let snap = machine.snapshot(sid.0, drv_uncertain);
         self.mode_switch.machine = Some(machine);
+        self.mode_switch.purpose = ModeSwitchPurpose::Standalone;
         self.mode_switch.stage_events_from_machine(sid);
         self.mode_switch.record_terminal(snap);
+        self.apply_mode_switch_terminal_rt(sid, purpose, progress, uncertain);
         let _ = self.sessions.set_hw_state_uncertain(
             crate::rt_core::session::SessionSlot::ExclusiveOutput,
             sid,
@@ -13837,6 +14165,33 @@ impl SupervisorInner {
         self.poll_mode_switch_rt(session_id)
     }
 
+    /// Records an admission-bound one-shot MIT qualification proof on RT (0 alloc).
+    /// Verifies live epoch, stop_gen, calibration_revision, motion_config_revision, zero offsets
+    /// digest, and `sched::mit_refusal()` before storing; rejects stale proofs fail-closed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn record_mit_gate_proof_rt(
+        &mut self,
+        proof: crate::rt_core::requests::config::MitGateProof,
+        now: Instant,
+    ) -> bool {
+        if crate::rt_core::sched::mit_refusal().is_some()
+            || self.estop_pending()
+            || self.safety.state().is_stopped()
+            || self.safety.epoch_id() != proof.estop_epoch
+            || self.current_stop_gen() != proof.stop_gen
+            || self.calibration_revision != proof.calibration_revision
+            || self.motion_config_revision != proof.motion_config_revision
+            || crate::mit::zero_offsets_hash(&self.joint_zero_offsets) != proof.zero_offsets_hash
+            || now.saturating_duration_since(proof.verified_at) > Duration::from_secs(5)
+        {
+            self.mit_gate_proof = None;
+            return false;
+        }
+        self.mit.qualified_holdoff = proof.holdoff;
+        self.mit_gate_proof = Some(proof);
+        true
+    }
+
     pub(crate) fn clear_mode_switch_rt(&mut self, session_id: u64) -> bool {
         use crate::rt_core::session::SessionSlot;
         let Some(sid) = self.mode_switch.active_session else {
@@ -13852,6 +14207,7 @@ impl SupervisorInner {
             return false;
         }
         self.mode_switch.active_session = None;
+        self.mode_switch.purpose = ModeSwitchPurpose::Standalone;
         self.mode_switch.machine = None;
         true
     }
@@ -13920,12 +14276,19 @@ impl SupervisorInner {
             |_, _, _| lease_ok,
             |_, _| op_ok,
         ) {
+            let purpose = self.mode_switch.purpose;
             let uncertain = self.reconcile_mode_switch_on_revocation(reason.code());
             if let Some(outcome) =
                 self.sessions
                     .finish_slot(SessionSlot::ExclusiveOutput, sid, reason, uncertain)
             {
                 self.maybe_escalate_session_safe_hold(outcome, active.escalate_safe_hold_on_uncertain);
+                if matches!(active.terminal, crate::rt_core::session::SessionTerminalBinding::Internal)
+                    && !matches!(purpose, ModeSwitchPurpose::Standalone)
+                {
+                    let _ = self.sessions.clear_terminal_slot(SessionSlot::ExclusiveOutput, sid);
+                    self.mode_switch.retire_if_session(sid);
+                }
             }
             return;
         }
@@ -13946,6 +14309,7 @@ impl SupervisorInner {
             return;
         };
 
+        let purpose = self.mode_switch.purpose;
         let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
         let max_tx_frames = self
             .config
@@ -13972,6 +14336,8 @@ impl SupervisorInner {
         let mut ms_rx_used: u16 = 0;
         let mut ms_rx_exhausted = false;
         let mut ms_tx_used: u16 = 0;
+        let mut mit_fence_tripped = false;
+        let mut handback_committed_tx: Option<Instant> = None;
         let step_progress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let Some(slot) = taken_drv.as_mut() else {
                 return ModeProgress::FailedClean {
@@ -13981,6 +14347,22 @@ impl SupervisorInner {
             };
             let mut out = ModeProgress::Pending { wake: None };
             let locked = slot.try_with_mut(|drv| {
+                // Check driver MIT deadline fence BEFORE stepping activation/handback so a
+                // prior fence trip never lets activation promote to Active.
+                if matches!(
+                    purpose,
+                    ModeSwitchPurpose::MitActivate { .. } | ModeSwitchPurpose::MitHandBack { .. }
+                ) && drv.mit_fence_trip_bounded().is_some()
+                {
+                    mit_fence_tripped = true;
+                    drv_uncertain = drv.mode_write_uncertain_mask();
+                    out = machine.reconcile_external_revocation(
+                        Some(drv),
+                        ModeSwitchFailure::WatchdogBudgetBreached,
+                        false,
+                    );
+                    return;
+                }
                 let Ok((drv_now, _, drv_cutoff)) =
                     translate_driver_cutoff_conservative(drv, effective_cutoff, &mut *owner_now_fn)
                 else {
@@ -14026,6 +14408,20 @@ impl SupervisorInner {
                 ms_rx_exhausted = drv_ledger.rx_exhausted();
                 ms_tx_used = drv_ledger.tx_used();
                 drv_uncertain = drv.mode_write_uncertain_mask();
+                if matches!(
+                    purpose,
+                    ModeSwitchPurpose::MitActivate { .. } | ModeSwitchPurpose::MitHandBack { .. }
+                ) {
+                    mit_fence_tripped = drv.mit_fence_trip_bounded().is_some();
+                    if let ModeSwitchPurpose::MitHandBack { mask, .. } = purpose {
+                        if !mit_fence_tripped && !out.is_terminal() {
+                            // Supply genuine oldest committed control-frame TX timestamp across
+                            // the handback axes so `mit_supervise()` observes real committed holds
+                            // rather than declaring ownership lost during a healthy multi-tick handback.
+                            handback_committed_tx = drv.mit_min_last_ctrl_tx(mask);
+                        }
+                    }
+                }
             });
             if locked.is_err() {
                 ModeProgress::Pending { wake: None }
@@ -14047,13 +14443,30 @@ impl SupervisorInner {
             ms_tx_used,
         );
 
-        let progress = match step_progress {
+        let mut progress = match step_progress {
             Ok(p) => p,
             Err(payload) => {
                 self.mode_switch.machine = Some(machine);
                 std::panic::resume_unwind(payload);
             }
         };
+
+        if let Some(ts) = handback_committed_tx {
+            if self.mit.owner == crate::mit::MitOwner::Active {
+                self.mit.last_output = Some(match self.mit.last_output {
+                    Some(prev) => prev.max(ts),
+                    None => ts,
+                });
+            }
+        }
+
+        // If the MIT deadline fence tripped during activation/handback, never allow Confirmed.
+        if mit_fence_tripped && !progress.is_ambiguous() {
+            progress = ModeProgress::Ambiguous {
+                failed_joint: 0,
+                reason: ModeSwitchFailure::WatchdogBudgetBreached,
+            };
+        }
 
         let uncertain_now = progress.is_ambiguous() || drv_uncertain != 0;
         let _ = self
@@ -14088,7 +14501,9 @@ impl SupervisorInner {
         self.mode_switch.machine = Some(machine);
         self.mode_switch.stage_events_from_machine(sid);
         if progress.is_terminal() {
+            self.mode_switch.purpose = ModeSwitchPurpose::Standalone;
             self.mode_switch.record_terminal(snap);
+            self.apply_mode_switch_terminal_rt(sid, purpose, progress, uncertain_now);
         }
 
         if let Some(SessionStep::Terminal(outcome)) = self.sessions.step_slot(
@@ -14101,6 +14516,15 @@ impl SupervisorInner {
             |_, _, _| phase_out,
         ) {
             self.maybe_escalate_session_safe_hold(outcome, active.escalate_safe_hold_on_uncertain);
+            // Owner-internal sessions (no external request/router terminal waiting to call
+            // ClearModeSwitch) retire their terminal slot immediately so subsequent ModeSwitch
+            // sessions (e.g. MitHandBack, GravityCompEnter/Exit) are never blocked with SlotBusy.
+            if matches!(active.terminal, crate::rt_core::session::SessionTerminalBinding::Internal)
+                && !matches!(purpose, ModeSwitchPurpose::Standalone)
+            {
+                let _ = self.sessions.clear_terminal_slot(SessionSlot::ExclusiveOutput, sid);
+                self.mode_switch.retire_if_session(sid);
+            }
         }
     }
 }
@@ -14108,7 +14532,7 @@ impl SupervisorInner {
 /// Allocates a collision-free `ActionId` for a router-bound `ModeSwitch` session terminal
 /// (session-request namespace bit set, never equal to a broker `ActionId`).
 #[cfg(not(target_arch = "wasm32"))]
-fn next_mode_switch_terminal_action_id() -> crate::rt_core::broker::ActionId {
+pub(crate) fn next_mode_switch_terminal_action_id() -> crate::rt_core::broker::ActionId {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     crate::rt_core::broker::ActionId(crate::rt_core::reply_router::SESSION_REQUEST_ID_BIT | n)
@@ -16389,14 +16813,15 @@ impl ArmSupervisor {
             || guard.zero_check_persisting.is_some()
             || guard.gravity_comp.is_some()
             || guard.macro_run.is_some()
-            || guard.mit_active()
+            || guard.mit.owner != crate::mit::MitOwner::Off
             || guard.mit.revoke_pending
+            || guard.mode_switch.active_session.is_some()
         {
             restore_legacy(&mut rollback);
             return Err(ArmError::Rejected {
                 status: 409,
                 code: "TRANSFER_BLOCKED".into(),
-                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, macro action, or MIT tracking is active".into(),
+                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, macro action, or MIT tracking (active or lost) is active".into(),
             });
         }
         #[cfg(feature = "policy-runtime")]
@@ -16406,14 +16831,6 @@ impl ArmSupervisor {
                 status: 409,
                 code: "TRANSFER_BLOCKED".into(),
                 message: "Cannot transfer ownership while policy runtime is active or loading".into(),
-            });
-        }
-        if crate::mit::mit_joint_mask(&guard.config) != 0 {
-            restore_legacy(&mut rollback);
-            return Err(ArmError::Rejected {
-                status: 503,
-                code: "UNSUPPORTED_RT_CONFIG".into(),
-                message: "MIT-configured profiles require synchronous qualification/handover and are not supported under synchronous RT executor step 1".into(),
             });
         }
         if guard.config.dof > crate::rt_core::mailbox::MAX_DOF {
@@ -16428,6 +16845,17 @@ impl ArmSupervisor {
                 ),
             });
         }
+        // Pre-allocate MIT runtime vectors before handing ownership to `armd-control` so
+        // activation and handback perform zero heap allocations on RT.
+        let j_len = guard.mit.joints.len();
+        if guard.mit.joints.capacity() < crate::rt_core::mailbox::MAX_DOF {
+            guard.mit.joints.reserve(crate::rt_core::mailbox::MAX_DOF.saturating_sub(j_len));
+        }
+        let ff_len = guard.mit.last_ff.len();
+        if guard.mit.last_ff.capacity() < crate::rt_core::mailbox::MAX_DOF {
+            guard.mit.last_ff.reserve(crate::rt_core::mailbox::MAX_DOF.saturating_sub(ff_len));
+        }
+        guard.mit_gate_proof = None;
         // Flush any legacy E-stop acks already applied before handoff so waiting callers
         // receive their exact recorded (state, epoch) instead of stalling after transfer,
         // and drop any legacy retired fault Arcs off-thread before transferring ownership.
@@ -18288,6 +18716,45 @@ impl ArmSupervisor {
         }
     }
 
+    /// Waits via `read_services` (`poll_mode_switch_session`) until `session_id` reaches terminal
+    /// or `wait_deadline` elapses (cancelling on timeout), clearing the slot when safe.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn await_mode_switch_session(
+        &self,
+        session_id: u64,
+        wait_deadline: Instant,
+    ) -> Result<Option<crate::motor_mode::ModeSwitchSnapshot>, crate::rt_core::requests::config::ConfigError>
+    {
+        loop {
+            match self.poll_mode_switch_session(session_id).await {
+                Ok(Some(snap)) if !snap.running => {
+                    if !snap.progress.is_ambiguous() && !self.internal_fault_lane.is_fenced() {
+                        let _ = self.clear_mode_switch_session(session_id).await;
+                    }
+                    return Ok(Some(snap));
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+            if Instant::now() >= wait_deadline {
+                let mut snap = self.cancel_mode_switch_session(session_id, "TIMEOUT").await?;
+                if snap.is_none() {
+                    snap = self
+                        .poll_mode_switch_session(session_id)
+                        .await?
+                        .filter(|s| !s.running);
+                }
+                if !snap.as_ref().is_some_and(|s| s.progress.is_ambiguous())
+                    && !self.internal_fault_lane.is_fenced()
+                {
+                    let _ = self.clear_mode_switch_session(session_id).await;
+                }
+                return Ok(snap);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Runs a `ModeSwitch` session to completion on the active owner (`OWNER_LEGACY` or
     /// `OWNER_EXECUTOR`), polling via [`Self::read_services`] until terminal and clearing the slot
     /// before returning the final authoritative snapshot.
@@ -18308,25 +18775,9 @@ impl ArmSupervisor {
             });
         };
         let session_id = self.start_mode_switch_session(req).await?;
-        loop {
-            match self.poll_mode_switch_session(session_id).await {
-                Ok(Some(snap)) if !snap.running => {
-                    let _ = self.clear_mode_switch_session(session_id).await;
-                    return Ok(snap);
-                }
-                Ok(Some(_)) | Ok(None) => {}
-                Err(e) => return Err(e),
-            }
-            if Instant::now() >= wait_deadline {
-                if let Ok(Some(snap)) = self.cancel_mode_switch_session(session_id, "TIMEOUT").await
-                {
-                    let _ = self.clear_mode_switch_session(session_id).await;
-                    return Ok(snap);
-                }
-                return Err(ConfigError::OwnerStopped);
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        self.await_mode_switch_session(session_id, wait_deadline)
+            .await?
+            .ok_or(ConfigError::OwnerStopped)
     }
 
     /// Reference adapter (PR0C): runs causal J7 gripper mode confirmation (`PositionVelocity` or
@@ -19808,6 +20259,86 @@ impl ArmSupervisor {
                     }
                 };
 
+                #[cfg(not(target_arch = "wasm32"))]
+                if prep_ws.enable == Some(true)
+                    && self
+                        .published_config()
+                        .await?
+                        .driver_supports_nonblocking_mode_switch
+                {
+                    let needs_handback = {
+                        let mut inner = self.inner.write().await;
+                        let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
+                        inner.set_command("/api/v1/torque");
+                        inner.set_direction("on");
+                        if let Err(e) = self.check_legacy_under_guard(&inner) {
+                            inner.set_io_timing(io_scope.finish());
+                            return Err(e);
+                        }
+                        if let Err(err) = check_torque_owner_preflight(
+                            &mut inner,
+                            prep_ws.connection,
+                            prep_ws.local_generation,
+                            prep_ws.supplied_epoch,
+                            prep_ws.request_id_valid,
+                            prep_ws.body_error,
+                            prep_ws.auth_policy,
+                            prep_ws.operator,
+                            Instant::now(),
+                        ) {
+                            inner.set_io_timing(io_scope.finish());
+                            return Ok(map_preflight_err(err));
+                        }
+                        if Instant::now() >= deadline {
+                            let epoch_id = inner.safety.epoch_id();
+                            let safety_state = inner.safety.state().clone();
+                            inner.set_io_timing(io_scope.finish());
+                            return Ok(map_legacy_failure(
+                                LegacyTorqueFailure::StaticCode("DEADLINE_EXPIRED"),
+                                epoch_id,
+                                &safety_state,
+                                &[],
+                            ));
+                        }
+                        let active =
+                            inner.driver_supports_nonblocking_mode_switch() && inner.mit_active();
+                        inner.set_io_timing(io_scope.finish());
+                        active
+                    };
+                    if needs_handback {
+                        let lease_holder = (prep_ws.local_generation != 0).then(|| {
+                            (
+                                prep_ws.connection.to_holder_label(),
+                                prep_ws.local_generation,
+                            )
+                        });
+                        let mut qual_stamp = prep_ws.stamp;
+                        qual_stamp.request_id = next_admission_request_id();
+                        qual_stamp.connection_id = prep_ws.connection.id();
+                        qual_stamp.lease_gen = prep_ws.local_generation;
+                        if let Some(ep) = prep_ws.supplied_epoch {
+                            qual_stamp.estop_epoch = ep;
+                        }
+                        if let Err(err) = crate::rt_core::requests::config::run_executor_mit_hand_back(
+                            self,
+                            crate::supervisor::MitHandBackReason::Rearm,
+                            qual_stamp,
+                            lease_holder,
+                            crate::auth::OperatorRequirement::NotRequired,
+                            crate::rt_core::broker::ClientId(prep_ws.connection.id()),
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        {
+                            let epoch_id = self.inner.read().await.safety.epoch_id();
+                            return Ok(TorqueWsOutcome::Rejected {
+                                error: err.into(),
+                                epoch_id,
+                            });
+                        }
+                    }
+                }
+
                 let (enabled, start_res, pre_epoch, joint_names, tick_seq_counter, mut last_tick_seq) = {
                     let mut inner = self.inner.write().await;
                     let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
@@ -20167,6 +20698,42 @@ impl ArmSupervisor {
                 };
                 let mut prep = prep_ws.broker.expect("checked above");
 
+                // MIT-configured profiles on OWNER_EXECUTOR: run off-RT qualification preflight
+                // (sched::mit_refusal + optional rearm handback + ReadIdentityForEnable +
+                // mit::check_gate + admission-bound MitGateProof) BEFORE submitting TorqueOn.
+                if enabled && crate::mit::mit_joint_mask(&self.published_config().await?.config) != 0 {
+                    let lease_holder = (prep_ws.local_generation != 0).then(|| {
+                        (
+                            prep_ws.connection.to_holder_label(),
+                            prep_ws.local_generation,
+                        )
+                    });
+                    let mut qual_stamp = prep.stamp;
+                    qual_stamp.request_id = prep.client_seq;
+                    qual_stamp.connection_id = prep.client.0;
+                    qual_stamp.lease_gen = prep.authority.lease_generation;
+                    qual_stamp.estop_epoch = prep.authority.epoch;
+                    qual_stamp.stop_gen = prep.authority.stop_generation;
+                    if let Err(err) = crate::mit::run_mit_qualification_for_enable_executor(
+                        self,
+                        qual_stamp,
+                        lease_holder,
+                        prep_ws.operator,
+                        prep.client,
+                    )
+                    .await
+                    {
+                        let epoch_id = self
+                            .hub
+                            .latest()
+                            .map_or(snap.obs.epoch_id, |s| s.obs.epoch_id);
+                        return Ok(TorqueWsOutcome::Rejected {
+                            error: ArmError::Safety(err).into(),
+                            epoch_id,
+                        });
+                    }
+                }
+
                 for attempt in 0..2 {
                     let reply = handle
                         .submit_transition_async(
@@ -20324,19 +20891,46 @@ impl ArmSupervisor {
                 let Some(handle) = self.executor_handle() else {
                     return Err(executor_unavailable());
                 };
-                let out = handle
-                    .lease_clear_fault_async(
-                        conn,
-                        local_generation,
-                        supplied_epoch,
-                        request_id_valid,
-                        body_error,
-                        auth_policy,
-                        operator,
-                    )
-                    .await
-                    .map_err(ArmError::from)?;
-                Ok(Ok(out))
+                let recovery_started_at = mit_recovery.then(Instant::now);
+                let mut final_attempt = false;
+                loop {
+                    let out = handle
+                        .lease_clear_fault_async(
+                            conn,
+                            local_generation,
+                            supplied_epoch,
+                            request_id_valid,
+                            body_error,
+                            mit_recovery,
+                            recovery_started_at,
+                            auth_policy,
+                            operator,
+                        )
+                        .await
+                        .map_err(ArmError::from)?;
+                    let incomplete = matches!(
+                        out,
+                        crate::rt_core::requests::lease::LeaseClearFaultOutcome::ClearFailed {
+                            err: crate::safety::ClearFaultError::Rejected(
+                                crate::safety::ClearRefusal::MitRecoveryIncomplete
+                            ),
+                            ..
+                        }
+                    );
+                    if !incomplete || final_attempt {
+                        return Ok(Ok(out));
+                    }
+                    let Some(started) = recovery_started_at else {
+                        return Ok(Ok(out));
+                    };
+                    if Instant::now().saturating_duration_since(started) >= Duration::from_secs(1) {
+                        // One final RT step after the 1 s Rule A′ lifetime expires so the driver
+                        // observes `DisableRequestExpired` and resets recovery state cleanly.
+                        final_attempt = true;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
             }
             _ => Err(executor_unavailable()),
         }

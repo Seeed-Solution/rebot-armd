@@ -4026,13 +4026,6 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
     });
     dm.read_joint_states().unwrap();
     dm.check_mapping_ranges();
-    // Cap TX to 2 frames/tick so tick 1 in FailedHold queues J3..J7 holds in the hold queue,
-    // allowing us to verify that stale J3 drops its queued hold while J1..J2/J4..J7 keep sending.
-    dm.set_tx_budget(TxBudget {
-        max_frames: 2,
-        max_duration: Duration::from_millis(10),
-        ..TxBudget::default()
-    });
 
     let mut inner = SupervisorInner::new(ArmConfig {
         lease_timeout_ms: 600_000,
@@ -4041,9 +4034,23 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
     .with_driver(Box::new(dm));
     inner.lease_enabled = false;
 
-    // Enter FailedHold with all 7 joints fresh at `initial_pose`.
+    // Enter FailedHold with valid enable TX budget and all 7 joints fresh at `initial_pose`.
     assert!(enable_torque_admitted(&mut inner).is_err());
     assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    // Cap TX to 2 frames/tick after entering FailedHold so tick 1 queues J3..J7 holds in the hold
+    // queue, verifying that stale J3 drops its queued hold while J1..J2/J4..J7 keep sending.
+    inner
+        .driver
+        .as_mut()
+        .unwrap()
+        .with_mut(|d| {
+            d.set_tx_budget(TxBudget {
+                max_frames: 2,
+                max_duration: Duration::from_millis(10),
+                ..TxBudget::default()
+            })
+        })
+        .unwrap();
 
     // Tick 1: J1 & J2 transmit, J3..J7 holds are queued in the hold TX queue.
     clock.advance(Duration::from_millis(10));

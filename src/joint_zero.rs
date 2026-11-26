@@ -179,6 +179,14 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Ok(states)
     }
+    fn read_joint_states_rx_only(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let mut states = self.inner.read_joint_states_rx_only()?;
+        for (i, s) in states.iter_mut().enumerate() {
+            let o = self.off(i);
+            if o != 0.0 { s.position -= o; }
+        }
+        Ok(states)
+    }
     fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         self.inner.read_joint_states_into(out)?;
         for (i, s) in out.iter_mut().enumerate() {
@@ -558,6 +566,12 @@ impl ArmDriver for ZeroOffsetDriver {
     fn begin_wake_tx_pass(&mut self) { self.inner.begin_wake_tx_pass() }
     fn reset_standalone_tx_pass(&mut self) { self.inner.reset_standalone_tx_pass() }
     fn tx_budget_max_frames(&self) -> Option<u16> { self.inner.tx_budget_max_frames() }
+    fn check_watchdog_tx_budget_for_enable(&self) -> Result<(), (usize, usize)> {
+        self.inner.check_watchdog_tx_budget_for_enable()
+    }
+    fn check_watchdog_tx_budget_for_energized(&self) -> Result<(), (usize, usize)> {
+        self.inner.check_watchdog_tx_budget_for_energized()
+    }
     fn release_budget_consumed(&self) -> (u16, u16) { self.inner.release_budget_consumed() }
     fn sync_release_budget_limits(&mut self, rx_remaining: u16, tx_remaining: u16) {
         self.inner.sync_release_budget_limits(rx_remaining, tx_remaining)
@@ -613,6 +627,12 @@ impl ArmDriver for ZeroOffsetDriver {
         (count, dropped)
     }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
+    fn mit_expiry_recover_with_gate(
+        &mut self,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<(), String> {
+        self.inner.mit_expiry_recover_with_gate(pre_tx_gate)
+    }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
     fn mit_feedback_after_recovery(&self, dof: usize) -> bool { self.inner.mit_feedback_after_recovery(dof) }
@@ -743,6 +763,31 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn set_mode_switch_active_mask(&mut self, mask: u32) {
         self.inner.set_mode_switch_active_mask(mask);
+    }
+    fn set_mode_switch_hold_targets(&mut self, targets: &[Option<crate::driver::ModeSwitchHoldTarget>]) {
+        let mut shifted = [None; crate::motor_mode::MAX_MODE_SWITCH_AXES];
+        let n = targets.len().min(shifted.len());
+        for i in 0..n {
+            if let Some(mut t) = targets[i] {
+                t.position += self.off(i);
+                shifted[i] = Some(t);
+            }
+        }
+        self.inner.set_mode_switch_hold_targets(&shifted[..n]);
+    }
+    fn mit_min_last_ctrl_tx(&self, mask: u64) -> Option<Instant> {
+        self.inner.mit_min_last_ctrl_tx(mask)
+    }
+    fn mit_expiry_recover_budgeted(
+        &mut self,
+        deadline: Instant,
+        started_at: Instant,
+        pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+    ) -> Result<bool, ArmDriverError> {
+        self.inner.mit_expiry_recover_budgeted(deadline, started_at, pre_tx_gate)
+    }
+    fn mit_expiry_recover_reset(&mut self) {
+        self.inner.mit_expiry_recover_reset();
     }
     fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> {
         self.inner.axis_last_ctrl_tx(joint)

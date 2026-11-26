@@ -1701,6 +1701,7 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     bus.with(|s| {
         s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
         s.immediate_replies = true;
+        s.tx_step = Duration::from_micros(50);
         s.push_all_feedback();
     });
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
@@ -1770,8 +1771,14 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
     armd::SupervisorInner::enable_torque(adm).unwrap();
-    for _ in 0..3 { inner.tick(DT); }
+    for _ in 0..10 {
+        inner.tick(DT);
+        if inner.mit_active() {
+            break;
+        }
+    }
     assert!(inner.mit_active(), "MIT should be active before injected TX failure");
+    inner.tick(DT);
 
     // Inject partial TX failure -> MIT enters MitOwner::Lost (BusLoss) and J4 command watchdog expires (0x0D).
     bus.with(|s| s.fail_tx_after = Some(3));
@@ -2115,6 +2122,8 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::EnableFreshenUnsafeGripper { .. } => "EnableFreshenUnsafeGripper",
             ArmDriverError::PartialDisable { .. } => "PartialDisable",
             ArmDriverError::WatchdogContinuityAbort { .. } => "WatchdogContinuityAbort",
+            ArmDriverError::WatchdogBudgetInsufficient { .. } => "WatchdogBudgetInsufficient",
+            ArmDriverError::WatchdogContinuityMissed { .. } => "WatchdogContinuityMissed",
         }
     }
 
@@ -2212,6 +2221,11 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             joint: 0,
             age_ms: 60,
         },
+        ArmDriverError::WatchdogBudgetInsufficient {
+            max_frames: 4,
+            required: 8,
+        },
+        ArmDriverError::WatchdogContinuityMissed { joint: 0 },
     ];
     #[cfg(unix)]
     {
@@ -2562,6 +2576,7 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         bus.with(|s| {
             s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             s.push_all_feedback();
         });
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
@@ -2630,8 +2645,14 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         let stamp = inner.current_admission_stamp();
         let adm = inner.check_admission(stamp).unwrap();
         armd::SupervisorInner::enable_torque(adm).unwrap();
-        for _ in 0..3 { inner.tick(DT); }
+        for _ in 0..10 {
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
         assert!(inner.mit_active());
+        inner.tick(DT);
         // Inject partial TX failure -> MIT enters MitOwner::Lost (BusLoss) and J4 command watchdog expires (0x0D).
         bus.with(|s| s.fail_tx_after = Some(3));
         inner.tick(DT);
@@ -2690,10 +2711,10 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         bus.with(|s| {
             s.motors[0].q = cfg.home_positions[0];
             s.on_disable_state = Some(Arc::new(move |st| {
-                // R10 disable sends 3 repeats x 7 motors = 21 CMD_DISABLE frames.
-                // Move J0 over limit on the 15th frame (J0 on the 3rd/final pass) so
-                // passes 1-2 pass Rule A' at rest and post-recovery feedback reports over_limit.
-                if disable_frames_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 15 {
+                // R10/PR2-LEDGER disable sends 1 CMD_DISABLE per motor (7 total, followed by
+                // causal barrier + 0xCC refresh). Move J0 over limit on the 7th/final disable
+                // frame so post-recovery feedback reports over_limit and clear refuses.
+                if disable_frames_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 7 {
                     st.motors[0].q = over_limit;
                 }
             }));
@@ -2797,8 +2818,14 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
             let adm = inner.check_admission(stamp).unwrap();
             armd::SupervisorInner::enable_torque(adm).unwrap();
         }
-        for _ in 0..3 { inner.tick(DT); }
+        for _ in 0..10 {
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
         assert!(inner.mit_active());
+        inner.tick(DT);
         bus.with(|s| s.fail_tx_after = Some(3));
         inner.tick(DT);
         assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
@@ -3496,6 +3523,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         bus.with(|s| {
             s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
             s.immediate_replies = true;
+            s.tx_step = Duration::from_micros(50);
             s.push_all_feedback();
         });
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
@@ -3564,8 +3592,14 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         let stamp = inner.current_admission_stamp();
         let adm = inner.check_admission(stamp).unwrap();
         armd::SupervisorInner::enable_torque(adm).unwrap();
-        for _ in 0..3 { inner.tick(DT); }
+        for _ in 0..10 {
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
         assert!(inner.mit_active());
+        inner.tick(DT);
         bus.with(|s| s.fail_tx_after = Some(3));
         inner.tick(DT);
         assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
@@ -3777,6 +3811,13 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
             self.recovered_called.store(true, Ordering::SeqCst);
             // Intentionally does NOT advance `self.seqs` (simulates stale/cached readback).
             Ok(())
+        }
+        fn mit_expiry_recover_with_gate(
+            &mut self,
+            pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
+        ) -> Result<(), String> {
+            pre_tx_gate().map_err(|e| e.to_string())?;
+            self.mit_expiry_recover()
         }
     }
 

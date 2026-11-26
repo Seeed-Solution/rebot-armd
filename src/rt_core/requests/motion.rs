@@ -1190,7 +1190,23 @@ pub(crate) fn commit_home(inner: &mut SupervisorInner, d: &Descriptor, slot: &Pr
 pub(crate) fn commit_park(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
     let mut bounded = *slot;
     bounded.authority.deadline = bounded.authority.deadline.min(d.stamp.deadline);
-    commit_broker(inner, d, ctx, |i, stamp, ep| install_park_at(i, stamp, &bounded, None, Some(ep), true, ctx.boot, ctx.now))
+    inner.check_commit_for_motion(d, ctx)?;
+    inner.sync_stop_generation(ctx.stop_generation);
+    let req_id = if d.stamp.client_seq != 0 {
+        d.stamp.client_seq
+    } else {
+        d.stamp.request.0
+    };
+    let stamp = AdmissionStamp::from_broker_conn(
+        d.stamp.authority.stop_generation,
+        d.stamp.authority.epoch,
+        d.stamp.authority.lease_generation,
+        d.stamp.client.0,
+        req_id,
+    );
+    let installed = install_park_at(inner, stamp, &bounded, None, Some(d.stamp.authority.epoch), true, ctx.boot, ctx.now)
+        .map_err(MotionInstallError::code)?;
+    Ok(Committed::authorized(d, Some(ActionId(installed.action_id()))))
 }
 pub(crate) fn commit_park_continuation(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
     let Some(action_id) = slot.continuation_action else { return Err("INVALID_COMMAND"); };

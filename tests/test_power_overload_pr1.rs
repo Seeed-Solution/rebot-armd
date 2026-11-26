@@ -622,15 +622,32 @@ fn b1_deferred_tx_stale_reply_and_spoofed_reply_id_rejected() {
         });
         bus.push_all_fb();
         let _ = drv.read_joint_states();
-        // Let CTRL_MODE stage succeed cleanly first (all 7 motors reply to CTRL_MODE).
-        // Silence J2 only for TIMEOUT readbacks, and inject a stale J2 TIMEOUT=2000 right after
-        // poll 1 of TIMEOUT stage (when only J1's TIMEOUT REG_READ was sent under max_frames=1).
+        // Admission invariant rejects max_frames=1 for 7 motors (requires >= 8).
+        assert!(matches!(
+            drv.begin_torque(true),
+            Err(armd::driver::ArmDriverError::WatchdogBudgetInsufficient {
+                max_frames: 1,
+                required: 8
+            })
+        ));
+        // Enable under valid max_frames=8, then tighten to 1 frame/poll during TIMEOUT readback
+        // so J2's TIMEOUT REG_READ is deferred and a stale J2 reply arrives first.
+        drv.set_tx_budget(armd::driver::TxBudget {
+            max_frames: 8,
+            max_duration: ms(10),
+            frame_max_age: ms(500),
+        });
         bus.with(|s| {
             s.motors[1].answer_timeout = false;
             s.motors[1].timeout_counts = 0;
         });
         let dl = clock.now() + Duration::from_secs(2);
         drv.begin_torque(true).unwrap();
+        drv.set_tx_budget(armd::driver::TxBudget {
+            max_frames: 1,
+            max_duration: ms(10),
+            frame_max_age: ms(500),
+        });
         let mut injected_stale = false;
         let mut final_err = None;
         for _ in 0..80 {

@@ -510,6 +510,196 @@ impl crate::supervisor::SupervisorInner {
     }
 }
 
+/// Off-RT executor torque-enable MIT qualification preflight:
+/// 1. Enforces `sched::mit_refusal()` (SCHED_FIFO + mlockall) and attached driver.
+/// 2. If MIT is currently active (rearm), runs stop-direction MIT handback (`POS_VEL`) first.
+/// 3. Reads fresh motor identity registers via PR0B `CommissioningOpKind::ReadIdentityForEnable`.
+/// 4. Evaluates the single authoritative [`check_gate`] against stored `MitQualificationFile`.
+/// 5. Commits an admission-bound one-shot [`MitGateProof`] on RT so `enable_prepare_rt_precheck`
+///    consumes it exclusively for this exact torque-on request.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_mit_qualification_for_enable_executor(
+    sup: &crate::supervisor::ArmSupervisor,
+    admission: crate::supervisor::AdmissionStamp,
+    lease_holder: Option<(crate::model::HolderLabel, u64)>,
+    operator_grant: crate::auth::OperatorGrant,
+    client: crate::rt_core::broker::ClientId,
+) -> Result<(), crate::safety::SafetyError> {
+    use crate::rt_core::publish::ReadRequirements;
+    use crate::rt_core::requests::config::{
+        run_executor_mit_hand_back, ConfigReply, ConfigRequest, MitGateProof,
+    };
+
+    let pub_cfg = sup
+        .published_config()
+        .await
+        .map_err(|e| crate::safety::SafetyError::ClearFaultRejected(e.to_string()))?;
+    let joints = mit_joints(&pub_cfg.config);
+    if joints.is_empty() {
+        return Ok(());
+    }
+    if let Some(why) = crate::rt_core::sched::mit_refusal() {
+        return Err(crate::safety::SafetyError::ClearFaultRejected(format!(
+            "MIT_UNQUALIFIED: MIT tracking refused: {why}"
+        )));
+    }
+    if !pub_cfg.has_driver {
+        return Err(crate::safety::SafetyError::ClearFaultRejected(
+            "MIT_UNQUALIFIED: MIT tracking refused: MIT needs a motor driver".into(),
+        ));
+    }
+
+    // Rearm while MIT owns joints: hand back to confirmed POS_VEL first (at rest).
+    // If the arm is moving, RT revokes MIT authorization, brakes motion, and refuses rearm.
+    if let Err(err) = run_executor_mit_hand_back(
+        sup,
+        crate::supervisor::MitHandBackReason::Rearm,
+        admission,
+        lease_holder,
+        crate::auth::OperatorRequirement::NotRequired,
+        client,
+        Duration::from_secs(2),
+    )
+    .await
+    {
+        return Err(crate::safety::SafetyError::ClearFaultRejected(err.to_string()));
+    }
+
+    let svc = sup
+        .read_services(ReadRequirements::identity())
+        .await
+        .map_err(|e| crate::safety::SafetyError::ClearFaultRejected(e.to_string()))?;
+    let mut joints_arr = [0usize; crate::rt_core::mailbox::MAX_DOF];
+    if joints.len() > crate::rt_core::mailbox::MAX_DOF {
+        return Err(crate::safety::SafetyError::ClearFaultRejected(
+            "MIT_UNQUALIFIED: MIT tracking refused: too many MIT joints".into(),
+        ));
+    }
+    for (i, &j) in joints.iter().enumerate() {
+        joints_arr[i] = j;
+    }
+    let start_req = CommissioningStartRequest {
+        kind: CommissioningOpKind::ReadIdentityForEnable,
+        joints: joints_arr,
+        joint_len: joints.len(),
+        timeout_counts: 0,
+        references: [0.0; crate::rt_core::mailbox::MAX_DOF],
+        authority: CommissioningAuthority {
+            conn_id: admission.connection_id,
+            lease_holder,
+            operator_grant,
+            expected_epoch: admission.estop_epoch,
+            expected_stop_gen: admission.stop_gen,
+            grant_id: None,
+            txn_id: 0,
+        },
+        txn_deadline: std::time::Instant::now() + COMMISSIONING_TXN_TIMEOUT,
+        prior_disk_mutated: false,
+    };
+    let Some(exec_handle) = sup.executor_handle() else {
+        return Err(crate::safety::SafetyError::ClearFaultRejected(
+            "MIT_UNQUALIFIED: MIT tracking refused: executor not running".into(),
+        ));
+    };
+    let noop_auth = || Ok(());
+    let snap = run_rt_commissioning_op_inner(
+        sup,
+        CommissioningCleanup::Executor(exec_handle),
+        start_req,
+        &noop_auth,
+    )
+    .await
+    .map_err(|e| {
+            crate::safety::SafetyError::ClearFaultRejected(format!(
+                "MIT_UNQUALIFIED: MIT tracking refused: register readback failed: {}",
+                e.into_calib_error().message
+            ))
+        })?;
+    if snap.state != CommissioningOpState::Done {
+        let msg = if snap.error_msg.is_empty() {
+            "register readback failed"
+        } else {
+            snap.error_msg.as_str()
+        };
+        return Err(crate::safety::SafetyError::ClearFaultRejected(format!(
+            "MIT_UNQUALIFIED: MIT tracking refused: register readback failed: {msg}"
+        )));
+    }
+    let mut rb = Vec::with_capacity(snap.joint_len);
+    for i in 0..snap.joint_len {
+        let Some(id) = snap.outcomes[i].before else {
+            return Err(crate::safety::SafetyError::ClearFaultRejected(
+                "MIT_UNQUALIFIED: MIT tracking refused: incomplete motor identity readback".into(),
+            ));
+        };
+        rb.push(id.into_motor_identity());
+    }
+    let pub_now = sup
+        .published_config()
+        .await
+        .map_err(|e| crate::safety::SafetyError::ClearFaultRejected(e.to_string()))?;
+    let rec = match pub_now.calibration.as_ref().map(|c| c.mit_record()) {
+        Some(Err(e)) => {
+            return Err(crate::safety::SafetyError::ClearFaultRejected(format!(
+                "MIT_UNQUALIFIED: MIT tracking refused: the stored record is invalid: {e}"
+            )));
+        }
+        Some(Ok(r)) => r,
+        None => None,
+    };
+    if let Err(e) = check_gate(
+        &pub_now.config,
+        rec.as_ref(),
+        &pub_now.joint_zero_offsets,
+        &joints,
+        &rb,
+        snap.supports_mit_switch,
+    ) {
+        return Err(crate::safety::SafetyError::ClearFaultRejected(format!(
+            "MIT_UNQUALIFIED: MIT tracking refused: {e}"
+        )));
+    }
+
+    let holdoff = joints
+        .iter()
+        .filter_map(|&j| rec.as_ref().and_then(|r| r.joint(j + 1)))
+        .map(|q| Duration::from_secs_f32((q.measured_expiry_ms * 2.0 / 1000.0).clamp(0.0, 10.0)))
+        .max()
+        .unwrap_or_default()
+        .max(MIT_TRIP_HOLDOFF_MIN);
+    let proof = MitGateProof {
+        admission_request_id: admission.request_id,
+        connection_id: admission.connection_id,
+        lease_generation: admission.lease_gen,
+        estop_epoch: admission.estop_epoch,
+        stop_gen: admission.stop_gen,
+        calibration_revision: pub_now.calibration_revision,
+        motion_config_revision: svc.revisions.motion_config,
+        zero_offsets_hash: zero_offsets_hash(&pub_now.joint_zero_offsets),
+        holdoff,
+        verified_at: std::time::Instant::now(),
+    };
+    match sup
+        .dispatch_config_request_owned_reliable(ConfigRequest::RecordMitGateProof(proof))
+        .await
+    {
+        Ok(ConfigReply::MitGateProofRecorded(true)) => Ok(()),
+        Ok(ConfigReply::MitGateProofRecorded(false)) => Err(
+            crate::safety::SafetyError::ClearFaultRejected(
+                "MIT_UNQUALIFIED: MIT tracking refused: qualification proof rejected by live owner".into(),
+            ),
+        ),
+        Err(e) => Err(crate::safety::SafetyError::ClearFaultRejected(format!(
+            "MIT_UNQUALIFIED: MIT tracking refused: {}",
+            e.to_arm_error()
+        ))),
+        _ => Err(crate::safety::SafetyError::ClearFaultRejected(
+            "MIT_UNQUALIFIED: MIT tracking refused: unexpected proof reply".into(),
+        )),
+    }
+}
+
 /// WS [`QUALIFICATION_PATH`] task (the calibration busy flag is held, so no other calibration
 /// write changes `calibration.json` meanwhile): recheck the lease, write the complete document
 /// atomically (temporary file + rename), then publish it live. A failed write changes nothing.
@@ -562,7 +752,7 @@ pub const MIT_COULOMB_VEL_RAD_S: f32 = 0.02;
 pub const MIT_TRIP_HOLDOFF_MIN: Duration = Duration::from_millis(250);
 
 /// MIT tracking state of the supervisor (`SupervisorInner::mit`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MitRuntime {
     pub owner: MitOwner,
     /// 0-based joints MIT owns while `Active`.
@@ -575,6 +765,8 @@ pub struct MitRuntime {
     pub armed_ok: bool,
     /// Why the last handover (or hand back) failed.
     pub handover_error: Option<String>,
+    /// Zero-allocation RT handover error text (`armd-control` writes here, never allocating `String`).
+    pub handover_error_rt: Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>>,
     /// Why the group was cancelled (bounded stack text — zero allocation on `armd-control`).
     pub lost_reason: Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>>,
     /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
@@ -590,6 +782,44 @@ pub struct MitRuntime {
     pub near_misses: u64,
     /// The current clear_fault carries the operator's recovery confirmation.
     pub recovery_confirmed: bool,
+    /// Original wall-clock start of the active multi-release MIT expiry recovery attempt
+    /// (cleared on terminal completion/refusal; mismatch resets driver recovery state).
+    pub recovery_attempt_started_at: Option<std::time::Instant>,
+    /// Owner authority baseline captured once at the start of the active multi-release MIT expiry
+    /// recovery attempt for `new_estop_since` gating across retry ticks.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub recovery_baseline: Option<crate::rt_core::authority::AuthorityBaseline>,
+    /// Precomputed MIT deadline-trip hold-off duration from the qualified record (0 alloc on RT).
+    pub qualified_holdoff: Duration,
+    /// Brief suppression window preventing `mit_maybe_activate_rt` from re-entering MIT
+    /// between an off-RT-coordinated `GravityCompEntry`/`Rearm` handback and its follow-up op.
+    pub handback_suppress_until: Option<std::time::Instant>,
+}
+
+impl Default for MitRuntime {
+    fn default() -> Self {
+        Self {
+            owner: MitOwner::Off,
+            joints: Vec::with_capacity(crate::rt_core::mailbox::MAX_DOF),
+            last_ff: Vec::with_capacity(crate::rt_core::mailbox::MAX_DOF),
+            last_output: None,
+            armed_ok: false,
+            handover_error: None,
+            handover_error_rt: None,
+            lost_reason: None,
+            park_after_hand_back: false,
+            deferred_park_off_owner: false,
+            deferred_park_action: None,
+            revoke_pending: false,
+            near_misses: 0,
+            recovery_confirmed: false,
+            recovery_attempt_started_at: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            recovery_baseline: None,
+            qualified_holdoff: Duration::ZERO,
+            handback_suppress_until: None,
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -638,7 +868,9 @@ impl crate::supervisor::SupervisorInner {
         match self.mit.owner {
             MitOwner::Active => None,
             MitOwner::Off => Some(format!("MIT tracking is not active: {}",
-                self.mit.handover_error.as_deref().unwrap_or("the handover waits for the arm at rest"))),
+                self.mit.handover_error_rt.as_deref()
+                    .or(self.mit.handover_error.as_deref())
+                    .unwrap_or("the handover waits for the arm at rest"))),
             MitOwner::Lost => Some(format!("MIT tracking was cancelled: {}", self.mit.lost_reason.as_deref().unwrap_or("?"))),
         }
     }
@@ -1511,17 +1743,19 @@ impl crate::supervisor::SupervisorInner {
                 .and_then(|d| d.try_with_ref(|drv| drv.mit_fence_trip_bounded()).ok())
                 .flatten();
             if let Some(t) = tripped {
-                self.safety.latch(
-                    crate::safety::FaultKind::BusLoss,
-                    crate::safety::FaultDetail::formatted(crate::safety::FaultCode::BusLoss, |buf| {
-                        let _ = core::fmt::write(
-                            buf,
-                            format_args!(
-                                "MIT_LOST: driver deadline fence: {t}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)"
-                            ),
-                        );
-                    }),
-                );
+                if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::BusLoss) {
+                    self.safety.latch(
+                        crate::safety::FaultKind::BusLoss,
+                        crate::safety::FaultDetail::formatted(crate::safety::FaultCode::BusLoss, |buf| {
+                            let _ = core::fmt::write(
+                                buf,
+                                format_args!(
+                                    "MIT_LOST: driver deadline fence: {t}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)"
+                                ),
+                            );
+                        }),
+                    );
+                }
                 self.notify_driver_bus_loss();
             }
             return;
@@ -1593,8 +1827,12 @@ impl crate::supervisor::SupervisorInner {
     /// Try the handover to MIT (each tick): only from fresh, stationary, confirmed position
     /// control of an armed arm whose qualification passed at this arm, with nothing else owning
     /// the output (no motion, park, gravity compensation, hold or fault).
-    pub(crate) fn mit_maybe_activate(&mut self) {
+    pub(crate) fn mit_maybe_activate(
+        &mut self,
+        #[cfg(not(target_arch = "wasm32"))] now: std::time::Instant,
+    ) {
         if mit_joint_mask(&self.config) == 0 || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
+            || self.mit.handback_suppress_until.is_some_and(|until| std::time::Instant::now() < until)
             || self.disable_pending || self.pending_rearm || self.pending_normal_unload
             || self.park_continuation.is_some() || self.gravity_comp.is_some()
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
@@ -1602,6 +1840,13 @@ impl crate::supervisor::SupervisorInner {
             || self.collision.hold.is_some() || self.torque_guard.hold.is_some() || self.servo_blocked_hold
             || self.commanded_velocities.iter().any(|v| *v != 0.0)
             || self.exclusive_session_owns_output() {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.driver.is_some()
+            && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+        {
+            self.mit_maybe_activate_rt(now);
             return;
         }
         let joints = mit_joints(&self.config);
@@ -1695,9 +1940,679 @@ impl crate::supervisor::SupervisorInner {
         }
     }
 
+    /// Zero-allocation RT MIT activation (`POS_VEL -> MIT`) driven by the shared PR0C
+    /// `ModeSwitch` service inside a PR0B `ExclusiveOutput` session.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mit_maybe_activate_rt(&mut self, now: std::time::Instant) {
+        use crate::driver::ModeSwitchHoldTarget;
+        use crate::motor_mode::{
+            ControlMode, ModeSwitch, ModeSwitchPlan, ModeSwitchRecovery, MAX_MODE_SWITCH_AXES,
+        };
+        use crate::rt_core::broker::ClientId;
+        use crate::rt_core::mailbox::MAX_DOF;
+        use crate::rt_core::session::{
+            PreparedSession, SessionAuthority, SessionAuthorityMode, SessionKind,
+            SessionTerminalBinding,
+        };
+        use crate::supervisor::ModeSwitchPurpose;
+
+        if self
+            .mit
+            .handback_suppress_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return;
+        }
+        let mask = mit_joint_mask(&self.config);
+        if mask == 0 || !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() {
+            return;
+        }
+        let g = match self.mit_gravity_inline() {
+            Ok(g) => g,
+            Err(e) => {
+                self.mit.handover_error_rt = Some(e);
+                self.mit.armed_ok = false;
+                return;
+            }
+        };
+        let dof = self.config.dof.min(MAX_DOF);
+        let mut ff = [0.0f32; MAX_DOF];
+        let mut hold_positions = [0.0f32; MAX_DOF];
+        let mut holds = [None; MAX_MODE_SWITCH_AXES];
+        let mut targets = [(0usize, ControlMode::Impedance); MAX_MODE_SWITCH_AXES];
+        let mut target_len = 0usize;
+        let mut active_mask: u32 = 0;
+
+        for j in 0..dof {
+            if (mask & (1u64 << j)) != 0 {
+                match self.mit_frame_bounded(j, self.measured_positions[j], 0.0, 0.0, true, g[j], None) {
+                    Ok((frame, tau)) => {
+                        ff[j] = tau;
+                        hold_positions[j] = frame.position;
+                        holds[j] = Some(ModeSwitchHoldTarget::mit(
+                            frame.position,
+                            frame.velocity.unwrap_or(0.0),
+                            frame.kp.unwrap_or(0.0),
+                            frame.kd.unwrap_or(0.0),
+                            frame.torque.unwrap_or(tau),
+                        ));
+                        if target_len < MAX_MODE_SWITCH_AXES && j < MAX_MODE_SWITCH_AXES {
+                            targets[target_len] = (j, ControlMode::Impedance);
+                            target_len += 1;
+                            active_mask |= 1u32 << j;
+                        }
+                    }
+                    Err(e) => {
+                        let mut buf = OutputErrorText::empty();
+                        let _ = core::fmt::write(
+                            &mut buf,
+                            format_args!("J{}: the hold does not fit the effort limit ({e})", j + 1),
+                        );
+                        self.mit.handover_error_rt = Some(buf);
+                        self.mit.armed_ok = false;
+                        return;
+                    }
+                }
+            } else {
+                let pos = self.commanded_positions.get(j).copied().unwrap_or(0.0);
+                hold_positions[j] = pos;
+                if j < MAX_MODE_SWITCH_AXES {
+                    holds[j] = Some(ModeSwitchHoldTarget::position(pos));
+                }
+            }
+        }
+        if target_len == 0 {
+            return;
+        }
+        let Ok(plan) = ModeSwitchPlan::switch_axes(&targets[..target_len], ModeSwitchRecovery::RollbackToPrevious) else {
+            return;
+        };
+        if let Some(slot) = self.driver.as_ref() {
+            let mut budget_ok = Ok(());
+            let _ = slot.try_with_ref(|drv| {
+                budget_ok = drv.check_watchdog_tx_budget_for_energized();
+            });
+            if let Err((max_frames, required)) = budget_ok {
+                let mut buf = OutputErrorText::empty();
+                let _ = core::fmt::write(
+                    &mut buf,
+                    format_args!(
+                        "WATCHDOG_BUDGET_INSUFFICIENT: tx_budget.max_frames ({max_frames}) < required ({required})"
+                    ),
+                );
+                self.mit.handover_error_rt = Some(buf);
+                self.mit.armed_ok = false;
+                return;
+            }
+        }
+        let mut prepared = PreparedSession::exclusive(SessionKind::ModeSwitch, ClientId(0));
+        prepared.deadline = Some(now + Duration::from_secs(2));
+        prepared.timeout_code = "TIMEOUT";
+        prepared.revoke_on_stop = true;
+        prepared.escalate_safe_hold_on_uncertain = true;
+        let lease_gen = self.active_lease.as_ref().map_or(0, |l| l.generation);
+        let auth = SessionAuthority {
+            baseline: self.capture_baseline(),
+            connection_id: self.active_lease_conn_id,
+            lease_generation: lease_gen,
+            epoch: self.safety.epoch_id(),
+            stop_generation: self.current_stop_gen(),
+            require_lease: false,
+            operator: crate::auth::OperatorRequirement::NotRequired,
+            revoke_on_stop: true,
+            revoke_on_epoch_change: true,
+            mode: SessionAuthorityMode::ClientControlled,
+        };
+        let Ok(sid) = self.sessions.admit_with_authority_handoff(
+            prepared,
+            auth,
+            SessionTerminalBinding::Internal,
+            None,
+            now,
+            false,
+        ) else {
+            return;
+        };
+        let holdoff = if !self.rt_executor_owned && self.mit.qualified_holdoff.is_zero() {
+            self.mit_holdoff()
+        } else {
+            self.mit.qualified_holdoff.max(MIT_TRIP_HOLDOFF_MIN)
+        };
+        if let Some(slot) = self.driver.as_mut() {
+            let _ = slot.try_with_mut(|drv| {
+                drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
+                drv.set_mode_switch_hold_targets(&holds);
+                drv.set_mode_switch_active_mask(active_mask);
+            });
+        }
+        self.install_mode_switch_session(
+            sid,
+            ModeSwitchPurpose::MitActivate {
+                mask,
+                hold_positions,
+                ff,
+            },
+            ModeSwitch::new(plan),
+        );
+    }
+
+    /// Single RT completion handler for `ModeSwitchPurpose::MitActivate` (0 alloc, 0 RT free).
+    pub(crate) fn on_mit_activate_mode_switch_terminal_rt(
+        &mut self,
+        mask: u64,
+        hold_positions: &[f32; crate::rt_core::mailbox::MAX_DOF],
+        ff: &[f32; crate::rt_core::mailbox::MAX_DOF],
+        progress: crate::motor_mode::ModeProgress,
+        uncertain: bool,
+    ) {
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        match progress {
+            crate::motor_mode::ModeProgress::Confirmed => {
+                // Verify driver fence did not trip and arm is still operational & torqued.
+                let fence_tripped = self
+                    .driver
+                    .as_ref()
+                    .and_then(|s| s.try_with_ref(|d| d.mit_fence_trip_bounded()).ok())
+                    .flatten()
+                    .is_some();
+                if fence_tripped {
+                    self.mit.armed_ok = false;
+                    self.mit.joints.clear();
+                    for j in 0..dof {
+                        if (mask & (1u64 << j)) != 0 && self.mit.joints.len() < self.mit.joints.capacity() {
+                            self.mit.joints.push(j);
+                        }
+                    }
+                    self.mit_lose_bounded(
+                        OutputErrorText::new("MIT handover failed: driver deadline fence tripped"),
+                        crate::safety::FaultCode::BusLoss,
+                    );
+                    return;
+                }
+                self.mit.joints.clear();
+                self.mit.last_ff.clear();
+                for j in 0..dof {
+                    if self.mit.last_ff.len() < self.mit.last_ff.capacity() {
+                        self.mit.last_ff.push(ff[j]);
+                    }
+                    if (mask & (1u64 << j)) != 0 {
+                        if self.mit.joints.len() < self.mit.joints.capacity() {
+                            self.mit.joints.push(j);
+                        }
+                        if j < self.commanded_positions.len() {
+                            self.commanded_positions[j] = hold_positions[j];
+                        }
+                        if j < self.target_positions.len() {
+                            self.target_positions[j] = hold_positions[j];
+                        }
+                    }
+                }
+                self.tracking.seed(&self.commanded_positions);
+                self.mit.owner = MitOwner::Active;
+                self.mit.last_output = Some(self.mit_now());
+                self.mit.handover_error_rt = None;
+                let mut smask = crate::torque::ChannelMask::EMPTY;
+                for j in 0..dof {
+                    if (mask & (1u64 << j)) != 0 && j < crate::torque::MAX_CHANNELS {
+                        smask.insert(j as u8);
+                    }
+                }
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                        channels: smask,
+                        target_mode: crate::motor_mode::ControlMode::Impedance,
+                        device_wide: false,
+                    },
+                );
+            }
+            other => {
+                self.mit.armed_ok = false;
+                self.tracking.invalidate();
+                let mut msg = OutputErrorText::empty();
+                let _ = core::fmt::write(&mut msg, format_args!("MIT handover failed: {other:?}"));
+                self.mit.handover_error_rt = Some(msg);
+                if !self.rt_executor_owned {
+                    self.mit.handover_error = Some(msg.as_str().to_string());
+                }
+                let mut fence_tripped = false;
+                if let Some(slot) = self.driver.as_mut() {
+                    let _ = slot.try_with_mut(|drv| {
+                        fence_tripped = drv.mit_fence_trip_bounded().is_some();
+                        if !uncertain && !fence_tripped {
+                            drv.set_mit_deadline_fence(None, Duration::ZERO);
+                        }
+                    });
+                }
+                if uncertain || fence_tripped || other.is_ambiguous() {
+                    self.mit.joints.clear();
+                    for j in 0..dof {
+                        if (mask & (1u64 << j)) != 0 && self.mit.joints.len() < self.mit.joints.capacity() {
+                            self.mit.joints.push(j);
+                        }
+                    }
+                    let code = self.mit_loss_code();
+                    self.mit_lose_bounded(msg, code);
+                }
+            }
+        }
+    }
+
+    /// Zero-allocation RT MIT handback (`MIT -> POS_VEL`, `FailClosed`) driven by PR0C
+    /// `ModeSwitch` inside a stop-direction PR0B `PosVelHandback` session.
+    pub(crate) fn mit_hand_back_start_rt(
+        &mut self,
+        reason: crate::supervisor::MitHandBackReason,
+        expected_epoch: u64,
+        deadline: std::time::Instant,
+        client: crate::rt_core::broker::ClientId,
+        terminal: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+        retired_handoff: &mut Option<crate::rt_core::reply_router::SessionTerminalHandoff>,
+        now: std::time::Instant,
+    ) -> Result<Option<u64>, &'static str> {
+        let ticket = match terminal {
+            Some(res) => {
+                let (t, h) = res.into_parts();
+                *retired_handoff = Some(h);
+                Some(t)
+            }
+            None => None,
+        };
+        self.mit_hand_back_start_with_ticket_rt(
+            reason,
+            expected_epoch,
+            deadline,
+            client,
+            ticket,
+            retired_handoff.as_ref(),
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mit_hand_back_start_with_ticket_rt(
+        &mut self,
+        reason: crate::supervisor::MitHandBackReason,
+        expected_epoch: u64,
+        deadline: std::time::Instant,
+        client: crate::rt_core::broker::ClientId,
+        ticket: Option<crate::rt_core::reply_router::SessionTerminalTicket>,
+        handoff: Option<&crate::rt_core::reply_router::SessionTerminalHandoff>,
+        now: std::time::Instant,
+    ) -> Result<Option<u64>, &'static str> {
+        use crate::driver::ModeSwitchHoldTarget;
+        use crate::motor_mode::{
+            ControlMode, ModeSwitch, ModeSwitchPlan, ModeSwitchRecovery, MAX_MODE_SWITCH_AXES,
+        };
+        use crate::rt_core::mailbox::MAX_DOF;
+        use crate::rt_core::session::PreparedSession;
+        use crate::supervisor::ModeSwitchPurpose;
+
+        if self.rt_executor_owned && client.0 != 0 && ticket.is_none() {
+            return Err("NO_DESTINATION");
+        }
+        if !self.rt_executor_owned && ticket.is_some() {
+            return Err("EXECUTOR_STOPPED");
+        }
+        if self.mit.owner != MitOwner::Active {
+            return Ok(None);
+        }
+        if self.mode_switch.is_running() {
+            return Err("SESSION_BUSY");
+        }
+        if !self.mit_feedback_fresh()
+            || !self.tracking_stationary_evidence()
+            || self.commanded_velocities.iter().any(|v| *v != 0.0)
+        {
+            return Err("MIT_NOT_AT_REST");
+        }
+        let g = match self.mit_gravity_inline() {
+            Ok(g) => g,
+            Err(e) => {
+                self.mit_lose_bounded(e, crate::safety::FaultCode::BusLoss);
+                return Err("GRAVITY_MODEL_UNAVAILABLE");
+            }
+        };
+        let dof = self.config.dof.min(MAX_DOF);
+        let dt = 1.0 / self.config.control_frequency_hz.max(1) as f32;
+        let mut mask = 0u64;
+        for &j in &self.mit.joints {
+            if j < dof {
+                mask |= 1u64 << j;
+            }
+        }
+        if mask == 0 {
+            return Ok(None);
+        }
+        let mut ff = [0.0f32; MAX_DOF];
+        let mut hold_positions = [0.0f32; MAX_DOF];
+        let mut holds = [None; MAX_MODE_SWITCH_AXES];
+        let mut targets = [(0usize, ControlMode::PositionVelocity); MAX_MODE_SWITCH_AXES];
+        let mut target_len = 0usize;
+        let mut active_mask: u32 = 0;
+
+        for j in 0..dof {
+            if (mask & (1u64 << j)) != 0 {
+                let last = self.mit.last_ff.get(j).copied().unwrap_or(0.0);
+                match self.mit_frame_bounded(
+                    j,
+                    self.measured_positions[j],
+                    0.0,
+                    0.0,
+                    true,
+                    g[j],
+                    Some((last, dt)),
+                ) {
+                    Ok((frame, tau)) => {
+                        ff[j] = tau;
+                        hold_positions[j] = frame.position;
+                        holds[j] = Some(ModeSwitchHoldTarget::mit(
+                            frame.position,
+                            frame.velocity.unwrap_or(0.0),
+                            frame.kp.unwrap_or(0.0),
+                            frame.kd.unwrap_or(0.0),
+                            frame.torque.unwrap_or(tau),
+                        ));
+                        if target_len < MAX_MODE_SWITCH_AXES && j < MAX_MODE_SWITCH_AXES {
+                            targets[target_len] = (j, ControlMode::PositionVelocity);
+                            target_len += 1;
+                            active_mask |= 1u32 << j;
+                        }
+                    }
+                    Err(e) => {
+                        let mut buf = OutputErrorText::empty();
+                        let _ = core::fmt::write(
+                            &mut buf,
+                            format_args!(
+                                "MIT hand back refused: rollback hold of J{} exceeds effort bound ({e})",
+                                j + 1
+                            ),
+                        );
+                        self.mit_lose_bounded(buf, crate::safety::FaultCode::BusLoss);
+                        return Err("MIT_HAND_BACK_FAILED");
+                    }
+                }
+            } else {
+                let pos = self.commanded_positions.get(j).copied().unwrap_or(0.0);
+                hold_positions[j] = pos;
+                if j < MAX_MODE_SWITCH_AXES {
+                    holds[j] = Some(ModeSwitchHoldTarget::position(pos));
+                }
+            }
+        }
+        // Stop-direction recovery uses FailClosed so a failed POS_VEL handback never writes MIT again.
+        let Ok(plan) = ModeSwitchPlan::switch_axes(&targets[..target_len], ModeSwitchRecovery::FailClosed) else {
+            return Err("MIT_HAND_BACK_FAILED");
+        };
+        let mut prepared = PreparedSession::pos_vel_handback(client, expected_epoch, false);
+        prepared.deadline = Some(deadline);
+        prepared.timeout_code = "TIMEOUT";
+        let terminal_arg = ticket.map(|t| (t, handoff));
+        let sid = self
+            .admit_pos_vel_handback_session(prepared, false, true, terminal_arg, now)
+            .map_err(|e| e.code())?;
+        if let Some(slot) = self.driver.as_mut() {
+            let _ = slot.try_with_mut(|drv| {
+                drv.set_mode_switch_hold_targets(&holds);
+                drv.set_mode_switch_active_mask(active_mask);
+            });
+        }
+        self.install_mode_switch_session(
+            sid,
+            ModeSwitchPurpose::MitHandBack {
+                reason,
+                mask,
+                hold_positions,
+                ff,
+            },
+            ModeSwitch::new(plan),
+        );
+        Ok(Some(sid.0))
+    }
+
+    /// ConfigRequest entry point for off-RT orchestrated MIT handback (`GravityCompEntry` / `Rearm`).
+    /// Validates live caller authority (connection, lease, epoch, stop_gen, E-stop, operator grant)
+    /// BEFORE any state mutation or `ModeSwitch` admission.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub(crate) fn request_mit_hand_back_rt(
+        &mut self,
+        reason: crate::supervisor::MitHandBackReason,
+        admission: crate::supervisor::AdmissionStamp,
+        lease_holder: Option<(crate::model::HolderLabel, u64)>,
+        operator: crate::auth::OperatorRequirement,
+        deadline: std::time::Instant,
+        client: crate::rt_core::broker::ClientId,
+        terminal: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+        retired_handoff: &mut Option<crate::rt_core::reply_router::SessionTerminalHandoff>,
+        now: std::time::Instant,
+    ) -> Result<Option<u64>, crate::rt_core::requests::config::ConfigError> {
+        use crate::rt_core::requests::config::ConfigError;
+        let ticket = match terminal {
+            Some(res) => {
+                let (t, h) = res.into_parts();
+                *retired_handoff = Some(h);
+                Some(t)
+            }
+            None => None,
+        };
+        if self.estop_pending()
+            || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst)
+            || matches!(self.safety.state(), crate::safety::SafetyState::EStop)
+        {
+            return Err(ConfigError::CalibPrecondition {
+                status: 409,
+                code: "ESTOP_ACTIVE",
+                message: "E-stop is active",
+            });
+        }
+        if admission.connection_id != 0 && self.is_connection_closed(admission.connection_id) {
+            return Err(ConfigError::LeaseLost);
+        }
+        if let Some((conn, gen)) = lease_holder {
+            if gen == 0 || !self.validate_lease_at(conn.as_str(), gen, now) {
+                return Err(ConfigError::LeaseLost);
+            }
+            // Bind the supplied `(holder, gen)` tuple, `admission.lease_gen`, and
+            // `admission.connection_id` against the SAME live lease before any state mutation.
+            if (self.lease_enabled || admission.lease_gen != 0) && admission.lease_gen != gen {
+                return Err(ConfigError::LeaseLost);
+            }
+            if admission.connection_id != 0
+                && !self.is_session_lease_valid_at(admission.connection_id, gen, now)
+            {
+                return Err(ConfigError::LeaseLost);
+            }
+        } else if self.lease_enabled
+            && (admission.lease_gen == 0
+                || !self.is_session_lease_valid_at(admission.connection_id, admission.lease_gen, now))
+        {
+            return Err(ConfigError::LeaseLost);
+        }
+        if admission.estop_epoch != self.safety.epoch_id() {
+            return Err(ConfigError::EpochMismatch {
+                current_epoch: self.safety.epoch_id(),
+            });
+        }
+        if self.urgent_stop_unapplied()
+            || admission.stop_gen != self.current_stop_gen()
+            || self.safety.state().is_stopped()
+        {
+            return Err(ConfigError::Stopped);
+        }
+        if self.check_operator_requirement(operator, now).is_err() {
+            return Err(ConfigError::CalibPrecondition {
+                status: 403,
+                code: "OPERATOR_REQUIRED",
+                message: "Operator unlock is required",
+            });
+        }
+        if reason == crate::supervisor::MitHandBackReason::Rearm {
+            self.mit.armed_ok = false;
+        }
+        match self.mit_hand_back_start_with_ticket_rt(
+            reason,
+            admission.estop_epoch,
+            deadline,
+            client,
+            ticket,
+            retired_handoff.as_ref(),
+            now,
+        ) {
+            Ok(opt_sid) => Ok(opt_sid),
+            Err("MIT_NOT_AT_REST") => {
+                if reason == crate::supervisor::MitHandBackReason::Rearm && self.mit_active() {
+                    // Match legacy rearm refusal (driver_transitions.rs:3518-3526): revoke
+                    // authorization, brake active motion (zero-free RT retirement), and schedule
+                    // handback at rest.
+                    self.replace_active_trajectory(None);
+                    self.release_servo_target();
+                    self.mit.revoke_pending = true;
+                }
+                Err(ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "MIT_HAND_BACK_FAILED",
+                    message: "MIT tracking hands back only at rest with fresh feedback",
+                })
+            }
+            Err(code) => Err(ConfigError::CalibPrecondition {
+                status: 409,
+                code,
+                message: "MIT hand back could not start",
+            }),
+        }
+    }
+
+    /// Single RT completion handler for `ModeSwitchPurpose::MitHandBack` (0 alloc, 0 RT free).
+    pub(crate) fn on_mit_handback_mode_switch_terminal_rt(
+        &mut self,
+        reason: crate::supervisor::MitHandBackReason,
+        mask: u64,
+        hold_positions: &[f32; crate::rt_core::mailbox::MAX_DOF],
+        ff: &[f32; crate::rt_core::mailbox::MAX_DOF],
+        progress: crate::motor_mode::ModeProgress,
+        uncertain: bool,
+    ) {
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        match progress {
+            crate::motor_mode::ModeProgress::Confirmed => {
+                if let Some(slot) = self.driver.as_mut() {
+                    let _ = slot.try_with_mut(|drv| {
+                        drv.set_mit_deadline_fence(None, Duration::ZERO);
+                    });
+                }
+                for j in 0..dof {
+                    if (mask & (1u64 << j)) != 0 {
+                        if j < self.commanded_positions.len() {
+                            self.commanded_positions[j] = hold_positions[j];
+                        }
+                        if j < self.target_positions.len() {
+                            self.target_positions[j] = hold_positions[j];
+                        }
+                    }
+                }
+                self.tracking.seed(&self.commanded_positions);
+                self.mit.owner = MitOwner::Off;
+                self.mit.joints.clear();
+                self.mit.last_output = None;
+                let mut smask = crate::torque::ChannelMask::EMPTY;
+                for j in 0..dof {
+                    if (mask & (1u64 << j)) != 0 && j < crate::torque::MAX_CHANNELS {
+                        smask.insert(j as u8);
+                    }
+                }
+                self.torque_shadow.enqueue(
+                    crate::torque::shadow::ShadowInputKind::MitOwnershipChange {
+                        channels: smask,
+                        target_mode: crate::motor_mode::ControlMode::PositionVelocity,
+                        device_wide: false,
+                    },
+                );
+                match reason {
+                    crate::supervisor::MitHandBackReason::AuthorizationRevoked => {
+                        self.mit.revoke_pending = false;
+                    }
+                    crate::supervisor::MitHandBackReason::Park => {
+                        self.mit.park_after_hand_back = false;
+                        if std::mem::take(&mut self.mit.deferred_park_off_owner) {
+                            if let Some(c) = self.park_continuation.as_mut() {
+                                c.phase = crate::supervisor::ParkContinuationPhase::ReadyForPlan;
+                            }
+                            if let Some(w) = self.watchdog_park_pending.as_mut() {
+                                w.waiting_mit_handback = false;
+                            }
+                            self.notify_park_continuation();
+                        } else if !self.rt_executor_owned {
+                            self.apply_stop_policy(crate::safety::StopPolicy::NormalUnload);
+                            if let Some(id) = self.mit.deferred_park_action.take() {
+                                if self.pending_normal_unload {
+                                    if let Some(active) = self.active_trajectory.as_mut() {
+                                        active.action_id = Some(id);
+                                    }
+                                } else {
+                                    let mut msg = self.take_action_msg_buf(id, 96);
+                                    msg.clear();
+                                    msg.push_str("Park could not start after the MIT hand back");
+                                    self.finish_action(
+                                        id,
+                                        "failed",
+                                        Some("UNLOAD_FAILED"),
+                                        Some(msg),
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    crate::supervisor::MitHandBackReason::GravityCompEntry
+                    | crate::supervisor::MitHandBackReason::Rearm => {
+                        self.mit.handback_suppress_until =
+                            Some(std::time::Instant::now() + Duration::from_secs(2));
+                    }
+                }
+            }
+            other => {
+                let mut msg = OutputErrorText::empty();
+                let _ = core::fmt::write(&mut msg, format_args!("MIT hand back failed: {other:?}"));
+                self.mit.handover_error_rt = Some(msg);
+                if !self.rt_executor_owned {
+                    self.mit.handover_error = Some(msg.as_str().to_string());
+                }
+                if uncertain || other.is_ambiguous() {
+                    let code = self.mit_loss_code();
+                    self.mit_lose_bounded(msg, code);
+                } else {
+                    // Clean failure with no ambiguity: keep confirmed MIT holds on remaining MIT axes
+                    // and latch HardwareFault (matching legacy mit_hand_back rollback branch).
+                    for j in 0..dof {
+                        if (mask & (1u64 << j)) != 0 {
+                            if let Some(slot) = self.mit.last_ff.get_mut(j) {
+                                *slot = ff[j];
+                            }
+                        }
+                    }
+                    self.mit.last_output = Some(self.mit_now());
+                    self.safety.latch(
+                        crate::safety::FaultKind::Other,
+                        crate::safety::FaultDetail::formatted(
+                            crate::safety::FaultCode::HardwareFault,
+                            |buf| buf.push_str(msg.as_str()),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     /// Hand the MIT joints back to confirmed stationary position control (gravity compensation
     /// entry, park, rearm). Needs fresh stationary feedback. Nothing to do when MIT is not active.
     pub fn mit_hand_back(&mut self, why: &str) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.driver.is_some()
+            && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+        {
+            return Err("synchronous mit_hand_back is forbidden for non-blocking ModeSwitch drivers; use PosVelHandback session".into());
+        }
         if self.mit.owner != MitOwner::Active { return Ok(()); }
         if !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() || self.commanded_velocities.iter().any(|v| *v != 0.0) {
             return Err(format!("MIT tracking hands back ({why}) only at rest with fresh feedback"));
@@ -1858,55 +2773,114 @@ impl crate::supervisor::SupervisorInner {
         mut pre_ctx: crate::safety::ClearContext,
         commit: crate::supervisor::ClearFaultCommit,
         driver_err_override: Option<crate::safety::BoundedText<256>>,
-    ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
+        authority: Option<crate::rt_core::requests::lease::ClearFaultAuthority>,
+    ) -> Result<crate::safety::SafetyState, crate::supervisor::ClearFaultLegacyInnerError> {
+        use crate::rt_core::requests::lease::recheck_clear_fault_authority_readonly;
         use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
-        // Recheck live J7 freshness, feedback validity, E-stop, and epoch under the SAME driver
-        // lock guard that issues `drv.mit_expiry_recover()` so there is zero check-to-command gap
-        // if J7 crosses 100 ms before the physical disable runs (ZERO commits & ZERO bus commands).
+        use crate::supervisor::ClearFaultLegacyInnerError;
+        // Recheck live J7 freshness, feedback validity, E-stop, epoch, and caller authority under
+        // the SAME driver lock guard that issues `drv.mit_expiry_recover()` so there is zero
+        // check-to-command gap (ZERO commits & ZERO bus commands on refusal/revocation).
         pre_ctx.expected_epoch = expected_epoch;
-        let (pre_recovery_seqs, res) = if let Some(ref mut d) = self.driver {
-            let mut drv = match d.write() {
-                Some(g) => g,
+        #[allow(clippy::large_enum_variant)]
+        enum PreRecoveryOutcome {
+            Ran(Vec<u64>, Result<(), String>),
+            ClearRefusal(ClearRefusal),
+            StoppedTorqueOff(crate::supervisor::StoppedTorqueOffRefusal),
+            Authority(crate::rt_core::requests::lease::ClearFaultAuthorityError),
+        }
+        let (pre_recovery_seqs, res) = if self.driver.is_some() {
+            let outcome = self.with_driver_and_owner_ref(|owner, drv| {
+                let mut local_ctx = pre_ctx;
+                local_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                local_ctx.feedback_fresh = local_ctx.feedback_fresh && drv.is_feedback_valid();
+                local_ctx.pending_estop =
+                    owner.estop_state.requested_count() != owner.applied_estop_count;
+                if let Err(refusal) = owner.safety.clear_check(&local_ctx) {
+                    return PreRecoveryOutcome::ClearRefusal(refusal);
+                }
+                if let Err(refusal) = Self::check_stopped_torque_off_with_driver(&owner.config, drv)
+                {
+                    return PreRecoveryOutcome::StoppedTorqueOff(refusal);
+                }
+                if let Some(auth) = authority {
+                    if let Err(auth_err) =
+                        recheck_clear_fault_authority_readonly(owner, auth, std::time::Instant::now())
+                    {
+                        return PreRecoveryOutcome::Authority(auth_err);
+                    }
+                }
+                let recovery_baseline = owner.capture_baseline();
+                let mut auth_abort: Option<crate::rt_core::requests::lease::ClearFaultAuthorityError> = None;
+                let mut estop_abort = false;
+                let mut pre_tx_gate = || -> Result<(), &'static str> {
+                    if owner.new_estop_since(recovery_baseline) {
+                        estop_abort = true;
+                        return Err("ESTOP_ACTIVE");
+                    }
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) =
+                            recheck_clear_fault_authority_readonly(owner, auth, std::time::Instant::now())
+                        {
+                            auth_abort = Some(auth_err);
+                            return Err("AUTH_REVOKED");
+                        }
+                    }
+                    Ok(())
+                };
+                let pre = drv.feedback_seqs();
+                let r = drv.mit_expiry_recover_with_gate(&mut pre_tx_gate);
+                if let Some(auth_err) = auth_abort {
+                    return PreRecoveryOutcome::Authority(auth_err);
+                }
+                if estop_abort {
+                    return PreRecoveryOutcome::ClearRefusal(ClearRefusal::EStopActive);
+                }
+                PreRecoveryOutcome::Ran(pre, r)
+            });
+            match outcome {
                 None => {
                     pre_ctx.j7_feedback_fresh = false;
                     pre_ctx.feedback_fresh = false;
                     pre_ctx.pending_estop =
                         self.estop_state.requested_count() != self.applied_estop_count;
-                    return Err(self
-                        .safety
-                        .clear_check(&pre_ctx)
-                        .err()
-                        .map_or(SafetyError::FeedbackUnavailable, ClearRefusal::into_safety_error));
+                    return Err(ClearFaultLegacyInnerError::Safety(
+                        self.safety
+                            .clear_check(&pre_ctx)
+                            .err()
+                            .map_or(SafetyError::FeedbackUnavailable, ClearRefusal::into_safety_error),
+                    ));
                 }
-            };
-            pre_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
-            pre_ctx.feedback_fresh = pre_ctx.feedback_fresh && drv.is_feedback_valid();
-            pre_ctx.pending_estop = self.estop_state.requested_count() != self.applied_estop_count;
-            if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
-                drop(drv);
-                if refusal == ClearRefusal::EStopActive {
-                    self.consume_pending_estop();
-                    if let Some(received) = expected_epoch {
-                        if received != self.safety.epoch_id() {
-                            return Err(SafetyError::EpochMismatch {
-                                expected: self.safety.epoch_id(),
-                                received,
-                            });
+                Some(PreRecoveryOutcome::ClearRefusal(refusal)) => {
+                    if refusal == ClearRefusal::EStopActive {
+                        self.consume_pending_estop();
+                        if let Some(received) = expected_epoch {
+                            if received != self.safety.epoch_id() {
+                                return Err(ClearFaultLegacyInnerError::Safety(
+                                    SafetyError::EpochMismatch {
+                                        expected: self.safety.epoch_id(),
+                                        received,
+                                    },
+                                ));
+                            }
                         }
                     }
+                    return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
                 }
-                return Err(refusal.into_safety_error());
+                Some(PreRecoveryOutcome::StoppedTorqueOff(refusal)) => {
+                    self.last_stopped_torque_off_refusal = Some(refusal);
+                    return Err(ClearFaultLegacyInnerError::Safety(
+                        refusal.into_safety_error(&self.config.joint_names),
+                    ));
+                }
+                Some(PreRecoveryOutcome::Authority(auth_err)) => {
+                    return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                }
+                Some(PreRecoveryOutcome::Ran(pre, r)) => {
+                    self.last_stopped_torque_off_refusal = None;
+                    (pre, r)
+                }
             }
-            if let Err(refusal) = Self::check_stopped_torque_off_with_driver(&self.config, drv.as_ref()) {
-                drop(drv);
-                self.last_stopped_torque_off_refusal = Some(refusal);
-                return Err(refusal.into_safety_error(&self.config.joint_names));
-            }
-            let pre = drv.feedback_seqs();
-            let r = drv.mit_expiry_recover();
-            drop(drv);
-            self.last_stopped_torque_off_refusal = None;
-            (pre, r)
         } else {
             pre_ctx.pending_estop = self.estop_request_unapplied();
             if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
@@ -1914,18 +2888,20 @@ impl crate::supervisor::SupervisorInner {
                     self.consume_pending_estop();
                     if let Some(received) = expected_epoch {
                         if received != self.safety.epoch_id() {
-                            return Err(SafetyError::EpochMismatch {
-                                expected: self.safety.epoch_id(),
-                                received,
-                            });
+                            return Err(ClearFaultLegacyInnerError::Safety(
+                                SafetyError::EpochMismatch {
+                                    expected: self.safety.epoch_id(),
+                                    received,
+                                },
+                            ));
                         }
                     }
                 }
-                return Err(refusal.into_safety_error());
+                return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
             }
             self.eval_stopped_torque_off()
-                .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
-            (Vec::new(), Err("no driver".into()))
+                .map_err(|r| ClearFaultLegacyInnerError::Safety(r.into_safety_error(&self.config.joint_names)))?;
+            (Vec::new(), Err("no driver".to_string()))
         };
         if let Err(e) = res {
             if self.estop_request_unapplied() {
@@ -1934,7 +2910,7 @@ impl crate::supervisor::SupervisorInner {
             let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
                 The recovery turns torque off on every joint (support the arm); check the named joints, then clear again");
             tracing::error!("{msg}");
-            return Err(SafetyError::ClearFaultRejected(msg));
+            return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(msg)));
         }
         tracing::warn!("MIT recovery after a motor timeout: accepted disable sent; torque is off on all joints");
         self.stop_motion();
@@ -1942,6 +2918,8 @@ impl crate::supervisor::SupervisorInner {
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
         self.disable_accepted();
+        let _ = self.safety.set_torque(false);
+        self.is_torqued = false;
 
         // Read post-recovery feedback strictly AFTER the recovery disable (verified by per-joint
         // receive sequence advance AND driver post-recovery RX boundary), keeping telemetry,
@@ -1951,7 +2929,7 @@ impl crate::supervisor::SupervisorInner {
         let thermal_cooldown = self.thermal_cooldown;
         let post_read = self.driver.as_mut().and_then(|d| {
             d.with_mut(|drv| {
-                let states = drv.read_joint_states().ok()?;
+                let states = drv.read_joint_states_rx_only().ok()?;
                 let post_seqs = drv.feedback_seqs();
                 let seqs_after_recovery = pre_recovery_seqs.len() == dof
                     && post_seqs.len() == dof
@@ -2065,26 +3043,50 @@ impl crate::supervisor::SupervisorInner {
         self.consume_pending_estop();
         post_ctx.expected_epoch = expected_epoch;
         post_ctx.pending_estop = self.estop_request_unapplied();
+        if let Some(auth) = authority {
+            recheck_clear_fault_authority_readonly(self, auth, std::time::Instant::now())
+                .map_err(ClearFaultLegacyInnerError::Authority)?;
+        }
         if let Some(received) = expected_epoch {
             if received != self.safety.epoch_id() {
-                return Err(SafetyError::EpochMismatch {
+                return Err(ClearFaultLegacyInnerError::Safety(SafetyError::EpochMismatch {
                     expected: self.safety.epoch_id(),
                     received,
-                });
+                }));
             }
         }
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
+            self.mit.owner = MitOwner::Off;
+            self.mit.joints.clear();
+            self.mit.last_ff.clear();
+            self.mit.last_output = None;
+            self.mit.armed_ok = false;
+            self.mit.revoke_pending = false;
+            self.mit.recovery_confirmed = false;
+            if let Some(d) = self.driver.as_mut() {
+                let _ = d.with_mut(|drv| drv.acknowledge_mit_fence_trip());
+            }
+            let _ = self.safety.set_torque(false);
             let _ = self.safety.clear_with_check(&post_ctx);
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
-            return Err(SafetyError::EStopActive);
+            return Err(ClearFaultLegacyInnerError::Safety(SafetyError::EStopActive));
         }
-        // Single authoritative clear commit FIRST — recheck live J7 freshness and feedback
-        // validity under the driver lock guard across `clear_with_check(&post_ctx)` so an earlier
-        // read can never clear a now-stale J7 fault (ZERO feedback/cooldown/limit/confirmation
-        // commits on refusal).
+        // Single authoritative clear commit FIRST — recheck live authority, J7 freshness, and
+        // feedback validity under the driver lock guard across `clear_with_check(&post_ctx)` so an
+        // earlier read or expired authority can never clear or commit staged limits.
         let clear_res = if let Some(ref d) = self.driver {
             match d.read() {
                 Some(drv) => {
+                    if let Some(auth) = authority {
+                        if let Err(auth_err) = recheck_clear_fault_authority_readonly(
+                            self,
+                            auth,
+                            std::time::Instant::now(),
+                        ) {
+                            drop(drv);
+                            return Err(ClearFaultLegacyInnerError::Authority(auth_err));
+                        }
+                    }
                     post_ctx.j7_feedback_fresh =
                         post_ctx.j7_feedback_fresh && drv.pos_force_feedback_fresh();
                     post_ctx.feedback_fresh = post_ctx.feedback_fresh && drv.is_feedback_valid();
@@ -2093,6 +3095,14 @@ impl crate::supervisor::SupervisorInner {
                     self.safety.clear_with_check(&post_ctx)
                 }
                 None => {
+                    if let Some(auth) = authority {
+                        recheck_clear_fault_authority_readonly(
+                            self,
+                            auth,
+                            std::time::Instant::now(),
+                        )
+                        .map_err(ClearFaultLegacyInnerError::Authority)?;
+                    }
                     post_ctx.j7_feedback_fresh = false;
                     post_ctx.feedback_fresh = false;
                     post_ctx.pending_estop = self.estop_request_unapplied();
@@ -2100,6 +3110,14 @@ impl crate::supervisor::SupervisorInner {
                 }
             }
         } else {
+            if let Some(auth) = authority {
+                recheck_clear_fault_authority_readonly(
+                    self,
+                    auth,
+                    std::time::Instant::now(),
+                )
+                .map_err(ClearFaultLegacyInnerError::Authority)?;
+            }
             self.safety.clear_with_check(&post_ctx)
         };
         if let Err(refusal) = clear_res {
@@ -2107,14 +3125,16 @@ impl crate::supervisor::SupervisorInner {
                 self.consume_pending_estop();
                 if let Some(received) = expected_epoch {
                     if received != self.safety.epoch_id() {
-                        return Err(SafetyError::EpochMismatch {
-                            expected: self.safety.epoch_id(),
-                            received,
-                        });
+                        return Err(ClearFaultLegacyInnerError::Safety(
+                            SafetyError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            },
+                        ));
                     }
                 }
             }
-            return Err(refusal.into_safety_error());
+            return Err(ClearFaultLegacyInnerError::Safety(refusal.into_safety_error()));
         }
 
         // Clear committed: apply staged post-recovery feedback, cooldown, limits, and confirmation.
@@ -2167,7 +3187,7 @@ impl crate::supervisor::SupervisorInner {
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
-            return Err(SafetyError::EStopActive);
+            return Err(ClearFaultLegacyInnerError::Safety(SafetyError::EStopActive));
         }
         Ok(self.safety.state().clone())
     }
@@ -2415,11 +3435,29 @@ impl Default for CommissioningJointOutcome {
     }
 }
 
+/// Deterministic FNV-1a 64-bit digest of `joint_zero_offsets` used to bind an off-RT
+/// `MitGateProof` to the exact zero offsets verified by [`check_gate`] (0 alloc).
+pub fn zero_offsets_hash(offsets: &[f32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &o in offsets {
+        let bits = if o == 0.0 { 0u32 } else { o.to_bits() };
+        for b in bits.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
 /// Kind of RT tick-driven hardware commissioning operation.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommissioningOpKind {
     ReadIdentity,
+    /// Non-mutating identity readback used by executor torque-enable MIT qualification
+    /// (`mit_gate`). Permits disarmed or stationary armed non-MIT state (for rearm) while
+    /// keeping verified watchdog holds serviced ahead of register reads.
+    ReadIdentityForEnable,
     WriteTimeout,
     MotorZeroDisable,
     MotorZeroWriteVerify,
@@ -2849,21 +3887,24 @@ impl crate::supervisor::SupervisorInner {
         if self.urgent_stop_unapplied() || self.current_stop_gen() != auth.expected_stop_gen {
             return Err((409, "STOPPED", "Stopped during commissioning"));
         }
-        match auth.lease_holder {
-            Some((conn, gen))
-                if gen != 0
-                    && self.is_lease_valid_for_conn_at(conn.as_str(), gen, owner_now) => {}
-            _ => {
-                return Err((
-                    409,
-                    "LEASE_LOST",
-                    "This connection lost the lease during commissioning",
-                ));
+        if self.lease_enabled || kind != CommissioningOpKind::ReadIdentityForEnable {
+            match auth.lease_holder {
+                Some((conn, gen))
+                    if gen != 0
+                        && self.is_lease_valid_for_conn_at(conn.as_str(), gen, owner_now) => {}
+                _ => {
+                    return Err((
+                        409,
+                        "LEASE_LOST",
+                        "This connection lost the lease during commissioning",
+                    ));
+                }
             }
         }
-        if !auth
-            .operator_grant
-            .is_valid_at(owner_now, self.operator_auth_enforced)
+        if kind != CommissioningOpKind::ReadIdentityForEnable
+            && !auth
+                .operator_grant
+                .is_valid_at(owner_now, self.operator_auth_enforced)
         {
             return Err((
                 403,
@@ -2975,7 +4016,20 @@ impl crate::supervisor::SupervisorInner {
                 (409, "MIT_TIMEOUT_ARMED", "the arm is stopped or faulted; clear the fault first")
             });
         }
-        if self.is_torqued
+        let is_enable_read = kind == CommissioningOpKind::ReadIdentityForEnable;
+        if is_enable_read {
+            if self.disable_pending
+                || self.torque_transition.is_some()
+                || self.handover_settling_since.is_some()
+                || self.mit_active()
+                || self.mit.revoke_pending
+            {
+                return Err((409, "MOTION_BUSY", "arm is busy or transitioning before MIT qualification"));
+            }
+            if self.is_torqued && !self.tracking_stationary_evidence_with_driver(drv) {
+                return Err((409, "MOTION_BUSY", "arm must be stationary for energized MIT qualification"));
+            }
+        } else if self.is_torqued
             || self.disable_pending
             || self.torque_transition.is_some()
             || self.handover_settling_since.is_some()
@@ -3016,7 +4070,9 @@ impl crate::supervisor::SupervisorInner {
             });
         }
         match kind {
-            CommissioningOpKind::ReadIdentity | CommissioningOpKind::WriteTimeout => {
+            CommissioningOpKind::ReadIdentity
+            | CommissioningOpKind::ReadIdentityForEnable
+            | CommissioningOpKind::WriteTimeout => {
                 if !drv.supports_nonblocking_commissioning() {
                     return Err((400, "UNSUPPORTED", "this driver does not support non-blocking register commissioning"));
                 }
@@ -3351,7 +4407,11 @@ impl crate::supervisor::SupervisorInner {
             SessionKind::Commissioning,
             crate::rt_core::broker::ClientId(req.authority.conn_id),
         );
-        let op_req = crate::auth::OperatorRequirement::Required(req.authority.operator_grant);
+        let op_req = if req.kind == CommissioningOpKind::ReadIdentityForEnable {
+            crate::auth::OperatorRequirement::NotRequired
+        } else {
+            crate::auth::OperatorRequirement::Required(req.authority.operator_grant)
+        };
         prepared.deadline = Some(req.txn_deadline);
         prepared.timeout_code = Self::commissioning_deadline_error_code(req.kind);
         prepared.operator = op_req;
@@ -3367,6 +4427,7 @@ impl crate::supervisor::SupervisorInner {
             operator: op_req,
             revoke_on_stop: true,
             revoke_on_epoch_change: true,
+            mode: crate::rt_core::session::SessionAuthorityMode::ClientControlled,
         };
         let session_id = self
             .sessions
@@ -3798,16 +4859,54 @@ impl crate::supervisor::SupervisorInner {
                 drv.set_tx_release_deadline(Some(drv_cutoff));
 
                 let res = match kind {
-                    CommissioningOpKind::ReadIdentity => self.step_read_identity_with_drv(
-                        drv,
-                        &auth,
-                        drv_cutoff,
-                        eff_rx,
-                        eff_max_tx,
-                        &mut reg_tx_attempted,
-                        &mut backpressured,
-                        owner_now_fn,
-                    ),
+                    CommissioningOpKind::ReadIdentity | CommissioningOpKind::ReadIdentityForEnable => {
+                        let mut read_max_tx = eff_max_tx;
+                        // Major 5: on energized rearm qualification, service verified watchdog
+                        // holds FIRST before spending any TX slot on register readback so every
+                        // enabled arm axis stays <= 40 ms gap.
+                        if kind == CommissioningOpKind::ReadIdentityForEnable && drv.any_axis_energized() {
+                            let cfg_max_frames = self
+                                .config
+                                .damiao_tx_budget()
+                                .max_frames
+                                .min(u8::MAX as usize) as u8;
+                            let ledger_tx_rem = budget_caps
+                                .map_or(cfg_max_frames, |(_, tx_rem)| {
+                                    tx_rem.min(u16::from(u8::MAX)) as u8
+                                })
+                                .min(cfg_max_frames);
+                            match drv.mode_switch_service_watchdog_holds(
+                                crate::motor_mode::DEFAULT_WATCHDOG_PROACTIVE_INTERVAL,
+                                0,
+                                0,
+                                drv_cutoff,
+                                ledger_tx_rem,
+                            ) {
+                                Ok(wd) => {
+                                    if !wd.all_due_serviced || drv.clock_now() >= drv_cutoff {
+                                        read_max_tx = 0;
+                                    } else {
+                                        let rem = ledger_tx_rem.saturating_sub(wd.frames_sent);
+                                        read_max_tx = read_max_tx.min(rem);
+                                    }
+                                }
+                                Err(_) => {
+                                    read_max_tx = 0;
+                                }
+                            }
+                        }
+                        self.step_read_identity_with_drv(
+                            kind,
+                            drv,
+                            &auth,
+                            drv_cutoff,
+                            eff_rx,
+                            read_max_tx,
+                            &mut reg_tx_attempted,
+                            &mut backpressured,
+                            owner_now_fn,
+                        )
+                    }
                     CommissioningOpKind::WriteTimeout => self.step_write_timeout_with_drv(
                         drv,
                         &auth,
@@ -3912,7 +5011,10 @@ impl crate::supervisor::SupervisorInner {
             && !awaiting_reply
             && !quiet_active
             && (rest_probe_pending
-                || (kind == CommissioningOpKind::ReadIdentity
+                || (matches!(
+                    kind,
+                    CommissioningOpKind::ReadIdentity | CommissioningOpKind::ReadIdentityForEnable
+                )
                     && !matches!(self.commissioning.reg_phase, RegReadPhase::QuietWait))
                 || (kind == CommissioningOpKind::WriteTimeout
                     && self.commissioning.write_phase != WriteTimeoutPhase::GatherRestEvidence));
@@ -3930,7 +5032,7 @@ impl crate::supervisor::SupervisorInner {
 
     fn commissioning_deadline_error_code(kind: CommissioningOpKind) -> &'static str {
         match kind {
-            CommissioningOpKind::ReadIdentity => "MIT_TIMEOUT_READ",
+            CommissioningOpKind::ReadIdentity | CommissioningOpKind::ReadIdentityForEnable => "MIT_TIMEOUT_READ",
             CommissioningOpKind::WriteTimeout => "MIT_TIMEOUT_FAILED",
             CommissioningOpKind::MotorZeroDisable => "MOTOR_ZERO_NOT_DISABLED",
             CommissioningOpKind::MotorZeroWriteVerify => "MOTOR_ZERO_UNVERIFIED",
@@ -4291,9 +5393,10 @@ impl crate::supervisor::SupervisorInner {
         }
     }
 
-    #[allow(clippy::result_large_err)]
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     fn step_read_identity_with_drv(
         &mut self,
+        kind: CommissioningOpKind,
         drv: &mut dyn crate::driver::ArmDriver,
         auth: &CommissioningAuthority,
         drv_cutoff: std::time::Instant,
@@ -4308,7 +5411,7 @@ impl crate::supervisor::SupervisorInner {
             let idx = self.commissioning.joint_idx;
             let joint = self.commissioning.joints[idx];
             if let Err((status, code, msg)) =
-                self.commissioning_safety_check_with_driver(CommissioningOpKind::ReadIdentity, &[joint], Some(drv))
+                self.commissioning_safety_check_with_driver(kind, &[joint], Some(drv))
             {
                 return Err((status, code, crate::safety::BoundedText::new(msg)));
             }
@@ -5219,32 +6322,54 @@ const COMMISSIONING_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const COMMISSIONING_TXN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(not(target_arch = "wasm32"))]
+enum CommissioningCleanup {
+    Supervisor(std::sync::Arc<crate::supervisor::ArmSupervisor>),
+    Executor(crate::rt_core::executor::RtExecutorHandle),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 struct CommissioningOpGuard {
-    sup: Option<std::sync::Arc<crate::supervisor::ArmSupervisor>>,
+    target: Option<CommissioningCleanup>,
     op_id: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl CommissioningOpGuard {
-    fn new(sup: std::sync::Arc<crate::supervisor::ArmSupervisor>, op_id: u64) -> Self {
+    fn new(target: CommissioningCleanup, op_id: u64) -> Self {
         Self {
-            sup: Some(sup),
+            target: Some(target),
             op_id,
         }
     }
 
     async fn clear(mut self, clean_complete: bool, force_reconcile: bool) {
-        if let Some(sup) = self.sup.take() {
+        if let Some(target) = self.target.take() {
             let op_id = self.op_id;
-            let _ = sup
-                .dispatch_config_request_reliable(|| {
-                    crate::rt_core::requests::config::ConfigRequest::ClearCommissioning {
-                        op_id,
-                        clean_complete,
-                        force_reconcile,
-                    }
-                })
-                .await;
+            match target {
+                CommissioningCleanup::Supervisor(sup) => {
+                    let _ = sup
+                        .dispatch_config_request_reliable(|| {
+                            crate::rt_core::requests::config::ConfigRequest::ClearCommissioning {
+                                op_id,
+                                clean_complete,
+                                force_reconcile,
+                            }
+                        })
+                        .await;
+                }
+                CommissioningCleanup::Executor(h) => {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = h.call_config(
+                            crate::rt_core::requests::config::ConfigRequest::ClearCommissioning {
+                                op_id,
+                                clean_complete,
+                                force_reconcile,
+                            },
+                        );
+                    })
+                    .await;
+                }
+            }
         }
     }
 }
@@ -5252,34 +6377,69 @@ impl CommissioningOpGuard {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for CommissioningOpGuard {
     fn drop(&mut self) {
-        let Some(sup) = self.sup.take() else {
+        let Some(target) = self.target.take() else {
             return;
         };
         let op_id = self.op_id;
-        match tokio::runtime::Handle::try_current() {
-            Ok(h) => {
-                h.spawn(async move {
-                    let _ = sup
-                        .dispatch_config_request_reliable(|| {
+        match target {
+            CommissioningCleanup::Supervisor(sup) => match tokio::runtime::Handle::try_current() {
+                Ok(h) => {
+                    h.spawn(async move {
+                        let _ = sup
+                            .dispatch_config_request_reliable(|| {
+                                crate::rt_core::requests::config::ConfigRequest::CancelCommissioning {
+                                    op_id,
+                                    reason: "CANCELLED",
+                                }
+                            })
+                            .await;
+                        let _ = sup
+                            .dispatch_config_request_reliable(|| {
+                                crate::rt_core::requests::config::ConfigRequest::ClearCommissioning {
+                                    op_id,
+                                    clean_complete: false,
+                                    force_reconcile: false,
+                                }
+                            })
+                            .await;
+                    });
+                }
+                Err(_) => {
+                    if let Some(h) = sup.executor_handle() {
+                        let _ = h.call_config(
                             crate::rt_core::requests::config::ConfigRequest::CancelCommissioning {
                                 op_id,
                                 reason: "CANCELLED",
-                            }
-                        })
-                        .await;
-                    let _ = sup
-                        .dispatch_config_request_reliable(|| {
+                            },
+                        );
+                        let _ = h.call_config(
                             crate::rt_core::requests::config::ConfigRequest::ClearCommissioning {
                                 op_id,
                                 clean_complete: false,
                                 force_reconcile: false,
-                            }
-                        })
-                        .await;
-                });
-            }
-            Err(_) => {
-                if let Some(h) = sup.executor_handle() {
+                            },
+                        );
+                    }
+                }
+            },
+            CommissioningCleanup::Executor(h) => {
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.spawn_blocking(move || {
+                        let _ = h.call_config(
+                            crate::rt_core::requests::config::ConfigRequest::CancelCommissioning {
+                                op_id,
+                                reason: "CANCELLED",
+                            },
+                        );
+                        let _ = h.call_config(
+                            crate::rt_core::requests::config::ConfigRequest::ClearCommissioning {
+                                op_id,
+                                clean_complete: false,
+                                force_reconcile: false,
+                            },
+                        );
+                    });
+                } else {
                     let _ = h.call_config(
                         crate::rt_core::requests::config::ConfigRequest::CancelCommissioning {
                             op_id,
@@ -5326,6 +6486,22 @@ pub(crate) async fn run_rt_commissioning_op(
     req: CommissioningStartRequest,
     auth_check: &(dyn Fn() -> Result<(), (&'static str, crate::supervisor::ArmError)> + Send + Sync),
 ) -> Result<CommissioningSnapshot, CommissioningRunError> {
+    run_rt_commissioning_op_inner(
+        sup,
+        CommissioningCleanup::Supervisor(std::sync::Arc::clone(sup)),
+        req,
+        auth_check,
+    )
+    .await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_rt_commissioning_op_inner(
+    sup: &crate::supervisor::ArmSupervisor,
+    cleanup: CommissioningCleanup,
+    req: CommissioningStartRequest,
+    auth_check: &(dyn Fn() -> Result<(), (&'static str, crate::supervisor::ArmError)> + Send + Sync),
+) -> Result<CommissioningSnapshot, CommissioningRunError> {
     use crate::rt_core::requests::config::{ConfigReply, ConfigRequest};
     if let Err((_, arm_err)) = (auth_check)() {
         return Err(CommissioningRunError::DefinitivePreTxRefusal(CalibError::from(
@@ -5355,7 +6531,7 @@ pub(crate) async fn run_rt_commissioning_op(
             )));
         }
     };
-    let op_guard = CommissioningOpGuard::new(std::sync::Arc::clone(sup), op_id);
+    let op_guard = CommissioningOpGuard::new(cleanup, op_id);
 
     // Legacy headless fallback tracking (matches TQ-LOCK pattern):
     // When a live 50 Hz legacy control loop is ticking, `tick_shared` services commissioning

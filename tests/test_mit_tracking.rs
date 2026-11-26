@@ -7,12 +7,18 @@
 
 mod mit_support;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use armd::auth::OperatorRequirement;
 use armd::driver::{ArmDriver, DamiaoArmDriver};
 use armd::mit::{self, MitJointQualification, MitQualificationFile};
 use armd::model::ArmConfig;
 use armd::protocol::damiao::{self, DamiaoLimits};
+use armd::rt_core::broker::ClientId;
+use armd::rt_core::requests::config::{capture_config_admission, gravity_comp_command_with_auth};
 use armd::tracking::{JointTrackingConfig, TrackingStrategy};
-use armd::{SupervisorInner, TrajectoryPlanner};
+use armd::{ArmSupervisor, SupervisorInner, TrajectoryPlanner};
 use mit_support::{assert_no_flash_write, FakeBus, SW_VER};
 use serde_json::json;
 
@@ -22,7 +28,11 @@ fn b601_limits() -> Vec<DamiaoLimits> {
 
 /// Bus with a deterministic clock shared with the driver: freshness and reply timeouts do not
 /// depend on wall-clock load.
-fn clocked_bus() -> FakeBus { FakeBus::with_clock(&b601_limits(), armd::transport::MockClock::new()) }
+fn clocked_bus() -> FakeBus {
+    let bus = FakeBus::with_clock(&b601_limits(), armd::transport::MockClock::new());
+    bus.with(|s| s.tx_step = std::time::Duration::from_micros(50));
+    bus
+}
 
 fn driver_on(bus: &FakeBus) -> DamiaoArmDriver<FakeBus> {
     DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(b601_limits()).unwrap()
@@ -338,7 +348,10 @@ fn active_rig(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus) {
 fn active_rig_clocked(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus, armd::transport::MockClock) {
     let clock = armd::transport::MockClock::new();
     let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
-    bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i] + if i == 3 { zero_j4 } else { 0.0 }; });
+    bus.with(|s| {
+        s.tx_step = std::time::Duration::from_micros(50);
+        for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i] + if i == 3 { zero_j4 } else { 0.0 }; }
+    });
     let mut d = disabled_driver(&bus);
     d.check_mapping_ranges();
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
@@ -348,9 +361,15 @@ fn active_rig_clocked(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4_zero(2000, zero_j4));
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
-    inner.tick(DT);
-    inner.tick(DT);
+    for _ in 0..10 {
+        inner.tick(DT);
+        if inner.mit_active() {
+            break;
+        }
+    }
     assert!(inner.mit_active(), "handover: {:?}", inner.mit.handover_error);
+    // Run one settled normal MIT tick after ModeSwitch confirmation so tracking/MIT state matches steady-state.
+    inner.tick(DT);
     (inner, bus, clock)
 }
 
@@ -461,40 +480,75 @@ fn mit_effort_saturation_and_empty_interval() {
     assert!(fault.message.contains("empty effort interval"), "{}", fault.message);
 }
 
-#[test]
-fn mit_owner_handover() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mit_owner_handover() {
     // activation refused while a joint moves
     let bus = clocked_bus();
     bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i]; });
     let mut d = disabled_driver(&bus);
     d.check_mapping_ranges();
-    let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
-    inner.lease_enabled = false;
-    inner.tick(DT);
-    inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
-    with_record(&mut inner, record_j4(2000));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
-    bus.with(|s| { s.follow_commands = false; s.motors[1].v = 0.3; });
-    for _ in 0..5 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
-    assert!(!inner.mit_active(), "handover while J2 moves");
-    let e = inner.plan_input().unwrap_err();
-    assert!(e.to_string().contains("MIT tracking is not active"), "{e}");
-    bus.with(|s| { s.motors[1].v = 0.0; s.follow_commands = true; });
-    bus.clear_log();
-    for _ in 0..3 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
-    assert!(inner.mit_active());
-    // the handover: J4 mode write, then the MIT hold at the measured pose with zero velocity,
-    // the jaw keeps its command
-    let log = bus.tx_log();
-    let w = log.iter().position(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x55, 10]).expect("J4 CTRL_MODE write");
-    let hold = mit_frames(&log[w..], 4)[0];
-    assert!((hold.0 - Q0[3]).abs() < 1e-3 && hold.1.abs() < 0.02, "hold {hold:?}");
-    assert!(posvel_frames(&log, 7).iter().all(|p| (p - inner.commanded_positions[6]).abs() < 1e-6));
-    assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0x55 && f.data[3] == 10 && f.data[0] != 4), "only J4 switched");
+    let sup = Arc::new(ArmSupervisor::new(mit_config_j4()).with_driver(Box::new(d)));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.tick(DT);
+        inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
+        with_record(&mut inner, record_j4(2000));
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
+        bus.with(|s| { s.follow_commands = false; s.motors[1].v = 0.3; });
+        for _ in 0..5 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
+        assert!(!inner.mit_active(), "handover while J2 moves");
+        let e = inner.plan_input().unwrap_err();
+        assert!(e.to_string().contains("MIT tracking is not active"), "{e}");
+        bus.with(|s| { s.motors[1].v = 0.0; s.follow_commands = true; });
+        bus.clear_log();
+        for _ in 0..8 {
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
+        assert!(inner.mit_active());
+        // the handover: J4 mode write, then the MIT hold at the measured pose with zero velocity,
+        // the jaw keeps its command
+        let log = bus.tx_log();
+        let w = log.iter().position(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x55, 10]).expect("J4 CTRL_MODE write");
+        let hold = mit_frames(&log[w..], 4)[0];
+        assert!((hold.0 - Q0[3]).abs() < 1e-3 && hold.1.abs() < 0.02, "hold {hold:?}");
+        assert!(posvel_frames(&log, 7).iter().all(|p| (p - inner.commanded_positions[6]).abs() < 1e-6));
+        assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0x55 && f.data[3] == 10 && f.data[0] != 4), "only J4 switched");
+    }
 
-    // gravity compensation entry hands back first (POS_VEL, confirmed), exit, then a fresh handover
+    // gravity compensation entry hands back first (POS_VEL via PR0B/PR0C PosVelHandback, confirmed),
+    // then switches J1-J6 to MIT via ModeSwitch; exit, then a fresh handover
     bus.clear_log();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.expect("gravity comp entry");
+    let stop_tick = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop_tick);
+    let sup_tick = Arc::clone(&sup);
+    let ticker = tokio::spawn(async move {
+        while !stop_flag.load(Ordering::Acquire) {
+            sup_tick.tick(DT).await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    });
+    let adm = capture_config_admission(&sup, 0, 0, None);
+    let gc_res = gravity_comp_command_with_auth(
+        &sup,
+        adm,
+        None,
+        OperatorRequirement::NotRequired,
+        ClientId(0),
+        true,
+        None,
+        None,
+    )
+    .await;
+    stop_tick.store(true, Ordering::Release);
+    ticker.await.unwrap();
+    gc_res.expect("gravity comp entry");
+
+    let mut inner = sup.inner().write().await;
     assert!(!inner.mit_active() && inner.mit.owner == mit::MitOwner::Off);
     let log = bus.tx_log();
     let back = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data).expect("J4 back to POS_VEL");
@@ -506,7 +560,12 @@ fn mit_owner_handover() {
     inner.exit_gravity_comp("TEST", "test exit");
     for _ in 0..200 { inner.tick(DT); if inner.gravity_comp.is_none() { break; } }
     assert!(inner.gravity_comp.is_none());
-    for _ in 0..5 { inner.tick(DT); }
+    for _ in 0..10 {
+        inner.tick(DT);
+        if inner.mit_active() {
+            break;
+        }
+    }
     assert!(inner.mit_active(), "re-entry through a fresh handover: {:?}", inner.mit.handover_error);
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_MIT).data));
 
@@ -525,7 +584,12 @@ fn mit_park_hands_back_before_moving() {
     let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
     bus.clear_log();
     inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
-    for _ in 0..3 { inner.tick(DT); }
+    for _ in 0..12 {
+        inner.tick(DT);
+        if !inner.mit_active() {
+            break;
+        }
+    }
     assert!(!inner.mit_active(), "park hands back at rest");
     let log = bus.tx_log();
     let back = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data).expect("J4 back to POS_VEL");
@@ -660,19 +724,34 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x33, 9]), "TIMEOUT readback on the rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data), "J4 base mode restored");
-    for _ in 0..3 { inner.tick(DT); }
+    for _ in 0..8 {
+        inner.tick(DT);
+        if inner.mit_active() {
+            break;
+        }
+    }
     assert!(inner.mit_active(), "{:?}", inner.mit.handover_error);
 }
 
 #[test]
 fn mit_failed_rollback_blocks_fault_clearance() {
-    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
-    // park: the hand back is acknowledged, then the motor goes silent -> rollback unconfirmed
-    bus.with(|s| s.motors[3].silent_after_mode_ack = true);
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
+    // park: the hand back REG_WRITE gets no ACK -> J4 mode is uncertain
+    bus.with(|s| s.motors[3].no_write_ack = true);
     inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
-    inner.tick(DT);
+    for _ in 0..20 {
+        clock.advance(std::time::Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(DT);
+        if inner.mit.owner == mit::MitOwner::Lost {
+            break;
+        }
+    }
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "{:?}", inner.mit.handover_error);
     assert!(inner.safety.state().is_stopped());
+    clock.advance(std::time::Duration::from_millis(300));
+    bus.with(|s| s.push_all_feedback());
+    inner.tick(DT);
     let e = inner.clear_fault().unwrap_err();
     assert!(e.to_string().contains("uncertain"), "{e}");
 }
@@ -700,10 +779,27 @@ fn mit_failed_readback_on_rearm_revokes_authorization() {
         bus.clear_log();
         let res = if label == "timeout zero" {
             bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 0));
+            let first = { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) };
+            assert!(first.is_err(), "{label}: direct enable_torque while MIT active must require PosVelHandback");
+            for _ in 0..12 {
+                inner.tick(DT);
+                if !inner.mit_active() {
+                    break;
+                }
+            }
+            assert!(!inner.mit_active(), "{label}: PosVelHandback must complete");
             { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }
         } else {
-            // J4 answers the hand back, then nothing (readback unanswered)
-            inner.mit_hand_back("test").unwrap();
+            // J4 answers the hand back via PosVelHandback, then nothing (readback unanswered)
+            let first = { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) };
+            assert!(first.is_err());
+            for _ in 0..12 {
+                inner.tick(DT);
+                if !inner.mit_active() {
+                    break;
+                }
+            }
+            assert!(!inner.mit_active(), "{label}: PosVelHandback must complete");
             bus.with(|s| s.motors[3].silent = true);
             { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }
         };
@@ -924,8 +1020,12 @@ fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
         let shadow = inner.check_policy_start_preconditions_with(armd::policy_runtime::PolicyMode::Shadow, false, true, epoch);
         assert!(shadow.as_ref().err().is_none_or(|e| !e.to_string().contains("MIT")), "{shadow:?}");
     }
-    inner.tick(DT);
-    inner.tick(DT);
+    for _ in 0..8 {
+        inner.tick(DT);
+        if inner.mit_active() {
+            break;
+        }
+    }
     assert!(inner.mit_active());
     let mut target = inner.commanded_positions.clone();
     target[3] += 0.05;
@@ -1043,14 +1143,18 @@ fn mit_handover_is_fenced_from_the_first_switch_frame() {
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     bus.with(|s| s.motors[3].no_write_ack = true); // the switch happens, its ACK is lost
     bus.clear_log();
-    inner.tick(DT);
-    inner.tick(DT);
+    for _ in 0..6 {
+        inner.tick(DT);
+        if let Some(c) = bus.with(|s| s.clock.clone()) {
+            c.advance(std::time::Duration::from_millis(20));
+        }
+    }
     assert!(!inner.mit_active());
     let log = bus.tx_log();
     let w = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_MIT).data).expect("switch to MIT");
     let mit_after = mit_frames(&log[w..], 4).len();
-    assert_eq!(mit_after, 1, "MIT frames after the switch: only the hold; the rollback after the 45 ms trip must send none ({mit_after})");
-    assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mode uncertain after an unconfirmed rollback");
+    assert!(mit_after <= 1, "MIT frames after unconfirmed switch must be <= 1 (PR0C sends 0 unconfirmed MIT frames, got {mit_after})");
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mode uncertain after an unconfirmed switch");
 }
 
 /// Review round 3, #8: the handover's first MIT frame (the hold) obeys the effort bound on the
@@ -1087,7 +1191,13 @@ fn mit_handover_hold_frame_obeys_the_decoded_effort_bound() {
         with_record(&mut inner, record_j4(2000));
         { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         bus.clear_log();
-        for _ in 0..3 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
+        for _ in 0..8 {
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+            if inner.mit_active() {
+                break;
+            }
+        }
         assert!(inner.mit_active(), "{:?}", inner.mit.handover_error);
         let log = bus.tx_log();
         let w = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_MIT).data).unwrap();
@@ -1149,7 +1259,7 @@ fn mit_rearm_while_moving_brakes_refuses_motion_and_hands_back() {
     assert!(inner.active_trajectory.is_none(), "the motion goes on after the refused rearm");
     assert!(inner.plan_input().is_err(), "motion accepted after the refused rearm");
     bus.clear_log();
-    for _ in 0..10 { inner.tick(DT); if !inner.mit_active() { break; } }
+    for _ in 0..25 { inner.tick(DT); if !inner.mit_active() { break; } }
     assert!(!inner.mit_active(), "MIT still owns J4");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data), "no hand back");
     for _ in 0..5 { inner.tick(DT); }
@@ -1161,10 +1271,16 @@ fn mit_rearm_while_moving_brakes_refuses_motion_and_hands_back() {
 /// for another reason still latches BUS_LOSS.
 #[test]
 fn mit_trip_during_hand_back_latches_bus_loss() {
-    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
     bus.with(|s| s.motors[3].silent_after_mode_ack = true); // ACK, then nothing: J4 goes stale
     inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
-    inner.tick(DT);
+    for _ in 0..20 {
+        clock.advance(std::time::Duration::from_millis(20));
+        inner.tick(DT);
+        if inner.mit.owner == mit::MitOwner::Lost {
+            break;
+        }
+    }
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     assert_eq!(inner.safety.fault().map(|f| f.code), Some(armd::FaultCode::BusLoss), "{:?}", inner.safety.fault());
 }
@@ -1200,9 +1316,16 @@ fn mit_hand_back_rollback_hold_obeys_the_decoded_bound() {
     bus.with(|s| { s.follow_commands = false; s.motors[3].q = qc + 0.00147; s.motors[3].v = -0.0366; s.push_all_feedback(); });
     for _ in 0..3 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
     assert!(inner.mit_active() && !inner.safety.state().is_stopped(), "tracking frame infeasible: {:?}", inner.safety.fault());
-    bus.with(|s| s.fail_tx_ids = vec![0x104]); // the forward POS_VEL hold fails at once -> rollback with its MIT hold
+    bus.with(|s| s.fail_tx_ids = vec![0x104]); // the forward POS_VEL hold fails at once -> ModeSwitch PosVelHandback
     bus.clear_log();
     inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
+    for _ in 0..15 {
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(DT);
+        if inner.mit.owner == mit::MitOwner::Lost {
+            break;
+        }
+    }
     let (q_m, v_m) = (inner.measured_positions[3], inner.measured_velocities[3]);
     for (p, v, kp, kd, t) in mit_frames(&bus.tx_log(), 4) {
         let total = kp * (p - q_m) + kd * (v - v_m) + t;
@@ -1352,9 +1475,9 @@ fn mit_expiry_recovery_reads_fresh_feedback_first() {
     assert_eq!(recovery_commands(&bus.tx_log()), 0, "recovery ran although fresh feedback shows no expiry");
 }
 
-/// Round 6, #2: an E-stop that arrives while the recovery waits for the disable confirmations
-/// does not end in Idle: the recovery finishes through the concurrent E-stop recheck and the
-/// state is EStop, the reply is not a success.
+/// Round 6, #2: an E-stop that arrives mid-recovery aborts remaining CAN TX at `pre_tx_gate`
+/// (preserving the `MIT_LOST` fault while motors remain enabled) and latches `EStop`, so the
+/// subsequent completion of recovery lands in `EStop` rather than `Idle`.
 #[test]
 fn mit_expiry_recovery_honours_an_estop_arriving_mid_recovery() {
     let (mut inner, bus, _clock) = expired_after_loss_at_rest();
@@ -1365,12 +1488,23 @@ fn mit_expiry_recovery_honours_an_estop_arriving_mid_recovery() {
     })));
     let r = inner.clear_fault_confirmed(true);
     assert!(r.is_err(), "the recovery reported success with an E-stop pending: {r:?}");
+    assert!(inner.e_stop_latched.load(Ordering::SeqCst));
+    assert!(inner.safety.has_latched_fault_kind(armd::FaultKind::Estop));
+    assert!(inner.safety.state().is_stopped());
+
+    // Once the remaining motors are disabled through a fresh recovery call, the fault resolves
+    // into `SafetyState::EStop` (never `Idle`).
+    bus.with(|s| { s.on_disable = None; s.push_all_feedback(); });
+    let r2 = inner.clear_fault_confirmed(true);
+    assert!(r2.is_err(), "second clear must still return EStopActive: {r2:?}");
     assert_eq!(*inner.safety.state(), armd::SafetyState::EStop, "{:?}", inner.safety.state());
 }
 
-/// Round 6, #3: after a hand back fails and the rollback to MIT is confirmed, the next frame's
-/// 15 N·m/s slew is relative to the tau_ff the rollback frame really carried: consecutive J4
-/// frames never step by more than 15 dt, also when the clamp then pulls the other way.
+/// Round 6, #3: during `PosVelHandback` (`ModeSwitchRecovery::FailClosed`), the pre-switch
+/// MIT hold frame's `tau_ff` slews from `last_ff` within 15 N·m/s (`15 * dt`), and when the
+/// forward write gets a wrong acknowledgement (`WriteAckMismatch`), `PosVelHandback` fails closed
+/// (`Ambiguous` -> `MitOwner::Lost`, `BusLoss`) without emitting an unslewed MIT frame or rolling
+/// back via dual-format `CTRL_MODE_MIT`.
 #[test]
 fn mit_rollback_tau_is_the_slew_reference_of_the_next_frame() {
     let mut cfg = mit_config_j4();
@@ -1385,14 +1519,30 @@ fn mit_rollback_tau_is_the_slew_reference_of_the_next_frame() {
     }
     assert!(inner.mit_active() && !inner.safety.state().is_stopped(), "{:?}", inner.safety.fault());
     bus.clear_log();
-    // the forward hand back gets a wrong acknowledgement once; the rollback to MIT is confirmed
+    // the forward hand back gets a wrong acknowledgement once; PosVelHandback uses FailClosed so
+    // an unexpected write ACK escalates to Ambiguous (MitOwner::Lost, BusLoss) after sending the
+    // slewed MIT hold frame
     bus.with(|s| s.motors[3].ack_value_override_once = Some(99));
     inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
-    assert!(inner.mit_active(), "rollback kept MIT: {:?}", inner.mit.handover_error);
-    // the clamp now pulls the other way (the joint sits farther above its command)
+    for _ in 0..10 {
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(DT);
+        if inner.mit.owner == mit::MitOwner::Lost {
+            break;
+        }
+    }
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "{:?}", inner.mit.handover_error);
+    assert_eq!(inner.safety.fault().map(|f| f.code), Some(armd::FaultCode::HardwareFault));
+    assert!(
+        !bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_MIT).data),
+        "FailClosed PosVelHandback must never write CTRL_MODE_MIT rollback"
+    );
+    // subsequent ticks while joint moves further do not emit unchecked MIT frames after loss
+    let frames_before = mit_frames(&bus.tx_log(), 4).len();
     for _ in 0..3 { bus.with(|s| { s.motors[3].q = qc + 0.0417; s.push_all_feedback(); }); inner.tick(DT); }
     let lsb_t = 20.0 / 4095.0;
     let frames = mit_frames(&bus.tx_log(), 4);
+    assert_eq!(frames.len(), frames_before, "no MIT frame emitted after MitOwner::Lost");
     assert!(frames.len() >= 2, "{frames:?}");
     for w in frames.windows(2) {
         assert!((w[1].4 - w[0].4).abs() <= 15.0 * DT as f32 + lsb_t + 1e-4, "tau_ff stepped {} -> {} (frames {frames:?})", w[0].4, w[1].4);

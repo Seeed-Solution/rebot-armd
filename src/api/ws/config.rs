@@ -22,9 +22,8 @@ use crate::motion::MotionError;
 use crate::persist::PendingWrite;
 use crate::rt_core::config_iface::ConfigDomain;
 use crate::rt_core::requests::config::{
-    gravity_comp_command, prepare_eval_bufs_off_thread, run_config_commit, ConfigAuthContext,
-    ConfigCandidate, ConfigCommitPlan, ConfigReply, ConfigRequest, PublishedConfig,
-    ReservePrecheck,
+    prepare_eval_bufs_off_thread, run_config_commit, ConfigAuthContext, ConfigCandidate,
+    ConfigCommitPlan, ConfigReply, ConfigRequest, PublishedConfig, ReservePrecheck,
 };
 use crate::supervisor::AdmissionStamp;
 
@@ -1530,8 +1529,7 @@ pub(super) async fn complete_or_spawn_config_write(
     }
 }
 
-/// Executor-owner WS router for PR C paths (config writes, calibration/motor-zero/MIT,
-/// and `/api/v1/mode/gravity_comp`).
+/// Executor-owner WS router for PR C paths (config writes and calibration/motor-zero/MIT).
 ///
 /// Returns `None` for any frame NOT owned by PR C so `ws.rs` falls through untouched to
 /// `executor_routing_reject` (leaving L/M/P/S/Y frames strictly unaffected).
@@ -1562,8 +1560,7 @@ pub(super) async fn handle_executor_ws_command(
     let path = entry.key.path?;
     let is_cfg = is_config_path(path);
     let is_cal = calibration::is_calibration_path(path);
-    let is_gcomp = path == "/api/v1/mode/gravity_comp";
-    if !is_cfg && !is_cal && !is_gcomp {
+    if !is_cfg && !is_cal {
         return None;
     }
 
@@ -1688,79 +1685,5 @@ pub(super) async fn handle_executor_ws_command(
         .await;
         return Some(reply);
     }
-
-    // `/api/v1/mode/gravity_comp`
-    if let Err(msg) = validate_command_body_common(&value["body"]) {
-        return Some(Some(off_lock_command_reject(
-            &request_id_val,
-            epoch,
-            invalid_command(msg),
-        )));
-    }
-    let enable = match value["body"].get("enable").and_then(Value::as_bool) {
-        Some(b) => b,
-        None => {
-            return Some(Some(off_lock_command_reject(
-                &request_id_val,
-                epoch,
-                invalid_command("enable must be boolean"),
-            )));
-        }
-    };
-    let (scale, damping_kd) = if enable {
-        match motion::gravity_comp_request(&value["body"]) {
-            Ok(req) => (req.scale, req.damping_kd),
-            Err(err) => {
-                return Some(Some(off_lock_command_reject(&request_id_val, epoch, err)));
-            }
-        }
-    } else {
-        (None, None)
-    };
-    let mut gc_stamp = stamp;
-    gc_stamp.connection_id = recv_conn_id;
-    gc_stamp.lease_gen = local_generation;
-    gc_stamp.estop_epoch = epoch;
-    let lease_holder = Some((HolderLabel::new(recv_connection), local_generation));
-    let operator = if enable {
-        crate::auth::OperatorRequirement::Required(ws_auth.operator_grant())
-    } else {
-        crate::auth::OperatorRequirement::NotRequired
-    };
-    match gravity_comp_command(
-        recv_supervisor,
-        gc_stamp,
-        lease_holder,
-        operator,
-        enable,
-        scale,
-        damping_kd,
-    )
-    .await
-    {
-        Ok(rep) => {
-            let control_mode = if rep.active { "gravity_comp" } else { "position" };
-            Some(Some(json!({
-                "type": "command_ack",
-                "request_id": request_id_val,
-                "status": "accepted",
-                "epoch_id": rep.epoch_id,
-                "safety_state": rep.safety_state.to_json_with_hub(recv_supervisor),
-                "is_torqued": rep.is_torqued,
-                "control_mode": control_mode,
-            })))
-        }
-        Err(ArmError::Rejected { status: 403, code, .. }) if code == "OPERATOR_REQUIRED" => {
-            let cur_epoch = current_epoch_off_lock(recv_supervisor, epoch);
-            Some(Some(off_lock_command_reject(
-                &request_id_val,
-                cur_epoch,
-                ApiError::operator_required("/api/v1/mode/gravity_comp"),
-            )))
-        }
-        Err(err) => {
-            let cur_epoch = current_epoch_off_lock(recv_supervisor, epoch);
-            Some(Some(off_lock_command_reject(&request_id_val, cur_epoch, err.into())))
-        }
-    }
+    None
 }

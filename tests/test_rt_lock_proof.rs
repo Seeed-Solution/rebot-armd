@@ -2666,13 +2666,18 @@ fn legacy_vs_executor_bus_trace_parity_mid_batch_stop_and_partial_tx_carryover()
             .with_joint_limits(dm_limits())
             .unwrap();
         drv.set_tx_budget(TxBudget {
-            max_frames: 7,
+            max_frames: 8,
             max_duration: Duration::from_millis(10),
             frame_max_age: Duration::from_millis(45),
         });
         drv.read_joint_states().unwrap();
         drv.check_mapping_ranges();
         drv.set_torque(true).unwrap();
+        drv.set_tx_budget(TxBudget {
+            max_frames: 7,
+            max_duration: Duration::from_millis(10),
+            frame_max_age: Duration::from_millis(45),
+        });
 
         let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
         inner.lease_enabled = false;

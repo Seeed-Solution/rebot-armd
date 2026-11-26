@@ -510,13 +510,23 @@ impl SupervisorInner {
                 // MIT tracking hands back to confirmed stationary position control before the
                 // park. Moving: brake to rest first (the reference stops; the tick ramps the
                 // velocity down), hand back at rest, then this park is requested again.
-                if self.mit_active() && self.mit_hand_back("park").is_err() {
-                    if self.mit_active() && !self.safety.state().is_stopped() {
-                        tracing::warn!("Park requested while MIT tracking moves the arm: braking to rest and handing back first");
+                if self.mit_active() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.driver.is_some()
+                        && (self.rt_executor_owned || self.driver_supports_nonblocking_mode_switch())
+                    {
                         self.replace_active_trajectory(None);
                         self.mit.park_after_hand_back = true;
+                        return;
                     }
-                    return;
+                    if self.mit_hand_back("park").is_err() {
+                        if self.mit_active() && !self.safety.state().is_stopped() {
+                            tracing::warn!("Park requested while MIT tracking moves the arm: braking to rest and handing back first");
+                            self.replace_active_trajectory(None);
+                            self.mit.park_after_hand_back = true;
+                        }
+                        return;
+                    }
                 }
                 // Return to home position cleanly, then disable torque.
                 // Allow unload from Operational or Idle.
@@ -1950,7 +1960,11 @@ impl SupervisorInner {
             return false;
         }
         if self.gravity_comp.is_some() {
-            self.exit_gravity_comp("STOPPED", "Stop command");
+            if self.rt_executor_owned {
+                self.exit_gravity_comp_rt("STOPPED", "Stop command");
+            } else {
+                self.exit_gravity_comp("STOPPED", "Stop command");
+            }
         }
         let disable_in_flight = self.park_disable_in_flight();
         let running_park_id = self

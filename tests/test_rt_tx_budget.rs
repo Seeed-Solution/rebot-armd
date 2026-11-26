@@ -1933,12 +1933,27 @@ fn j7_pos_force_autonomous_recovery_obeys_estop_and_handshake_obeys_tx_budget() 
     clock.advance(ms(120));
     d.set_tx_budget(TxBudget { max_frames: 0, max_duration: ms(5), frame_max_age: ms(45) });
     bus.clear();
-    let p = d.begin_torque(true).expect("begin_torque enters RefreshBeforeRestore pending");
-    assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+    assert!(
+        matches!(
+            d.begin_torque(true),
+            Err(armd::driver::ArmDriverError::WatchdogBudgetInsufficient {
+                max_frames: 0,
+                required: 8
+            })
+        ),
+        "enable admission must reject max_frames = 0 for 7 motors"
+    );
     assert!(
         bus.with(|s| s.tx_log.is_empty()),
-        "max_frames = 0 must bound J7 0xCC handshake refresh to 0 frames"
+        "rejected enable admission must send 0 frames"
     );
+    // Start with valid max_frames = 8 (RefreshBeforeRestore sends 0xCC and returns Pending),
+    // then tighten to max_frames = 0 during poll_torque to verify polls stay bounded at 0 frames.
+    d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
+    let p = d.begin_torque(true).expect("begin_torque enters RefreshBeforeRestore pending");
+    assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+    d.set_tx_budget(TxBudget { max_frames: 0, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.with(|s| s.tx_log.clear());
     // Poll once still under max_frames = 0: still 0 frames sent.
     clock.advance(ms(10));
     let p2 = d.poll_torque(clock.now() + ms(5)).expect("still pending within 50 ms refresh deadline");
@@ -2060,16 +2075,35 @@ fn enable_and_retry_frames_obey_tx_budget_across_polls() {
 
     d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
     bus.clear();
-    let p = d.begin_torque(true).expect("begin_torque under max_frames=1");
+    assert!(
+        matches!(
+            d.begin_torque(true),
+            Err(armd::driver::ArmDriverError::WatchdogBudgetInsufficient {
+                max_frames: 1,
+                required: 8
+            })
+        ),
+        "enable admission must reject max_frames=1 for 7 motors"
+    );
+    // Admit under valid max_frames=8 (7-motor restore+enable still pauses across polls), then
+    // tighten to max_frames=1 across polls to verify per-poll TX bounding.
+    d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
+    let p = d.begin_torque(true).expect("begin_torque under valid max_frames=8");
     assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
     assert!(
-        bus.with(|s| s.tx_log.len()) <= 1,
-        "begin_torque exceeded max_frames=1: {:?}",
+        bus.with(|s| s.tx_log.len()) <= 8,
+        "begin_torque exceeded max_frames=8: {:?}",
         bus.with(|s| s.tx_log.clone())
     );
+    let mut total_enables = bus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.data == damiao::CMD_ENABLE)
+            .count()
+    });
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
 
     let mut confirmed = false;
-    let mut total_enables = 0usize;
     for step in 0..120 {
         bus.clear();
         clock.advance(ms(1));
@@ -2816,16 +2850,26 @@ fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() 
     bus.with(|s| s.push_all_feedback());
     d.read_joint_states().unwrap();
 
-    // Now set max_frames = 1: J4 needs CTRL_MODE + 2 dual hold frames (3 frames > 1).
+    // Admission invariant rejects max_frames = 1 for 7 motors (requires >= 8).
     d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
     bus.clear();
-    let p = d.begin_torque(true).expect("begin_torque under max_frames=1 with stray MIT joint");
+    assert!(matches!(
+        d.begin_torque(true),
+        Err(armd::driver::ArmDriverError::WatchdogBudgetInsufficient {
+            max_frames: 1,
+            required: 8
+        })
+    ));
+    // Admit under valid max_frames = 8, then tighten to max_frames = 1 for polls.
+    d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
+    let p = d.begin_torque(true).expect("begin_torque under valid max_frames=8 with stray MIT joint");
     assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
     assert!(
-        bus.with(|s| s.tx_log.len()) <= 1,
-        "begin_torque exceeded max_frames=1: {:?}",
+        bus.with(|s| s.tx_log.len()) <= 8,
+        "begin_torque exceeded max_frames=8: {:?}",
         bus.with(|s| s.tx_log.clone())
     );
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
 
     let mut confirmed = false;
     let mut saw_j4_ctrl_mode = false;
@@ -2984,11 +3028,15 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
         vbus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
 
-        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         drop_307.store(true, Ordering::SeqCst);
         let _ = d.begin_torque(true).expect("begin");
-        let mut saw_pre_enable_hold = false;
+        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        let mut saw_pre_enable_hold = vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307));
         for _ in 0..10 {
+            if saw_pre_enable_hold {
+                break;
+            }
             vbus.clear();
             clock.advance(ms(1));
             let p = d.poll_torque(clock.now() + ms(5)).expect("poll before hold");
@@ -3155,11 +3203,22 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
         clock3.advance(ms(40));
         drop_307.store(true, Ordering::SeqCst);
         *delay_slot.lock().unwrap() = ms(reply_delay_ms);
-        d3.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        d3.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d3.begin_torque(true).expect("begin");
-        let mut saw_pre_enable_hold = false;
-        let mut aged_for_carry = false;
+        d3.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        let mut saw_pre_enable_hold = vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307));
+        let mut aged_for_carry = vbus.with(|s| {
+            s.tx_accepted
+                .iter()
+                .any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == damiao::REG_READ)
+        });
+        if aged_for_carry && !saw_pre_enable_hold {
+            clock3.advance(ms(32));
+        }
         for _ in 0..10 {
+            if saw_pre_enable_hold {
+                break;
+            }
             vbus.clear();
             clock3.advance(ms(1));
             let p = d3.poll_torque(clock3.now() + ms(5)).expect("poll before hold");
@@ -3265,8 +3324,9 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
         drop_307.store(true, Ordering::SeqCst);
         drop_en.store(true, Ordering::SeqCst);
         *delay_slot.lock().unwrap() = ms(40);
-        d4.set_tx_budget(TxBudget { max_frames: 7, max_duration: ms(5), frame_max_age: ms(45) });
+        d4.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d4.begin_torque(true).expect("begin");
+        d4.set_tx_budget(TxBudget { max_frames: 7, max_duration: ms(5), frame_max_age: ms(45) });
         let mut saw_initial_j7 = false;
         let mut aged_for_retry = false;
         for _ in 0..10 {
@@ -3335,8 +3395,9 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
         d5.read_joint_states().unwrap();
         vbus.with(|s| s.push_all_feedback());
         d5.read_joint_states().unwrap();
-        d5.set_tx_budget(TxBudget { max_frames: 2, max_duration: ms(5), frame_max_age: ms(45) });
+        d5.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d5.begin_torque(true).expect("begin");
+        d5.set_tx_budget(TxBudget { max_frames: 2, max_duration: ms(5), frame_max_age: ms(45) });
         let mut saw_pre_enable_hold = false;
         for _ in 0..10 {
             vbus.clear();
@@ -5454,9 +5515,9 @@ async fn legacy_ws_torque_on_ticked_enable_7_motors_realistic_latency_10_seeded_
         // Realistic SG2002 SPI-CAN frame time (250-450 us/frame): inside the 1 ms legacy
         // transition step budget (`LEGACY_TORQUE_STEP_BUDGET`), each 20 ms release sends 2-4
         // frames before carrying the remaining enable frames to subsequent releases, while
-        // keeping `max_frames = 7` (default) for post-enable steady-state ticks.
+        // keeping valid `max_frames = 8` (7 motors + 1) for post-enable steady-state ticks.
         let tx_frame_us = rng.range(250, 450);
-        let max_frames = 7usize;
+        let max_frames = 8usize;
         let j7_refresh_delay_ms = rng.range(10, 38);
         let j7_starts_pos_vel = (seed % 2) == 0;
         let drop_first_j7_307 = (seed % 3) != 0;
@@ -5719,14 +5780,17 @@ fn j7_enable_refresh_review_blocker_regressions() {
         d.read_joint_states().unwrap();
 
         // Start fresh through 0x307 (with 0x307 reply suppressed), then cross 100 ms to arm in-enable 0xCC.
-        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d.begin_torque(true).unwrap();
-        for _ in 0..10 {
-            vbus.clear();
-            clock.advance(ms(1));
-            let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
-            if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
-                break;
+        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        if !vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+            for _ in 0..10 {
+                vbus.clear();
+                clock.advance(ms(1));
+                let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
+                if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+                    break;
+                }
             }
         }
         clock.advance(ms(105)); // J7 is now stale (> 100 ms); next poll sends 0xCC and leaves refresh pending.
@@ -5786,14 +5850,17 @@ fn j7_enable_refresh_review_blocker_regressions() {
         vbus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
 
-        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d.begin_torque(true).unwrap();
-        for _ in 0..10 {
-            vbus.clear();
-            clock.advance(ms(1));
-            let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
-            if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
-                break;
+        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        if !vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+            for _ in 0..10 {
+                vbus.clear();
+                clock.advance(ms(1));
+                let _ = d.poll_torque(clock.now() + ms(5)).unwrap();
+                if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+                    break;
+                }
             }
         }
         vbus.with(|s| s.rx.clear());
@@ -5894,8 +5961,9 @@ fn j7_enable_refresh_review_blocker_regressions() {
         d.read_joint_states().unwrap();
 
         // Carry J7 into `poll_enable` with J1..J6 already enabled so the next poll attempts J7 CMD_ENABLE first.
-        d.set_tx_budget(TxBudget { max_frames: 7, max_duration: ms(5), frame_max_age: ms(45) });
+        d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         let _ = d.begin_torque(true).unwrap();
+        d.set_tx_budget(TxBudget { max_frames: 7, max_duration: ms(5), frame_max_age: ms(45) });
         for _ in 0..10 {
             vbus.clear();
             base_clock.advance(ms(1));
@@ -6022,9 +6090,10 @@ fn j7_enable_refresh_review_blocker_regressions() {
         vbus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
 
-        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+        d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(5), frame_max_age: ms(45) });
         d.set_enable_authority(Some(clock.now() + ms(500)), Some(1));
         let _ = d.begin_torque(true).unwrap();
+        d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
         for _ in 0..10 {
             vbus.clear();
             clock.advance(ms(1));

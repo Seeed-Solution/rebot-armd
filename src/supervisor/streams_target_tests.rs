@@ -735,8 +735,11 @@ fn expired_lease_during_pending_torque_enable_preserves_step2_timing_and_revokes
                 lease_generation: g1,
                 owner_conn_id: 1,
                 admitted_epoch: fx.core.safety.epoch_id(),
+                admission_request_id: 0,
+                stop_gen: 0,
             }),
             budgeted: true,
+            mit_qualified: false,
         },
     ));
 

@@ -2123,7 +2123,8 @@ mod shutdown_tests {
             .emergency_process_exit_disable_until(std::time::Instant::now() + Duration::from_millis(500))
             .await;
 
-        // Also verify MIT-configured profile triggers recoverable refusal -> fallback to legacy holding.
+        // Also verify MIT-configured rebot-dm hands over directly to OWNER_EXECUTOR (Adapter 4)
+        // without falling back to legacy or sending any torque-off frames.
         let mut mit_cfg = ArmConfig::rebot_dm();
         if let Some(jt) = mit_cfg.joint_tracking.as_mut() {
             jt.enabled = true;
@@ -2156,12 +2157,12 @@ mod shutdown_tests {
             armd::rt_core::executor::PersistTestHooks::default(),
         )
         .await
-        .expect("MIT refusal on rebot-dm must fall back to legacy owner");
-        assert!(started_mit.fell_back_to_legacy);
-        assert_eq!(sup_mit.owner_mode(), armd::supervisor::OWNER_LEGACY);
+        .expect("MIT-configured rebot-dm must start on executor (Adapter 4)");
+        assert!(!started_mit.fell_back_to_legacy);
+        assert_eq!(sup_mit.owner_mode(), armd::supervisor::OWNER_EXECUTOR);
         assert_eq!(disable_mit.load(Ordering::SeqCst), 0);
-        if let Some(stop) = started_mit.legacy_control_stop {
-            sup_mit.signal_legacy_stop(&stop);
+        if let Some(exec_handle) = started_mit.executor_handle {
+            let _ = tokio::task::spawn_blocking(move || exec_handle.stop_and_join()).await;
         }
 
         // Mock follower (no real hardware) still fails fast on executor startup error.

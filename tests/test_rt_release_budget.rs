@@ -815,11 +815,11 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     drv.set_tx_release_deadline(None);
     record_release_frames(7, &mut last_axis_tx, &mut max_axis_gap);
 
-    // Release 8 (t = 140 ms): exact physical cap (`tx_budget.max_frames == 7`, matching the
-    // 7-frame batch size) with a transient one-shot transport error after 2 sends must still
-    // recover via bounded recovery capacity and cover all axes without tripping the fence.
+    // Release 8 (t = 140 ms): exact minimum valid physical cap (`tx_budget.max_frames == 8`,
+    // matching 6 energized arm axes + 1 J7 + 1 retry slot) with a transient one-shot transport
+    // error after 2 sends must still cover all axes inside the hard cap without tripping the fence.
     let mut exact_cap_budget = TxBudget::default();
-    exact_cap_budget.max_frames = 7;
+    exact_cap_budget.max_frames = 8;
     drv.set_tx_budget(exact_cap_budget);
     clock.advance(Duration::from_millis(15));
     bus.with(|s| {
@@ -833,7 +833,7 @@ fn armed_mit_fence_watchdog_continuity_never_deferred_across_consecutive_tight_r
     let t8 = clock.now();
     drv.begin_control_release(8);
     drv.set_tx_release_deadline(Some(t8 + Duration::from_millis(10)));
-    drv.sync_release_budget_limits(64, 7);
+    drv.sync_release_budget_limits(64, 8);
     let r_partial_tx = drv.write_joint_targets_bounded(&targets).unwrap();
     assert!(
         matches!(r_partial_tx, TxBatchOutcome::Deferred { .. }),
@@ -1653,12 +1653,29 @@ fn safe_hold_keeps_holding_unconfirmed_on_deferral_and_j7_only_traffic() {
         "complete arm hold batch with fresh bus must clear holding_unconfirmed"
     );
 
-    // 6. End-to-end with real `DamiaoArmDriver`: tightened `tx_budget.max_frames = 2` causes
-    //    `write_measured_hold_masked` to return `Deferred` while J7/arm traffic is partial ->
+    // 6. End-to-end with real `DamiaoArmDriver`: verify enable admission rejects `max_frames = 2`
+    //    (< 7 + 1 = 8), enable with valid `max_frames = 16`, then tighten `tx_budget.max_frames = 2`
+    //    so `write_measured_hold_masked` returns `Deferred` while J7/arm traffic is partial ->
     //    SAFE-HOLD must keep `holding_unconfirmed == true`, then clear it once budget allows
     //    all arm axes to complete.
     let (bus, mut damiao_drv, cfg2) = make_bus_and_driver(Some(clock.clone()), 2, true);
+    assert!(
+        matches!(
+            damiao_drv.set_torque(true),
+            Err(armd::driver::ArmDriverError::WatchdogBudgetInsufficient {
+                max_frames: 2,
+                required: 8
+            })
+        ),
+        "enable admission must reject max_frames=2 for 7 motors"
+    );
+    let mut init_budget = TxBudget::default();
+    init_budget.max_frames = 16;
+    damiao_drv.set_tx_budget(init_budget);
     damiao_drv.set_torque(true).expect("enable torque");
+    let mut tight_budget = TxBudget::default();
+    tight_budget.max_frames = 2;
+    damiao_drv.set_tx_budget(tight_budget);
     damiao_drv.set_external_pos_force_emitter(false);
     let mut runner2 = SafeHoldBuffers::from_config(&cfg2, Duration::from_millis(20));
     let ctrl2 = SafeHoldControl::new();
@@ -2232,6 +2249,196 @@ fn j7_continuity_hold_fallback_does_not_count_as_accepted_motion_in_supervisor()
         assert!(
             drv.oldest_pending_tx_age().is_some(),
             "J7 continuity Hold fallback must keep pending deferral tracked for next release"
+        );
+    }
+}
+
+#[test]
+fn dec_merge_g3_admission_accounting_cutoff_and_mit_recovery_miss() {
+    use armd::driver::{ArmDriver, ArmDriverError, JointTarget, TxBudget};
+    use armd::motor_mode::{
+        ArmDriverModeAdapter, ModeProgress, ModeSwitch, ModeSwitchFailure, ModeSwitchPlan,
+        ModeSwitchRecovery, ReleaseBudget as ModeReleaseBudget,
+    };
+    use armd::rt_core::budget::ReleaseBudget as CoreReleaseBudget;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // 1. Pre-transmit final-gate refusal charges 0 TX attempts; WouldBlock charges 1 TX attempt.
+    {
+        let clock = MockClock::new();
+        let (bus, drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 16, true);
+        let hook_clock = clock.clone();
+        let hook_armed = Arc::new(AtomicBool::new(false));
+        let hook_armed_c = Arc::clone(&hook_armed);
+        let mut drv = drv.with_before_final_tx_gate_hook(Arc::new(move |_f| {
+            if hook_armed_c.swap(false, Ordering::SeqCst) {
+                hook_clock.advance(Duration::from_millis(12));
+            }
+        }));
+        drv.set_torque(true).expect("enable torque");
+        drv.set_external_pos_force_emitter(true);
+
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.push_all_feedback();
+        });
+        let _ = drv.read_joint_states();
+
+        let t0 = clock.now();
+        hook_armed.store(true, Ordering::SeqCst);
+        drv.begin_control_release(101);
+        drv.set_tx_release_deadline(Some(t0 + Duration::from_millis(10)));
+        drv.sync_release_budget_limits(64, 16);
+        let (_, tx_before) = drv.release_budget_consumed();
+        let targets = vec![JointTarget::position(0.0); 7];
+        let _ = drv.write_joint_targets_bounded(&targets);
+        let (_, tx_after_refusal) = drv.release_budget_consumed();
+        hook_armed.store(false, Ordering::SeqCst);
+        drv.set_tx_release_deadline(None);
+        assert_eq!(
+            tx_after_refusal.saturating_sub(tx_before),
+            0,
+            "final-gate pre-transmit DeadlinePassed refusal must charge 0 TX attempts"
+        );
+        assert!(
+            bus.with(|s| s.tx_log.is_empty()),
+            "final-gate pre-transmit refusal must submit 0 frames to CAN"
+        );
+
+        // Next release: transport returns WouldBlock on the first frame -> charges exactly 1 attempt.
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.push_all_feedback();
+            s.fail_tx_once_after = Some(0);
+        });
+        let _ = drv.read_joint_states();
+        let t1 = clock.now();
+        drv.begin_control_release(102);
+        drv.set_tx_release_deadline(Some(t1 + Duration::from_millis(10)));
+        drv.sync_release_budget_limits(64, 16);
+        let (_, tx_b2) = drv.release_budget_consumed();
+        let _ = drv.write_joint_targets_bounded(&targets);
+        let (_, tx_a2) = drv.release_budget_consumed();
+        drv.set_tx_release_deadline(None);
+        assert_eq!(
+            tx_a2.saturating_sub(tx_b2),
+            1,
+            "transport WouldBlock at can.transmit must charge exactly 1 TX attempt"
+        );
+    }
+
+    // 2. Admission invariant rejects invalid max_frames at Enable, ModeSwitch, and MIT recovery.
+    {
+        let clock = MockClock::new();
+        let (bus, mut drv, _cfg) = make_bus_and_driver(Some(clock.clone()), 7, true);
+        assert!(
+            matches!(
+                drv.set_torque(true),
+                Err(ArmDriverError::WatchdogBudgetInsufficient {
+                    max_frames: 7,
+                    required: 8
+                })
+            ),
+            "enable admission must reject max_frames=7 for 7 motors (requires 8)"
+        );
+        let mut valid_tb = TxBudget::default();
+        valid_tb.max_frames = 8;
+        drv.set_tx_budget(valid_tb);
+        drv.set_torque(true).expect("enable with valid max_frames=8");
+
+        // Tighten below 7+1=8 post-enable -> ModeSwitch admission must fail clean with WatchdogBudgetInsufficient.
+        let mut low_tb = TxBudget::default();
+        low_tb.max_frames = 7;
+        drv.set_tx_budget(low_tb);
+        let plan = ModeSwitchPlan::switch_axes(
+            &[(0, armd::motor_mode::ControlMode::Impedance)],
+            ModeSwitchRecovery::RollbackToPrevious,
+        )
+        .unwrap();
+        let mut ms = ModeSwitch::new(plan);
+        let now = clock.now();
+        let mut ledger = CoreReleaseBudget::new(201, now, now + Duration::from_millis(10), 64, 7);
+        let ms_budget = ModeReleaseBudget::from_ledger(
+            &ledger,
+            now,
+            now + Duration::from_millis(10),
+            Duration::from_millis(20),
+            7,
+        );
+        let mut gate = || Ok(());
+        let mut adapter = ArmDriverModeAdapter::new(&mut drv, &mut gate);
+        let prog = ms.step_driver_with_ledger(&mut adapter, ms_budget, &mut ledger);
+        assert!(
+            matches!(
+                prog,
+                ModeProgress::FailedClean {
+                    reason: ModeSwitchFailure::WatchdogBudgetInsufficient,
+                    ..
+                }
+            ),
+            "ModeSwitch admission must refuse max_frames=7 with 7 energized motors, got {prog:?}"
+        );
+
+        // MIT recovery admission with max_frames=7 and 7 energized motors must refuse too.
+        let rest_arr = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+        let mut arm_j = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for (i, slot) in arm_j.iter_mut().take(6).enumerate() {
+            *slot = i;
+        }
+        drv.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(false)),
+            has_resting_pose: true,
+            arm_joints: arm_j,
+            arm_joints_len: 6,
+            rest_positions: rest_arr,
+            rest_pose_tolerance_rad: 0.25,
+        });
+        let mut rec_gate = || Ok(());
+        let rec_err = drv.mit_expiry_recover_budgeted(
+            now + Duration::from_millis(50),
+            now,
+            &mut rec_gate,
+        );
+        assert!(
+            matches!(
+                rec_err,
+                Err(ArmDriverError::WatchdogBudgetInsufficient {
+                    max_frames: 7,
+                    required: 8
+                })
+            ),
+            "MIT recovery admission must refuse max_frames=7 with 7 energized motors, got {rec_err:?}"
+        );
+
+        // 3. MIT recovery runtime miss: valid max_frames=8 + due energized axis + backpressure
+        //    must fail closed with WatchdogContinuityMissed instead of silently yielding Pending.
+        drv.set_tx_budget(valid_tb);
+        clock.advance(Duration::from_millis(25));
+        bus.with(|s| {
+            s.tx_log.clear();
+            for m in s.motors.iter_mut() {
+                m.q = 0.0;
+                m.v = 0.0;
+            }
+            s.push_all_feedback();
+        });
+        drv.begin_control_release(202);
+        drv.read_joint_states().unwrap();
+        bus.with(|s| s.fail_tx_once_after = Some(0));
+        let now2 = clock.now();
+        drv.set_tx_release_deadline(Some(now2 + Duration::from_millis(50)));
+        let miss = drv.mit_expiry_recover_budgeted(
+            now2 + Duration::from_millis(50),
+            now2,
+            &mut rec_gate,
+        );
+        drv.set_tx_release_deadline(None);
+        assert!(
+            matches!(miss, Err(ArmDriverError::WatchdogContinuityMissed { .. })),
+            "MIT recovery must fail closed with WatchdogContinuityMissed on due-axis backpressure, got {miss:?}"
         );
     }
 }

@@ -979,10 +979,17 @@ fn mit_config_j4() -> ArmConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_mit_moving_park_off_lock_exclusion_and_executor_mit_gate() {
-    // 6a. Executor start_executor keeps rejecting MIT through the existing gate.
+    // 6a. Adapter 4: Executor start_executor now accepts inactive MIT-configured profiles
+    // (while live MIT ownership Active/Lost is blocked with 409 TRANSFER_BLOCKED — covered in
+    // test_rt_adapter4_gravity_mit).
     let mit_sup = Arc::new(ArmSupervisor::new(mit_config_j4()));
-    let gate_err = mit_sup.start_executor(ExecutorConfig::for_tests(Duration::from_millis(5))).await;
-    assert!(gate_err.is_err(), "executor must keep rejecting MIT config");
+    let exec_handle = mit_sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .expect("inactive MIT-configured profile must hand over to RT executor");
+    tokio::task::spawn_blocking(move || exec_handle.stop_and_join())
+        .await
+        .unwrap();
 
     // 6b. Legacy MIT moving-park: single-action exclusion across WaitingMitHandback AND ReadyForPlan.
     let limits: Vec<DamiaoLimits> = ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(|r| r.limits()).collect();
@@ -1007,7 +1014,10 @@ async fn legacy_mit_moving_park_off_lock_exclusion_and_executor_mit_gate() {
     inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: serde_json::to_value(&rec).ok(), ..Default::default() }));
     let stamp = inner.current_admission_stamp();
     SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
-    inner.tick(0.01);
+    for _ in 0..10 {
+        inner.tick(0.01);
+        if inner.mit_active() { break; }
+    }
     assert!(inner.mit_active());
 
     let snap = MotionPlanSnapshot::from_supervisor(&inner);
@@ -1591,7 +1601,10 @@ async fn m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_
         inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: serde_json::to_value(&rec).ok(), ..Default::default() }));
         let stamp = inner.current_admission_stamp();
         SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
-        inner.tick(0.01);
+        for _ in 0..10 {
+            inner.tick(0.01);
+            if inner.mit_active() { break; }
+        }
         assert!(inner.mit_active());
         assert!(inner.commanded_velocities.iter().all(|&v| v == 0.0), "stationary MIT arm");
 
@@ -1608,7 +1621,12 @@ async fn m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_
         assert_eq!(inner.park_continuation().unwrap().phase, ParkContinuationPhase::WaitingMitHandback);
         assert!(inner.mit_active(), "MIT handback must NOT have executed synchronously under WS write lock");
 
-        inner.tick(0.01);
+        for _ in 0..10 {
+            inner.tick(0.01);
+            if !inner.mit_active() && inner.park_continuation().is_some_and(|c| c.phase == ParkContinuationPhase::ReadyForPlan) {
+                break;
+            }
+        }
         assert!(!inner.mit_active(), "control tick completes MIT handback off WS write lock");
         assert_eq!(inner.park_continuation().unwrap().phase, ParkContinuationPhase::ReadyForPlan);
         let cont_plan = req::prepare_motion(&MotionPlanSnapshot::from_supervisor(&inner), &MotionRequest::park()).unwrap();

@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -184,6 +184,7 @@ pub struct PublishedConfig {
     pub zero_convention: crate::joint_zero::ZeroConvention,
     pub operator_auth_enforced: bool,
     pub has_driver: bool,
+    pub driver_supports_nonblocking_mode_switch: bool,
     pub driver_torque_feedback: bool,
     pub driver_temperature_feedback: bool,
     pub driver_supports_automatic_unload: bool,
@@ -204,6 +205,13 @@ pub struct PublishedConfig {
 impl PublishedConfig {
     /// Captures a complete configuration snapshot from `inner` off the RT thread.
     pub fn from_inner(inner: &SupervisorInner) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let driver_supports_nonblocking_mode_switch = inner
+            .driver
+            .as_ref()
+            .is_some_and(|d| d.with_ref(|drv| drv.supports_nonblocking_mode_switch()).unwrap_or(false));
+        #[cfg(target_arch = "wasm32")]
+        let driver_supports_nonblocking_mode_switch = false;
         let driver_torque_feedback = inner
             .driver
             .as_ref()
@@ -259,6 +267,7 @@ impl PublishedConfig {
             zero_convention: inner.zero_convention,
             operator_auth_enforced: inner.operator_auth_enforced,
             has_driver: inner.driver.is_some(),
+            driver_supports_nonblocking_mode_switch,
             driver_torque_feedback,
             driver_temperature_feedback,
             driver_supports_automatic_unload: inner.supports_automatic_unload(),
@@ -952,9 +961,11 @@ impl ConfigError {
             Self::ExecutorCapabilityUnsupported(msg) => executor_capability_unsupported(msg),
             Self::GravityCompRejected { code, message } => {
                 let status = match code.as_str() {
+                    "OPERATOR_REQUIRED" => 403,
                     "UNSUPPORTED" | "GRAVITY_MODEL_UNAVAILABLE" => 422,
                     "NOT_ARMED" => 412,
                     "INVALID_COMMAND" => 400,
+                    "RECLAIM_BACKPRESSURE" => 503,
                     _ => 409,
                 };
                 ArmError::Rejected {
@@ -1302,7 +1313,7 @@ pub struct FinishReconcileConfig {
     pub cleanup_marker_txn_id: Option<u64>,
 }
 
-/// Owner-routed gravity compensation request (mock zero-alloc; hardware driver fails closed in Executor).
+/// Owner-routed gravity compensation request (mock zero-alloc; hardware uses PR0C ModeSwitch).
 pub enum GravityCompOp {
     Enter {
         admission: AdmissionStamp,
@@ -1310,13 +1321,38 @@ pub enum GravityCompOp {
         operator: crate::auth::OperatorRequirement,
         policy: Option<crate::model::GravityCompPolicy>,
         scale: Option<f32>,
-        damping_kd: Option<[f32; 6]>,
+        damping_kd: Option<crate::gravity_comp::GravityCompDampingInput>,
     },
     Exit {
         lease_holder: Option<(HolderLabel, u64)>,
+        operator: crate::auth::OperatorRequirement,
+        expected_epoch: Option<u64>,
         code: &'static str,
         message: &'static str,
     },
+}
+
+/// Result of admitting hardware gravity-comp entry on the RT owner.
+#[derive(Debug, Clone, Copy)]
+pub enum GravityCompEnterOutcome {
+    Immediate(GravityCompReply),
+    Session(u64),
+}
+
+/// Admission-bound MIT qualification proof committed after off-RT `check_gate` succeeds on
+/// fresh `ReadIdentityForEnable` readback, consumed once at `enable_prepare_rt_precheck`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MitGateProof {
+    pub admission_request_id: u64,
+    pub connection_id: u64,
+    pub lease_generation: u64,
+    pub estop_epoch: u64,
+    pub stop_gen: u64,
+    pub calibration_revision: u64,
+    pub motion_config_revision: u64,
+    pub zero_offsets_hash: u64,
+    pub holdoff: Duration,
+    pub verified_at: Instant,
 }
 
 /// Allocation-free tag mirroring `SafetyState` for owner replies without cloning `FaultReason`.
@@ -1454,6 +1490,33 @@ pub enum ConfigRequest {
     ForceReconcile(ConfigDomain),
     SampleTableCapture,
     GravityComp(GravityCompOp),
+    /// Admits a hardware gravity-comp entry PR0C `ModeSwitch` session (`POS_VEL -> MIT`) on RT
+    /// (zero alloc), binding a typed P-F1 `SessionTerminalReservation` from the shared router.
+    StartGravityCompEnter {
+        admission: AdmissionStamp,
+        lease_holder: Option<(HolderLabel, u64)>,
+        policy: Option<crate::model::GravityCompPolicy>,
+        scale: Option<f32>,
+        damping_kd: Option<crate::gravity_comp::GravityCompDampingInput>,
+        operator: crate::auth::OperatorRequirement,
+        deadline: Instant,
+        client: ClientId,
+        reservation: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+    },
+    /// Requests a stop-direction MIT handback (`MIT -> POS_VEL`) via PR0C `ModeSwitch` on RT
+    /// (used before gravity-comp entry or torque rearm when MIT is currently active).
+    RequestMitHandBack {
+        reason: crate::supervisor::MitHandBackReason,
+        admission: AdmissionStamp,
+        lease_holder: Option<(HolderLabel, u64)>,
+        operator: crate::auth::OperatorRequirement,
+        deadline: Instant,
+        client: ClientId,
+        reservation: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+    },
+    /// Records an admission-bound one-shot MIT qualification proof verified off-RT against fresh
+    /// `ReadIdentityForEnable` readback + `mit::check_gate`, consumed at `enable_prepare_rt_precheck`.
+    RecordMitGateProof(MitGateProof),
     InspectHold(ConfigDomain),
     /// Zero-alloc check on live owner whether `episode_id` may be deleted (not referenced by
     /// saved sequences, active running sequence pins, or an active `Sequences` save reservation).
@@ -1547,7 +1610,8 @@ impl ConfigRequest {
             Self::FinishReconcile(f) => f.domain.command_path(),
             Self::Release(r) => r.reservation.domain().command_path(),
             Self::SampleTableCapture => "/api/v1/grasp/setup",
-            Self::GravityComp(_) => "/api/v1/mode/gravity_comp",
+            Self::GravityComp(_) | Self::StartGravityCompEnter { .. } => "/api/v1/mode/gravity_comp",
+            Self::RequestMitHandBack { .. } | Self::RecordMitGateProof(_) => "/api/v1/torque",
             Self::CheckEpisodeDeleteAllowed(_) => "/api/v1/episodes/delete",
             Self::BeginCalibrationTxn { .. }
             | Self::EndCalibrationTxn { .. }
@@ -1580,6 +1644,9 @@ pub enum ConfigReply {
     ReconcilingForced,
     TableCaptureSampled(Result<([f32; 8], usize), ConfigError>),
     GravityCompDone(Result<GravityCompReply, ConfigError>),
+    GravityCompEnterStarted(Result<GravityCompEnterOutcome, ConfigError>),
+    MitHandBackStarted(Result<Option<u64>, ConfigError>),
+    MitGateProofRecorded(bool),
     HoldInspected {
         config_inhibited: bool,
         state: Option<crate::rt_core::config_iface::HoldState>,
@@ -1664,7 +1731,7 @@ impl ConfigExchange {
 
 /// Executes one [`ConfigExchange`] in-place on the single owner (`SupervisorInner`).
 /// Called identically by `armd-control` (`MaintenanceOp::Config`) and Legacy (`SupervisorLock`).
-pub(crate) fn handle_config_exchange(
+pub fn handle_config_exchange(
     core: &mut SupervisorInner,
     ctx: &CommitCtx,
     ex: &mut ConfigExchange,
@@ -1718,6 +1785,52 @@ pub(crate) fn handle_config_exchange(
         ConfigRequest::SampleTableCapture => ConfigReply::TableCaptureSampled(install_sample_table_capture(core)),
         ConfigRequest::GravityComp(op) => {
             ConfigReply::GravityCompDone(install_gravity_comp(core, ctx, op, &mut ex.retired))
+        }
+        ConfigRequest::StartGravityCompEnter {
+            admission,
+            lease_holder,
+            policy,
+            scale,
+            damping_kd,
+            operator,
+            deadline,
+            client,
+            reservation,
+        } => ConfigReply::GravityCompEnterStarted(install_start_gravity_comp_enter(
+            core,
+            ctx,
+            admission,
+            lease_holder,
+            policy,
+            scale,
+            damping_kd,
+            operator,
+            deadline,
+            client,
+            reservation,
+            &mut ex.retired,
+        )),
+        ConfigRequest::RequestMitHandBack {
+            reason,
+            admission,
+            lease_holder,
+            operator,
+            deadline,
+            client,
+            reservation,
+        } => ConfigReply::MitHandBackStarted(core.request_mit_hand_back_rt(
+            reason,
+            admission,
+            lease_holder,
+            operator,
+            deadline,
+            client,
+            reservation,
+            &mut ex.retired.session_terminal_handoff,
+            ctx.now,
+        )),
+        ConfigRequest::RecordMitGateProof(proof) => {
+            ConfigReply::MitGateProofRecorded(core.record_mit_gate_proof_rt(proof, ctx.now))
         }
         ConfigRequest::InspectHold(domain) => ConfigReply::HoldInspected {
             config_inhibited: core.core.motion_inhibited_by_config(),
@@ -3190,6 +3303,7 @@ fn swap_config_candidate_in_place(
             core.retire_servo_ws_min_depths();
             core.keepout.revision += 1;
             retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, ws_eval_bufs));
+            core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
         }
         ConfigCandidate::Collision { enabled, sensitivity } => {
             if let Some(e) = enabled {
@@ -3245,6 +3359,7 @@ fn swap_config_candidate_in_place(
             retired.grasp_setup = core.config.grasp.replace(setup);
             if let Some(bufs) = ws_eval_bufs {
                 retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+                core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
             }
             core.grasp_setup_revision += 1;
         }
@@ -3308,6 +3423,7 @@ fn swap_config_candidate_in_place(
             }
             if let Some(bufs) = ws_eval_bufs {
                 retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+                core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
             }
             if ws_changed {
                 core.workspace_revision += 1;
@@ -3446,6 +3562,7 @@ fn swap_config_candidate_in_place(
             }
             if let Some(bufs) = ws_eval_bufs {
                 retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+                core.tracking.install_ws_depth_spares_from_eval_bufs(&mut core.ws_eval_bufs, retired.eval_bufs.as_mut());
             }
             if ws_changed {
                 core.workspace_revision += 1;
@@ -3598,6 +3715,117 @@ fn install_sample_table_capture(core: &SupervisorInner) -> Result<([f32; 8], usi
     Ok((pos, len))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn install_start_gravity_comp_enter(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    admission: AdmissionStamp,
+    lease_holder: Option<(HolderLabel, u64)>,
+    policy: Option<crate::model::GravityCompPolicy>,
+    scale: Option<f32>,
+    damping_kd: Option<crate::gravity_comp::GravityCompDampingInput>,
+    operator: crate::auth::OperatorRequirement,
+    deadline: Instant,
+    client: ClientId,
+    reservation: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
+    retired: &mut ConfigRetiredPayloads,
+) -> Result<GravityCompEnterOutcome, ConfigError> {
+    // Park handoff Arc off-RT before any fallible step so `armd-control` executes 0 RT frees.
+    let ticket = match reservation {
+        Some(res) => {
+            let (t, h) = res.into_parts();
+            retired.session_terminal_handoff = Some(h);
+            Some(t)
+        }
+        None => None,
+    };
+    if core.calibration_busy {
+        retired.gravity_comp_policy = policy;
+        return Err(ConfigError::CalibPrecondition {
+            status: 409,
+            code: "MOTION_BUSY",
+            message: "a calibration apply, restore or motor zero is running",
+        });
+    }
+    if let Some((conn, gen)) = lease_holder {
+        if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
+            retired.gravity_comp_policy = policy;
+            return Err(ConfigError::LeaseLost);
+        }
+    }
+    if core
+        .check_protected_operator_requirement(operator, ctx.now)
+        .is_err()
+    {
+        retired.gravity_comp_policy = policy;
+        return Err(ConfigError::CalibPrecondition {
+            status: 403,
+            code: "OPERATOR_REQUIRED",
+            message: "Operator unlock is required for /api/v1/mode/gravity_comp",
+        });
+    }
+    let admitted = match core.check_admission(admission) {
+        Ok(a) => a,
+        Err(e) => {
+            retired.gravity_comp_policy = policy;
+            return Err(match e {
+                crate::safety::SafetyError::StampAlreadyConsumed => ConfigError::StampConsumed,
+                crate::safety::SafetyError::LeaseLost => ConfigError::LeaseLost,
+                crate::safety::SafetyError::Stopped => ConfigError::Stopped,
+                crate::safety::SafetyError::EpochMismatch { .. } => ConfigError::EpochMismatch {
+                    current_epoch: core.safety.epoch_id(),
+                },
+                crate::safety::SafetyError::EStopActive => ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "ESTOP_ACTIVE",
+                    message: "E-stop is latched",
+                },
+                _ => ConfigError::Stopped,
+            });
+        }
+    };
+    match SupervisorInner::start_gravity_comp_enter_mode_switch_with_ticket_rt(
+        admitted,
+        policy,
+        scale,
+        damping_kd,
+        operator,
+        deadline,
+        client,
+        ticket,
+        retired.session_terminal_handoff.as_ref(),
+        ctx.now,
+    ) {
+        Ok(crate::gravity_comp::GravityCompEnterRtStart::AlreadyActive(unused_policy)) => {
+            retired.gravity_comp_policy = unused_policy;
+            Ok(GravityCompEnterOutcome::Immediate(GravityCompReply {
+                active: core.gravity_comp_active(),
+                epoch_id: core.safety.epoch_id(),
+                is_torqued: core.is_torqued,
+                safety_state: SafetyStateTag::from_state(core.safety.state()),
+            }))
+        }
+        Ok(crate::gravity_comp::GravityCompEnterRtStart::ImmediateMock) => {
+            Ok(GravityCompEnterOutcome::Immediate(GravityCompReply {
+                active: core.gravity_comp_active(),
+                epoch_id: core.safety.epoch_id(),
+                is_torqued: core.is_torqued,
+                safety_state: SafetyStateTag::from_state(core.safety.state()),
+            }))
+        }
+        Ok(crate::gravity_comp::GravityCompEnterRtStart::StartedSession(sid)) => {
+            Ok(GravityCompEnterOutcome::Session(sid))
+        }
+        Err((reason, unused_policy)) => {
+            retired.gravity_comp_policy = unused_policy;
+            Err(ConfigError::GravityCompRejected {
+                code: reason.code,
+                message: reason.message,
+            })
+        }
+    }
+}
+
 fn install_gravity_comp(
     core: &mut SupervisorInner,
     ctx: &CommitCtx,
@@ -3613,13 +3841,14 @@ fn install_gravity_comp(
             scale,
             damping_kd,
         } => {
-            if crate::gravity_comp::executor_blocks_hardware_gravity_comp(
-                core.rt_executor_owned,
-                core.driver.is_some(),
-            ) {
+            if core.rt_executor_owned
+                && core
+                    .read_driver_for_tick()
+                    .is_some_and(|drv| drv.supports_nonblocking_mode_switch())
+            {
                 retired.gravity_comp_policy = policy;
                 return Err(ConfigError::ExecutorCapabilityUnsupported(
-                    "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
+                    "hardware gravity_comp entry must use StartGravityCompEnter",
                 ));
             }
             if core
@@ -3647,6 +3876,7 @@ fn install_gravity_comp(
                     return Err(ConfigError::LeaseLost);
                 }
             }
+            let use_legacy_sync_driver = !core.rt_executor_owned && core.driver.is_some();
             let admitted = match core.check_admission(admission) {
                 Ok(a) => a,
                 Err(e) => {
@@ -3662,6 +3892,52 @@ fn install_gravity_comp(
                     });
                 }
             };
+            // Legacy owner with a synchronous driver (no non-blocking ModeSwitch, e.g. SimDriver):
+            // must execute synchronous `set_joint_modes` via `enter_gravity_comp` instead of
+            // falling into the driverless no-op RT branch.
+            if use_legacy_sync_driver {
+                retired.gravity_comp_policy = policy;
+                let req = crate::gravity_comp::GravityCompRequest {
+                    scale,
+                    damping_kd: damping_kd.map(|inp| {
+                        let len = usize::from(inp.len);
+                        if len == 6 {
+                            inp.values.to_vec()
+                        } else {
+                            vec![0.0; len]
+                        }
+                    }),
+                };
+                return match SupervisorInner::enter_gravity_comp(admitted, req) {
+                    Ok(()) => Ok(GravityCompReply {
+                        active: core.gravity_comp_active(),
+                        epoch_id: core.safety.epoch_id(),
+                        is_torqued: core.is_torqued,
+                        safety_state: SafetyStateTag::from_state(core.safety.state()),
+                    }),
+                    Err(ArmError::Rejected { code, message, .. }) => {
+                        Err(ConfigError::GravityCompRejected {
+                            code: BoundedText::new(&code),
+                            message: BoundedText::new(&message),
+                        })
+                    }
+                    Err(ArmError::Safety(crate::safety::SafetyError::EpochMismatch {
+                        expected, ..
+                    })) => Err(ConfigError::EpochMismatch {
+                        current_epoch: expected,
+                    }),
+                    Err(ArmError::Safety(crate::safety::SafetyError::LeaseLost)) => {
+                        Err(ConfigError::LeaseLost)
+                    }
+                    Err(ArmError::Safety(crate::safety::SafetyError::StampAlreadyConsumed)) => {
+                        Err(ConfigError::StampConsumed)
+                    }
+                    Err(other) => Err(ConfigError::GravityCompRejected {
+                        code: BoundedText::new("GRAVITY_COMP_ENTER_FAILED"),
+                        message: BoundedText::new(&other.to_string()),
+                    }),
+                };
+            }
             match SupervisorInner::enter_gravity_comp_rt(admitted, policy, scale, damping_kd) {
                 Ok(unused_policy) => {
                     retired.gravity_comp_policy = unused_policy;
@@ -3683,17 +3959,11 @@ fn install_gravity_comp(
         }
         GravityCompOp::Exit {
             lease_holder,
+            operator,
+            expected_epoch,
             code,
             message,
         } => {
-            if crate::gravity_comp::executor_blocks_hardware_gravity_comp(
-                core.rt_executor_owned,
-                core.driver.is_some(),
-            ) {
-                return Err(ConfigError::ExecutorCapabilityUnsupported(
-                    "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
-                ));
-            }
             if core.calibration_busy {
                 return Err(ConfigError::CalibPrecondition {
                     status: 409,
@@ -3705,6 +3975,20 @@ fn install_gravity_comp(
                 if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
                     return Err(ConfigError::LeaseLost);
                 }
+            }
+            if let Some(ep) = expected_epoch {
+                if ep != core.safety.epoch_id() {
+                    return Err(ConfigError::EpochMismatch {
+                        current_epoch: core.safety.epoch_id(),
+                    });
+                }
+            }
+            if core.check_operator_requirement(operator, ctx.now).is_err() {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 403,
+                    code: "OPERATOR_REQUIRED",
+                    message: "Operator unlock is required for /api/v1/mode/gravity_comp",
+                });
             }
             core.exit_gravity_comp_rt(code, message);
             Ok(GravityCompReply {
@@ -7392,11 +7676,126 @@ pub fn prepare_eval_bufs_off_thread(
     bufs
 }
 
+/// Reserves a typed P-F1 session terminal RAII guard on `OWNER_EXECUTOR`, failing closed on
+/// EVERY router admission refusal (`NoDestination`, `RepliesFull`, `Disconnected`, `Stopped`, etc.)
+/// so no Executor session is ever admitted without a bound router terminal. Returns `Ok(None)`
+/// only when `handle` is `None` (`OWNER_LEGACY`).
+fn reserve_session_terminal_fail_closed(
+    handle: Option<&crate::rt_core::executor::RtExecutorHandle>,
+    client: ClientId,
+) -> Result<Option<crate::rt_core::reply_router::SessionTerminalReservationGuard>, ArmError> {
+    use crate::rt_core::broker::AdmitError;
+    use crate::rt_core::reply_router::{ExternalDestinationPolicy, ExternalSubmitError};
+    let Some(h) = handle else {
+        return Ok(None);
+    };
+    let policy = if client.0 != 0 {
+        ExternalDestinationPolicy::ConnectionOnly
+    } else {
+        ExternalDestinationPolicy::ConnectionOrGlobal
+    };
+    match h.reserve_session_terminal(
+        client,
+        crate::supervisor::next_mode_switch_terminal_action_id(),
+        policy,
+    ) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(ExternalSubmitError::NoDestination) => Err(ArmError::Rejected {
+            status: 503,
+            code: "EXECUTOR_ROUTING_PENDING".into(),
+            message: "RT executor has no reply destination bound for this session".into(),
+        }),
+        Err(ExternalSubmitError::Admit(AdmitError::RepliesFull)) => Err(ArmError::Rejected {
+            status: 503,
+            code: "REPLIES_FULL".into(),
+            message: "session terminal reply queue is full".into(),
+        }),
+        Err(ExternalSubmitError::Admit(AdmitError::Disconnected)) => Err(ArmError::Rejected {
+            status: 409,
+            code: "LEASE_LOST".into(),
+            message: "client connection is disconnected".into(),
+        }),
+        Err(ExternalSubmitError::Admit(other)) => Err(ArmError::Rejected {
+            status: 503,
+            code: "EXECUTOR_ROUTING_PENDING".into(),
+            message: format!("session terminal credit refused: {other:?}"),
+        }),
+        Err(ExternalSubmitError::Stopped) => Err(ArmError::Rejected {
+            status: 503,
+            code: "EXECUTOR_UNAVAILABLE".into(),
+            message: "RT executor is not running".into(),
+        }),
+        Err(ExternalSubmitError::NotAnExternalAction) => Err(ArmError::Internal(
+            "session terminal reservation rejected as non-external action".into(),
+        )),
+    }
+}
+
+/// Runs a stop-direction MIT handback (`MIT -> POS_VEL`) via PR0C `ModeSwitch` on the active
+/// owner (`OWNER_LEGACY` or `OWNER_EXECUTOR`) and waits via `read_services` until terminal.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_executor_mit_hand_back(
+    sup: &ArmSupervisor,
+    reason: crate::supervisor::MitHandBackReason,
+    admission: AdmissionStamp,
+    lease_holder: Option<(HolderLabel, u64)>,
+    operator: crate::auth::OperatorRequirement,
+    client: ClientId,
+    timeout: Duration,
+) -> Result<(), ArmError> {
+    use crate::motor_mode::ModeProgress;
+
+    let handle = sup.executor_handle();
+    let mut terminal_guard = reserve_session_terminal_fail_closed(handle.as_ref(), client)?;
+    let reservation = terminal_guard.as_mut().and_then(|g| g.stage_for_admission());
+    let deadline = Instant::now() + timeout;
+    let start_res = sup
+        .dispatch_config_request_owned_reliable(ConfigRequest::RequestMitHandBack {
+            reason,
+            admission,
+            lease_holder,
+            operator,
+            deadline,
+            client,
+            reservation,
+        })
+        .await;
+    let session_id = match start_res {
+        Ok(ConfigReply::MitHandBackStarted(Ok(Some(sid)))) => {
+            if let Some(g) = terminal_guard.as_mut() {
+                g.commit_transferred();
+            }
+            sid
+        }
+        Ok(ConfigReply::MitHandBackStarted(Ok(None))) => return Ok(()),
+        Ok(ConfigReply::MitHandBackStarted(Err(e))) => return Err(e.to_arm_error()),
+        Err(e) => return Err(e.to_arm_error()),
+        _ => return Err(ArmError::Internal("unexpected MIT handback reply".into())),
+    };
+    let wait_deadline = Instant::now() + timeout + Duration::from_millis(250);
+    match sup.await_mode_switch_session(session_id, wait_deadline).await {
+        Ok(Some(snap)) => match snap.progress {
+            ModeProgress::Confirmed => Ok(()),
+            other => Err(ArmError::Rejected {
+                status: 409,
+                code: "MIT_HAND_BACK_FAILED".into(),
+                message: format!("MIT hand back failed: {other:?}"),
+            }),
+        },
+        Ok(None) => Err(ArmError::Rejected {
+            status: 409,
+            code: "MIT_HAND_BACK_FAILED".into(),
+            message: "MIT hand back timed out".into(),
+        }),
+        Err(e) => Err(e.to_arm_error()),
+    }
+}
+
 /// Owner-routed gravity-compensation enter/exit command (shared across `Legacy` and `Executor`).
 ///
-/// In `OWNER_EXECUTOR`, mock (driverless) entry/exit runs zero-alloc on `armd-control` using a
-/// pre-cloned `GravityCompPolicy`; hardware drivers requiring synchronous CAN MIT mode-switch
-/// fail closed with `503 EXECUTOR_CAPABILITY_UNSUPPORTED`.
+/// Mock (driverless) entry/exit runs zero-alloc on the owner; hardware drivers supporting
+/// non-blocking mode switch (Damiao on both `Legacy` and `Executor`) execute `POS_VEL <-> MIT`
+/// switching through the shared PR0C `ModeSwitch` service inside a PR0B `ExclusiveOutput` session.
 pub async fn gravity_comp_command(
     sup: &Arc<ArmSupervisor>,
     admission: AdmissionStamp,
@@ -7406,67 +7805,229 @@ pub async fn gravity_comp_command(
     scale: Option<f32>,
     damping_kd: Option<Vec<f32>>,
 ) -> Result<GravityCompReply, ArmError> {
-    let op = if enable {
-        let pub_cfg = sup.published_config().await?;
-        if crate::gravity_comp::executor_blocks_hardware_gravity_comp(
-            sup.owner_mode() == OWNER_EXECUTOR,
-            pub_cfg.has_driver,
-        ) {
-            return Err(executor_capability_unsupported(
-                "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
-            ));
-        }
+    gravity_comp_command_with_auth(
+        sup,
+        admission,
+        lease_holder,
+        operator,
+        ClientId(admission.connection_id),
+        enable,
+        scale,
+        damping_kd,
+    )
+    .await
+}
+
+/// Owner-routed gravity-compensation enter/exit command carrying explicit live `OperatorRequirement`
+/// and `ClientId` for PR0B/PR0C hardware `ModeSwitch` sessions.
+#[allow(clippy::too_many_arguments)]
+pub async fn gravity_comp_command_with_auth(
+    sup: &ArmSupervisor,
+    admission: AdmissionStamp,
+    lease_holder: Option<(HolderLabel, u64)>,
+    operator: crate::auth::OperatorRequirement,
+    client: ClientId,
+    enable: bool,
+    scale: Option<f32>,
+    damping_kd: Option<Vec<f32>>,
+) -> Result<GravityCompReply, ArmError> {
+    use crate::gravity_comp::GravityCompDampingInput;
+    use crate::motor_mode::{ModeProgress, ModeSwitchFailure};
+    use crate::rt_core::publish::ReadRequirements;
+
+    let pub_cfg = sup.published_config().await?;
+    // Converge ALL hardware drivers supporting non-blocking mode switch (Damiao on both
+    // OWNER_LEGACY and OWNER_EXECUTOR) onto PR0C ModeSwitch + SAFE-HOLD, keeping the direct
+    // GravityCompOp::Enter path when driverless or on drivers without non-blocking mode switch
+    // (synchronous Legacy drivers run `set_joint_modes`; Executor fails closed with 422 UNSUPPORTED).
+    let use_mode_switch = pub_cfg.has_driver && pub_cfg.driver_supports_nonblocking_mode_switch;
+
+    if enable {
         let policy = pub_cfg
             .config
             .gravity_comp
             .clone()
             .filter(|_| pub_cfg.config.six_plus_gripper() && pub_cfg.config.gravity_model.is_some());
-        let damping_arr = match damping_kd {
-            None => None,
-            Some(v) => {
-                let max_kd = policy.as_ref().map_or(f32::INFINITY, |p| p.damping_kd_max);
-                if v.len() != 6 || !v.iter().all(|k| k.is_finite() && *k >= 0.0 && *k <= max_kd) {
-                    return Err(ArmError::Rejected {
-                        status: 400,
-                        code: "INVALID_COMMAND".into(),
-                        message: format!("damping_kd must be 6 values in [0, {max_kd}]"),
-                    });
+        // Carry raw damping_kd to the RT owner without pre-validating so idempotence
+        // (`gravity_comp.is_some()`) and state blockers (`NOT_ARMED`, etc.) take precedence
+        // identically to legacy.
+        let damping_input = damping_kd.as_deref().map(GravityCompDampingInput::from_slice);
+
+        if !use_mode_switch {
+            let op = GravityCompOp::Enter {
+                admission,
+                lease_holder,
+                operator,
+                policy,
+                scale,
+                damping_kd: damping_input,
+            };
+            return match sup
+                .dispatch_config_request(ConfigRequest::GravityComp(op))
+                .await
+            {
+                Ok(ConfigReply::GravityCompDone(Ok(reply))) => Ok(reply),
+                Ok(ConfigReply::GravityCompDone(Err(e))) => Err(e.to_arm_error()),
+                Err(e) => Err(e.to_arm_error()),
+                _ => Err(ArmError::Internal("unexpected gravity_comp reply".into())),
+            };
+        }
+
+        // Hardware ModeSwitch path (Executor & Legacy Damiao): admit PR0B ModeSwitch session
+        // (POS_VEL -> MIT) with P-F1 credit when on Executor.
+        // If MIT tracking is active after entry validation passes, hand MIT back first (matching
+        // legacy precedence where invalid requests never change the MIT owner).
+        const ENTER_TIMEOUT: Duration = Duration::from_secs(3);
+        let mut cur_admission = admission;
+        let mut tried_mit_handback = false;
+        let session_id = loop {
+            let handle = sup.executor_handle();
+            let mut terminal_guard = reserve_session_terminal_fail_closed(handle.as_ref(), client)?;
+            let reservation = terminal_guard.as_mut().and_then(|g| g.stage_for_admission());
+            let deadline = Instant::now() + ENTER_TIMEOUT;
+            let res = sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::StartGravityCompEnter {
+                    admission: cur_admission,
+                    lease_holder,
+                    policy: policy.clone(),
+                    scale,
+                    damping_kd: damping_input,
+                    operator,
+                    deadline,
+                    client,
+                    reservation,
+                })
+                .await;
+            match res {
+                Ok(ConfigReply::GravityCompEnterStarted(Ok(GravityCompEnterOutcome::Immediate(reply)))) => {
+                    return Ok(reply);
                 }
-                let mut arr = [0.0f32; 6];
-                arr.copy_from_slice(&v);
-                Some(arr)
+                Ok(ConfigReply::GravityCompEnterStarted(Ok(GravityCompEnterOutcome::Session(sid)))) => {
+                    if let Some(g) = terminal_guard.as_mut() {
+                        g.commit_transferred();
+                    }
+                    break sid;
+                }
+                Ok(ConfigReply::GravityCompEnterStarted(Err(ConfigError::GravityCompRejected {
+                    ref code,
+                    ..
+                }))) if code.as_str() == "MIT_HAND_BACK_REQUIRED" && !tried_mit_handback => {
+                    drop(terminal_guard);
+                    tried_mit_handback = true;
+                    run_executor_mit_hand_back(
+                        sup,
+                        crate::supervisor::MitHandBackReason::GravityCompEntry,
+                        cur_admission,
+                        lease_holder,
+                        operator,
+                        client,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        ArmError::Rejected { ref code, .. }
+                            if matches!(
+                                code.as_str(),
+                                "MIT_HAND_BACK_FAILED"
+                                    | "LEASE_LOST"
+                                    | "EPOCH_MISMATCH"
+                                    | "OPERATOR_REQUIRED"
+                                    | "ESTOP_ACTIVE"
+                                    | "REPLIES_FULL"
+                                    | "EXECUTOR_UNAVAILABLE"
+                            ) =>
+                        {
+                            e
+                        }
+                        ArmError::Safety(crate::safety::SafetyError::Stopped) => {
+                            ArmError::Safety(crate::safety::SafetyError::Stopped)
+                        }
+                        other => ArmError::Rejected {
+                            status: 409,
+                            code: "MIT_HAND_BACK_FAILED".into(),
+                            message: other.to_string(),
+                        },
+                    })?;
+                    // Re-stamp with a fresh request_id while keeping original connection/lease/epoch/stop_gen.
+                    cur_admission.request_id = crate::supervisor::next_admission_request_id();
+                }
+                Ok(ConfigReply::GravityCompEnterStarted(Err(e))) => return Err(e.to_arm_error()),
+                Err(e) => return Err(e.to_arm_error()),
+                _ => return Err(ArmError::Internal("unexpected gravity_comp enter reply".into())),
             }
         };
-        GravityCompOp::Enter {
-            admission,
-            lease_holder,
-            operator,
-            policy,
-            scale,
-            damping_kd: damping_arr,
+
+        // Wait via shared `await_mode_switch_session` (`read_services`) until terminal.
+        let wait_deadline = Instant::now() + ENTER_TIMEOUT + Duration::from_millis(250);
+        let final_snap = match sup.await_mode_switch_session(session_id, wait_deadline).await {
+            Ok(Some(snap)) => snap,
+            Ok(None) => {
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "GRAVITY_COMP_SWITCH_FAILED".into(),
+                    message: "gravity_comp mode-switch session timed out".into(),
+                });
+            }
+            Err(e) => return Err(e.to_arm_error()),
+        };
+
+        match final_snap.progress {
+            ModeProgress::Confirmed => {
+                let svc = sup
+                    .read_services(ReadRequirements::identity())
+                    .await?;
+                Ok(GravityCompReply {
+                    active: svc.snapshot.rt.owner.gravity_comp_active,
+                    epoch_id: svc.snapshot.obs.epoch_id,
+                    is_torqued: svc.snapshot.obs.is_torqued,
+                    safety_state: SafetyStateTag::from_state(&svc.snapshot.obs.safety_state),
+                })
+            }
+            ModeProgress::StoppedRecovered { reason: ModeSwitchFailure::Stopped } => {
+                Err(ArmError::Safety(crate::safety::SafetyError::Stopped))
+            }
+            ModeProgress::RolledBack { failed_joint, reason }
+            | ModeProgress::FailedClean { failed_joint, reason }
+            | ModeProgress::Ambiguous { failed_joint, reason } => Err(ArmError::Rejected {
+                status: 409,
+                code: "GRAVITY_COMP_SWITCH_FAILED".into(),
+                message: format!(
+                    "gravity_comp mode switch failed on J{}: {} ({:?})",
+                    failed_joint + 1,
+                    reason.code(),
+                    final_snap.progress
+                ),
+            }),
+            ModeProgress::StoppedRecovered { reason } => Err(ArmError::Rejected {
+                status: 409,
+                code: "GRAVITY_COMP_SWITCH_FAILED".into(),
+                message: format!("gravity_comp mode switch revoked: {}", reason.code()),
+            }),
+            ModeProgress::Pending { .. } => Err(ArmError::Rejected {
+                status: 409,
+                code: "GRAVITY_COMP_SWITCH_FAILED".into(),
+                message: "gravity_comp mode switch did not complete".into(),
+            }),
         }
     } else {
-        if sup.owner_mode() == OWNER_EXECUTOR {
-            let pub_cfg = sup.published_config().await?;
-            if crate::gravity_comp::executor_blocks_hardware_gravity_comp(true, pub_cfg.has_driver) {
-                return Err(executor_capability_unsupported(
-                    "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
-                ));
-            }
-        }
-        GravityCompOp::Exit {
+        // Exit (`enable: false`): returns its synchronous reply immediately and transitions into
+        // owner-internal stop-direction `Exiting -> ModeSwitch` (identical to safety exits, never
+        // retaining or stranding a client P-F1 router credit on `ExitFailed`).
+        let op = GravityCompOp::Exit {
             lease_holder,
+            operator,
+            expected_epoch: (admission.estop_epoch != 0).then_some(admission.estop_epoch),
             code: "REQUESTED",
             message: "Exit requested",
+        };
+        match sup
+            .dispatch_config_request(ConfigRequest::GravityComp(op))
+            .await
+        {
+            Ok(ConfigReply::GravityCompDone(Ok(reply))) => Ok(reply),
+            Ok(ConfigReply::GravityCompDone(Err(e))) => Err(e.to_arm_error()),
+            Err(e) => Err(e.to_arm_error()),
+            _ => Err(ArmError::Internal("unexpected gravity_comp reply".into())),
         }
-    };
-    match sup
-        .dispatch_config_request(ConfigRequest::GravityComp(op))
-        .await
-    {
-        Ok(ConfigReply::GravityCompDone(Ok(reply))) => Ok(reply),
-        Ok(ConfigReply::GravityCompDone(Err(e))) => Err(e.to_arm_error()),
-        Err(e) => Err(e.to_arm_error()),
-        _ => Err(ArmError::Internal("unexpected gravity_comp reply".into())),
     }
 }

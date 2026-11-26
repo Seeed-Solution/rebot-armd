@@ -1103,6 +1103,8 @@ pub mod switch {
         /// The plan's watchdog gap is shorter than one release period plus the hold delivery
         /// margin, so no hold schedule can keep it.
         WatchdogGapInfeasible,
+        /// Configured `tx_budget.max_frames` is smaller than `energized_arm_axes + energized_j7 + 1`.
+        WatchdogBudgetInsufficient,
     }
 
     impl ModeSwitchFailure {
@@ -1126,6 +1128,7 @@ pub mod switch {
                 Self::DeadlineExpired => "TIMEOUT",
                 Self::NoConfirmedMode => "MODE_UNVERIFIED",
                 Self::WatchdogGapInfeasible => "WATCHDOG_GAP_INFEASIBLE",
+                Self::WatchdogBudgetInsufficient => "WATCHDOG_BUDGET_INSUFFICIENT",
             }
         }
 
@@ -1458,6 +1461,10 @@ pub mod switch {
         /// True when `joint` is configured to support `ControlMode::PositionForce`.
         fn axis_supports_pos_force(&self, joint: usize) -> bool;
         fn remaining_rx_budget(&self, default_max: u16) -> u16;
+        /// Verifies the admission invariant `max_frames >= energized_arm_axes + energized_j7 + 1`.
+        fn check_watchdog_tx_budget(&self) -> Result<(), (usize, usize)> { Ok(()) }
+        /// Cumulative `(rx_frames, tx_attempts)` consumed by the driver in the active release.
+        fn release_budget_consumed(&self) -> Option<(u16, u16)> { None }
         fn axis_confirmed_mode(&self, joint: usize) -> Option<ControlMode>;
         fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<ControlMode>);
         fn latch_axis_mode_uncertain(&mut self, joint: usize);
@@ -1563,6 +1570,12 @@ pub mod switch {
         fn axis_supports_pos_force(&self, joint: usize) -> bool { self.drv.axis_supports_pos_force(joint) }
         fn remaining_rx_budget(&self, default_max: u16) -> u16 {
             self.drv.mode_switch_remaining_rx_budget(default_max)
+        }
+        fn check_watchdog_tx_budget(&self) -> Result<(), (usize, usize)> {
+            self.drv.check_watchdog_tx_budget_for_energized()
+        }
+        fn release_budget_consumed(&self) -> Option<(u16, u16)> {
+            Some(self.drv.release_budget_consumed())
         }
         fn axis_confirmed_mode(&self, joint: usize) -> Option<ControlMode> { self.drv.axis_confirmed_mode(joint) }
         fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<ControlMode>) {
@@ -2069,15 +2082,25 @@ pub mod switch {
                 let exclude_mask = drv.mode_write_uncertain_mask();
                 let effective_gap = self.effective_max_watchdog_gap(budget);
                 let tx_cap = sub.tx_remaining().min(u16::from(u8::MAX)) as u8;
-                match drv.service_watchdog_holds(
+                let tx_before = drv.release_budget_consumed().map(|(_, tx)| tx);
+                let wd_res = drv.service_watchdog_holds(
                     self.hold_due_age(budget),
                     exclude_mask,
                     0,
                     sub.deadline(),
                     tx_cap,
-                ) {
+                );
+                let tx_after = drv.release_budget_consumed().map(|(_, tx)| tx);
+                let reported_frames = wd_res.as_ref().map_or(0, |wd| u16::from(wd.frames_sent));
+                let charged_tx = match (tx_before, tx_after) {
+                    (Some(b), Some(a)) => a.saturating_sub(b),
+                    _ => reported_frames,
+                };
+                if charged_tx > 0 {
+                    sub.charge_tx(charged_tx);
+                }
+                match wd_res {
                     Ok(wd) => {
-                        sub.charge_tx(u16::from(wd.frames_sent));
                         if !wd.all_due_serviced
                             && wd
                                 .max_energized_age
@@ -2216,13 +2239,24 @@ pub mod switch {
                 let exclude_mask = drv.mode_write_uncertain_mask();
                 let rem_tx = sub.tx_remaining().min(u16::from(u8::MAX)) as u8;
                 let force_mask = self.next_write_force_refresh_mask(drv, rem_tx);
-                let wd = match drv.service_watchdog_holds(
+                let tx_before = drv.release_budget_consumed().map(|(_, tx)| tx);
+                let wd_res = drv.service_watchdog_holds(
                     self.hold_due_age(budget),
                     exclude_mask,
                     force_mask,
                     sub.deadline(),
                     rem_tx,
-                ) {
+                );
+                let tx_after = drv.release_budget_consumed().map(|(_, tx)| tx);
+                let reported_frames = wd_res.as_ref().map_or(0, |wd| u16::from(wd.frames_sent));
+                let charged_tx = match (tx_before, tx_after) {
+                    (Some(b), Some(a)) => a.saturating_sub(b),
+                    _ => reported_frames,
+                };
+                if charged_tx > 0 {
+                    sub.charge_tx(charged_tx);
+                }
+                let wd = match wd_res {
                     Ok(res) => res,
                     Err(reason) => {
                         let fj = self.current_joint();
@@ -2230,7 +2264,6 @@ pub mod switch {
                         return self.handle_axis_failure(drv, fj, reason, uncertain);
                     }
                 };
-                sub.charge_tx(u16::from(wd.frames_sent));
                 // Predictive starvation guard: if any energized watchdog-bearing confirmed axis
                 // was NOT refreshed and waiting until the next release would breach `max_watchdog_gap`,
                 // abort fail-closed BEFORE the 40 ms window closes.
@@ -2313,6 +2346,14 @@ pub mod switch {
                 return Err(ModeProgress::FailedClean {
                     failed_joint: self.slots[0].target.joint,
                     reason: ModeSwitchFailure::WatchdogGapInfeasible,
+                });
+            }
+            // Predictive fail-closed admission invariant: energized operation requires
+            // `max_frames >= energized_arm_axes + energized_j7 + 1`.
+            if drv.check_watchdog_tx_budget().is_err() {
+                return Err(ModeProgress::FailedClean {
+                    failed_joint: self.slots[0].target.joint,
+                    reason: ModeSwitchFailure::WatchdogBudgetInsufficient,
                 });
             }
 
@@ -2455,11 +2496,24 @@ pub mod switch {
                 return 0;
             }
             let slot = &self.slots[self.active_idx];
-            if matches!(slot.phase, AxisPhase::NeedWrite) {
-                let j = usize::from(slot.target.joint);
-                if drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
-                    return 1u32 << j;
+            match slot.phase {
+                AxisPhase::NeedWrite => {
+                    let j = usize::from(slot.target.joint);
+                    if drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
+                        return 1u32 << j;
+                    }
                 }
+                AxisPhase::AwaitingFeedback {
+                    confirmed_mode,
+                    fenced_pending_feedback: false,
+                    ..
+                } if confirmed_mode != ControlMode::PositionForce => {
+                    let j = usize::from(slot.target.joint);
+                    if drv.axis_is_energized(j) && drv.axis_has_watchdog(j) {
+                        return 1u32 << j;
+                    }
+                }
+                _ => {}
             }
             0
         }
@@ -3021,13 +3075,25 @@ pub mod switch {
                         );
                     }
                     drv.clear_register_reply_log();
-                    match drv.try_send_range_read(j, rid_idx, sub.deadline()) {
+                    let tx_before = drv.release_budget_consumed().map(|(_, tx)| tx);
+                    let res = drv.try_send_range_read(j, rid_idx, sub.deadline());
+                    let tx_after = drv.release_budget_consumed().map(|(_, tx)| tx);
+                    let charge_attempt = |sub: &mut crate::rt_core::budget::SubBudget<'_>, fallback: u16| {
+                        let used = match (tx_before, tx_after) {
+                            (Some(b), Some(a)) => a.saturating_sub(b),
+                            _ => fallback,
+                        };
+                        if used > 0 {
+                            sub.charge_tx(used);
+                        }
+                    };
+                    match res {
                         ModeTxResult::Sent {
                             boundary_seq,
                             tx_at,
                             tx_offset_ns,
                         } => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             let Some(deadline) = tx_at.checked_add(self.plan.per_axis_timeout) else {
                                 return self.handle_axis_failure(
                                     drv,
@@ -3047,12 +3113,15 @@ pub mod switch {
                             ModeProgress::Pending { wake: Some(deadline) }
                         }
                         ModeTxResult::Backpressure => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             ModeProgress::Pending { wake: None }
                         }
-                        ModeTxResult::Revoked(code) => self.handle_revocation(drv, code),
+                        ModeTxResult::Revoked(code) => {
+                            charge_attempt(sub, 0);
+                            self.handle_revocation(drv, code)
+                        }
                         ModeTxResult::SentFlushFailed { .. } => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             self.handle_axis_failure(
                                 drv,
                                 slot.target.joint,
@@ -3061,6 +3130,7 @@ pub mod switch {
                             )
                         }
                         ModeTxResult::Refused(_) => {
+                            charge_attempt(sub, 0);
                             self.handle_axis_failure(
                                 drv,
                                 slot.target.joint,
@@ -3117,13 +3187,25 @@ pub mod switch {
                     }
                     drv.clear_register_reply_log();
                     let goal = slot.active_goal;
-                    match drv.try_send_ctrl_mode_write(j, goal, sub.deadline()) {
+                    let tx_before = drv.release_budget_consumed().map(|(_, tx)| tx);
+                    let res = drv.try_send_ctrl_mode_write(j, goal, sub.deadline());
+                    let tx_after = drv.release_budget_consumed().map(|(_, tx)| tx);
+                    let charge_attempt = |sub: &mut crate::rt_core::budget::SubBudget<'_>, fallback: u16| {
+                        let used = match (tx_before, tx_after) {
+                            (Some(b), Some(a)) => a.saturating_sub(b),
+                            _ => fallback,
+                        };
+                        if used > 0 {
+                            sub.charge_tx(used);
+                        }
+                    };
+                    match res {
                         ModeTxResult::Sent {
                             boundary_seq,
                             tx_at,
                             tx_offset_ns,
                         } => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             let mut deadline = tx_at
                                 .checked_add(self.plan.per_axis_timeout)
                                 .unwrap_or(sub.deadline());
@@ -3147,7 +3229,7 @@ pub mod switch {
                             ModeProgress::Pending { wake: Some(deadline) }
                         }
                         ModeTxResult::SentFlushFailed { .. } => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             // Blocker 2: Frame was handed to transport before flush failed ->
                             // driver already marked `mode_write_uncertain_mask`; fail closed as Ambiguous!
                             self.ambiguous_mask |= 1u32 << j;
@@ -3159,16 +3241,22 @@ pub mod switch {
                             )
                         }
                         ModeTxResult::Backpressure => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             ModeProgress::Pending { wake: None }
                         }
-                        ModeTxResult::Revoked(code) => self.handle_revocation(drv, code),
-                        ModeTxResult::Refused(_) => self.handle_axis_failure(
-                            drv,
-                            slot.target.joint,
-                            ModeSwitchFailure::TxFailed,
-                            false,
-                        ),
+                        ModeTxResult::Revoked(code) => {
+                            charge_attempt(sub, 0);
+                            self.handle_revocation(drv, code)
+                        }
+                        ModeTxResult::Refused(_) => {
+                            charge_attempt(sub, 0);
+                            self.handle_axis_failure(
+                                drv,
+                                slot.target.joint,
+                                ModeSwitchFailure::TxFailed,
+                                false,
+                            )
+                        }
                     }
                 }
                 AxisPhase::NeedReadback {
@@ -3203,13 +3291,25 @@ pub mod switch {
                         return ModeProgress::Pending { wake: None };
                     }
                     drv.clear_register_reply_log();
-                    match drv.try_send_ctrl_mode_read(j, tx_cutoff) {
+                    let tx_before = drv.release_budget_consumed().map(|(_, tx)| tx);
+                    let res = drv.try_send_ctrl_mode_read(j, tx_cutoff);
+                    let tx_after = drv.release_budget_consumed().map(|(_, tx)| tx);
+                    let charge_attempt = |sub: &mut crate::rt_core::budget::SubBudget<'_>, fallback: u16| {
+                        let used = match (tx_before, tx_after) {
+                            (Some(b), Some(a)) => a.saturating_sub(b),
+                            _ => fallback,
+                        };
+                        if used > 0 {
+                            sub.charge_tx(used);
+                        }
+                    };
+                    match res {
                         ModeTxResult::Sent {
                             boundary_seq,
                             tx_at,
                             tx_offset_ns,
                         } => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             let base_dl = tx_at
                                 .checked_add(self.plan.per_axis_timeout)
                                 .unwrap_or(sub.deadline());
@@ -3237,12 +3337,15 @@ pub mod switch {
                             ModeProgress::Pending { wake: Some(deadline) }
                         }
                         ModeTxResult::Backpressure => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             ModeProgress::Pending { wake: None }
                         }
-                        ModeTxResult::Revoked(code) => self.handle_revocation(drv, code),
+                        ModeTxResult::Revoked(code) => {
+                            charge_attempt(sub, 0);
+                            self.handle_revocation(drv, code)
+                        }
                         ModeTxResult::SentFlushFailed { .. } => {
-                            sub.charge_tx(1);
+                            charge_attempt(sub, 1);
                             self.handle_axis_failure(
                                 drv,
                                 slot.target.joint,
@@ -3251,6 +3354,7 @@ pub mod switch {
                             )
                         }
                         ModeTxResult::Refused(_) => {
+                            charge_attempt(sub, 0);
                             self.handle_axis_failure(
                                 drv,
                                 slot.target.joint,
@@ -3275,9 +3379,21 @@ pub mod switch {
                     if !refresh_sent
                         && (!drv.axis_is_energized(j) || confirmed_mode == ControlMode::PositionForce)
                     {
-                        match drv.try_send_status_refresh(j, sub.deadline()) {
+                        let tx_before = drv.release_budget_consumed().map(|(_, tx)| tx);
+                        let res = drv.try_send_status_refresh(j, sub.deadline());
+                        let tx_after = drv.release_budget_consumed().map(|(_, tx)| tx);
+                        let charge_attempt = |sub: &mut crate::rt_core::budget::SubBudget<'_>, fallback: u16| {
+                            let used = match (tx_before, tx_after) {
+                                (Some(b), Some(a)) => a.saturating_sub(b),
+                                _ => fallback,
+                            };
+                            if used > 0 {
+                                sub.charge_tx(used);
+                            }
+                        };
+                        match res {
                             ModeTxResult::Sent { .. } => {
-                                sub.charge_tx(1);
+                                charge_attempt(sub, 1);
                                 self.slots[idx].phase = AxisPhase::AwaitingFeedback {
                                     after_seq,
                                     after_at,
@@ -3290,10 +3406,15 @@ pub mod switch {
                                 };
                             }
                             ModeTxResult::Backpressure | ModeTxResult::SentFlushFailed { .. } => {
-                                sub.charge_tx(1);
+                                charge_attempt(sub, 1);
                             }
-                            ModeTxResult::Revoked(code) => return self.handle_revocation(drv, code),
-                            _ => {}
+                            ModeTxResult::Revoked(code) => {
+                                charge_attempt(sub, 0);
+                                return self.handle_revocation(drv, code);
+                            }
+                            _ => {
+                                charge_attempt(sub, 0);
+                            }
                         }
                     }
                     ModeProgress::Pending { wake: Some(deadline) }

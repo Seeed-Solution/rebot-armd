@@ -4558,12 +4558,13 @@ fn pos_force_carryover_j7_at_100ms_boundary_never_counted_as_fifo_expired() {
             .unwrap()
             .with_gripper_pos_force(pf())
             .unwrap()
-            .with_tx_budget(b6);
+            .with_tx_budget(TxBudget { max_frames: 16, ..b6 });
         d.read_joint_states().unwrap();
         raw_bus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
         d.check_mapping_ranges();
         d.set_torque(true).expect("enable");
+        d.set_tx_budget(b6);
         // Establish fresh empty-RX boundary + J1-J7 samples at t = 0 right after enable handshake.
         d.read_joint_states().unwrap();
         raw_bus.with(|s| {
@@ -4659,12 +4660,13 @@ fn pos_force_carryover_j7_at_100ms_boundary_never_counted_as_fifo_expired() {
             .unwrap()
             .with_gripper_pos_force(pf())
             .unwrap()
-            .with_tx_budget(b6);
+            .with_tx_budget(TxBudget { max_frames: 16, ..b6 });
         d.read_joint_states().unwrap();
         raw_bus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
         d.check_mapping_ranges();
         d.set_torque(true).expect("enable");
+        d.set_tx_budget(b6);
         d.read_joint_states().unwrap();
         raw_bus.with(|s| {
             s.immediate_replies = false;
