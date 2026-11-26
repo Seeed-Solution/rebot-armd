@@ -12754,13 +12754,20 @@ impl SupervisorInner {
     pub(crate) fn start_mode_switch_rt(
         &mut self,
         req: crate::rt_core::requests::config::ModeSwitchStartRequest,
-        terminal: Option<crate::rt_core::reply_router::SessionTerminalTicket>,
+        terminal: Option<crate::rt_core::reply_router::SessionTerminalReservation>,
         owner_now: Instant,
     ) -> Result<u64, crate::rt_core::requests::config::ConfigError> {
         use crate::rt_core::requests::config::ConfigError;
         use crate::rt_core::session::{
-            admit_session, PreparedSession, SessionAdmitError, SessionKind,
+            admit_internal, admit_routed, PreparedSession, SessionAdmitError, SessionKind,
         };
+        if self.rt_executor_owned && req.client.0 != 0 && terminal.is_none() {
+            return Err(ConfigError::CalibPrecondition {
+                status: 409,
+                code: "NO_DESTINATION",
+                message: "routed mode-switch session requires a reserved terminal destination",
+            });
+        }
         if self.mode_switch.active_session.is_some() {
             return Err(ConfigError::Busy("a mode-switch session is already active"));
         }
@@ -12807,10 +12814,11 @@ impl SupervisorInner {
         prepared.operator = req.operator;
         prepared.revoke_on_stop = true;
         prepared.escalate_safe_hold_on_uncertain = true;
-        if let Some(ticket) = terminal.as_ref() {
-            prepared.bind_terminal_ticket(ticket);
-        }
-        let sid = admit_session(admitted, prepared, owner_now).map_err(|err| match err {
+        let admit_res = match terminal {
+            Some(reservation) => admit_routed(admitted, prepared, reservation, owner_now),
+            None => admit_internal(admitted, prepared, owner_now),
+        };
+        let sid = admit_res.map_err(|err| match err {
             SessionAdmitError::SlotBusy | SessionAdmitError::OutputBusy(_) => {
                 ConfigError::Busy(err.code())
             }
@@ -12823,6 +12831,11 @@ impl SupervisorInner {
                 status: 400,
                 code: "INVALID_COMMAND",
                 message: "invalid mode-switch session slot",
+            },
+            SessionAdmitError::InvalidReservation => ConfigError::CalibPrecondition {
+                status: 409,
+                code: "NO_DESTINATION",
+                message: "invalid or missing mode-switch terminal reservation",
             },
             SessionAdmitError::AuthorityRejected("LEASE_LOST") => ConfigError::LeaseLost,
             SessionAdmitError::AuthorityRejected("EPOCH_MISMATCH") => ConfigError::EpochMismatch {
@@ -13168,30 +13181,6 @@ impl SupervisorInner {
             |_, _, _| phase_out,
         ) {
             self.maybe_escalate_session_safe_hold(outcome, active.escalate_safe_hold_on_uncertain);
-        }
-    }
-}
-
-/// RAII owner of one reserved P-F1 session terminal credit: released on drop unless ownership
-/// was transferred to an admitted session (which then emits or abandons it through the router).
-#[cfg(not(target_arch = "wasm32"))]
-struct TerminalCreditGuard {
-    handle: crate::rt_core::executor::RtExecutorHandle,
-    ticket: Option<crate::rt_core::reply_router::SessionTerminalTicket>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl TerminalCreditGuard {
-    fn transfer_to_session(&mut self) {
-        self.ticket = None;
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for TerminalCreditGuard {
-    fn drop(&mut self) {
-        if let Some(t) = self.ticket.take() {
-            let _ = self.handle.release_session_terminal(&t);
         }
     }
 }
@@ -17149,35 +17138,55 @@ impl ArmSupervisor {
             .read_services(crate::rt_core::publish::ReadRequirements::identity())
             .await
             .map_err(|_| ConfigError::OwnerStopped)?;
-        // Major 2 (R5): on OWNER_EXECUTOR, bind 1 shared P-F1 terminal credit for a caller with an
-        // open reply destination so its terminal is delivered through the router instead of
-        // depending on bounded snapshot history. No destination: polling only (as on Legacy).
+        // Routed requests on OWNER_EXECUTOR (`req.client.0 != 0`) MUST obtain a typed P-F1
+        // terminal reservation via the shared RAII guard BEFORE enqueue; missing destination or
+        // disconnected clients fail closed (never silently downgraded to `None`).
         let handle = self.executor_handle();
-        let terminal = match handle.as_ref() {
+        let mut terminal_guard = match handle.as_ref() {
             Some(h) if req.client.0 != 0 => {
                 use crate::rt_core::reply_router::{ExternalDestinationPolicy, ExternalSubmitError};
-                match h.reserve_session_terminal_direct(
+                match h.reserve_session_terminal(
                     req.client,
                     next_mode_switch_terminal_action_id(),
                     ExternalDestinationPolicy::ConnectionOnly,
                 ) {
-                    Ok(t) => Some(TerminalCreditGuard { handle: h.clone(), ticket: Some(t) }),
+                    Ok(guard) => Some(guard),
                     Err(ExternalSubmitError::Admit(crate::rt_core::broker::AdmitError::RepliesFull)) => {
                         return Err(ConfigError::Busy("REPLIES_FULL"));
                     }
+                    Err(ExternalSubmitError::Admit(crate::rt_core::broker::AdmitError::Disconnected)) => {
+                        return Err(ConfigError::ConnectionClosed);
+                    }
+                    Err(ExternalSubmitError::NoDestination) => {
+                        return Err(ConfigError::CalibPrecondition {
+                            status: 409,
+                            code: "NO_DESTINATION",
+                            message: "routed mode-switch session has no registered reply destination",
+                        });
+                    }
                     Err(ExternalSubmitError::Stopped) => return Err(ConfigError::OwnerStopped),
-                    Err(_) => None,
+                    Err(ExternalSubmitError::NotAnExternalAction) => {
+                        return Err(ConfigError::CalibPrecondition {
+                            status: 400,
+                            code: "INVALID_COMMAND",
+                            message: "session terminal reservation requires an external routed action",
+                        });
+                    }
+                    Err(ExternalSubmitError::Admit(_)) => {
+                        return Err(ConfigError::Busy("ADMIT_REJECTED"));
+                    }
                 }
             }
             _ => None,
         };
-        // Major M2 (R6): the guard releases the credit on rejection AND when this future is
-        // dropped (e.g. cancelled during the queue-full backoff); only an admitted session takes
-        // ownership of it.
-        let mut terminal = terminal;
-        let ticket = terminal.as_ref().and_then(|g| g.ticket);
+        let reservation = terminal_guard
+            .as_mut()
+            .and_then(|g| g.stage_for_admission());
         let res = match self
-            .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(req, ticket))
+            .dispatch_config_request_owned_reliable(ConfigRequest::StartModeSwitch(
+                req,
+                reservation,
+            ))
             .await
         {
             Ok(ConfigReply::ModeSwitchStarted(res)) => res,
@@ -17185,8 +17194,8 @@ impl ArmSupervisor {
             Err(e) => Err(e),
         };
         if res.is_ok() {
-            if let Some(g) = terminal.as_mut() {
-                g.transfer_to_session();
+            if let Some(g) = terminal_guard.as_mut() {
+                g.commit_transferred();
             }
         }
         res

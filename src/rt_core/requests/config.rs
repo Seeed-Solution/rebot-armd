@@ -1507,11 +1507,11 @@ pub enum ConfigRequest {
         force_reconcile: bool,
     },
     /// Starts one tick-driven PR0C `ModeSwitch` session on `SessionSlot::ExclusiveOutput` (0 alloc).
-    /// The optional P-F1 terminal ticket (reserved off-RT on the shared router) binds the
-    /// session's terminal for delivery to the caller's reply destination.
+    /// Routed requests on `OWNER_EXECUTOR` MUST carry a move-only [`SessionTerminalReservation`]
+    /// obtained from [`ActionReplyRouter`] before enqueue; internal/Legacy requests pass `None`.
     StartModeSwitch(
         ModeSwitchStartRequest,
-        Option<crate::rt_core::reply_router::SessionTerminalTicket>,
+        Option<crate::rt_core::reply_router::SessionTerminalReservation>,
     ),
     /// Cancels active `ModeSwitch` session matching `session_id` (stale IDs ignored; 0 alloc).
     CancelModeSwitch { session_id: u64, reason: &'static str },

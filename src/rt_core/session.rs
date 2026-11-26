@@ -124,6 +124,19 @@ pub struct SessionAuthority {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTerminalBinding {
+    /// Explicit internal / autonomous session with no external routed terminal reservation.
+    Internal,
+    /// Routed external session bound to one reserved P-F1 terminal credit.
+    Routed {
+        request: RequestId,
+        route_gen: u64,
+        client: ClientId,
+        action_id: ActionId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedSession {
     pub slot: SessionSlot,
     pub kind: SessionKind,
@@ -132,8 +145,6 @@ pub struct PreparedSession {
     pub timeout_code: &'static str,
     pub child_timeout_code: &'static str,
     pub action_id: Option<ActionId>,
-    pub request_id: Option<RequestId>,
-    pub route_gen: u64,
     pub client: ClientId,
     pub require_lease: bool,
     pub operator: crate::auth::OperatorRequirement,
@@ -152,8 +163,6 @@ impl PreparedSession {
             timeout_code: "TIMEOUT",
             child_timeout_code: "TIMEOUT",
             action_id: None,
-            request_id: None,
-            route_gen: 0,
             client,
             require_lease: true,
             operator: crate::auth::OperatorRequirement::NotRequired,
@@ -172,8 +181,6 @@ impl PreparedSession {
             timeout_code: "TIMEOUT",
             child_timeout_code: "TIMEOUT",
             action_id: None,
-            request_id: None,
-            route_gen: 0,
             client,
             require_lease: false,
             operator: crate::auth::OperatorRequirement::NotRequired,
@@ -181,15 +188,6 @@ impl PreparedSession {
             revoke_on_epoch_change: false,
             escalate_safe_hold_on_uncertain: false,
         }
-    }
-
-    /// Binds a P-F1 [`super::reply_router::SessionTerminalTicket`] (request, client, action_id,
-    /// route_gen) into this prepared session so RT terminal handoff carries exact identity.
-    pub fn bind_terminal_ticket(&mut self, ticket: &super::reply_router::SessionTerminalTicket) {
-        self.request_id = Some(ticket.request());
-        self.client = ticket.client();
-        self.action_id = Some(ticket.action_id());
-        self.route_gen = ticket.route_gen();
     }
 }
 
@@ -199,6 +197,7 @@ pub enum SessionAdmitError {
     OutputBusy(&'static str),
     DeadlineExpired,
     InvalidSlotKind,
+    InvalidReservation,
     AuthorityRejected(&'static str),
 }
 
@@ -209,6 +208,7 @@ impl SessionAdmitError {
             Self::OutputBusy(c) | Self::AuthorityRejected(c) => c,
             Self::DeadlineExpired => "DEADLINE_EXPIRED",
             Self::InvalidSlotKind => "INVALID_COMMAND",
+            Self::InvalidReservation => "NO_DESTINATION",
         }
     }
 
@@ -328,8 +328,7 @@ pub struct ActiveSession {
     pub timeout_code: &'static str,
     pub child_timeout_code: &'static str,
     pub action_id: Option<ActionId>,
-    pub request_id: Option<RequestId>,
-    pub route_gen: u64,
+    pub terminal: SessionTerminalBinding,
     pub client: ClientId,
     pub escalate_safe_hold_on_uncertain: bool,
     pub hw_state_uncertain: bool,
@@ -483,12 +482,30 @@ impl SessionDriver {
         &mut self,
         prepared: PreparedSession,
         authority: SessionAuthority,
+        terminal: SessionTerminalBinding,
         now: Instant,
         reject_expired_at_admit: bool,
     ) -> Result<SessionId, SessionAdmitError> {
         let invalid = (prepared.slot == SessionSlot::Recorder && prepared.kind != SessionKind::Recorder)
             || (prepared.slot == SessionSlot::ExclusiveOutput && prepared.kind == SessionKind::Recorder);
         if invalid { return Err(SessionAdmitError::InvalidSlotKind); }
+        let (client, action_id) = match terminal {
+            SessionTerminalBinding::Internal => (prepared.client, prepared.action_id),
+            SessionTerminalBinding::Routed {
+                request,
+                route_gen,
+                client,
+                action_id,
+            } => {
+                if (request.0 & super::reply_router::SESSION_REQUEST_ID_BIT) == 0
+                    || route_gen == 0
+                    || (prepared.client.0 != 0 && prepared.client != client)
+                {
+                    return Err(SessionAdmitError::InvalidReservation);
+                }
+                (client, Some(action_id))
+            }
+        };
         if self.is_slot_occupied(prepared.slot) { return Err(SessionAdmitError::SlotBusy); }
         if reject_expired_at_admit
             && (prepared.deadline.is_some_and(|dl| now >= dl)
@@ -511,10 +528,9 @@ impl SessionDriver {
             child_deadline,
             timeout_code: prepared.timeout_code,
             child_timeout_code: prepared.child_timeout_code,
-            action_id: prepared.action_id,
-            request_id: prepared.request_id,
-            route_gen: prepared.route_gen,
-            client: prepared.client,
+            action_id,
+            terminal,
+            client,
             escalate_safe_hold_on_uncertain: prepared.escalate_safe_hold_on_uncertain,
             hw_state_uncertain: false,
             state: SessionState::Running,
@@ -645,14 +661,19 @@ impl SessionDriver {
         active.state = SessionState::Terminal(outcome);
         active.terminal_emitted = true;
         self.terminals_emitted = self.terminals_emitted.saturating_add(1);
-        if let Some(request) = active.request_id {
-            let action_id = active.action_id.unwrap_or(ActionId(id.0));
+        if let SessionTerminalBinding::Routed {
+            request,
+            route_gen,
+            client,
+            action_id,
+        } = active.terminal
+        {
             self.pending_terminals[idx] = Some(SessionTerminalRecord {
                 session: id,
                 slot,
                 request,
-                route_gen: active.route_gen,
-                client: active.client,
+                route_gen,
+                client,
                 action_id,
                 outcome,
             });
@@ -832,15 +853,30 @@ impl SessionDriver {
     }
 }
 
-/// Admits a prepared session by consuming a verified A1 [`Admitted`] token, binding authority
-/// strictly from [`AdmittedProof`] and live owner policy (fail-closed).
-pub fn admit_session(
+/// Admits a routed session by consuming a verified A1 [`Admitted`] token and a move-only
+/// [`super::reply_router::SessionTerminalReservation`] obtained before enqueue.
+///
+/// Validates authority, deadlines, slot occupancy, and exclusive output conflicts BEFORE binding
+/// the reservation and making the slot live.
+pub fn admit_routed(
+    admitted: Admitted<'_>,
+    prepared: PreparedSession,
+    reservation: super::reply_router::SessionTerminalReservation,
+    now: Instant,
+) -> Result<SessionId, SessionAdmitError> {
+    let (inner, proof) = admitted.consume().map_err(SessionAdmitError::from_safety)?;
+    inner.admit_routed_with_proof(prepared, reservation, &proof, now)
+}
+
+/// Admits an explicit internal session (autonomous cleanup, recorder, Legacy polling-only session,
+/// or action-broker-owned session) that has no external routed terminal reservation.
+pub fn admit_internal(
     admitted: Admitted<'_>,
     prepared: PreparedSession,
     now: Instant,
 ) -> Result<SessionId, SessionAdmitError> {
     let (inner, proof) = admitted.consume().map_err(SessionAdmitError::from_safety)?;
-    inner.admit_session_with_proof(prepared, &proof, now)
+    inner.admit_internal_with_proof(prepared, &proof, now)
 }
 
 impl SupervisorInner {
@@ -850,9 +886,36 @@ impl SupervisorInner {
     #[inline]
     pub fn sessions_mut(&mut self) -> &mut SessionDriver { &mut self.sessions }
 
-    pub(crate) fn admit_session_with_proof(
+    pub(crate) fn admit_routed_with_proof(
         &mut self,
         prepared: PreparedSession,
+        reservation: super::reply_router::SessionTerminalReservation,
+        proof: &AdmittedProof,
+        now: Instant,
+    ) -> Result<SessionId, SessionAdmitError> {
+        let ticket = reservation.into_ticket();
+        let terminal = SessionTerminalBinding::Routed {
+            request: ticket.request(),
+            route_gen: ticket.route_gen(),
+            client: ticket.client(),
+            action_id: ticket.action_id(),
+        };
+        self.admit_session_inner(prepared, terminal, proof, now)
+    }
+
+    pub(crate) fn admit_internal_with_proof(
+        &mut self,
+        prepared: PreparedSession,
+        proof: &AdmittedProof,
+        now: Instant,
+    ) -> Result<SessionId, SessionAdmitError> {
+        self.admit_session_inner(prepared, SessionTerminalBinding::Internal, proof, now)
+    }
+
+    fn admit_session_inner(
+        &mut self,
+        prepared: PreparedSession,
+        terminal: SessionTerminalBinding,
         proof: &AdmittedProof,
         now: Instant,
     ) -> Result<SessionId, SessionAdmitError> {
@@ -893,7 +956,9 @@ impl SupervisorInner {
         if let Err(code) = self.check_operator_requirement(authority.operator, now) {
             return Err(SessionAdmitError::AuthorityRejected(code));
         }
-        let id = self.sessions.admit_with_authority(prepared, authority, now, true)?;
+        let id = self
+            .sessions
+            .admit_with_authority(prepared, authority, terminal, now, true)?;
         if prepared.slot == SessionSlot::ExclusiveOutput && prepared.kind != SessionKind::MacroBacked {
             self.release_servo_target();
             self.servo_stream_active = false;
@@ -1300,7 +1365,13 @@ impl SupervisorInner {
         };
         let session_id = self
             .sessions
-            .admit_with_authority(prepared, authority, now, true)
+            .admit_with_authority(
+                prepared,
+                authority,
+                SessionTerminalBinding::Internal,
+                now,
+                true,
+            )
             .map_err(|_| RecorderStartError::SlotBusy)?;
         self.rt_recorder.begin(op_id, session_id, max_frames, bound_action_id);
         Ok(RecorderStartAck {

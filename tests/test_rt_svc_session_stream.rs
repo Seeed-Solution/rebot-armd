@@ -30,7 +30,7 @@ use armd::model::ArmConfig;
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{
     ActionId, AdmitError, Authority, BootId, ClientId, DeliveryDecision, ImmediateOp, Outcome,
-    Reply, RequestId, Submit,
+    Reply, Submit,
 };
 use armd::rt_core::executor::{ExecutorConfig, PanicPolicy};
 use armd::rt_core::ids::ArmId;
@@ -41,7 +41,7 @@ use armd::rt_core::reply_router::{
 use armd::rt_core::requests::config::{ConfigReply, ConfigRequest};
 use armd::rt_core::safe_hold::SafeHoldReason;
 use armd::rt_core::session::{
-    admit_session, PhaseStepOutcome, PreparedSession, ReleaseCtx, SessionAdmitError,
+    admit_internal, admit_routed, PhaseStepOutcome, PreparedSession, ReleaseCtx, SessionAdmitError,
     SessionId, SessionKind, SessionSlot, SessionState, SessionStep, SessionTerminalReason,
     SessionTerminalRecord, WorkerReply, WorkerReplyError, WorkerTicket,
 };
@@ -183,7 +183,7 @@ async fn cancellation_in_every_session_and_cf1_phase() {
 
     // (a) Running phase cancellation + duplicate suppression.
     let admitted = inner.check_admission(make_admit_stamp(11, lease_gen, epoch, stop_gen, 1)).unwrap();
-    let sid = admit_session(admitted, PreparedSession::exclusive(SessionKind::Custom(1), ClientId(11)), now).unwrap();
+    let sid = admit_internal(admitted, PreparedSession::exclusive(SessionKind::Custom(1), ClientId(11)), now).unwrap();
     assert!(inner.sessions().blocks_ordinary_output(None));
     let out = inner
         .sessions_mut()
@@ -199,7 +199,7 @@ async fn cancellation_in_every_session_and_cf1_phase() {
 
     // (b) AwaitWorker phase cancellation invalidates ticket cleanly.
     let admitted2 = inner.check_admission(make_admit_stamp(11, lease_gen, epoch, stop_gen, 2)).unwrap();
-    let sid2 = admit_session(admitted2, PreparedSession::exclusive(SessionKind::Custom(2), ClientId(11)), now).unwrap();
+    let sid2 = admit_internal(admitted2, PreparedSession::exclusive(SessionKind::Custom(2), ClientId(11)), now).unwrap();
     let rctx = make_release_ctx(now, epoch, stop_gen);
     let step = inner
         .sessions_mut()
@@ -351,8 +351,8 @@ async fn cancellation_in_every_session_and_cf1_phase() {
 // 3. Stale worker replies, deadline expiry, TX cutoff & slot independence
 // ---------------------------------------------------------------------------
 
-#[test]
-fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     time_this_thread();
     let (mut inner, lease_gen, epoch) = new_core_with_lease(22);
     let now = Instant::now();
@@ -362,7 +362,7 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     let mut expired_prep = PreparedSession::exclusive(SessionKind::Custom(10), ClientId(22));
     expired_prep.deadline = Some(now);
     let adm = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 1)).unwrap();
-    assert_eq!(admit_session(adm, expired_prep, now), Err(SessionAdmitError::DeadlineExpired));
+    assert_eq!(admit_internal(adm, expired_prep, now), Err(SessionAdmitError::DeadlineExpired));
 
     // Admit ExclusiveOutput with parent deadline 80ms + child deadline 30ms.
     let mut prep = PreparedSession::exclusive(SessionKind::Custom(11), ClientId(22));
@@ -371,13 +371,13 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     prep.timeout_code = "SESSION_TIMEOUT";
     prep.child_timeout_code = "CHILD_TIMEOUT";
     let adm2 = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 2)).unwrap();
-    let sid = admit_session(adm2, prep, now).unwrap();
+    let sid = admit_internal(adm2, prep, now).unwrap();
 
     // ExclusiveOutput deadline feeds active_action_deadline (child 30ms < parent 80ms).
     assert_eq!(inner.active_action_deadline(), Some(now + Duration::from_millis(30)));
     // Independent Recorder admits concurrently while ExclusiveOutput is busy.
     let adm_rec = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 3)).unwrap();
-    let rec_id = admit_session(adm_rec, PreparedSession::recorder(ClientId(22)), now).unwrap();
+    let rec_id = admit_internal(adm_rec, PreparedSession::recorder(ClientId(22)), now).unwrap();
     assert_ne!(sid, rec_id);
 
     // Pre-TX gate passes while Running within cutoff, rejects Recorder, expired cutoff, AwaitWorker, and cancelled!
@@ -480,32 +480,56 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     assert!(inner.sessions_mut().clear_terminal_slot(SessionSlot::ExclusiveOutput, sid));
 
     // Full RT terminal SPSC ring (cap=1) retains pending terminal and blocks slot reuse until drained.
-    let mut p1 = PreparedSession::exclusive(SessionKind::Custom(20), ClientId(22));
-    p1.request_id = Some(RequestId(SESSION_REQUEST_ID_BIT | 1));
+    let router_sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    router_sup.set_lease_enabled(false).await;
+    let router_exec = router_sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(8)))
+        .await
+        .unwrap();
+    let _ = router_exec.open_connection_sync(22).unwrap();
+    let noop_sink = Arc::new(|_c: ClientId, _r: Reply| DeliveryDecision::Delivered);
+    let _tok_22 = router_exec
+        .register_connection_reply_sink(ClientId(22), noop_sink, Some(4))
+        .unwrap();
+
+    let mut g1 = router_exec
+        .reserve_session_terminal(ClientId(22), ActionId(1), ExternalDestinationPolicy::ConnectionOnly)
+        .unwrap();
+    let r1 = g1.stage_for_admission().unwrap();
+    let r1_req = r1.request();
+    let p1 = PreparedSession::exclusive(SessionKind::Custom(20), ClientId(22));
     let a1 = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 4)).unwrap();
-    let id1 = admit_session(a1, p1, now).unwrap();
+    let id1 = admit_routed(a1, p1, r1, now).unwrap();
+    g1.commit_transferred();
     assert!(inner.sessions_mut().finish_slot(SessionSlot::ExclusiveOutput, id1, SessionTerminalReason::Completed, false).is_some());
     assert!(!inner.sessions_mut().clear_terminal_slot(SessionSlot::ExclusiveOutput, id1), "must block reuse before flush");
     assert_eq!(inner.sessions_mut().flush_published_terminals(), 1);
     assert!(inner.sessions_mut().clear_terminal_slot(SessionSlot::ExclusiveOutput, id1));
 
-    let mut p2 = PreparedSession::exclusive(SessionKind::Custom(21), ClientId(22));
-    p2.request_id = Some(RequestId(SESSION_REQUEST_ID_BIT | 2));
+    let mut g2 = router_exec
+        .reserve_session_terminal(ClientId(22), ActionId(2), ExternalDestinationPolicy::ConnectionOnly)
+        .unwrap();
+    let r2 = g2.stage_for_admission().unwrap();
+    let r2_req = r2.request();
+    let p2 = PreparedSession::exclusive(SessionKind::Custom(21), ClientId(22));
     let a2 = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 5)).unwrap();
-    let id2 = admit_session(a2, p2, now).unwrap();
+    let id2 = admit_routed(a2, p2, r2, now).unwrap();
+    g2.commit_transferred();
     assert!(inner.sessions_mut().finish_slot(SessionSlot::ExclusiveOutput, id2, SessionTerminalReason::Completed, false).is_some());
     assert_eq!(inner.sessions_mut().flush_published_terminals(), 0, "full ring retains terminal inline");
     assert!(inner.sessions().has_pending_terminal(SessionSlot::ExclusiveOutput));
     assert!(!inner.sessions_mut().clear_terminal_slot(SessionSlot::ExclusiveOutput, id2));
-    assert_eq!(rx.try_pop().unwrap().payload.request, RequestId(SESSION_REQUEST_ID_BIT | 1));
+    assert_eq!(rx.try_pop().unwrap().payload.request, r1_req);
     assert_eq!(inner.sessions_mut().flush_published_terminals(), 1);
     assert!(inner.sessions_mut().clear_terminal_slot(SessionSlot::ExclusiveOutput, id2));
-    assert_eq!(rx.try_pop().unwrap().payload.request, RequestId(SESSION_REQUEST_ID_BIT | 2));
+    assert_eq!(rx.try_pop().unwrap().payload.request, r2_req);
+    router_exec.stop_and_join();
+
     // Verify pre-TX gate rejects explicitly cancelled session even while lease/epoch/stop are live.
     let mut p_cancel = PreparedSession::exclusive(SessionKind::Custom(23), ClientId(22));
     p_cancel.deadline = Some(now + Duration::from_millis(200));
     let a_cancel = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 7)).unwrap();
-    let id_cancel = admit_session(a_cancel, p_cancel, now).unwrap();
+    let id_cancel = admit_internal(a_cancel, p_cancel, now).unwrap();
     assert!(inner.sessions_mut().cancel_slot(SessionSlot::ExclusiveOutput, id_cancel, SessionTerminalReason::Cancelled("STOPPED"), false).is_some());
     assert_eq!(
         inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, id_cancel, now, now + Duration::from_millis(20)),
@@ -518,7 +542,7 @@ fn stale_worker_replies_deadline_expiry_and_tx_cutoff_exemption() {
     let mut p_stop = PreparedSession::exclusive(SessionKind::Custom(22), ClientId(22));
     p_stop.deadline = Some(now + Duration::from_millis(200));
     let a_stop = inner.check_admission(make_admit_stamp(22, lease_gen, epoch, stop_gen, 6)).unwrap();
-    let id_stop = admit_session(a_stop, p_stop, now).unwrap();
+    let id_stop = admit_internal(a_stop, p_stop, now).unwrap();
     assert!(inner.check_session_pre_tx(SessionSlot::ExclusiveOutput, id_stop, now, now + Duration::from_millis(20)).is_ok());
     let _ = inner.safety.trigger_e_stop();
     assert!(inner.safety.state().is_stopped());
@@ -630,11 +654,11 @@ async fn energized_uncertain_session_triggers_same_release_safe_hold_with_zero_a
         prep.deadline = Some(now + Duration::from_millis(35));
         prep.escalate_safe_hold_on_uncertain = true;
         let adm = inner.check_admission(make_admit_stamp(0, 0, ep, sg, 1001)).unwrap();
-        let sid = admit_session(adm, prep, now).unwrap();
+        let sid = admit_internal(adm, prep, now).unwrap();
         assert!(inner.sessions_mut().set_hw_state_uncertain(SessionSlot::ExclusiveOutput, sid, true));
 
         let adm_rec = inner.check_admission(make_admit_stamp(0, 0, ep, sg, 1002)).unwrap();
-        let _rec_id = admit_session(adm_rec, PreparedSession::recorder(ClientId(33)), now).unwrap();
+        let _rec_id = admit_internal(adm_rec, PreparedSession::recorder(ClientId(33)), now).unwrap();
         (ep, sg)
     };
     bus.clear_log();

@@ -44,7 +44,8 @@ use crate::supervisor::{
     JointGoalSnapshot, PreparedQuintic, SupervisorInner, OWNER_EXECUTOR,
 };
 pub use crate::rt_core::session::{
-    admit_session, ActiveSession, PhaseStepOutcome, PreparedSession, ReleaseCtx, SessionAdmitError,
+    admit_internal, ActiveSession, PhaseStepOutcome, PreparedSession, ReleaseCtx,
+    SessionAdmitError,
     SessionAuthority, SessionDriver, SessionDriverStats, SessionId, SessionKind, SessionOutcome,
     SessionSlot, SessionState, SessionStep, SessionTerminalReason, SessionTerminalRecord,
     WorkerReply, WorkerReplyError, WorkerTicket,
@@ -4295,7 +4296,6 @@ fn install_gripper_zero_check_rt(
         ClientId(proof.stamp().connection_id),
     );
     prepared_session.action_id = Some(ActionId(predicted_id));
-    prepared_session.request_id = None; // Single P-F1 terminal owned by ReleaseEngine::active.
     prepared_session.child_deadline =
         Some(ctx.now + Duration::from_secs_f64(motion_timeout_s + 2.0));
     prepared_session.deadline = Some(
@@ -4308,8 +4308,9 @@ fn install_gripper_zero_check_rt(
     prepared_session.revoke_on_stop = true;
     prepared_session.escalate_safe_hold_on_uncertain = true;
 
+    // Single P-F1 terminal owned by ReleaseEngine::active -> explicit internal session admission.
     let sid = this
-        .admit_session_with_proof(prepared_session, &proof, ctx.now)
+        .admit_internal_with_proof(prepared_session, &proof, ctx.now)
         .map_err(SessionAdmitError::code)?;
     if let Err(e) = this.safety.mark_motion_started() {
         let _ = this.sessions.cancel_slot(

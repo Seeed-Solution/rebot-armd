@@ -5474,6 +5474,29 @@ impl RtExecutorHandle {
             .pending_external_count()
     }
 
+    /// Reserves 1 bounded P-F1 terminal credit for a routed session and returns a dispatcher-side
+    /// RAII [`super::reply_router::SessionTerminalReservationGuard`].
+    pub fn reserve_session_terminal(
+        &self,
+        client: ClientId,
+        action_id: super::broker::ActionId,
+        policy: ExternalDestinationPolicy,
+    ) -> Result<super::reply_router::SessionTerminalReservationGuard, ExternalSubmitError> {
+        if self.shared.exited.load(Ordering::Acquire) {
+            return Err(ExternalSubmitError::Stopped);
+        }
+        let ticket = self
+            .shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reserve_session_terminal_direct(client, action_id, policy)?;
+        Ok(super::reply_router::SessionTerminalReservationGuard::new(
+            Arc::clone(&self.shared.reply_router),
+            ticket,
+        ))
+    }
+
     /// Reserves 1 bounded P-F1 terminal credit for a direct/no-wire-ACK session.
     pub fn reserve_session_terminal_direct(
         &self,
@@ -5481,6 +5504,9 @@ impl RtExecutorHandle {
         action_id: super::broker::ActionId,
         policy: ExternalDestinationPolicy,
     ) -> Result<super::reply_router::SessionTerminalTicket, ExternalSubmitError> {
+        if self.shared.exited.load(Ordering::Acquire) {
+            return Err(ExternalSubmitError::Stopped);
+        }
         self.shared
             .reply_router
             .lock()
@@ -5526,6 +5552,15 @@ impl RtExecutorHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .global_reserved()
+    }
+
+    /// Current reserved credits held for `client`'s live connection slot (tests / diagnostics).
+    pub fn router_connection_reserved(&self, client: ClientId) -> Option<usize> {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connection_reserved(client)
     }
 
     pub fn disconnect_client(&self, client: ClientId) {

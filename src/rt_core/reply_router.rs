@@ -407,6 +407,113 @@ impl SessionTerminalTicket {
     pub fn route_gen(&self) -> u64 { self.route_gen }
 }
 
+/// Move-only typed terminal reservation proving 1 bounded P-F1 terminal credit was reserved on
+/// [`ActionReplyRouter`] before enqueueing a routed session request.
+///
+/// Consumed by value in [`super::session::admit_routed`] so a reservation can be bound to at most
+/// one live session and cannot be fabricated outside `reply_router`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionTerminalReservation {
+    ticket: SessionTerminalTicket,
+}
+
+impl SessionTerminalReservation {
+    #[inline]
+    pub(crate) fn from_ticket(ticket: SessionTerminalTicket) -> Self {
+        Self { ticket }
+    }
+
+    #[inline]
+    pub fn ticket(&self) -> SessionTerminalTicket { self.ticket }
+    #[inline]
+    pub fn request(&self) -> RequestId { self.ticket.request }
+    #[inline]
+    pub fn client(&self) -> ClientId { self.ticket.client }
+    #[inline]
+    pub fn action_id(&self) -> ActionId { self.ticket.action_id }
+    #[inline]
+    pub fn route_gen(&self) -> u64 { self.ticket.route_gen }
+
+    #[inline]
+    pub(crate) fn into_ticket(self) -> SessionTerminalTicket { self.ticket }
+}
+
+/// Dispatcher-side RAII owner of 1 reserved P-F1 session terminal credit.
+///
+/// Automatically releases the reserved credit on [`Drop`] if enqueue fails, owner admission is
+/// rejected, or the caller future is cancelled before admission completes. Call
+/// [`Self::stage_for_admission`] once to extract the move-only [`SessionTerminalReservation`] for
+/// enqueue, then call [`Self::commit_transferred`] strictly after the owner confirms admission so
+/// ownership transfers exactly once to the live session.
+pub struct SessionTerminalReservationGuard {
+    router: Arc<Mutex<ActionReplyRouter>>,
+    ticket: Option<SessionTerminalTicket>,
+    staged: bool,
+}
+
+impl std::fmt::Debug for SessionTerminalReservationGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionTerminalReservationGuard")
+            .field("ticket", &self.ticket)
+            .field("staged", &self.staged)
+            .finish()
+    }
+}
+
+impl SessionTerminalReservationGuard {
+    pub(crate) fn new(
+        router: Arc<Mutex<ActionReplyRouter>>,
+        ticket: SessionTerminalTicket,
+    ) -> Self {
+        Self {
+            router,
+            ticket: Some(ticket),
+            staged: false,
+        }
+    }
+
+    #[inline]
+    pub fn ticket(&self) -> Option<SessionTerminalTicket> {
+        self.ticket
+    }
+
+    /// Extracts the single move-only [`SessionTerminalReservation`] for enqueue into
+    /// [`super::session::admit_routed`]. May be called at most once; RAII rollback remains armed
+    /// until [`Self::commit_transferred`] is invoked after owner admission succeeds.
+    pub fn stage_for_admission(&mut self) -> Option<SessionTerminalReservation> {
+        if self.staged {
+            return None;
+        }
+        let ticket = self.ticket?;
+        self.staged = true;
+        Some(SessionTerminalReservation::from_ticket(ticket))
+    }
+
+    /// Disarms RAII rollback once the owner has admitted the session and taken ownership of the
+    /// reservation credit.
+    #[inline]
+    pub fn commit_transferred(&mut self) {
+        self.ticket = None;
+    }
+
+    /// Explicitly releases the reserved credit now (idempotent; also invoked on [`Drop`]).
+    pub fn release_now(&mut self) -> bool {
+        let Some(ticket) = self.ticket.take() else {
+            return false;
+        };
+        self.router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_session_terminal(&ticket)
+    }
+}
+
+impl Drop for SessionTerminalReservationGuard {
+    fn drop(&mut self) {
+        let _ = self.release_now();
+    }
+}
+
 /// Result of attempting to emit a session terminal through [`ActionReplyRouter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionTerminalEmit {
@@ -904,6 +1011,14 @@ impl ActionReplyRouter {
 
     pub(crate) fn global_reserved(&self) -> usize {
         self.global_reserved
+    }
+
+    pub(crate) fn connection_reserved(&self, client: ClientId) -> Option<usize> {
+        self.client_to_slot
+            .get(&client)
+            .and_then(|&idx| self.slots[idx].as_ref())
+            .filter(|s| s.client == client && !s.closed.load(Ordering::Acquire))
+            .map(|s| s.reserved)
     }
 
     /// Registers a per-connection reply sink in a free fixed slot with a strictly monotonic

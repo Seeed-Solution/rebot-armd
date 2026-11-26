@@ -3326,7 +3326,13 @@ impl crate::supervisor::SupervisorInner {
         };
         let session_id = self
             .sessions
-            .admit_with_authority(prepared, session_auth, owner_now, false)
+            .admit_with_authority(
+                prepared,
+                session_auth,
+                crate::rt_core::session::SessionTerminalBinding::Internal,
+                owner_now,
+                false,
+            )
             .map_err(|_| {
                 ConfigError::Busy("a hardware commissioning operation is already running")
             })?;
