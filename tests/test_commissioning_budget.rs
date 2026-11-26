@@ -68,6 +68,13 @@ fn spin_for(dur: Duration) {
         return;
     }
     let start = Instant::now();
+    // Sleep the bulk minus a 300 us spin tail so parallel test runs don't saturate host cores
+    // while keeping sub-50 us timing accuracy for SG2002 0.4–1.5 ms I/O intervals.
+    if let Some(sleep_part) = dur.checked_sub(Duration::from_micros(300)) {
+        if !sleep_part.is_zero() {
+            std::thread::sleep(sleep_part);
+        }
+    }
     while start.elapsed() < dur {
         std::hint::spin_loop();
     }
@@ -249,6 +256,9 @@ impl Sg2002WallBus {
 
 impl CanTransport for Sg2002WallBus {
     fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+    fn flush_is_noop(&self) -> bool {
         true
     }
     fn supports_nonblocking_rt(&self) -> bool {
@@ -1024,6 +1034,98 @@ async fn sg2002_legacy_tick_output_precedes_commissioning_and_release_cutoff_is_
         (1..=4).contains(&sent_in_one_release),
         "normal SG2002 release must send 1..=4 bounded commissioning frames (got {sent_in_one_release})"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sg2002_legacy_post_tick_commissioning_never_blocks_on_contended_lock() {
+    let bus = Sg2002WallBus::new(0x5602_0005, 0, 0);
+    let dm = build_sg2002_driver(bus.clone());
+    let cfg = ArmConfig {
+        lease_timeout_ms: 15_000,
+        workspace: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(dm)));
+
+    // Warm up and start a 6-axis ReadIdentity commissioning op.
+    bus.begin_release();
+    sup.control_tick_with_deadline(0.02, Instant::now() + Duration::from_millis(20))
+        .await;
+    let (lease_gen, epoch, stop_gen) = {
+        let mut inner = sup.inner().write().await;
+        let gen = inner.acquire_lease("connection:1").unwrap();
+        (gen, inner.safety.epoch_id(), inner.current_stop_gen())
+    };
+    let mut joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        joints[i] = i;
+    }
+    let start_req = CommissioningStartRequest {
+        kind: CommissioningOpKind::ReadIdentity,
+        joints,
+        joint_len: 6,
+        timeout_counts: 0,
+        references: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        authority: CommissioningAuthority {
+            conn_id: 1,
+            lease_holder: Some((armd::model::HolderLabel::new("connection:1"), lease_gen)),
+            operator_grant: OperatorGrant::unenforced(),
+            expected_epoch: epoch,
+            expected_stop_gen: stop_gen,
+            grant_id: None,
+            txn_id: 0,
+        },
+        txn_deadline: Instant::now() + Duration::from_secs(15),
+        prior_disk_mutated: false,
+    };
+    let _op_id = match sup
+        .dispatch_config_request(ConfigRequest::StartCommissioning(start_req))
+        .await
+        .unwrap()
+    {
+        ConfigReply::CommissioningStarted(Ok(id)) => id,
+        _ => panic!("unexpected StartCommissioning reply"),
+    };
+
+    // Contention trigger: as soon as the first post-tick commissioning micro-step transmits a
+    // frame, signal a background task to acquire `SupervisorLock::read` as soon as micro-step 1
+    // drops its write guard and hold it for 45 ms (well past the 20 ms release deadline).
+    let (tx_sig, rx_sig) = tokio::sync::oneshot::channel::<()>();
+    let tx_sig_slot = Arc::new(Mutex::new(Some(tx_sig)));
+    bus.with(|s| {
+        let slot = Arc::clone(&tx_sig_slot);
+        s.on_first_comm_tx = Some(Box::new(move || {
+            if let Some(ch) = slot.lock().unwrap().take() {
+                let _ = ch.send(());
+            }
+        }));
+    });
+    let sup_holder = Arc::clone(&sup);
+    let holder_acquired = Arc::new(AtomicBool::new(false));
+    let holder_acq_bg = Arc::clone(&holder_acquired);
+    let holder_jh = tokio::spawn(async move {
+        let _ = rx_sig.await;
+        let _guard = sup_holder.inner().read().await;
+        holder_acq_bg.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(45)).await;
+    });
+
+    bus.begin_release();
+    let tick_start = Instant::now();
+    let release_deadline = tick_start + Duration::from_millis(20);
+    sup.control_tick_with_deadline(0.02, release_deadline).await;
+    let tick_elapsed = tick_start.elapsed();
+
+    println!(
+        "[SG2002-COMM lock-contention] tick_elapsed_ms={:.2} holder_acquired={}",
+        tick_elapsed.as_secs_f64() * 1e3,
+        holder_acquired.load(Ordering::Acquire),
+    );
+    assert!(
+        tick_elapsed < Duration::from_millis(15),
+        "optional post-tick commissioning MUST NOT block on contended SupervisorLock past release deadline (elapsed={tick_elapsed:?})"
+    );
+    let _ = holder_jh.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

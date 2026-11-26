@@ -14739,7 +14739,6 @@ impl ArmSupervisor {
         comm_margin: Duration,
         tx_budget_dur: Duration,
     ) {
-        const LEGACY_COMM_GUARD_BUDGET: Duration = Duration::from_micros(1_200);
         const OFF_LOCK_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
         const MAX_OFF_LOCK_POLLS_PER_REQ: u8 = 3;
         const MAX_GUARD_STEPS_PER_RELEASE: u8 = 16;
@@ -14759,40 +14758,59 @@ impl ArmSupervisor {
         let mut first_step = true;
         let mut wait_polls_for_req: u8 = 0;
         let mut guard_steps: u8 = 0;
+        let mut lock_yields: u8 = 0;
 
         while guard_steps < MAX_GUARD_STEPS_PER_RELEASE {
-            if self.owner_mode() != OWNER_LEGACY {
+            if self.owner_mode() != OWNER_LEGACY
+                || self.estop_state.is_latched()
+                || self.process_exit_requested.load(Ordering::Acquire)
+                || self.internal_fault_lane.is_fenced()
+            {
                 break;
             }
-            if !first_step && Instant::now() >= comm_release_cap {
+            // Never acquire `SupervisorLock` for optional commissioning once the release cutoff
+            // (`release_deadline - comm_margin`) has elapsed.
+            if Instant::now() >= comm_release_cap {
                 break;
             }
+            // Non-blocking acquisition: optional post-tick commissioning must NEVER queue behind
+            // another `SupervisorLock` holder and delay the next 50 Hz control release.
+            let Ok(mut inner) = self.inner.try_write() else {
+                if lock_yields >= 1 || Instant::now() >= comm_release_cap {
+                    break;
+                }
+                lock_yields = lock_yields.saturating_add(1);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            lock_yields = 0;
             let progress = {
-                let mut inner = self.inner.write().await;
                 let io_scope = crate::diagnostics::tick::HoldIoScope::enter();
                 inner.set_command(crate::mit::TIMEOUT_PATH);
-                if self.owner_mode() != OWNER_LEGACY || !inner.legacy_commissioning_eligible() {
+                let guard_start = Instant::now();
+                if self.owner_mode() != OWNER_LEGACY
+                    || guard_start >= comm_release_cap
+                    || !inner.legacy_commissioning_eligible()
+                {
                     inner.set_io_timing(io_scope.finish());
                     break;
                 }
-                let guard_start = Instant::now();
-                let step_cutoff = if guard_start >= comm_release_cap {
-                    guard_start
-                } else {
-                    (guard_start + LEGACY_COMM_GUARD_BUDGET).min(comm_release_cap)
-                };
                 let ctx = crate::rt_core::ops::CommitCtx {
                     arm: inner.core.id(),
                     boot: crate::rt_core::broker::BootId::process(),
                     now: guard_start,
                     stop_generation: inner.current_stop_gen(),
                 };
+                // Each guard executes at most 1 commissioning TX frame (keeping guard hold <= 2 ms
+                // on SG2002 0.4–0.6 ms/frame TX) while passing the true `comm_release_cap`
+                // (`release_deadline - comm_margin`) as the hardware TX/flush cutoff so transient
+                // OS jitter never causes false `SentFlushFailed` on non-noop flush transports.
                 let step_reg_tx = reg_tx_left.min(1);
                 let step_probe_tx = probe_tx_left.min(1);
                 let mut sys_now = Instant::now;
                 let p = inner.service_commissioning_step_with_cutoff(
                     &ctx,
-                    step_cutoff,
+                    comm_release_cap,
                     step_reg_tx,
                     Some(step_probe_tx),
                     first_step,
@@ -14802,6 +14820,7 @@ impl ArmSupervisor {
                 inner.set_io_timing(io_scope.finish());
                 p
             };
+            drop(inner);
             first_step = false;
             guard_steps = guard_steps.saturating_add(1);
             if progress.probe_tx_attempted > 0 {
