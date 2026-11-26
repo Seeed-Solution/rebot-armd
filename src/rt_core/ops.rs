@@ -2869,12 +2869,22 @@ impl<O: CoreOps> ReleaseFixture<O> {
             let post_exec_optional_cutoff = release_deadline
                 .checked_sub(crate::driver::OPTIONAL_WORK_RELEASE_MARGIN.min(period / 3))
                 .unwrap_or(started);
-            let post_cutoff = if is_urgent || self.engine.has_pending_urgent(&self.core) {
+            let post_now = self.clock.now();
+            let urgent_now = is_urgent || self.engine.has_pending_urgent(&self.core);
+            let post_cutoff = if urgent_now {
                 urgent_cutoff
             } else {
                 post_exec_optional_cutoff
             };
-            if self.clock.now() >= post_cutoff { break; }
+            if post_now >= post_cutoff {
+                if !urgent_now && post_now < urgent_cutoff {
+                    if let Some(urg) = report.poll.urgent_wake.filter(|w| *w < urgent_cutoff) {
+                        next = Some((urg, true));
+                        continue;
+                    }
+                }
+                break;
+            }
             self.engine.service_wake_with_clock(&mut self.core, &mut now_fn, release_deadline, next_gen, &mut report);
             next = if self.engine.has_pending_urgent(&self.core) && self.clock.now() < urgent_cutoff {
                 Some((self.clock.now(), true))

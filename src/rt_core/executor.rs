@@ -9985,12 +9985,23 @@ fn control_thread_main_inner(
                             )),
                         )
                         .unwrap_or(release_start);
-                    let post_cutoff = if is_urgent || engine.has_pending_urgent(&*core) {
+                    if control_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let post_now = now_inst();
+                    let urgent_now = is_urgent || engine.has_pending_urgent(&*core);
+                    let post_cutoff = if urgent_now {
                         urgent_wake_cutoff
                     } else {
                         post_exec_optional_cutoff
                     };
-                    if control_stop.load(Ordering::Acquire) || now_inst() >= post_cutoff {
+                    if post_now >= post_cutoff {
+                        if !urgent_now && post_now < urgent_wake_cutoff {
+                            if let Some(urg) = report.poll.urgent_wake.filter(|w| *w < urgent_wake_cutoff) {
+                                next_wake = Some((urg, true));
+                                continue;
+                            }
+                        }
                         break;
                     }
                     wakes += 1;
