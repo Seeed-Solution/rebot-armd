@@ -515,11 +515,12 @@ impl ActionDiagEntry {
         if self.sealed {
             return;
         }
+        let had_phase = self.current_phase.is_some() || !self.phase_ms.is_empty();
         if let Some((prev_phase, start)) = self.current_phase.take() {
             let ms = terminal_at.saturating_duration_since(start).as_millis() as u32;
             *self.phase_ms.entry(prev_phase).or_insert(0) += ms;
         }
-        if mark_done_phase {
+        if mark_done_phase && had_phase {
             self.phase_ms.entry("done".to_owned()).or_insert(0);
         }
         self.sealed = true;
