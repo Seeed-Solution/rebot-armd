@@ -15448,7 +15448,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = true;
-            self.shadow_disable_pass_sent_mask = 0;
+            self.shadow_disable_pass_sent_mask = if skip_dispatched {
+                self.disable_dispatched_mask
+            } else {
+                0
+            };
         }
         for idx in 0..self.motor_ids.len() {
             if skip_dispatched && idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
@@ -16126,7 +16130,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 self.defer_disable_shadow = true;
-                self.shadow_disable_pass_sent_mask = 0;
+                self.shadow_disable_pass_sent_mask = self.disable_dispatched_mask;
             }
             for idx in 0..self.motor_ids.len() {
                 if idx < 64 && (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
@@ -18305,7 +18309,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.defer_disable_shadow = true;
-            self.shadow_disable_pass_sent_mask = 0;
+            self.shadow_disable_pass_sent_mask = self.disable_dispatched_mask;
         }
         for idx in 0..n {
             if (self.disable_dispatched_mask & (1u64 << idx)) != 0 {
