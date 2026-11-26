@@ -2207,4 +2207,58 @@ mod tests {
         );
         assert_eq!(hub.read_services(ReadRequirements::identity()).unwrap().publish_seq, 5);
     }
+
+    #[tokio::test]
+    async fn supervisor_read_services_works_on_legacy_and_executor_and_tracks_motion_generation() {
+        let sup = Arc::new(crate::supervisor::ArmSupervisor::new(crate::ArmConfig::rebot_dm()));
+
+        // Legacy without control ticker falls back cleanly under one read guard.
+        let legacy_svc = sup
+            .read_services(ReadRequirements::identity())
+            .await
+            .expect("legacy no-ticker read_services");
+        assert_eq!(legacy_svc.identity.dof, 7);
+        assert_eq!(legacy_svc.identity.arm_dof, 6);
+        assert!(legacy_svc.motion_idle);
+
+        // Start RT executor and wait for its first post-handoff published sample.
+        let handle = sup
+            .start_executor(super::super::executor::ExecutorConfig::for_tests(
+                Duration::from_millis(20),
+            ))
+            .await
+            .expect("start executor");
+        let mut exec_svc = None;
+        for _ in 0..50 {
+            if let Ok(s) = sup.read_services(ReadRequirements::default()).await {
+                exec_svc = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s1 = exec_svc.expect("executor must publish coherent ServiceSnapshot past handoff");
+        assert!(s1.publish_seq >= 1);
+        assert!(s1.release_seq >= 1);
+        assert_eq!(s1.identity.boot, s1.boot);
+        let gen_before = s1.motion_generation;
+
+        // Triggering E-stop bumps epoch and motion_generation on the next release.
+        let _ = sup.trigger_e_stop().await;
+        let mut s2 = None;
+        for _ in 0..50 {
+            if let Ok(s) = sup.read_services(ReadRequirements::default()).await {
+                if s.motion_generation > gen_before {
+                    s2 = Some(s);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s2 = s2.expect("motion_generation must advance after E-stop");
+        assert!(s2.motion_generation > gen_before);
+        assert!(s2.epoch_id > s1.epoch_id);
+        assert!(s2.release_seq > s1.release_seq);
+
+        handle.stop_and_join();
+    }
 }
