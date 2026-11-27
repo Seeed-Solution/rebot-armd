@@ -28,6 +28,7 @@ struct CliArgs {
     operator_pin: Option<String>,
     operator_pin_file: Option<String>,
     no_operator_auth: bool,
+    test_fail_executor_startup: bool,
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
@@ -60,6 +61,7 @@ where
                 --operator-pin <PIN>         operator unlock PIN (or ARMD_OPERATOR_PIN; enforces operator auth)\n\
                 --operator-pin-file <PATH>   path to write generated PIN with 0600 permissions (or ARMD_OPERATOR_PIN_FILE; default /userdata/rebot-teleop/operator.pin)\n\
                 --no-operator-auth           disable operator auth (unsafe on real hardware; mock/sim default is disabled)\n\
+                --test-fail-executor-startup ATTENDED TEST ONLY: fail the RT executor's control-thread spawn once at start to exercise the legacy fallback (rebot-dm with owner executor only; never in a service config)\n\
                 --help                       Print help\n\n\
                 Leader-following is not implemented. Hardware failures never fall back to mock.");
             std::process::exit(0);
@@ -68,6 +70,10 @@ where
             return Err(
                 "Leader-following is not implemented; refusing to start a simulated leader".into(),
             );
+        }
+        if arg == "--test-fail-executor-startup" {
+            cli.test_fail_executor_startup = true;
+            continue;
         }
         if arg == "--no-operator-auth" {
             cli.no_operator_auth = true;
@@ -158,6 +164,35 @@ where
         }
     }
     Ok(cli)
+}
+
+/// `--test-fail-executor-startup` makes the RT executor's control-thread spawn fail once so the
+/// recoverable handback to the legacy owner runs on the real hardware. It is refused before the
+/// hardware is opened unless the follower is `rebot-dm` and the resolved owner is the executor,
+/// and it logs an ERROR when armed.
+fn validate_test_fail_executor_startup(
+    armed: bool,
+    follower: &str,
+    owner: armd::rt_core::executor::RtOwner,
+) -> Result<(), String> {
+    if !armed {
+        return Ok(());
+    }
+    if follower != "rebot-dm" {
+        return Err(format!(
+            "--test-fail-executor-startup is only permitted with '--follower rebot-dm' (got '--follower {follower}')"
+        ));
+    }
+    if owner != armd::rt_core::executor::RtOwner::Executor {
+        return Err(format!(
+            "--test-fail-executor-startup needs the RT executor as owner (resolved owner: {}); use '--owner executor' or '--owner auto'",
+            owner.as_str()
+        ));
+    }
+    error!(
+        "--test-fail-executor-startup is ARMED: the RT executor start will fail on purpose and the legacy owner takes over; attended tests only, restart armd without this flag afterwards"
+    );
+    Ok(())
 }
 
 fn resolve_operator_auth(follower: &str, cli: &CliArgs) -> Result<OperatorAuth, String> {
@@ -997,6 +1032,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         follower,
         &config,
     )?;
+    validate_test_fail_executor_startup(cli.test_fail_executor_startup, follower, resolved_owner.effective)?;
     let mock_owner_test_mode = match std::env::var("ARMD_MOCK_TEST_OWNER_MODE") {
         Ok(raw) if !raw.trim().is_empty() => {
             if follower != "mock" {
@@ -1277,7 +1313,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             alloc_timing,
             true,
             armd::rt_core::executor::PanicPolicy::AbortProcess,
-            armd::rt_core::executor::PersistTestHooks::default(),
+            armd::rt_core::executor::PersistTestHooks {
+                fail_control_spawn: cli.test_fail_executor_startup,
+                ..Default::default()
+            },
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
