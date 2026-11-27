@@ -300,3 +300,39 @@ fn error_margin_source_stays_fallback_and_names_the_reason() {
     let m = reason(Some(&stale));
     assert!(m.reason.starts_with("fallback: stale") && m.measured_budget_m.is_none(), "{m:?}");
 }
+
+#[tokio::test]
+async fn nonzero_tcp_offset_envelope_points_stay_in_end_link_frame() {
+    // Custom tool whose TCP is +0.030 m ahead of end_link along +x (tool axis).
+    // With an end_link envelope point at +0.025 m along +x (5 mm BEHIND the TCP, not 25 mm
+    // ahead of it), a vertical grasp (tool +x straight down) has that envelope point 5 mm ABOVE
+    // the TCP, so z_min stays at grasp_height_m (0.015 m) rather than being pushed up by 25 mm.
+    let (c, s) = mounted();
+    let q = solve_camera_down(&c, &s, [0.30, 0.0, 0.26]);
+    let sc = scene_q(c, s, q).await;
+    let poly = bar([0.30, 0.0], 0.08, 0.030, 0.0);
+    let body = exact(request(&sc, &poly, 0.040), 0.040);
+    let inner = sc.sup.inner().read().await;
+    let pending = grasp::prepare(&inner, &legacy_of(&body), inner.safety.epoch_id()).unwrap();
+    let mut snap = armd::grasp_select::capture(&inner, &pending, &body).unwrap();
+    drop(inner);
+    snap.input.tcp_offset = [0.030, 0.0, 0.0];
+    snap.envelope = vec![[0.0, 0.0, 0.0], [0.025, 0.0, 0.0]];
+    let t = armd::grasp_select::snapshot::target(&snap).unwrap();
+    let (chords, _) = armd::grasp_select::candidates::chords(&t, &snap.tool);
+    let mut stats = armd::grasp_select::candidates::CheapStats::default();
+    let hy = armd::grasp_select::candidates::make(
+        &snap, &t, &chords[0], 0, (armd::grasp_select::candidates::DirClass::Vertical, 0.0, [1.0, 0.0]), false, false, 0, &mut stats,
+    ).expect("envelope point behind TCP must not push z_min into PAD_OVERLAP");
+    assert!((hy.g[2] - (snap.setup.table_z_m + snap.setup.grasp_height_m)).abs() < 1e-9, "gz={}", hy.g[2]);
+    // Now place an end_link point 0.010 m BEYOND the TCP (+0.040 m vs tcp_offset +0.030 m):
+    // vertical tool +x points down, so that point sits 10 mm BELOW the TCP and raises z_min by 10 mm
+    // above TABLE_CLEARANCE_M + IK_POSITION_ALLOWANCE_M (= 0.0165 m > grasp_height_m 0.015 m).
+    snap.envelope = vec![[0.0, 0.0, 0.0], [0.040, 0.0, 0.0]];
+    let hy2 = armd::grasp_select::candidates::make(
+        &snap, &t, &chords[0], 0, (armd::grasp_select::candidates::DirClass::Vertical, 0.0, [1.0, 0.0]), false, false, 1, &mut stats,
+    ).expect("10 mm protrusion raises z_min to 16.5 mm, still within 40 mm object");
+    let expected_z = snap.setup.table_z_m + grasp::TABLE_CLEARANCE_M + armd::grasp_select::candidates::IK_POSITION_ALLOWANCE_M + 0.010;
+    assert!((hy2.g[2] - expected_z).abs() < 1e-9, "gz={} expected={expected_z}", hy2.g[2]);
+    assert!((hy2.table_clearance_m - (grasp::TABLE_CLEARANCE_M + armd::grasp_select::candidates::IK_POSITION_ALLOWANCE_M)).abs() < 1e-9);
+}

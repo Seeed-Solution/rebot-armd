@@ -325,8 +325,15 @@ pub fn off_pad_contact(tool: &ToolVolumes, t: &Target, pose: &Pose, w: f64) -> O
     hit
 }
 
-/// Lowest z of `pts` (end_link / jaw frame) at orientation `r`, relative to the TCP.
+/// Lowest z of `pts` (jaw/TCP frame) at orientation `r`, relative to the TCP.
 fn lowest(r: &Mat3, pts: &[Vec3]) -> f64 { pts.iter().map(|p| kinematics::mat_vec(r, p)[2]).fold(0.0, f64::min) }
+
+/// Lowest z of `end_link`-frame `pts` at orientation `r`, relative to the TCP (`p - tcp_offset`).
+pub(super) fn lowest_end(r: &Mat3, pts: &[Vec3], tcp_offset: &Vec3) -> f64 {
+    pts.iter()
+        .map(|p| kinematics::mat_vec(r, &kinematics::sub(p, tcp_offset))[2])
+        .fold(0.0, f64::min)
+}
 
 /// Counters of the cheap stage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -390,10 +397,10 @@ fn build(s: &Snapshot, t: &Target, ch: &Chord, mut hy: Hypothesis, y_in: Vec3, p
         return Err(Rejection::new("geometry", "TOO_NARROW", format!("chord {width:.4} m")).with(width, MIN_CHORD_M));
     }
     let reserve = super::admission::jaw_check(width, t.hard_error_m, tool.open_width_m, tool.max_grasp_width_m)?;
-    // shallowest admissible contact: envelope points and open fingers TABLE_CLEARANCE_M above
-    // the table, the tips at least grasp_height_m
+    // shallowest admissible contact: envelope points (in end_link frame) and open fingers (in
+    // TCP/jaw frame) TABLE_CLEARANCE_M above the table, the tips at least grasp_height_m
     let finger_low = lowest(&r, &gripper_lattice(tool, tool.open_width_m));
-    let env_low = lowest(&r, &s.envelope);
+    let env_low = lowest_end(&r, &s.envelope, &s.input.tcp_offset);
     let z_min = (table + TABLE_CLEARANCE_M + IK_POSITION_ALLOWANCE_M - finger_low.min(env_low)).max(table + s.setup.grasp_height_m);
     let top_lo = table + t.height[0];
     let cos_t = -hy.a[2];
@@ -410,6 +417,8 @@ fn build(s: &Snapshot, t: &Target, ch: &Chord, mut hy: Hypothesis, y_in: Vec3, p
         deeper
     } else { z_min };
     let ov = overlap(gz);
+    // TODO(1.6.2): align pad-engagement check across both strategies after measuring real-arm
+    // pad geometry (on-site item G8).
     if ov < MIN_PAD_OVERLAP_M {
         return Err(Rejection::new("table", "PAD_OVERLAP", format!("the pads overlap the object by {:.4} m above the table clearance", ov)).with(ov, MIN_PAD_OVERLAP_M));
     }
