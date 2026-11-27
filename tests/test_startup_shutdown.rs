@@ -643,6 +643,86 @@ fn init_skips_wifi_without_a_wifi_interface() {
     assert!(!env.read("calls").contains("ap-guard"), "{}", env.read("calls"));
 }
 
+/// network.hotspot = off with the STA configured: the client is set up, then no wlan1, no AP,
+/// no console takeover, no guard and no dnsmasq restart.
+#[cfg(unix)]
+#[test]
+fn init_hotspot_off_starts_no_ap_guard_or_takeover() {
+    let env = ApEnv::new();
+    env.process(500, "hostapd -B /etc/hostapd_2g4.conf");
+    let out = env.run("HOTSPOT=off; STA_SSID=office; wpa_supplicant() { echo wpa >> \"$T/calls\"; }; wpa_cli() { echo \"wpa_cli $*\" >> \"$T/calls\"; echo 0; }; start_wifi");
+    let calls = env.read("calls");
+    assert!(calls.contains("wpa_cli -i wlan0 enable_network"), "STA still set up: {calls}");
+    assert_eq!(env.read("signals"), "", "console hostapd untouched: {out}");
+    assert!(out.contains("hostapd now: 500 \n"), "{out}");
+    assert!(!env.p("run/hostapd_arm.conf").exists(), "{out}");
+    for forbidden in ["hostapd ", "ap-guard", "ifconfig", "ssd -K", "interface add"] {
+        assert!(!calls.contains(forbidden), "{forbidden}: {calls}");
+    }
+    assert!(env.read("log").contains("network.hotspot=off"), "{}", env.read("log"));
+}
+
+/// off stops our own hostapd and guard that survive from an earlier start; a console or foreign
+/// hostapd stays.
+#[cfg(unix)]
+#[test]
+fn init_hotspot_off_cleans_up_surviving_rebot_processes_only() {
+    let env = ApEnv::new();
+    let out = env.run("start_wifi; : > \"$T/calls\"; : > \"$T/signals\"");
+    let own = env.own_pid();
+    assert!(env.p(&format!("proc/{own}")).is_dir(), "{out}");
+    env.process(800, "/bin/sh /etc/init.d/K92rebot-teleop ap-guard 5g 44");
+    env.process(700, "hostapd -B /etc/other_ap.conf");
+    std::fs::write(env.p("run/apguard.pid"), "800\n").unwrap();
+    let out = env.run("HOTSPOT=off; start_wifi");
+    let signals = env.read("signals");
+    assert!(signals.contains("-TERM 800\n") && signals.contains(&format!("-TERM {own}\n")), "{signals} / {out}");
+    assert!(!signals.contains("700"), "{signals}");
+    assert!(!env.p("run/apguard.pid").exists());
+    assert!(!env.p("run/hostapd_arm.pid").exists());
+    assert!(out.contains("hostapd now: 700 \n"), "{out}");
+}
+
+/// The direct `ap-guard` entry with hotspot off ends at once and starts nothing.
+#[cfg(unix)]
+#[test]
+fn init_ap_guard_with_hotspot_off_exits_without_ticks() {
+    let env = ApEnv::new();
+    std::fs::write(env.p("run/apguard.pid"), "1\n").unwrap();
+    let out = env.run("HOTSPOT=off; AP_GUARD_TICKS=3 ap_guard 5g 44; echo guard-returned");
+    assert!(out.contains("guard-returned"), "{out}");
+    assert!(!env.p("run/apguard.pid").exists());
+    assert!(!env.read("calls").contains("hostapd "), "{}", env.read("calls"));
+}
+
+/// The setting is read from network.hotspot; absent, "on" and invalid values keep the hotspot.
+#[cfg(unix)]
+#[test]
+fn init_parses_network_hotspot_default_on() {
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+    let parse = init_section(source, "config_shell_vars() {", "\n# 读取 supervisor");
+    let temp = tempfile::tempdir().unwrap();
+    let cases = [
+        (r#"{}"#, "on"),
+        (r#"{"network":{}}"#, "on"),
+        (r#"{"network":{"hotspot":"on"}}"#, "on"),
+        (r#"{"network":{"hotspot":"maybe"}}"#, "on"),
+        (r#"{"network":{"hotspot":"off"}}"#, "off"),
+        (r#"{"network":{"hotspot":false}}"#, "off"),
+    ];
+    for (json, want) in cases {
+        let cfg = temp.path().join("c.json");
+        std::fs::write(&cfg, json).unwrap();
+        let script = format!(
+            "{parse}\nHOTSPOT=on\neval \"$(config_shell_vars '{c}')\"\nprintf '%s' \"$HOTSPOT\"\n",
+            c = cfg.display()
+        );
+        let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(out.status.success(), "{json}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{json}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn init_takes_wlan1_over_from_the_console_hotspot_at_start() {

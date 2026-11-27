@@ -87,6 +87,14 @@
         "title_zh": "Wi-Fi 热点与联网配置",
         "items": [
           {
+            "key": "hotspot",
+            "type": "select",
+            "title": "Wi-Fi Hotspot (on = start the AP hotspot; off = no hotspot, the Wi-Fi client and the USB address 192.168.42.1 stay available)",
+            "title_zh": "Wi-Fi 热点（on = 启动 AP 热点；off = 不启动热点，Wi-Fi 客户端和 USB 地址 192.168.42.1 保持可用）",
+            "options": ["on", "off"],
+            "default": "on"
+          },
+          {
             "key": "ap_ssid",
             "type": "text",
             "title": "AP Hotspot SSID",

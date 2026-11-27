@@ -56,6 +56,8 @@ AP_CONF=/var/run/hostapd_arm.conf
 AP_PIDFILE=/var/run/hostapd_arm.pid
 AP_GUARD_PIDFILE=/var/run/rebot-teleop-apguard.pid
 AP_GUARD_TICKS=30  # x 2 s
+# network.hotspot: "off" starts no hotspot and no guard, and stops ours if it survives
+HOTSPOT="on"
 
 # SG2002 RT priority tuning (applied only when device-tree compatible matches SG2002/CV181x)
 RT_PROC_ROOT=${RT_PROC_ROOT:-/proc}
@@ -111,6 +113,7 @@ try:
     if 'ap_ssid' in net and net['ap_ssid']: put('AP_SSID', net['ap_ssid'])
     if 'ap_password' in net and net['ap_password']: put('AP_PASS', net['ap_password'])
     if 'ap_ip' in net and net['ap_ip']: put('AP_IP', net['ap_ip'])
+    if str(net.get('hotspot', 'on')).strip().lower() in ('off', 'false', '0'): put('HOTSPOT', 'off')
     if net.get('ap_band') in ('5g', '2g4'): put('AP_BAND', net['ap_band'])
     if str(net.get('ap_channel', '')).isdigit() and int(net['ap_channel']) > 0: put('AP_CHANNEL', int(net['ap_channel']))
     if 'sta_ssid' in net: put('STA_SSID', net['sta_ssid'])
@@ -279,6 +282,11 @@ stop_own_ap() {
 # (band $1, channel $2) when it is no longer running or no longer on its channel.
 ap_guard() {
     has_wifi || { rm -f "$AP_GUARD_PIDFILE"; return 0; }
+    if [ "${HOTSPOT:-on}" = off ]; then
+        hotspot_off
+        rm -f "$AP_GUARD_PIDFILE"
+        return 0
+    fi
     t=0
     off=0
     while [ "$t" -lt "${AP_GUARD_TICKS:-30}" ]; do
@@ -324,6 +332,15 @@ start_ap_guard() {
     start-stop-daemon -S -b -m -p "$AP_GUARD_PIDFILE" -a /bin/sh -- "$INIT_SCRIPT" ap-guard "$1" "$2" >/dev/null 2>&1 || true
 }
 
+# network.hotspot = off: stop our guard and our hostapd if they survive from an earlier start.
+# The console's own hotspot and any other hostapd are not touched; dnsmasq is not restarted.
+hotspot_off() {
+    echo "[rebot-teleop] network.hotspot is off: Wi-Fi AP hotspot and its guard not started"
+    logger -t "$NAME" "network.hotspot=off: AP hotspot and guard not started" 2>/dev/null || true
+    stop_own_ap
+    return 0
+}
+
 # True when the device has a Wi-Fi interface. Some models (e.g. PoE) have none; then the STA
 # connection, the AP hotspot and its guard are skipped and armd runs on the wired network.
 has_wifi() {
@@ -354,6 +371,13 @@ start_wifi() {
             wpa_cli -i wlan0 enable_network "$NID" >/dev/null 2>&1 || true
             wpa_cli -i wlan0 select_network "$NID" >/dev/null 2>&1 || true
         fi
+    fi
+
+    # network.hotspot = off: STA only, no wlan1, no AP, no console takeover, no guard
+    if [ "${HOTSPOT:-on}" = off ]; then
+        stop_ap_guard
+        hotspot_off
+        return 0
     fi
 
     # 2. 确保虚拟网卡 wlan1 存在
