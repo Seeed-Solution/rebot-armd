@@ -1,0 +1,374 @@
+/* ---------------------------------------------------------------
+   reBot Teleop — offline single-file UI (no external resources)
+   Visual language: SenseCraft UI light tokens
+   --------------------------------------------------------------- */
+:root {
+  --sc-color-primary: #8CC020;
+  --sc-color-primary-hover: #7aad1c;
+  --sc-color-primary-dark: #5B7D15;
+  --sc-color-primary-dark-hover: #547313;
+  --sc-color-primary-dark-active: #4D6A12;
+  --sc-color-primary-soft: #f1f8e3;
+  --sc-color-bg-container: #ffffff;
+  --sc-color-bg-layout: #f7fbf0;
+  --sc-color-bg-sunken: #f3f7ec;
+  --sc-color-border: #ddeec0;
+  --sc-color-border-neutral: #e5e7eb;
+  --sc-color-text: #1f2937;
+  --sc-color-text-secondary: #64748b;
+  --sc-color-text-tertiary: #9ca3af;
+  --sc-status-normal-bg: #effce8;
+  --sc-status-normal-fg: #357f11;
+  --sc-status-warning-bg: #fff7e6;
+  --sc-status-warning-fg: #96680c;
+  --sc-status-danger-bg: #fff1f0;
+  --sc-status-danger-fg: #c73c3e;
+  --sc-status-disabled-bg: #f5f5f5;
+  --sc-status-disabled-fg: #6a6f77;
+  --sc-estop: #dc2626;
+  --sc-estop-hover: #b91c1c;
+  --sc-radius-sm: 4px;
+  --sc-radius-base: 6px;
+  --sc-radius-md: 8px;
+  --sc-radius-lg: 12px;
+  --sc-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+  --sc-shadow-float: 0 6px 20px rgba(31, 41, 55, 0.12);
+  --sc-font-sans: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
+  --head-h: 60px;
+  --gap: 16px;
+  --stick: 120px;
+  --knob: 44px;
+  --disc: 172px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; overscroll-behavior: none; background: var(--sc-color-bg-layout); }
+body {
+  color: var(--sc-color-text);
+  font: 14px/1.45 var(--sc-font-sans);
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  overflow: hidden;
+}
+button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+input { font: inherit; color: inherit; -webkit-user-select: text; user-select: text; }
+svg { flex: none; }
+[hidden] { display: none !important; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+body.ui-simple .only-expert, body.ui-expert .only-simple { display: none !important; }
+
+/* ---------- surfaces ---------- */
+.sc-card {
+  background: var(--sc-color-bg-container);
+  border: 1px solid #e3efcc;
+  border-radius: var(--sc-radius-lg);
+  box-shadow: 0 4px 20px -2px rgba(91,125,21,0.07), 0 2px 8px -1px rgba(0,0,0,0.04), inset 0 1px 0 rgba(255,255,255,0.8);
+}
+.sc-card-title {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 14px; font-weight: 600; color: var(--sc-color-text); padding: 14px 16px 10px;
+}
+.sc-card-title small { font-size: 12px; font-weight: 400; color: var(--sc-color-text-tertiary); margin-left: 6px; }
+
+/* ---------- status badge (ui-kit .sc-status-badge, four states) ---------- */
+.sc-status-badge {
+  display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px;
+  border-radius: var(--sc-radius-base); font-size: 12px; line-height: 20px; font-weight: 500; white-space: nowrap;
+  background: var(--sc-status-disabled-bg); color: var(--sc-status-disabled-fg);
+  font-variant-numeric: tabular-nums;
+}
+.sc-status-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.sc-status-badge.plain::before { display: none; }
+.sc-status-badge.is-ok, .sc-status-badge.is-info, .sc-status-badge.sc-status-normal { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
+.sc-status-badge.is-warn, .sc-status-badge.sc-status-warning { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); }
+.sc-status-badge.is-danger, .sc-status-badge.sc-status-danger { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+
+/* ---------- segmented control ---------- */
+.seg {
+  display: inline-flex; padding: 3px; gap: 2px; border-radius: var(--sc-radius-md);
+  background: var(--sc-color-bg-sunken); border: 1px solid var(--sc-color-border);
+}
+.seg button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 34px; padding: 0 14px; border-radius: var(--sc-radius-base);
+  font-size: 13px; font-weight: 500; color: var(--sc-color-text-secondary); white-space: nowrap;
+  transition: background .15s, color .15s, box-shadow .15s;
+}
+.seg button svg { width: 15px; height: 15px; }
+.seg button:hover { color: var(--sc-color-text); }
+.seg button.on { background: #fff; color: var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-weight: 600; }
+.seg-sm button { min-height: 28px; padding: 0 10px; font-size: 12px; }
+.seg.off button, .seg button:disabled { cursor: not-allowed; }
+.seg.off { opacity: .45; filter: saturate(0); }
+.seg.off button.on { background: transparent; box-shadow: none; }
+body.locked .pose-go { cursor: not-allowed; }
+
+/* ---------- buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 40px; padding: 0 16px; border-radius: var(--sc-radius-md);
+  border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text);
+  font-weight: 500; transition: background .15s, border-color .15s, color .15s;
+}
+.btn svg { width: 18px; height: 18px; }
+.btn:hover { border-color: var(--sc-color-primary); color: var(--sc-color-primary-dark); }
+.btn:disabled { opacity: .45; pointer-events: none; }
+.btn-primary { background: var(--sc-color-primary-dark); border-color: var(--sc-color-primary-dark); color: #fff; }
+.btn-primary:hover { background: var(--sc-color-primary-dark-hover); border-color: var(--sc-color-primary-dark-hover); color: #fff; }
+.btn-primary:active { background: var(--sc-color-primary-dark-active); }
+
+.btn-estop {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  min-height: 56px; padding: 0 18px; border-radius: var(--sc-radius-lg);
+  background: linear-gradient(180deg, #ef4444 0%, #dc2626 60%, #b91c1c 100%); color: #fff; font-size: 17px; font-weight: 700; letter-spacing: .02em;
+  border: 1px solid #a51b1b; text-shadow: 0 1px 1px rgba(0,0,0,0.25);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -3px 0 rgba(127,17,17,0.35), 0 8px 18px -6px rgba(185,28,28,0.55), 0 2px 4px rgba(0,0,0,0.1);
+  touch-action: none; transition: filter .12s, transform .08s, box-shadow .12s;
+}
+.btn-estop svg { width: 22px; height: 22px; }
+.btn-estop span { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.15; }
+.btn-estop small { font-size: 11px; font-weight: 500; opacity: .85; letter-spacing: .04em; }
+.btn-estop:hover { filter: brightness(1.05); box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -3px 0 rgba(127,17,17,0.35), 0 10px 22px -6px rgba(185,28,28,0.6), 0 0 0 4px rgba(220,38,38,0.12); }
+.btn-estop:active { transform: translateY(2px); box-shadow: inset 0 2px 5px rgba(0,0,0,0.25), 0 3px 8px -4px rgba(185,28,28,0.5); }
+
+.btn-stop {
+  min-height: 56px; padding: 0 14px; border-radius: var(--sc-radius-lg);
+  font-size: 14px; font-weight: 600; color: var(--sc-color-text);
+  border: 1px solid #d97706; background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: none;
+  transition: transform .06s ease, filter .15s, box-shadow .15s, background .15s;
+}
+.btn-stop svg { width: 18px; height: 18px; color: #d97706; flex: none; }
+.btn-stop span { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.15; }
+.btn-stop small { font-size: 10px; font-weight: 500; color: var(--sc-color-text-secondary); letter-spacing: .04em; }
+.btn-stop:hover { background: #fffbe6; border-color: #b45309; }
+.btn-stop:active { transform: translateY(1px); background: #fef3c7; }
+.btn-stop:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ---------- app shell ---------- */
+.app { height: 100vh; height: 100dvh; display: flex; flex-direction: column; }
+.topbar {
+  flex: none; height: var(--head-h); display: flex; align-items: center; gap: 16px;
+  padding: 0 20px; padding-left: max(20px, env(safe-area-inset-left)); padding-right: max(20px, env(safe-area-inset-right));
+  background: #fff; border-bottom: 1px solid var(--sc-color-border);
+}
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand-mark { width: 32px; height: 32px; border-radius: var(--sc-radius-md); background: var(--sc-color-primary-dark); display: grid; place-items: center; }
+.brand-mark svg { width: 20px; height: 20px; }
+.brand-text { font-size: 16px; font-weight: 600; white-space: nowrap; }
+.brand-text small { display: block; font-size: 11px; font-weight: 400; color: var(--sc-color-text-tertiary); line-height: 1.2; }
+.ui-switch {
+  flex: none; margin: 0 auto; height: 28px; padding: 2px; gap: 2px; border-radius: 14px;
+  background: rgba(15, 23, 42, 0.06); border: 1px solid var(--sc-color-border-neutral);
+  align-items: center;
+}
+.ui-switch button {
+  min-width: 0; min-height: 22px; height: 22px; padding: 0 10px; border-radius: 11px;
+  font-size: 12px; font-weight: 500; line-height: 1; color: var(--sc-color-text-secondary);
+}
+.ui-switch button.on {
+  background: #fff; color: var(--sc-color-text); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.10);
+}
+/* the title never runs under the mode switch: it does not shrink below its text; it drops the subtitle, then the
+   text, as the header narrows (header probe at 360-1440 px, zh / en, simple / expert) */
+.brand { flex: none; }
+@media (max-width: 1279px) { .brand-text .full { display: none; } }
+@media (max-width: 999px) { .brand-text { display: none; } }
+@media (max-width: 899px) {
+  .topbar { gap: 8px; }
+  .head-stats #link-badge { display: none; }
+}
+.head-stats { display: flex; align-items: center; gap: 8px; }
+.speed-pill {
+  width: 52px; height: 26px; border-radius: 13px; padding: 0; margin: 0;
+  border: 1px solid var(--sc-color-border-neutral, #e5e7eb); background: #fff;
+  color: var(--sc-color-text-secondary, #4b5563); font-size: 12px; font-weight: 600;
+  text-align: center; display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; touch-action: manipulation; user-select: none; font-variant-numeric: tabular-nums;
+  line-height: 1; transition: background .15s, color .15s, border-color .15s;
+}
+.speed-pill:hover { color: var(--sc-color-text-primary, #111827); border-color: var(--sc-color-primary, #2563eb); }
+.speed-pill:focus-visible { outline: 2px solid var(--sc-color-primary, #2563eb); outline-offset: 2px; }
+.fs-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
+.fs-btn[hidden] { display: none; }
+.lang-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; height: 36px; min-width: 36px; padding: 0 10px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); font: 600 12px/1 inherit; font-family: inherit; white-space: nowrap; cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
+.lang-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
+.lang-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.op-btn { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; border-radius: 14px; border: 1px solid var(--sc-color-border-neutral); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
+.op-btn[hidden] { display: none; }
+.op-btn.is-unlocked { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); border-color: var(--sc-color-border); }
+.op-btn:hover { border-color: var(--sc-color-primary); }
+.op-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+/* operator unlock: small centred dialog, kept inside the visual viewport (on-screen keyboard) by opFit() */
+.op-modal { position: fixed; left: 0; right: 0; top: 0; height: 100dvh; z-index: 1060; display: flex; align-items: center; justify-content: center; padding: 12px 16px; overflow-y: auto;
+  background: rgba(15, 23, 42, 0.42); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); animation: tin .15s ease; overscroll-behavior: contain; }
+.op-modal[hidden] { display: none; }
+.op-dialog { width: min(380px, 100%); margin: auto; display: grid; gap: 10px; padding: 18px 18px 14px; border-radius: 16px; background: #fff; border: 1px solid var(--sc-color-border-neutral); box-shadow: 0 20px 48px rgba(0, 0, 0, 0.2); }
+.op-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.op-head h3 { margin: 0; font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
+.btn.op-estop { flex: none; min-height: 36px; padding: 0 12px; font-size: 13px; font-weight: 700; color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); touch-action: none; }
+.btn.op-estop:hover { color: #fff; background: var(--sc-estop); filter: brightness(1.06); }
+.preempt-head-acts { display: flex; align-items: center; gap: 6px; flex: none; }
+.btn.op-stop { flex: none; min-height: 36px; padding: 0 12px; font-size: 13px; font-weight: 600; color: #92400e; background: #fef3c7; border-color: #f59e0b; touch-action: none; }
+.btn.op-stop:hover { color: #92400e; background: #fde68a; border-color: #d97706; }
+.op-why { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.45; color: var(--sc-status-warning-fg); }
+.op-why:empty, .op-err:empty, .op-retry:empty { display: none; }
+.op-retry { margin: -4px 0 0; font-size: 12px; color: var(--sc-color-text-secondary); }
+/* short visual viewport (on-screen keyboard): keep the reason, the PIN field and the buttons */
+.op-modal.op-short { align-items: flex-start; padding-block: 8px; }
+.op-modal.op-short .op-dialog { gap: 6px; padding: 12px 14px 10px; }
+.op-modal.op-short .op-hint, .op-modal.op-short .op-retry { display: none; }
+.op-modal.op-short .op-dialog .field input { height: 40px; }
+.op-dialog form { display: grid; gap: 8px; }
+.op-dialog .field { font-size: 13px; }
+.op-dialog .field input { height: 44px; font-size: 20px; letter-spacing: .2em; text-align: center; }
+.op-dialog .field[hidden] { display: none; }
+.op-err { margin: 0; font-size: 13px; font-weight: 600; color: var(--sc-status-danger-fg); }
+.op-ok { margin: 0; font-size: 13px; color: var(--sc-status-normal-fg); }
+.op-ok:empty { display: none; }
+.op-hint { margin: 0; font-size: 12px; line-height: 1.5; color: var(--sc-color-text-secondary); }
+.op-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+.op-actions .btn { min-width: 88px; min-height: 40px; justify-content: center; }
+.op-actions .btn[hidden] { display: none; }
+body.op-open { overflow: hidden; }
+body.op-open .toasts { z-index: 1055; } /* under the dialog: a toast must not cover the PIN field or the buttons */
+/* in the safety card while a stop needs operator access to reset */
+.btn.op-inline { width: 100%; justify-content: center; margin-top: 8px; min-height: 40px; font-weight: 600; color: var(--sc-status-warning-fg); border-color: #ffd591; background: var(--sc-status-warning-bg); }
+.btn.op-inline[hidden] { display: none; }
+.fs-btn svg { width: 18px; height: 18px; }
+.fs-btn .ic-exit, .fs-btn.on .ic-enter { display: none; }
+.fs-btn.on .ic-exit { display: block; }
+.fs-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
+.fs-btn.on { background: var(--sc-color-primary); border-color: var(--sc-color-primary); color: #fff; }
+.fs-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+
+.main {
+  flex: 1; min-height: 0; display: grid; gap: var(--gap);
+  padding: var(--gap); padding-left: max(var(--gap), env(safe-area-inset-left)); padding-right: max(var(--gap), env(safe-area-inset-right));
+  grid-template-columns: minmax(0, 1fr) 380px;
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "stage side";
+}
+body.ui-expert .main {
+  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-rows: minmax(240px, 1fr) auto;
+  grid-template-areas: "stage side" "ops side";
+}
+.stage { grid-area: stage; min-height: 0; display: flex; }
+.ops { grid-area: ops; min-width: 0; }
+.side { grid-area: side; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-bottom: 4px; scrollbar-width: thin; }
+
+/* ---------- video ---------- */
+.video {
+  position: relative; flex: 1; min-height: 0; border-radius: var(--sc-radius-lg); overflow: hidden;
+  background: #e9f0de; border: 1px solid var(--sc-color-border); box-shadow: var(--sc-shadow);
+}
+.video video, .video .mjpeg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #1f2937; }
+.video .mjpeg { display: none; }
+.video .overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.vhint {
+  position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 20px;
+  background: #eef4e4; transition: opacity .3s; pointer-events: none;
+}
+.vhint.hide { opacity: 0; pointer-events: none; }
+.vhint-inner { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.vhint-icon { width: 56px; height: 56px; border-radius: 50%; display: grid; place-items: center; background: #fff; color: var(--sc-color-primary-dark); box-shadow: var(--sc-shadow); }
+.vhint-icon svg { width: 28px; height: 28px; }
+.vhint.connecting .vhint-icon { animation: breathe 1.4s ease-in-out infinite; }
+.vhint-title { font-size: 15px; font-weight: 600; }
+.vhint-sub { font-size: 12px; color: var(--sc-color-text-secondary); font-family: var(--mono); word-break: break-all; }
+.vhint-btn { margin-top: 4px; pointer-events: auto; }
+.vhint.hide .vhint-btn { visibility: hidden; pointer-events: none; }
+.vhint.connecting .vhint-btn { display: none; }
+@keyframes breathe { 50% { transform: scale(.92); opacity: .7; } }
+
+.hud { position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; flex-wrap: wrap; pointer-events: none; }
+.hud-r { left: auto; right: 12px; }
+.hud .sc-status-badge { background: rgba(255,255,255,0.55); backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); border: 1px solid rgba(255,255,255,0.6); border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.hud .sc-status-badge.is-ok { color: var(--sc-status-normal-fg); }
+.hud .sc-status-badge.is-warn { color: var(--sc-status-warning-fg); }
+.hud .sc-status-badge.is-danger { color: var(--sc-status-danger-fg); }
+#rec-chip { display: none; }
+/* Detect toggle: first item of the video HUD row (stays put as chips come and go), the .btn style at HUD chip scale */
+.det-ctl { display: inline-flex; align-self: center; pointer-events: auto; }
+.det-ctl[hidden] { display: none; }
+.det-btn { min-height: 28px; padding: 0 12px; gap: 6px; font-size: 12px; font-weight: 600; border-radius: 14px; background: rgba(255,255,255,0.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; touch-action: manipulation; }
+.det-btn::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--sc-status-disabled-fg); }
+.det-btn.btn-primary { background: var(--sc-color-primary-dark); }
+.det-btn.btn-primary::before { background: #fff; }
+.det-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.det-ctl { gap: 6px; flex-wrap: wrap; }
+/* vision mode selector (rebot-vision): HUD-scale segmented control next to Detect */
+.vmode { align-self: center; pointer-events: auto; padding: 2px; border-radius: 14px; background: rgba(255,255,255,0.9); border: 1px solid rgba(255,255,255,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.vmode[hidden] { display: none; }
+.vmode button { min-height: 24px; padding: 0 9px; border-radius: 12px; font-size: 12px; font-weight: 600; color: var(--sc-color-text); cursor: pointer; touch-action: manipulation; }
+#vmode button.on { background: var(--sc-color-primary-dark); color: #fff; box-shadow: none; }
+.vmode button:disabled { opacity: 0.45; cursor: default; }
+.vmode .vm-k { align-self: center; padding: 0 4px 0 8px; font-size: 12px; font-weight: 500; color: var(--sc-color-text-secondary); white-space: nowrap; }
+.vmode button:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 1px; }
+/* depth view (model estimate): the map canvas sits under the detection overlay and takes no pointer events; the
+   readout follows pointer events on the video box. Panel bottom-left, lifted above the grasp bar when that shows. */
+.video .depth-ov { pointer-events: none; image-rendering: pixelated; }
+.video .depth-ov[hidden] { display: none; }
+.depth-panel { position: absolute; z-index: 6; left: 12px; bottom: 12px; width: max-content; max-width: min(320px, calc(100% - 24px)); box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border-radius: 12px; font-size: 12px; pointer-events: auto;
+  background: rgba(255,255,255,0.88); border: 1px solid rgba(255,255,255,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+.depth-panel[hidden], .depth-read[hidden] { display: none; }
+.video:has(#grasp-bar:not([hidden])) .depth-panel { bottom: 72px; }
+.dp-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dp-title { flex: 1 1 auto; font-weight: 600; white-space: nowrap; }
+.dp-btn { min-height: 26px; padding: 0 9px; border-radius: 13px; font-size: 12px; font-weight: 600; touch-action: manipulation; }
+.dp-btn[aria-pressed="true"] { background: var(--sc-color-primary-dark); border-color: var(--sc-color-primary-dark); color: #fff; }
+.dp-x { min-width: 26px; padding: 0; }
+.dp-leg { display: grid; grid-template-columns: auto minmax(48px, 1fr) auto; gap: 0 6px; align-items: center; }
+.dp-end { white-space: nowrap; }
+.dp-bar { display: block; height: 8px; border-radius: 4px; }
+/* small video (phone portrait): tighter panel so most of the map stays visible */
+.video { container-type: inline-size; }
+@container (max-width: 520px) {
+  .depth-panel { left: 6px; bottom: 6px; max-width: calc(100% - 12px); padding: 4px 6px; gap: 2px; font-size: 11px; }
+  .dp-row { gap: 4px; }
+  .dp-btn { min-height: 24px; padding: 0 8px; font-size: 11px; }
+  .dp-x { min-width: 24px; }
+  .dp-sub { font-size: 10px; }
+  .dp-op { width: 56px; }
+  /* the slider keeps its label for assistive tech; on a small video only the slider shows */
+  .dp-op-k { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+.dp-op { width: 76px; margin: 0; }
+.dp-sub { font-size: 11px; color: var(--sc-color-text-secondary); }
+.dp-sub.is-warn { color: var(--sc-status-warning-fg); }
+.dp-status { margin-left: auto; white-space: nowrap; }
+.depth-read { position: absolute; z-index: 6; pointer-events: none; padding: 2px 7px; border-radius: 8px; white-space: nowrap; transform: translate(12px, -50%);
+  background: rgba(17,24,39,0.85); color: #fff; font: 600 12px var(--mono); }
+.det-btn.det-trig::before { background: var(--sc-color-primary-dark); border-radius: 2px; }
+.det-btn.det-trig.busy::before { animation: breathe 0.9s ease-in-out infinite; }
+/* camera power-state pill: idle (grey) / working (green) / snapshot (amber) */
+.fps-pill { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 14px; font-size: 12px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums;
+  background: rgba(255,255,255,0.8); color: var(--sc-status-disabled-fg); border: 1px solid rgba(255,255,255,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.fps-pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.fps-pill.is-work { color: var(--sc-status-normal-fg); background: rgba(239,252,232,0.92); }
+.fps-pill.is-snap { color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.92); }
+.fps-pill.is-snap::before { animation: breathe 0.9s ease-in-out infinite; }
+/* simple mode: one recognition chip in the HUD; Detect, vision mode, single shot, camera rate and grasp setup
+   open from it as a popover (#det-ctl). The camera chip carries the stream rate and latency (no #vstat). */
+.vis-chip { pointer-events: auto; }
+.vis-chip::after { content: ""; width: 0; height: 0; margin-left: 2px; border: 4px solid transparent; border-top-color: currentColor; border-bottom-width: 0; }
+.vis-chip[aria-expanded="true"]::after { border-top-width: 0; border-bottom: 4px solid currentColor; }
+body.ui-simple #det-ctl { display: none; }
+body.ui-simple.vis-open #det-ctl:not([hidden]) {
+  display: flex; position: absolute; z-index: 30; top: calc(100% + 8px); left: 0; width: max-content; max-width: min(300px, calc(100vw - 24px));
+  flex-wrap: wrap; align-items: center; gap: 8px 6px; padding: 8px; border-radius: 16px;
+  background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6); box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+body.ui-simple.vis-open #det-ctl .vmode { order: -1; flex: 1 0 100%; display: flex; flex-wrap: wrap; }
+body.ui-simple.vis-open #det-ctl .vmode[hidden] { display: none; }
+body.ui-simple.vis-open #det-ctl .vmode button { flex: 1 1 auto; }
+body.ui-simple.vis-open .hud { z-index: 9; }
+body.ui-simple.vis-open .move-hint { visibility: hidden; }
+body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
+
