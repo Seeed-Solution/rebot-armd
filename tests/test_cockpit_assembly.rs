@@ -113,7 +113,7 @@ fn splice_order_and_indented_lines() {
     assert_eq!(assemble::splice_target(" <!-- @include cockpit/b.js -->"), None, "indented lines are not splice points");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn copy_tree(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -128,7 +128,7 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn write_executable(path: &Path, content: &str) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -136,7 +136,7 @@ fn write_executable(path: &Path, content: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 struct DebFixture {
     _root: tempfile::TempDir,
     _conflicting_target: tempfile::TempDir,
@@ -148,7 +148,7 @@ struct DebFixture {
     models_dir: PathBuf,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn make_deb_fixture() -> DebFixture {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = tempfile::tempdir().unwrap();
@@ -196,7 +196,7 @@ fn make_deb_fixture() -> DebFixture {
     DebFixture { _root: root, _conflicting_target: conflicting, repo, conflicting_target, fake_bin, sdk_dir, vision_bin, models_dir }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_build_deb(fx: &DebFixture, args: &[&str]) -> std::process::Output {
     let orig_path = std::env::var("PATH").unwrap_or_default();
     Command::new("bash")
@@ -212,7 +212,8 @@ fn run_build_deb(fx: &DebFixture, args: &[&str]) -> std::process::Output {
         .expect("run build_deb.sh")
 }
 
-#[cfg(unix)]
+// Linux only: build_deb.sh uses GNU tar options (--sort=name).
+#[cfg(target_os = "linux")]
 #[test]
 fn build_deb_packages_armd_without_standalone_index_html() {
     assert!(!api_dir().join("cockpit/assembler/assemble.sh").exists(), "assemble.sh is gone");
