@@ -7918,8 +7918,8 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
                 armd::driver::JointMode::Position,
                 armd::driver::JointMode::Position,
             ];
-            let _ = drv.set_joint_modes_confirmed(&modes, &hold);
-            assert!(!drv.joint_hold_mode_verified(2), "precondition: J3 mode unverified while energized");
+            let _ = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
+            assert!(!drv.joint_mode().joint_hold_mode_verified(2), "precondition: J3 mode unverified while energized");
         }
         bus.with(|s| {
             s.fail_tx_ids.clear();
@@ -8040,8 +8040,8 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
                 armd::driver::JointMode::Position,
                 armd::driver::JointMode::Position,
             ];
-            let _ = drv.set_joint_modes_confirmed(&modes, &hold);
-            assert!(!drv.joint_hold_mode_verified(2));
+            let _ = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
+            assert!(!drv.joint_mode().joint_hold_mode_verified(2));
         }
         bus.with(|s| {
             s.fail_tx_ids.clear();
@@ -8071,7 +8071,7 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
             inner.tick(0.02);
         }
         assert!(
-            inner.driver.as_ref().unwrap().read().unwrap().joint_hold_mode_verified(2),
+            inner.driver.as_ref().unwrap().read().unwrap().joint_mode().joint_hold_mode_verified(2),
             "L2: causal on-tick readback reply before 200 ms must verify J3"
         );
         assert_eq!(
@@ -9468,7 +9468,7 @@ fn r12_b2_mit_lost_falls_back_to_verified_posvel_hold_or_faults_under_l2_bound()
                     torque: Some(0.0),
                 })
                 .collect();
-            drv.set_joint_modes(&modes, &targets).unwrap();
+            drv.joint_mode_mut().set_joint_modes(&modes, &targets).unwrap();
         }
         // Capture initial stopped hold targets before MIT loss so J4 has a captured target.
         inner.apply_stop_policy(StopPolicy::EStopLatch);

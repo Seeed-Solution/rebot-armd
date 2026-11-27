@@ -5164,7 +5164,7 @@ impl SupervisorInner {
         out.control_mode = if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position };
         self.gravity_comp_observation_into(&mut out.gravity_comp);
         match self.read_driver_for_tick() {
-            Some(drv) => drv.with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
+            Some(drv) => drv.joint_mode().with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
             None => out.driver_range_check = None,
         }
         // inline label: setting or clearing it never allocates or frees on the tick
@@ -9729,7 +9729,7 @@ impl SupervisorInner {
                     Ok((frames, exhausted)) => {
                         out.rx_frames = frames;
                         out.budget_exhausted = exhausted;
-                        driver.take_recovery_writes_into(&mut sc.recovered);
+                        driver.joint_mode_mut().take_recovery_writes_into(&mut sc.recovered);
                         let has_loads = driver.joint_loads_into(&mut sc.loads);
                         self.feedback_numeric_valid = Self::states_valid(
                             &sc.states,
@@ -13033,7 +13033,7 @@ impl SupervisorInner {
                         }
                     }
                     if unverified_mask != 0 {
-                        let _ = drv.request_mode_readback_budgeted(unverified_mask);
+                        let _ = drv.joint_mode_mut().request_mode_readback_budgeted(unverified_mask);
                     }
                     shadow_rt.drain_from_driver(drv);
                 };
@@ -19064,7 +19064,7 @@ impl ArmSupervisor {
                 driver.set_estop_state(self.estop_state.clone());
                 driver.set_estop_gate(inner.estop_gate());
                 driver.set_gripper_index(inner.config.gripper_index());
-                driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
+                driver.joint_mode_mut().set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
                 let caps = driver.capabilities();
                 if caps.load_feedback {
                     inner.loads = vec![f32::NAN; inner.config.dof];

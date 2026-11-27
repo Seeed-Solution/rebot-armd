@@ -7,53 +7,6 @@ use super::*;
 
 impl dyn ArmDriver + '_ {
     #[inline]
-    pub fn joint_hold_mode_verified(&self, a0: usize) -> bool {
-        self.joint_mode().joint_hold_mode_verified(a0)
-    }
-    #[inline]
-    pub fn request_mode_readback_budgeted(&mut self, a0: u64) -> bool {
-        self.joint_mode_mut().request_mode_readback_budgeted(a0)
-    }
-    #[inline]
-    pub fn with_range_check(&self, a0: &mut dyn FnMut(Option<&DriverRangeCheck>))  {
-        self.joint_mode().with_range_check(a0)
-    }
-    #[inline]
-    pub fn take_recovery_writes_into(&mut self, a0: &mut Vec<usize>)  {
-        self.joint_mode_mut().take_recovery_writes_into(a0)
-    }
-    #[inline]
-    pub fn supports_mit_mode_switch(&self) -> bool {
-        self.joint_mode().supports_mit_mode_switch()
-    }
-    #[inline]
-    pub fn set_joint_modes(&mut self, a0: &[JointMode], a1: &[JointTarget]) -> Result<(), ArmDriverError> {
-        self.joint_mode_mut().set_joint_modes(a0, a1)
-    }
-    #[inline]
-    pub fn set_joint_modes_in_tick(&mut self, a0: &[JointMode], a1: &[JointTarget]) -> Result<(), ArmDriverError> {
-        self.joint_mode_mut().set_joint_modes_in_tick(a0, a1)
-    }
-    #[inline]
-    pub fn joint_modes_uncertain(&self) -> bool {
-        self.joint_mode().joint_modes_uncertain()
-    }
-    #[inline]
-    pub fn set_strict_mode_handover(&mut self, a0: bool)  {
-        self.joint_mode_mut().set_strict_mode_handover(a0)
-    }
-    #[inline]
-    pub fn set_joint_modes_confirmed(&mut self, a0: &[JointMode], a1: &[JointTarget]) -> Result<(), ArmDriverError> {
-        self.joint_mode_mut().set_joint_modes_confirmed(a0, a1)
-    }
-    #[inline]
-    pub fn set_mode_switch_hold_targets(&mut self, a0: &[Option<ModeSwitchHoldTarget>])  {
-        self.joint_mode_mut().set_mode_switch_hold_targets(a0)
-    }
-}
-
-impl dyn ArmDriver + '_ {
-    #[inline]
     pub fn set_mit_deadline_fence(&mut self, a0: Option<Duration>, a1: Duration)  {
         self.mit_mut().set_mit_deadline_fence(a0, a1)
     }

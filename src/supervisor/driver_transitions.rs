@@ -660,7 +660,7 @@ impl OwnerDriverSnapshot {
                     None
                 }
             };
-            snap.hold_mode_verified[j] = drv.joint_hold_mode_verified(j);
+            snap.hold_mode_verified[j] = drv.joint_mode().joint_hold_mode_verified(j);
         }
         snap.valid = true;
         snap
@@ -1143,7 +1143,7 @@ impl SupervisorInner {
         driver.set_estop_state(self.estop_state.clone());
         driver.set_estop_gate(self.estop_gate());
         driver.set_gripper_index(self.config.gripper_index());
-        driver.set_strict_mode_handover(self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
+        driver.joint_mode_mut().set_strict_mode_handover(self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
         if driver.capabilities().load_feedback {
             self.loads = vec![f32::NAN; self.config.dof];
         }
@@ -2555,7 +2555,7 @@ impl SupervisorInner {
             }
         }
         if unverified_mask != 0 {
-            let _ = driver.request_mode_readback_budgeted(unverified_mask);
+            let _ = driver.joint_mode_mut().request_mode_readback_budgeted(unverified_mask);
         }
         if timed_out_mask != 0 {
             measured_hold.unverified_mode_faulted_mask |= timed_out_mask;
@@ -9095,7 +9095,7 @@ impl SupervisorInner {
         let mut ctx = self.build_clear_context_base(None);
         if let Some(ref d) = self.driver {
             let _ = d.with_ref(|drv| {
-                ctx.mit_modes_uncertain = self.mit.owner == crate::mit::MitOwner::Lost && drv.joint_modes_uncertain();
+                ctx.mit_modes_uncertain = self.mit.owner == crate::mit::MitOwner::Lost && drv.joint_mode().joint_modes_uncertain();
                 ctx.thermal_sensor_available = drv.capabilities().temperature_feedback;
                 ctx.feedback_fresh = self.feedback_numeric_valid
                     && drv.is_feedback_valid()
@@ -9236,7 +9236,7 @@ impl SupervisorInner {
             && self
                 .driver
                 .as_ref()
-                .and_then(|d| d.with_ref(|drv| drv.joint_modes_uncertain()))
+                .and_then(|d| d.with_ref(|drv| drv.joint_mode().joint_modes_uncertain()))
                 .unwrap_or(false);
         let mut pre_ctx = self.build_clear_context_base(driver_err_override);
         if clear_driver_err_field && driver_err_override.is_none() {
@@ -9319,7 +9319,7 @@ impl SupervisorInner {
                         let ages = drv.feedback_ages();
                         let loads = drv.joint_loads();
                         let caps = drv.capabilities();
-                        let modes_uncertain = drv.joint_modes_uncertain();
+                        let modes_uncertain = drv.joint_mode().joint_modes_uncertain();
                         let tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
                         let tx_probe_confirmed = drv.tx().tx_probe_confirmed();
                         let tx_probe_sent = drv.tx().tx_probe_pending();

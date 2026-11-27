@@ -764,7 +764,7 @@ impl SafeHoldBuffers {
                 // Causally probe CTRL_MODE for any mode-uncertain joint (e.g. lost REG_WRITE ACK)
                 // so SAFE-HOLD can resume holding it in its verified mode without ever sending a
                 // guessed-mode frame or letting the 100 ms motor watchdog expire.
-                let _ = drv.request_mode_readback_budgeted(unverified_mask);
+                let _ = drv.joint_mode_mut().request_mode_readback_budgeted(unverified_mask);
             }
             if let Some(ref mut sh) = shadow {
                 sh.drain_from_driver(drv);

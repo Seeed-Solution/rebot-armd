@@ -210,7 +210,7 @@ impl SupervisorInner {
             let Some(drv) = self.read_driver_for_tick() else {
                 return Err(reason("UNSUPPORTED", "driver lock unavailable"));
             };
-            if !drv.supports_mit_mode_switch() {
+            if !drv.joint_mode().supports_mit_mode_switch() {
                 return Err(reason("UNSUPPORTED", "The driver cannot switch joints to MIT mode"));
             }
             let caps = drv.capabilities();
@@ -303,7 +303,7 @@ impl SupervisorInner {
         // startup range check to have passed when the driver ran one.
         let mut blocked = None;
         if let Some(drv) = self.read_driver_for_tick() {
-            drv.with_range_check(&mut |c| match c.map(|c| (c.status, c)) {
+            drv.joint_mode().with_range_check(&mut |c| match c.map(|c| (c.status, c)) {
                 Some((RangeCheckStatus::Mismatch, c)) => blocked = Some(reason("DRIVER_RANGE_MISMATCH", &c.message)),
                 Some((RangeCheckStatus::Unverified, c)) => blocked = Some(reason("DRIVER_RANGE_UNVERIFIED", &c.message)),
                 _ => {}
@@ -681,7 +681,7 @@ impl SupervisorInner {
         }
         if let Some(slot) = this.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
-                drv.set_mode_switch_hold_targets(&holds);
+                drv.joint_mode_mut().set_mode_switch_hold_targets(&holds);
                 drv.mode_switch_mut().set_mode_switch_active_mask(0b11_1111);
             });
         }
@@ -856,7 +856,7 @@ impl SupervisorInner {
         }
         if let Some(slot) = self.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
-                drv.set_mode_switch_hold_targets(&holds);
+                drv.joint_mode_mut().set_mode_switch_hold_targets(&holds);
                 drv.mode_switch_mut().set_mode_switch_active_mask(0b11_1111);
             });
         }
@@ -1006,9 +1006,9 @@ impl SupervisorInner {
                 .map(|i| JointTarget::mit(pose[i], 0.0, policy.hold_kp[i], policy.hold_kd[i], entry_torque[i])).collect();
             hold.push(JointTarget::position(gripper));
             let switch_res = d
-                .with_mut(|drv| match drv.set_joint_modes(&modes, &hold) {
+                .with_mut(|drv| match drv.joint_mode_mut().set_joint_modes(&modes, &hold) {
                     Ok(()) => Ok(()),
-                    Err(e) => Err((e, drv.joint_modes_uncertain())),
+                    Err(e) => Err((e, drv.joint_mode().joint_modes_uncertain())),
                 })
                 .ok_or_else(|| ArmError::Internal("driver lock poisoned".into()))?;
             if let Err((e, uncertain)) = switch_res {
@@ -1661,7 +1661,7 @@ impl SupervisorInner {
                                 JointTarget::position(gripper)
                             }
                         });
-                        drv.set_joint_modes_in_tick(&[JointMode::Position; ARM + 1], &hold_targets).map_err(|e| e.to_string())
+                        drv.joint_mode_mut().set_joint_modes_in_tick(&[JointMode::Position; ARM + 1], &hold_targets).map_err(|e| e.to_string())
                     })
                     .unwrap_or_else(|| Err("driver lock poisoned".into())),
             }

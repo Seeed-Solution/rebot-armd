@@ -497,7 +497,7 @@ impl crate::supervisor::SupervisorInner {
         let Some(slot) = self.driver.as_mut() else { return Err("MIT needs a motor driver".into()) };
         let (supports, rb_res) = slot
             .with_mut(|driver| {
-                (driver.supports_mit_mode_switch(), driver.commissioning_mut().read_motor_identity(&joints))
+                (driver.joint_mode().supports_mit_mode_switch(), driver.commissioning_mut().read_motor_identity(&joints))
             })
             .ok_or_else(|| "driver lock poisoned".to_string())?;
         let rb = rb_res.map_err(|e| format!("register readback failed: {e}"))?;
@@ -1884,8 +1884,8 @@ impl crate::supervisor::SupervisorInner {
                     // armed before the first MIT-capable switch frame: a lost acknowledgement or a slow
                     // confirmation cannot outlast the deadline, and a rollback after a trip sends nothing
                     drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
-                    let res = drv.set_joint_modes_confirmed(&modes, &hold);
-                    let uncertain = drv.joint_modes_uncertain();
+                    let res = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
+                    let uncertain = drv.joint_mode().joint_modes_uncertain();
                     if res.is_err() && !uncertain && drv.mit_fence_trip().is_none() {
                         // switched back and confirmed in position control: nothing to fence
                         drv.set_mit_deadline_fence(None, Duration::ZERO);
@@ -2081,7 +2081,7 @@ impl crate::supervisor::SupervisorInner {
         if let Some(slot) = self.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
                 drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
-                drv.set_mode_switch_hold_targets(&holds);
+                drv.joint_mode_mut().set_mode_switch_hold_targets(&holds);
                 drv.mode_switch_mut().set_mode_switch_active_mask(active_mask);
             });
         }
@@ -2352,7 +2352,7 @@ impl crate::supervisor::SupervisorInner {
             .map_err(|e| e.code())?;
         if let Some(slot) = self.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
-                drv.set_mode_switch_hold_targets(&holds);
+                drv.joint_mode_mut().set_mode_switch_hold_targets(&holds);
                 drv.mode_switch_mut().set_mode_switch_active_mask(active_mask);
             });
         }
@@ -2644,11 +2644,11 @@ impl crate::supervisor::SupervisorInner {
             let shadow_rt = &mut self.torque_shadow;
             let Some(d) = self.driver.as_mut() else { return Err("no driver".into()) };
             d.with_mut(|drv| {
-                let res = drv.set_joint_modes_confirmed(&modes, &hold);
+                let res = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
                 if res.is_ok() { drv.set_mit_deadline_fence(None, Duration::ZERO); }
                 #[cfg(not(target_arch = "wasm32"))]
                 shadow_rt.drain_from_driver(drv);
-                (res, drv.joint_modes_uncertain())
+                (res, drv.joint_mode().joint_modes_uncertain())
             })
             .ok_or_else(|| "driver lock poisoned".to_string())?
         };
@@ -4372,7 +4372,7 @@ impl crate::supervisor::SupervisorInner {
                 let mut check_res = Ok(());
                 let mut mit_sw = false;
                 let locked = slot.try_with_ref(|drv| {
-                    mit_sw = drv.supports_mit_mode_switch();
+                    mit_sw = drv.joint_mode().supports_mit_mode_switch();
                     check_res = self.commissioning_safety_check_with_driver_inner(
                         req.kind,
                         &req.joints[..req.joint_len],

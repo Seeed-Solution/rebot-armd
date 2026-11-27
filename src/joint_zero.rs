@@ -770,32 +770,32 @@ impl crate::driver::CommissioningExt for ZeroOffsetDriver {
 
 impl crate::driver::JointModeExt for ZeroOffsetDriver {
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-        self.inner.joint_hold_mode_verified(joint)
+        self.inner.joint_mode().joint_hold_mode_verified(joint)
     }
     fn request_mode_readback_budgeted(&mut self, unverified_mask: u64) -> bool {
-        self.inner.request_mode_readback_budgeted(unverified_mask)
+        self.inner.joint_mode_mut().request_mode_readback_budgeted(unverified_mask)
     }
-    fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { self.inner.with_range_check(f) }
-    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { self.inner.take_recovery_writes_into(out) }
-    fn supports_mit_mode_switch(&self) -> bool { self.inner.supports_mit_mode_switch() }
+    fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { self.inner.joint_mode().with_range_check(f) }
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { self.inner.joint_mode_mut().take_recovery_writes_into(out) }
+    fn supports_mit_mode_switch(&self) -> bool { self.inner.joint_mode().supports_mit_mode_switch() }
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         match self.to_motor(hold) {
-            None => self.inner.set_joint_modes(modes, hold),
-            Some(m) => self.inner.set_joint_modes(modes, &m),
+            None => self.inner.joint_mode_mut().set_joint_modes(modes, hold),
+            Some(m) => self.inner.joint_mode_mut().set_joint_modes(modes, &m),
         }
     }
     fn set_joint_modes_in_tick(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         match self.to_motor(hold) {
-            None => self.inner.set_joint_modes_in_tick(modes, hold),
-            Some(m) => self.inner.set_joint_modes_in_tick(modes, &m),
+            None => self.inner.joint_mode_mut().set_joint_modes_in_tick(modes, hold),
+            Some(m) => self.inner.joint_mode_mut().set_joint_modes_in_tick(modes, &m),
         }
     }
-    fn joint_modes_uncertain(&self) -> bool { self.inner.joint_modes_uncertain() }
-    fn set_strict_mode_handover(&mut self, strict: bool) { self.inner.set_strict_mode_handover(strict) }
+    fn joint_modes_uncertain(&self) -> bool { self.inner.joint_mode().joint_modes_uncertain() }
+    fn set_strict_mode_handover(&mut self, strict: bool) { self.inner.joint_mode_mut().set_strict_mode_handover(strict) }
     fn set_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         match self.to_motor(hold) {
-            None => self.inner.set_joint_modes_confirmed(modes, hold),
-            Some(m) => self.inner.set_joint_modes_confirmed(modes, &m),
+            None => self.inner.joint_mode_mut().set_joint_modes_confirmed(modes, hold),
+            Some(m) => self.inner.joint_mode_mut().set_joint_modes_confirmed(modes, &m),
         }
     }
     fn set_mode_switch_hold_targets(&mut self, targets: &[Option<crate::driver::ModeSwitchHoldTarget>]) {
@@ -807,7 +807,7 @@ impl crate::driver::JointModeExt for ZeroOffsetDriver {
                 shifted[i] = Some(t);
             }
         }
-        self.inner.set_mode_switch_hold_targets(&shifted[..n]);
+        self.inner.joint_mode_mut().set_mode_switch_hold_targets(&shifted[..n]);
     }
 }
 

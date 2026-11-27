@@ -4361,7 +4361,7 @@ fn dual_owner_mit_j1_j6_posforce_j7_80ms_stall_during_home_continues_mit_frames(
                 armd::driver::JointMode::Position,
             ];
             let drv = rig.inner_mut().driver.as_mut().unwrap();
-            drv.write().unwrap().set_joint_modes(&modes, &holds).expect("switch J1–J6 to MIT");
+            drv.write().unwrap().joint_mode_mut().set_joint_modes(&modes, &holds).expect("switch J1–J6 to MIT");
             rig.bus.with(|s| {
                 s.immediate_replies = false;
                 s.push_all_feedback();
@@ -5049,7 +5049,7 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
                     .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
                     .collect();
                 let mut drv = rig.inner_mut().driver.as_mut().unwrap().write().unwrap();
-                drv.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+                drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
                 drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
             }
             rig.inner_mut().mit.owner = MitOwner::Active;
@@ -5800,7 +5800,7 @@ fn dual_owner_single_j7_emitter_covers_all_fenced_and_invalid_target_paths() {
                 .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
                 .collect();
             let mut drv = rig.inner_mut().driver.as_mut().unwrap().write().unwrap();
-            drv.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+            drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
             drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
         }
         rig.inner_mut().mit.owner = MitOwner::Active;
