@@ -860,3 +860,168 @@ impl<C: CanTransport> ModeSwitchExt for DamiaoArmDriver<C> {
         crate::motor_mode::ModeFeedbackMatch::FreshConfirmed
     }
 }
+
+impl<C: CanTransport> JointModeExt for DamiaoArmDriver<C> {
+    fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+        self.joint_hold_mode_verified_inner(joint)
+    }
+
+    fn request_mode_readback_budgeted(&mut self, unverified_mask: u64) -> bool {
+        /// Retry spacing (< one 20 ms 50 Hz tick) so a lost SAFE-HOLD recovery `REG_READ` reply
+        /// retries on the very next control release (t = 60 ms) and confirmed-mode holding resumes
+        /// at t = 80 ms, safely below Damiao's 100 ms `TIMEOUT = 2000` hardware watchdog.
+        const SAFE_HOLD_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(15);
+        /// Maximum causal reply window for a SAFE-HOLD recovery probe (allows one 20 ms 50 Hz tick
+        /// plus scheduling jitter while rejecting stale replies beyond 35 ms).
+        const SAFE_HOLD_PROBE_DEADLINE: Duration = Duration::from_millis(35);
+
+        // Never issue background/Step-2 recovery readbacks or clear `comm_reg_replies` for any
+        // axis currently owned by an active `ModeSwitch` transaction.
+        let unverified_mask = unverified_mask & !u64::from(self.mode_switch_active_mask);
+        if unverified_mask == 0
+            || self.torque_hs.is_some()
+            || self.mit_expiry_budgeted_boundary.is_some()
+            || self.awaiting_rx_boundary
+            || !self.last_read_drained
+        {
+            return false;
+        }
+        let mut sent_any = false;
+        let mut cleared_comm_log = false;
+        let mut drained_before_retry = false;
+        let mut staged_uncertain =
+            [None::<(u64, Instant, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS];
+        let dof = self.motor_ids.len().min(64);
+        for i in 0..dof {
+            if (unverified_mask & (1u64 << i)) == 0 || self.verified_hold_mode(i).is_some() {
+                continue;
+            }
+            let uncertain = self.is_axis_mode_uncertain(i);
+            let now = self.now();
+            if uncertain
+                && i < MAX_MODE_JOINTS
+                && self.uncertain_readback_probe[i]
+                    .is_some_and(|(_, _, retry_at, _, _)| now < retry_at)
+            {
+                // Avoid sending duplicate in-flight REG_READ probes within the same retry interval,
+                // while retrying promptly on the very next 50 Hz release if the reply was lost.
+                continue;
+            }
+            if uncertain && i < MAX_MODE_JOINTS && self.uncertain_readback_probe[i].is_some() {
+                // Before issuing a retry probe, perform one bounded RX drain so any late/promoted
+                // reply to the prior probe is matched (or cleared out of RX) BEFORE capturing the
+                // retry's causal TX boundary.
+                if !drained_before_retry {
+                    let _ = self.receive_feedback();
+                    drained_before_retry = true;
+                }
+                if !self.last_read_drained {
+                    break;
+                }
+                if self.verified_hold_mode(i).is_some() {
+                    continue;
+                }
+            }
+            if uncertain && !cleared_comm_log {
+                self.comm_reg_reply_len = 0;
+                self.comm_reg_reply_overflow = false;
+                cleared_comm_log = true;
+            }
+            let id = self.motor_ids[i];
+            let mut revoked: Option<&'static str> = None;
+            // Use `self.send(...)` directly so `seq_before`, `tx_started`, and `tx_offset_ns`
+            // reflect the actual TX submission boundary (never a pre-send sample).
+            match self.send(
+                TxKind::Refresh,
+                None,
+                None,
+                false,
+                ContinuityBypass::None,
+                None,
+                &mut revoked,
+                |_| Some(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE)),
+            ) {
+                Ok((_frame, seq_before, tx_started, tx_offset_ns)) => {
+                    if uncertain && i < MAX_MODE_JOINTS {
+                        let retry_at = tx_started
+                            .checked_add(SAFE_HOLD_PROBE_RETRY_INTERVAL)
+                            .unwrap_or(tx_started);
+                        let probe_deadline = tx_started
+                            .checked_add(SAFE_HOLD_PROBE_DEADLINE)
+                            .unwrap_or(tx_started);
+                        staged_uncertain[i] = Some((
+                            seq_before,
+                            tx_started,
+                            retry_at,
+                            probe_deadline,
+                            tx_offset_ns,
+                        ));
+                    } else {
+                        self.mode_readback_boundary[i].get_or_insert(seq_before);
+                    }
+                    sent_any = true;
+                }
+                Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed) => break,
+                Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => break,
+                Err(_) => break,
+            }
+        }
+        if sent_any && self.flush_can_and_commit().is_ok() {
+            for (i, probe) in staged_uncertain.into_iter().enumerate() {
+                if let Some(p) = probe {
+                    self.uncertain_readback_probe[i] = Some(p);
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn supports_mit_mode_switch(&self) -> bool {
+        self.control_mode == DamiaoControlMode::PosVel
+    }
+
+    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        // MIT tracking owns the joints (fence armed) or lost them (tripped): only the fenced,
+        // confirmed switch may touch the modes
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+            return Err(ArmDriverError::HardwareFault("MIT tracking holds the deadline fence: plain mode switch refused".into()));
+        }
+        self.discard_all_pending_tx();
+        self.begin_tx_tick();
+        self.set_joint_modes_impl(modes, hold)
+    }
+
+    fn set_joint_modes_in_tick(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+            return Err(ArmDriverError::HardwareFault("MIT tracking holds the deadline fence: plain mode switch refused".into()));
+        }
+        self.discard_all_pending_tx();
+        let _ = self.ensure_tx_pass();
+        self.set_joint_modes_impl(modes, hold)
+    }
+
+    fn set_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        self.switch_joint_modes_confirmed(modes, hold)
+    }
+
+    fn joint_modes_uncertain(&self) -> bool {
+        self.joint_modes.iter().any(Option::is_none)
+    }
+
+    fn set_strict_mode_handover(&mut self, strict: bool) {
+        self.strict_mode_handover = strict;
+    }
+
+    fn set_mode_switch_hold_targets(&mut self, targets: &[Option<ModeSwitchHoldTarget>]) {
+        self.mode_switch_hold_targets = [None; MAX_MODE_JOINTS];
+        let n = targets.len().min(MAX_MODE_JOINTS);
+        self.mode_switch_hold_targets[..n].copy_from_slice(&targets[..n]);
+    }
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend_from_slice(&self.recovery_written_joints);
+        self.recovery_written_joints.clear();
+    }
+    fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
+}
