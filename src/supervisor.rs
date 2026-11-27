@@ -7953,8 +7953,8 @@ impl SupervisorInner {
         self.reset_tx_joint_progress();
         if let Some(d) = self.driver.as_mut() {
             let _ = d.try_with_mut(|drv| {
-                drv.discard_pending_tx();
-                drv.clear_tx_probe();
+                drv.tx_mut().discard_pending_tx();
+                drv.tx_mut().clear_tx_probe();
             });
         }
         self.stop_motion();
@@ -8133,7 +8133,7 @@ impl SupervisorInner {
         } else if let Some(cap) = action_cap {
             let pre_now = drv.clock_now();
             if matches!(tick_output, TickOutput::ActionDeadlineRefused { .. }) || pre_now >= cap {
-                drv.discard_pending_tx();
+                drv.tx_mut().discard_pending_tx();
                 *allow_output_accepted = false;
                 if !matches!(tick_output, TickOutput::ActionDeadlineRefused { .. }) {
                     *tick_output = TickOutput::ActionDeadlineRefused {
@@ -8145,7 +8145,7 @@ impl SupervisorInner {
             }
         }
         let now = drv.clock_now();
-        let max_age = drv.tx_frame_max_age();
+        let max_age = drv.tx().tx_frame_max_age();
         let emit_res = drv.emit_pos_force_j7(intent, current_stamp);
         if !j7_effective_hold_or_freeze
             && matches!(
@@ -8166,7 +8166,7 @@ impl SupervisorInner {
                 ) => pf_status,
                 _ => drv.take_last_pos_force_tx_status(),
             };
-            drv.discard_pending_tx();
+            drv.tx_mut().discard_pending_tx();
             *allow_output_accepted = false;
             *tick_output = TickOutput::ActionDeadlineRefused {
                 drv_now: refused_now,
@@ -8283,7 +8283,7 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
                             is_hold: j7_is_hold,
                             sent_mask: if j7_is_hold { pf_bit_hold } else { 0 },
@@ -8298,13 +8298,13 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { 0 },
                             is_hold,
                             sent_mask: if is_hold {
                                 sent_mask | pf_bit_hold
                             } else {
-                                drv.last_target_tx_sent_mask()
+                                drv.tx().last_target_tx_sent_mask()
                             },
                             pf_status,
                         };
@@ -8323,7 +8323,7 @@ impl SupervisorInner {
                             pending: pending.saturating_add(1),
                             now,
                             max_age,
-                            oldest_age: oldest_age.or_else(|| drv.oldest_pending_tx_age()),
+                            oldest_age: oldest_age.or_else(|| drv.tx().oldest_pending_tx_age()),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
                             is_hold,
                             sent_mask: if is_hold { sent_mask | pf_bit_hold } else { sent_mask },
@@ -8395,7 +8395,7 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
                             is_hold: j7_is_hold,
                             sent_mask: 0,
@@ -8411,10 +8411,10 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { 0 },
                             is_hold,
-                            sent_mask: if is_hold { sent_mask } else { drv.last_target_tx_sent_mask() },
+                            sent_mask: if is_hold { sent_mask } else { drv.tx().last_target_tx_sent_mask() },
                             pf_status,
                         };
                     }
@@ -8432,7 +8432,7 @@ impl SupervisorInner {
                             pending: pending.saturating_add(1),
                             now,
                             max_age,
-                            oldest_age: oldest_age.or_else(|| drv.oldest_pending_tx_age()),
+                            oldest_age: oldest_age.or_else(|| drv.tx().oldest_pending_tx_age()),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
                             is_hold,
                             sent_mask,
@@ -8611,10 +8611,10 @@ impl SupervisorInner {
     ) -> TickOutput {
         use crate::driver::TxBatchOutcome;
         let now = drv.clock_now();
-        let max_age = drv.tx_frame_max_age();
-        let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
-        let due_mask = if is_hold { drv.last_hold_tx_due_mask() } else { 0 };
-        let hold_sent_mask = if is_hold { drv.last_hold_tx_sent_mask() } else { 0 };
+        let max_age = drv.tx().tx_frame_max_age();
+        let hold_sent_any = is_hold && drv.tx().last_hold_tx_sent_any();
+        let due_mask = if is_hold { drv.tx().last_hold_tx_due_mask() } else { 0 };
+        let hold_sent_mask = if is_hold { drv.tx().last_hold_tx_sent_mask() } else { 0 };
         let pf_status = drv.take_last_pos_force_tx_status();
         match write_res {
             Ok(TxBatchOutcome::Complete) => TickOutput::Complete {
@@ -8629,10 +8629,10 @@ impl SupervisorInner {
                 pending,
                 now,
                 max_age,
-                oldest_age: drv.oldest_pending_tx_age(),
+                oldest_age: drv.tx().oldest_pending_tx_age(),
                 due_mask,
                 is_hold,
-                sent_mask: if is_hold { hold_sent_mask } else { drv.last_target_tx_sent_mask() },
+                sent_mask: if is_hold { hold_sent_mask } else { drv.tx().last_target_tx_sent_mask() },
                 pf_status,
             },
             Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
@@ -8640,7 +8640,7 @@ impl SupervisorInner {
                 pending,
                 now,
                 max_age,
-                oldest_age: drv.last_tx_expired_age(),
+                oldest_age: drv.tx().last_tx_expired_age(),
                 due_mask,
                 sent_mask: hold_sent_mask,
                 is_hold,
@@ -9115,20 +9115,20 @@ impl SupervisorInner {
         }
         let mut effective_hold = is_hold || fence.estop_latched();
         let write_res = if effective_hold {
-            drv.set_output_lease_gen(0);
+            drv.tx_mut().set_output_lease_gen(0);
             drv.write_estop_hold_bounded(targets)
         } else {
-            drv.set_output_lease_gen(output_lease_gen);
+            drv.tx_mut().set_output_lease_gen(output_lease_gen);
             if fence.estop_latched() {
-                drv.set_output_lease_gen(0);
+                drv.tx_mut().set_output_lease_gen(0);
                 effective_hold = true;
                 drv.write_estop_hold_bounded(targets)
             } else if fence.blocks_non_hold() {
-                drv.set_output_lease_gen(0);
+                drv.tx_mut().set_output_lease_gen(0);
                 return None;
             } else {
                 let r = drv.write_joint_targets_bounded(targets);
-                drv.set_output_lease_gen(0);
+                drv.tx_mut().set_output_lease_gen(0);
                 r
             }
         };
@@ -9233,7 +9233,7 @@ impl SupervisorInner {
         self.driver
             .as_ref()
             .and_then(|d| {
-                d.try_with_ref_recover(|drv| drv.tx_budget_max_frames())
+                d.try_with_ref_recover(|drv| drv.tx().tx_budget_max_frames())
                     .flatten()
             })
             .unwrap_or(cfg_max)
@@ -9257,8 +9257,8 @@ impl SupervisorInner {
         let rx_rem = budget.rx_remaining();
         let tx_rem = budget.tx_remaining();
         let apply = |drv: &mut dyn ArmDriver| {
-            let before = drv.release_budget_consumed();
-            drv.sync_release_budget_limits(rx_rem, tx_rem);
+            let before = drv.tx().release_budget_consumed();
+            drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
             before
         };
         d.try_with_mut(apply).ok()
@@ -9283,7 +9283,7 @@ impl SupervisorInner {
                 let after = self
                     .driver
                     .as_ref()
-                    .and_then(|d| d.try_with_ref_recover(|drv| drv.release_budget_consumed()))
+                    .and_then(|d| d.try_with_ref_recover(|drv| drv.tx().release_budget_consumed()))
                     .unwrap_or(before);
                 (
                     after.0.saturating_sub(before.0).max(reported_rx),
@@ -9561,7 +9561,7 @@ impl SupervisorInner {
                 let urgent_wake = if torque_poll.is_some() || park_wake.is_some() {
                     let owner_now = now_fn();
                     let drv_now = d.clock_now();
-                    d.next_watchdog_hold_wake()
+                    d.tx().next_watchdog_hold_wake()
                         .map(|w| owner_now + w.saturating_duration_since(drv_now))
                 } else {
                     None
@@ -12466,7 +12466,7 @@ impl SupervisorInner {
                 }
                 let lease_gen = self.current_active_lease_gen();
                 if let Some(mut drv) = self.write_driver_for_tick() {
-                    drv.set_output_lease_gen(lease_gen);
+                    drv.tx_mut().set_output_lease_gen(lease_gen);
                     drv.defer_motion_targets_past_cutoff(&sc.targets);
                 }
                 self.scratch = sc;
@@ -13161,7 +13161,7 @@ impl SupervisorInner {
             && self.max_tx_joint_no_progress_ticks() > 0
             && self
                 .read_driver_for_tick()
-                .is_some_and(|drv| drv.pending_motion_tx_len() > 0);
+                .is_some_and(|drv| drv.tx().pending_motion_tx_len() > 0);
         let j7_stale = tick_output.j7_stale();
         let batch_completed = self.classify_tick_output(tick_output, true, has_pending_motion);
 
@@ -13917,7 +13917,7 @@ impl SupervisorInner {
         if let Some(slot) = self.driver.as_ref() {
             let mut budget_ok = Ok(());
             let _ = slot.try_with_ref(|drv| {
-                budget_ok = drv.check_watchdog_tx_budget_for_energized();
+                budget_ok = drv.tx().check_watchdog_tx_budget_for_energized();
             });
             if budget_ok.is_err() {
                 retire_terminal(&mut terminal, retired);

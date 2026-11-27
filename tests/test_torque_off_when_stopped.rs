@@ -4043,7 +4043,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         .as_mut()
         .unwrap()
         .with_mut(|d| {
-            d.set_tx_budget(TxBudget {
+            d.tx_mut().set_tx_budget(TxBudget {
                 max_frames: 2,
                 max_duration: Duration::from_millis(10),
                 ..TxBudget::default()
@@ -4058,7 +4058,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
     inner.tick(0.02);
     {
         let drv = inner.driver.as_ref().unwrap().read().unwrap();
-        assert!(drv.pending_tx_len_total() > 0, "J3..J7 holds should be queued in hold queue");
+        assert!(drv.tx().pending_tx_len_total() > 0, "J3..J7 holds should be queued in hold queue");
     }
 
     // M-12: Specifically queue J3's hold frame at t=85 ms (age=85 ms <= 100 ms, TX age=0 ms < 45 ms),
@@ -4111,7 +4111,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         JointHoldStatus::Queued,
         "J3 hold must be specifically queued right before crossing the 100 ms freshness boundary"
     );
-    let pending_before_stale = inner.driver.as_ref().unwrap().read().unwrap().pending_tx_len_total();
+    let pending_before_stale = inner.driver.as_ref().unwrap().read().unwrap().tx().pending_tx_len_total();
     assert!(pending_before_stale > 0);
 
     // Cross the 100 ms freshness boundary by advancing 20 ms (J3 age = 105..110 ms > 100 ms, while

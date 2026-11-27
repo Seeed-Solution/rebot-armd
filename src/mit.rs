@@ -1426,7 +1426,7 @@ impl crate::supervisor::SupervisorInner {
                     let (now, max_age) = self
                         .driver
                         .as_ref()
-                        .and_then(|d| d.try_with_ref(|drv| (drv.clock_now(), drv.tx_frame_max_age())).ok())
+                        .and_then(|d| d.try_with_ref(|drv| (drv.clock_now(), drv.tx().tx_frame_max_age())).ok())
                         .unwrap_or_else(|| (self.mit_now(), crate::driver::DAMIAO_TX_FRAME_MAX_AGE));
                     let mut buf = OutputErrorText::empty();
                     let _ = core::fmt::write(&mut buf, format_args!("MIT output refused: {e}"));
@@ -1459,8 +1459,8 @@ impl crate::supervisor::SupervisorInner {
         let res = self.driver.as_mut().and_then(|d| {
             d.with_mut(|drv| {
                 let before_cons = if conservative_cap {
-                    let b = drv.release_budget_consumed();
-                    drv.sync_release_budget_limits(0, 0);
+                    let b = drv.tx().release_budget_consumed();
+                    drv.tx_mut().sync_release_budget_limits(0, 0);
                     Some(b)
                 } else {
                     None
@@ -1535,7 +1535,7 @@ impl crate::supervisor::SupervisorInner {
                 } else if let Some(cap) = action_cap {
                     let pre_now = drv.clock_now();
                     if pre_now >= cap {
-                        drv.discard_pending_tx();
+                        drv.tx_mut().discard_pending_tx();
                         return TickOutput::ActionDeadlineRefused {
                             drv_now: pre_now,
                             pf_status: crate::driver::PosForceTxStatus::Unobserved,
@@ -1543,16 +1543,16 @@ impl crate::supervisor::SupervisorInner {
                     }
                 }
                 let write_res = if is_hold {
-                    drv.set_output_lease_gen(0);
+                    drv.tx_mut().set_output_lease_gen(0);
                     drv.write_estop_hold_bounded(targets)
                 } else {
-                    drv.set_output_lease_gen(output_lease_gen);
+                    drv.tx_mut().set_output_lease_gen(output_lease_gen);
                     let r = drv.write_joint_targets_bounded(targets);
-                    drv.set_output_lease_gen(0);
+                    drv.tx_mut().set_output_lease_gen(0);
                     r
                 };
                 if let Some(b) = before_cons {
-                    let after = drv.release_budget_consumed();
+                    let after = drv.tx().release_budget_consumed();
                     cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(b.0));
                     cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(b.1));
                 }
@@ -1569,7 +1569,7 @@ impl crate::supervisor::SupervisorInner {
                     )
                     && action_cap.is_some_and(|cap| now >= cap)
                 {
-                    drv.discard_pending_tx();
+                    drv.tx_mut().discard_pending_tx();
                     return TickOutput::ActionDeadlineRefused {
                         drv_now: now,
                         pf_status: drv.take_last_pos_force_tx_status(),
@@ -2030,7 +2030,7 @@ impl crate::supervisor::SupervisorInner {
         if let Some(slot) = self.driver.as_ref() {
             let mut budget_ok = Ok(());
             let _ = slot.try_with_ref(|drv| {
-                budget_ok = drv.check_watchdog_tx_budget_for_energized();
+                budget_ok = drv.tx().check_watchdog_tx_budget_for_energized();
             });
             if let Err((max_frames, required)) = budget_ok {
                 let mut buf = OutputErrorText::empty();
@@ -4842,8 +4842,8 @@ impl crate::supervisor::SupervisorInner {
             let mut run_with_drv = |drv: &mut dyn crate::driver::ArmDriver| {
                 let (before_counters, eff_rx, eff_max_tx, eff_probe_tx) =
                     if let Some((rx_rem, tx_rem)) = budget_caps {
-                        let before = drv.release_budget_consumed();
-                        drv.sync_release_budget_limits(rx_rem, tx_rem);
+                        let before = drv.tx().release_budget_consumed();
+                        drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
                         let rx = remaining_rx.min(rx_rem.min(16));
                         let reg_tx = u16::from(max_tx).min(tx_rem).min(u16::from(u8::MAX)) as u8;
                         let probe_tx = probe_tx_cap
@@ -4940,7 +4940,7 @@ impl crate::supervisor::SupervisorInner {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.torque_shadow.drain_from_driver(drv);
                 if let Some(before) = before_counters {
-                    let after = drv.release_budget_consumed();
+                    let after = drv.tx().release_budget_consumed();
                     drv_rx_delta = after.0.saturating_sub(before.0);
                     drv_tx_delta = after.1.saturating_sub(before.1);
                 }

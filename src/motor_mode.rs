@@ -1572,10 +1572,10 @@ pub mod switch {
             self.drv.mode_switch_remaining_rx_budget(default_max)
         }
         fn check_watchdog_tx_budget(&self) -> Result<(), (usize, usize)> {
-            self.drv.check_watchdog_tx_budget_for_energized()
+            self.drv.tx().check_watchdog_tx_budget_for_energized()
         }
         fn release_budget_consumed(&self) -> Option<(u16, u16)> {
-            Some(self.drv.release_budget_consumed())
+            Some(self.drv.tx().release_budget_consumed())
         }
         fn axis_confirmed_mode(&self, joint: usize) -> Option<ControlMode> { self.drv.axis_confirmed_mode(joint) }
         fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<ControlMode>) {

@@ -640,7 +640,7 @@ impl SupervisorInner {
         if let Some(slot) = this.driver.as_ref() {
             let mut budget_ok = Ok(());
             let _ = slot.try_with_ref(|drv| {
-                budget_ok = drv.check_watchdog_tx_budget_for_energized();
+                budget_ok = drv.tx().check_watchdog_tx_budget_for_energized();
             });
             if budget_ok.is_err() {
                 return Err((

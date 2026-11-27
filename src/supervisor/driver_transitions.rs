@@ -2866,18 +2866,18 @@ impl SupervisorInner {
                 let dispatched_mask = drv.disable_dispatched_mask();
                 let effective_hold_mask = hold_mask & !dispatched_mask;
                 let effective_keep_mask = keep_queued_mask & !dispatched_mask;
-                drv.drop_pending_holds_outside_mask(effective_keep_mask);
+                drv.tx_mut().drop_pending_holds_outside_mask(effective_keep_mask);
                 drv.set_pending_pos_force_hold_hint(true);
                 let r = drv.write_measured_hold_masked(effective_hold_mask, &targets);
                 let now = drv.clock_now();
-                let max_age = drv.tx_frame_max_age();
-                let oldest_pending = drv.oldest_pending_tx_age();
-                let last_expired = drv.last_tx_expired_age();
-                let sent_any_fallback = drv.last_hold_tx_sent_any();
-                let due_mask = drv.last_hold_tx_due_mask();
-                let sent_mask = drv.last_hold_tx_sent_mask();
+                let max_age = drv.tx().tx_frame_max_age();
+                let oldest_pending = drv.tx().oldest_pending_tx_age();
+                let last_expired = drv.tx().last_tx_expired_age();
+                let sent_any_fallback = drv.tx().last_hold_tx_sent_any();
+                let due_mask = drv.tx().last_hold_tx_due_mask();
+                let sent_mask = drv.tx().last_hold_tx_sent_mask();
                 let pf_status = drv.take_last_pos_force_tx_status();
-                let has_pending_holds = drv.pending_tx_len_total() > 0;
+                let has_pending_holds = drv.tx().pending_tx_len_total() > 0;
                 #[cfg(not(target_arch = "wasm32"))]
                 shadow_rt.drain_from_driver(drv);
                 (
@@ -3553,7 +3553,7 @@ impl SupervisorInner {
         }
         if let Some(d) = self.driver.as_ref() {
             if let Some(driver) = d.read() {
-                if let Err((max_frames, required)) = driver.check_watchdog_tx_budget_for_enable() {
+                if let Err((max_frames, required)) = driver.tx().check_watchdog_tx_budget_for_enable() {
                     return Err(SafetyError::ClearFaultRejected(format!(
                         "WATCHDOG_BUDGET_INSUFFICIENT: tx_budget.max_frames ({max_frames}) < required ({required}) for energized watchdog continuity"
                     )));
@@ -3724,7 +3724,7 @@ impl SupervisorInner {
                 drv.abort_enable();
                 self.refresh_owner_driver_snapshot_from_ref(&*drv);
                 let (hold_mask, _) = self.capture_measured_hold_from_owner();
-                drv.drop_pending_holds_outside_mask(hold_mask);
+                drv.tx_mut().drop_pending_holds_outside_mask(hold_mask);
                 #[cfg(not(target_arch = "wasm32"))]
                 self.torque_shadow.drain_from_driver(drv);
             }) {
@@ -3987,7 +3987,7 @@ impl SupervisorInner {
                 self.driver = Some(d);
                 return Err("ESTOP_ACTIVE");
             }
-            if driver.check_watchdog_tx_budget_for_enable().is_err() {
+            if driver.tx().check_watchdog_tx_budget_for_enable().is_err() {
                 drop(driver);
                 self.driver = Some(d);
                 return Err("WATCHDOG_BUDGET_INSUFFICIENT");
@@ -4116,7 +4116,7 @@ impl SupervisorInner {
                 let enable_fb = drv.capabilities().enable_feedback;
                 let drv_now = drv.clock_now();
                 let tx_dl = owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now));
-                drv.set_enable_authority(tx_dl, expected_lease_gen);
+                drv.tx_mut().set_enable_authority(tx_dl, expected_lease_gen);
                 let started = if budgeted && retry_unverified_ranges {
                     drv.begin_torque_budgeted_with_range_retry(true, 0)
                 } else if budgeted {
@@ -4223,7 +4223,7 @@ impl SupervisorInner {
                     || drv.has_known_partial_enable();
                 if reducer.was_torqued || any {
                     let (hold_mask, _) = self.capture_measured_hold_from_owner();
-                    drv.drop_pending_holds_outside_mask(hold_mask);
+                    drv.tx_mut().drop_pending_holds_outside_mask(hold_mask);
                 }
                 any
             }) {
@@ -4362,7 +4362,7 @@ impl SupervisorInner {
                     || drv.has_known_partial_enable();
                 if was_torqued || any {
                     let (hold_mask, _) = self.capture_measured_hold_from_owner();
-                    drv.drop_pending_holds_outside_mask(hold_mask);
+                    drv.tx_mut().drop_pending_holds_outside_mask(hold_mask);
                 }
                 any
             }) {
@@ -4589,10 +4589,10 @@ impl SupervisorInner {
                                     let tx_dl = owner_dl.map(|dl| {
                                         drv_now + dl.saturating_duration_since(live_owner_now)
                                     });
-                                    drv.set_enable_authority(tx_dl, expected_lease_gen);
+                                    drv.tx_mut().set_enable_authority(tx_dl, expected_lease_gen);
                                     let before_cons = if conservative_cap {
-                                        let bc = drv.release_budget_consumed();
-                                        drv.sync_release_budget_limits(0, 0);
+                                        let bc = drv.tx().release_budget_consumed();
+                                        drv.tx_mut().sync_release_budget_limits(0, 0);
                                         Some(bc)
                                     } else {
                                         None
@@ -4603,7 +4603,7 @@ impl SupervisorInner {
                                         drv.poll_torque(drv_deadline)
                                     };
                                     if let Some(bc) = before_cons {
-                                        let after = drv.release_budget_consumed();
+                                        let after = drv.tx().release_budget_consumed();
                                         cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(bc.0));
                                         cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(bc.1));
                                     }
@@ -4620,7 +4620,7 @@ impl SupervisorInner {
                         } else {
                             let drv_now = drv.clock_now();
                             let tx_dl = owner_dl.map(|dl| drv_now + dl.saturating_duration_since(owner_now));
-                            drv.set_enable_authority(tx_dl, expected_lease_gen);
+                            drv.tx_mut().set_enable_authority(tx_dl, expected_lease_gen);
                             let r = drv.poll_torque(drv_now + crate::driver::DAMIAO_RX_PASS);
                             (drv_now, r, None, None)
                         };
@@ -6164,7 +6164,7 @@ impl SupervisorInner {
                     let disable_kind = crate::driver::DisableKind::DisableRequested {
                         started_at: requested_at,
                     };
-                    drv.set_disable_authority(None, active_lease_gen);
+                    drv.tx_mut().set_disable_authority(None, active_lease_gen);
                     let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
                     let frames_dispatched = drv.disable_frames_dispatched();
                     let dispatched_mask = drv.disable_dispatched_mask();
@@ -6811,7 +6811,7 @@ impl SupervisorInner {
                     let req_rem = deadline.saturating_duration_since(Instant::now());
                     let step_budget = req_rem.min(per_tick_tx_budget);
                     let use_budgeted = drv.supports_rt_executor().is_ok();
-                    drv.set_disable_authority(Some(requested_at + req_rem), active_lease_gen);
+                    drv.tx_mut().set_disable_authority(Some(requested_at + req_rem), active_lease_gen);
                     drv.set_tx_release_deadline(Some(requested_at + step_budget));
                     let res = if use_budgeted {
                         drv.begin_disable_torque_budgeted(disable_kind, 0)
@@ -8029,15 +8029,15 @@ impl SupervisorInner {
                         return BgPollStep::BudgetExpired;
                     };
                     let before_cons = if conservative_cap {
-                        let bc = drv.release_budget_consumed();
-                        drv.sync_release_budget_limits(0, 0);
+                        let bc = drv.tx().release_budget_consumed();
+                        drv.tx_mut().sync_release_budget_limits(0, 0);
                         Some(bc)
                     } else {
                         None
                     };
                     let poll_res = drv.poll_torque_budgeted(drv_deadline, budget.max_rx_frames);
                     if let Some(bc) = before_cons {
-                        let after = drv.release_budget_consumed();
+                        let after = drv.tx().release_budget_consumed();
                         cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(bc.0));
                         cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(bc.1));
                     }
@@ -8685,8 +8685,8 @@ impl SupervisorInner {
                             || rt_executor_owned
                             || drv.supports_rt_executor().is_ok();
                         let before_cons = if conservative_cap {
-                            let bc = drv.release_budget_consumed();
-                            drv.sync_release_budget_limits(0, 0);
+                            let bc = drv.tx().release_budget_consumed();
+                            drv.tx_mut().sync_release_budget_limits(0, 0);
                             Some(bc)
                         } else {
                             None
@@ -8697,7 +8697,7 @@ impl SupervisorInner {
                             drv.poll_torque(drv_deadline)
                         };
                         if let Some(bc) = before_cons {
-                            let after = drv.release_budget_consumed();
+                            let after = drv.tx().release_budget_consumed();
                             cons_rx_delta = cons_rx_delta.saturating_add(after.0.saturating_sub(bc.0));
                             cons_tx_delta = cons_tx_delta.saturating_add(after.1.saturating_sub(bc.1));
                         }
@@ -9101,9 +9101,9 @@ impl SupervisorInner {
                     && drv.is_feedback_valid()
                     && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
                 ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
-                ctx.tx_queue_drained = drv.pending_tx_len_total() == 0;
-                ctx.tx_probe_confirmed = drv.tx_probe_confirmed();
-                ctx.tx_probe_sent = drv.tx_probe_pending();
+                ctx.tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
+                ctx.tx_probe_confirmed = drv.tx().tx_probe_confirmed();
+                ctx.tx_probe_sent = drv.tx().tx_probe_pending();
                 ctx.enable_state_known = true;
             });
         }
@@ -9320,9 +9320,9 @@ impl SupervisorInner {
                         let loads = drv.joint_loads();
                         let caps = drv.capabilities();
                         let modes_uncertain = drv.joint_modes_uncertain();
-                        let tx_queue_drained = drv.pending_tx_len_total() == 0;
-                        let tx_probe_confirmed = drv.tx_probe_confirmed();
-                        let tx_probe_sent = drv.tx_probe_pending();
+                        let tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
+                        let tx_probe_confirmed = drv.tx().tx_probe_confirmed();
+                        let tx_probe_sent = drv.tx().tx_probe_pending();
                         let fb_fresh = drv.is_feedback_valid()
                             && ages.len() == dof
                             && ages.iter().all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT))
@@ -9498,9 +9498,9 @@ impl SupervisorInner {
                 let hw_fault = drv.check_hardware_status().is_err();
                 let fb_valid = drv.is_feedback_valid();
                 let j7_fb_fresh = drv.pos_force_feedback_fresh();
-                let tx_queue_drained = drv.pending_tx_len_total() == 0;
-                let tx_probe_confirmed = drv.tx_probe_confirmed();
-                let tx_probe_sent = drv.tx_probe_pending();
+                let tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
+                let tx_probe_confirmed = drv.tx().tx_probe_confirmed();
+                let tx_probe_sent = drv.tx().tx_probe_pending();
                 let states_ok = Self::states_valid(&states, caps, dof, loads.as_deref());
                 let fb_fresh = fb_valid
                     && ages.len() == dof
@@ -9616,12 +9616,12 @@ impl SupervisorInner {
                         if let Some(auth) = authority {
                             recheck_clear_fault_authority_readonly(owner, auth, Instant::now())?;
                         }
-                        let res = drv.probe_tx_ready();
+                        let res = drv.tx_mut().probe_tx_ready();
                         Ok((
                             res,
-                            drv.pending_tx_len_total() == 0,
-                            drv.tx_probe_confirmed(),
-                            drv.tx_probe_pending(),
+                            drv.tx().pending_tx_len_total() == 0,
+                            drv.tx().tx_probe_confirmed(),
+                            drv.tx().tx_probe_pending(),
                             drv.check_hardware_status().is_err(),
                             drv.is_feedback_valid(),
                             drv.pos_force_feedback_fresh(),
@@ -9993,8 +9993,8 @@ impl SupervisorInner {
         let mut scratch_status = std::mem::take(&mut self.scratch.status);
         if let Some(ref mut d) = self.driver {
             let _ = d.with_mut(|drv| {
-                drv.discard_pending_tx();
-                drv.clear_tx_probe();
+                drv.tx_mut().discard_pending_tx();
+                drv.tx_mut().clear_tx_probe();
                 if drv.motor_status_into(&mut scratch_status) {
                     let mut names = [None; crate::rt_core::mailbox::MAX_DOF];
                     for (slot, &code) in names.iter_mut().zip(scratch_status.iter()) {
@@ -10601,7 +10601,7 @@ impl SupervisorInner {
                     drv.mit_expiry_recover_reset();
                     return MitRecStep::TorqueOffWouldDrop(refusal);
                 }
-                if let Err((max_frames, required)) = drv.check_watchdog_tx_budget_for_energized() {
+                if let Err((max_frames, required)) = drv.tx().check_watchdog_tx_budget_for_energized() {
                     drv.mit_expiry_recover_reset();
                     return MitRecStep::WatchdogBudgetInsufficient {
                         max_frames: max_frames.min(u16::MAX as usize) as u16,
@@ -10637,9 +10637,9 @@ impl SupervisorInner {
                     }
                     Ok(())
                 };
-                let before_budget = drv.release_budget_consumed();
+                let before_budget = drv.tx().release_budget_consumed();
                 if let Some((rx_rem, tx_rem)) = mit_budget_rem {
-                    drv.sync_release_budget_limits(rx_rem, tx_rem);
+                    drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
                 }
                 drv.set_tx_release_deadline(Some(drv_deadline));
                 let r = drv.mit_expiry_recover_budgeted(
@@ -10648,7 +10648,7 @@ impl SupervisorInner {
                     &mut pre_tx_gate,
                 );
                 drv.set_tx_release_deadline(None);
-                let after_budget = drv.release_budget_consumed();
+                let after_budget = drv.tx().release_budget_consumed();
                 mit_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                 mit_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                 if let Some(auth_err) = auth_abort {
@@ -11014,9 +11014,9 @@ impl SupervisorInner {
                 && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
             let fb_valid = drv.is_feedback_valid();
             let j7_fb_fresh = drv.pos_force_feedback_fresh();
-            let tx_queue_drained = drv.pending_tx_len_total() == 0;
-            let tx_probe_confirmed = drv.tx_probe_confirmed();
-            let tx_probe_sent = drv.tx_probe_pending();
+            let tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
+            let tx_probe_confirmed = drv.tx().tx_probe_confirmed();
+            let tx_probe_sent = drv.tx().tx_probe_pending();
             let hw_fault = drv.has_hardware_fault();
             let caps = drv.capabilities();
             let temp_fb = caps.temperature_feedback;
@@ -11123,19 +11123,19 @@ impl SupervisorInner {
                     else {
                         return BudgetedProbeAttempt::BudgetExpired;
                     };
-                    let before_budget = drv.release_budget_consumed();
+                    let before_budget = drv.tx().release_budget_consumed();
                     if let Some((rx_rem, tx_rem)) = budget_rem {
-                        drv.sync_release_budget_limits(rx_rem, tx_rem);
+                        drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
                     } else {
                         // Standalone off-release clear_fault call: exit any prior managed release
                         // and open a fresh TX pass before installing the release-margin deadline
                         // so a backpressured/expired pass from a prior release never blocks 0xCC.
-                        drv.reset_standalone_tx_pass();
+                        drv.tx_mut().reset_standalone_tx_pass();
                     }
                     drv.set_tx_release_deadline(Some(drv_deadline));
-                    let res = drv.probe_tx_ready_budgeted(drv_deadline);
+                    let res = drv.tx_mut().probe_tx_ready_budgeted(drv_deadline);
                     drv.set_tx_release_deadline(None);
-                    let after_budget = drv.release_budget_consumed();
+                    let after_budget = drv.tx().release_budget_consumed();
                     probe_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                     probe_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     drv.feedback_ages_into(&mut scratch_ages);
@@ -11143,9 +11143,9 @@ impl SupervisorInner {
                         && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
                     BudgetedProbeAttempt::Ran((
                         res,
-                        drv.pending_tx_len_total() == 0,
-                        drv.tx_probe_confirmed(),
-                        drv.tx_probe_pending(),
+                        drv.tx().pending_tx_len_total() == 0,
+                        drv.tx().tx_probe_confirmed(),
+                        drv.tx().tx_probe_pending(),
                         drv.has_hardware_fault(),
                         drv.is_feedback_valid(),
                         drv.pos_force_feedback_fresh(),
@@ -11249,14 +11249,14 @@ impl SupervisorInner {
                             else {
                                 return BudgetedResetAttempt::Refusal(R::BudgetExpired);
                             };
-                            let before_budget = drv.release_budget_consumed();
+                            let before_budget = drv.tx().release_budget_consumed();
                             if let Some((rx_rem, tx_rem)) = budget_rem {
-                                drv.sync_release_budget_limits(rx_rem, tx_rem);
+                                drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
                             }
                             drv.set_tx_release_deadline(Some(drv_deadline));
                             let res = drv.clear_fault_budgeted(drv_deadline);
                             drv.set_tx_release_deadline(None);
-                            let after_budget = drv.release_budget_consumed();
+                            let after_budget = drv.tx().release_budget_consumed();
                             reset_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                             reset_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                             BudgetedResetAttempt::Ran(res)
@@ -11545,9 +11545,9 @@ impl SupervisorInner {
         let mut scratch_status = std::mem::take(&mut self.scratch.status);
         let attempt = self
             .with_driver_and_owner_ref(|owner, drv| {
-                let before_budget = drv.release_budget_consumed();
+                let before_budget = drv.tx().release_budget_consumed();
                 if let Some((rx_rem, tx_rem)) = budget_rem {
-                    drv.sync_release_budget_limits(rx_rem, tx_rem);
+                    drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
                 }
                 let drv_deadline = if let Some(dl) = deadline {
                     let Ok((_, _, translated)) =
@@ -11567,7 +11567,7 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
-                    let after_budget = drv.release_budget_consumed();
+                    let after_budget = drv.tx().release_budget_consumed();
                     co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                     co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::DriverError(clear_fault_driver_error(&e)));
@@ -11581,7 +11581,7 @@ impl SupervisorInner {
                         if deadline.is_some() {
                             drv.set_tx_release_deadline(None);
                         }
-                        let after_budget = drv.release_budget_consumed();
+                        let after_budget = drv.tx().release_budget_consumed();
                         co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                         co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                         return CarryoverAttempt::Authority(auth_err);
@@ -11591,7 +11591,7 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
-                    let after_budget = drv.release_budget_consumed();
+                    let after_budget = drv.tx().release_budget_consumed();
                     co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                     co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::EStopActive);
@@ -11609,7 +11609,7 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
-                    let after_budget = drv.release_budget_consumed();
+                    let after_budget = drv.tx().release_budget_consumed();
                     co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                     co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::MotorErrorClearRequiresDisarmed);
@@ -11618,7 +11618,7 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
-                    let after_budget = drv.release_budget_consumed();
+                    let after_budget = drv.tx().release_budget_consumed();
                     co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                     co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(R::FreshFeedbackRequiredForRestingSupport);
@@ -11630,7 +11630,7 @@ impl SupervisorInner {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
-                    let after_budget = drv.release_budget_consumed();
+                    let after_budget = drv.tx().release_budget_consumed();
                     co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                     co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                     return CarryoverAttempt::Refusal(refusal);
@@ -11661,7 +11661,7 @@ impl SupervisorInner {
                 if deadline.is_some() {
                     drv.set_tx_release_deadline(None);
                 }
-                let after_budget = drv.release_budget_consumed();
+                let after_budget = drv.tx().release_budget_consumed();
                 co_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                 co_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                 if let Ok(CarryoverMotorClearOutcome::Revoked(code)) = outcome {

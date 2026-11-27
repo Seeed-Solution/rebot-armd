@@ -464,47 +464,47 @@ impl ArmDriver for ZeroOffsetDriver {
 
 impl crate::driver::BoundedTxExt for ZeroOffsetDriver {
     fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
-        self.inner.drop_pending_holds_outside_mask(hold_mask);
+        self.inner.tx_mut().drop_pending_holds_outside_mask(hold_mask);
     }
-    fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
-    fn set_tx_budget(&mut self, budget: crate::driver::TxBudget) { self.inner.set_tx_budget(budget); }
-    fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
-    fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
-    fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }
-    fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
-    fn last_hold_tx_due_mask(&self) -> u64 { self.inner.last_hold_tx_due_mask() }
-    fn last_hold_tx_sent_mask(&self) -> u64 { self.inner.last_hold_tx_sent_mask() }
-    fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
+    fn discard_pending_tx(&mut self) { self.inner.tx_mut().discard_pending_tx(); }
+    fn set_tx_budget(&mut self, budget: crate::driver::TxBudget) { self.inner.tx_mut().set_tx_budget(budget); }
+    fn tx_frame_max_age(&self) -> Duration { self.inner.tx().tx_frame_max_age() }
+    fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.tx().last_tx_expired_age() }
+    fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.tx().oldest_pending_tx_age() }
+    fn last_hold_tx_sent_any(&self) -> bool { self.inner.tx().last_hold_tx_sent_any() }
+    fn last_hold_tx_due_mask(&self) -> u64 { self.inner.tx().last_hold_tx_due_mask() }
+    fn last_hold_tx_sent_mask(&self) -> u64 { self.inner.tx().last_hold_tx_sent_mask() }
+    fn last_target_tx_sent_mask(&self) -> u64 { self.inner.tx().last_target_tx_sent_mask() }
     fn set_enable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
-        self.inner.set_enable_authority(deadline, expected_lease_gen)
+        self.inner.tx_mut().set_enable_authority(deadline, expected_lease_gen)
     }
     fn set_disable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
-        self.inner.set_disable_authority(deadline, expected_lease_gen)
+        self.inner.tx_mut().set_disable_authority(deadline, expected_lease_gen)
     }
-    fn set_output_lease_gen(&mut self, lease_gen: u64) { self.inner.set_output_lease_gen(lease_gen) }
-    fn pending_motion_tx_len(&self) -> usize { self.inner.pending_motion_tx_len() }
-    fn pending_hold_tx_len(&self) -> usize { self.inner.pending_hold_tx_len() }
-    fn tx_probe_confirmed(&self) -> bool { self.inner.tx_probe_confirmed() }
-    fn tx_probe_pending(&self) -> bool { self.inner.tx_probe_pending() }
-    fn probe_tx_ready(&mut self) -> Result<bool, ArmDriverError> { self.inner.probe_tx_ready() }
+    fn set_output_lease_gen(&mut self, lease_gen: u64) { self.inner.tx_mut().set_output_lease_gen(lease_gen) }
+    fn pending_motion_tx_len(&self) -> usize { self.inner.tx().pending_motion_tx_len() }
+    fn pending_hold_tx_len(&self) -> usize { self.inner.tx().pending_hold_tx_len() }
+    fn tx_probe_confirmed(&self) -> bool { self.inner.tx().tx_probe_confirmed() }
+    fn tx_probe_pending(&self) -> bool { self.inner.tx().tx_probe_pending() }
+    fn probe_tx_ready(&mut self) -> Result<bool, ArmDriverError> { self.inner.tx_mut().probe_tx_ready() }
     fn probe_tx_ready_budgeted(&mut self, deadline: Instant) -> Result<bool, ArmDriverError> {
-        self.inner.probe_tx_ready_budgeted(deadline)
+        self.inner.tx_mut().probe_tx_ready_budgeted(deadline)
     }
-    fn clear_tx_probe(&mut self) { self.inner.clear_tx_probe(); }
-    fn begin_wake_tx_pass(&mut self) { self.inner.begin_wake_tx_pass() }
-    fn reset_standalone_tx_pass(&mut self) { self.inner.reset_standalone_tx_pass() }
-    fn tx_budget_max_frames(&self) -> Option<u16> { self.inner.tx_budget_max_frames() }
+    fn clear_tx_probe(&mut self) { self.inner.tx_mut().clear_tx_probe(); }
+    fn begin_wake_tx_pass(&mut self) { self.inner.tx_mut().begin_wake_tx_pass() }
+    fn reset_standalone_tx_pass(&mut self) { self.inner.tx_mut().reset_standalone_tx_pass() }
+    fn tx_budget_max_frames(&self) -> Option<u16> { self.inner.tx().tx_budget_max_frames() }
     fn check_watchdog_tx_budget_for_enable(&self) -> Result<(), (usize, usize)> {
-        self.inner.check_watchdog_tx_budget_for_enable()
+        self.inner.tx().check_watchdog_tx_budget_for_enable()
     }
     fn check_watchdog_tx_budget_for_energized(&self) -> Result<(), (usize, usize)> {
-        self.inner.check_watchdog_tx_budget_for_energized()
+        self.inner.tx().check_watchdog_tx_budget_for_energized()
     }
-    fn release_budget_consumed(&self) -> (u16, u16) { self.inner.release_budget_consumed() }
+    fn release_budget_consumed(&self) -> (u16, u16) { self.inner.tx().release_budget_consumed() }
     fn sync_release_budget_limits(&mut self, rx_remaining: u16, tx_remaining: u16) {
-        self.inner.sync_release_budget_limits(rx_remaining, tx_remaining)
+        self.inner.tx_mut().sync_release_budget_limits(rx_remaining, tx_remaining)
     }
-    fn next_watchdog_hold_wake(&self) -> Option<std::time::Instant> { self.inner.next_watchdog_hold_wake() }
+    fn next_watchdog_hold_wake(&self) -> Option<std::time::Instant> { self.inner.tx().next_watchdog_hold_wake() }
 }
 
 impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {

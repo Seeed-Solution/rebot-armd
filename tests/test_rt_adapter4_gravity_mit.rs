@@ -3207,7 +3207,7 @@ async fn predating_fault_does_not_prove_applied_stop_for_gravity_comp_handback_t
                         let mut b = TxBudget::default();
                         // Energized 6 arm + J7 requires max_frames >= 8 (7 continuity + 1 register slot).
                         b.max_frames = 8;
-                        let _ = slot.try_with_mut(|d| d.set_tx_budget(b));
+                        let _ = slot.try_with_mut(|d| d.tx_mut().set_tx_budget(b));
                     }
                 }
             }

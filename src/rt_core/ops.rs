@@ -2044,7 +2044,7 @@ impl CoreOps for SupervisorInner {
             },
             outcome => {
                 if let Some(d) = self.driver.as_mut() {
-                    let _ = d.try_with_mut(|drv| drv.begin_wake_tx_pass());
+                    let _ = d.try_with_mut(|drv| drv.tx_mut().begin_wake_tx_pass());
                 }
                 let before = self.sync_driver_budget_before(budget);
                 let mut sb = budget.poll_service_budget(now);
@@ -2099,7 +2099,7 @@ impl CoreOps for SupervisorInner {
                 // `refresh_scheduler`, `release_recovery_tx_count`), and mark that Step 5 normal
                 // output will NOT run again in this release.
                 if let Some(d) = self.driver.as_mut() {
-                    let _ = d.try_with_mut(|drv| drv.begin_wake_tx_pass());
+                    let _ = d.try_with_mut(|drv| drv.tx_mut().begin_wake_tx_pass());
                 }
                 let poll = self.poll_transition_wake_with_clock(budget, now_fn);
                 if outcome == crate::supervisor::DriverTxCapOutcome::Installed {
@@ -2166,7 +2166,7 @@ impl CoreOps for SupervisorInner {
             d.feedback_ages_into(ages);
             let oldest = ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
             let wd_rem = d
-                .next_watchdog_hold_wake()
+                .tx().next_watchdog_hold_wake()
                 .map(|w| w.saturating_duration_since(d.clock_now()));
             (d.is_feedback_valid(), d.enable_state(), oldest, wd_rem)
         };
@@ -2253,7 +2253,7 @@ impl CoreOps for SupervisorInner {
         let driver = self.driver.as_ref()?;
         driver
             .try_with_ref_recover(|d| {
-                d.next_watchdog_hold_wake()
+                d.tx().next_watchdog_hold_wake()
                     .map(|w| owner_now + w.saturating_duration_since(d.clock_now()))
             })
             .flatten()

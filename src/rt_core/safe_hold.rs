@@ -462,7 +462,7 @@ impl SafeHoldBuffers {
         drv.begin_control_release(0x8000_0000_0000_0000u64 | release_seq);
         drv.set_tx_release_deadline(Some(drv_cap));
         let tx_cap = drv
-            .tx_budget_max_frames()
+            .tx().tx_budget_max_frames()
             .unwrap_or(super::budget::DEFAULT_TX_ATTEMPT_BUDGET);
         let mut ledger = super::budget::ReleaseBudget::new(
             release_seq,
@@ -483,21 +483,21 @@ impl SafeHoldBuffers {
 
         // 2. Zero-alloc live RX intake across all supported drivers (Damiao, RobStride, Feetech).
         let rx_deadline = drv_cap.min(drv_now + crate::rt_core::ops::RX_TIME_BUDGET);
-        drv.sync_release_budget_limits(ledger.rx_remaining(), ledger.tx_remaining());
-        let before_rx = drv.release_budget_consumed();
+        drv.tx_mut().sync_release_budget_limits(ledger.rx_remaining(), ledger.tx_remaining());
+        let before_rx = drv.tx().release_budget_consumed();
         let rx_ok = match drv.read_joint_states_safe_hold(
             &mut self.rx_states,
             rx_deadline,
             ledger.rx_remaining(),
         ) {
             Ok((frames, exhausted)) => {
-                let after = drv.release_budget_consumed();
+                let after = drv.tx().release_budget_consumed();
                 ledger.charge_rx(after.0.saturating_sub(before_rx.0).max(frames), exhausted);
                 ledger.charge_tx(after.1.saturating_sub(before_rx.1));
                 true
             }
             Err(_) => {
-                let after = drv.release_budget_consumed();
+                let after = drv.tx().release_budget_consumed();
                 ledger.charge_rx(after.0.saturating_sub(before_rx.0), true);
                 ledger.charge_tx(after.1.saturating_sub(before_rx.1));
                 drv.read_cached_joint_states_into(&mut self.rx_states).is_some()
@@ -599,8 +599,8 @@ impl SafeHoldBuffers {
                 if self.thermal_disable_started
                     && !ctrl.thermal_disable_confirmed.load(Ordering::Acquire)
                 {
-                    drv.sync_release_budget_limits(ledger.rx_remaining(), ledger.tx_remaining());
-                    let before_poll = drv.release_budget_consumed();
+                    drv.tx_mut().sync_release_budget_limits(ledger.rx_remaining(), ledger.tx_remaining());
+                    let before_poll = drv.tx().release_budget_consumed();
                     match drv.poll_torque_budgeted(ledger.deadline(), ledger.rx_remaining()) {
                         Ok(TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
                             if drv.is_hardware_disarmed_confirmed() =>
@@ -617,7 +617,7 @@ impl SafeHoldBuffers {
                             }
                         }
                     }
-                    let after_poll = drv.release_budget_consumed();
+                    let after_poll = drv.tx().release_budget_consumed();
                     let (rep_rx, rep_ex) = drv.take_last_poll_rx().unwrap_or((0, false));
                     ledger.charge_rx(
                         after_poll.0.saturating_sub(before_poll.0).max(rep_rx),
