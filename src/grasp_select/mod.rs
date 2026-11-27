@@ -14,6 +14,7 @@
 //! The selected candidate carries what an executor needs (phase B): pre-grasp, insertion
 //! along `a`, contact, separation and lift TCP poses with their joint solutions.
 
+pub mod admission;
 pub mod candidates;
 pub mod feasibility;
 pub mod geometry;
@@ -349,12 +350,9 @@ impl AdaptiveSelection {
     }
 
     /// Adaptive dry-run reply JSON (parity with Phase A fields plus authoritative Phase B
-    /// route summary, `failing_phase`, and checked-alternative `hint` only when verified).
-    pub fn to_json(
-        &self,
-        s: &Snapshot,
-        legacy_verdict: Option<(bool, Option<&str>, Option<&str>)>,
-    ) -> Value {
+    /// route summary, `failing_phase`, and checked-alternative `hint` only when verified; the
+    /// top-down candidate is part of the search, so no legacy-pass hint exists).
+    pub fn to_json(&self, s: &Snapshot) -> Value {
         let mut v = self.selection.to_json(s);
         if let Some(route) = &self.route {
             v["expected_duration_s"] = json!(route.budget.nominal_total_s);
@@ -367,15 +365,7 @@ impl AdaptiveSelection {
             }
         }
         v["failing_phase"] = json!(self.failing_phase);
-        let hint = self.checked_hint.clone().or_else(|| {
-            if !self.reachable() {
-                if let Some((true, _, _)) = legacy_verdict {
-                    return Some("legacy strategy passed dry_run for this target".to_string());
-                }
-            }
-            None
-        });
-        if let Some(h) = hint {
+        if let Some(h) = self.checked_hint.clone() {
             v["hint"] = json!(h);
         }
         v
@@ -581,7 +571,14 @@ impl Search<'_> {
         self.start.elapsed().as_secs_f64() * 1000.0 > self.s.budget.wall_ms as f64
             || self.s.budget.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
-    fn id(&self, hy: &Hypothesis) -> String { format!("{}-{:03}", self.s.id, hy.index) }
+    fn id(&self, hy: &Hypothesis) -> String {
+        if hy.index == admission::TOP_DOWN_INDEX { admission::top_down_id(self.s) } else { format!("{}-{:03}", self.s.id, hy.index) }
+    }
+    /// A rejection without a hypothesis (counted only).
+    fn reject_bare(&mut self, r: Rejection) {
+        *self.by_phase.entry(r.phase).or_default() += 1;
+        *self.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
+    }
     fn reject(&mut self, hy: &Hypothesis, r: Rejection, shortlisted: bool) {
         *self.by_phase.entry(r.phase).or_default() += 1;
         *self.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
@@ -683,6 +680,38 @@ fn visible(s: &Snapshot, t: &snapshot::Target, tcp: &Pose) -> bool {
 /// `pre_open`, straight-line TCP `insert`, capped `close`, nominal + contact-window `separation`
 /// & `lift` with conservative swept OBB SAT + 8-corner payload torque, closed & open `withdrawal`,
 /// and unified per-child + parent deadline admission) under ONE absolute `budget_ms` deadline.
+/// A canonical target-facing front-branch seed (clamped to the joint limits): starting on an
+/// alternate IK branch does not trap endpoint IK in a local minimum.
+fn canonical_seed(s: &Snapshot, t: &snapshot::Target) -> [f64; 6] {
+    let az = t.centroid[1].atan2(t.centroid[0]);
+    let raw_canonical = [az, -1.167, -1.565, 1.435, 0.0, 0.0];
+    std::array::from_fn(|j| {
+        let lim = &s.input.limits[j];
+        match lim.effective_planning_range() {
+            Some((lo32, hi32)) => {
+                let (lo, hi) = (f64::from(lo32), f64::from(hi32));
+                let margin = 0.05f64.min((hi - lo) * 0.25);
+                raw_canonical[j].clamp(lo + margin, hi - margin)
+            }
+            None => raw_canonical[j].clamp(f64::from(lim.min_position), f64::from(lim.max_position)),
+        }
+    })
+}
+
+/// Budget exhaustion of the optional search: the verified top-down route when there is one,
+/// else no winner.
+fn exhausted_or_top(se: Search, n: usize, ev: Value, top: &Option<(Candidate, AdaptiveRoute)>) -> AdaptiveSelection {
+    match top {
+        Some((c, route)) if c.checked.insufficient_evidence.is_none() => {
+            let mut se = se;
+            se.stats.fully_checked = 1;
+            let sel = se.finish(Outcome::Selected, None, None, vec![c.clone()], ev);
+            AdaptiveSelection { selection: sel, route: Some(route.clone()), failing_phase: None, checked_hint: None }
+        }
+        _ => AdaptiveSelection { selection: se.exhausted(n, ev), route: None, failing_phase: Some("budget"), checked_hint: None },
+    }
+}
+
 pub fn select_adaptive_route(
     s: &Snapshot,
     gripper_policy: &crate::model::GripperPolicy,
@@ -719,13 +748,36 @@ pub fn select_adaptive_route(
         }
     };
     let ev = evidence_json(s, Some(&t));
-    let (chords, chord_rej) = candidates::chords(&t, &s.tool);
+    let (mut chords, chord_rej) = candidates::chords(&t, &s.tool);
+    // the top-down (legacy) candidate first, with its own reserved budget: when the optional
+    // search below runs out of budget, the verified top-down route is returned
+    let mut work = Work::default();
+    let acq_res = feasibility::acquisition(s, &mut work);
+    let acq_seed = acq_res.as_ref().ok().map(|a| a.q_end);
+    let mut cheap = candidates::CheapStats::default();
+    let ctx = admission::Ctx { policy: gripper_policy, limit: gripper_limit, close_speed_limit, has_gravity_model };
+    let mut top_rej: Option<Rejection> = None;
+    let top = match admission::top_down_hypothesis(s, &t, chords.len(), &mut cheap) {
+        Ok((chord, hy)) => {
+            let r = admission::evaluate_top_down(s, &t, &chord, &hy, &ctx, (acq_res.is_ok(), acq_seed), &mut work);
+            chords.push(chord);
+            match r {
+                Ok(entry) => Some(entry),
+                Err(f) => { top_rej = Some(f.rejection.clone()); if let Some(hy) = f.hy { se.reject(&hy, f.rejection, true); } None }
+            }
+        }
+        Err(f) => {
+            top_rej = Some(f.rejection.clone());
+            match f.hy { Some(hy) => se.reject(&hy, f.rejection, true), None => se.reject_bare(f.rejection) }
+            None
+        }
+    };
+    se.start = Instant::now();
     se.stats.chords = chords.len();
     for r in chord_rej {
         *se.by_phase.entry(r.phase).or_default() += 1;
         *se.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
     }
-    let mut cheap = candidates::CheapStats::default();
     let (hyps, hyp_rej) = candidates::hypotheses(s, &t, &chords, &mut cheap);
     se.stats.generated = cheap.generated;
     se.stats.geometric_survivors = hyps.len();
@@ -734,49 +786,23 @@ pub fn select_adaptive_route(
     }
     if se.out_of_budget() {
         se.stats.lattice_tests = cheap.lattice_tests;
-        return AdaptiveSelection {
-            selection: se.exhausted(0, ev),
-            route: None,
-            failing_phase: Some("budget"),
-            checked_hint: None,
-        };
+        return exhausted_or_top(se, 0, ev, &top);
     }
 
     // Check acquisition as a reference seed / diagnostic only — NEVER hard-blocking direct-from-q0
     // candidates when acquisition itself is blocked (e.g. overhead keep-out box above target).
-    let mut work = Work::default();
-    let acq_res = feasibility::acquisition(s, &mut work);
-    let acq_seed = acq_res.as_ref().ok().map(|a| a.q_end);
-
     // Seed endpoint IK from cache, actual start q0, optional acq_seed, and a canonical
     // target-facing front-branch seed (clamped to joint limits) so starting on an alternate IK
     // branch does not trap endpoint IK in a local minimum and can cleanly fall back to a
     // swept-joint pregrasp transition.
-    let az = t.centroid[1].atan2(t.centroid[0]);
-    let raw_canonical = [az, -1.167, -1.565, 1.435, 0.0, 0.0];
-    let canonical_seed: [f64; 6] = std::array::from_fn(|j| {
-        let lim = &s.input.limits[j];
-        match lim.effective_planning_range() {
-            Some((lo32, hi32)) => {
-                let (lo, hi) = (f64::from(lo32), f64::from(hi32));
-                let margin = 0.05f64.min((hi - lo) * 0.25);
-                raw_canonical[j].clamp(lo + margin, hi - margin)
-            }
-            None => raw_canonical[j].clamp(f64::from(lim.min_position), f64::from(lim.max_position)),
-        }
-    });
+    let canonical_seed = canonical_seed(s, &t);
     let mut seed_cache: BTreeMap<(DirClass, bool), [f64; 6]> = BTreeMap::new();
     let mut screened: Vec<(Hypothesis, [f64; 6], [f64; 6], f64)> = Vec::new();
     for hy in hyps {
         if se.out_of_budget() {
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
-            return AdaptiveSelection {
-                selection: se.exhausted(0, ev),
-                route: None,
-                failing_phase: Some("budget"),
-                checked_hint: None,
-            };
+            return exhausted_or_top(se, 0, ev, &top);
         }
         let mut seeds = Vec::with_capacity(4);
         if let Some(q) = seed_cache.get(&(hy.class, hy.half_turn)) {
@@ -861,7 +887,8 @@ pub fn select_adaptive_route(
 
     let acq_ok = acq_res.is_ok();
     let mut entries: Vec<(Candidate, AdaptiveRoute)> = Vec::new();
-    let mut deepest: Option<(usize, Rejection)> = None;
+    let mut deepest: Option<(usize, Rejection)> = top_rej.map(|r| (phase_rank(r.phase, true), r));
+    entries.extend(top.iter().cloned());
 
     let evaluate = |se: &mut Search,
                         hy: &Hypothesis,
@@ -919,12 +946,7 @@ pub fn select_adaptive_route(
             let n = entries.len();
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
-            return AdaptiveSelection {
-                selection: se.exhausted(n, ev),
-                route: None,
-                failing_phase: Some("budget"),
-                checked_hint: None,
-            };
+            return exhausted_or_top(se, n, ev, &top);
         }
         let (hy, _, q_pre_seed, _) = &screened[i];
         evaluate(&mut se, hy, *q_pre_seed, &mut work, &mut entries, &mut deepest);
@@ -960,12 +982,7 @@ pub fn select_adaptive_route(
                 let n = entries.len();
                 se.stats.work = work;
                 se.stats.lattice_tests = cheap.lattice_tests;
-                return AdaptiveSelection {
-                    selection: se.exhausted(n, ev),
-                    route: None,
-                    failing_phase: Some("budget"),
-                    checked_hint: None,
-                };
+                return exhausted_or_top(se, n, ev, &top);
             }
             next += 1;
             se.stats.refined += 1;
@@ -1020,12 +1037,7 @@ pub fn select_adaptive_route(
     // cannot exceed `budget_ms` and still return `Outcome::Selected`.
     if se.out_of_budget() {
         let n = entries.len();
-        return AdaptiveSelection {
-            selection: se.exhausted(n, ev),
-            route: None,
-            failing_phase: Some("budget"),
-            checked_hint: None,
-        };
+        return exhausted_or_top(se, n, ev, &top);
     }
     entries.sort_by(|a, b| {
         let ia = a.0.checked.insufficient_evidence.is_some();

@@ -369,16 +369,20 @@ async fn timing_and_work_counts() {
 }
 
 #[tokio::test]
-async fn budget_exhaustion_returns_no_winner() {
+async fn budget_exhaustion_returns_the_verified_top_down_route() {
+    // the top-down candidate is checked first with its own reserved budget: a 1 ms search
+    // budget runs out in the optional search and the verified top-down route is returned
     let sc = mounted_scene(0.30, 0.0, 0.26).await;
     let poly = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
     let mut body = request(&sc, &poly, 0.035);
     body["budget_ms"] = json!(1);
     let v = dry(&sc, &body).await;
-    assert_eq!(v["outcome"], "budget_exhausted", "{}", summary(&v));
-    assert_eq!(v["reachable"], false);
-    assert_eq!(v["code"], "BUDGET_EXHAUSTED");
-    assert!(sel(&v).is_null());
+    assert_eq!(v["outcome"], "selected", "{}", summary(&v));
+    assert_eq!(v["reachable"], true);
+    let c = sel_of(&v);
+    assert!(c["id"].as_str().unwrap().ends_with("-top"), "{c}");
+    assert_eq!(c["approach_class"], "vertical");
+    assert_eq!(v["search"]["fully_checked"], 1);
 }
 
 #[tokio::test]

@@ -109,6 +109,9 @@ pub struct PendingGrasp {
     pub physical_contact_end_m: Option<[f64; 3]>,
     /// Populated only when `strategy: "adaptive"` is requested (`None` for legacy).
     pub adaptive: Option<Box<PendingAdaptive>>,
+    /// Legacy requests: the same snapshot state, for the shared admission of the top-down
+    /// candidate ([`crate::grasp_select::admission::legacy_admission`]).
+    pub shared: Option<Box<PendingAdaptive>>,
 }
 
 /// A grasp whose coarse approach (legacy) or whole adaptive route was found reachable.
@@ -127,6 +130,8 @@ pub struct PlannedGrasp {
     pub mode: Option<Result<ModeInfo, String>>,
     /// Populated only when `strategy: "adaptive"` is requested (`None` for legacy).
     pub adaptive: Option<Box<PlannedAdaptive>>,
+    /// Legacy: the admitted jaw fit (re-checked on the live measured width).
+    pub jaw: Option<crate::grasp_select::admission::JawAdmission>,
 }
 
 fn adaptive_prep_err(phase: &'static str, err: ArmError) -> ArmError {
@@ -167,40 +172,12 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         }
         Err(e) => return Err(e),
     };
-    if strategy == crate::grasp_select::Strategy::Adaptive {
-        let snap = crate::grasp_select::capture(inner, &pending, body)
-            .map_err(|e| adaptive_prep_err("snapshot", e))?;
-        let gripper_idx = inner
-            .config
-            .gripper_index()
-            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint".into()))))?;
-        let gripper_policy = inner
-            .config
-            .gripper_policy
-            .clone()
-            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into()))))?;
-        let gripper_limit = inner
-            .config
-            .limits
-            .get(gripper_idx)
-            .cloned()
-            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint limit".into()))))?;
-        let revisions = crate::grasp_select::AdaptiveRevisions {
-            workspace_revision: inner.workspace_revision,
-            calibration_revision: inner.calibration_revision,
-            grasp_setup_revision: inner.grasp_setup_revision,
-            gripper_calib_revision: inner.gripper_calib_revision,
-            power_budget_revision: inner.power_budget_revision,
-        };
-        pending.adaptive = Some(Box::new(PendingAdaptive {
-            snapshot: snap,
-            start_positions: inner.commanded_positions.clone(),
-            revisions,
-            gripper_policy,
-            gripper_limit,
-            close_speed_limit: inner.gripper_close_speed_limit(),
-            has_gravity_model: inner.config.gravity_model.is_some(),
-        }));
+    let adaptive = strategy == crate::grasp_select::Strategy::Adaptive;
+    let state = shared_inner(inner, &pending, body, adaptive);
+    if adaptive {
+        pending.adaptive = Some(state.map_err(|e| adaptive_prep_err("snapshot", e))?);
+    } else {
+        pending.shared = Some(state?);
     }
     Ok(pending)
 }
@@ -227,7 +204,63 @@ fn prepare_any(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         open_rad: policy.open_rad,
         physical_contact_end_m: inner.config.effective_physical_contact_end_m(),
         adaptive: None,
+        shared: None,
     })
+}
+
+/// The snapshot state of a request under the lock: the adaptive selection input, or (`strict`
+/// false, legacy) the same state for the shared top-down admission.
+fn shared_inner(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value, strict: bool) -> Result<Box<PendingAdaptive>, ArmError> {
+    let unsupported = |m: &str| ArmError::from(MotionError::Unsupported(m.into()));
+    let snapshot = crate::grasp_select::snapshot::capture_mode(inner, pending, body, strict)?;
+    let g_idx = inner.config.gripper_index().ok_or_else(|| unsupported("Grasp needs a gripper joint"))?;
+    let gripper_policy = inner.config.gripper_policy.clone().ok_or_else(|| unsupported("Grasp needs a gripper policy"))?;
+    let gripper_limit = inner.config.limits.get(g_idx).cloned().ok_or_else(|| unsupported("Grasp needs a gripper joint limit"))?;
+    Ok(Box::new(PendingAdaptive {
+        snapshot,
+        start_positions: inner.commanded_positions.clone(),
+        revisions: crate::grasp_select::AdaptiveRevisions {
+            workspace_revision: inner.workspace_revision,
+            calibration_revision: inner.calibration_revision,
+            grasp_setup_revision: inner.grasp_setup_revision,
+            gripper_calib_revision: inner.gripper_calib_revision,
+            power_budget_revision: inner.power_budget_revision,
+        },
+        gripper_policy,
+        gripper_limit,
+        close_speed_limit: inner.gripper_close_speed_limit(),
+        has_gravity_model: inner.config.gravity_model.is_some(),
+    }))
+}
+
+/// [`shared_inner`] from a published environment (0 `SupervisorLock`).
+fn shared_env(
+    env: &crate::rt_core::requests::actions::ActionPrepEnv,
+    commanded_positions: &[f32],
+    pending: &PendingGrasp,
+    body: &Value,
+    strict: bool,
+) -> Result<Box<PendingAdaptive>, ArmError> {
+    let unsupported = |m: &str| ArmError::from(MotionError::Unsupported(m.into()));
+    let snapshot = crate::grasp_select::snapshot::capture_from_env_mode(env, pending, body, strict)?;
+    let g_idx = env.config.gripper_index().ok_or_else(|| unsupported("Grasp needs a gripper joint"))?;
+    let gripper_policy = env.config.gripper_policy.clone().ok_or_else(|| unsupported("Grasp needs a gripper policy"))?;
+    let gripper_limit = env.config.limits.get(g_idx).cloned().ok_or_else(|| unsupported("Grasp needs a gripper joint limit"))?;
+    Ok(Box::new(PendingAdaptive {
+        snapshot,
+        start_positions: commanded_positions.to_vec(),
+        revisions: crate::grasp_select::AdaptiveRevisions {
+            workspace_revision: env.workspace_revision,
+            calibration_revision: env.calibration_revision,
+            grasp_setup_revision: env.grasp_setup_revision,
+            gripper_calib_revision: env.gripper_calib_revision,
+            power_budget_revision: env.power_budget_revision,
+        },
+        gripper_policy,
+        gripper_limit,
+        close_speed_limit: env.gripper_close_speed_limit,
+        has_gravity_model: env.config.gravity_model.is_some(),
+    }))
 }
 
 fn prepare_from_env_parts(
@@ -278,36 +311,14 @@ fn prepare_from_env_parts(
         open_rad: policy.open_rad,
         physical_contact_end_m: env.config.effective_physical_contact_end_m(),
         adaptive: None,
+        shared: None,
     };
-    if strategy == crate::grasp_select::Strategy::Adaptive {
-        let gsnap = crate::grasp_select::capture_from_env(env, &pending, body)
-            .map_err(|e| adaptive_prep_err("snapshot", e))?;
-        let gripper_idx = env
-            .config
-            .gripper_index()
-            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint".into()))))?;
-        let gripper_limit = env
-            .config
-            .limits
-            .get(gripper_idx)
-            .cloned()
-            .ok_or_else(|| adaptive_prep_err("snapshot", ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint limit".into()))))?;
-        let revisions = crate::grasp_select::AdaptiveRevisions {
-            workspace_revision: env.workspace_revision,
-            calibration_revision: env.calibration_revision,
-            grasp_setup_revision: env.grasp_setup_revision,
-            gripper_calib_revision: env.gripper_calib_revision,
-            power_budget_revision: env.power_budget_revision,
-        };
-        pending.adaptive = Some(Box::new(PendingAdaptive {
-            snapshot: gsnap,
-            start_positions: commanded_positions.to_vec(),
-            revisions,
-            gripper_policy: policy,
-            gripper_limit,
-            close_speed_limit: env.gripper_close_speed_limit,
-            has_gravity_model: env.config.gravity_model.is_some(),
-        }));
+    let adaptive = strategy == crate::grasp_select::Strategy::Adaptive;
+    let state = shared_env(env, commanded_positions, &pending, body, adaptive);
+    if adaptive {
+        pending.adaptive = Some(state.map_err(|e| adaptive_prep_err("snapshot", e))?);
+    } else {
+        pending.shared = Some(state?);
     }
     Ok(pending)
 }
@@ -356,7 +367,7 @@ pub(super) fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> 
 /// Outside the lock: estimate the target from the box-centre ray and plan the approach
 /// (legacy) or select & preflight the whole adaptive route (`strategy: "adaptive"`).
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
-    let PendingGrasp { input, request, open_rad, physical_contact_end_m, adaptive } = pending;
+    let PendingGrasp { input, request, open_rad, physical_contact_end_m, adaptive, shared } = pending;
     if let Some(pa) = adaptive {
         let sel = crate::grasp_select::select_adaptive_route(
             &pa.snapshot,
@@ -382,25 +393,15 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
                     revisions: pa.revisions,
                     expected_generation: None,
                 })),
+                jaw: None,
             });
         }
         let code = sel.selection.code.unwrap_or_else(|| "NO_CANDIDATE".into());
         let phase = sel.failing_phase.unwrap_or("selection");
         let base_msg = sel.selection.message.unwrap_or_else(|| "adaptive grasp infeasible".into());
-        // Preserve dry-run/live parity for checked-only hints: only emit the legacy hint when
-        // the legacy route actually passes on this exact snapshot.
-        let checked_hint = sel.checked_hint.or_else(|| {
-            let legacy_pending = PendingGrasp {
-                input,
-                request,
-                open_rad,
-                physical_contact_end_m,
-                adaptive: None,
-            };
-            plan(legacy_pending)
-                .ok()
-                .map(|_| "legacy strategy passed dry_run for this target".to_string())
-        });
+        // only checked hints (the top-down candidate is part of the search, so a legacy pass
+        // cannot exist where adaptive refuses)
+        let checked_hint = sel.checked_hint;
         let message = match &checked_hint {
             Some(hint) => format!("[{phase}] {base_msg}; hint: {hint}"),
             None => format!("[{phase}] {base_msg}"),
@@ -421,31 +422,16 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let request = *request;
     let setup = &request.setup;
     let pose_end = input.arm.fk(&input.q0);
-    let pose_tcp = motion::end_to_tcp(&pose_end, &input.tcp_offset);
     let cam = CamModel::assumed(&input.arm, setup, &input.cam);
-    let centre = cam.to_px(box_centre(&request.box_norm));
-    let target = cam.plane_point(&pose_end, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
-        "the box centre ray does not meet the table plane in front of the camera".into())))?;
-    let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
     let pts = envelope_with_contact(input.ws.as_ref(), &input.cam, &cam.rec, physical_contact_end_m);
     let is_5dof = input.arm.arm_dof() == 5;
-    let r_ref_p = if camera_down { &pose_end.p } else { &pose_tcp.p };
-    let r_ref = if is_5dof {
-        motion::apply_auto_yaw(r_ref_p, &target, pose_end.r)
-    } else {
-        pose_end.r
-    };
+    let td = top_down_pose(&input, setup, &cam, &pts, &request.box_norm)?;
+    let TopDown { target, goal, tool, camera_down, .. } = td;
     // the envelope stays above the table on the approach and (camera-down) the transition
-    let (goal, tool) = if camera_down {
-        let goal = camera_down_pose(&r_ref, &target, setup, &cam, &pts);
-        let tool = approach_pose(&goal.r, &target, setup);
+    if camera_down {
         let tool_end = motion::tcp_to_end(&tool, &input.tcp_offset);
         if let Some(e) = table_violation(&goal, &tool_end, &pts, setup.table_z_m) { return Err(e.into()); }
-        (goal, tool)
-    } else {
-        let goal = approach_pose(&r_ref, &target, setup);
-        (goal, goal)
-    };
+    }
     let goal_end = if camera_down { goal } else { motion::tcp_to_end(&goal, &input.tcp_offset) };
     if let Some(e) = table_violation(&pose_end, &goal_end, &pts, setup.table_z_m) { return Err(e.into()); }
     let mut cur = input.clone();
@@ -467,9 +453,45 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     } else {
         0.0
     };
-    let grasp_pose = Pose::new(tool.r, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
-    let _descend_path = motion::plan_cartesian_ex(&cur, grasp_pose, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
-    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration, mode: None, adaptive: None })
+    let _descend_path = motion::plan_cartesian_ex(&cur, td.grasp, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
+    // the shared admission of the top-down candidate (jaw fit and, on 6-DOF, the full route)
+    let shared = shared.ok_or_else(|| ArmError::from(MotionError::InvalidCommand("grasp admission state missing".into())))?;
+    let jaw = crate::grasp_select::admission::legacy_admission(&shared)?;
+    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration, mode: None, adaptive: None, jaw: Some(jaw) })
+}
+
+/// The top-down (legacy) grasp of a request, shared by the legacy plan, the adaptive
+/// acquisition prefix and the top-down adaptive candidate: the box-centre target on the grasp
+/// plane, the approach goal (camera-down pose in end_link, else the look-down pose in TCP), the
+/// tool-vertical pose above the target and the grasp pose at `table_z_m + grasp_height_m`.
+#[derive(Debug, Clone, Copy)]
+pub struct TopDown {
+    pub target: Vec3,
+    pub goal: Pose,
+    pub tool: Pose,
+    pub grasp: Pose,
+    pub camera_down: bool,
+}
+
+/// [`TopDown`] from the capture pose `input.q0`; `pts` are the end_link envelope points.
+pub fn top_down_pose(input: &PlanInput, setup: &GraspSetup, cam: &CamModel, pts: &[Vec3], box_norm: &[f64; 4]) -> Result<TopDown, ArmError> {
+    let pose_end = input.arm.fk(&input.q0);
+    let pose_tcp = motion::end_to_tcp(&pose_end, &input.tcp_offset);
+    let centre = cam.to_px(box_centre(box_norm));
+    let target = cam.plane_point(&pose_end, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
+        "the box centre ray does not meet the table plane in front of the camera".into())))?;
+    let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
+    let r_ref_p = if camera_down { &pose_end.p } else { &pose_tcp.p };
+    let r_ref = if input.arm.arm_dof() == 5 { motion::apply_auto_yaw(r_ref_p, &target, pose_end.r) } else { pose_end.r };
+    let (goal, tool) = if camera_down {
+        let goal = camera_down_pose(&r_ref, &target, setup, cam, pts);
+        (goal, approach_pose(&goal.r, &target, setup))
+    } else {
+        let goal = approach_pose(&r_ref, &target, setup);
+        (goal, goal)
+    };
+    let grasp = Pose::new(tool.r, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
+    Ok(TopDown { target, goal, tool, grasp, camera_down })
 }
 
 /// Duration of the transition from the camera-down pose `from` to the tool-vertical pose
@@ -595,48 +617,24 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
         Ok(s) => s,
         Err(e) => { let (r, c, m) = rejected(e.into()); return (r, c, m, None, None); }
     };
+    // adaptive requests also carry the legacy verdict (`legacy`), from the same snapshot
     let pending_res: Result<(PendingGrasp, Option<Box<PendingAdaptive>>), ArmError> =
         if supervisor.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
             // Lease-free read-only snapshot on RT Executor (0 SupervisorLock, no AdmissionStamp).
             match crate::rt_core::requests::actions::ReadOnlySnapshot::capture(supervisor).await {
-                Ok(ro) => prepare_from_read_only(&ro, body, strategy).map(|mut p| {
+                Ok(ro) => prepare_from_read_only(&ro, body, strategy).and_then(|mut p| {
                     let pa = p.adaptive.take();
-                    (p, pa)
+                    if pa.is_some() { p.shared = Some(shared_env(&ro.env, &ro.commanded_positions, &p, body, false)?); }
+                    Ok((p, pa))
                 }),
                 Err(e) => Err(e),
             }
         } else {
             let inner = supervisor.inner().read().await;
-            prepare_any(&inner, body, inner.safety.epoch_id()).and_then(|p| {
+            prepare_any(&inner, body, inner.safety.epoch_id()).and_then(|mut p| {
+                p.shared = Some(shared_inner(&inner, &p, body, false)?);
                 let pa = match strategy {
-                    crate::grasp_select::Strategy::Adaptive => {
-                        let snap = crate::grasp_select::capture(&inner, &p, body)?;
-                        let g_idx = inner.config.gripper_index().ok_or_else(|| {
-                            ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint".into()))
-                        })?;
-                        let gripper_policy = inner.config.gripper_policy.clone().ok_or_else(|| {
-                            ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into()))
-                        })?;
-                        let gripper_limit = inner.config.limits.get(g_idx).cloned().ok_or_else(|| {
-                            ArmError::from(MotionError::Unsupported("Grasp needs a gripper joint limit".into()))
-                        })?;
-                        let revisions = crate::grasp_select::AdaptiveRevisions {
-                            workspace_revision: inner.workspace_revision,
-                            calibration_revision: inner.calibration_revision,
-                            grasp_setup_revision: inner.grasp_setup_revision,
-                            gripper_calib_revision: inner.gripper_calib_revision,
-                            power_budget_revision: inner.power_budget_revision,
-                        };
-                        Some(Box::new(PendingAdaptive {
-                            snapshot: snap,
-                            start_positions: inner.commanded_positions.clone(),
-                            revisions,
-                            gripper_policy,
-                            gripper_limit,
-                            close_speed_limit: inner.gripper_close_speed_limit(),
-                            has_gravity_model: inner.config.gravity_model.is_some(),
-                        }))
-                    }
+                    crate::grasp_select::Strategy::Adaptive => Some(shared_inner(&inner, &p, body, true)?),
                     crate::grasp_select::Strategy::Legacy => None,
                 };
                 Ok((p, pa))
@@ -666,7 +664,7 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
                 }
                 Ok((legacy, Some((snap, sel)))) => {
                     let (lr, lc, lm) = match legacy { Ok(()) => (true, None, None), Err(e) => rejected(e) };
-                    let mut v = sel.to_json(&snap, Some((lr, lc.as_deref(), lm.as_deref())));
+                    let mut v = sel.to_json(&snap);
                     v["legacy"] = serde_json::json!({"reachable": lr, "code": lc, "message": lm});
                     let reachable = sel.reachable();
                     let code = sel.selection.code;

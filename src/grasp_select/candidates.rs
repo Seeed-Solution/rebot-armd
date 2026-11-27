@@ -102,7 +102,7 @@ fn station_mid(poly: &[V2], origin: V2, axis: V2, s: f64) -> Option<V2> {
 }
 
 /// Width of the inside interval of the line through `p` along `u` containing `p` (or nearest it).
-fn cut_width_near(poly: &[V2], p: V2, u: V2) -> Option<f64> {
+pub fn cut_width_near(poly: &[V2], p: V2, u: V2) -> Option<f64> {
     g::inside_intervals(poly, p, u).into_iter()
         .min_by(|a, b| interval_gap(a).total_cmp(&interval_gap(b)))
         .map(|(a, b)| b.t - a.t)
@@ -110,6 +110,41 @@ fn cut_width_near(poly: &[V2], p: V2, u: V2) -> Option<f64> {
 
 fn interval_gap(iv: &(g::Crossing, g::Crossing)) -> f64 {
     if iv.0.t <= 0.0 && iv.1.t >= 0.0 { 0.0 } else { iv.0.t.abs().min(iv.1.t.abs()) }
+}
+
+/// The chord of the cut `m + t·u` between crossings `(t0, edge0, t1, edge1)`: contacts, width,
+/// opposition, pad support within the finger width and moment quality (`len`: footprint length
+/// along `tangent`). Station and axis are 0.5 / 0 (callers set them).
+fn chord_from(t: &Target, m: V2, u: V2, cut: (f64, usize, f64, usize), tangent: V2, len: f64, tool: &ToolVolumes) -> Result<Chord, Rejection> {
+    let poly = &t.poly;
+    let (t0, edge0, t1, edge1) = cut;
+    let (e1, e2) = (g::add2(m, g::scale2(u, t0)), g::add2(m, g::scale2(u, t1)));
+    let width = t1 - t0;
+    let centre = g::scale2(g::add2(e1, e2), 0.5);
+    let (n1, n2) = (g::edge_normal(poly, edge0), g::edge_normal(poly, edge1));
+    let opposition = (-g::dot2(n1, u) + g::dot2(n2, u)) / 2.0;
+    let half = tool.finger_width_m / 2.0;
+    let support = [-1.0, 1.0].iter()
+        .map(|k| cut_width_near(poly, g::add2(centre, g::scale2(tangent, k * half)), u).map_or(0.0, |w| w / width))
+        .fold(f64::INFINITY, f64::min);
+    if support < 0.5 {
+        return Err(Rejection::new("geometry", "PAD_BEYOND_TIP", format!("the cross-section within the finger width shrinks to {:.0} % of the chord", support * 100.0)).with(support, 0.5));
+    }
+    let d = g::cross2(u, g::sub2(t.centroid, centre)).abs();
+    let moment_q = 1.0 - (d / (len / 2.0).max(1e-6)).min(1.0);
+    Ok(Chord { station: 0.5, axis_index: 0, centre, dir: u, width_m: width, tangent, opposition, moment_q, pad_support: support.min(1.0) })
+}
+
+/// The chord along the closing axis `u` through `p` (the top-down target): the cut interval
+/// containing `p`, else the nearest one. The jaws centre on the chord midpoint.
+pub fn chord_through(t: &Target, p: V2, u: V2, tool: &ToolVolumes) -> Result<Chord, Rejection> {
+    let u = g::unit2(u);
+    let tangent = g::perp2(u);
+    let (lo, hi) = g::extent_along(&t.poly, t.centroid, tangent);
+    let Some((c0, c1)) = g::inside_intervals(&t.poly, p, u).into_iter().min_by(|a, b| interval_gap(a).total_cmp(&interval_gap(b))) else {
+        return Err(Rejection::new("geometry", "NO_CROSS_SECTION", "the closing line through the top-down target misses the footprint"));
+    };
+    chord_from(t, p, u, (c0.t, c0.edge, c1.t, c1.edge), tangent, hi - lo, tool)
 }
 
 /// Contact chords at [`STATIONS`] along the local centreline (both axes when the long axis is
@@ -138,24 +173,13 @@ pub fn chords(t: &Target, tool: &ToolVolumes) -> (Vec<Chord>, Vec<Rejection>) {
                 rej.push(Rejection::new("geometry", "CHORD_CROSSES_EMPTY_SPACE", format!("station {f:.2}: the centreline point lies outside the cut")));
                 continue;
             };
-            let (e1, e2) = (g::add2(m, g::scale2(u, c0.t)), g::add2(m, g::scale2(u, c1.t)));
-            let width = c1.t - c0.t;
-            let centre = g::scale2(g::add2(e1, e2), 0.5);
-            let (n1, n2) = (g::edge_normal(poly, c0.edge), g::edge_normal(poly, c1.edge));
-            let opposition = (-g::dot2(n1, u) + g::dot2(n2, u)) / 2.0;
-            let half = tool.finger_width_m / 2.0;
-            let support = [-1.0, 1.0].iter()
-                .map(|k| cut_width_near(poly, g::add2(centre, g::scale2(tangent, k * half)), u).map_or(0.0, |w| w / width))
-                .fold(f64::INFINITY, f64::min);
-            if support < 0.5 {
-                rej.push(Rejection::new("geometry", "PAD_BEYOND_TIP", format!("station {f:.2}: the cross-section within the finger width shrinks to {:.0} % of the chord", support * 100.0)).with(support, 0.5));
-                continue;
-            }
-            let d = g::cross2(u, g::sub2(t.centroid, centre)).abs();
-            let moment_q = 1.0 - (d / (len / 2.0).max(1e-6)).min(1.0);
-            let chord = Chord { station: f, axis_index: ai, centre, dir: u, width_m: width, tangent, opposition, moment_q, pad_support: support.min(1.0) };
+            let chord = match chord_from(t, m, u, (c0.t, c0.edge, c1.t, c1.edge), tangent, len, tool) {
+                Ok(c) => Chord { station: f, axis_index: ai, ..c },
+                Err(why) => { rej.push(Rejection { message: format!("station {f:.2}: {}", why.message), ..why }); continue; }
+            };
+            let centre = chord.centre;
             // the same contact from both axes (round objects) once
-            if !out.iter().any(|c: &Chord| g::norm2(g::sub2(c.centre, centre)) < 0.002 && g::dot2(c.dir, u).abs() > 0.995) {
+            if !out.iter().any(|c: &Chord| g::norm2(g::sub2(c.centre, centre)) < 0.002 && g::dot2(c.dir, chord.dir).abs() > 0.995) {
                 out.push(chord);
             }
         }
@@ -362,16 +386,10 @@ fn build(s: &Snapshot, t: &Target, ch: &Chord, mut hy: Hypothesis, y_in: Vec3, p
         return Err(Rejection::new("geometry", "JAW_AXIS_TILTED", format!("the jaw axis leaves the horizontal by {elev:.0} deg")).with(elev, MAX_JAW_ELEVATION_DEG));
     }
     let width = ch.width_m / elev.to_radians().cos();
-    if width > tool.max_grasp_width_m {
-        return Err(Rejection::new("geometry", "TOO_WIDE", format!("chord {:.3} m exceeds max_grasp_width_m {:.3} m", width, tool.max_grasp_width_m)).with(width, tool.max_grasp_width_m));
-    }
-    if width < MIN_CHORD_M {
+    if width < MIN_CHORD_M && width.is_finite() {
         return Err(Rejection::new("geometry", "TOO_NARROW", format!("chord {width:.4} m")).with(width, MIN_CHORD_M));
     }
-    let reserve = (tool.open_width_m - width - 2.0 * t.hard_error_m) / 2.0;
-    if reserve < MIN_OPENING_RESERVE_M {
-        return Err(Rejection::new("geometry", "OPENING", format!("open jaws clear the error-shifted object by {:.4} m per side", reserve)).with(reserve, MIN_OPENING_RESERVE_M));
-    }
+    let reserve = super::admission::jaw_check(width, t.hard_error_m, tool.open_width_m, tool.max_grasp_width_m)?;
     // shallowest admissible contact: envelope points and open fingers TABLE_CLEARANCE_M above
     // the table, the tips at least grasp_height_m
     let finger_low = lowest(&r, &gripper_lattice(tool, tool.open_width_m));

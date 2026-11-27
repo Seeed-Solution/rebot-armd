@@ -214,6 +214,13 @@ fn invalid(m: String) -> ArmError { MotionError::InvalidCommand(m).into() }
 /// Under the lock: bind the parsed request (`pending`) and the request's evidence to the
 /// supervisor state.
 pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) -> Result<Snapshot, ArmError> {
+    capture_mode(inner, pending, body, true)
+}
+
+/// [`capture`] with `strict` = the adaptive rules (6-DOF only, malformed `evidence`,
+/// `pose_preferences` or `budget_ms` refused). Legacy requests (`strict` false) capture on any
+/// arm and ignore those adaptive-only fields when malformed.
+pub fn capture_mode(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value, strict: bool) -> Result<Snapshot, ArmError> {
     let policy = inner.config.gripper_policy.clone()
         .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
     capture_from_parts(
@@ -223,6 +230,7 @@ pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) ->
         inner.requires_real_jaw_curve(),
         inner.config.gravity_comp.as_ref(),
         inner.config.damiao_ranges.as_deref(),
+        strict,
     )
 }
 
@@ -233,6 +241,16 @@ pub fn capture_from_env(
     pending: &PendingGrasp,
     body: &Value,
 ) -> Result<Snapshot, ArmError> {
+    capture_from_env_mode(env, pending, body, true)
+}
+
+/// [`capture_from_env`] with the `strict` rules of [`capture_mode`].
+pub fn capture_from_env_mode(
+    env: &crate::rt_core::requests::actions::ActionPrepEnv,
+    pending: &PendingGrasp,
+    body: &Value,
+    strict: bool,
+) -> Result<Snapshot, ArmError> {
     let policy = env.config.gripper_policy.clone()
         .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
     capture_from_parts(
@@ -242,6 +260,7 @@ pub fn capture_from_env(
         env.requires_real_jaw_curve,
         env.config.gravity_comp.as_ref(),
         env.config.damiao_ranges.as_deref(),
+        strict,
     )
 }
 
@@ -252,13 +271,16 @@ fn capture_from_parts(
     requires_real_jaw_curve: bool,
     gravity_comp: Option<&crate::model::GravityCompPolicy>,
     damiao_ranges: Option<&[crate::model::DamiaoRange]>,
+    strict: bool,
 ) -> Result<Snapshot, ArmError> {
-    let evidence = parse_evidence(body).map_err(invalid)?;
-    let prefs = parse_preferences(body).map_err(invalid)?;
-    let wall_ms = parse_budget(body).map_err(invalid)?;
+    let (evidence, prefs, wall_ms) = if strict {
+        (parse_evidence(body).map_err(invalid)?, parse_preferences(body).map_err(invalid)?, parse_budget(body).map_err(invalid)?)
+    } else {
+        (parse_evidence(body).unwrap_or_default(), parse_preferences(body).unwrap_or_default(), parse_budget(body).unwrap_or(DEFAULT_BUDGET_MS))
+    };
     let request = &pending.request;
     let mut input = pending.input.clone();
-    if input.arm.arm_dof() != 6 {
+    if strict && input.arm.arm_dof() != 6 {
         return Err(MotionError::Unsupported("strategy \"adaptive\" needs a 6-DOF arm (the grasp orientation is fully constrained)".into()).into());
     }
     input.goal_frame = GoalFrame::Tcp;

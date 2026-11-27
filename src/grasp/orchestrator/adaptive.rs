@@ -441,6 +441,28 @@ impl Orchestrator {
                 }
             }
 
+            // The shared jaw predicate on the fresh contour (when the detection carries one):
+            // the cut along the planned closing axis through the planned contact.
+            if let Some(Ok(ref pts)) = best.contour_norm {
+                let world: Option<Vec<[f64; 2]>> = pts
+                    .iter()
+                    .map(|v| self.cam.plane_point(pose_end, self.cam.to_px(*v), z_mid).map(|p| [p[0], p[1]]))
+                    .collect();
+                if let Some(mut wpts) = world.filter(|w| w.len() >= 3) {
+                    crate::grasp_select::geometry::ensure_ccw(&mut wpts);
+                    let y = kinematics::column(&route.plan.grasp.r, 1);
+                    let u = crate::grasp_select::geometry::unit2([y[0], y[1]]);
+                    let p = [route.plan.grasp.p[0], route.plan.grasp.p[1]];
+                    if let Some(w) = crate::grasp_select::candidates::cut_width_near(&wpts, p, u) {
+                        let max_w = self.max_grasp_width().await;
+                        let max_w = if max_w > 0.0 { max_w } else { f64::INFINITY };
+                        if let Err(r) = crate::grasp_select::admission::jaw_check(w, route.target_hard_error_m, route.plan.jaw_opening_m, max_w) {
+                            return Err(fail(&r.code, format!("[{phase}] fresh contour of '{label}': {}", r.message)));
+                        }
+                    }
+                }
+            }
+
             // Orientation consistency when target long axis is non-ambiguous (tightened to 12 deg).
             if !route.target_axis_ambiguous {
                 let exp_axis = route.target_axis;
