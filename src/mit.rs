@@ -2082,7 +2082,7 @@ impl crate::supervisor::SupervisorInner {
             let _ = slot.try_with_mut(|drv| {
                 drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
                 drv.set_mode_switch_hold_targets(&holds);
-                drv.set_mode_switch_active_mask(active_mask);
+                drv.mode_switch_mut().set_mode_switch_active_mask(active_mask);
             });
         }
         self.install_mode_switch_session(
@@ -2353,7 +2353,7 @@ impl crate::supervisor::SupervisorInner {
         if let Some(slot) = self.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
                 drv.set_mode_switch_hold_targets(&holds);
-                drv.set_mode_switch_active_mask(active_mask);
+                drv.mode_switch_mut().set_mode_switch_active_mask(active_mask);
             });
         }
         self.install_mode_switch_session(
@@ -4864,7 +4864,7 @@ impl crate::supervisor::SupervisorInner {
                         // Major 5: on energized rearm qualification, service verified watchdog
                         // holds FIRST before spending any TX slot on register readback so every
                         // enabled arm axis stays <= 40 ms gap.
-                        if kind == CommissioningOpKind::ReadIdentityForEnable && drv.any_axis_energized() {
+                        if kind == CommissioningOpKind::ReadIdentityForEnable && drv.mode_switch().any_axis_energized() {
                             let cfg_max_frames = self
                                 .config
                                 .damiao_tx_budget()
@@ -4875,7 +4875,7 @@ impl crate::supervisor::SupervisorInner {
                                     tx_rem.min(u16::from(u8::MAX)) as u8
                                 })
                                 .min(cfg_max_frames);
-                            match drv.mode_switch_service_watchdog_holds(
+                            match drv.mode_switch_mut().mode_switch_service_watchdog_holds(
                                 crate::motor_mode::DEFAULT_WATCHDOG_PROACTIVE_INTERVAL,
                                 0,
                                 0,

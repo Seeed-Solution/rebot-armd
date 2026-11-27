@@ -209,7 +209,7 @@ impl PublishedConfig {
         let driver_supports_nonblocking_mode_switch = inner
             .driver
             .as_ref()
-            .is_some_and(|d| d.with_ref(|drv| drv.supports_nonblocking_mode_switch()).unwrap_or(false));
+            .is_some_and(|d| d.with_ref(|drv| drv.mode_switch().supports_nonblocking_mode_switch()).unwrap_or(false));
         #[cfg(target_arch = "wasm32")]
         let driver_supports_nonblocking_mode_switch = false;
         let driver_torque_feedback = inner
@@ -3884,7 +3884,7 @@ fn install_gravity_comp(
             if core.rt_executor_owned
                 && core
                     .read_driver_for_tick()
-                    .is_some_and(|drv| drv.supports_nonblocking_mode_switch())
+                    .is_some_and(|drv| drv.mode_switch().supports_nonblocking_mode_switch())
             {
                 retired.gravity_comp_policy = policy;
                 return Err(ConfigError::ExecutorCapabilityUnsupported(

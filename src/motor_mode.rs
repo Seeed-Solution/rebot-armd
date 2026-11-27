@@ -1561,15 +1561,15 @@ pub mod switch {
 
     impl ModeSwitchDriver for ArmDriverModeAdapter<'_> {
         fn clock_now(&self) -> Instant { self.drv.clock_now() }
-        fn dof(&self) -> usize { self.drv.mode_switch_dof() }
-        fn vendor(&self) -> Option<VendorBinding> { self.drv.driver_vendor_binding() }
-        fn supports_nonblocking_mode_switch(&self) -> bool { self.drv.supports_nonblocking_mode_switch() }
-        fn axis_is_energized(&self, joint: usize) -> bool { self.drv.axis_is_energized(joint) }
-        fn any_axis_energized(&self) -> bool { self.drv.any_axis_energized() }
-        fn axis_has_watchdog(&self, joint: usize) -> bool { self.drv.axis_has_watchdog(joint) }
-        fn axis_supports_pos_force(&self, joint: usize) -> bool { self.drv.axis_supports_pos_force(joint) }
+        fn dof(&self) -> usize { self.drv.mode_switch().mode_switch_dof() }
+        fn vendor(&self) -> Option<VendorBinding> { self.drv.mode_switch().driver_vendor_binding() }
+        fn supports_nonblocking_mode_switch(&self) -> bool { self.drv.mode_switch().supports_nonblocking_mode_switch() }
+        fn axis_is_energized(&self, joint: usize) -> bool { self.drv.mode_switch().axis_is_energized(joint) }
+        fn any_axis_energized(&self) -> bool { self.drv.mode_switch().any_axis_energized() }
+        fn axis_has_watchdog(&self, joint: usize) -> bool { self.drv.mode_switch().axis_has_watchdog(joint) }
+        fn axis_supports_pos_force(&self, joint: usize) -> bool { self.drv.mode_switch().axis_supports_pos_force(joint) }
         fn remaining_rx_budget(&self, default_max: u16) -> u16 {
-            self.drv.mode_switch_remaining_rx_budget(default_max)
+            self.drv.mode_switch().mode_switch_remaining_rx_budget(default_max)
         }
         fn check_watchdog_tx_budget(&self) -> Result<(), (usize, usize)> {
             self.drv.tx().check_watchdog_tx_budget_for_energized()
@@ -1577,23 +1577,23 @@ pub mod switch {
         fn release_budget_consumed(&self) -> Option<(u16, u16)> {
             Some(self.drv.tx().release_budget_consumed())
         }
-        fn axis_confirmed_mode(&self, joint: usize) -> Option<ControlMode> { self.drv.axis_confirmed_mode(joint) }
+        fn axis_confirmed_mode(&self, joint: usize) -> Option<ControlMode> { self.drv.mode_switch().axis_confirmed_mode(joint) }
         fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<ControlMode>) {
-            self.drv.set_axis_confirmed_mode(joint, mode);
+            self.drv.mode_switch_mut().set_axis_confirmed_mode(joint, mode);
         }
         fn latch_axis_mode_uncertain(&mut self, joint: usize) {
-            self.drv.latch_axis_mode_uncertain(joint);
+            self.drv.mode_switch_mut().latch_axis_mode_uncertain(joint);
         }
-        fn mode_write_uncertain_mask(&self) -> u32 { self.drv.mode_write_uncertain_mask() }
-        fn set_mode_switch_active_mask(&mut self, mask: u32) { self.drv.set_mode_switch_active_mask(mask); }
+        fn mode_write_uncertain_mask(&self) -> u32 { self.drv.mode_switch().mode_write_uncertain_mask() }
+        fn set_mode_switch_active_mask(&mut self, mask: u32) { self.drv.mode_switch_mut().set_mode_switch_active_mask(mask); }
         fn stop_applied(&self) -> bool { self.stop_applied.is_some_and(|f| f()) }
-        fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> { self.drv.axis_last_ctrl_tx(joint) }
-        fn axis_impedance_ranges_verified(&self, joint: usize) -> bool { self.drv.axis_impedance_ranges_verified(joint) }
-        fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]> { self.drv.axis_configured_impedance_ranges(joint) }
+        fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> { self.drv.mode_switch().axis_last_ctrl_tx(joint) }
+        fn axis_impedance_ranges_verified(&self, joint: usize) -> bool { self.drv.mode_switch().axis_impedance_ranges_verified(joint) }
+        fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]> { self.drv.mode_switch().axis_configured_impedance_ranges(joint) }
         fn set_axis_impedance_ranges_verified(&mut self, joint: usize, verified: bool) {
-            self.drv.set_axis_impedance_ranges_verified(joint, verified);
+            self.drv.mode_switch_mut().set_axis_impedance_ranges_verified(joint, verified);
         }
-        fn rx_drained(&self) -> bool { self.drv.mode_switch_rx_drained() }
+        fn rx_drained(&self) -> bool { self.drv.mode_switch().mode_switch_rx_drained() }
         fn drain_rx_step(&mut self, max_frames: u16, deadline: Instant) -> Result<(u16, bool), ModeSwitchFailure> {
             self.drv
                 .commissioning_drain_rx_step(max_frames, deadline)
@@ -1608,7 +1608,7 @@ pub mod switch {
             deadline: Instant,
             max_frames: u8,
         ) -> Result<WatchdogHoldResult, ModeSwitchFailure> {
-            self.drv.mode_switch_service_watchdog_holds(
+            self.drv.mode_switch_mut().mode_switch_service_watchdog_holds(
                 min_age,
                 exclude_mask,
                 force_mask,
@@ -1617,7 +1617,7 @@ pub mod switch {
             )
         }
         fn try_send_ctrl_mode_read(&mut self, joint: usize, deadline: Instant) -> ModeTxResult {
-            self.drv.mode_switch_try_send_ctrl_mode_read(joint, deadline, self.pre_tx_gate)
+            self.drv.mode_switch_mut().mode_switch_try_send_ctrl_mode_read(joint, deadline, self.pre_tx_gate)
         }
         fn try_send_ctrl_mode_write(
             &mut self,
@@ -1625,13 +1625,13 @@ pub mod switch {
             mode: ControlMode,
             deadline: Instant,
         ) -> ModeTxResult {
-            self.drv.mode_switch_try_send_ctrl_mode_write(joint, mode, deadline, self.pre_tx_gate)
+            self.drv.mode_switch_mut().mode_switch_try_send_ctrl_mode_write(joint, mode, deadline, self.pre_tx_gate)
         }
         fn try_send_range_read(&mut self, joint: usize, rid_idx: u8, deadline: Instant) -> ModeTxResult {
-            self.drv.mode_switch_try_send_range_read(joint, rid_idx, deadline, self.pre_tx_gate)
+            self.drv.mode_switch_mut().mode_switch_try_send_range_read(joint, rid_idx, deadline, self.pre_tx_gate)
         }
         fn try_send_status_refresh(&mut self, joint: usize, deadline: Instant) -> ModeTxResult {
-            self.drv.mode_switch_try_send_status_refresh(joint, deadline, self.pre_tx_gate)
+            self.drv.mode_switch_mut().mode_switch_try_send_status_refresh(joint, deadline, self.pre_tx_gate)
         }
         fn find_ctrl_mode_reply(
             &self,
@@ -1643,7 +1643,7 @@ pub mod switch {
             tx_offset_ns: Option<i128>,
             require_expected_id: bool,
         ) -> ModeRegMatch {
-            self.drv.mode_switch_find_ctrl_mode_reply(
+            self.drv.mode_switch().mode_switch_find_ctrl_mode_reply(
                 joint,
                 write,
                 after_seq,
@@ -1662,7 +1662,7 @@ pub mod switch {
             max_rx_at: Instant,
             tx_offset_ns: Option<i128>,
         ) -> ModeRangeMatch {
-            self.drv.mode_switch_find_range_reply(
+            self.drv.mode_switch().mode_switch_find_range_reply(
                 joint,
                 rid_idx,
                 after_seq,
@@ -1682,7 +1682,7 @@ pub mod switch {
             now: Instant,
             require_disarmed_stationary: bool,
         ) -> ModeFeedbackMatch {
-            self.drv.mode_switch_post_confirm_feedback(
+            self.drv.mode_switch().mode_switch_post_confirm_feedback(
                 joint,
                 mode,
                 after_seq,
@@ -1985,14 +1985,14 @@ pub mod switch {
         ) -> ModeProgress {
             if let RunnerPhase::Done(p) = self.phase {
                 if let Some(d) = drv {
-                    d.set_mode_switch_active_mask(0);
+                    d.mode_switch_mut().set_mode_switch_active_mask(0);
                 }
                 return p;
             }
-            let drv_energized = drv.as_ref().is_some_and(|d| d.any_axis_energized());
+            let drv_energized = drv.as_ref().is_some_and(|d| d.mode_switch().any_axis_energized());
             let drv_uncertain = if let Some(d) = drv {
-                d.set_mode_switch_active_mask(0);
-                d.mode_write_uncertain_mask()
+                d.mode_switch_mut().set_mode_switch_active_mask(0);
+                d.mode_switch().mode_write_uncertain_mask()
             } else {
                 0
             };

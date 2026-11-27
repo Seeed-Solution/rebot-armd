@@ -509,58 +509,58 @@ impl crate::driver::BoundedTxExt for ZeroOffsetDriver {
 
 impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
     fn supports_nonblocking_mode_switch(&self) -> bool {
-        self.inner.supports_nonblocking_mode_switch()
+        self.inner.mode_switch().supports_nonblocking_mode_switch()
     }
     fn driver_vendor_binding(&self) -> Option<crate::motor_mode::VendorBinding> {
-        self.inner.driver_vendor_binding()
+        self.inner.mode_switch().driver_vendor_binding()
     }
     fn mode_switch_dof(&self) -> usize {
-        self.inner.mode_switch_dof()
+        self.inner.mode_switch().mode_switch_dof()
     }
     fn axis_is_energized(&self, joint: usize) -> bool {
-        self.inner.axis_is_energized(joint)
+        self.inner.mode_switch().axis_is_energized(joint)
     }
     fn any_axis_energized(&self) -> bool {
-        self.inner.any_axis_energized()
+        self.inner.mode_switch().any_axis_energized()
     }
     fn axis_has_watchdog(&self, joint: usize) -> bool {
-        self.inner.axis_has_watchdog(joint)
+        self.inner.mode_switch().axis_has_watchdog(joint)
     }
     fn axis_supports_pos_force(&self, joint: usize) -> bool {
-        self.inner.axis_supports_pos_force(joint)
+        self.inner.mode_switch().axis_supports_pos_force(joint)
     }
     fn mode_switch_remaining_rx_budget(&self, default_max: u16) -> u16 {
-        self.inner.mode_switch_remaining_rx_budget(default_max)
+        self.inner.mode_switch().mode_switch_remaining_rx_budget(default_max)
     }
     fn axis_confirmed_mode(&self, joint: usize) -> Option<crate::motor_mode::ControlMode> {
-        self.inner.axis_confirmed_mode(joint)
+        self.inner.mode_switch().axis_confirmed_mode(joint)
     }
     fn set_axis_confirmed_mode(&mut self, joint: usize, mode: Option<crate::motor_mode::ControlMode>) {
-        self.inner.set_axis_confirmed_mode(joint, mode);
+        self.inner.mode_switch_mut().set_axis_confirmed_mode(joint, mode);
     }
     fn latch_axis_mode_uncertain(&mut self, joint: usize) {
-        self.inner.latch_axis_mode_uncertain(joint);
+        self.inner.mode_switch_mut().latch_axis_mode_uncertain(joint);
     }
     fn mode_write_uncertain_mask(&self) -> u32 {
-        self.inner.mode_write_uncertain_mask()
+        self.inner.mode_switch().mode_write_uncertain_mask()
     }
     fn set_mode_switch_active_mask(&mut self, mask: u32) {
-        self.inner.set_mode_switch_active_mask(mask);
+        self.inner.mode_switch_mut().set_mode_switch_active_mask(mask);
     }
     fn axis_last_ctrl_tx(&self, joint: usize) -> Option<Instant> {
-        self.inner.axis_last_ctrl_tx(joint)
+        self.inner.mode_switch().axis_last_ctrl_tx(joint)
     }
     fn axis_impedance_ranges_verified(&self, joint: usize) -> bool {
-        self.inner.axis_impedance_ranges_verified(joint)
+        self.inner.mode_switch().axis_impedance_ranges_verified(joint)
     }
     fn axis_configured_impedance_ranges(&self, joint: usize) -> Option<[f32; 3]> {
-        self.inner.axis_configured_impedance_ranges(joint)
+        self.inner.mode_switch().axis_configured_impedance_ranges(joint)
     }
     fn set_axis_impedance_ranges_verified(&mut self, joint: usize, verified: bool) {
-        self.inner.set_axis_impedance_ranges_verified(joint, verified);
+        self.inner.mode_switch_mut().set_axis_impedance_ranges_verified(joint, verified);
     }
     fn mode_switch_rx_drained(&self) -> bool {
-        self.inner.mode_switch_rx_drained()
+        self.inner.mode_switch().mode_switch_rx_drained()
     }
     fn mode_switch_service_watchdog_holds(
         &mut self,
@@ -570,7 +570,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         deadline: Instant,
         max_frames: u8,
     ) -> Result<crate::motor_mode::WatchdogHoldResult, crate::motor_mode::ModeSwitchFailure> {
-        self.inner.mode_switch_service_watchdog_holds(
+        self.inner.mode_switch_mut().mode_switch_service_watchdog_holds(
             min_age,
             exclude_mask,
             force_mask,
@@ -584,7 +584,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::motor_mode::ModeTxResult {
-        self.inner.mode_switch_try_send_ctrl_mode_read(joint, deadline, pre_tx_gate)
+        self.inner.mode_switch_mut().mode_switch_try_send_ctrl_mode_read(joint, deadline, pre_tx_gate)
     }
     fn mode_switch_try_send_ctrl_mode_write(
         &mut self,
@@ -593,7 +593,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::motor_mode::ModeTxResult {
-        self.inner.mode_switch_try_send_ctrl_mode_write(joint, mode, deadline, pre_tx_gate)
+        self.inner.mode_switch_mut().mode_switch_try_send_ctrl_mode_write(joint, mode, deadline, pre_tx_gate)
     }
     fn mode_switch_try_send_range_read(
         &mut self,
@@ -602,7 +602,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::motor_mode::ModeTxResult {
-        self.inner.mode_switch_try_send_range_read(joint, rid_idx, deadline, pre_tx_gate)
+        self.inner.mode_switch_mut().mode_switch_try_send_range_read(joint, rid_idx, deadline, pre_tx_gate)
     }
     fn mode_switch_try_send_status_refresh(
         &mut self,
@@ -610,7 +610,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::motor_mode::ModeTxResult {
-        self.inner.mode_switch_try_send_status_refresh(joint, deadline, pre_tx_gate)
+        self.inner.mode_switch_mut().mode_switch_try_send_status_refresh(joint, deadline, pre_tx_gate)
     }
     fn mode_switch_find_ctrl_mode_reply(
         &self,
@@ -622,7 +622,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         tx_offset_ns: Option<i128>,
         require_expected_id: bool,
     ) -> crate::motor_mode::ModeRegMatch {
-        self.inner.mode_switch_find_ctrl_mode_reply(
+        self.inner.mode_switch().mode_switch_find_ctrl_mode_reply(
             joint,
             write,
             after_seq,
@@ -641,7 +641,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         max_rx_at: Instant,
         tx_offset_ns: Option<i128>,
     ) -> crate::motor_mode::ModeRangeMatch {
-        self.inner.mode_switch_find_range_reply(
+        self.inner.mode_switch().mode_switch_find_range_reply(
             joint,
             rid_idx,
             after_seq,
@@ -662,7 +662,7 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
         now: Instant,
         require_disarmed_stationary: bool,
     ) -> crate::motor_mode::ModeFeedbackMatch {
-        self.inner.mode_switch_post_confirm_feedback(
+        self.inner.mode_switch().mode_switch_post_confirm_feedback(
             joint,
             mode,
             after_seq,

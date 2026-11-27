@@ -13743,7 +13743,7 @@ impl SupervisorInner {
         if let Some(machine) = self.mode_switch.machine.as_ref() {
             let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
                 let mut m = 0u32;
-                let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+                let _ = slot.try_with_ref(|d| m = d.mode_switch().mode_write_uncertain_mask());
                 m
             });
             return Some(machine.snapshot(sid.0, drv_uncertain));
@@ -13813,7 +13813,7 @@ impl SupervisorInner {
     pub(crate) fn driver_supports_nonblocking_mode_switch(&self) -> bool {
         self.driver
             .as_ref()
-            .is_some_and(|d| d.try_with_ref(|drv| drv.supports_nonblocking_mode_switch()).unwrap_or(false))
+            .is_some_and(|d| d.try_with_ref(|drv| drv.mode_switch().supports_nonblocking_mode_switch()).unwrap_or(false))
     }
 
     /// True when any exclusive PR0B session (e.g. `ModeSwitch` or `Commissioning`) owns output
@@ -14020,7 +14020,7 @@ impl SupervisorInner {
             }
         }
         if let Some(slot) = self.driver.as_mut() {
-            let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(plan_mask));
+            let _ = slot.try_with_mut(|drv| drv.mode_switch_mut().set_mode_switch_active_mask(plan_mask));
         }
         self.install_mode_switch_session(
             sid,
@@ -14046,7 +14046,7 @@ impl SupervisorInner {
     ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
         let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
             let mut m = 0u32;
-            let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+            let _ = slot.try_with_ref(|d| m = d.mode_switch().mode_write_uncertain_mask());
             m
         });
         if let (Some(sid), Some(machine)) =
@@ -14091,7 +14091,7 @@ impl SupervisorInner {
         uncertain: bool,
     ) {
         if let Some(slot) = self.driver.as_mut() {
-            let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(0));
+            let _ = slot.try_with_mut(|drv| drv.mode_switch_mut().set_mode_switch_active_mask(0));
         }
         match purpose {
             ModeSwitchPurpose::Standalone => {}
@@ -14128,7 +14128,7 @@ impl SupervisorInner {
             let mut p = None;
             let _ = slot.try_with_mut(|drv| {
                 p = Some(machine.reconcile_external_revocation(Some(drv), reason, stop_applied));
-                drv_uncertain = drv.mode_write_uncertain_mask();
+                drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
             });
             p.unwrap_or_else(|| machine.reconcile_external_revocation(None, reason, stop_applied))
         } else {
@@ -14365,7 +14365,7 @@ impl SupervisorInner {
                 ) && drv.mit_fence_trip_bounded().is_some()
                 {
                     mit_fence_tripped = true;
-                    drv_uncertain = drv.mode_write_uncertain_mask();
+                    drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
                     out = machine.reconcile_external_revocation(
                         Some(drv),
                         ModeSwitchFailure::WatchdogBudgetBreached,
@@ -14377,7 +14377,7 @@ impl SupervisorInner {
                     translate_driver_cutoff_conservative(drv, effective_cutoff, &mut *owner_now_fn)
                 else {
                     out = ModeProgress::Pending { wake: None };
-                    drv_uncertain = drv.mode_write_uncertain_mask();
+                    drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
                     return;
                 };
                 let mut drv_ledger = crate::rt_core::budget::ReleaseBudget::new(
@@ -14417,7 +14417,7 @@ impl SupervisorInner {
                 ms_rx_used = drv_ledger.rx_used();
                 ms_rx_exhausted = drv_ledger.rx_exhausted();
                 ms_tx_used = drv_ledger.tx_used();
-                drv_uncertain = drv.mode_write_uncertain_mask();
+                drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
                 if matches!(
                     purpose,
                     ModeSwitchPurpose::MitActivate { .. } | ModeSwitchPurpose::MitHandBack { .. }

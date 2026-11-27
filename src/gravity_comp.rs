@@ -242,7 +242,7 @@ impl SupervisorInner {
         if rt_executor_owned && self.driver.is_some() {
             let supports_nb = self
                 .read_driver_for_tick()
-                .is_some_and(|drv| drv.supports_nonblocking_mode_switch());
+                .is_some_and(|drv| drv.mode_switch().supports_nonblocking_mode_switch());
             if !supports_nb {
                 return Err(reason(
                     "UNSUPPORTED",
@@ -682,7 +682,7 @@ impl SupervisorInner {
         if let Some(slot) = this.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
                 drv.set_mode_switch_hold_targets(&holds);
-                drv.set_mode_switch_active_mask(0b11_1111);
+                drv.mode_switch_mut().set_mode_switch_active_mask(0b11_1111);
             });
         }
         if let Some(stale) = this.pending_gravity_enter.take() {
@@ -857,7 +857,7 @@ impl SupervisorInner {
         if let Some(slot) = self.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
                 drv.set_mode_switch_hold_targets(&holds);
-                drv.set_mode_switch_active_mask(0b11_1111);
+                drv.mode_switch_mut().set_mode_switch_active_mask(0b11_1111);
             });
         }
         self.install_mode_switch_session(sid, ModeSwitchPurpose::GravityCompExit { hold }, ModeSwitch::new(plan));
