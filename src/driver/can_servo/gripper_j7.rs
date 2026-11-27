@@ -1348,3 +1348,80 @@ impl<C: CanTransport> PosForceExt for DamiaoArmDriver<C> {
         }
     }
 }
+
+/// Gripper joint driven in position-force mode with a motor current ceiling
+/// ([`DamiaoArmDriver::with_gripper_pos_force`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GripperPosForce {
+    /// Joint index (0-based).
+    pub joint: usize,
+    /// Current ceiling of every frame: 1/10000 of the maximum phase current.
+    pub current_raw: u16,
+    /// Speed limit of closing frames (rad/s): min(requested, this).
+    pub close_speed_rad_s: f32,
+    /// Jaw positions (rad): a frame closes when it moves from the measured position toward `closed_rad`.
+    pub closed_rad: f32,
+    pub open_rad: f32,
+    /// The ceiling's torque equivalent was measured (commissioning); false: uncalibrated.
+    pub calibrated: bool,
+    /// Torque equivalent of the ceiling (N·m), when commissioned.
+    pub ceiling_torque_nm: Option<f32>,
+    /// What the torque equivalent was measured against (`external` / `feedback_equivalent`).
+    pub torque_reference: Option<String>,
+}
+
+/// The profile's choice for the Damiao gripper joint.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GripperDrive {
+    PosForce(GripperPosForce),
+    /// Legacy POS_VEL on this joint (no motor current cap).
+    PosVel(usize),
+}
+
+/// `ArmConfig::damiao_gripper` as a driver setting (None: no block or no gripper joint).
+/// Position-force needs the gripper policy's closed / open positions (closing direction).
+pub fn gripper_drive_from_profile(cfg: &crate::model::ArmConfig) -> Result<Option<GripperDrive>, String> {
+    use crate::model::DamiaoGripperMode;
+    let (Some(g), Some(joint)) = (cfg.damiao_gripper.as_ref(), cfg.gripper_index()) else { return Ok(None) };
+    Ok(Some(match g.mode {
+        DamiaoGripperMode::PosVel => GripperDrive::PosVel(joint),
+        DamiaoGripperMode::PosForce => {
+            let p = cfg.gripper_policy.as_ref().ok_or("damiao_gripper pos_force needs gripper_policy (closed_rad / open_rad)")?;
+            let close_speed_rad_s = cfg.limits.get(joint)
+                .filter(|l| l.max_velocity.is_finite() && l.max_velocity > 0.0)
+                .map_or(g.close_speed_rad_s, |l| g.close_speed_rad_s.min(l.max_velocity));
+            GripperDrive::PosForce(GripperPosForce {
+                joint, current_raw: g.current_ceiling_raw, close_speed_rad_s,
+                closed_rad: p.closed_rad, open_rad: p.open_rad, calibrated: g.calibrated,
+                ceiling_torque_nm: g.ceiling_torque_nm, torque_reference: g.torque_reference.clone(),
+            })
+        }
+    }))
+}
+
+/// Allocation-free `Copy` summary of the gripper's position-force motor current cap,
+/// safe to query on the RT control thread (`armd-control`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GripperPosForceInfo {
+    pub joint: usize,
+    pub active: bool,
+    pub close_speed_rad_s: f32,
+    pub ceiling_torque_estimate_nm: Option<f32>,
+}
+
+/// Motor-level current cap of the gripper, as the driver applies it (`ArmDriver::motor_current_cap`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MotorCurrentCap {
+    pub joint: usize,
+    /// `pos_force` (capped) or `pos_vel` (legacy, no motor current cap).
+    pub mode: &'static str,
+    /// Configured ceiling (raw, 1/10000 of the maximum phase current); None in `pos_vel`.
+    pub current_raw: Option<u16>,
+    /// The motor confirmed the capped mode (register reply and readback) at the last enable.
+    pub active: bool,
+    pub calibrated: bool,
+    pub ceiling_torque_nm: Option<f32>,
+    pub torque_reference: Option<String>,
+    pub close_speed_rad_s: Option<f32>,
+    pub note: &'static str,
+}
