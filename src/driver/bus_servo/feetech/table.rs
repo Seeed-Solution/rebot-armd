@@ -2,7 +2,7 @@
 
 use std::f32::consts::PI;
 use serde::{Deserialize, Serialize};
-use crate::protocol::feetech::FeetechError;
+use super::codec::FeetechError;
 
 /// Header bytes for Feetech STS/SMS series servo packets
 pub const FEETECH_HEADER: [u8; 2] = [0xFF, 0xFF];
