@@ -19,6 +19,7 @@ pub mod zero_offset;
 pub mod handshake;
 pub mod bus_servo;
 pub use bus_servo::FashionStarArmDriver;
+pub use bus_servo::FeetechArmDriver;
 pub mod can_servo;
 pub use can_servo::RobStrideArmDriver;
 pub use handshake::{TorqueOutcome, TorqueProgress};
@@ -1992,100 +1993,6 @@ pub enum JointMode {
 // 1. Feetech STS3215 Arm Driver (SO-ARM 101)
 // =========================================================================
 
-#[derive(Clone, Copy, Debug)]
-struct PendingFeetechDisable {
-    kind: DisableKind,
-    client_park: Option<(Option<u64>, Option<u64>)>,
-}
-
-pub struct FeetechArmDriver<T: Transport> {
-    transport: T,
-    clock: Option<Arc<dyn crate::transport::DriverClock>>,
-    servo_ids: Vec<u8>,
-    config: feetech::FeetechConfig,
-    cached_states: Vec<JointState>,
-    cached_loads: Vec<f32>,
-    pub motor_status: Vec<u8>,
-    last_feedback_instant: Vec<Option<Instant>>,
-    feedback_seq: Vec<u64>,
-    /// Incremented whenever a joint's feedback continuity breaks (`> 100 ms` gap or non-finite).
-    feedback_continuity_epoch: Vec<u64>,
-    /// Reported per-servo `REG_TORQUE_ENABLE` telemetry (`Some(0 | 1)` or `None`, observation/UI only).
-    reported_enable: Vec<Option<u8>>,
-    /// True after torque enable was commanded until a torque-off write is dispatched; keeps
-    /// periodic causal `REG_TORQUE_ENABLE` telemetry polling active even if a servo reports 0 (R12 M2).
-    torque_enable_commanded: bool,
-    /// Monotonic counter bumped strictly when a causal `REG_TORQUE_ENABLE == 0` reply is decoded (R12 M2).
-    reported_torque_loss_sample_seq: u64,
-    /// True after a 1-byte register read to servo `i` timed out: a late 1-byte reply may still
-    /// be in flight, so causal torque readback requires a 0-byte `PING` FIFO barrier first.
-    unmatched_1b_read: Vec<bool>,
-    tx_echo: Option<bool>,
-    tx_echo_auto: bool,
-    poll_cursor: usize,
-    rx_buffer: Vec<u8>,
-    pub effective_ranges: Vec<(u16, u16)>,
-    cached_raw_steps: Vec<i32>,
-    read_poll_count: u64,
-    missed_poll_replies: u64,
-    abort_flag: Option<Arc<AtomicBool>>,
-    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
-    estop_state: Option<Arc<crate::rt_core::urgent::EstopState>>,
-    stopped_disable_gate: Option<StoppedDisableGate>,
-    tx_release_deadline: Option<Instant>,
-    pub last_enable_poll: Option<Instant>,
-    gripper_index: Option<usize>,
-    pub hw_angle_limits: Vec<Option<(u16, u16)>>,
-    pub last_enable_confirmed: Vec<Option<Instant>>,
-    pub missed_enable_polls: Vec<u8>,
-    incomplete_chunk_idx: Option<usize>,
-    incomplete_frame_started_at: Option<Instant>,
-    partial_pos_rx: Vec<u8>,
-    /// Per-byte host monotonic receive timestamps aligned 1:1 with `partial_pos_rx` (S2).
-    partial_pos_rx_timestamps: Vec<Instant>,
-    /// Per-byte host monotonic receive timestamps aligned 1:1 with `rx_buffer` (E3).
-    rx_timestamps: Vec<Instant>,
-    /// True after any Feetech request times out or observes an ambiguous duplicate reply; the next
-    /// request MUST discard RX bytes until continuous line idle (20 ms) before transmitting (S2).
-    line_poisoned: bool,
-    /// Host monotonic instant when continuous silence on a poisoned serial line began (S2).
-    line_poison_quiet_since: Option<Instant>,
-    /// Active control-release id distinguishing separate ticks for the rest-pose K=3 window.
-    control_release_id: u64,
-    /// True once the owner has called `begin_control_release`, preventing receive passes from
-    /// advancing `control_release_id` independently.
-    control_release_managed: bool,
-    /// Most recent `control_release_id` for which `read_joint_states_inner` completed a bus pass,
-    /// avoiding redundant same-release polling inside `poll_torque` (R12 B1).
-    last_read_release_id: u64,
-    /// Pending stopped disable awaiting rest-pose K=3 confirmation or poisoned-line drain within
-    /// the single 1 s request lifetime (0 torque-off packets transmitted while pending).
-    pending_disable: Option<PendingFeetechDisable>,
-    /// Bitmask of 0-based servo indices that have already received `TORQUE_ENABLE = 0` in an
-    /// active/partial disable sequence (R12 B3). Cleared on full completion or `set_torque(true)`.
-    disable_dispatched_mask: u64,
-    /// Per-servo host monotonic instant of the last motion/enable write (`write_joint_targets` or
-    /// `set_torque(true)`): rest-pose samples must come from requests sent at/after this instant.
-    last_motion_write_at: Vec<Option<Instant>>,
-    /// `(frames, exhausted)` summary of the most recent `poll_torque` pass.
-    last_poll_rx: Option<(u16, bool)>,
-    /// Per-servo K=3 causal confirmation window for the rest-pose gate.
-    rest_pose_window: Vec<CausalWindow>,
-    /// Preallocated goal-position scratch buffer for zero-alloc `FailedHold` / stopped holds (R1).
-    hold_positions_buf: Vec<(u8, u16)>,
-    /// Preallocated `SYNC_WRITE` packet buffer for zero-alloc `FailedHold` / stopped holds (R1).
-    hold_sync_pkt_buf: Vec<u8>,
-    consecutive_missed_echoes: u32,
-    warned_missed_echoes: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    shadow_staging: crate::torque::shadow::ShadowDriverStaging,
-    #[cfg(not(target_arch = "wasm32"))]
-    last_disable_flush_ok: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    in_disable_drain: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    pending_disable_shadow: Option<PendingDisableShadowBatch>,
-}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]

@@ -16,6 +16,101 @@ use crate::protocol::feetech;
 #[allow(unused_imports)]
 use crate::transport::{Transport, TransportError};
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingFeetechDisable {
+    pub(super) kind: DisableKind,
+    pub(super) client_park: Option<(Option<u64>, Option<u64>)>,
+}
+
+pub struct FeetechArmDriver<T: Transport> {
+    pub(super) transport: T,
+    pub(super) clock: Option<Arc<dyn crate::transport::DriverClock>>,
+    pub(super) servo_ids: Vec<u8>,
+    pub(super) config: feetech::FeetechConfig,
+    pub(super) cached_states: Vec<JointState>,
+    pub(super) cached_loads: Vec<f32>,
+    pub motor_status: Vec<u8>,
+    pub(super) last_feedback_instant: Vec<Option<Instant>>,
+    pub(super) feedback_seq: Vec<u64>,
+    /// Incremented whenever a joint's feedback continuity breaks (`> 100 ms` gap or non-finite).
+    pub(super) feedback_continuity_epoch: Vec<u64>,
+    /// Reported per-servo `REG_TORQUE_ENABLE` telemetry (`Some(0 | 1)` or `None`, observation/UI only).
+    pub(super) reported_enable: Vec<Option<u8>>,
+    /// True after torque enable was commanded until a torque-off write is dispatched; keeps
+    /// periodic causal `REG_TORQUE_ENABLE` telemetry polling active even if a servo reports 0 (R12 M2).
+    pub(super) torque_enable_commanded: bool,
+    /// Monotonic counter bumped strictly when a causal `REG_TORQUE_ENABLE == 0` reply is decoded (R12 M2).
+    pub(super) reported_torque_loss_sample_seq: u64,
+    /// True after a 1-byte register read to servo `i` timed out: a late 1-byte reply may still
+    /// be in flight, so causal torque readback requires a 0-byte `PING` FIFO barrier first.
+    pub(super) unmatched_1b_read: Vec<bool>,
+    pub(super) tx_echo: Option<bool>,
+    pub(super) tx_echo_auto: bool,
+    pub(super) poll_cursor: usize,
+    pub(super) rx_buffer: Vec<u8>,
+    pub effective_ranges: Vec<(u16, u16)>,
+    pub(super) cached_raw_steps: Vec<i32>,
+    pub(super) read_poll_count: u64,
+    pub(super) missed_poll_replies: u64,
+    pub(super) abort_flag: Option<Arc<AtomicBool>>,
+    pub(super) estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    pub(super) estop_state: Option<Arc<crate::rt_core::urgent::EstopState>>,
+    pub(super) stopped_disable_gate: Option<StoppedDisableGate>,
+    pub(super) tx_release_deadline: Option<Instant>,
+    pub last_enable_poll: Option<Instant>,
+    pub(super) gripper_index: Option<usize>,
+    pub hw_angle_limits: Vec<Option<(u16, u16)>>,
+    pub last_enable_confirmed: Vec<Option<Instant>>,
+    pub missed_enable_polls: Vec<u8>,
+    pub(super) incomplete_chunk_idx: Option<usize>,
+    pub(super) incomplete_frame_started_at: Option<Instant>,
+    pub(super) partial_pos_rx: Vec<u8>,
+    /// Per-byte host monotonic receive timestamps aligned 1:1 with `partial_pos_rx` (S2).
+    pub(super) partial_pos_rx_timestamps: Vec<Instant>,
+    /// Per-byte host monotonic receive timestamps aligned 1:1 with `rx_buffer` (E3).
+    pub(super) rx_timestamps: Vec<Instant>,
+    /// True after any Feetech request times out or observes an ambiguous duplicate reply; the next
+    /// request MUST discard RX bytes until continuous line idle (20 ms) before transmitting (S2).
+    pub(super) line_poisoned: bool,
+    /// Host monotonic instant when continuous silence on a poisoned serial line began (S2).
+    pub(super) line_poison_quiet_since: Option<Instant>,
+    /// Active control-release id distinguishing separate ticks for the rest-pose K=3 window.
+    pub(super) control_release_id: u64,
+    /// True once the owner has called `begin_control_release`, preventing receive passes from
+    /// advancing `control_release_id` independently.
+    pub(super) control_release_managed: bool,
+    /// Most recent `control_release_id` for which `read_joint_states_inner` completed a bus pass,
+    /// avoiding redundant same-release polling inside `poll_torque` (R12 B1).
+    pub(super) last_read_release_id: u64,
+    /// Pending stopped disable awaiting rest-pose K=3 confirmation or poisoned-line drain within
+    /// the single 1 s request lifetime (0 torque-off packets transmitted while pending).
+    pub(super) pending_disable: Option<PendingFeetechDisable>,
+    /// Bitmask of 0-based servo indices that have already received `TORQUE_ENABLE = 0` in an
+    /// active/partial disable sequence (R12 B3). Cleared on full completion or `set_torque(true)`.
+    pub(super) disable_dispatched_mask: u64,
+    /// Per-servo host monotonic instant of the last motion/enable write (`write_joint_targets` or
+    /// `set_torque(true)`): rest-pose samples must come from requests sent at/after this instant.
+    pub(super) last_motion_write_at: Vec<Option<Instant>>,
+    /// `(frames, exhausted)` summary of the most recent `poll_torque` pass.
+    pub(super) last_poll_rx: Option<(u16, bool)>,
+    /// Per-servo K=3 causal confirmation window for the rest-pose gate.
+    pub(super) rest_pose_window: Vec<CausalWindow>,
+    /// Preallocated goal-position scratch buffer for zero-alloc `FailedHold` / stopped holds (R1).
+    pub(super) hold_positions_buf: Vec<(u8, u16)>,
+    /// Preallocated `SYNC_WRITE` packet buffer for zero-alloc `FailedHold` / stopped holds (R1).
+    pub(super) hold_sync_pkt_buf: Vec<u8>,
+    pub(super) consecutive_missed_echoes: u32,
+    pub(super) warned_missed_echoes: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) shadow_staging: crate::torque::shadow::ShadowDriverStaging,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) last_disable_flush_ok: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) in_disable_drain: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) pending_disable_shadow: Option<PendingDisableShadowBatch>,
+}
+
 impl<T: Transport> FeetechArmDriver<T> {
     pub fn new(transport: T, servo_ids: Vec<u8>) -> Self {
         let clock = transport.clock();

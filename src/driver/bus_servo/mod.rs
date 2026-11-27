@@ -6,3 +6,4 @@ pub mod feetech;
 pub mod poll;
 pub mod torque;
 pub use fashionstar::FashionStarArmDriver;
+pub use engine::FeetechArmDriver;
