@@ -912,7 +912,7 @@ fn relatching_deferral_fault_loop_allows_disable_at_rest_on_both_owners() {
 
 #[test]
 fn cockpit_html_exposes_stopped_torque_off_inline_message_without_override() {
-    let html = include_str!("../src/api/index.html");
+    let html = include_str!(concat!(env!("OUT_DIR"), "/cockpit/index.html"));
     assert!(html.contains("id=\"btn-torque-off\""), "stopped torque-off button missing");
     assert!(html.contains("id=\"torque-off-msg\""), "inline TORQUE_OFF_WOULD_DROP container missing");
     assert!(

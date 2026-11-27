@@ -2,7 +2,7 @@
 // Camera calibration wizard flow against a running armd, without a browser (test_calibration_e2e.py).
 //   node calib_wizard_e2e.mjs --armd http://127.0.0.1:PORT --board X,Y,YAW_DEG --out result.json
 // The cockpit's steps with the same code: src/api/calib_wizard.js (CW) and the IK / FK blocks of
-// src/api/index.html (CALM, VIK; as scripts/view_ik_selftest.mjs loads them). The operator's jog to the
+// the assembled cockpit page (CALM, VIK; as scripts/view_ik_selftest.mjs loads them). The operator's jog to the
 // start pose is a move_to above the board (--board: where the board lies; only used for that pose).
 //   start pose (camera 0.28 m above the board centre with armd's current mount) -> ["aruco"] capture ->
 //   bootstrap with nominal values (fx 824, GET /api/v1/calibration camera_mount) -> generated poses ->
@@ -13,13 +13,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith('--') ? [...a, [v.slice(2), all[i + 1]]] : a), []));
 const BASE = args.armd, OUT = args.out, BOARD_AT = (args.board || '0.30,0.02,-80').split(',').map(Number);
 const THICK = Number(args.thickness ?? 0);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const CW = await import(pathToFileURL(path.join(root, 'src/api/calib_wizard.js')).href);
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'), 'utf8');
+const { readCockpitHtml } = createRequire(import.meta.url)(path.join(root, 'scripts/source_paths.cjs'));
+const html = readCockpitHtml();
 const block = (name) => html.slice(html.indexOf(`/* ${name}-BEGIN */`), html.indexOf(`/* ${name}-END */`));
 const { CALM, VIK } = vm.runInContext(block('CALIB-MATH') + '\n' + block('VIEW-IK') + '\n({ CALM, VIK });', vm.createContext({}));
 const D = 180 / Math.PI;

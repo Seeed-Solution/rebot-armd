@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Self-test of the camera-view cartesian IK (src/api/index.html, blocks CALIB-MATH and VIEW-IK).
+// Self-test of the camera-view cartesian IK (the assembled cockpit page, blocks CALIB-MATH and VIEW-IK).
 // Runs without a browser:  node scripts/view_ik_selftest.mjs
 //   a. VIK.fk equals CALM.fk (full URDF chain)
 //   b. FK -> IK round trip: 200 random joint sets (inside limits, away from singularities), perturbed start
@@ -21,7 +21,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const html = readCockpitHtml();
 const block = (name) => {
   const a = html.indexOf(`/* ${name}-BEGIN */`), b = html.indexOf(`/* ${name}-END */`);
-  if (a < 0 || b < a) throw new Error(`${name} block not found in index.html`);
+  if (a < 0 || b < a) throw new Error(`${name} block not found in the cockpit page`);
   return html.slice(a, b);
 };
 const ctx = vm.createContext({});

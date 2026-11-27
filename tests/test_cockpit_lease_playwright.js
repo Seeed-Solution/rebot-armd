@@ -362,6 +362,10 @@ async function assertReachable(page, sel, label) {
 
 async function assertControlInputsState(page, expectedState, label) {
   assert(expectedState === 'unavailable' || expectedState === 'active', `${label}: invalid expectedState=${expectedState}`);
+  // The render loop (frame()) applies the control-input classes at most every 60 ms: wait (bounded) for the body
+  // class and the data-control-state to reach the expected state, then check every element below.
+  await page.waitForFunction((exp) => document.body.classList.contains('controls-unavailable') === (exp !== 'active')
+    && document.querySelector('#btn-home')?.dataset.controlState === exp, expectedState, { timeout: 2000 }).catch(() => {});
   const errors = await page.evaluate((exp) => {
     const errs = [];
     const wantActive = exp === 'active';

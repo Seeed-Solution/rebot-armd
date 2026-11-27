@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const html = fs.readFileSync(path.join(__dirname, '../src/api/index.html'), 'utf8');
+const html = require('../src/api/cockpit/assembler/assemble.cjs').assemble();
 function source(name) {
   const plain = html.indexOf('function ' + name + '(');
   assert.notEqual(plain, -1, name);
@@ -12,11 +12,11 @@ function source(name) {
 }
 // The handlers translate their messages with t(); load the real dictionary (Chinese UI).
 function i18nSource() {
-  const start = html.indexOf('const I18N = {');
+  const start = html.indexOf('const I18N = {};');
   assert.notEqual(start, -1, 'I18N');
-  const end = html.indexOf('\n// ----', start);
-  const assignEnd = html.indexOf('\n});', html.indexOf('Object.assign(I18N.en', start));
-  return html.slice(start, assignEnd !== -1 ? assignEnd + 4 : html.indexOf('\n};', start) + 3);
+  const end = html.indexOf('\nlet LANG', start);
+  assert.notEqual(end, -1, 'LANG after the dictionaries');
+  return html.slice(start, end + 1);
 }
 const context = vm.createContext({ console });
 vm.runInContext(`

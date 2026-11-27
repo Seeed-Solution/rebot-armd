@@ -1,18 +1,20 @@
 #!/usr/bin/env node
-// Generates tests/fixtures/vik_samples.json from the cockpit's JS kinematics (src/api/index.html,
+// Generates tests/fixtures/vik_samples.json from the cockpit's JS kinematics (assembled cockpit page,
 // blocks CALIB-MATH and VIEW-IK). The Rust port in src/kinematics.rs is cross-checked against it
 // by tests/test_kinematics.rs.  Run:  node tests/fixtures/gen_vik_fixture.mjs
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..', '..');
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'), 'utf8');
+const { readCockpitHtml } = createRequire(import.meta.url)(path.join(root, 'scripts/source_paths.cjs'));
+const html = readCockpitHtml();
 const block = (name) => {
   const a = html.indexOf(`/* ${name}-BEGIN */`), b = html.indexOf(`/* ${name}-END */`);
-  if (a < 0 || b < a) throw new Error(`${name} block not found in index.html`);
+  if (a < 0 || b < a) throw new Error(`${name} block not found in the cockpit page`);
   return html.slice(a, b);
 };
 const ctx = vm.createContext({});

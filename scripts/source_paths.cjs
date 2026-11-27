@@ -72,12 +72,29 @@ function resolveCockpitInDir(dir) {
   return cockpitHtmlPath();
 }
 
+// The cockpit page as armd serves it. An explicit file (override or ARMD_COCKPIT_HTML) is read as is;
+// otherwise the shell (`cockpit_html`) is assembled with its fragments by the Node assembler under
+// `cockpit_fragments_dir` (same bytes as build.rs, tests/test_cockpit_assembly.rs).
 function readCockpitHtml(override) {
-  return fs.readFileSync(cockpitHtmlPath(override), 'utf8');
+  if (override || process.env.ARMD_COCKPIT_HTML) return fs.readFileSync(cockpitHtmlPath(override), 'utf8');
+  return assembleCockpitDir(path.dirname(cockpitHtmlPath()));
 }
 
 function readCockpitHtmlBuffer(override) {
-  return fs.readFileSync(cockpitHtmlPath(override));
+  if (override || process.env.ARMD_COCKPIT_HTML) return fs.readFileSync(cockpitHtmlPath(override));
+  return Buffer.from(readCockpitHtml(), 'utf8');
+}
+
+// Assembles `<dir>/index.html` with the fragments under `<dir>/cockpit/`.
+function assembleCockpitDir(dir) {
+  return require(path.join(sourcePath('cockpit_fragments_dir'), 'assembler', 'assemble.cjs')).assemble(path.resolve(dir));
+}
+
+// The page of an explicit SRC tree: assembled when it is a fragment tree (`<dir>/cockpit/`), else the
+// standalone `<dir>/index.html` of an older tree.
+function readCockpitInDir(dir) {
+  if (fs.existsSync(path.join(path.resolve(dir), 'cockpit'))) return assembleCockpitDir(dir);
+  return fs.readFileSync(resolveCockpitInDir(dir), 'utf8');
 }
 
 function cockpitAssetPath(rel) {
@@ -94,5 +111,7 @@ module.exports = {
   resolveCockpitInDir,
   readCockpitHtml,
   readCockpitHtmlBuffer,
+  assembleCockpitDir,
+  readCockpitInDir,
   cockpitAssetPath,
 };

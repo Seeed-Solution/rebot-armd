@@ -3,6 +3,7 @@
 # Multiple rows with the same key are allowed (e.g. after splitting a module).
 # When a source file moves or splits into a directory, update its row(s) here once.
 cockpit_html	src/api/index.html
+cockpit_fragments_dir	src/api/cockpit
 cockpit_assets_dir	src/api
 driver	src/driver.rs
 sim_driver	src/sim_driver.rs

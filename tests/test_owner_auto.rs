@@ -636,7 +636,7 @@ async fn binary_startup_precedence_auto_resolution_and_diagnostics() {
 
 #[test]
 fn cockpit_owner_badge_shows_in_expert_and_only_on_fallback_in_simple() {
-    let html = include_str!("../src/api/index.html");
+    let html = include_str!(concat!(env!("OUT_DIR"), "/cockpit/index.html"));
     assert!(html.contains("<button type=\"button\" class=\"sc-status-badge plain\" id=\"owner-badge\" hidden></button>"));
     assert!(html.contains("body.ui-simple #owner-badge:not(.is-fallback) { display: none !important; }"));
     assert!(html.contains("function renderOwnerStatus()"));

@@ -1,0 +1,220 @@
+{
+ "_comment": "Shared cockpit assembly cases: tests/test_cockpit_assembly.rs runs them with assemble.rs and (through node) tests/test_cockpit_assembly_cases.js with assemble.cjs. files: path -> text or {hex}; page: exact output; error: substring of the error.",
+ "cases": [
+  {
+   "name": "splice_in_order",
+   "files": {
+    "index.html": "<a>\n<!-- @include cockpit/x/a.css -->\n<b>\n<!-- @include cockpit/b.js -->\n</c>\n",
+    "cockpit/x/a.css": "A1\nA2\n",
+    "cockpit/b.js": "B\n"
+   },
+   "page": "<a>\nA1\nA2\n<b>\nB\n</c>\n"
+  },
+  {
+   "name": "shell_final_line_without_lf_is_kept",
+   "files": {
+    "index.html": "a\n<!-- @include cockpit/a.js -->\nend",
+    "cockpit/a.js": "A\n"
+   },
+   "page": "a\nA\nend"
+  },
+  {
+   "name": "assembler_dir_is_not_a_fragment_dir",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": "A\n",
+    "cockpit/assembler/notes.js": "x\n"
+   },
+   "page": "A\n"
+  },
+  {
+   "name": "non_fragment_extension_is_not_an_orphan",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": "A\n",
+    "cockpit/README.md": "r\n",
+    "cockpit/.js": "dot\n"
+   },
+   "page": "A\n"
+  },
+  {
+   "name": "indented_marker_is_literal",
+   "files": {
+    "index.html": " <!-- @include cockpit/a.js -->\n"
+   },
+   "page": " <!-- @include cockpit/a.js -->\n"
+  },
+  {
+   "name": "trailing_space_marker_is_literal",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js --> \n"
+   },
+   "page": "<!-- @include cockpit/a.js --> \n"
+  },
+  {
+   "name": "crlf_marker_is_literal",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\r\nx\n"
+   },
+   "page": "<!-- @include cockpit/a.js -->\r\nx\n"
+  },
+  {
+   "name": "bom_before_marker_is_literal",
+   "files": {
+    "index.html": "\ufeff<!-- @include cockpit/a.js -->\n"
+   },
+   "page": "\ufeff<!-- @include cockpit/a.js -->\n"
+  },
+  {
+   "name": "marker_inside_template_literal_is_expanded",
+   "files": {
+    "index.html": "<script>const s = `\n<!-- @include cockpit/a.js -->\n`;</script>\n",
+    "cockpit/a.js": "A\n"
+   },
+   "page": "<script>const s = `\nA\n`;</script>\n"
+  },
+  {
+   "name": "fragment_bom_and_crlf_bytes_are_kept",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.css -->\n",
+    "cockpit/a.css": "\ufeffa {}\r\nb {}\n"
+   },
+   "page": "\ufeffa {}\r\nb {}\n"
+  },
+  {
+   "name": "crlf_marker_leaves_its_fragment_orphan",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\r\n",
+    "cockpit/a.js": "A\n"
+   },
+   "error": "fragments not included by index.html: cockpit/a.js"
+  },
+  {
+   "name": "splice_line_without_lf",
+   "files": {
+    "index.html": "x\n<!-- @include cockpit/a.js -->",
+    "cockpit/a.js": "A\n"
+   },
+   "error": "splice line for cockpit/a.js must end with a newline"
+  },
+  {
+   "name": "included_twice",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": "A\n"
+   },
+   "error": "fragment cockpit/a.js is included twice"
+  },
+  {
+   "name": "empty_fragment",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": ""
+   },
+   "error": "fragment cockpit/a.js must be non-empty and end with a newline"
+  },
+  {
+   "name": "fragment_without_lf",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": "no newline"
+   },
+   "error": "fragment cockpit/a.js must be non-empty and end with a newline"
+  },
+  {
+   "name": "nested_marker",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": "<!-- @include cockpit/b.js -->\n",
+    "cockpit/b.js": "b\n"
+   },
+   "error": "(no nested includes)"
+  },
+  {
+   "name": "nested_marker_crlf",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": "x\r\n<!-- @include cockpit/b.js -->\r\n",
+    "cockpit/b.js": "b\n"
+   },
+   "error": "(no nested includes)"
+  },
+  {
+   "name": "orphan_fragments_sorted",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": "A\n",
+    "cockpit/z.css": "z\n",
+    "cockpit/p/o.html": "o\n"
+   },
+   "error": "fragments not included by index.html: cockpit/p/o.html, cockpit/z.css"
+  },
+  {
+   "name": "dotdot_path",
+   "files": {
+    "index.html": "<!-- @include cockpit/../a.js -->\n",
+    "a.js": "a\n"
+   },
+   "error": "invalid fragment path `cockpit/../a.js`"
+  },
+  {
+   "name": "path_outside_cockpit",
+   "files": {
+    "index.html": "<!-- @include other/a.js -->\n",
+    "other/a.js": "a\n"
+   },
+   "error": "invalid fragment path `other/a.js`"
+  },
+  {
+   "name": "path_with_space",
+   "files": {
+    "index.html": "<!-- @include cockpit/a b.js -->\n",
+    "cockpit/a b.js": "a\n"
+   },
+   "error": "invalid fragment path `cockpit/a b.js`"
+  },
+  {
+   "name": "bare_root_path",
+   "files": {
+    "index.html": "<!-- @include cockpit -->\n"
+   },
+   "error": "invalid fragment path `cockpit`"
+  },
+  {
+   "name": "missing_fragment",
+   "files": {
+    "index.html": "<!-- @include cockpit/missing.js -->\n"
+   },
+   "error": "cannot read fragment"
+  },
+  {
+   "name": "invalid_utf8_fragment",
+   "files": {
+    "index.html": "<!-- @include cockpit/a.js -->\n",
+    "cockpit/a.js": {
+     "hex": "41ff0a"
+    }
+   },
+   "error": "cannot read fragment"
+  },
+  {
+   "name": "invalid_utf8_shell",
+   "files": {
+    "index.html": {
+     "hex": "3cff3e0a"
+    }
+   },
+   "error": "cannot read"
+  },
+  {
+   "name": "orphan_with_literal_backslash",
+   "unix_only": true,
+   "files": {
+    "index.html": "<!-- @include cockpit/a/b.js -->\n",
+    "cockpit/a/b.js": "A\n",
+    "cockpit/a\\b.js": "orphan\n"
+   },
+   "error": "fragments not included by index.html: cockpit/a\\b.js"
+  }
+ ]
+}
