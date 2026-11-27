@@ -2053,28 +2053,6 @@ impl PendingDisableShadowBatch {
 
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadbackStage {
-    CtrlMode,
-    Timeout,
-}
-
-/// Pre-enable `CTRL_MODE` and `TIMEOUT` readback (L2 + power-overload PR 1): verifies
-/// `verified_modes[j] == Some(base_mode(j))` and fresh causal `RID_TIMEOUT` replies before any
-/// `CMD_ENABLE` frame is transmitted. Stored inline with bitmasks (zero heap allocation).
-#[derive(Debug)]
-struct ModeReadback {
-    stage: ReadbackStage,
-    remaining_mask: u32,
-    sent_mask: u32,
-    timeout_pending_mask: u32,
-    log_cleared: bool,
-    tx_evidence: [Option<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS],
-    deadline: Deadline,
-}
-
-/// Maximum joints supported in inline stack-allocated [`ModeWrite`] buffers.
-const MAX_MODE_JOINTS: usize = 16;
 
 /// Maximum unconsumed causal TX events (1 probe + up to 3 subsequent continuity holds) tracked
 /// per axis within one MIT expiry probe window (zero alloc; overflow fails closed as ambiguous).

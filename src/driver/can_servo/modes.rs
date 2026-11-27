@@ -1048,3 +1048,26 @@ pub(in crate::driver::can_servo) enum ModeWritePolicy {
     /// (`<= 100 ms`) measured feedback, rebuilding every hold at the fresh measured position.
     BaseRollback { start_stamp: StopStamp, force_fresh_hold: bool },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::driver::can_servo) enum ReadbackStage {
+    CtrlMode,
+    Timeout,
+}
+
+/// Pre-enable `CTRL_MODE` and `TIMEOUT` readback (L2 + power-overload PR 1): verifies
+/// `verified_modes[j] == Some(base_mode(j))` and fresh causal `RID_TIMEOUT` replies before any
+/// `CMD_ENABLE` frame is transmitted. Stored inline with bitmasks (zero heap allocation).
+#[derive(Debug)]
+pub(in crate::driver::can_servo) struct ModeReadback {
+    pub(in crate::driver::can_servo) stage: ReadbackStage,
+    pub(in crate::driver::can_servo) remaining_mask: u32,
+    pub(in crate::driver::can_servo) sent_mask: u32,
+    pub(in crate::driver::can_servo) timeout_pending_mask: u32,
+    pub(in crate::driver::can_servo) log_cleared: bool,
+    pub(in crate::driver::can_servo) tx_evidence: [Option<(u64, Instant, Option<i128>)>; MAX_MODE_JOINTS],
+    pub(in crate::driver::can_servo) deadline: Deadline,
+}
+
+/// Maximum joints supported in inline stack-allocated [`ModeWrite`] buffers.
+pub(in crate::driver) const MAX_MODE_JOINTS: usize = 16;
