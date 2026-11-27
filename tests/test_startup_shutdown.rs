@@ -1026,7 +1026,7 @@ fn init_passes_the_operator_pin_to_armd_in_the_environment_only() {
     let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
     let parse = init_section(source, "config_shell_vars() {", "\n# 读取 supervisor");
     let launch = init_section(source, "launch_armd() {", "\nstart() {");
-    assert!(source.contains("    launch_armd\n    if [ $? -ne 0 ]; then"), "start() launches armd through launch_armd");
+    assert!(source.contains("    launch_armd \"$@\"\n    if [ $? -ne 0 ]; then"), "start() launches armd through launch_armd");
     let temp = tempfile::tempdir().unwrap();
     // start-stop-daemon stub on PATH (dash takes no '-' in function names): logs its environment and arguments
     let bin = temp.path().join("bin");
@@ -1046,8 +1046,8 @@ fn init_passes_the_operator_pin_to_armd_in_the_environment_only() {
              ARMD_OPERATOR_PIN=999999; export ARMD_OPERATOR_PIN\n\
              OPERATOR_PIN=''; OPERATOR_PIN_INVALID=''\n\
              eval \"$(config_shell_vars '{c}')\"\n\
-             PIDFILE=/tmp/x.pid DAEMON=/usr/local/bin/armd DAEMON_OPTS='--follower mock' LOGFILE=/dev/null\n\
-             launch_armd || exit 9\n\
+             PIDFILE=/tmp/x.pid DAEMON=/usr/local/bin/armd LOGFILE=/dev/null\n\
+             launch_armd --follower mock || exit 9\n\
              echo \"after=$ARMD_OPERATOR_PIN invalid=$OPERATOR_PIN_INVALID\"\n",
             b = bin.display(), c = cfg.display()
         );
@@ -1145,10 +1145,10 @@ fn init_parses_armd_owner_and_omits_when_unset() {
         "{parse}\n{launch}\n\
          PATH='{b}':$PATH\n\
          ARMD_RT_OWNER=legacy; export ARMD_RT_OWNER\n\
-         OPERATOR_PIN=''; ARMD_OWNER=''; ARMD_OWNER_INVALID=''; DAEMON_OPTS='--follower rebot-dm'\n\
+         OPERATOR_PIN=''; ARMD_OWNER=''; ARMD_OWNER_INVALID=''; set -- --follower rebot-dm\n\
          eval \"$(config_shell_vars '{c}')\"\n\
-         if [ -z \"${{ARMD_RT_OWNER:-}}\" ] && [ -n \"$ARMD_OWNER\" ]; then DAEMON_OPTS=\"$DAEMON_OPTS --owner $ARMD_OWNER\"; fi\n\
-         PIDFILE=/tmp/x.pid DAEMON=/usr/local/bin/armd LOGFILE=/dev/null launch_armd || exit 9\n",
+         if [ -z \"${{ARMD_RT_OWNER:-}}\" ] && [ -n \"$ARMD_OWNER\" ]; then set -- \"$@\" --owner \"$ARMD_OWNER\"; fi\n\
+         PIDFILE=/tmp/x.pid DAEMON=/usr/local/bin/armd LOGFILE=/dev/null launch_armd \"$@\" || exit 9\n",
         b = bin.display(),
         c = cfg.display()
     );

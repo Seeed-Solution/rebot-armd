@@ -64,27 +64,31 @@ fn init_script_passes_kit_profile_to_rebot_dm_and_mock_only() {
     assert!(INIT_SCRIPT.contains("PROFILE=/usr/share/$NAME/profile/rebot-b601dm.json"));
     assert!(include_str!("../scripts/build_deb.sh")
         .contains("/usr/share/rebot-teleop/profile/rebot-b601dm.json\""));
-    let start = INIT_SCRIPT.find("    DAEMON_OPTS=\"--follower").unwrap();
+    let start = INIT_SCRIPT.find("    set -- --follower \"$FOLLOWER_MODEL\"").unwrap();
     // The snippet ends with the `fi` that closes the `--config` block.
-    let config_at = start + INIT_SCRIPT[start..].find("--config $PROFILE").unwrap();
+    let config_at = start + INIT_SCRIPT[start..].find("set -- \"$@\" --config \"$PROFILE\"").unwrap();
     let end = config_at + INIT_SCRIPT[config_at..].find("\n    fi\n").unwrap() + "\n    fi\n".len();
     let snippet = &INIT_SCRIPT[start..end];
     let run = |model: &str, profile: &str| {
         let script = format!(
-            "FOLLOWER_MODEL={model}\nFOLLOWER_PORT=can0\nPORT=8765\nPROFILE='{profile}'\n{snippet}printf '%s' \"$DAEMON_OPTS\"\n"
+            "FOLLOWER_MODEL={model}\nFOLLOWER_PORT=can0\nPORT=8765\nPROFILE='{profile}'\n{snippet}printf '%s\\0' \"$@\"\n"
         );
         let out = std::process::Command::new("sh").args(["-c", &script]).output().unwrap();
         assert!(out.status.success());
-        String::from_utf8(out.stdout).unwrap()
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8(s.to_vec()).unwrap())
+            .collect::<Vec<_>>()
     };
     assert_eq!(
         run("rebot-dm", PROFILE_PATH),
-        format!("--follower rebot-dm --follower-port can0 --port 8765 --config {PROFILE_PATH}")
+        vec!["--follower", "rebot-dm", "--follower-port", "can0", "--port", "8765", "--config", PROFILE_PATH]
     );
-    assert_eq!(run("rebot-dm", "/nonexistent/profile.json"), "--follower rebot-dm --follower-port can0 --port 8765");
-    assert_eq!(run("so-arm101", PROFILE_PATH), "--follower so-arm101 --follower-port can0 --port 8765");
-    assert_eq!(run("mock", PROFILE_PATH), format!("--follower mock --port 8765 --config {PROFILE_PATH}"));
-    assert_eq!(run("mock", "/nonexistent/profile.json"), "--follower mock --port 8765");
+    assert_eq!(run("rebot-dm", "/nonexistent/profile.json"), vec!["--follower", "rebot-dm", "--follower-port", "can0", "--port", "8765"]);
+    assert_eq!(run("so-arm101", PROFILE_PATH), vec!["--follower", "so-arm101", "--follower-port", "can0", "--port", "8765"]);
+    assert_eq!(run("mock", PROFILE_PATH), vec!["--follower", "mock", "--port", "8765", "--config", PROFILE_PATH]);
+    assert_eq!(run("mock", "/nonexistent/profile.json"), vec!["--follower", "mock", "--port", "8765"]);
 }
 
 /// armd started with `--config <kit profile>` serves the B601-DM schema (mock follower).

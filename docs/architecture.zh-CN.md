@@ -166,6 +166,7 @@ schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`w
 - **`auto` 规则**：对已认证的 `--follower rebot-dm` 和 `mock`（且配置符合条件）选择 `executor`；对其余从手（`so-arm101`、`so-arm100`、`rebot-rs`、`fashionstar`、`star-arm102`、`sim`）、启用 MIT 的配置或超出 `MAX_DOF` 的配置选择 `legacy`，并打印一条写明原因的启动日志。
 - **显式拒绝（fail-closed）**：在不符合条件的从手或配置上显式指定 `executor`（通过 CLI、环境变量或配置）会在启动时报错拒绝。
 - **打包（`K92rebot-teleop`）**：仅在 `/userdata/local/apps/rebot-teleop.config.json` 显式设置了 `arm.armd_owner` 时才传 `--owner`。应用清单默认值为 `"auto"`，升级保留用户已写入的值。
+- **强制执行器启动失败（`--test-fail-executor-startup`）**：有人值守测试用的开关，默认关闭，打包脚本不会设置。它让执行器的控制线程创建失败一次，从而触发向 legacy 所有者的可恢复回退（legacy 持有，不发 torque-off）。armd 在打开硬件前拒绝该开关，除非 `--follower rebot-dm` 且解析出的所有者为 `executor`；启动时输出 ERROR 日志 `--test-fail-executor-startup is ARMED`。手动运行（`armd --follower rebot-dm --owner executor --test-fail-executor-startup ...`），操作者在机械臂旁，测完后不带该开关重启 armd。真机上的保持不掉落和回退后的驾驶舱提示尚未验证。
 - **诊断与测试注意**：`GET /api/v1/observation`、`GET /api/v1/diagnostics` 与 `GET /api/v1/diagnostics/tick` 均输出 `effective_owner` 与 `owner_reason`。由于 `mock` 与 `rebot-dm` 现默认走 `executor`，任何明确测试或依赖 legacy 路径的脚本、测试或 Agent 流程必须显式固定 `--owner legacy` 或 `ARMD_RT_OWNER=legacy`。
 
 官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.3.4）：
