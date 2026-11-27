@@ -5532,11 +5532,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        let now = self.clock_now();
         out.clear();
         out.extend(
             self.last_feedback_instant
                 .iter()
-                .map(|opt| opt.map(|t| self.elapsed_since(t))),
+                .map(|opt| opt.map(|t| now.saturating_duration_since(t))),
         );
     }
 

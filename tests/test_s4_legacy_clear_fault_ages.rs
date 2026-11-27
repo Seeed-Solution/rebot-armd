@@ -255,7 +255,7 @@ fn feetech_feedback_reply(id: u8) -> Vec<u8> {
 }
 
 #[test]
-fn feetech_feedback_ages_into_samples_clock_per_joint_like_feedback_ages() {
+fn feetech_feedback_ages_into_keeps_one_clock_sample_like_base() {
     let clock = Arc::new(SteppingClock::new(2));
     let mut mock = MockTransport::new();
     let ids = vec![1u8, 2, 3];
@@ -282,11 +282,9 @@ fn feetech_feedback_ages_into_samples_clock_per_joint_like_feedback_ages() {
     let mut ages_into = Vec::new();
     drv.feedback_ages_into(&mut ages_into);
 
-    assert_eq!(
-        ages_into, ages_prim,
-        "Feetech feedback_ages_into() must sample the clock per joint identically to feedback_ages()"
-    );
-    assert!(ages_into[0].unwrap() <= Duration::from_millis(250));
-    assert!(ages_into[1].unwrap() > Duration::from_millis(250));
-    assert!(ages_into[2].unwrap() > Duration::from_millis(250));
+    // Base 2626d1fa semantics, kept on purpose: feedback_ages() samples the clock per joint (legacy
+    // fault-clear gates read it), feedback_ages_into() samples it once for all joints (RT callers such
+    // as SAFE-HOLD compare joints against one instant).
+    assert!(ages_prim[1].unwrap() > Duration::from_millis(250), "{ages_prim:?}");
+    assert_eq!(ages_into, vec![Some(Duration::from_millis(249)); 3], "one clock sample for all joints");
 }
