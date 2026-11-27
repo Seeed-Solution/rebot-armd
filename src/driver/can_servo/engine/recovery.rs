@@ -19,6 +19,12 @@ use crate::protocol::damiao::{self, DamiaoLimits};
 use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
+    /// Joint indices that received an autonomous driver recovery write during
+    /// `read_joint_states` since the previous call, clearing the record.
+    pub fn take_recovery_writes(&mut self) -> Vec<usize> {
+        self.recovery_written_joints.drain(..).collect()
+    }
+
     /// Remaining per-release RX frames allowed on this driver under the active control release.
     #[inline]
     pub(in crate::driver::can_servo) fn driver_remaining_release_rx(&self) -> u16 {

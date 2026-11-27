@@ -19,6 +19,10 @@ use crate::protocol::damiao::{self, DamiaoLimits};
 use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
+    /// Why the MIT deadline fence tripped (None = not tripped).
+    pub fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.to_string()) }
+
+
     /// Predictive fail-closed enable admission invariant:
     /// energized operation requires `max_frames >= configured_motors + 1`.
     #[inline]

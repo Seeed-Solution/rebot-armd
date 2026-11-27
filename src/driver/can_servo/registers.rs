@@ -19,6 +19,9 @@ use crate::protocol::damiao::{self, DamiaoLimits};
 use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
+    /// Result of the startup check of the motors' mapping ranges against the configured ones.
+    pub fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
+
     /// Enable mandatory startup and post-BusLoss causal `CTRL_MODE` and `TIMEOUT` readback
     /// verification across all motors. When `expected` is `Some`, each `Some(counts)` entry is
     /// also matched against the observed raw `RID_TIMEOUT` counts; when `expected` is `None` (or
