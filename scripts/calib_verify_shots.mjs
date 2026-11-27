@@ -17,12 +17,13 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { actRowsCheck, stepBarCheck } from './act_rows_check.mjs';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = path.join(root, '.cache/calib-verify-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 const js = fs.readFileSync(path.join(root, 'src/api/calib_wizard.js'));
 const FX = path.join(root, 'tests/fixtures/calib_t20');
 const fixtures = JSON.parse(fs.readFileSync(path.join(FX, 'fixtures.json'), 'utf8'));

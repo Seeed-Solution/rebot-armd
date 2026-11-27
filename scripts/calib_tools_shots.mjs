@@ -17,12 +17,13 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { actRowsCheck } from './act_rows_check.mjs';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = path.join(root, '.cache/calib-tools-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 const js = fs.readFileSync(path.join(root, 'src/api/calib_wizard.js'));
 const bundle = fs.readFileSync(path.join(root, 'src/api/vendor/three-urdf.min.js.gz'));
 const modelDir = process.env.MODEL_DIR || path.join(root, 'kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets');

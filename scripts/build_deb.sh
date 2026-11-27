@@ -294,9 +294,10 @@ if [ -d "${REPO_ROOT}/assets/so101_meshes" ]; then
     cp -rf "${REPO_ROOT}/assets/so101_meshes/"* "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_meshes/"
 fi
 
-# Ensure web UI index.html is present in usr/share/rebot-teleop
-if [ -f "${REPO_ROOT}/src/api/index.html" ]; then
-    cp -f "${REPO_ROOT}/src/api/index.html" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
+# Ensure web UI index.html is present in usr/share/rebot-teleop (resolved via .config/source_paths.tsv)
+COCKPIT_HTML="$("${SCRIPT_DIR}/source_paths.sh" --repo cockpit_html)"
+if [ -f "${COCKPIT_HTML}" ]; then
+    cp -f "${COCKPIT_HTML}" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
 fi
 # Gallery manifest: its "version" is the package version (the console reports it as the
 # installed version), written here so the two cannot differ.

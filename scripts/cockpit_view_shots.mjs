@@ -17,13 +17,14 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = process.env.OUT || path.join(root, '.cache/cockpit-view-shots');
 fs.mkdirSync(out, { recursive: true });
 const modelDir = process.env.MODEL_DIR || path.join(root, 'kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets');
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 const bundle = fs.readFileSync(path.join(root, 'src/api/vendor/three-urdf.min.js.gz'));
 const LIMITS = [[-2.8, 2.8, 2], [-3.14, 0, 2], [-3.14, 0, 2], [-1.87, 1.57, 3], [-1.57, 1.57, 3], [-3.14, 3.14, 4], [-5.75, 0.1, 2]]
   .map(([a, b, v]) => ({ min_position: a, max_position: b, max_velocity: v }));

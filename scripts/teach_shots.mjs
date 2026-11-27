@@ -20,12 +20,13 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { actRowsCheck } from './act_rows_check.mjs';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = path.join(root, '.cache/teach-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 const js = fs.readFileSync(path.join(root, 'src/api/calib_wizard.js'));
 
 const STALE = { reason: 'motor zero of joints [2]', at: '2026-11-18T10:20:00Z' };

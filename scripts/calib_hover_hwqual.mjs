@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readCockpitHtml } from './source_paths.mjs';
 
 const args = process.argv.slice(2);
 if (!args.includes('--i-am-at-the-arm')) {
@@ -32,7 +33,7 @@ const out = opt('--out', path.join(root, '.cache/hwqual'));
 fs.mkdirSync(out, { recursive: true });
 const base = (process.env.ARMD || 'http://127.0.0.1:8765').replace(/\/$/, '');
 const CW = await import(pathToFileURL(path.join(root, 'src/api/calib_wizard.js')).href);
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'), 'utf8');
+const html = readCockpitHtml();
 const block = (n) => html.slice(html.indexOf(`/* ${n}-BEGIN */`), html.indexOf(`/* ${n}-END */`));
 const { CALM } = vm.runInContext(block('CALIB-MATH') + '\n({ CALM });', vm.createContext({}));
 const log = { started_at: new Date().toISOString(), armd: base, max_points: MAX_POINTS, steps: [] };
