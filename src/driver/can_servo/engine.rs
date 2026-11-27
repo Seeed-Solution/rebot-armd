@@ -878,3 +878,421 @@ pub(super) mod recovery;
 pub(super) mod tx;
 pub(super) mod tx_types;
 pub(super) mod target_tx;
+
+pub struct DamiaoArmDriver<C: CanTransport> {
+    pub(in crate::driver::can_servo) can: C,
+    /// Checked before each frame of a target batch (`ArmDriver::set_estop_gate`).
+    pub(in crate::driver::can_servo) estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    /// Client lease generation stamped onto queued motion target frames (`0` for hold/autonomous).
+    pub(in crate::driver::can_servo) output_lease_gen: u64,
+    /// Per-call client lease generation checked inside [`Self::send`] (set by `send_with_lease`).
+    pub(in crate::driver::can_servo) send_lease_gen: u64,
+    /// Atomic E-stop latch (`ArmDriver::set_abort_flag`), checked before enable transmissions.
+    pub(in crate::driver::can_servo) abort_flag: Option<Arc<AtomicBool>>,
+    /// Supervisor-injected stopped-disable gate enforced at send time for `DisableRequested`.
+    pub(in crate::driver::can_servo) stopped_disable_gate: Option<StoppedDisableGate>,
+    /// Authoritative packed E-stop state (`ArmDriver::set_estop_state`).
+    pub(in crate::driver::can_servo) estop_state: Option<Arc<crate::rt_core::urgent::EstopState>>,
+    /// Strict non-sleeping RT mode (`ArmDriver::set_rt_mode`), disables retry sleeps on WouldBlock.
+    pub(in crate::driver::can_servo) rt_no_sleep: bool,
+    pub(in crate::driver) motor_ids: Vec<u16>,
+    pub(in crate::driver::can_servo) master_id: u32,
+    /// Explicit master CAN ID from [`Self::with_master_id`]; `None` uses Damiao's per-motor `0x10 + motor_id`.
+    pub(in crate::driver::can_servo) configured_master_id: Option<u32>,
+    /// MIT / feedback mapping range per joint (must equal each motor's PMAX / VMAX / TMAX).
+    pub(in crate::driver::can_servo) limits: Vec<DamiaoLimits>,
+    pub(in crate::driver::can_servo) control_mode: DamiaoControlMode,
+    pub(in crate::driver::can_servo) default_vlim: f32,
+    pub(in crate::driver::can_servo) default_kp: f32,
+    pub(in crate::driver::can_servo) default_kd: f32,
+    pub(in crate::driver) cached_states: Vec<JointState>,
+    pub(in crate::driver::can_servo) last_target_frames: Vec<Option<CanFrame>>,
+    /// Last MIT `(kp, kd, torque)` parameters transmitted per joint (used to rebuild fresh
+    /// gravity-compensation recovery frames from live measured position without replaying bytes).
+    pub(in crate::driver::can_servo) last_mit_params: Vec<Option<(f32, f32, f32)>>,
+    pub(in crate::driver) last_feedback_instant: Vec<Option<Instant>>,
+    /// Most recent decoded feedback instant per joint, preserved across `send_enable()` (which
+    /// clears `last_feedback_instant` to gate post-enable state-1 confirmation) and cleared on
+    /// `awaiting_rx_boundary` reset so Rule A′ send-time pose checks during enable rollback still
+    /// observe provably fresh (`<= 100 ms`) pose telemetry.
+    pub(in crate::driver) pose_feedback_instant: Vec<Option<Instant>>,
+    pub(in crate::driver::can_servo) feedback_seq: Vec<u64>,
+    /// Instant taken before the last receive call that found the RX queue empty.
+    pub(in crate::driver::can_servo) rx_empty_instant: Option<Instant>,
+    /// `rx_empty_instant` when each joint's last sample was decoded.
+    pub(in crate::driver) feedback_queue_bound: Vec<Option<Instant>>,
+    pub(in crate::driver::can_servo) motor_status: Vec<u8>,
+    pub(in crate::driver) is_enabled: bool,
+    pub(in crate::driver::can_servo) pending_rearm: bool,
+    pub(in crate::driver::can_servo) last_query_instant: Option<Instant>,
+    pub(in crate::driver::can_servo) last_enable_command: Option<Instant>,
+    /// `rx_seq` snapshot when `last_enable_command` was recorded so pre-command feedback cannot
+    /// satisfy `enable_state()` even if a virtual clock does not advance between receive and send.
+    pub(in crate::driver::can_servo) last_enable_command_rx_seq: Option<u64>,
+    /// True when `last_enable_command` was recorded by a disable command (as opposed to enable).
+    pub(in crate::driver::can_servo) last_command_was_disable: bool,
+    pub(in crate::driver::can_servo) awaiting_rx_boundary: bool,
+    pub(in crate::driver::can_servo) is_enabling: bool,
+    pub(in crate::driver::can_servo) last_warn_sec: AtomicU64,
+    /// Confirmed control mode per joint; None = unconfirmed after a failed switch.
+    pub(in crate::driver) joint_modes: Vec<Option<DamiaoControlMode>>,
+    /// Per-joint control mode verified from a causal `RID_CTRL_MODE` readback (or confirmed
+    /// `RID_CTRL_MODE` write reply) after this daemon start (E4). Starts `None` for every joint;
+    /// Damiao holds are sent ONLY in a verified mode, never assumed `PosVel`.
+    pub(in crate::driver) verified_modes: Vec<Option<DamiaoControlMode>>,
+    /// Open RX sequence boundary for on-tick `RID_CTRL_MODE` readback requests per joint (L2).
+    /// Only causal post-boundary, post-settle `REG_READ(RID_CTRL_MODE)` replies advance
+    /// `verified_modes[i]`.
+    pub(in crate::driver::can_servo) mode_readback_boundary: Vec<Option<u64>>,
+    /// Bitmask of joints with an unconfirmed mode-changing `REG_WRITE(RID_CTRL_MODE)` that may
+    /// have reached the wire (including failed flush). Cleared only on causal confirmation.
+    pub(in crate::driver::can_servo) mode_write_uncertain_mask: u32,
+    /// Bitmask of joints currently owned by an active `ModeSwitch` transaction (suppresses
+    /// legacy `mode_readback_boundary` auto-verification in `process_rx_frame`).
+    pub(in crate::driver::can_servo) mode_switch_active_mask: u32,
+    /// Per-joint hold targets used by `mode_switch_service_watchdog_holds` during an active
+    /// `ModeSwitch` transaction (preserves exact MIT `kp`/`kd`/`torque` hold parameters, 0 alloc).
+    pub(in crate::driver::can_servo) mode_switch_hold_targets: [Option<ModeSwitchHoldTarget>; MAX_MODE_JOINTS],
+    /// RX sequence boundary captured at the start of an active budgeted MIT expiry recovery
+    /// (`mit_expiry_recover_budgeted`), cleared on completion or reset.
+    pub(in crate::driver::can_servo) mit_expiry_budgeted_boundary: Option<u64>,
+    /// True while either legacy (`mit_expiry_recover_with_gate`) or executor
+    /// (`mit_expiry_recover_budgeted`, including initial drain) MIT expiry recovery is active,
+    /// keeping provisional `state == 0` feedback from clearing `motor_energized_mask` or
+    /// `motor_last_ctrl_tx` before full two-round confirmation and enabling per-frame causal
+    /// probe/hold reply matching on `mit_expiry_axes`.
+    pub(in crate::driver::can_servo) mit_expiry_recovery_active: bool,
+    /// Bitmask of joints that have had `CMD_CLEAR_FAULT` sent during budgeted MIT expiry recovery.
+    pub(in crate::driver::can_servo) mit_expiry_cleared_mask: u64,
+    /// Per-joint sequential causal disable confirmation state shared by both legacy and executor
+    /// MIT expiry recovery: `CMD_DISABLE` -> `REG_READ(RID_CTRL_MODE)` barrier -> Round 1 `0xCC`
+    /// (`state == 0`) -> Round 2 `0xCC` (`state == 0`), draining RX right before each axis's
+    /// probe submission (0 alloc).
+    pub(in crate::driver::can_servo) mit_expiry_axes: [MitExpiryAxisState; MAX_MODE_JOINTS],
+    /// Most recent `rx_seq` at which each joint reported an adverse (`state_or_error != 0`)
+    /// feedback frame (recorded before timestamp filtering so untimestamped adverse frames also
+    /// veto disable confirmation).
+    pub(in crate::driver::can_servo) last_adverse_feedback_seq: [u64; MAX_MODE_JOINTS],
+    /// Per-release RX frame counter shared across Step 2 RX, transition polls, ModeSwitch, MIT
+    /// recovery, and commissioning (one release ledger).
+    pub(in crate::driver::can_servo) release_rx_frames: u16,
+    /// Per-release RX frame cap tightened by the owner's [`crate::rt_core::budget::ReleaseBudget`] (default 64).
+    pub(in crate::driver::can_servo) release_rx_limit: u16,
+    /// Optional per-release budgeted TX cap tightened by the owner's [`crate::rt_core::budget::ReleaseBudget`].
+    pub(in crate::driver::can_servo) release_tx_limit: Option<u16>,
+    /// Bitmask of axes causally confirmed disabled during the active MIT expiry recovery attempt
+    /// so `watchdog_continuity_reserved_mask` and `service_mit_recovery_continuity_holds_inner`
+    /// share the exact same due-axis eligibility predicate.
+    pub(in crate::driver::can_servo) mit_expiry_confirmed_disabled_mask: u64,
+    /// Per-joint `CLOCK_REALTIME - monotonic` decode offset (ns) of the latest causal feedback.
+    pub(in crate::driver::can_servo) last_feedback_decode_offset_ns: Vec<Option<i128>>,
+    /// Per-joint causal `REG_READ(RID_CTRL_MODE)` probe boundary
+    /// `(after_seq, tx_at, retry_at, deadline, tx_offset_ns)` used by SAFE-HOLD / stopped recovery
+    /// for joints in `mode_write_uncertain_mask` (0 alloc).
+    pub(in crate::driver::can_servo) uncertain_readback_probe: [Option<(u64, Instant, Instant, Instant, Option<i128>)>; MAX_MODE_JOINTS],
+    /// PMAX / VMAX / TMAX read back from the motor and equal to `limits[i]`.
+    pub(in crate::driver::can_servo) mit_limits_verified: Vec<bool>,
+    /// Opt-in expected Damiao `RID_TIMEOUT` counts per joint (`None` = any fresh reply accepted).
+    pub(in crate::driver::can_servo) expected_timeout_counts: Vec<Option<u32>>,
+    /// True when pre-enable `RID_TIMEOUT` readback verification is enabled (via
+    /// [`Self::with_timeout_verification`] or [`Self::with_expected_timeout_counts`]).
+    pub(in crate::driver::can_servo) timeout_check_enabled: bool,
+    /// Per-joint causal `RID_TIMEOUT` verification state (cleared on startup and after BusLoss).
+    pub(in crate::driver::can_servo) timeout_verified: Vec<bool>,
+    /// True when startup or post-BusLoss register verification is pending: next enable must run
+    /// fresh causal `CTRL_MODE` and `TIMEOUT` readbacks across all motors and only clears upon
+    /// confirmed enable ([`Self::finish_enable_confirmed`]).
+    pub(in crate::driver::can_servo) startup_register_check_pending: bool,
+    /// Bitmask of joints whose `verified_modes[j]` transitioned from unverified to verified during
+    /// the current enable attempt so an aborted startup/post-BusLoss attempt discards them.
+    pub(in crate::driver::can_servo) attempt_verified_modes_mask: u32,
+    /// Staged quantized wire target positions `(tx_at, motor_space_rad)` awaiting `can.flush()`.
+    pub(in crate::driver::can_servo) staged_wire_pos: [Option<(Instant, f32)>; MAX_MODE_JOINTS],
+    pub(in crate::driver::can_servo) staged_wire_pos_mask: u32,
+    /// Last wire-committed target position per joint as `(commit_seq, tx_at, motor_space_rad)`,
+    /// recorded strictly at confirmed transmit/flush for non-skipped PosVel/MIT control frames.
+    pub(in crate::driver::can_servo) committed_wire_pos: [Option<(u64, Instant, f32)>; MAX_MODE_JOINTS],
+    pub(in crate::driver::can_servo) wire_pos_commit_seq: u64,
+    /// Register replies seen by `read_joint_states` since the last clear.
+    pub(in crate::driver::can_servo) register_replies: Vec<damiao::RegisterReply>,
+    /// Last mapping-range check (`check_mapping_ranges`); None = not run.
+    pub(in crate::driver::can_servo) range_check: Option<DriverRangeCheck>,
+    /// Joints that received an autonomous recovery write during `read_joint_states`
+    /// since the supervisor last queried `take_recovery_writes`.
+    pub(in crate::driver::can_servo) recovery_written_joints: Vec<usize>,
+    /// `ArmDriver::set_strict_mode_handover`; false keeps the e4f72b6 `write_modes`.
+    pub(in crate::driver::can_servo) strict_mode_handover: bool,
+    /// Register replies with the CAN ID they arrived on and their receive instant (MIT
+    /// identity readback and TIMEOUT commissioning).
+    pub(in crate::driver::can_servo) register_reply_log: Vec<(damiao::RegisterReply, u32, Instant, u64, u64)>,
+    /// Preallocated inline register reply buffer for RT commissioning (zero heap alloc/free).
+    pub(in crate::driver::can_servo) comm_reg_replies: [Option<crate::mit::CommissioningRegReply>; 64],
+    pub(in crate::driver::can_servo) comm_reg_reply_len: usize,
+    /// True if more than 64 register replies arrived since the last `commissioning_clear_register_log`;
+    /// forces `commissioning_find_register_reply` to fail closed as `Ambiguous`.
+    pub(in crate::driver::can_servo) comm_reg_reply_overflow: bool,
+    /// Test-only hook invoked strictly AFTER section-6 pre-TX bookkeeping and immediately BEFORE
+    /// the final authority/deadline check and `can.transmit(&frame)`.
+    pub(in crate::driver::can_servo) before_final_tx_gate_hook: Option<std::sync::Arc<dyn Fn(&CanFrame) + Send + Sync>>,
+    /// RX sequence number of the last observed-empty receive queue: every frame dequeued after
+    /// it (sequence number larger) was enqueued after that observation.
+    pub(in crate::driver::can_servo) rx_empty_seq: u64,
+    /// The last `read_joint_states` observed an empty receive queue.
+    pub(in crate::driver::can_servo) last_read_drained: bool,
+    /// Deterministic clock of the CAN transport (tests); None = the system clock.
+    pub(in crate::driver::can_servo) clock: Option<std::sync::Arc<dyn crate::transport::DriverClock>>,
+    /// Sequence number of the last processed RX frame, and of each joint's last feedback.
+    pub(in crate::driver::can_servo) rx_seq: u64,
+    /// Exact `(rx_seq, now)` mark captured immediately before `can.transmit(&frame)` on the most
+    /// recent successful `send_inner` call (with zero intervening transport callbacks or hooks).
+    pub(in crate::driver::can_servo) last_tx_mark: Option<(u64, Instant)>,
+    pub(in crate::driver::can_servo) last_feedback_seq: Vec<u64>,
+    /// Incremented whenever joint `i`'s feedback continuity breaks (`> 100 ms` gap or non-finite).
+    pub(in crate::driver::can_servo) feedback_continuity_epoch: Vec<u64>,
+    /// Per-motor causal boundary captured after the last motion/enable write returns from
+    /// `can.transmit()`. Used ONLY inside the rest-pose disable gate.
+    pub(in crate::driver::can_servo) rest_pose_boundary: Vec<Option<RestPoseBoundary>>,
+    /// Active control-release id distinguishing separate ticks for the rest-pose K=3 window.
+    pub(in crate::driver::can_servo) control_release_id: u64,
+    /// True once the owner has called `begin_control_release`, preventing receive passes from
+    /// advancing `control_release_id` independently.
+    pub(in crate::driver::can_servo) control_release_managed: bool,
+    /// Per-motor K=3 causal confirmation window for rest pose (the ONLY strict evidence gate).
+    pub(in crate::driver) rest_pose_window: Vec<CausalWindow>,
+    /// `rx_seq` snapshot when `CMD_ENABLE` was transmitted for motor `i`.
+    pub(in crate::driver::can_servo) motor_enable_seq: Vec<u64>,
+    /// Per-axis `(rx_seq, tx_started)` boundary captured at the most recent `CMD_ENABLE`
+    /// submission so ordinary disarm confirmation requires a fresh post-enable `state == 0` reply.
+    pub(in crate::driver::can_servo) motor_last_enable_tx: Vec<Option<(u64, Instant)>>,
+    /// True once motor `i` has produced a causal `state == 0` feedback frame after its latest
+    /// `CMD_ENABLE` submission (cleared on any `CMD_ENABLE` or non-zero `state_or_error`).
+    pub(in crate::driver::can_servo) motor_disarmed_after_enable: Vec<bool>,
+    /// True once motor `i` has received feedback strictly after its latest `CMD_ENABLE`
+    /// transmit (any state, including fault states, so `poll_enable` detects faults causally).
+    pub(in crate::driver::can_servo) motor_post_enable_feedback: Vec<bool>,
+    /// Monotonic counter bumped strictly when a post-enable motor feedback frame carries
+    /// `state_or_error != 1` (R12 M2).
+    pub(in crate::driver::can_servo) reported_torque_loss_sample_seq: u64,
+    /// True while a `ProcessExit` panic-disable sequence is active and awaiting causal per-axis
+    /// `state == 0` feedback replies after `CMD_DISABLE` transmission.
+    pub(in crate::driver::can_servo) panic_disable_active: bool,
+    /// Per-axis `(rx_seq, tx_started)` boundary captured when a flushed `CMD_DISABLE` was sent
+    /// after an empty RX boundary during `panic_disable_step`.
+    pub(in crate::driver::can_servo) panic_disable_tx_boundary: Vec<Option<(u64, Instant)>>,
+    /// Per-axis causal confirmation that a fresh `state == 0` reply arrived after the axis's
+    /// flushed `panic_disable_step` `CMD_DISABLE` transmission.
+    pub(in crate::driver::can_servo) panic_disable_confirmed: Vec<bool>,
+    /// True while `probe_hardware_disarmed_until` is actively polling read-only `0xCC` status.
+    pub(in crate::driver::can_servo) disarm_probe_active: bool,
+    /// Per-axis bitmask of axes that produced a non-disabled (`state != 0`) post-boundary feedback
+    /// frame during an active `probe_hardware_disarmed_until` pass so a later `state == 0` frame
+    /// in the same drain can never mask or cache proof for any adverse axis.
+    pub(in crate::driver::can_servo) disarm_probe_adverse_mask: u32,
+    /// First non-disabled (`state != 0`) state recorded per axis during an active
+    /// `probe_hardware_disarmed_until` pass.
+    pub(in crate::driver::can_servo) disarm_probe_adverse_state: [u8; MAX_MODE_JOINTS],
+    /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
+    pub(in crate::driver::can_servo) mit_fence: Option<Duration>,
+    /// Per joint: when its last confirmed command started out (the earliest frame of it, never
+    /// its completion), while the fence is armed. The output gap is measured from the oldest.
+    pub(in crate::driver::can_servo) mit_fence_last_cmd: Vec<Option<Instant>>,
+    /// Trip reason and instant; refuses writes until a confirmed enable (zero allocation).
+    pub(in crate::driver::can_servo) mit_fence_trip: Option<(MitFenceTripReason, Instant)>,
+    /// No autonomous frame (recovery, status poll) this long after a trip.
+    pub(in crate::driver::can_servo) mit_fence_holdoff: Duration,
+    /// The operator cleared the trip (`acknowledge_mit_fence_trip`): polls may resume.
+    pub(in crate::driver::can_servo) mit_fence_acked: bool,
+    /// True while supervisor MIT ownership is `Lost`: `verified_hold_mode` rejects MIT frames
+    /// so MIT-configured joints fall back to verified `PosVel` holds or stay unheld under L2.
+    pub(in crate::driver::can_servo) mit_ownership_lost: bool,
+    /// RX sequence boundary captured at the start of the most recent [`ArmDriver::mit_expiry_recover`]
+    /// request; final MIT clear requires every joint's `last_feedback_seq` to exceed this boundary.
+    pub(in crate::driver::can_servo) last_mit_recovery_rx_seq: Option<u64>,
+    /// MIT tracking armed a fence since the last confirmed enable: base-mode restores use POS_VEL
+    /// frames only.
+    pub(in crate::driver::can_servo) mit_tracking_used: bool,
+    /// Pending torque transition (`begin_torque` / `poll_torque`); None = idle.
+    pub(in crate::driver::can_servo) torque_hs: Option<DamiaoTorque>,
+    /// Bitmask of 0-based motor indices that have already received `CMD_DISABLE` in an active
+    /// or partial disable sequence (R12 B3). Cleared on full disable completion or enable.
+    pub(in crate::driver::can_servo) disable_dispatched_mask: u64,
+    /// True once K=3 causal rest-pose evidence on J1–J6 has been confirmed BEFORE the first
+    /// `CMD_DISABLE` frame of the active `DisableRequested` sequence.
+    pub(in crate::driver::can_servo) disable_rest_established: bool,
+    /// Optional absolute driver-clock authority deadline for dispatching undispatched motors
+    /// during a multi-tick `DisableRequested` sequence.
+    pub(in crate::driver::can_servo) disable_tx_deadline: Option<Instant>,
+    /// Optional admitted client lease generation checked before dispatching undispatched motors
+    /// during a multi-tick `DisableRequested` sequence.
+    pub(in crate::driver::can_servo) disable_lease_gen: Option<u64>,
+    /// Service deadline capping the receive pass of the current `poll_torque` (None: 5 ms only).
+    pub(in crate::driver::can_servo) rx_deadline: Option<Instant>,
+    /// True while inside `poll_torque_inner` so its internal `receive_feedback` calls do not
+    /// reset the single TX budget pass opened at `poll_torque_inner` entry.
+    pub(in crate::driver::can_servo) in_poll_torque: bool,
+    /// Frame limit capping the receive pass of the current budgeted read/poll (None: 64 frames).
+    pub(in crate::driver::can_servo) rx_frame_limit: Option<u16>,
+    /// `(frames_processed, budget_exhausted)` of the most recent `receive_feedback` pass.
+    pub(in crate::driver::can_servo) last_poll_rx: Option<(u16, bool)>,
+    /// Base (position-control) mode per joint: `control_mode`, or `PosForce` for the gripper.
+    pub(in crate::driver::can_servo) base_modes: Vec<DamiaoControlMode>,
+    /// Gripper in position-force mode (None: every joint uses `control_mode`, legacy).
+    pub(in crate::driver::can_servo) pos_force: Option<GripperPosForce>,
+    /// The gripper's CTRL_MODE 4 was read back at the last full enable.
+    pub(in crate::driver) pos_force_verified: bool,
+    /// Legacy profile: gripper joint driven in POS_VEL (reported without a motor current cap).
+    pub(in crate::driver::can_servo) legacy_gripper: Option<usize>,
+    /// First timely post-boundary 0xCC refresh sample captured while a refresh is active.
+    pub(in crate::driver::can_servo) refresh_capture: Option<RefreshCapture>,
+    /// Per-tick bounded TX budget (attempts, start-cutoff duration, inclusive frame expiry).
+    pub(in crate::driver::can_servo) tx_budget: TxBudget,
+    /// Inline fixed-capacity queue of unsent motion frames carried to the next tick (zero alloc).
+    pub(in crate::driver::can_servo) pending_tx: PendingTxQueue,
+    /// Inline fixed-capacity queue of unsent stopped-hold frames carried across ticks (separate
+    /// from `pending_tx` so `strict_stop_check` while latched in E-stop never wipes hold carryover).
+    pub(in crate::driver::can_servo) pending_hold_tx: PendingTxQueue,
+    /// Round-robin start joint for stopped-hold batches so slow-cadence partial passes never starve
+    /// higher-index joints.
+    pub(in crate::driver::can_servo) hold_cursor: usize,
+    /// True if the most recent `write_estop_hold_bounded` call transmitted at least one frame.
+    pub(in crate::driver::can_servo) last_hold_tx_sent_any: bool,
+    /// Bitmask of 0-based joint indices whose motion target transmitted & flushed in the most
+    /// recent `write_joint_targets_bounded` / `drain_pending_tx` pass with no frame still queued.
+    pub(in crate::driver::can_servo) last_target_tx_sent_mask: u64,
+    /// Observed age of the oldest frame expired in the most recent bounded TX pass.
+    pub(in crate::driver::can_servo) last_expired_oldest_age: Option<Duration>,
+    /// Shared TX pass state across `receive_feedback()`, J7 handshakes, and `write_joint_targets*()` in one tick.
+    pub(in crate::driver::can_servo) tick_tx: Option<TickTxPass>,
+    /// Unified owner-local `0xCC` refresh scheduler (fixed `u64` bitmask + round-robin cursor,
+    /// at most one `0xCC` slot per tick across enable, FailedHold, Idle-torqued, and stopped).
+    pub(in crate::driver::can_servo) refresh_scheduler: RefreshScheduler,
+    /// Stop/E-stop generation stamp captured when an enable handshake starts so an applied stop
+    /// (`requested == applied`) mid-handshake also inhibits subsequent enable frames.
+    pub(in crate::driver::can_servo) enable_stop_stamp: Option<StopStamp>,
+    /// Most recent provably fresh (`queue_bound.is_some()` + finite position) feedback
+    /// `(rx_at, queue_bound)` decoded for the position-force gripper. Unlike
+    /// `last_feedback_instant` (cleared by `send_enable` to enforce post-enable state-1 replies),
+    /// this preserves live J7 telemetry age across carried and retried `CMD_ENABLE` frames.
+    pub(in crate::driver::can_servo) pf_last_fresh_feedback: Option<(Instant, Instant)>,
+    /// Last provably fresh (`<= 100 ms`, bounded, finite) measured J7 position decoded for the
+    /// position-force gripper; preserved across staleness so J7 freeze frames always hold the
+    /// last known fresh position with `vel_raw = 0` and the configured current cap.
+    pub(in crate::driver) pf_last_fresh_position: Option<f32>,
+    /// Optional absolute driver-clock ceiling on the active control release's TX start-cutoff
+    /// (`release_deadline - publish_margin`), set during a release and cleared afterwards.
+    pub(in crate::driver::can_servo) tx_release_deadline: Option<Instant>,
+    /// Optional absolute driver-clock authority ceiling (`min(lease_expiry, request_deadline)`)
+    /// checked immediately before transmitting every `CMD_ENABLE` frame.
+    pub(in crate::driver::can_servo) enable_tx_deadline: Option<Instant>,
+    /// Optional admitted client lease generation checked against the atomic lease fence
+    /// immediately before transmitting every `CMD_ENABLE` frame.
+    pub(in crate::driver::can_servo) enable_lease_gen: Option<u64>,
+    /// True once at least one `CMD_ENABLE` frame has been transmitted in the current enable attempt.
+    pub(in crate::driver::can_servo) enable_frames_sent_any: bool,
+    /// Active/confirmed CAN transmit probe recorded for clearing `CAN_TX_STALLED` (zero alloc).
+    pub(in crate::driver::can_servo) tx_probe: Option<TxProbeState>,
+    /// Attempt-scoped J7 position-force freshness status observed in the most recent bounded TX pass.
+    pub(in crate::driver::can_servo) last_tx_pf_status: PosForceTxStatus,
+    /// Monotonic generation incremented each time a provably fresh (`<= 100 ms`, bounded, finite)
+    /// J7 position-force feedback sample is decoded. Binds owner-side staleness episodes to the
+    /// actual feedback sample so a fresh RX sample between two stale output passes never carries
+    /// over an older stale timer.
+    pub(in crate::driver::can_servo) pf_fresh_gen: u64,
+    /// True when the active `PosForce` joint needs a read-only `0xCC` refresh.
+    pub(in crate::driver::can_servo) pf_refresh_pending: bool,
+    /// Consecutive ticks in which a needed J7 `0xCC` refresh was deferred by TX budget/backpressure;
+    /// when `>= 1`, the next tick prioritizes J7's `0xCC` ahead of competing frames so refresh never starves.
+    pub(in crate::driver::can_servo) pf_refresh_deferred_ticks: u8,
+    /// True when an output pass ran since the previous `receive_feedback()` pass.
+    pub(in crate::driver::can_servo) output_ran_since_rx: bool,
+    /// True when the most recent bounded output pass was a stopped hold (`write_estop_hold_bounded`),
+    /// so `receive_feedback()` yields the shared TX budget to due J1–J6 stopped holds instead of
+    /// preempting them with a J7 `0xCC` refresh.
+    pub(in crate::driver::can_servo) last_output_was_hold: bool,
+    /// Bitmask of `(joint, slot)` stopped-hold frames (`1u64 << (joint * 2 + slot)`) that were
+    /// due in the most recent `write_estop_hold_bounded` pass (`0` when nothing was due or
+    /// stop-inhibited).
+    pub(in crate::driver::can_servo) last_hold_tx_due_mask: u64,
+    /// Bitmask of `(joint, slot)` stopped-hold frames (`1u64 << (joint * 2 + slot)`) that
+    /// actually reached the transport (transmitted and flushed) in the most recent
+    /// `write_estop_hold_bounded` pass.
+    pub(in crate::driver::can_servo) last_hold_tx_sent_mask: u64,
+    /// When `true` (installed by `SupervisorInner` on both Legacy and RT Executor), control-tick
+    /// arm write paths and `receive_feedback` NEVER write `0x307` frames; `SupervisorInner`'s
+    /// tick epilogue calls [`ArmDriver::emit_pos_force_j7`] once per tick.
+    pub(in crate::driver::can_servo) external_pos_force_emitter: bool,
+    /// Consecutive ticks in which the J7 `PosForce` emitter was deferred by TX budget or
+    /// backpressure; when `>= 1`, arm writes reserve a TX budget slot for J7 so J7 never starves
+    /// under tight per-tick frame budgets (e.g. 6 frames for 7 motors).
+    pub(in crate::driver::can_servo) pf_deferred_ticks: u8,
+    /// True when J7's motion target was deferred and awaits transmission on the next tick.
+    pub(in crate::driver::can_servo) pf_deferred_motion: bool,
+    /// Driver-clock timestamp when J7's current deferral streak began (used for `oldest_pending_tx_age`
+    /// only while J7 feedback is fresh; stale J7 never counts as FIFO-expired).
+    pub(in crate::driver::can_servo) pf_deferred_since: Option<Instant>,
+    /// Last deferred J7 intent (used by direct-driver `drain_pending_tx`).
+    pub(in crate::driver::can_servo) pf_deferred_intent: Option<PosForceIntent>,
+    /// Per-`(joint, slot)` unchanged-hold state (`true` once a stop/hold/freeze frame has been
+    /// flushed for that slot and no motion frame has superseded it; `false` after enable or any
+    /// flushed motion frame). Drives TX Class 1 (motion/non-hold -> stop / hold / freeze) vs
+    /// Class 3 (re-send of an unchanged hold) across ALL joints including J7.
+    pub(in crate::driver::can_servo) slot_in_unchanged_hold: [bool; MAX_MODE_JOINTS * 2],
+    /// Monotonic counter incremented on every flushed joint TX frame (J1–J6 slots and J7).
+    pub(in crate::driver::can_servo) tx_progress_seq: u64,
+    /// Per-`(joint, slot)` sequence number of the last flushed TX frame (`joint * 2 + slot`;
+    /// smallest = waited longest = oldest pending first round-robin within each priority class
+    /// across J1–J6 POS_VEL/MIT slots and J7).
+    pub(in crate::driver::can_servo) slot_last_tx_seq: [u64; MAX_MODE_JOINTS * 2],
+    /// Hint set by `SupervisorInner` before arm output indicating whether this tick's upcoming
+    /// J7 intent is `Hold`/`Stop` (rather than a `Target`). Cleared after `pos_force_emitter::emit_tick`.
+    pub(in crate::driver::can_servo) pf_next_intent_is_hold: bool,
+    /// Latched while `pf_last_fresh_position == None` under `NoOutputUntilFresh`: forces the
+    /// first `0x307` emission after the first provably fresh J7 sample arrives to be a stationary
+    /// `Hold` at that measured position (`vel_raw = 0`, configured `current_raw`).
+    pub(in crate::driver::can_servo) pf_hold_on_first_fresh: bool,
+    /// Inline fixed-capacity shadow observation staging (zero alloc, zero lock).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::driver::can_servo) shadow_staging: crate::torque::shadow::ShadowDriverStaging,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::driver::can_servo) defer_disable_shadow: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::driver::can_servo) shadow_disable_pass_sent_mask: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::driver::can_servo) pending_disable_shadow: Option<PendingDisableShadowBatch>,
+    /// Bitmask of joints (`1u32 << idx`) that have received a `CMD_ENABLE` frame (or reported
+    /// `state == 1`) and have not subsequently received `CMD_DISABLE` or causal post-enable
+    /// `state == 0` confirmation. Used to guarantee Damiao `TIMEOUT` watchdog hold continuity
+    /// (`<= 40 ms` between control frames) across multi-tick handshakes and blocking loops.
+    pub(in crate::driver::can_servo) motor_energized_mask: u32,
+    /// Driver-clock timestamp of the most recent watchdog-refreshing control frame (`POS_VEL`,
+    /// `MIT`, `POS_FORCE`) or `CMD_ENABLE` successfully transmitted to joint `idx`.
+    pub(in crate::driver::can_servo) motor_last_ctrl_tx: [Option<Instant>; MAX_MODE_JOINTS],
+    /// Last finite measured position observed for joint `idx` (never cleared by transient
+    /// staleness) so energized non-`PosForce` arm joints always have a stationary hold target.
+    pub(in crate::driver::can_servo) motor_keepalive_hold_pos: [Option<f32>; MAX_MODE_JOINTS],
+    /// Bitmask of joints (`1u32 << idx`) that already received a confirmed watchdog-refreshing
+    /// control frame (`POS_VEL`, `MIT`, `POS_FORCE`, or initial `CMD_ENABLE`) during the current
+    /// control release (`control_release_id`). Prevents duplicate control/hold frames per release.
+    pub(in crate::driver::can_servo) release_ctrl_tx_mask: u32,
+    /// Staged watchdog-refreshing control TX timestamps awaiting confirmed `can.flush()` on
+    /// real-flush (`!flush_is_noop()`) transports. Committed atomically on flush success and
+    /// discarded on any pre-flush error, cutoff, stop, or flush failure.
+    pub(in crate::driver::can_servo) staged_ctrl_tx: [Option<Instant>; MAX_MODE_JOINTS],
+    /// Bitmask of joints (`1u32 << idx`) present in `staged_ctrl_tx`.
+    pub(in crate::driver::can_servo) staged_ctrl_tx_mask: u32,
+    /// True from `begin_control_release` through Window 1 Step 5 while a subsequent normal/hold
+    /// output step in THIS release still owns watchdog servicing. Cleared on Window 2 wakes,
+    /// end-of-release fallback, and release-cap teardown so off-tick and Window 2 confirmations
+    /// never skip inline watchdog holds.
+    pub(in crate::driver::can_servo) output_step_pending_in_release: bool,
+    /// `control_release_id` for which the current per-release TX pass (`tick_tx`,
+    /// `refresh_scheduler`, `release_ctrl_tx_mask`, `release_recovery_tx_count`) was opened.
+    pub(in crate::driver::can_servo) release_tx_pass_release_id: u64,
+    /// Autonomous stale-feedback recovery TX frames emitted during the current control release.
+    pub(in crate::driver::can_servo) release_recovery_tx_count: u8,
+    /// Round-robin cursor across joints for bounded per-release autonomous recovery TX.
+    pub(in crate::driver::can_servo) recovery_cursor: usize,
+    /// Diagnostic tag distinguishing urgent watchdog continuity holds (`TxFrameKind::UrgentHold`)
+    /// from normal stopped / SAFE-HOLD / FailedHold holds (`TxFrameKind::Hold`).
+    pub(in crate::driver::can_servo) in_urgent_watchdog_hold: bool,
+}
