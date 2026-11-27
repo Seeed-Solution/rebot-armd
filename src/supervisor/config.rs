@@ -176,7 +176,7 @@ impl SupervisorInner {
         if joint == 5 { self.zero_convention = Default::default(); }
         self.zero_check_pending = true;
         match self.driver.as_mut() {
-            Some(d) => d.with_mut(|drv| drv.set_zero_position(joint)).ok_or_else(|| "driver unavailable".to_string())?.map_err(|e| e.to_string()),
+            Some(d) => d.with_mut(|drv| drv.commissioning_mut().set_zero_position(joint)).ok_or_else(|| "driver unavailable".to_string())?.map_err(|e| e.to_string()),
             None => {
                 // the simulated motor reads 0: the joint reads 0 - its joint zero offset
                 let r = -self.joint_zero_offsets.get(joint).copied().unwrap_or(0.0);

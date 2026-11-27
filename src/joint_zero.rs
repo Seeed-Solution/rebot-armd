@@ -676,25 +676,25 @@ impl crate::driver::ModeSwitchExt for ZeroOffsetDriver {
 }
 
 impl crate::driver::CommissioningExt for ZeroOffsetDriver {
-    fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.set_zero_position(joint) }
-    fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
+    fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.commissioning_mut().set_zero_position(joint) }
+    fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.commissioning_mut().read_motor_identity(joints) }
     fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
-        self.inner.commission_motor_timeout(joints, counts)
+        self.inner.commissioning_mut().commission_motor_timeout(joints, counts)
     }
     fn supports_nonblocking_commissioning(&self) -> bool {
-        self.inner.supports_nonblocking_commissioning()
+        self.inner.commissioning().supports_nonblocking_commissioning()
     }
     fn supports_nonblocking_motor_zero(&self) -> bool {
-        self.inner.supports_nonblocking_motor_zero()
+        self.inner.commissioning().supports_nonblocking_motor_zero()
     }
     fn commissioning_motor_id(&self, joint: usize) -> Option<u16> {
-        self.inner.commissioning_motor_id(joint)
+        self.inner.commissioning().commissioning_motor_id(joint)
     }
     fn commissioning_drain_rx_step(&mut self, max_frames: u16, deadline: Instant) -> Result<(u16, bool), ArmDriverError> {
-        self.inner.commissioning_drain_rx_step(max_frames, deadline)
+        self.inner.commissioning_mut().commissioning_drain_rx_step(max_frames, deadline)
     }
     fn commissioning_clear_register_log(&mut self) {
-        self.inner.commissioning_clear_register_log();
+        self.inner.commissioning_mut().commissioning_clear_register_log();
     }
     fn commissioning_try_send_register_read(
         &mut self,
@@ -703,7 +703,7 @@ impl crate::driver::CommissioningExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::mit::CommissioningTxStatus {
-        self.inner.commissioning_try_send_register_read(joint, rid, deadline, pre_tx_gate)
+        self.inner.commissioning_mut().commissioning_try_send_register_read(joint, rid, deadline, pre_tx_gate)
     }
     fn commissioning_try_send_rest_probe(
         &mut self,
@@ -711,7 +711,7 @@ impl crate::driver::CommissioningExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::mit::CommissioningTxStatus {
-        self.inner.commissioning_try_send_rest_probe(joint, deadline, pre_tx_gate)
+        self.inner.commissioning_mut().commissioning_try_send_rest_probe(joint, deadline, pre_tx_gate)
     }
     fn commissioning_try_send_timeout_write(
         &mut self,
@@ -720,7 +720,7 @@ impl crate::driver::CommissioningExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::mit::CommissioningTxStatus {
-        self.inner.commissioning_try_send_timeout_write(joint, counts, deadline, pre_tx_gate)
+        self.inner.commissioning_mut().commissioning_try_send_timeout_write(joint, counts, deadline, pre_tx_gate)
     }
     fn commissioning_find_register_reply(
         &self,
@@ -732,7 +732,7 @@ impl crate::driver::CommissioningExt for ZeroOffsetDriver {
         max_rx_at: Option<Instant>,
         tx_offset_ns: Option<i128>,
     ) -> crate::mit::CommissioningRegMatch {
-        self.inner.commissioning_find_register_reply(
+        self.inner.commissioning().commissioning_find_register_reply(
             joint,
             write,
             rid,
@@ -748,7 +748,7 @@ impl crate::driver::CommissioningExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::mit::CommissioningDisableStep {
-        self.inner.commissioning_disable_step(started_at, deadline, pre_tx_gate)
+        self.inner.commissioning_mut().commissioning_disable_step(started_at, deadline, pre_tx_gate)
     }
     fn commissioning_try_send_set_zero(
         &mut self,
@@ -756,10 +756,10 @@ impl crate::driver::CommissioningExt for ZeroOffsetDriver {
         deadline: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> crate::mit::CommissioningTxStatus {
-        self.inner.commissioning_try_send_set_zero(joint, deadline, pre_tx_gate)
+        self.inner.commissioning_mut().commissioning_try_send_set_zero(joint, deadline, pre_tx_gate)
     }
     fn commissioning_raw_feedback(&self, joint: usize) -> Option<crate::mit::CommissioningFeedback> {
-        let mut fb = self.inner.commissioning_raw_feedback(joint)?;
+        let mut fb = self.inner.commissioning().commissioning_raw_feedback(joint)?;
         let o = self.off(joint);
         if o != 0.0 {
             fb.joint_position = fb.raw_position - o;

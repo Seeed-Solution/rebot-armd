@@ -1596,10 +1596,10 @@ pub mod switch {
         fn rx_drained(&self) -> bool { self.drv.mode_switch().mode_switch_rx_drained() }
         fn drain_rx_step(&mut self, max_frames: u16, deadline: Instant) -> Result<(u16, bool), ModeSwitchFailure> {
             self.drv
-                .commissioning_drain_rx_step(max_frames, deadline)
+                .commissioning_mut().commissioning_drain_rx_step(max_frames, deadline)
                 .map_err(|_| ModeSwitchFailure::TxFailed)
         }
-        fn clear_register_reply_log(&mut self) { self.drv.commissioning_clear_register_log(); }
+        fn clear_register_reply_log(&mut self) { self.drv.commissioning_mut().commissioning_clear_register_log(); }
         fn service_watchdog_holds(
             &mut self,
             min_age: Duration,

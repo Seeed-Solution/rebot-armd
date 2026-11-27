@@ -423,13 +423,13 @@ impl crate::supervisor::SupervisorInner {
         let d = self.driver.as_mut().expect("checked above");
         let res = d.with_mut(|driver| {
             if cmd.dry_run {
-                let rb = driver.read_motor_identity(&cmd.joints);
+                let rb = driver.commissioning_mut().read_motor_identity(&cmd.joints);
                 #[cfg(not(target_arch = "wasm32"))]
                 shadow_rt.drain_from_driver(driver);
                 let rb = rb.map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))?;
                 return Ok(json!({"dry_run": true, "readback": rb, "timeout_unit": unit}));
             }
-            let res = driver.commission_motor_timeout(&cmd.joints, cmd.timeout_counts);
+            let res = driver.commissioning_mut().commission_motor_timeout(&cmd.joints, cmd.timeout_counts);
             #[cfg(not(target_arch = "wasm32"))]
             shadow_rt.drain_from_driver(driver);
             let res = res.map_err(|e| {
@@ -471,7 +471,7 @@ impl crate::supervisor::SupervisorInner {
         let rb = {
             let d = self.driver.as_mut().expect("checked above");
             d.with_mut(|driver| {
-                driver.read_motor_identity(&joints).map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))
+                driver.commissioning_mut().read_motor_identity(&joints).map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))
             })
             .ok_or_else(|| CalibError::new(500, "DRIVER", "driver lock poisoned"))??
         };
@@ -497,7 +497,7 @@ impl crate::supervisor::SupervisorInner {
         let Some(slot) = self.driver.as_mut() else { return Err("MIT needs a motor driver".into()) };
         let (supports, rb_res) = slot
             .with_mut(|driver| {
-                (driver.supports_mit_mode_switch(), driver.read_motor_identity(&joints))
+                (driver.supports_mit_mode_switch(), driver.commissioning_mut().read_motor_identity(&joints))
             })
             .ok_or_else(|| "driver lock poisoned".to_string())?;
         let rb = rb_res.map_err(|e| format!("register readback failed: {e}"))?;
@@ -4073,12 +4073,12 @@ impl crate::supervisor::SupervisorInner {
             CommissioningOpKind::ReadIdentity
             | CommissioningOpKind::ReadIdentityForEnable
             | CommissioningOpKind::WriteTimeout => {
-                if !drv.supports_nonblocking_commissioning() {
+                if !drv.commissioning().supports_nonblocking_commissioning() {
                     return Err((400, "UNSUPPORTED", "this driver does not support non-blocking register commissioning"));
                 }
             }
             CommissioningOpKind::MotorZeroDisable | CommissioningOpKind::MotorZeroWriteVerify => {
-                if !drv.supports_nonblocking_motor_zero() {
+                if !drv.commissioning().supports_nonblocking_motor_zero() {
                     return Err((400, "UNSUPPORTED", "this driver does not support non-blocking motor zero"));
                 }
             }
@@ -4106,7 +4106,7 @@ impl crate::supervisor::SupervisorInner {
                     (409, "MIT_TIMEOUT_ARMED", "arm must be stationary for TIMEOUT commissioning")
                 });
             }
-            if let Some(fb) = drv.commissioning_raw_feedback(j) {
+            if let Some(fb) = drv.commissioning().commissioning_raw_feedback(j) {
                 let age = drv_now.saturating_duration_since(fb.rx_at);
                 if age <= crate::driver::ZERO_FEEDBACK_MAX_AGE
                     && (!fb.velocity.is_finite() || fb.velocity.abs() > vlim)
@@ -4130,7 +4130,7 @@ impl crate::supervisor::SupervisorInner {
         if drv.capabilities().enable_feedback {
             // Any fresh non-zero motor_status is an immediate hard refusal (even when gathering).
             for j in 0..dof {
-                if let Some(fb) = drv.commissioning_raw_feedback(j) {
+                if let Some(fb) = drv.commissioning().commissioning_raw_feedback(j) {
                     let age = drv_now.saturating_duration_since(fb.rx_at);
                     if age <= crate::driver::ZERO_FEEDBACK_MAX_AGE && fb.motor_status != 0 {
                         return Err(if is_zero {
@@ -4151,7 +4151,7 @@ impl crate::supervisor::SupervisorInner {
         }
         if !can_gather {
             for &j in joints {
-                let Some(fb) = drv.commissioning_raw_feedback(j) else {
+                let Some(fb) = drv.commissioning().commissioning_raw_feedback(j) else {
                     return Err(if is_zero {
                         (409, "MOTOR_ZERO_NO_FEEDBACK", "the motor feedback is not fresh; check the bus and the motor power")
                     } else {
@@ -4243,7 +4243,7 @@ impl crate::supervisor::SupervisorInner {
                 continue;
             }
             arm_count += 1;
-            let Some(fb) = drv.commissioning_raw_feedback(i) else {
+            let Some(fb) = drv.commissioning().commissioning_raw_feedback(i) else {
                 return Err((
                     409,
                     "ARM_NOT_AT_RESTING_POSE",
@@ -5191,7 +5191,7 @@ impl crate::supervisor::SupervisorInner {
         backpressured: &mut bool,
         owner_now_fn: &mut dyn FnMut() -> std::time::Instant,
     ) -> Result<Option<CommissioningIdentity>, (u16, &'static str, crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>)> {
-        let Some(motor_id) = drv.commissioning_motor_id(joint) else {
+        let Some(motor_id) = drv.commissioning().commissioning_motor_id(joint) else {
             return Err((
                 502,
                 "MIT_TIMEOUT_READ",
@@ -5226,13 +5226,13 @@ impl crate::supervisor::SupervisorInner {
                     if *remaining_rx == 0 {
                         return Ok(None);
                     }
-                    match drv.commissioning_drain_rx_step(*remaining_rx, drv_cutoff) {
+                    match drv.commissioning_mut().commissioning_drain_rx_step(*remaining_rx, drv_cutoff) {
                         Ok((frames, drained)) => {
                             *remaining_rx = remaining_rx.saturating_sub(frames);
                             if !drained {
                                 return Ok(None);
                             }
-                            drv.commissioning_clear_register_log();
+                            drv.commissioning_mut().commissioning_clear_register_log();
                             self.commissioning.req_attempts = 0;
                             self.commissioning.reg_phase = RegReadPhase::SendReq;
                         }
@@ -5256,7 +5256,7 @@ impl crate::supervisor::SupervisorInner {
                     };
                     *tx_budget_left = tx_budget_left.saturating_sub(1);
                     *reg_tx_attempted = reg_tx_attempted.saturating_add(1);
-                    match drv.commissioning_try_send_register_read(joint, rid, drv_cutoff, &mut gate) {
+                    match drv.commissioning_mut().commissioning_try_send_register_read(joint, rid, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
                             tx_seq,
                             tx_started,
@@ -5311,7 +5311,7 @@ impl crate::supervisor::SupervisorInner {
                     let req_deadline = self.commissioning.req_deadline;
                     let mut drained = false;
                     if *remaining_rx > 0 && drv.clock_now() < drv_cutoff {
-                        match drv.commissioning_drain_rx_step(*remaining_rx, drv_cutoff) {
+                        match drv.commissioning_mut().commissioning_drain_rx_step(*remaining_rx, drv_cutoff) {
                             Ok((frames, d)) => {
                                 *remaining_rx = remaining_rx.saturating_sub(frames);
                                 drained = d;
@@ -5333,7 +5333,7 @@ impl crate::supervisor::SupervisorInner {
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
                     let reply_expired = req_deadline.is_some_and(|dl| drv.clock_now() >= dl);
-                    let match_res = drv.commissioning_find_register_reply(
+                    let match_res = drv.commissioning().commissioning_find_register_reply(
                         joint,
                         false,
                         rid,
@@ -5467,7 +5467,7 @@ impl crate::supervisor::SupervisorInner {
             }
             let idx = self.commissioning.joint_idx;
             let joint = self.commissioning.joints[idx];
-            let Some(motor_id) = drv.commissioning_motor_id(joint) else {
+            let Some(motor_id) = drv.commissioning().commissioning_motor_id(joint) else {
                 return Err((
                     502,
                     "MIT_TIMEOUT_FAILED",
@@ -5497,7 +5497,7 @@ impl crate::supervisor::SupervisorInner {
                     // transmitting read-only 0xCC probes.
                     let mut drained_now = false;
                     if remaining_rx > 0 && drv.clock_now() < drv_cutoff {
-                        match drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
+                        match drv.commissioning_mut().commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
                             Ok((frames, drained)) => {
                                 remaining_rx = remaining_rx.saturating_sub(frames);
                                 drained_now = drained;
@@ -5558,7 +5558,7 @@ impl crate::supervisor::SupervisorInner {
                         }
                         if let Some(tx_at) = self.commissioning.rest_probe_tx_at[i] {
                             let tx_seq = self.commissioning.rest_probe_tx_seq[i];
-                            let causal_reply = drv.commissioning_raw_feedback(i).is_some_and(|fb| {
+                            let causal_reply = drv.commissioning().commissioning_raw_feedback(i).is_some_and(|fb| {
                                 fb.rx_seq > tx_seq
                                     && fb.rx_at >= tx_at
                                     && fb.queue_bound.is_some()
@@ -5606,7 +5606,7 @@ impl crate::supervisor::SupervisorInner {
                         let mut mask = arm_mask;
                         if let Some(gi) = gripper_idx {
                             if gi < dof && enable_fb {
-                                let stale = drv.commissioning_raw_feedback(gi).is_none_or(|fb| {
+                                let stale = drv.commissioning().commissioning_raw_feedback(gi).is_none_or(|fb| {
                                     drv_now.saturating_duration_since(fb.rx_at)
                                         > crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE
                                 });
@@ -5639,7 +5639,7 @@ impl crate::supervisor::SupervisorInner {
                                 owner_now_fn(),
                             )
                         };
-                        match drv.commissioning_try_send_rest_probe(i, probe_dl, &mut gate) {
+                        match drv.commissioning_mut().commissioning_try_send_rest_probe(i, probe_dl, &mut gate) {
                             CommissioningTxStatus::Sent {
                                 tx_seq,
                                 tx_started,
@@ -5753,13 +5753,13 @@ impl crate::supervisor::SupervisorInner {
                     if remaining_rx == 0 {
                         return Ok(());
                     }
-                    match drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
+                    match drv.commissioning_mut().commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
                         Ok((frames, drained)) => {
                             remaining_rx = remaining_rx.saturating_sub(frames);
                             if !drained {
                                 return Ok(());
                             }
-                            drv.commissioning_clear_register_log();
+                            drv.commissioning_mut().commissioning_clear_register_log();
                             self.commissioning.write_phase = WriteTimeoutPhase::SendWrite;
                         }
                         Err(_) => {
@@ -5806,7 +5806,7 @@ impl crate::supervisor::SupervisorInner {
                     };
                     tx_budget = tx_budget.saturating_sub(1);
                     *reg_tx_attempted = reg_tx_attempted.saturating_add(1);
-                    match drv.commissioning_try_send_timeout_write(joint, counts, drv_cutoff, &mut gate) {
+                    match drv.commissioning_mut().commissioning_try_send_timeout_write(joint, counts, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
                             tx_seq,
                             tx_started,
@@ -5873,7 +5873,7 @@ impl crate::supervisor::SupervisorInner {
                     let req_deadline = self.commissioning.req_deadline;
                     let mut drained = false;
                     if remaining_rx > 0 && drv.clock_now() < drv_cutoff {
-                        match drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
+                        match drv.commissioning_mut().commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
                             Ok((frames, d)) => {
                                 remaining_rx = remaining_rx.saturating_sub(frames);
                                 drained = d;
@@ -5896,7 +5896,7 @@ impl crate::supervisor::SupervisorInner {
                         return Err((status, code, crate::safety::BoundedText::new(msg)));
                     }
                     let reply_expired = req_deadline.is_some_and(|dl| drv.clock_now() >= dl);
-                    let match_res = drv.commissioning_find_register_reply(
+                    let match_res = drv.commissioning().commissioning_find_register_reply(
                         joint,
                         true,
                         damiao::RID_TIMEOUT,
@@ -6062,7 +6062,7 @@ impl crate::supervisor::SupervisorInner {
                         owner_now_fn(),
                     )
                 };
-                match drv.commissioning_disable_step(started_at, drv_cutoff, &mut gate) {
+                match drv.commissioning_mut().commissioning_disable_step(started_at, drv_cutoff, &mut gate) {
                     CommissioningDisableStep::AllDispatched {
                         boundary_seq,
                         tx_started,
@@ -6098,7 +6098,7 @@ impl crate::supervisor::SupervisorInner {
         // Confirm ALL motors (matching DamiaoArmDriver::enable_state() == Disabled) have fresh
         // post-command disabled feedback before allowing any motor-zero write.
         if remaining_rx > 0 && drv.clock_now() < drv_cutoff {
-            if let Ok((frames, _)) = drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
+            if let Ok((frames, _)) = drv.commissioning_mut().commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
                 remaining_rx = remaining_rx.saturating_sub(frames);
             }
         }
@@ -6109,7 +6109,7 @@ impl crate::supervisor::SupervisorInner {
         let mut all_disabled = drv.enable_state() == crate::model::EnableState::Disabled;
         if all_disabled {
             for j in 0..dof {
-                let ok = drv.commissioning_raw_feedback(j).is_some_and(|fb| {
+                let ok = drv.commissioning().commissioning_raw_feedback(j).is_some_and(|fb| {
                     fb.rx_seq > boundary_seq
                         && fb.rx_at >= tx_started
                         && fb.queue_bound.is_some()
@@ -6180,7 +6180,7 @@ impl crate::supervisor::SupervisorInner {
                         )
                     };
                     *reg_tx_attempted = reg_tx_attempted.saturating_add(1);
-                    match drv.commissioning_try_send_set_zero(joint, drv_cutoff, &mut gate) {
+                    match drv.commissioning_mut().commissioning_try_send_set_zero(joint, drv_cutoff, &mut gate) {
                         CommissioningTxStatus::Sent {
                             tx_seq,
                             tx_started,
@@ -6259,7 +6259,7 @@ impl crate::supervisor::SupervisorInner {
             return Ok(());
         }
         if remaining_rx > 0 && drv.clock_now() < drv_cutoff {
-            if let Ok((frames, _)) = drv.commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
+            if let Ok((frames, _)) = drv.commissioning_mut().commissioning_drain_rx_step(remaining_rx, drv_cutoff) {
                 remaining_rx = remaining_rx.saturating_sub(frames);
             }
         }
@@ -6276,7 +6276,7 @@ impl crate::supervisor::SupervisorInner {
                 all_verified = false;
                 continue;
             };
-            if let Some(fb) = drv.commissioning_raw_feedback(joint) {
+            if let Some(fb) = drv.commissioning().commissioning_raw_feedback(joint) {
                 let fresh = fb.rx_seq > boundary_seq
                     && fb.rx_at >= tx_started
                     && fb.queue_bound.is_some();
