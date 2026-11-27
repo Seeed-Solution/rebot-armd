@@ -1078,6 +1078,8 @@ body.ui-expert .ops .ex-presets .gc-sw { grid-column: 1 / -1; min-height: 44px; 
   body.ui-expert #safety .btn-stop small, body.ui-expert #safety .btn-estop small { display: none; }
   body.ui-expert #safety .btn-stop svg, body.ui-expert #safety .btn-estop svg { width: 18px; height: 18px; }
   body.ui-expert #safety .ex-sline { display: none; }
+  body.ui-expert #safety > #lease-status:not(.is-lost) { display: none; }
+  body.ui-expert #safety > #lease-status.is-lost { margin-top: 2px; font-size: 11.5px; padding: 3px 7px; }
   body.ui-expert:not(.offline):not(.stopped) #safety .lock-note { display: none; }
 
   body.ui-expert .stage { order: 1; flex: none; padding: 6px 8px 0; gap: 6px; }

@@ -694,8 +694,7 @@ function exPlaceDom() {
       const el = $(id);
       if (el && el.parentElement !== objHost) objHost.appendChild(el);
     }
-    // Unified safety status line
-    if (ls && ls.parentElement !== sline) sline.insertBefore(ls, $('ex-link'));
+    // Unified safety status line (#lease-status stays in #safety on phone so lost-connection + #btn-reconnect-now stay reachable)
     if (pwr && pwr.parentElement !== sline) sline.appendChild(pwr);
     // Diagnostics cards inside diagnostics drawer tabs
     const teleHost = $('ex-diag-tele'), recHost = $('ex-diag-rec'), kbdHost = $('ex-diag-kbd');
@@ -706,6 +705,7 @@ function exPlaceDom() {
 
     if (phone) {
       // Layout B-style phone portrait: motion inside Move tab, model picker inside Vision tab
+      if (ls && ls.parentElement !== safety) safety.insertBefore(ls, sline);
       if (ops && ops.parentElement !== $('ex-ppane-move')) $('ex-ppane-move').appendChild(ops);
       if (vpop && vpop.parentElement !== $('ex-ppane-vision')) $('ex-ppane-vision').appendChild(vpop);
       if (vpop) vpop.hidden = false;
@@ -715,6 +715,7 @@ function exPlaceDom() {
       $('ex-model-chip')?.setAttribute('aria-expanded', String(EX.ptab === 'vision'));
     } else {
       // Layout A tablet/desktop: motion card in right rail, model picker popover in video card
+      if (ls && ls.parentElement !== sline) sline.insertBefore(ls, $('ex-link'));
       if (ops && ops.parentElement !== side) side.appendChild(ops);
       if (vpop && vpop.parentElement !== vcard) vcard.appendChild(vpop);
       if (vpop) vpop.hidden = !EX.popOpen;
@@ -1144,7 +1145,7 @@ function renderExpertLive(live, dets, detAge) {
   if (lk) setText(lk, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : t('no_telemetry'));
   const ph = $('ex-ph-status');
   if (ph && S.connLost) {
-    // Phone expert: #lease-status sits in the hidden status line, so the header badge carries the warning.
+    // Phone expert: topbar badge mirrors the lost-connection warning while #lease-status.is-lost exposes #btn-reconnect-now.
     const retryS = reconnectInS();
     setCls(ph, 'sc-status-badge only-expert is-danger');
     setText(ph, retryS != null ? t('lease.t.lost') + ' · ' + t('lease.retry_in', { s: retryS }) : t('lease.conn_lost'));
