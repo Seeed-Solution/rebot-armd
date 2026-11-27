@@ -121,8 +121,16 @@ pub enum RefusalDetail {
         capsule_len: u8,
         /// Bounded UTF-8 capsule identifier when `geom_kind == 255`.
         capsule_id: [u8; 32],
-        /// Finite intrusion depth (m) encoded via `f32::to_bits` so formatting happens once off-RT.
-        depth_bits: u32,
+        /// Finite intrusion depth (m) encoded via `f64::to_bits` so formatting matches legacy bit-for-bit.
+        depth_bits: u64,
+        /// Previous intrusion depth (m) encoded via `f64::to_bits`.
+        prev_depth_bits: u64,
+        /// Measured coordinate (m) encoded via `f64::to_bits`.
+        value_bits: u64,
+        /// Box boundary limit (m) encoded via `f64::to_bits`.
+        bound_bits: u64,
+        /// True when the start pose is already outside the workspace (suggest Park, not Home).
+        start_outside: bool,
     },
 }
 

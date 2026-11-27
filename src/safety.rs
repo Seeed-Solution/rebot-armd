@@ -398,22 +398,8 @@ pub enum SafetyError {
     StampAlreadyConsumed,
 }
 
-fn format_workspace_violation(
-    point: usize,
-    limit: &str,
-    value: f32,
-    bound: f32,
-    detail: &crate::kinematics::WorkspaceViolationDetail,
-) -> String {
-    if let (Some(cid), Some(reason)) = (detail.constraint_id.as_deref(), detail.reason.as_deref()) {
-        if matches!(
-            cid,
-            "box_min_x" | "box_max_x" | "box_min_y" | "box_max_y" | "box_min_z" | "box_max_z"
-        ) {
-            return reason.to_string();
-        }
-    }
-    format!("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")
+fn format_workspace_violation(point: usize, limit: &str, value: f32, bound: f32, detail: &crate::kinematics::WorkspaceViolationDetail) -> String {
+    crate::chain::WorkspaceFailure::format_error_message(None, point, limit, f64::from(value), f64::from(bound), detail)
 }
 
 impl SafetyError {
@@ -1108,14 +1094,13 @@ impl std::fmt::Display for WorkspaceSupportViolation {
         match self {
             Self::EvalFailed { limit, reason } =>
                 write!(f, "measured pose workspace evaluation failed ({limit}): {reason}"),
-            Self::Constraint { limit, point, cid, gid, depth, value, bound } => {
-                write!(f, "measured pose violates workspace constraint '{limit}' (point {point} [{gid}]: ")?;
-                if !depth.is_finite() {
-                    write!(f, "invalid workspace check for {cid} ({gid})")?;
-                } else {
-                    write!(f, "new intrusion into {cid} by {depth:.3}m (geometry {gid})")?;
-                }
-                write!(f, ", value {value:.4} m vs bound {bound:.4} m)")
+            Self::Constraint { limit, point: _, cid, gid, depth, value, bound } => {
+                f.write_str("measured pose violates workspace: ")?;
+                crate::chain::WorkspaceFailure::write_witness(f, crate::chain::WorkspaceWitness::Constraint {
+                    cid: cid.as_str(), gid: gid.as_str(), limit: limit.as_str(),
+                    value: *value, bound: *bound, prev_depth: 0.0, depth: *depth, start_outside: true,
+                });
+                Ok(())
             }
         }
     }

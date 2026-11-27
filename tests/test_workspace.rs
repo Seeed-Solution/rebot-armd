@@ -1687,7 +1687,7 @@ fn workspace_box_escape_tolerance_stretched_pose_all_paths() {
         assert!(detail.geometry_id.as_deref().is_some());
         let msg = se.to_string();
         assert!(
-            msg.contains("beyond the workspace front edge (box_max_x); move back or press Home"),
+            msg.contains("beyond the workspace front edge (box_max_x ") && msg.ends_with("; move back or press Park"),
             "unexpected jog error message: {msg}"
         );
         assert_eq!(detail.reason.as_deref(), Some(msg.as_str()));
@@ -1726,7 +1726,11 @@ fn workspace_box_escape_tolerance_stretched_pose_all_paths() {
             panic!("expected WorkspaceViolation on servo, got {err:?}");
         };
         assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
-        assert!(err.to_string().contains("beyond the workspace front edge (box_max_x); move back or press Home"));
+        assert!(
+            err.to_string().contains("beyond the workspace front edge (box_max_x ")
+                && err.to_string().ends_with("; move back or press Park"),
+            "unexpected servo error: {err}"
+        );
     }
     {
         let mut inner = armed(cfg.clone(), &q_start);
@@ -1760,7 +1764,11 @@ fn workspace_box_escape_tolerance_stretched_pose_all_paths() {
             panic!("expected MotionError::WorkspaceViolation, got {err:?}");
         };
         assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
-        assert!(err.to_string().contains("beyond the workspace front edge (box_max_x); move back or press Home"));
+        assert!(
+            err.to_string().contains("beyond the workspace front edge (box_max_x ")
+                && err.to_string().ends_with("; move back or press Park"),
+            "unexpected servo error: {err}"
+        );
 
         // Retreat -2cm (-x) -> allowed
         let (goal_back, _) = resolve_goal_opts(
@@ -1875,40 +1883,42 @@ fn workspace_escape_tolerance_does_not_loosen_floor_or_keepout() {
 
 #[test]
 fn workspace_box_edge_messages_all_six_faces_and_geometries() {
+    use armd::chain::{WorkspaceFailure, WorkspaceWitness};
     let cases = [
-        ("box_max_x", "end_point:5", 0.010, "gripper is 1.0 cm beyond the workspace front edge (box_max_x); move back or press Home"),
-        ("box_min_x", "end_origin", 0.015, "gripper is 1.5 cm beyond the workspace back edge (box_min_x); move forward or press Home"),
-        ("box_max_y", "end_point:2", 0.024, "gripper is 2.4 cm beyond the workspace left edge (box_max_y); move right or press Home"),
-        ("box_min_y", "camera_mount", 0.008, "camera is 0.8 cm beyond the workspace right edge (box_min_y); move left or press Home"),
-        ("box_max_z", "capsule:upper_arm", 0.012, "arm is 1.2 cm beyond the workspace top edge (box_max_z); move down or press Home"),
-        ("box_min_z", "end_point:1", 0.006, "gripper is 0.6 cm beyond the workspace bottom edge (box_min_z); move up or press Home"),
-        ("box_max_x", "end_point:5", 0.0002, "gripper is 0.2 mm beyond the workspace front edge (box_max_x); move back or press Home"),
+        ("box_max_x", "box_x_max", "end_point:5", 0.610, 0.600, 0.0, 0.010, false,
+            "gripper (end_point:5) is 1.0 cm beyond the workspace front edge (box_max_x 0.610 m, limit 0.600 m; previous depth 0.000 m, new depth 0.010 m); move back or press Home"),
+        ("box_min_x", "box_x_min", "end_origin", -0.615, -0.600, 0.0, 0.015, false,
+            "gripper (end_origin) is 1.5 cm beyond the workspace back edge (box_min_x -0.615 m, limit -0.600 m; previous depth 0.000 m, new depth 0.015 m); move forward or press Home"),
+        ("box_max_y", "box_y_max", "end_point:2", 0.624, 0.600, 0.0, 0.024, false,
+            "gripper (end_point:2) is 2.4 cm beyond the workspace left edge (box_max_y 0.624 m, limit 0.600 m; previous depth 0.000 m, new depth 0.024 m); move right or press Home"),
+        ("box_min_y", "box_y_min", "camera_mount", -0.608, -0.600, 0.0, 0.008, false,
+            "camera (camera_mount) is 0.8 cm beyond the workspace right edge (box_min_y -0.608 m, limit -0.600 m; previous depth 0.000 m, new depth 0.008 m); move left or press Home"),
+        ("box_max_z", "box_z_max", "capsule:upper_arm", 0.812, 0.800, 0.0, 0.012, false,
+            "arm (capsule:upper_arm) is 1.2 cm beyond the workspace top edge (box_max_z 0.812 m, limit 0.800 m; previous depth 0.000 m, new depth 0.012 m); move down or press Home"),
+        ("box_min_z", "box_z_min", "end_point:1", -1.006, -1.000, 0.0, 0.006, false,
+            "gripper (end_point:1) is 0.6 cm beyond the workspace bottom edge (box_min_z -1.006 m, limit -1.000 m; previous depth 0.000 m, new depth 0.006 m); move up or press Home"),
+        ("box_max_x", "box_x_max", "end_point:5", 0.6002, 0.600, 0.0, 0.0002, false,
+            "gripper (end_point:5) is 0.2 mm beyond the workspace front edge (box_max_x 0.600 m, limit 0.600 m; previous depth 0.000 m, new depth 0.000 m); move back or press Home"),
+        ("box_max_x", "box_x_max", "end_point:8", 0.645, 0.600, 0.040, 0.045, true,
+            "gripper (end_point:8) is 4.5 cm beyond the workspace front edge (box_max_x 0.645 m, limit 0.600 m; previous depth 0.040 m, new depth 0.045 m; this move would go 5 mm deeper); move back or press Park"),
     ];
-    for (cid, gid, depth, expected) in cases {
+    for (cid, limit, gid, value, bound, prev_depth, depth, start_outside, expected) in cases {
         let mut buf = String::new();
-        assert!(armd::chain::write_workspace_box_edge_reason(&mut buf, cid, gid, depth));
+        WorkspaceFailure::write_witness(
+            &mut buf,
+            WorkspaceWitness::Constraint { cid, gid, limit, value, bound, prev_depth, depth, start_outside },
+        );
         assert_eq!(buf, expected);
     }
-    let mut non_box = String::new();
-    assert!(!armd::chain::write_workspace_box_edge_reason(&mut non_box, "floor_z", "end_origin", 0.01));
-    assert!(!armd::chain::write_workspace_box_edge_reason(&mut non_box, "keepout:table", "end_origin", 0.01));
-    assert!(!armd::chain::write_workspace_box_edge_reason(&mut non_box, "max_reach", "end_origin", 0.01));
-    assert!(non_box.is_empty());
 
-    // RT mailbox encoding preserves exact capsule id and single-rounded depth (0.96 mm -> 1.0 mm, never 0.1 cm).
+    // RT mailbox encoding preserves exact capsule id, witness numbers, and Park/Home choice.
     let mut cap_bytes = [0u8; 32];
     cap_bytes[..9].copy_from_slice(b"upper_arm");
     let (cid, gid, reason) = armd::chain::decode_workspace_box_edge_refusal(
-        1,
-        255,
-        9,
-        &cap_bytes,
-        0.00096_f32.to_bits(),
-    )
-    .expect("decode capsule refusal");
-    assert_eq!(cid, "box_max_x");
-    assert_eq!(gid, "capsule:upper_arm");
-    assert_eq!(reason, "arm is 1.0 mm beyond the workspace front edge (box_max_x); move back or press Home");
+        1, 255, 9, &cap_bytes, 0.00096_f64.to_bits(), 0.0_f64.to_bits(), 0.60096_f64.to_bits(), 0.600_f64.to_bits(), false,
+    ).expect("decode capsule refusal");
+    assert_eq!((cid, gid.as_str()), ("box_max_x", "capsule:upper_arm"));
+    assert_eq!(reason, "arm (capsule:upper_arm) is 1.0 mm beyond the workspace front edge (box_max_x 0.601 m, limit 0.600 m; previous depth 0.000 m, new depth 0.001 m); move back or press Home");
 }
 
 #[tokio::test]
@@ -1986,7 +1996,7 @@ async fn workspace_box_escape_parity_legacy_and_executor() {
         assert_eq!(rej["constraint_id"], "box_max_x", "{label}: {rej}");
         assert!(rej["geometry_id"].as_str().is_some(), "{label}: {rej}");
         assert!(
-            rej["message"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x); move back or press Home")),
+            rej["message"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x ") && m.ends_with("; move back or press Park")),
             "{label}: unexpected jog reject message: {rej}"
         );
 
@@ -2002,7 +2012,7 @@ async fn workspace_box_escape_parity_legacy_and_executor() {
         assert_eq!(rej_cart["code"], "WORKSPACE_VIOLATION", "{label}: {rej_cart}");
         assert_eq!(rej_cart["constraint_id"], "box_max_x", "{label}: {rej_cart}");
         assert!(
-            rej_cart["message"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x); move back or press Home")),
+            rej_cart["message"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x ") && m.ends_with("; move back or press Park")),
             "{label}: unexpected move_relative reject message: {rej_cart}"
         );
 
@@ -2014,7 +2024,7 @@ async fn workspace_box_escape_parity_legacy_and_executor() {
         assert_eq!(srej["violation_phase"], "servo_target", "{label}: {srej}");
         assert!(srej["geometry_id"].as_str().is_some(), "{label}: {srej}");
         assert!(
-            srej["reason"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x); move back or press Home")),
+            srej["reason"].as_str().is_some_and(|m| m.contains("beyond the workspace front edge (box_max_x ") && m.ends_with("; move back or press Park")),
             "{label}: unexpected servo_reject reason: {srej}"
         );
         servo_reject_fields.push((
@@ -2047,4 +2057,74 @@ async fn workspace_box_escape_parity_legacy_and_executor() {
         servo_reject_fields[0], servo_reject_fields[1],
         "legacy and executor servo_reject fields must match identically"
     );
+}
+
+/// Pins the three 1.6.0 workspace refusal message cases from `[0,-2.046,-1.855,-0.297,-0.053,0.123,0]`
+/// on B601-DM across both owners (legacy and RT executor) and RT bounded detail output.
+#[tokio::test]
+async fn workspace_refusal_messages_three_cases_both_owners_and_rt_bounded() {
+    let mut cfg: ArmConfig = serde_json::from_reader(std::fs::File::open(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm/profile/rebot-b601dm.json"
+    )).unwrap()).unwrap();
+    cfg.collision = None;
+    let far_pose = [0.0f32, -2.046, -1.855, -0.297, -0.053, 0.123, 0.0];
+    let mut j3_jog = far_pose;
+    j3_jog[2] += 0.1;
+    let exp1 = "return path could not be checked (needs more than 4000 FK evaluations near max_reach on end_origin); press Park or make a short jog inward toward the base";
+    let exp2 = "gripper (end_point:8) is 4.5 cm beyond the workspace front edge (box_max_x 0.645 m, limit 0.600 m; previous depth 0.040 m, new depth 0.045 m; this move would go 5 mm deeper); move back or press Park";
+    let exp3_rsn = "end_origin reach 0.685 m (limit 0.520 m, new depth 0.165 m over, previous depth 0.164 m; this move would go 1.5 mm deeper)";
+    let exp3_msg = format!("Path leaves the safe workspace at s=0.200: {exp3_rsn}");
+    let mut owner_outputs = Vec::new();
+    for use_executor in [false, true] {
+        let label = if use_executor { "executor" } else { "legacy" };
+        let sup = std::sync::Arc::new(armd::ArmSupervisor::new(cfg.clone()));
+        { let mut i = sup.inner().write().await; i.commanded_positions = far_pose.to_vec(); i.measured_positions = far_pose.to_vec(); i.target_positions = far_pose.to_vec(); }
+        let exec = if use_executor { Some(sup.start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(std::time::Duration::from_millis(20))).await.unwrap()) } else { None };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn({ let s = sup.clone(); async move { axum::serve(listener, armd::create_router(s, armd::OperatorAuth::disabled())).await.unwrap(); } });
+        let tick = (!use_executor).then(|| { let t = sup.clone(); tokio::spawn(async move { let mut iv = tokio::time::interval(std::time::Duration::from_millis(20)); loop { iv.tick().await; t.tick(0.02).await; } }) });
+        let (mut ws, gen) = common::controller(addr).await;
+        let ep = sup.get_observation().await.epoch_id;
+        assert_eq!(common::rpc(&mut ws, gen, ep, "/api/v1/torque", serde_json::json!({"enable": true})).await["type"], "command_ack");
+        let ep = sup.get_observation().await.epoch_id;
+        let cases = [
+            ("/api/v1/motion/home", serde_json::json!({}), "sweep_budget", exp1, exp1),
+            ("/api/v1/motion/jog", serde_json::json!({"target_positions": j3_jog}), "box_max_x", exp2, exp2),
+            ("/api/v1/action/move_relative", serde_json::json!({"frame": "base", "d": [0.0, 0.0, 0.02]}), "max_reach", exp3_msg.as_str(), exp3_rsn),
+        ];
+        let mut outs = Vec::new();
+        for (path, body, cid, exp_msg, exp_rsn) in cases {
+            let r = common::rpc(&mut ws, gen, ep, path, body).await;
+            assert_eq!((r["type"].as_str(), r["code"].as_str(), r["constraint_id"].as_str()), (Some("command_reject"), Some("WORKSPACE_VIOLATION"), Some(cid)), "{label}: {r}");
+            assert_eq!((r["message"].as_str(), r["reason"].as_str()), (Some(exp_msg), Some(exp_rsn)), "{label}: {r}");
+            outs.push((cid.to_string(), exp_msg.to_string(), exp_rsn.to_string()));
+        }
+        owner_outputs.push(outs);
+        drop(ws);
+        if let Some(t) = tick { t.abort(); }
+        srv.abort();
+        if let Some(h) = exec { h.stop_and_join(); }
+    }
+    assert_eq!(owner_outputs[0], owner_outputs[1], "legacy and executor messages must match");
+
+    // RT zero-alloc `write_failure_detail_rt` matches allocating formatter on constraint and sweep_budget.
+    let eval = armd::chain::WorkspaceEvaluator::new_with_tcp(&cfg.arm_model, cfg.workspace.as_ref().unwrap(), &cfg.camera_mount, cfg.tcp_offset);
+    let (mut c0, mut c_j3) = (eval.alloc_buf(), eval.alloc_buf());
+    eval.eval_into(&far_pose, &mut c0, "plan").unwrap();
+    eval.eval_into(&j3_jog, &mut c_j3, "plan").unwrap();
+    let min_d = eval.init_min_depths(&c0);
+    let alloc_j3 = eval.check_readonly(&c_j3, &min_d, "plan").unwrap_err();
+    let rt_j3 = eval.check_readonly_slice_rt(c_j3.as_slice(), min_d.as_slice(), "plan").unwrap_err();
+    let empty_rt = || armd::kinematics::WorkspaceViolationDetail { constraint_id: Some(String::with_capacity(128)), geometry_id: Some(String::with_capacity(128)), violation_phase: Some(String::with_capacity(64)), reason: Some(String::with_capacity(256)) };
+    let mut rt_detail = empty_rt();
+    eval.write_failure_detail_rt(&rt_j3, &mut rt_detail);
+    assert_eq!((&rt_detail.constraint_id, &rt_detail.geometry_id, &rt_detail.reason), (&alloc_j3.detail.constraint_id, &alloc_j3.detail.geometry_id, &alloc_j3.detail.reason));
+    let mut rt_stack = Box::new(armd::chain::RtSweepStack::default());
+    let (mut md_leg, mut md_rt, mut b_leg, mut b_rt) = (eval.init_min_depths(&c0), eval.init_min_depths(&c0), 1usize, 1usize);
+    let leg_b = eval.sweep_linear_step(&far_pose, &cfg.home_positions, &c0, &mut md_leg, &mut b_leg, 1, "end", "sweep").unwrap_err().1;
+    let rt_b = eval.sweep_linear_step_slotbuf_rt(&far_pose, &cfg.home_positions, &c0, &mut md_rt, &mut b_rt, 1, "end", "sweep", &mut rt_stack).unwrap_err().1;
+    let mut rt_b_detail = empty_rt();
+    eval.write_failure_detail_rt(&rt_b, &mut rt_b_detail);
+    assert_eq!((rt_b_detail.constraint_id.as_deref(), &rt_b_detail.geometry_id, &rt_b_detail.reason), (Some("sweep_budget"), &leg_b.detail.geometry_id, &leg_b.detail.reason));
 }

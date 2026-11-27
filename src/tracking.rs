@@ -428,13 +428,16 @@ fn fmt_ws_failure_rt(
         WorkspaceFailureKindRt::InvalidSelfPair(pi) => {
             write!(f, "{prefix}: invalid self-collision pair (index {pi})")
         }
-        WorkspaceFailureKindRt::BudgetExceeded { max_budget } => {
-            write!(f, "{prefix}: sweep exceeded {max_budget} FK evaluations")
+        WorkspaceFailureKindRt::BudgetExceeded { max_budget, start_outside, .. } => {
+            let path_kind = if start_outside { "return path" } else { "path" };
+            write!(f, "{prefix}: {path_kind} could not be checked (needs more than {max_budget} FK evaluations)")
         }
-        WorkspaceFailureKindRt::Constraint { slot, depth, min_d } => {
+        WorkspaceFailureKindRt::Constraint { slot, depth, min_d, .. } => {
             write!(
                 f,
-                "{prefix} (slot {slot}, depth={depth:.4}m, min_depth={min_d:.4}m)"
+                "{prefix} (slot {slot}, previous depth {:.3} m, new depth {:.3} m)",
+                min_d.max(0.0),
+                depth,
             )
         }
     }
@@ -1596,12 +1599,7 @@ impl crate::supervisor::SupervisorInner {
         match err {
             TrackingRejectRt::JointLimit(msg) => TrackingReject::JointLimit(msg.as_str().to_string()),
             TrackingRejectRt::Workspace(f) => {
-                let mut detail = crate::kinematics::WorkspaceViolationDetail {
-                    constraint_id: Some(String::with_capacity(64)),
-                    geometry_id: Some(String::with_capacity(64)),
-                    violation_phase: Some(String::with_capacity(32)),
-                    reason: Some(String::with_capacity(128)),
-                };
+                let mut detail = crate::kinematics::WorkspaceViolationDetail::preallocated_rt();
                 if let Some((ws, cam)) = self.workspace_policy() {
                     let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
                         &self.config.arm_model,
