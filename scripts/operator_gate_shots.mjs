@@ -26,7 +26,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveCockpitInDir } from './source_paths.mjs';
+import sourcePaths from './source_paths.cjs';
+const { readCockpitInDir } = sourcePaths;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
@@ -89,7 +90,7 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   const page = await ctx.newPage();
   page.on('pageerror', (e) => { console.log('  pageerror ' + e.message); ok(false, name + ' pageerror'); });
   if (SRC) {
-    await page.route((u) => u.pathname === '/', (r) => r.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: fs.readFileSync(resolveCockpitInDir(SRC), 'utf8') }));
+    await page.route((u) => u.pathname === '/', (r) => r.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: readCockpitInDir(SRC) }));
     await page.route((u) => u.pathname === '/assets/calib_wizard.js', (r) => r.fulfill({ status: 200, contentType: 'application/javascript', body: fs.readFileSync(path.join(SRC, 'calib_wizard.js'), 'utf8') }));
   }
   const vmPosts = [];
