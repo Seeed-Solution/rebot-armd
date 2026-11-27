@@ -8,7 +8,6 @@ use crate::model::JointState;
 pub use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointRangeReading, MotorZeroSupport, RangeCheckStatus};
 use crate::protocol::damiao::{self, DamiaoLimits};
 pub use crate::protocol::damiao::DAMIAO_GRIPPER_POSFORCE_VEL_RAW;
-use crate::protocol::feetech;
 use crate::transport::{
     CanFrame, CanRxTime, CanTransport, Transport, TransportError,
     MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS,
@@ -1989,11 +1988,6 @@ pub enum JointMode {
     Mit,
 }
 
-// =========================================================================
-// 1. Feetech STS3215 Arm Driver (SO-ARM 101)
-// =========================================================================
-
-
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 struct PendingDisableShadowBatch {
@@ -2045,9 +2039,6 @@ impl PendingDisableShadowBatch {
         }
         *slot = Some(incoming);
     }
-}
-
-impl<T: Transport> FeetechArmDriver<T> {
 }
 
 

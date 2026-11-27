@@ -1,15 +1,12 @@
 //! Feetech STS3215 torque enable/disable, rest-pose gating, and causal readback.
 
-#[allow(unused_imports)]
 use std::sync::atomic::Ordering;
-#[allow(unused_imports)]
 use std::time::{Duration, Instant};
 
-#[allow(unused_imports)]
 use crate::driver::*;
-#[allow(unused_imports)]
 use crate::protocol::feetech;
 use crate::transport::Transport;
+use super::engine::PendingFeetechDisable;
 
 impl<T: Transport> FeetechArmDriver<T> {
     /// R12 M1/M3: Drain and decode any queued position replies from `partial_pos_rx`, `rx_buffer`,
