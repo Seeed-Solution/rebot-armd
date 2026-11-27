@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
+pub use admission::BestRefusal;
 pub use snapshot::{capture, capture_from_env, Snapshot};
 use candidates::{Chord, DirClass, Hypothesis, Rejection};
 pub use feasibility::{
@@ -525,6 +526,9 @@ pub struct Selection {
     pub budget_ms: u64,
     /// Phase B input of the selected candidate.
     pub plan: Option<ExecutionPlan>,
+    /// Without a winner: the structured reason, chosen before the alternatives are truncated
+    /// (deepest phase, ties to the lowest candidate index).
+    pub best_refusal: Option<admission::BestRefusal>,
 }
 
 impl Selection {
@@ -589,6 +593,7 @@ impl Search<'_> {
         Selection {
             snapshot_id: self.s.id.clone(), outcome, code, message, ranked, rejected: self.rejected, rejections_by_phase: self.by_phase, rejections_by_code: self.by_code,
             evidence, stats: self.stats, elapsed_ms: self.start.elapsed().as_secs_f64() * 1000.0, budget_ms: self.s.budget.wall_ms, plan,
+            best_refusal: None,
         }
     }
     fn exhausted(self, ranked_so_far: usize, evidence: Value) -> Selection {
@@ -713,6 +718,29 @@ fn exhausted_or_top(se: Search, n: usize, ev: Value, top: &Option<(Candidate, Ad
 }
 
 pub fn select_adaptive_route(
+    s: &Snapshot,
+    gripper_policy: &crate::model::GripperPolicy,
+    gripper_limit: &crate::model::JointLimit,
+    close_speed_limit: Option<f32>,
+    has_gravity_model: bool,
+) -> AdaptiveSelection {
+    let mut a = select_adaptive_route_inner(s, gripper_policy, gripper_limit, close_speed_limit, has_gravity_model);
+    if !a.reachable() && a.selection.best_refusal.is_none() {
+        let sel = &a.selection;
+        let candidate_id = (sel.outcome == Outcome::InsufficientEvidence).then(|| sel.ranked.first().map(|c| c.id.clone())).flatten();
+        a.selection.best_refusal = Some(admission::BestRefusal {
+            candidate_id,
+            phase: a.failing_phase.unwrap_or("selection").to_string(),
+            code: sel.code.clone().unwrap_or_else(|| "NO_CANDIDATE".into()),
+            message: sel.message.clone().unwrap_or_default(),
+            value: None,
+            bound: None,
+        });
+    }
+    a
+}
+
+fn select_adaptive_route_inner(
     s: &Snapshot,
     gripper_policy: &crate::model::GripperPolicy,
     gripper_limit: &crate::model::JointLimit,
@@ -887,7 +915,7 @@ pub fn select_adaptive_route(
 
     let acq_ok = acq_res.is_ok();
     let mut entries: Vec<(Candidate, AdaptiveRoute)> = Vec::new();
-    let mut deepest: Option<(usize, Rejection)> = top_rej.map(|r| (phase_rank(r.phase, true), r));
+    let mut deepest: Option<(usize, Rejection, String)> = top_rej.map(|r| (phase_rank(r.phase, true), r, admission::top_down_id(s)));
     entries.extend(top.iter().cloned());
 
     let evaluate = |se: &mut Search,
@@ -895,7 +923,7 @@ pub fn select_adaptive_route(
                         q_pre_seed: [f64; 6],
                         work: &mut Work,
                         entries: &mut Vec<(Candidate, AdaptiveRoute)>,
-                        deepest: &mut Option<(usize, Rejection)>| {
+                        deepest: &mut Option<(usize, Rejection, String)>| {
         let budget_check = || se.out_of_budget();
         match preflight_candidate_from_start(
             s,
@@ -933,8 +961,8 @@ pub fn select_adaptive_route(
             }
             Err(r) => {
                 let rank = phase_rank(r.phase, true);
-                if deepest.as_ref().is_none_or(|(d, _)| rank > *d) {
-                    *deepest = Some((rank, r.clone()));
+                if deepest.as_ref().is_none_or(|(d, _, _)| rank > *d) {
+                    *deepest = Some((rank, r.clone(), se.id(hy)));
                 }
                 se.reject(hy, r, true);
             }
@@ -1084,18 +1112,21 @@ pub fn select_adaptive_route(
             }
         }
         None => {
+            let mut best = None;
             let (phase, code, m) = match deepest {
-                Some((_, r)) => (
-                    r.phase,
-                    r.code.clone(),
-                    format!("no candidate passed; deepest failure in {}: {}", r.phase, r.message),
-                ),
+                Some((_, r, id)) => {
+                    best = Some(admission::BestRefusal::from_rejection(Some(id), &r));
+                    (r.phase, r.code.clone(), format!("no candidate passed; deepest failure in {}: {}", r.phase, r.message))
+                }
                 None => {
                     let top = se.rejected.iter().max_by(|a, b| {
                         phase_rank(a.rejection.phase, false)
                             .cmp(&phase_rank(b.rejection.phase, false))
                             .then(b.hy.index.cmp(&a.hy.index))
                     });
+                    if let Some(r) = top {
+                        best = Some(admission::BestRefusal::from_rejection(Some(r.id.clone()), &r.rejection));
+                    }
                     match top {
                         Some(r) => (
                             r.rejection.phase,
@@ -1113,7 +1144,8 @@ pub fn select_adaptive_route(
                     }
                 }
             };
-            let sel = se.finish(Outcome::Infeasible, Some(code), Some(m), ranked, ev);
+            let mut sel = se.finish(Outcome::Infeasible, Some(code), Some(m), ranked, ev);
+            sel.best_refusal = best;
             AdaptiveSelection {
                 selection: sel,
                 route: None,
@@ -1847,6 +1879,7 @@ impl Selection {
             "rejections": self.rejections_by_phase,
             "rejection_codes": self.rejections_by_code,
             "alternatives": alts,
+            "best_refusal": self.best_refusal.as_ref().map(admission::BestRefusal::to_json),
             "search": {
                 "chords": self.stats.chords, "generated": self.stats.generated, "geometric_survivors": self.stats.geometric_survivors,
                 "ik_survivors": self.stats.ik_survivors, "shortlisted": self.stats.shortlisted, "refined": self.stats.refined,

@@ -412,6 +412,9 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
         if let Some(hint) = checked_hint {
             details.insert("hint".into(), serde_json::json!(hint));
         }
+        if let Some(r) = &sel.selection.best_refusal {
+            details.insert("best_refusal".into(), r.to_json());
+        }
         return Err(ArmError::Detailed {
             status: 422,
             code,
@@ -535,6 +538,9 @@ pub struct DryRun {
     /// `strategy: "adaptive"`: the selection reply ([`crate::grasp_select::Selection::to_json`])
     /// plus `legacy` (the legacy verdict on the same request).
     pub adaptive: Option<Value>,
+    /// Legacy requests: the shared admission evidence merged into the reply (`jaw` on a pass;
+    /// `best_refusal`, `failing_phase` and `error_margin` on an admission refusal).
+    pub admission: Option<serde_json::Map<String, Value>>,
 }
 
 impl DryRun {
@@ -552,6 +558,9 @@ impl DryRun {
         if let Some(Value::Object(a)) = &self.adaptive {
             for (k, v) in a { m.insert(k.clone(), v.clone()); }
         }
+        if self.adaptive.is_none() {
+            for (k, v) in self.admission.iter().flatten() { m.insert(k.clone(), v.clone()); }
+        }
         m
     }
 }
@@ -560,7 +569,7 @@ impl DryRun {
 /// Returns (reachable, code, message). The task requirements are not checked (see
 /// [`dry_run_task`]).
 pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>) {
-    let (reachable, code, message, _, _) = dry_run_plan(supervisor, body).await;
+    let (reachable, code, message, _, _, _) = dry_run_plan(supervisor, body).await;
     (reachable, code, message)
 }
 
@@ -568,7 +577,7 @@ pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Op
 /// request's task has requirements or models, none otherwise; never a model switch. The task
 /// result does not change `reachable`.
 pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> DryRun {
-    let (mut reachable, mut code, mut message, request, mut adaptive) = dry_run_plan(supervisor, body).await;
+    let (mut reachable, mut code, mut message, request, mut adaptive, admission) = dry_run_plan(supervisor, body).await;
     let is_adaptive = adaptive.is_some();
     let task = match request {
         Some((Some(name), requires, models)) => Some(if requires.is_empty() && models.is_none() {
@@ -596,7 +605,7 @@ pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn Detectio
             }
         }
     }
-    DryRun { reachable, code, message, task, adaptive }
+    DryRun { reachable, code, message, task, adaptive, admission }
 }
 
 /// Dry-run verdict: (reachable, code, message, (task, requires, models) when the request parsed,
@@ -606,7 +615,23 @@ pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn Detectio
 /// or a lock-free [`crate::rt_core::requests::actions::ReadOnlySnapshot`] on `OWNER_EXECUTOR`,
 /// and runs off-lock in `spawn_blocking`): never starts motion or actuator output, so no
 /// `Admitted` token is required.
-type DryRunPlan = (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires, Option<TaskModels>)>, Option<Value>);
+type DryRunPlan = (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires, Option<TaskModels>)>, Option<Value>, Option<serde_json::Map<String, Value>>);
+
+/// The admission evidence of a legacy plan result: `jaw` on a pass, the structured refusal
+/// fields of an admission refusal ([`ArmError::Detailed`] details), nothing otherwise.
+fn admission_fields(r: &Result<Option<Value>, ArmError>) -> Option<serde_json::Map<String, Value>> {
+    let mut m = serde_json::Map::new();
+    match r {
+        Ok(Some(jaw)) => { m.insert("jaw".into(), jaw.clone()); }
+        Err(ArmError::Detailed { details, .. }) => {
+            for k in ["best_refusal", "failing_phase", "error_margin"] {
+                if let Some(v) = details.get(k) { m.insert(k.into(), v.clone()); }
+            }
+        }
+        _ => {}
+    }
+    (!m.is_empty()).then_some(m)
+}
 
 async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPlan {
     let rejected = |e: ArmError| {
@@ -615,7 +640,7 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
     };
     let strategy = match crate::grasp_select::parse_strategy(body) {
         Ok(s) => s,
-        Err(e) => { let (r, c, m) = rejected(e.into()); return (r, c, m, None, None); }
+        Err(e) => { let (r, c, m) = rejected(e.into()); return (r, c, m, None, None, None); }
     };
     // adaptive requests also carry the legacy verdict (`legacy`), from the same snapshot
     let pending_res: Result<(PendingGrasp, Option<Box<PendingAdaptive>>), ArmError> =
@@ -644,7 +669,7 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
         Ok((pending, pa)) => {
             let task = Some((pending.request.task.clone(), pending.request.requires, pending.request.models.clone()));
             let joined = tokio::task::spawn_blocking(move || {
-                let legacy = plan(pending).map(|_| ());
+                let legacy = plan(pending).map(|p| p.jaw.map(|j| j.to_json()));
                 let adaptive_sel = pa.map(|pa| {
                     let sel = crate::grasp_select::select_adaptive_route(
                         &pa.snapshot,
@@ -659,19 +684,23 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
             }).await;
             match joined {
                 Ok((legacy, None)) => {
-                    let (reachable, code, message) = match legacy { Ok(()) => (true, None, None), Err(e) => rejected(e) };
-                    (reachable, code, message, task, None)
+                    let admission = admission_fields(&legacy);
+                    let (reachable, code, message) = match legacy { Ok(_) => (true, None, None), Err(e) => rejected(e) };
+                    (reachable, code, message, task, None, admission)
                 }
                 Ok((legacy, Some((snap, sel)))) => {
-                    let (lr, lc, lm) = match legacy { Ok(()) => (true, None, None), Err(e) => rejected(e) };
+                    let admission = admission_fields(&legacy);
+                    let (lr, lc, lm) = match legacy { Ok(_) => (true, None, None), Err(e) => rejected(e) };
                     let mut v = sel.to_json(&snap);
-                    v["legacy"] = serde_json::json!({"reachable": lr, "code": lc, "message": lm});
+                    let mut lv = serde_json::json!({"reachable": lr, "code": lc, "message": lm});
+                    for (k, x) in admission.into_iter().flatten() { lv[k] = x; }
+                    v["legacy"] = lv;
                     let reachable = sel.reachable();
                     let code = sel.selection.code;
                     let message = sel.selection.message;
-                    (reachable, code, message, task, Some(v))
+                    (reachable, code, message, task, Some(v), None)
                 }
-                Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}")), task, None),
+                Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}")), task, None, None),
             }
         }
         Err(e) => {
@@ -690,7 +719,7 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
                     "failing_phase": failing_phase.as_deref().unwrap_or("request"),
                 })
             });
-            (reachable, code, message, None, adaptive)
+            (reachable, code, message, None, adaptive, None)
         }
     }
 }

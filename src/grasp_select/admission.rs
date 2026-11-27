@@ -43,6 +43,29 @@ pub fn jaw_check(width_m: f64, hard_error_m: f64, open_width_m: f64, max_grasp_w
     Ok(reserve)
 }
 
+/// The structured reason of a refusal: the candidate (None for a refusal before any
+/// candidate), the phase, the code, the message, and the failing value with its bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BestRefusal {
+    pub candidate_id: Option<String>,
+    pub phase: String,
+    pub code: String,
+    pub message: String,
+    pub value: Option<f64>,
+    pub bound: Option<f64>,
+}
+
+impl BestRefusal {
+    pub fn from_rejection(candidate_id: Option<String>, r: &Rejection) -> Self {
+        Self { candidate_id, phase: r.phase.to_string(), code: r.code.clone(), message: r.message.clone(), value: r.value, bound: r.bound }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({"candidate_id": self.candidate_id, "phase": self.phase, "code": self.code, "message": self.message,
+            "value": self.value, "bound": self.bound})
+    }
+}
+
 /// The jaw fit a legacy grasp was admitted with; the live measured width is checked against
 /// the same predicate ([`JawAdmission::recheck`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -158,8 +181,9 @@ pub(super) fn evaluate_top_down(
 
 /// The refusal of a legacy grasp as [`ArmError::Detailed`] (422): `[phase] message` with the
 /// structured refusal in the details.
-fn legacy_refusal(_s: &Snapshot, _t: Option<&Target>, r: &Rejection, _id: Option<String>) -> ArmError {
-    let details = json!({"failing_phase": r.phase, "outcome": "infeasible"});
+fn legacy_refusal(_s: &Snapshot, _t: Option<&Target>, r: &Rejection, id: Option<String>) -> ArmError {
+    let refusal = BestRefusal::from_rejection(id, r);
+    let details = json!({"failing_phase": r.phase, "outcome": "infeasible", "best_refusal": refusal.to_json()});
     ArmError::Detailed { status: 422, code: r.code.clone(), message: format!("[{}] {}", r.phase, r.message), details: Box::new(details) }
 }
 
