@@ -19,6 +19,342 @@ use crate::protocol::damiao::{self, DamiaoLimits};
 use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
+    pub(in crate::driver::can_servo) fn probe_hardware_disarmed_until_impl(&mut self, wall_deadline: Instant) -> bool {
+        let n = self.motor_ids.len();
+        if n == 0
+            || n > MAX_MODE_JOINTS
+            || self.is_enabled
+            || self.is_enabling
+            || self.torque_transition_pending()
+            || self.disable_dispatched_mask != 0
+            || self.panic_disable_active
+        {
+            tracing::warn!(
+                "Shutdown disarm proof skipped: active Damiao torque state or transition \
+                 (dof={}, is_enabled={}, is_enabling={}, pending={}, disable_mask=0x{:x}, panic_active={})",
+                n,
+                self.is_enabled,
+                self.is_enabling,
+                self.torque_transition_pending(),
+                self.disable_dispatched_mask,
+                self.panic_disable_active,
+            );
+            return false;
+        }
+        if self.is_hardware_disarmed_confirmed() {
+            return true;
+        }
+        if !self.poll_tx_allowed() {
+            tracing::warn!(
+                "Shutdown disarm proof refused: read-only 0xCC polling inhibited by active/unacknowledged MIT deadline fence"
+            );
+            return false;
+        }
+        let now_wall = Instant::now();
+        let budget = wall_deadline
+            .saturating_duration_since(now_wall)
+            .min(SHUTDOWN_DISARM_PROOF_WINDOW);
+        if budget.is_zero() {
+            for i in 0..n {
+                let id = self.motor_ids[i];
+                let fresh = self
+                    .last_feedback_instant
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW);
+                let st = self.motor_status[i];
+                if !fresh || st != 0 || !self.motor_disarmed_after_enable[i] {
+                    tracing::warn!(
+                        "Shutdown disarm proof deadline expired before probe: Damiao joint J{} (CAN ID 0x{:X}) unconfirmed (fresh={}, state=0x{:X})",
+                        i + 1,
+                        id,
+                        fresh,
+                        st
+                    );
+                }
+            }
+            return false;
+        }
+
+        let drv_deadline = self.now() + budget;
+        let hard_wall = now_wall + budget;
+        const PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+        let log_unconfirmed_axes = |drv: &Self, boundaries: &[Option<(u64, Instant)>; MAX_MODE_JOINTS]| {
+            for (i, boundary) in boundaries.iter().enumerate().take(n) {
+                let fresh_reply = boundary.is_some_and(|(p_seq, p_at)| {
+                    drv.last_feedback_seq[i] > p_seq
+                        && drv.last_feedback_instant[i].is_some_and(|t| {
+                            t >= p_at && drv.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW
+                        })
+                });
+                let id = drv.motor_ids[i];
+                if !fresh_reply {
+                    tracing::warn!(
+                        "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) did not reply to read-only 0xCC poll within {} ms",
+                        i + 1,
+                        id,
+                        budget.as_millis()
+                    );
+                } else if drv.motor_status[i] == 1 {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                        i + 1,
+                        id
+                    );
+                } else if drv.motor_status[i] != 0 || !drv.motor_disarmed_after_enable[i] {
+                    tracing::warn!(
+                        "Shutdown disarm proof unconfirmed: Damiao joint J{} (CAN ID 0x{:X}) state=0x{:X}, disarmed_after_enable={}",
+                        i + 1,
+                        id,
+                        drv.motor_status[i],
+                        drv.motor_disarmed_after_enable[i]
+                    );
+                }
+            }
+        };
+
+        let mut probe_tx_boundary: [Option<(u64, Instant)>; MAX_MODE_JOINTS] =
+            [None; MAX_MODE_JOINTS];
+
+        // RAII guard ensures provisional probe state is ALWAYS cleaned up and fails closed on
+        // EVERY exit path (adverse reply, incomplete drain, deadline expiry, or transport unwind).
+        struct DisarmProbeGuard<'a, C: CanTransport> {
+            drv: &'a mut DamiaoArmDriver<C>,
+            committed: bool,
+        }
+        impl<C: CanTransport> Drop for DisarmProbeGuard<'_, C> {
+            fn drop(&mut self) {
+                self.drv.disarm_probe_active = false;
+                self.drv.disarm_probe_adverse_mask = 0;
+                self.drv.disarm_probe_adverse_state = [0; MAX_MODE_JOINTS];
+                if !self.committed {
+                    self.drv.motor_disarmed_after_enable.fill(false);
+                    if !self.drv.last_read_drained {
+                        self.drv.awaiting_rx_boundary = true;
+                    }
+                }
+            }
+        }
+
+        // RX-only bounded drain helper (NEVER emits autonomous `0xCC` refresh TX while draining).
+        let drain_rx_only = |drv: &mut Self, drv_dl: Instant, wall_dl: Instant| -> bool {
+            drv.last_read_drained = false;
+            loop {
+                if drv.now() >= drv_dl || Instant::now() >= wall_dl {
+                    return false;
+                }
+                let seq_before = drv.rx_seq;
+                if drv.drain_rx_frames_only(Some(Deadline { at: drv_dl }), 64) {
+                    return true;
+                }
+                // Stop looping if transport returned an error without advancing `rx_seq`.
+                if drv.rx_seq == seq_before {
+                    return false;
+                }
+            }
+        };
+
+        let mut guard = DisarmProbeGuard {
+            drv: self,
+            committed: false,
+        };
+        guard.drv.disarm_probe_adverse_mask = 0;
+        guard.drv.disarm_probe_adverse_state = [0; MAX_MODE_JOINTS];
+        guard.drv.disarm_probe_active = true;
+
+        // ALWAYS fence and drain RX-only to a fresh observed-empty RX boundary IMMEDIATELY before
+        // transmitting `0xCC` polls — NEVER reuse `last_read_drained` from an earlier tick and
+        // NEVER emit autonomous refresh TX during the pre-poll drain.
+        guard.drv.awaiting_rx_boundary = true;
+        if !drain_rx_only(guard.drv, drv_deadline, hard_wall) {
+            tracing::warn!(
+                "Shutdown disarm proof refused: could not establish empty RX boundary before deadline"
+            );
+            log_unconfirmed_axes(guard.drv, &probe_tx_boundary);
+            return false;
+        }
+        guard.drv.awaiting_rx_boundary = false;
+
+        let mut next_tx_at = guard.drv.now();
+        let mut first_pass = true;
+
+        loop {
+            let now_drv = guard.drv.now();
+            let now_w = Instant::now();
+            if now_drv >= drv_deadline || now_w >= hard_wall {
+                break;
+            }
+
+            if first_pass || now_drv >= next_tx_at {
+                first_pass = false;
+                let tx_dl = Deadline { at: drv_deadline };
+                let mut sent_any = false;
+                let mut newly_armed_mask = 0u32;
+                let clean_rx_boundary = !guard.drv.awaiting_rx_boundary;
+                for i in 0..n {
+                    let already_confirmed = probe_tx_boundary[i].is_some_and(|(p_seq, p_at)| {
+                        guard.drv.last_feedback_seq[i] > p_seq
+                            && guard.drv.last_feedback_instant[i].is_some_and(|t| {
+                                t >= p_at && guard.drv.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW / 2
+                            })
+                            && guard.drv.motor_status[i] == 0
+                            && (guard.drv.disarm_probe_adverse_mask & (1u32 << i)) == 0
+                    });
+                    if already_confirmed {
+                        continue;
+                    }
+                    let id = guard.drv.motor_ids[i];
+                    match guard.drv.send_plain(
+                        TxKind::DisableProbe,
+                        None,
+                        Some(tx_dl),
+                        false,
+                        |_| Some(damiao::build_refresh_frame(id)),
+                    ) {
+                        Ok(_) => {
+                            sent_any = true;
+                            if clean_rx_boundary && probe_tx_boundary[i].is_none() {
+                                let (seq_mark, at_mark) =
+                                    guard.drv.last_tx_mark.unwrap_or((guard.drv.rx_seq, guard.drv.now()));
+                                probe_tx_boundary[i] = Some((seq_mark, at_mark));
+                                newly_armed_mask |= 1u32 << i;
+                            }
+                        }
+                        Err(TxRefusal::DeadlinePassed) => break,
+                        Err(r) => {
+                            tracing::warn!(
+                                "Shutdown disarm proof 0xCC TX failed for Damiao joint J{} (CAN ID 0x{:X}): {:?}",
+                                i + 1,
+                                id,
+                                r
+                            );
+                        }
+                    }
+                }
+                if sent_any {
+                    if let Err(e) = guard.drv.can.flush() {
+                        tracing::warn!("Shutdown disarm proof CAN flush failed: {e}");
+                        for (i, slot) in probe_tx_boundary.iter_mut().enumerate().take(n) {
+                            if (newly_armed_mask & (1u32 << i)) != 0 {
+                                *slot = None;
+                            }
+                        }
+                    }
+                }
+                next_tx_at = guard.drv.now() + PROBE_RETRY_INTERVAL;
+            }
+
+            // Drain RX-only through a fresh observed-empty queue boundary (bounded by
+            // `drv_deadline` / `hard_wall`) so no adverse reply past frame 64 is left queued.
+            let drained = drain_rx_only(guard.drv, drv_deadline, hard_wall);
+
+            // Preserve EVERY adverse (enabled/faulted) axis observed across all drained RX batches
+            // (including untimestamped/unmappable adverse frames). `DisarmProbeGuard::drop`
+            // guarantees full fail-closed invalidation on return.
+            if guard.drv.disarm_probe_adverse_mask != 0 {
+                for i in 0..n {
+                    if (guard.drv.disarm_probe_adverse_mask & (1u32 << i)) == 0 {
+                        continue;
+                    }
+                    let bad_st = guard.drv.disarm_probe_adverse_state[i];
+                    guard.drv.motor_status[i] = bad_st;
+                    let id = guard.drv.motor_ids[i];
+                    if bad_st == 1 {
+                        tracing::warn!(
+                            "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                            i + 1,
+                            id
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied non-disabled (state=0x{:X})",
+                            i + 1,
+                            id,
+                            bad_st
+                        );
+                    }
+                }
+                return false;
+            }
+
+            let mut all_post_probe_disarmed = drained && guard.drv.last_read_drained;
+            for (i, boundary) in probe_tx_boundary.iter().enumerate().take(n) {
+                let fresh_reply = boundary.is_some_and(|(p_seq, p_at)| {
+                    guard.drv.last_feedback_seq[i] > p_seq
+                        && guard.drv.last_feedback_instant[i].is_some_and(|t| {
+                            t >= p_at && guard.drv.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW
+                        })
+                });
+                if !fresh_reply {
+                    all_post_probe_disarmed = false;
+                    continue;
+                }
+                let after_enable = match guard.drv.motor_last_enable_tx[i] {
+                    Some((en_seq, en_at)) => {
+                        guard.drv.last_feedback_seq[i] > en_seq
+                            && guard.drv.last_feedback_instant[i].is_some_and(|t| t >= en_at)
+                    }
+                    None => true,
+                };
+                if !after_enable {
+                    all_post_probe_disarmed = false;
+                    continue;
+                }
+                let st = guard.drv.motor_status[i];
+                if st == 1 {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied enabled (state=1)",
+                        i + 1,
+                        guard.drv.motor_ids[i]
+                    );
+                    return false;
+                }
+                if st != 0 {
+                    tracing::warn!(
+                        "Shutdown disarm proof refused: Damiao joint J{} (CAN ID 0x{:X}) replied non-disabled (state=0x{:X})",
+                        i + 1,
+                        guard.drv.motor_ids[i],
+                        st
+                    );
+                    return false;
+                }
+            }
+            // Enforce caller wall and driver deadlines BEFORE committing provisional proof.
+            if guard.drv.now() >= drv_deadline || Instant::now() >= hard_wall {
+                tracing::warn!(
+                    "Shutdown disarm proof refused: deadline ({} ms) expired before post-poll confirmation completed",
+                    budget.as_millis()
+                );
+                break;
+            }
+            if all_post_probe_disarmed {
+                // Commit provisional proof ONLY after every axis passed fresh causal post-poll
+                // `state == 0` checks through an observed-empty RX boundary with zero adverse frames.
+                for i in 0..n {
+                    guard.drv.motor_disarmed_after_enable[i] = true;
+                }
+                if guard.drv.is_hardware_disarmed_confirmed() {
+                    guard.committed = true;
+                    return true;
+                }
+                guard.drv.motor_disarmed_after_enable.fill(false);
+            }
+
+            let rem_drv = drv_deadline.saturating_duration_since(guard.drv.now());
+            let rem_wall = hard_wall.saturating_duration_since(Instant::now());
+            let rem = rem_drv.min(rem_wall);
+            if rem.is_zero() {
+                break;
+            }
+            guard.drv.pause(rem.min(Duration::from_millis(2)));
+        }
+
+        log_unconfirmed_axes(guard.drv, &probe_tx_boundary);
+        false
+    }
+
     #[inline]
     pub(in crate::driver::can_servo) fn is_disable_tx_kind(kind: TxKind) -> bool {
         matches!(
