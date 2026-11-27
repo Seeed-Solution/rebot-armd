@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use armd::auth::OperatorGrant;
-use armd::driver::{
+use armd::driver::{PosForceExt,
     gripper_drive_from_profile, ArmDriver, ArmDriverError, DamiaoArmDriver, EnableState,
 };
 use armd::protocol::damiao::{self, DamiaoLimits};
@@ -589,7 +589,7 @@ async fn enable_after_long_disabled_idle_succeeds_50_of_50_seeded_runs() {
                     .unwrap()
                     .read()
                     .unwrap()
-                    .motor_current_cap()
+                    .pos_force().motor_current_cap()
                     .unwrap();
                 assert!(cap.active, "seed={seed} (legacy): J7 cap inactive");
             }
@@ -676,7 +676,7 @@ async fn enable_after_long_disabled_idle_succeeds_50_of_50_seeded_runs() {
                 .unwrap()
                 .read()
                 .unwrap()
-                .motor_current_cap()
+                .pos_force().motor_current_cap()
                 .unwrap();
             assert!(cap.active, "seed={seed} (rt): J7 cap inactive");
             bus.with(|s| {

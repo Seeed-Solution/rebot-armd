@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use armd::collision::CollisionPolicy;
-use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
+use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointModeExt, JointTarget};
 use armd::model::{ArmConfig, JointState, KeepoutBox, MotionLimitReason};
 use armd::motion::{plan_cartesian, GripperCommand, GripperRequest, Speed};
 use armd::recording::RecordFrame;
@@ -255,12 +255,11 @@ impl ArmDriver for TrackingTestDriver {
         }
         Ok(())
     }
-    fn supports_mit_mode_switch(&self) -> bool {
-        true
-    }
-    fn set_strict_mode_handover(&mut self, strict: bool) {
-        self.0.lock().unwrap().strict_mode_handover = Some(strict);
-    }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for TrackingTestDriver {
+    fn supports_mit_mode_switch(&self) -> bool { true }
+    fn set_strict_mode_handover(&mut self, strict: bool) { self.0.lock().unwrap().strict_mode_handover = Some(strict); }
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut s = self.0.lock().unwrap();
         if s.fail_mode_switch {

@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use armd::driver::{ArmDriver, DamiaoArmDriver, EnableState};
+use armd::driver::{ArmDriver, DamiaoArmDriver, EnableState, JointModeExt, PosForceExt};
 use armd::model::{ArmConfig, DEFAULT_REST_POSE_TOLERANCE_RAD};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{
@@ -2901,12 +2901,6 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
         fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
             self.inner.fresh_measured_position_for(joint, max_age)
         }
-        fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-            self.inner.joint_hold_mode_verified(joint)
-        }
-        fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
-            self.inner.drop_pending_holds_outside_mask(hold_mask);
-        }
         fn write_measured_hold_masked(
             &mut self,
             hold_mask: u64,
@@ -3000,12 +2994,17 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
         fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
             self.inner.disable_torque(kind)
         }
-        fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
-            self.inner.set_stopped_disable_gate(gate);
+        fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) { self.inner.set_stopped_disable_gate(gate); }
+        fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.inner.set_abort_flag(flag); }
+        armd::ext_accessors!(tx, joint_mode);
+    }
+    impl armd::driver::BoundedTxExt for EnableFinishFailWrapper {
+        fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
+            self.inner.drop_pending_holds_outside_mask(hold_mask);
         }
-        fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
-            self.inner.set_abort_flag(flag);
-        }
+    }
+    impl armd::driver::JointModeExt for EnableFinishFailWrapper {
+        fn joint_hold_mode_verified(&self, joint: usize) -> bool { self.inner.joint_hold_mode_verified(joint) }
     }
 
     for fail_read_err in [true, false] {
@@ -4044,7 +4043,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         .as_mut()
         .unwrap()
         .with_mut(|d| {
-            d.set_tx_budget(TxBudget {
+            d.tx_mut().set_tx_budget(TxBudget {
                 max_frames: 2,
                 max_duration: Duration::from_millis(10),
                 ..TxBudget::default()
@@ -4059,7 +4058,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
     inner.tick(0.02);
     {
         let drv = inner.driver.as_ref().unwrap().read().unwrap();
-        assert!(drv.pending_tx_len_total() > 0, "J3..J7 holds should be queued in hold queue");
+        assert!(drv.tx().pending_tx_len_total() > 0, "J3..J7 holds should be queued in hold queue");
     }
 
     // M-12: Specifically queue J3's hold frame at t=85 ms (age=85 ms <= 100 ms, TX age=0 ms < 45 ms),
@@ -4112,7 +4111,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         JointHoldStatus::Queued,
         "J3 hold must be specifically queued right before crossing the 100 ms freshness boundary"
     );
-    let pending_before_stale = inner.driver.as_ref().unwrap().read().unwrap().pending_tx_len_total();
+    let pending_before_stale = inner.driver.as_ref().unwrap().read().unwrap().tx().pending_tx_len_total();
     assert!(pending_before_stale > 0);
 
     // Cross the 100 ms freshness boundary by advancing 20 ms (J3 age = 105..110 ms > 100 ms, while
@@ -7919,8 +7918,8 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
                 armd::driver::JointMode::Position,
                 armd::driver::JointMode::Position,
             ];
-            let _ = drv.set_joint_modes_confirmed(&modes, &hold);
-            assert!(!drv.joint_hold_mode_verified(2), "precondition: J3 mode unverified while energized");
+            let _ = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
+            assert!(!drv.joint_mode().joint_hold_mode_verified(2), "precondition: J3 mode unverified while energized");
         }
         bus.with(|s| {
             s.fail_tx_ids.clear();
@@ -8041,8 +8040,8 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
                 armd::driver::JointMode::Position,
                 armd::driver::JointMode::Position,
             ];
-            let _ = drv.set_joint_modes_confirmed(&modes, &hold);
-            assert!(!drv.joint_hold_mode_verified(2));
+            let _ = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
+            assert!(!drv.joint_mode().joint_hold_mode_verified(2));
         }
         bus.with(|s| {
             s.fail_tx_ids.clear();
@@ -8072,7 +8071,7 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
             inner.tick(0.02);
         }
         assert!(
-            inner.driver.as_ref().unwrap().read().unwrap().joint_hold_mode_verified(2),
+            inner.driver.as_ref().unwrap().read().unwrap().joint_mode().joint_hold_mode_verified(2),
             "L2: causal on-tick readback reply before 200 ms must verify J3"
         );
         assert_eq!(
@@ -8346,7 +8345,7 @@ fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
         inner.apply_stop_policy(StopPolicy::EStopLatch);
         {
             let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
-            drv.set_mit_deadline_fence(Some(Duration::from_millis(50)), Duration::ZERO);
+            drv.mit_mut().set_mit_deadline_fence(Some(Duration::from_millis(50)), Duration::ZERO);
         }
 
         clock.advance(Duration::from_millis(20));
@@ -9469,7 +9468,7 @@ fn r12_b2_mit_lost_falls_back_to_verified_posvel_hold_or_faults_under_l2_bound()
                     torque: Some(0.0),
                 })
                 .collect();
-            drv.set_joint_modes(&modes, &targets).unwrap();
+            drv.joint_mode_mut().set_joint_modes(&modes, &targets).unwrap();
         }
         // Capture initial stopped hold targets before MIT loss so J4 has a captured target.
         inner.apply_stop_policy(StopPolicy::EStopLatch);

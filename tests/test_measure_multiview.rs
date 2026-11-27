@@ -708,6 +708,9 @@ impl ArmDriver for CreepArm {
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.write_joint_targets(targets) }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for CreepArm {
     fn supports_mit_mode_switch(&self) -> bool { false }
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.set_joint_modes(modes, hold) }
 }
@@ -1409,6 +1412,9 @@ impl ArmDriver for QueuedFeedbackArm {
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.write_joint_targets(targets) }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for QueuedFeedbackArm {
     fn supports_mit_mode_switch(&self) -> bool { false }
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.set_joint_modes(modes, hold) }
 }
@@ -1660,6 +1666,9 @@ impl ArmDriver for FrozenFeedbackArm {
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.write_joint_targets(targets) }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for FrozenFeedbackArm {
     fn supports_mit_mode_switch(&self) -> bool { false }
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.set_joint_modes(modes, hold) }
 }

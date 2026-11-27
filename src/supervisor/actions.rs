@@ -1768,7 +1768,7 @@ impl SupervisorInner {
         }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
-            .and_then(|d| d.with_ref(|drv| drv.gripper_pos_force_info()).flatten())
+            .and_then(|d| d.with_ref(|drv| drv.pos_force().gripper_pos_force_info()).flatten())
             .filter(|info| info.joint == gripper_idx)
             .map(|info| info.close_speed_rad_s)
             .filter(|v| v.is_finite() && *v > 0.0)
@@ -1783,7 +1783,7 @@ impl SupervisorInner {
         }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
-            .and_then(|d| d.with_ref(|drv| drv.gripper_pos_force_info()).flatten())
+            .and_then(|d| d.with_ref(|drv| drv.pos_force().gripper_pos_force_info()).flatten())
             .filter(|info| info.joint == gripper_idx)
             .and_then(|info| info.ceiling_torque_estimate_nm)
             .filter(|v| v.is_finite() && *v > 0.0)

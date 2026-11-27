@@ -7,7 +7,7 @@ mod mit_support;
 
 use std::time::Duration;
 
-use armd::driver::{gripper_drive_from_profile, ArmDriver, DamiaoArmDriver, DamiaoControlMode, GripperDrive, GripperPosForce, JointTarget};
+use armd::driver::{JointModeExt, PosForceExt, gripper_drive_from_profile, ArmDriver, DamiaoArmDriver, DamiaoControlMode, GripperDrive, GripperPosForce, JointTarget};
 use armd::model::{ArmConfig, DamiaoGripperDrive, DamiaoGripperMode};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::transport::{CanFrame, MockClock};
@@ -3597,20 +3597,6 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
             DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true,
                 torque_feedforward: false, enable_feedback: true, load_feedback: false }
         }
-        fn motor_current_cap(&self) -> Option<MotorCurrentCap> {
-            let cap = self.0.lock().unwrap().close_speed_cap?;
-            Some(MotorCurrentCap {
-                joint: J7,
-                mode: "pos_force",
-                current_raw: Some(460),
-                active: true,
-                calibrated: false,
-                ceiling_torque_nm: None,
-                torque_reference: None,
-                close_speed_rad_s: Some(cap),
-                note: "",
-            })
-        }
         fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
         fn is_feedback_valid(&self) -> bool { true }
         fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
@@ -3660,6 +3646,16 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         fn set_torque(&mut self, on: bool) -> Result<(), ArmDriverError> {
             self.0.lock().unwrap().enabled = if on { EnableState::Enabled } else { EnableState::Disabled };
             Ok(())
+        }
+        armd::ext_accessors!(pos_force);
+    }
+    impl armd::driver::PosForceExt for SlowTravelDriver {
+        fn motor_current_cap(&self) -> Option<MotorCurrentCap> {
+            let cap = self.0.lock().unwrap().close_speed_cap?;
+            Some(MotorCurrentCap {
+                joint: J7, mode: "pos_force", current_raw: Some(460), active: true, calibrated: false,
+                ceiling_torque_nm: None, torque_reference: None, close_speed_rad_s: Some(cap), note: "",
+            })
         }
     }
 

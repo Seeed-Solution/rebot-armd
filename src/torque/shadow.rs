@@ -1567,7 +1567,7 @@ impl ShadowRuntime {
         if !self.enabled {
             return;
         }
-        self.drain_driver_staging_into_fifo(|buf| drv.drain_shadow_observations(buf));
+        self.drain_driver_staging_into_fifo(|buf| drv.shadow_mut().drain_shadow_observations(buf));
     }
 
     /// True when the deferred shadow FIFO has reached half capacity and must flush immediately

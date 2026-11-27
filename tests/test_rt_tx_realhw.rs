@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
-use armd::driver::{
+use armd::driver::{BoundedTxExt, JointModeExt, MitExt, PosForceExt,
     is_estop_inhibited, ArmDriver, DamiaoArmDriver, JointTarget,
     TxBatchOutcome, TxBudget, DAMIAO_TX_FRAME_MAX_AGE, DAMIAO_TX_MAX_DURATION,
     DAMIAO_TX_MAX_FRAMES, DAMIAO_TX_RELEASE_PUBLISH_MARGIN,
@@ -89,7 +89,7 @@ impl DualRig {
         let admitted = inner.check_admission(stamp).unwrap();
         SupervisorInner::enable_torque(admitted).expect("initial arm");
         if tx_budget.max_frames != enable_budget.max_frames {
-            inner.driver.as_mut().unwrap().with_mut(|d| d.set_tx_budget(tx_budget)).unwrap();
+            inner.driver.as_mut().unwrap().with_mut(|d| d.tx_mut().set_tx_budget(tx_budget)).unwrap();
         }
         // Only run warmup output ticks when the configured budget can complete a full 7-joint batch
         // in one tick; constrained-budget tests (e.g. max_frames = 4) start armed immediately.
@@ -750,7 +750,7 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
                     .driver
                     .as_mut()
                     .unwrap()
-                    .with_mut(|d| d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) }))
+                    .with_mut(|d| d.tx_mut().set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) }))
                     .unwrap();
                 let stamp = inner.current_admission_stamp();
                 let admitted = inner.check_admission(stamp).unwrap();
@@ -766,7 +766,7 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
                     .driver
                     .as_mut()
                     .unwrap()
-                    .with_mut(|d| d.set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) }))
+                    .with_mut(|d| d.tx_mut().set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) }))
                     .unwrap();
 
                 rig.bus.with(|s| s.push_all_feedback());
@@ -1293,7 +1293,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             // Clear the off-tick pending queue so periodic ticks start fresh from tick 1 without
             // hitting 45 ms expiry early; if off-tick exit had counted as streak 1, then 3 periodic
             // deferred releases would reach streak 4 and trip CAN_TX_STALLED.
-            rig_s2.inner_mut().driver.as_mut().unwrap().write().unwrap().discard_pending_tx();
+            rig_s2.inner_mut().driver.as_mut().unwrap().write().unwrap().tx_mut().discard_pending_tx();
             for tick in 1..=3 {
                 rig_s2.step();
                 assert!(
@@ -1302,7 +1302,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 );
             }
             // Bus clears on next tick after discarding aged frames -> recovers cleanly!
-            rig_s2.inner_mut().driver.as_mut().unwrap().write().unwrap().discard_pending_tx();
+            rig_s2.inner_mut().driver.as_mut().unwrap().write().unwrap().tx_mut().discard_pending_tx();
             rig_s2.bus.with(|s| s.tx_enobufs = false);
             for _ in 0..32 {
                 rig_s2.step();
@@ -1329,7 +1329,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             rig_none.step(); // streak = 2 (< 4)
             assert!(rig_none.inner().safety.state().is_operational());
             if let Some(d) = rig_none.inner_mut().driver.as_mut() {
-                d.write().unwrap().discard_pending_tx();
+                d.write().unwrap().tx_mut().discard_pending_tx();
             }
             rig_none.inner_mut().tracking.recovery_suspended = true;
             rig_none.inner_mut().tracking.recovery_joints.push((0, std::time::Instant::now()));
@@ -1459,7 +1459,7 @@ fn dual_owner_can_tx_stalled_clear_check_requires_drained_tx_queue_and_fresh_fee
         // Run one stopped tick while still backpressured so pending_hold_tx is non-empty.
         rig.step();
         assert!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_tx_len_total() > 0,
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_tx_len_total() > 0,
             "{owner:?}: expected pending hold TX frames while bus is backpressured"
         );
 
@@ -1489,7 +1489,7 @@ fn dual_owner_can_tx_stalled_clear_check_requires_drained_tx_queue_and_fresh_fee
         rig.bus.with(|s| s.tx_enobufs = false);
         rig.step();
         assert_eq!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_tx_len_total(),
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_tx_len_total(),
             0,
             "{owner:?}: expected TX queue drained after bus recovery step"
         );
@@ -1597,7 +1597,7 @@ fn dual_owner_late_output_start_stops_tx_at_release_deadline_and_carries_over() 
             "{owner:?}: TX must stop at release_deadline - margin ({cutoff:?}), observed {tx_end_observed:?}"
         );
         assert_eq!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_motion_tx_len(),
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_motion_tx_len(),
             4,
             "{owner:?}: remaining 4 frames must carry over in pending_tx"
         );
@@ -1608,7 +1608,7 @@ fn dual_owner_late_output_start_stops_tx_at_release_deadline_and_carries_over() 
         rig.bus.with(|s| s.tx_step = Duration::ZERO);
         rig.step();
         assert_eq!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_motion_tx_len(),
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_motion_tx_len(),
             0,
             "{owner:?}: next on-time release must drain carried-over frames"
         );
@@ -1649,7 +1649,7 @@ fn dual_owner_late_output_start_stops_tx_at_release_deadline_and_carries_over() 
             "{owner:?}: output starting past release_deadline - margin must transmit 0 frames"
         );
         assert_eq!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_motion_tx_len(),
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_motion_tx_len(),
             7,
             "{owner:?}: all 7 frames must carry over when output starts past TX cutoff"
         );
@@ -1659,7 +1659,7 @@ fn dual_owner_late_output_start_stops_tx_at_release_deadline_and_carries_over() 
         rig.bus.with(|s| s.tx_step = Duration::ZERO);
         rig.step();
         assert_eq!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_motion_tx_len(),
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_motion_tx_len(),
             0
         );
         assert_eq!(rig.bus.tx_log().len(), 7);
@@ -1695,7 +1695,7 @@ fn dual_owner_can_tx_stalled_clear_requires_tx_probe_and_post_probe_feedback() {
         // Stall handler discarded pending motion frames -> software queue is empty right now,
         // and feedback from the latching tick is fresh, while ENOBUFS still persists!
         assert_eq!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_tx_len_total(),
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_tx_len_total(),
             0,
             "{owner:?}: software TX queue is empty immediately after stall latch"
         );
@@ -1769,7 +1769,7 @@ fn dual_owner_can_tx_stalled_clear_requires_tx_probe_and_post_probe_feedback() {
             s.tx_enobufs = true;
         });
         rig.step(); // stopped-hold hits ENOBUFS -> invalidates probe
-        rig.inner_mut().driver.as_mut().unwrap().write().unwrap().discard_pending_tx();
+        rig.inner_mut().driver.as_mut().unwrap().write().unwrap().tx_mut().discard_pending_tx();
         match &mut rig.owner {
             RigOwner::Legacy(inner) => {
                 let err = inner.clear_fault().unwrap_err().to_string();
@@ -1834,7 +1834,7 @@ fn dual_owner_10hz_single_deferral_does_not_latch_sustained_does() {
             rig.inner().safety.fault()
         );
         assert_eq!(
-            rig.inner().driver.as_ref().unwrap().read().unwrap().pending_motion_tx_len(),
+            rig.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_motion_tx_len(),
             7,
             "{owner:?}: deferred frames should remain queued after single 10 Hz deferral"
         );
@@ -1876,7 +1876,7 @@ fn dual_owner_10hz_single_deferral_does_not_latch_sustained_does() {
             "{owner:?}: recovery tick after single 10 Hz deferral must stay operational"
         );
         assert_eq!(
-            rig_s.inner().driver.as_ref().unwrap().read().unwrap().pending_motion_tx_len(),
+            rig_s.inner().driver.as_ref().unwrap().read().unwrap().tx().pending_motion_tx_len(),
             0
         );
 
@@ -2560,7 +2560,7 @@ impl DualRig {
             SupervisorInner::enable_torque(admitted).expect("initial pos-force arm");
         }
         if tx_budget.max_frames != enable_budget.max_frames {
-            inner.driver.as_mut().unwrap().with_mut(|d| d.set_tx_budget(tx_budget)).unwrap();
+            inner.driver.as_mut().unwrap().with_mut(|d| d.tx_mut().set_tx_budget(tx_budget)).unwrap();
         }
         bus.with(|s| {
             s.immediate_replies = false;
@@ -2813,7 +2813,7 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
             .unwrap()
             .write()
             .unwrap()
-            .set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) });
+            .tx_mut().set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) });
         rig_full.bus.with(|s| {
             s.motors[6].mute_feedback = false;
             s.push_all_feedback();
@@ -2843,7 +2843,7 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
             .unwrap()
             .write()
             .unwrap()
-            .set_tx_budget(tight);
+            .tx_mut().set_tx_budget(tight);
         rig_full.inner_mut()
             .safety
             .trigger_fault_coded(FaultCode::Other, FaultReason::Other("6-frame hold test".into()));
@@ -3418,7 +3418,7 @@ fn dual_owner_stopped_hold_zero_queued_stale_j7_and_dual_slot_backlog() {
                 .unwrap()
                 .read()
                 .unwrap()
-                .pending_hold_tx_len();
+                .tx().pending_hold_tx_len();
             assert_eq!(pending_hold, 0, "{owner:?}: expected 0 queued hold frames");
             let log = rig.bus.tx_log();
             if tick >= 6 {
@@ -4179,7 +4179,7 @@ fn dual_owner_fresh_j7_rx_between_two_stale_outputs_resets_staleness_episode() {
             let _ = g.read_joint_states().unwrap();
             bus.with(|s| s.push_all_feedback());
             let _ = g.read_joint_states().unwrap();
-            assert!(g.pos_force_feedback_fresh(), "{owner:?}: sample #2 must be provably fresh at t=240 ms");
+            assert!(g.pos_force().pos_force_feedback_fresh(), "{owner:?}: sample #2 must be provably fresh at t=240 ms");
         }
         rig.bus.with(|s| s.motors[6].mute_feedback = true);
 
@@ -4361,7 +4361,7 @@ fn dual_owner_mit_j1_j6_posforce_j7_80ms_stall_during_home_continues_mit_frames(
                 armd::driver::JointMode::Position,
             ];
             let drv = rig.inner_mut().driver.as_mut().unwrap();
-            drv.write().unwrap().set_joint_modes(&modes, &holds).expect("switch J1–J6 to MIT");
+            drv.write().unwrap().joint_mode_mut().set_joint_modes(&modes, &holds).expect("switch J1–J6 to MIT");
             rig.bus.with(|s| {
                 s.immediate_replies = false;
                 s.push_all_feedback();
@@ -4829,7 +4829,7 @@ fn dual_owner_stopped_hold_per_motor_lack_of_progress_hard_error_all_expired_and
                     .unwrap()
                     .read()
                     .unwrap()
-                    .pending_hold_tx_len();
+                    .tx().pending_hold_tx_len();
                 assert_eq!(pending_hold, 0, "{owner:?}: all-expired pass must leave pending == 0");
                 if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
                     latched = true;
@@ -5049,8 +5049,8 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
                     .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
                     .collect();
                 let mut drv = rig.inner_mut().driver.as_mut().unwrap().write().unwrap();
-                drv.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
-                drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+                drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+                drv.mit_mut().set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
             }
             rig.inner_mut().mit.owner = MitOwner::Active;
             rig.inner_mut().mit.joints = vec![3];
@@ -5096,7 +5096,7 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
             rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
             rig.step_dt(DT, false);
             assert!(
-                rig.inner().driver.as_ref().unwrap().read().unwrap().mit_fence_trip().is_some(),
+                rig.inner().driver.as_ref().unwrap().read().unwrap().mit().mit_fence_trip_bounded().is_some(),
                 "{owner:?} (estop={is_estop}): 55 ms J7 outage must trip 45 ms MIT fence"
             );
             assert_eq!(
@@ -5800,8 +5800,8 @@ fn dual_owner_single_j7_emitter_covers_all_fenced_and_invalid_target_paths() {
                 .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
                 .collect();
             let mut drv = rig.inner_mut().driver.as_mut().unwrap().write().unwrap();
-            drv.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
-            drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+            drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+            drv.mit_mut().set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
         }
         rig.inner_mut().mit.owner = MitOwner::Active;
         rig.inner_mut().mit.joints = vec![3];
@@ -6414,7 +6414,7 @@ fn dual_owner_r8_m2_tx_priority_by_change_class1_j7_within_ceil_bound_1_2_6() {
                     .unwrap()
                     .write()
                     .unwrap()
-                    .set_tx_budget(TxBudget {
+                    .tx_mut().set_tx_budget(TxBudget {
                         max_frames,
                         max_duration: ms(10),
                         frame_max_age: ms(45),
@@ -6512,7 +6512,7 @@ fn dual_owner_r8_m2_tx_priority_by_change_class1_j7_within_ceil_bound_1_2_6() {
                     .unwrap()
                     .write()
                     .unwrap()
-                    .set_tx_budget(TxBudget {
+                    .tx_mut().set_tx_budget(TxBudget {
                         max_frames,
                         max_duration: ms(10),
                         frame_max_age: ms(45),
@@ -6592,7 +6592,7 @@ fn dual_owner_r8_d1_boot_fallback_no_output_until_fresh_and_stop_before_first_sa
                 .unwrap()
                 .write()
                 .unwrap()
-                .reset_pos_force_boot_state();
+                .pos_force_mut().reset_pos_force_boot_state();
 
             rig.bus.clear_log();
             for _ in 0..3 {
@@ -6652,7 +6652,7 @@ fn dual_owner_r8_d1_boot_fallback_no_output_until_fresh_and_stop_before_first_sa
                 .unwrap()
                 .write()
                 .unwrap()
-                .reset_pos_force_boot_state();
+                .pos_force_mut().reset_pos_force_boot_state();
 
             if is_estop {
                 rig.inner_mut().apply_stop_policy(armd::StopPolicy::EStopLatch);

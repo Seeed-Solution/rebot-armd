@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use armd::auth::{OperatorGrant, OperatorRequirement};
 use armd::diagnostics::alloc::{snapshot_counts, time_this_thread};
-use armd::driver::{gripper_drive_from_profile, ArmDriver, DamiaoArmDriver, TxBudget};
+use armd::driver::{ArmDriver, DamiaoArmDriver, JointModeExt, ModeSwitchExt, TxBudget, gripper_drive_from_profile};
 use armd::model::ArmConfig;
 use armd::motor_mode::{
     AxisTarget, ControlMode, ModeProgress, ModeSwitch, ModeSwitchFailure, ModeSwitchIntent,
@@ -259,9 +259,9 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
     }
     assert_eq!(final_prog, ModeProgress::Confirmed, "6-axis PosVel->Impedance must confirm");
     for j in 0..6 {
-        assert_eq!(ex_drv.get_ref().axis_confirmed_mode(j), Some(ControlMode::Impedance));
+        assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(j), Some(ControlMode::Impedance));
     }
-    assert_eq!(ex_drv.get_ref().mode_write_uncertain_mask(), 0);
+    assert_eq!(ex_drv.get_ref().mode_switch().mode_write_uncertain_mask(), 0);
 
     // Return switch: Impedance -> PositionVelocity (continuous log, no clear_log, no synthetic t0!).
     let to_pv = ModeSwitchPlan::switch_axes(
@@ -293,7 +293,7 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
     }
     assert_eq!(back_prog, ModeProgress::Confirmed, "6-axis Impedance->PosVel must confirm");
     for j in 0..6 {
-        assert_eq!(ex_drv.get_ref().axis_confirmed_mode(j), Some(ControlMode::PositionVelocity));
+        assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(j), Some(ControlMode::PositionVelocity));
     }
 
     // One post-terminal normal control release (verifies gap through handback to normal holds).
@@ -382,7 +382,7 @@ fn fakebus_damiao_timeout_6axis_switch_watchdog_gap_le_40ms_and_zero_alloc() {
         ex_drv
             .get_mut()
             .as_mut()
-            .set_axis_confirmed_mode(6, Some(ControlMode::PositionVelocity));
+            .mode_switch_mut().set_axis_confirmed_mode(6, Some(ControlMode::PositionVelocity));
         bus.clear_log();
         let mut ms_j7_hold = ModeSwitch::new(
             ModeSwitchPlan::switch_axes(&[(1, ControlMode::Impedance)], ModeSwitchRecovery::FailClosed)
@@ -482,12 +482,12 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
     let p_n = step_release_on_exclusive(&mut ex_drv, &mut ms_late, &clock, PERIOD_50HZ, 8, seq);
     assert!(matches!(p_n, ModeProgress::Pending { .. }));
     assert_ne!(
-        ex_drv.get_ref().mode_write_uncertain_mask() & 1,
+        ex_drv.get_ref().mode_switch().mode_write_uncertain_mask() & 1,
         0,
         "driver must mark J1 uncertain immediately at REG_WRITE TX boundary"
     );
     assert_eq!(
-        ex_drv.get_ref().axis_confirmed_mode(0),
+        ex_drv.get_ref().mode_switch().axis_confirmed_mode(0),
         None,
         "driver must clear verified_hold_mode immediately at REG_WRITE TX boundary"
     );
@@ -523,7 +523,7 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
         },
         "must abort fail-closed as Ambiguous when ACK misses predictive watchdog deadline"
     );
-    assert_ne!(ex_drv.get_ref().mode_write_uncertain_mask() & 1, 0);
+    assert_ne!(ex_drv.get_ref().mode_switch().mode_write_uncertain_mask() & 1, 0);
 
     // Restore J1 cleanly for part (c).
     bus.with(|s| {
@@ -532,7 +532,7 @@ fn fakebus_watchdog_budget_first_tight_tx_ack_after_rx_and_readback_gate() {
         s.motors[0].enabled = true;
         s.push_all_feedback();
     });
-    ex_drv.get_mut().as_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
+    ex_drv.get_mut().as_mut().mode_switch_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
 
     // (c) Required post-write readback:
     // - At 50 Hz (2 * 20 + 5 = 45 > 40 ms): refused fail-closed at admission with 0 REG_WRITE frames!
@@ -684,7 +684,7 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
     // (a) Mandatory wire-range check + partial switch causal rollback:
     // J1 ranges verified; J2 ranges unverified and hardware reports mismatched TMAX (99.0 vs configured 28.0).
     // J1 switches to Impedance -> J2 fails mandatory range check BEFORE writing J2 -> J1 rolls back to PosVel!
-    ex_drv.get_mut().as_mut().set_axis_impedance_ranges_verified(1, false);
+    ex_drv.get_mut().as_mut().mode_switch_mut().set_axis_impedance_ranges_verified(1, false);
     bus.with(|s| {
         s.motors[1].regs.insert(damiao::RID_TMAX, 99.0f32.to_le_bytes());
     });
@@ -711,9 +711,9 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
             reason: ModeSwitchFailure::RangeMismatch,
         }
     );
-    assert_eq!(ex_drv.get_ref().axis_confirmed_mode(0), Some(ControlMode::PositionVelocity));
-    assert_eq!(ex_drv.get_ref().axis_confirmed_mode(1), Some(ControlMode::PositionVelocity));
-    assert_eq!(ex_drv.get_ref().mode_write_uncertain_mask(), 0);
+    assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(0), Some(ControlMode::PositionVelocity));
+    assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(1), Some(ControlMode::PositionVelocity));
+    assert_eq!(ex_drv.get_ref().mode_switch().mode_write_uncertain_mask(), 0);
     // Verify J2 NEVER received a REG_WRITE(RID_CTRL_MODE)!
     let j2_writes = bus.with(|s| {
         s.tx_log
@@ -766,14 +766,14 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
             reason: ModeSwitchFailure::TxFailed,
         }
     );
-    assert_ne!(ex_drv.get_ref().mode_write_uncertain_mask() & 1, 0);
-    assert_eq!(ex_drv.get_ref().axis_confirmed_mode(0), None);
+    assert_ne!(ex_drv.get_ref().mode_switch().mode_write_uncertain_mask() & 1, 0);
+    assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(0), None);
     bus.with(|s| {
         s.real_flush = false;
         s.fail_flushes = 0;
         s.motors[0].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL);
     });
-    ex_drv.get_mut().as_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
+    ex_drv.get_mut().as_mut().mode_switch_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
 
     // (c) Duplicate REG_WRITE ACK in the same window -> Ambiguous!
     let dup_ack = CanFrame::new_standard(
@@ -803,14 +803,14 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
             reason: ModeSwitchFailure::AmbiguousReply,
         }
     );
-    assert_eq!(ex_drv.get_ref().axis_confirmed_mode(0), None);
+    assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(0), None);
     bus.with(|s| s.motors[0].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL));
-    ex_drv.get_mut().as_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
+    ex_drv.get_mut().as_mut().mode_switch_mut().set_axis_confirmed_mode(0, Some(ControlMode::PositionVelocity));
 
     // (d) Blocker 3/4: Energized ConfirmOnly contradiction on J7!
     // Driver cache believes J7 is verified PosForce, but motor causally answers POS_VEL.
     // Must invalidate cached PosForce mode & return Ambiguous!
-    assert_eq!(ex_drv.get_ref().axis_confirmed_mode(6), Some(ControlMode::PositionForce));
+    assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(6), Some(ControlMode::PositionForce));
     bus.with(|s| {
         s.motors[6].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL);
     });
@@ -832,12 +832,12 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
         }
     );
     assert_eq!(
-        ex_drv.get_ref().axis_confirmed_mode(6),
+        ex_drv.get_ref().mode_switch().axis_confirmed_mode(6),
         None,
         "contradictory energized ConfirmOnly reply MUST invalidate cached PosForce mode"
     );
     assert!(
-        !ex_drv.get_ref().gripper_pos_force_info().unwrap().active,
+        !ex_drv.get_ref().pos_force().gripper_pos_force_info().unwrap().active,
         "pos_force_verified must be cleared on contradiction"
     );
 
@@ -864,7 +864,7 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
             reason: ModeSwitchFailure::AmbiguousReply,
         }
     );
-    assert!(!ex_drv.get_ref().gripper_pos_force_info().unwrap().active);
+    assert!(!ex_drv.get_ref().pos_force().gripper_pos_force_info().unwrap().active);
 }
 
 // ---------------------------------------------------------------------------
@@ -2025,7 +2025,7 @@ fn confirm_only_reply_contradicting_cached_mode_on_energized_axis_escalates() {
     enable_driver_sync(&mut raw_drv, &bus, Some(&clock));
     let mut ex_drv = ExclusiveDriver::new(Box::new(raw_drv));
     // Driver cache: J1 verified Impedance; wire: J1 is POS_VEL.
-    ex_drv.get_mut().as_mut().set_axis_confirmed_mode(0, Some(ControlMode::Impedance));
+    ex_drv.get_mut().as_mut().mode_switch_mut().set_axis_confirmed_mode(0, Some(ControlMode::Impedance));
     let mut plan = ModeSwitchPlan::empty(ModeSwitchIntent::ConfirmOnly);
     plan.axes[0] = AxisTarget::new(0, ControlMode::PositionVelocity);
     plan.len = 1;
@@ -2048,8 +2048,8 @@ fn confirm_only_reply_contradicting_cached_mode_on_energized_axis_escalates() {
             reason: ModeSwitchFailure::ReadbackMismatch,
         }
     );
-    assert_eq!(ex_drv.get_ref().axis_confirmed_mode(0), None, "contradicting reply must not be published");
-    assert_ne!(ex_drv.get_ref().mode_write_uncertain_mask() & 1, 0, "J1 must be fenced");
+    assert_eq!(ex_drv.get_ref().mode_switch().axis_confirmed_mode(0), None, "contradicting reply must not be published");
+    assert_ne!(ex_drv.get_ref().mode_switch().mode_write_uncertain_mask() & 1, 0, "J1 must be fenced");
 }
 
 /// Major 1: 20 ms accepted gap, 10 ms release, 15 ms proactive interval, 5 ms delivery margin.

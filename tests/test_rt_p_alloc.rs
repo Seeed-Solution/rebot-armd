@@ -236,6 +236,38 @@ impl ArmDriver for ZeroAllocDriver {
         self.read_joint_states_into(out)?;
         Ok((self.dof as u16, false))
     }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        for (i, t) in targets.iter().enumerate().take(self.dof) {
+            self.q[i] = t.position;
+        }
+        Ok(())
+    }
+    fn write_joint_targets_bounded(
+        &mut self,
+        targets: &[JointTarget],
+    ) -> Result<armd::driver::TxBatchOutcome, ArmDriverError> {
+        if self.reject_writes.load(Ordering::Acquire) {
+            return Ok(armd::driver::TxBatchOutcome::Deferred { pending: 1 });
+        }
+        self.write_joint_targets(targets)?;
+        Ok(armd::driver::TxBatchOutcome::Complete)
+    }
+    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+        self.enabled = enable;
+        Ok(())
+    }
+    fn begin_torque_budgeted(&mut self, enable: bool, _max: u16) -> Result<TorqueProgress, ArmDriverError> {
+        self.enabled = enable;
+        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+    fn poll_torque_budgeted(&mut self, _dl: Instant, _max: u16) -> Result<TorqueProgress, ArmDriverError> {
+        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+    fn abort_enable(&mut self) {}
+    fn torque_transition_pending(&self) -> bool { false }
+    armd::ext_accessors!(pos_force);
+}
+impl armd::driver::PosForceExt for ZeroAllocDriver {
     fn gripper_pos_force_info(&self) -> Option<armd::driver::GripperPosForceInfo> {
         self.pos_force_close_speed.map(|s| armd::driver::GripperPosForceInfo {
             joint: 6,
@@ -272,35 +304,6 @@ impl ArmDriver for ZeroAllocDriver {
             pf_status: armd::driver::PosForceTxStatus::Fresh,
         })
     }
-    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-        for (i, t) in targets.iter().enumerate().take(self.dof) {
-            self.q[i] = t.position;
-        }
-        Ok(())
-    }
-    fn write_joint_targets_bounded(
-        &mut self,
-        targets: &[JointTarget],
-    ) -> Result<armd::driver::TxBatchOutcome, ArmDriverError> {
-        if self.reject_writes.load(Ordering::Acquire) {
-            return Ok(armd::driver::TxBatchOutcome::Deferred { pending: 1 });
-        }
-        self.write_joint_targets(targets)?;
-        Ok(armd::driver::TxBatchOutcome::Complete)
-    }
-    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
-        self.enabled = enable;
-        Ok(())
-    }
-    fn begin_torque_budgeted(&mut self, enable: bool, _max: u16) -> Result<TorqueProgress, ArmDriverError> {
-        self.enabled = enable;
-        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
-    }
-    fn poll_torque_budgeted(&mut self, _dl: Instant, _max: u16) -> Result<TorqueProgress, ArmDriverError> {
-        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
-    }
-    fn abort_enable(&mut self) {}
-    fn torque_transition_pending(&self) -> bool { false }
 }
 
 fn drain(handle: &RtExecutorHandle) -> Vec<Reply> {

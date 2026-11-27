@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use armd::auth::OperatorRequirement;
-use armd::driver::{ArmDriver, DamiaoArmDriver};
+use armd::driver::{ArmDriver, CommissioningExt, DamiaoArmDriver};
 use armd::mit::{self, MitJointQualification, MitQualificationFile};
 use armd::model::ArmConfig;
 use armd::protocol::damiao::{self, DamiaoLimits};

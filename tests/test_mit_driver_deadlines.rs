@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use armd::driver::{is_estop_inhibited, ArmDriver, DamiaoArmDriver, JointMode, JointTarget, TorqueOutcome, TorqueProgress};
+use armd::driver::{JointModeExt, MitExt, is_estop_inhibited, ArmDriver, DamiaoArmDriver, JointMode, JointTarget, TorqueOutcome, TorqueProgress};
 use armd::model::ArmConfig;
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::urgent::EstopGate;

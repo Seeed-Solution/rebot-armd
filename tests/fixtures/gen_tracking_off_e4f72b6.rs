@@ -156,12 +156,11 @@ impl ArmDriver for TrackingTestDriver {
         }
         Ok(())
     }
-    fn supports_mit_mode_switch(&self) -> bool {
-        true
-    }
-    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
-        Ok(())
-    }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for TrackingTestDriver {
+    fn supports_mit_mode_switch(&self) -> bool { true }
+    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
 }
 
 #[derive(Serialize)]

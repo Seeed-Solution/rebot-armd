@@ -1,6 +1,6 @@
 //! Damiao set-zero sequence of the motor zero tool. The motors' answers are simulated by
 //! MockCanTransport; this checks the frames armd sends, not the motors' behaviour.
-use armd::driver::{ArmDriver, DamiaoArmDriver};
+use armd::driver::{ArmDriver, CommissioningExt, DamiaoArmDriver};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::transport::{CanFrame, MockCanTransport};
 

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use armd::auth::OperatorRequirement;
-use armd::driver::{
+use armd::driver::{BoundedTxExt, JointModeExt, MitExt, PosForceExt,
     gripper_drive_from_profile, ArmDriver, DamiaoArmDriver, EnableState, TxBudget,
 };
 use armd::model::ArmConfig;
@@ -2048,9 +2048,9 @@ fn j7_continuity_hold_fallback_does_not_count_as_accepted_motion_in_supervisor()
             .as_mut()
             .unwrap()
             .try_with_mut(|d| {
-                d.set_joint_modes(&modes, &base_targets)
+                d.joint_mode_mut().set_joint_modes(&modes, &base_targets)
                     .expect("set MIT modes");
-                d.set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
+                d.mit_mut().set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
                 clock.advance(Duration::from_millis(10));
                 bus.with(|s| {
                     s.tx_log.clear();

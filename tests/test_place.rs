@@ -77,10 +77,11 @@ impl ArmDriver for RecordingArm {
         self.0.lock().unwrap().torqued = enabled;
         Ok(())
     }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for RecordingArm {
     fn supports_mit_mode_switch(&self) -> bool { true }
-    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
-        Ok(())
-    }
+    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
 }
 
 struct Rig {

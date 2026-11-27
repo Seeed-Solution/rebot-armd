@@ -112,10 +112,11 @@ impl ArmDriver for Shared {
     fn motor_status(&self) -> Option<Vec<u8>> { self.0.lock().unwrap().motor_status() }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { self.0.lock().unwrap().motor_status_into(out) }
     fn set_torque_flag(&mut self, e: bool) { self.0.lock().unwrap().set_torque_flag(e) }
-    fn set_pending_rearm(&mut self, p: bool) { self.0.lock().unwrap().set_pending_rearm(p) }
     fn clock_now(&self) -> Instant { self.0.lock().unwrap().clock_now() }
     fn clock_pause(&self, d: Duration) { self.0.lock().unwrap().clock_pause(d) }
+    armd::ext_accessors!(bus_recovery);
 }
+impl armd::driver::BusRecoveryExt for Shared { fn set_pending_rearm(&mut self, p: bool) { self.0.lock().unwrap().set_pending_rearm(p) } }
 
 /// Feedback noise: Gaussian sigma in LSB, clipped to +/- `clip` LSB.
 #[derive(Clone, Copy)]

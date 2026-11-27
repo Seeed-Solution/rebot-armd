@@ -11,7 +11,7 @@ use armd::diagnostics::tick::{
     record_tx_attempt, record_tx_deferred, record_tx_dropped_stale, record_tx_dropped_stopped,
     reset_tx_metrics, thread_usage, TickSample, TickStats, TxAttemptKind, UsageMark,
 };
-use armd::driver::{
+use armd::driver::{BoundedTxExt, JointModeExt, MitExt,
     is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, JointMode, JointTarget,
     TxBatchOutcome, TxBudget,
 };
@@ -981,7 +981,7 @@ fn bounded_hold_and_zero_offset_paths_do_not_allocate_or_free() {
     wrapped.read_joint_states_into(&mut scratch).unwrap();
     let (res, a, f) = counted(|| wrapped.write_estop_hold_bounded(&targets));
     assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
-    assert!(wrapped.last_hold_tx_sent_any());
+    assert!(wrapped.tx_ext().unwrap().last_hold_tx_sent_any());
     assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_estop_hold_bounded Complete touched allocator");
 
     // write_estop_hold_bounded: Deferred
@@ -993,7 +993,7 @@ fn bounded_hold_and_zero_offset_paths_do_not_allocate_or_free() {
     }
     let (res, a, f) = counted(|| wrapped.write_estop_hold_bounded(&targets));
     assert_eq!(res.unwrap(), TxBatchOutcome::Deferred { pending: 4 });
-    assert!(wrapped.last_hold_tx_sent_any());
+    assert!(wrapped.tx_ext().unwrap().last_hold_tx_sent_any());
     assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_estop_hold_bounded Deferred touched allocator");
 }
 
@@ -3009,17 +3009,13 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
                 ..DriverCapabilities::default()
             }
         }
-        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-            Ok(self.states.to_vec())
-        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> { Ok(self.states.to_vec()) }
         fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
             out.clear();
             out.extend_from_slice(&self.states);
             Ok(())
         }
-        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-            Ok(())
-        }
+        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
         fn write_joint_targets_bounded(
             &mut self,
             _targets: &[JointTarget],
@@ -3048,6 +3044,9 @@ fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
             dof == 7 && Duration::from_millis(5) <= max_age
         }
         fn clock_now(&self) -> std::time::Instant { self.clock.now() }
+        armd::ext_accessors!(pos_force);
+    }
+    impl armd::driver::PosForceExt for StubMitBatchDriver {
         fn gripper_pos_force_info(&self) -> Option<GripperPosForceInfo> {
             Some(GripperPosForceInfo {
                 joint: 6,

@@ -5016,7 +5016,7 @@ impl SupervisorInner {
             .and_then(|g| {
                 self.driver
                     .as_ref()
-                    .and_then(|d| d.with_ref(|drv| drv.gripper_pos_force_info()).flatten())
+                    .and_then(|d| d.with_ref(|drv| drv.pos_force().gripper_pos_force_info()).flatten())
                     .filter(|info| info.joint == g)
             });
         self.driver_gripper_close_speed_limit = pf_info
@@ -5164,7 +5164,7 @@ impl SupervisorInner {
         out.control_mode = if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position };
         self.gravity_comp_observation_into(&mut out.gravity_comp);
         match self.read_driver_for_tick() {
-            Some(drv) => drv.with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
+            Some(drv) => drv.joint_mode().with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
             None => out.driver_range_check = None,
         }
         // inline label: setting or clearing it never allocates or frees on the tick
@@ -5464,7 +5464,7 @@ impl SupervisorInner {
                 return Some("driver lacks load feedback for support load limits".into());
             }
             let max_age = Duration::from_millis(policy.feedback_max_age_ms);
-            let ages = driver.feedback_ages();
+            let ages = driver.feedback_ages_snapshot();
             if !self.feedback_numeric_valid
                 || ages.len() != dof
                 || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
@@ -7421,7 +7421,7 @@ impl SupervisorInner {
     /// and initialize owner torque intent to `On` (R10 hold-by-default).
     pub(crate) fn install_driver(&mut self, mut driver: Box<dyn ArmDriver>) {
         driver.set_estop_gate(self.estop_gate());
-        driver.set_external_pos_force_emitter(true);
+        driver.pos_force_mut().set_external_pos_force_emitter(true);
         driver.set_stopped_disable_gate(self.stopped_disable_gate());
         self.driver_clock = driver.driver_clock();
         self.last_valid_motor_rx = [None; crate::model::MAX_MOTION_DOF];
@@ -7432,7 +7432,7 @@ impl SupervisorInner {
         if let Some(pf) = self
             .config
             .gripper_index()
-            .and_then(|g| driver.gripper_pos_force_info().filter(|info| info.joint == g))
+            .and_then(|g| driver.pos_force().gripper_pos_force_info().filter(|info| info.joint == g))
         {
             self.driver_gripper_close_speed_limit =
                 (pf.close_speed_rad_s.is_finite() && pf.close_speed_rad_s > 0.0)
@@ -7475,7 +7475,7 @@ impl SupervisorInner {
         self.torque_intent = crate::supervisor::TorqueIntent::On;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            driver.set_shadow_enabled(self.torque_shadow.is_enabled());
+            driver.shadow_mut().set_shadow_enabled(self.torque_shadow.is_enabled());
             let boot_sync = crate::torque::shadow::LiveBootSync {
                 live_is_torqued: self.is_torqued,
                 live_stopped: self.safety.state().is_stopped(),
@@ -7487,7 +7487,7 @@ impl SupervisorInner {
             };
             self.torque_shadow.reinit_for_driver_synced(
                 &self.config,
-                driver.shadow_vendor_kind(),
+                driver.shadow().shadow_vendor_kind(),
                 driver.driver_clock(),
                 boot_sync,
             );
@@ -7764,7 +7764,7 @@ impl SupervisorInner {
         let Some(d) = self.driver.as_ref() else {
             return false;
         };
-        d.try_with_ref_recover(|drv| !drv.pos_force_feedback_fresh())
+        d.try_with_ref_recover(|drv| !drv.pos_force().pos_force_feedback_fresh())
             .unwrap_or_else(|| self.j7_stale_since.is_some())
     }
 
@@ -7776,7 +7776,7 @@ impl SupervisorInner {
         let raw = self
             .driver
             .as_ref()
-            .and_then(|d| d.try_with_ref_recover(|drv| drv.pos_force_last_fresh_position()).flatten())
+            .and_then(|d| d.try_with_ref_recover(|drv| drv.pos_force().pos_force_last_fresh_position()).flatten())
             .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
             .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
         Some(self.config.limits.get(g).map_or(raw, |l| raw.clamp(l.min_position, l.max_position)))
@@ -7953,8 +7953,8 @@ impl SupervisorInner {
         self.reset_tx_joint_progress();
         if let Some(d) = self.driver.as_mut() {
             let _ = d.try_with_mut(|drv| {
-                drv.discard_pending_tx();
-                drv.clear_tx_probe();
+                drv.tx_mut().discard_pending_tx();
+                drv.tx_mut().clear_tx_probe();
             });
         }
         self.stop_motion();
@@ -8122,7 +8122,7 @@ impl SupervisorInner {
         let j7_effective_hold_or_freeze = j7_is_hold
             || !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
             || intent.stamp.is_stale_against(current_stamp)
-            || !drv.pos_force_feedback_fresh();
+            || !drv.pos_force().pos_force_feedback_fresh();
         let action_cap = cutoff.and_then(|c| c.drv_action_cutoff);
         if j7_effective_hold_or_freeze {
             if let Some(c) = cutoff {
@@ -8133,7 +8133,7 @@ impl SupervisorInner {
         } else if let Some(cap) = action_cap {
             let pre_now = drv.clock_now();
             if matches!(tick_output, TickOutput::ActionDeadlineRefused { .. }) || pre_now >= cap {
-                drv.discard_pending_tx();
+                drv.tx_mut().discard_pending_tx();
                 *allow_output_accepted = false;
                 if !matches!(tick_output, TickOutput::ActionDeadlineRefused { .. }) {
                     *tick_output = TickOutput::ActionDeadlineRefused {
@@ -8145,8 +8145,8 @@ impl SupervisorInner {
             }
         }
         let now = drv.clock_now();
-        let max_age = drv.tx_frame_max_age();
-        let emit_res = drv.emit_pos_force_j7(intent, current_stamp);
+        let max_age = drv.tx().tx_frame_max_age();
+        let emit_res = drv.pos_force_mut().emit_pos_force_j7(intent, current_stamp);
         if !j7_effective_hold_or_freeze
             && matches!(
                 emit_res,
@@ -8164,9 +8164,9 @@ impl SupervisorInner {
                     PosForceEmitOutcome::Deferred { pf_status, .. }
                     | PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. },
                 ) => pf_status,
-                _ => drv.take_last_pos_force_tx_status(),
+                _ => drv.pos_force_mut().take_last_pos_force_tx_status(),
             };
-            drv.discard_pending_tx();
+            drv.tx_mut().discard_pending_tx();
             *allow_output_accepted = false;
             *tick_output = TickOutput::ActionDeadlineRefused {
                 drv_now: refused_now,
@@ -8283,7 +8283,7 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
                             is_hold: j7_is_hold,
                             sent_mask: if j7_is_hold { pf_bit_hold } else { 0 },
@@ -8298,13 +8298,13 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { 0 },
                             is_hold,
                             sent_mask: if is_hold {
                                 sent_mask | pf_bit_hold
                             } else {
-                                drv.last_target_tx_sent_mask()
+                                drv.tx().last_target_tx_sent_mask()
                             },
                             pf_status,
                         };
@@ -8323,7 +8323,7 @@ impl SupervisorInner {
                             pending: pending.saturating_add(1),
                             now,
                             max_age,
-                            oldest_age: oldest_age.or_else(|| drv.oldest_pending_tx_age()),
+                            oldest_age: oldest_age.or_else(|| drv.tx().oldest_pending_tx_age()),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
                             is_hold,
                             sent_mask: if is_hold { sent_mask | pf_bit_hold } else { sent_mask },
@@ -8395,7 +8395,7 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
                             is_hold: j7_is_hold,
                             sent_mask: 0,
@@ -8411,10 +8411,10 @@ impl SupervisorInner {
                             pending: 1,
                             now,
                             max_age,
-                            oldest_age: drv.oldest_pending_tx_age(),
+                            oldest_age: drv.tx().oldest_pending_tx_age(),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { 0 },
                             is_hold,
-                            sent_mask: if is_hold { sent_mask } else { drv.last_target_tx_sent_mask() },
+                            sent_mask: if is_hold { sent_mask } else { drv.tx().last_target_tx_sent_mask() },
                             pf_status,
                         };
                     }
@@ -8432,7 +8432,7 @@ impl SupervisorInner {
                             pending: pending.saturating_add(1),
                             now,
                             max_age,
-                            oldest_age: oldest_age.or_else(|| drv.oldest_pending_tx_age()),
+                            oldest_age: oldest_age.or_else(|| drv.tx().oldest_pending_tx_age()),
                             due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
                             is_hold,
                             sent_mask,
@@ -8502,13 +8502,13 @@ impl SupervisorInner {
                 }
             }
             Err(e) => {
-                if let Some(c) = drv.gripper_pos_force_info() {
+                if let Some(c) = drv.pos_force().gripper_pos_force_info() {
                     hold_status_update = Some((c.joint, JointHoldStatus::UnheldTxFailed));
                 }
                 let pf_bit_hold = drv
-                    .gripper_pos_force_info()
+                    .pos_force().gripper_pos_force_info()
                     .map_or(0, |c| if c.joint.saturating_mul(2) < 64 { 1u64 << (c.joint * 2) } else { 0 });
-                let pf_status = drv.take_last_pos_force_tx_status();
+                let pf_status = drv.pos_force_mut().take_last_pos_force_tx_status();
                 match tick_output {
                     TickOutput::ActionDeadlineRefused { pf_status: dst_pf, .. } => {
                         *dst_pf = pf_status;
@@ -8611,11 +8611,11 @@ impl SupervisorInner {
     ) -> TickOutput {
         use crate::driver::TxBatchOutcome;
         let now = drv.clock_now();
-        let max_age = drv.tx_frame_max_age();
-        let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
-        let due_mask = if is_hold { drv.last_hold_tx_due_mask() } else { 0 };
-        let hold_sent_mask = if is_hold { drv.last_hold_tx_sent_mask() } else { 0 };
-        let pf_status = drv.take_last_pos_force_tx_status();
+        let max_age = drv.tx().tx_frame_max_age();
+        let hold_sent_any = is_hold && drv.tx().last_hold_tx_sent_any();
+        let due_mask = if is_hold { drv.tx().last_hold_tx_due_mask() } else { 0 };
+        let hold_sent_mask = if is_hold { drv.tx().last_hold_tx_sent_mask() } else { 0 };
+        let pf_status = drv.pos_force_mut().take_last_pos_force_tx_status();
         match write_res {
             Ok(TxBatchOutcome::Complete) => TickOutput::Complete {
                 is_hold,
@@ -8629,10 +8629,10 @@ impl SupervisorInner {
                 pending,
                 now,
                 max_age,
-                oldest_age: drv.oldest_pending_tx_age(),
+                oldest_age: drv.tx().oldest_pending_tx_age(),
                 due_mask,
                 is_hold,
-                sent_mask: if is_hold { hold_sent_mask } else { drv.last_target_tx_sent_mask() },
+                sent_mask: if is_hold { hold_sent_mask } else { drv.tx().last_target_tx_sent_mask() },
                 pf_status,
             },
             Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
@@ -8640,7 +8640,7 @@ impl SupervisorInner {
                 pending,
                 now,
                 max_age,
-                oldest_age: drv.last_tx_expired_age(),
+                oldest_age: drv.tx().last_tx_expired_age(),
                 due_mask,
                 sent_mask: hold_sent_mask,
                 is_hold,
@@ -8793,7 +8793,7 @@ impl SupervisorInner {
         let notified = self
             .driver
             .as_mut()
-            .and_then(|d| d.try_with_mut(|drv| drv.notify_bus_loss()).ok())
+            .and_then(|d| d.try_with_mut(|drv| drv.bus_recovery_mut().notify_bus_loss()).ok())
             .is_some();
         if !notified && self.driver.is_some() {
             self.pending_driver_bus_loss_notify = true;
@@ -9115,20 +9115,20 @@ impl SupervisorInner {
         }
         let mut effective_hold = is_hold || fence.estop_latched();
         let write_res = if effective_hold {
-            drv.set_output_lease_gen(0);
+            drv.tx_mut().set_output_lease_gen(0);
             drv.write_estop_hold_bounded(targets)
         } else {
-            drv.set_output_lease_gen(output_lease_gen);
+            drv.tx_mut().set_output_lease_gen(output_lease_gen);
             if fence.estop_latched() {
-                drv.set_output_lease_gen(0);
+                drv.tx_mut().set_output_lease_gen(0);
                 effective_hold = true;
                 drv.write_estop_hold_bounded(targets)
             } else if fence.blocks_non_hold() {
-                drv.set_output_lease_gen(0);
+                drv.tx_mut().set_output_lease_gen(0);
                 return None;
             } else {
                 let r = drv.write_joint_targets_bounded(targets);
-                drv.set_output_lease_gen(0);
+                drv.tx_mut().set_output_lease_gen(0);
                 r
             }
         };
@@ -9233,7 +9233,7 @@ impl SupervisorInner {
         self.driver
             .as_ref()
             .and_then(|d| {
-                d.try_with_ref_recover(|drv| drv.tx_budget_max_frames())
+                d.try_with_ref_recover(|drv| drv.tx().tx_budget_max_frames())
                     .flatten()
             })
             .unwrap_or(cfg_max)
@@ -9257,8 +9257,8 @@ impl SupervisorInner {
         let rx_rem = budget.rx_remaining();
         let tx_rem = budget.tx_remaining();
         let apply = |drv: &mut dyn ArmDriver| {
-            let before = drv.release_budget_consumed();
-            drv.sync_release_budget_limits(rx_rem, tx_rem);
+            let before = drv.tx().release_budget_consumed();
+            drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
             before
         };
         d.try_with_mut(apply).ok()
@@ -9283,7 +9283,7 @@ impl SupervisorInner {
                 let after = self
                     .driver
                     .as_ref()
-                    .and_then(|d| d.try_with_ref_recover(|drv| drv.release_budget_consumed()))
+                    .and_then(|d| d.try_with_ref_recover(|drv| drv.tx().release_budget_consumed()))
                     .unwrap_or(before);
                 (
                     after.0.saturating_sub(before.0).max(reported_rx),
@@ -9540,10 +9540,10 @@ impl SupervisorInner {
                     .copied()
                     .try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
                 let gate = if is_pf {
-                    let stale = !d.pos_force_feedback_fresh();
+                    let stale = !d.pos_force().pos_force_feedback_fresh();
                     let freeze_pos = self.config.gripper_index().and_then(|g| {
                         let raw = d
-                            .pos_force_last_fresh_position()
+                            .pos_force().pos_force_last_fresh_position()
                             .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
                             .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
                         Some(
@@ -9561,7 +9561,7 @@ impl SupervisorInner {
                 let urgent_wake = if torque_poll.is_some() || park_wake.is_some() {
                     let owner_now = now_fn();
                     let drv_now = d.clock_now();
-                    d.next_watchdog_hold_wake()
+                    d.tx().next_watchdog_hold_wake()
                         .map(|w| owner_now + w.saturating_duration_since(drv_now))
                 } else {
                     None
@@ -9682,7 +9682,7 @@ impl SupervisorInner {
                                     == driver_transitions::EnableLifecycle::FailedHold
                             {
                                 driver
-                                    .service_pending_refresh()
+                                    .bus_recovery_mut().service_pending_refresh()
                                     .map(|()| (frames, exhausted))
                             } else {
                                 Ok((frames, exhausted))
@@ -9729,7 +9729,7 @@ impl SupervisorInner {
                     Ok((frames, exhausted)) => {
                         out.rx_frames = frames;
                         out.budget_exhausted = exhausted;
-                        driver.take_recovery_writes_into(&mut sc.recovered);
+                        driver.joint_mode_mut().take_recovery_writes_into(&mut sc.recovered);
                         let has_loads = driver.joint_loads_into(&mut sc.loads);
                         self.feedback_numeric_valid = Self::states_valid(
                             &sc.states,
@@ -9912,7 +9912,7 @@ impl SupervisorInner {
                     }
                 }
                 if self.pending_driver_bus_loss_notify {
-                    driver.notify_bus_loss();
+                    driver.bus_recovery_mut().notify_bus_loss();
                     self.pending_driver_bus_loss_notify = false;
                 }
                 if self.is_torqued
@@ -9933,7 +9933,7 @@ impl SupervisorInner {
                 // R1/B2: Sync MIT ownership loss before capturing hold-mode verification so
                 // MIT-configured joints in verified `PosVel` fall back to position-mode holds
                 // while joints still in `Mit` mode enter L2's 200 ms readback -> fault bound.
-                driver.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
+                driver.mit_mut().set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
                 // R1: Refresh the owner-held driver snapshot while already holding the driver
                 // so stopped-hold capture and MIT stopped-hold preparation never lock
                 // `self.driver` or allocate.
@@ -10769,7 +10769,7 @@ impl SupervisorInner {
                         && self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50))
                         && driver.is_feedback_valid();
                     let caps = driver.capabilities();
-                    let pf = driver.gripper_pos_force_info().filter(|info| info.joint == g_idx);
+                    let pf = driver.pos_force().gripper_pos_force_info().filter(|info| info.joint == g_idx);
                     (fresh, caps.torque_feedback, caps.load_feedback, pf)
                 } else {
                     (false, false, false, None)
@@ -12466,7 +12466,7 @@ impl SupervisorInner {
                 }
                 let lease_gen = self.current_active_lease_gen();
                 if let Some(mut drv) = self.write_driver_for_tick() {
-                    drv.set_output_lease_gen(lease_gen);
+                    drv.tx_mut().set_output_lease_gen(lease_gen);
                     drv.defer_motion_targets_past_cutoff(&sc.targets);
                 }
                 self.scratch = sc;
@@ -13015,7 +13015,7 @@ impl SupervisorInner {
                     if let Some(cap) = release_cap {
                         drv.set_tx_release_deadline(Some(cap));
                     }
-                    drv.set_pending_pos_force_hold_hint(true);
+                    drv.pos_force_mut().set_pending_pos_force_hold_hint(true);
                     let mut unverified_mask = 0u64;
                     if hold_mask != 0 {
                         if let Ok(report) =
@@ -13033,7 +13033,7 @@ impl SupervisorInner {
                         }
                     }
                     if unverified_mask != 0 {
-                        let _ = drv.request_mode_readback_budgeted(unverified_mask);
+                        let _ = drv.joint_mode_mut().request_mode_readback_budgeted(unverified_mask);
                     }
                     shadow_rt.drain_from_driver(drv);
                 };
@@ -13161,7 +13161,7 @@ impl SupervisorInner {
             && self.max_tx_joint_no_progress_ticks() > 0
             && self
                 .read_driver_for_tick()
-                .is_some_and(|drv| drv.pending_motion_tx_len() > 0);
+                .is_some_and(|drv| drv.tx().pending_motion_tx_len() > 0);
         let j7_stale = tick_output.j7_stale();
         let batch_completed = self.classify_tick_output(tick_output, true, has_pending_motion);
 
@@ -13743,7 +13743,7 @@ impl SupervisorInner {
         if let Some(machine) = self.mode_switch.machine.as_ref() {
             let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
                 let mut m = 0u32;
-                let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+                let _ = slot.try_with_ref(|d| m = d.mode_switch().mode_write_uncertain_mask());
                 m
             });
             return Some(machine.snapshot(sid.0, drv_uncertain));
@@ -13813,7 +13813,7 @@ impl SupervisorInner {
     pub(crate) fn driver_supports_nonblocking_mode_switch(&self) -> bool {
         self.driver
             .as_ref()
-            .is_some_and(|d| d.try_with_ref(|drv| drv.supports_nonblocking_mode_switch()).unwrap_or(false))
+            .is_some_and(|d| d.try_with_ref(|drv| drv.mode_switch().supports_nonblocking_mode_switch()).unwrap_or(false))
     }
 
     /// True when any exclusive PR0B session (e.g. `ModeSwitch` or `Commissioning`) owns output
@@ -13917,7 +13917,7 @@ impl SupervisorInner {
         if let Some(slot) = self.driver.as_ref() {
             let mut budget_ok = Ok(());
             let _ = slot.try_with_ref(|drv| {
-                budget_ok = drv.check_watchdog_tx_budget_for_energized();
+                budget_ok = drv.tx().check_watchdog_tx_budget_for_energized();
             });
             if budget_ok.is_err() {
                 retire_terminal(&mut terminal, retired);
@@ -14020,7 +14020,7 @@ impl SupervisorInner {
             }
         }
         if let Some(slot) = self.driver.as_mut() {
-            let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(plan_mask));
+            let _ = slot.try_with_mut(|drv| drv.mode_switch_mut().set_mode_switch_active_mask(plan_mask));
         }
         self.install_mode_switch_session(
             sid,
@@ -14046,7 +14046,7 @@ impl SupervisorInner {
     ) -> Option<crate::motor_mode::ModeSwitchSnapshot> {
         let drv_uncertain = self.driver.as_ref().map_or(0, |slot| {
             let mut m = 0u32;
-            let _ = slot.try_with_ref(|d| m = d.mode_write_uncertain_mask());
+            let _ = slot.try_with_ref(|d| m = d.mode_switch().mode_write_uncertain_mask());
             m
         });
         if let (Some(sid), Some(machine)) =
@@ -14091,7 +14091,7 @@ impl SupervisorInner {
         uncertain: bool,
     ) {
         if let Some(slot) = self.driver.as_mut() {
-            let _ = slot.try_with_mut(|drv| drv.set_mode_switch_active_mask(0));
+            let _ = slot.try_with_mut(|drv| drv.mode_switch_mut().set_mode_switch_active_mask(0));
         }
         match purpose {
             ModeSwitchPurpose::Standalone => {}
@@ -14128,7 +14128,7 @@ impl SupervisorInner {
             let mut p = None;
             let _ = slot.try_with_mut(|drv| {
                 p = Some(machine.reconcile_external_revocation(Some(drv), reason, stop_applied));
-                drv_uncertain = drv.mode_write_uncertain_mask();
+                drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
             });
             p.unwrap_or_else(|| machine.reconcile_external_revocation(None, reason, stop_applied))
         } else {
@@ -14362,10 +14362,10 @@ impl SupervisorInner {
                 if matches!(
                     purpose,
                     ModeSwitchPurpose::MitActivate { .. } | ModeSwitchPurpose::MitHandBack { .. }
-                ) && drv.mit_fence_trip_bounded().is_some()
+                ) && drv.mit().mit_fence_trip_bounded().is_some()
                 {
                     mit_fence_tripped = true;
-                    drv_uncertain = drv.mode_write_uncertain_mask();
+                    drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
                     out = machine.reconcile_external_revocation(
                         Some(drv),
                         ModeSwitchFailure::WatchdogBudgetBreached,
@@ -14377,7 +14377,7 @@ impl SupervisorInner {
                     translate_driver_cutoff_conservative(drv, effective_cutoff, &mut *owner_now_fn)
                 else {
                     out = ModeProgress::Pending { wake: None };
-                    drv_uncertain = drv.mode_write_uncertain_mask();
+                    drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
                     return;
                 };
                 let mut drv_ledger = crate::rt_core::budget::ReleaseBudget::new(
@@ -14417,18 +14417,18 @@ impl SupervisorInner {
                 ms_rx_used = drv_ledger.rx_used();
                 ms_rx_exhausted = drv_ledger.rx_exhausted();
                 ms_tx_used = drv_ledger.tx_used();
-                drv_uncertain = drv.mode_write_uncertain_mask();
+                drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
                 if matches!(
                     purpose,
                     ModeSwitchPurpose::MitActivate { .. } | ModeSwitchPurpose::MitHandBack { .. }
                 ) {
-                    mit_fence_tripped = drv.mit_fence_trip_bounded().is_some();
+                    mit_fence_tripped = drv.mit().mit_fence_trip_bounded().is_some();
                     if let ModeSwitchPurpose::MitHandBack { mask, .. } = purpose {
                         if !mit_fence_tripped && !out.is_terminal() {
                             // Supply genuine oldest committed control-frame TX timestamp across
                             // the handback axes so `mit_supervise()` observes real committed holds
                             // rather than declaring ownership lost during a healthy multi-tick handback.
-                            handback_committed_tx = drv.mit_min_last_ctrl_tx(mask);
+                            handback_committed_tx = drv.mit().mit_min_last_ctrl_tx(mask);
                         }
                     }
                 }
@@ -19026,7 +19026,7 @@ impl ArmSupervisor {
             inner.loads = vec![f32::NAN; inner.config.dof];
         }
         if let Ok(states) = drv.read_joint_states() {
-            let loads = drv.joint_loads();
+            let loads = drv.joint_loads_snapshot();
             if !states.is_empty() && drv.is_feedback_valid() && SupervisorInner::states_valid(&states, caps, inner.config.dof, loads.as_deref()) {
                 inner.sync_driver_feedback(&states, loads.as_deref());
                 for (i, s) in states.iter().enumerate().take(inner.config.dof) {
@@ -19064,7 +19064,7 @@ impl ArmSupervisor {
                 driver.set_estop_state(self.estop_state.clone());
                 driver.set_estop_gate(inner.estop_gate());
                 driver.set_gripper_index(inner.config.gripper_index());
-                driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
+                driver.joint_mode_mut().set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
                 let caps = driver.capabilities();
                 if caps.load_feedback {
                     inner.loads = vec![f32::NAN; inner.config.dof];
@@ -23397,28 +23397,19 @@ mod observation_snapshot_tests {
             fn supports_rt_executor(&self) -> Result<(), &'static str> {
                 Ok(())
             }
-            fn is_feedback_valid(&self) -> bool {
-                true
-            }
-            fn is_enabled(&self) -> bool {
-                true
-            }
-            fn enable_state(&self) -> EnableState {
-                EnableState::Enabled
-            }
-            fn feedback_ages(&self) -> Vec<Option<Duration>> {
-                vec![Some(Duration::from_millis(1)); self.dof]
-            }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn is_enabled(&self) -> bool { true }
+            fn enable_state(&self) -> EnableState { EnableState::Enabled }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
             fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
                 out.clear();
                 out.resize(self.dof, Some(Duration::from_millis(1)));
             }
-            fn feedback_instants(&self) -> Vec<Option<Instant>> {
-                vec![Some(Instant::now()); self.dof]
-            }
-            fn feedback_seqs(&self) -> Vec<u64> {
-                vec![1; self.dof]
-            }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
+            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+            crate::ext_accessors!(pos_force);
+        }
+        impl crate::driver::PosForceExt for ObservableReleaseDriver {
             fn emit_pos_force_j7(
                 &mut self,
                 _intent: PosForceIntent,
@@ -23644,12 +23635,6 @@ mod observation_snapshot_tests {
             fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
                 Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
             }
-            fn set_output_lease_gen(&mut self, gen: u64) {
-                self.last_lease_gen.store(gen, Ordering::SeqCst);
-                if matches!(self.inject_at, InjectPoint::SetOutputLeaseGen) && gen != 0 {
-                    self.pending_disconnect_hold.fetch_add(1, Ordering::SeqCst);
-                }
-            }
             fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
                 self.writes.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -23673,6 +23658,15 @@ mod observation_snapshot_tests {
             fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
             fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
             fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+            crate::ext_accessors!(tx);
+        }
+        impl crate::driver::BoundedTxExt for DisconnectInjectDriver {
+            fn set_output_lease_gen(&mut self, gen: u64) {
+                self.last_lease_gen.store(gen, Ordering::SeqCst);
+                if matches!(self.inject_at, InjectPoint::SetOutputLeaseGen) && gen != 0 {
+                    self.pending_disconnect_hold.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
 
         let make_run = |phase: GravityCompPhase, lease_generation: Option<u64>| GravityCompRun {
@@ -23795,12 +23789,6 @@ mod observation_snapshot_tests {
                 fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
                     Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
                 }
-                fn set_output_lease_gen(&mut self, gen: u64) {
-                    self.last_lease_gen.store(gen, Ordering::SeqCst);
-                    if self.inject_in_setter && gen != 0 {
-                        self.estop_state.request_and_latch();
-                    }
-                }
                 fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
                     self.writes.fetch_add(1, Ordering::SeqCst);
                     Ok(())
@@ -23824,6 +23812,15 @@ mod observation_snapshot_tests {
                 fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
                 fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
                 fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+                crate::ext_accessors!(tx);
+            }
+            impl crate::driver::BoundedTxExt for EstopInjectDriver {
+                fn set_output_lease_gen(&mut self, gen: u64) {
+                    self.last_lease_gen.store(gen, Ordering::SeqCst);
+                    if self.inject_in_setter && gen != 0 {
+                        self.estop_state.request_and_latch();
+                    }
+                }
             }
 
             let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
@@ -23897,17 +23894,11 @@ mod observation_snapshot_tests {
             }
             fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
             fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
-            fn probe_tx_ready_budgeted(&mut self, _deadline: Instant) -> Result<bool, ArmDriverError> {
-                self.tx_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(true)
-            }
             fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
                 self.tx_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
             fn has_hardware_fault(&self) -> bool { self.hw_fault }
-            fn tx_probe_pending(&self) -> bool { false }
-            fn tx_probe_confirmed(&self) -> bool { !self.tx_probe_pending }
             fn is_feedback_valid(&self) -> bool { true }
             fn is_enabled(&self) -> bool { false }
             fn enable_state(&self) -> EnableState { EnableState::Disabled }
@@ -23918,6 +23909,15 @@ mod observation_snapshot_tests {
             }
             fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(self.clock.now()); self.dof] }
             fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+            crate::ext_accessors!(tx);
+        }
+        impl crate::driver::BoundedTxExt for ExpiryProbeDriver {
+            fn probe_tx_ready_budgeted(&mut self, _deadline: Instant) -> Result<bool, ArmDriverError> {
+                self.tx_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            }
+            fn tx_probe_pending(&self) -> bool { false }
+            fn tx_probe_confirmed(&self) -> bool { !self.tx_probe_pending }
         }
 
         // Test BOTH budgeted TX probe and budgeted hardware reset when owner clock reaches

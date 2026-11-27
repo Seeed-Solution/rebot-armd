@@ -131,6 +131,9 @@ impl ArmDriver for SimArm {
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
         if self.0.lock().unwrap().hw_fault { Err(ArmDriverError::HardwareFault("Joint 3 reported fault: Overload".into())) } else { Ok(()) }
     }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for SimArm {
     fn supports_mit_mode_switch(&self) -> bool { true }
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut s = self.0.lock().unwrap();

@@ -1,7 +1,7 @@
 //! Damiao per-joint control-mode switch (POS_VEL <-> MIT) used by gravity compensation.
 //! Frame layouts follow Damiao's DM_CAN reference library; the motors' answers here are
 //! simulated by MockCanTransport and are not a hardware verification.
-use armd::driver::{ArmDriver, DamiaoArmDriver, DamiaoControlMode, JointMode, JointTarget};
+use armd::driver::{ArmDriver, BusRecoveryExt, DamiaoArmDriver, DamiaoControlMode, JointMode, JointModeExt, JointTarget};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::transport::{CanFrame, MockCanTransport};
 

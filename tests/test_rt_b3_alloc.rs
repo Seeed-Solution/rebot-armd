@@ -21,7 +21,7 @@ use armd::diagnostics::tick::{
     TickSample, RELEASE_FLAG_CLEAR_OK, RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED,
     RELEASE_FLAG_INJECT_ALLOC, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
-use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget, StoppedDisableGate};
+use armd::driver::{MitExt, ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget, StoppedDisableGate};
 use armd::model::JointState;
 use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks};
@@ -3801,6 +3801,9 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
         }
         fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
         fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        armd::ext_accessors!(mit);
+    }
+    impl armd::driver::MitExt for CachedMitRecoveryDriver {
         fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
             // Simulate J4 expired (0x0D), others enabled (1) -> triggers MIT expiry recovery path.
             let mut st = vec![1u8; self.dof];
@@ -3812,10 +3815,7 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
             // Intentionally does NOT advance `self.seqs` (simulates stale/cached readback).
             Ok(())
         }
-        fn mit_expiry_recover_with_gate(
-            &mut self,
-            pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
-        ) -> Result<(), String> {
+        fn mit_expiry_recover_with_gate(&mut self, pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>) -> Result<(), String> {
             pre_tx_gate().map_err(|e| e.to_string())?;
             self.mit_expiry_recover()
         }
@@ -3922,8 +3922,6 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
                 load_feedback: false,
             }
         }
-        fn supports_mit_mode_switch(&self) -> bool { true }
-        fn set_joint_modes(&mut self, _: &[armd::driver::JointMode], _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
         fn enable_state(&self) -> EnableState { EnableState::Enabled }
         fn is_feedback_valid(&self) -> bool { true }
         fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); self.dof] }
@@ -3932,9 +3930,7 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
             for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
         }
         fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
-        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
-            joints.iter().all(|&j| j < self.dof)
-        }
+        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool { joints.iter().all(|&j| j < self.dof) }
         fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
             out.clear();
             for _ in 0..self.dof { out.push(Some(0)); }
@@ -3981,12 +3977,16 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
         fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
             let mut dst = self.last_targets.lock().unwrap();
             for (d, s) in dst.iter_mut().zip(targets.iter()) { *d = s.clone(); }
-            self.estop_hold_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            self.estop_hold_count.fetch_add(1, Ordering::Relaxed); Ok(())
         }
         fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
         fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
         fn clock_now(&self) -> Instant { self.clock.now() }
+        armd::ext_accessors!(joint_mode);
+    }
+    impl armd::driver::JointModeExt for CollisionAndGravityDriver {
+        fn supports_mit_mode_switch(&self) -> bool { true }
+        fn set_joint_modes(&mut self, _: &[armd::driver::JointMode], _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
     }
 
     let mut cfg = ArmConfig::rebot_dm();

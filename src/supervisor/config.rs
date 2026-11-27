@@ -98,7 +98,7 @@ impl SupervisorInner {
                 .with_mut(|drv| {
                     #[cfg(not(target_arch = "wasm32"))]
                     shadow_rt.drain_from_driver(drv);
-                    drv.set_joint_zero_offsets(offsets);
+                    drv.joint_zero_mut().set_joint_zero_offsets(offsets);
                     (0..dof).any(|i| drv.position_limits(i).is_some())
                 })
                 .ok_or_else(|| "driver unavailable".to_string())?;
@@ -176,7 +176,7 @@ impl SupervisorInner {
         if joint == 5 { self.zero_convention = Default::default(); }
         self.zero_check_pending = true;
         match self.driver.as_mut() {
-            Some(d) => d.with_mut(|drv| drv.set_zero_position(joint)).ok_or_else(|| "driver unavailable".to_string())?.map_err(|e| e.to_string()),
+            Some(d) => d.with_mut(|drv| drv.commissioning_mut().set_zero_position(joint)).ok_or_else(|| "driver unavailable".to_string())?.map_err(|e| e.to_string()),
             None => {
                 // the simulated motor reads 0: the joint reads 0 - its joint zero offset
                 let r = -self.joint_zero_offsets.get(joint).copied().unwrap_or(0.0);

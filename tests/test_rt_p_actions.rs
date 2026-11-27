@@ -4147,15 +4147,9 @@ impl armd::driver::ArmDriver for RecordingHoldDriver {
     fn clock_now(&self) -> Instant { self.now() }
     fn enable_state(&self) -> armd::driver::EnableState { armd::driver::EnableState::Enabled }
     fn is_feedback_valid(&self) -> bool { true }
-    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool {
-        self.q.lock().unwrap().len() == dof
-    }
-    fn feedback_instants(&self) -> Vec<Option<Instant>> {
-        vec![Some(self.now()); self.q.lock().unwrap().len()]
-    }
-    fn feedback_seqs(&self) -> Vec<u64> {
-        vec![10; self.q.lock().unwrap().len()]
-    }
+    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool { self.q.lock().unwrap().len() == dof }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(self.now()); self.q.lock().unwrap().len()] }
+    fn feedback_seqs(&self) -> Vec<u64> { vec![10; self.q.lock().unwrap().len()] }
     fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
         let ms = self.read_sleep_ms.load(std::sync::atomic::Ordering::SeqCst);
         if ms > 0 {
@@ -4187,9 +4181,10 @@ impl armd::driver::ArmDriver for RecordingHoldDriver {
         Ok(armd::driver::TxBatchOutcome::Complete)
     }
     fn set_torque(&mut self, _enable: bool) -> Result<(), armd::driver::ArmDriverError> { Ok(()) }
-    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
-        *self.armed_cutoff.lock().unwrap() = deadline;
-    }
+    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { *self.armed_cutoff.lock().unwrap() = deadline; }
+    armd::ext_accessors!(pos_force);
+}
+impl armd::driver::PosForceExt for RecordingHoldDriver {
     fn gripper_pos_force_info(&self) -> Option<armd::driver::GripperPosForceInfo> {
         if let Some(cap) = *self.armed_cutoff.lock().unwrap() {
             let mut guard = self.bump_when_cutoff_le.lock().unwrap();
@@ -4610,7 +4605,6 @@ impl armd::driver::ArmDriver for LockCriticalSectionDriver {
     fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_receive_instants_into(out) }
     fn feedback_seqs_into(&self, out: &mut Vec<u64>) { self.inner.feedback_seqs_into(out) }
     fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_queue_bounds_into(out) }
-    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { self.inner.take_recovery_writes_into(out) }
     fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
         self.inner.read_joint_states()
     }
@@ -4643,11 +4637,15 @@ impl armd::driver::ArmDriver for LockCriticalSectionDriver {
     ) -> Result<armd::driver::TxBatchOutcome, armd::driver::ArmDriverError> {
         self.inner.write_estop_hold_bounded(targets)
     }
-    fn discard_pending_tx(&mut self) { armd::driver::ArmDriver::discard_pending_tx(&mut self.inner); }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
         self.armed_cutoff = deadline;
         self.inner.set_tx_release_deadline(deadline);
     }
+    fn set_torque(&mut self, enable: bool) -> Result<(), armd::driver::ArmDriverError> { self.inner.set_torque(enable) }
+    armd::ext_accessors!(tx, joint_mode, pos_force);
+}
+impl armd::driver::BoundedTxExt for LockCriticalSectionDriver {
+    fn discard_pending_tx(&mut self) { armd::driver::BoundedTxExt::discard_pending_tx(&mut self.inner); }
     fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
     fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
     fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }
@@ -4655,9 +4653,11 @@ impl armd::driver::ArmDriver for LockCriticalSectionDriver {
     fn pending_hold_tx_len(&self) -> usize { self.inner.pending_hold_tx_len() }
     fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
-    fn set_torque(&mut self, enable: bool) -> Result<(), armd::driver::ArmDriverError> {
-        self.inner.set_torque(enable)
-    }
+}
+impl armd::driver::JointModeExt for LockCriticalSectionDriver {
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { self.inner.take_recovery_writes_into(out) }
+}
+impl armd::driver::PosForceExt for LockCriticalSectionDriver {
     fn gripper_pos_force_info(&self) -> Option<armd::driver::GripperPosForceInfo> {
         if let Some(cap) = self.armed_cutoff {
             let mut guard = self.bump_when_cutoff_le.lock().unwrap();

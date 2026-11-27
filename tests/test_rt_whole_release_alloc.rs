@@ -21,7 +21,7 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use armd::diagnostics::alloc::{self, AllocCounts, TimedAlloc};
-use armd::driver::{
+use armd::driver::{ModeSwitchExt,
     ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, TorqueOutcome,
     TorqueProgress,
 };

@@ -116,6 +116,9 @@ impl ArmDriver for StopArm {
         s.mit = false;
         Ok(())
     }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for StopArm {
     fn supports_mit_mode_switch(&self) -> bool { true }
     fn set_joint_modes(&mut self, modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         self.0.lock().unwrap().mit = modes.iter().take(6).any(|m| *m == JointMode::Mit);

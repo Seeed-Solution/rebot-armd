@@ -108,9 +108,6 @@ impl ArmDriver for DropWatchDamiao {
     fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
         self.inner.fresh_measured_sample_for(joint, max_age)
     }
-    fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-        self.inner.joint_hold_mode_verified(joint)
-    }
     fn is_feedback_valid(&self) -> bool {
         self.inner.is_feedback_valid()
     }
@@ -153,12 +150,6 @@ impl ArmDriver for DropWatchDamiao {
     fn supports_budgeted_disable_await(&self) -> bool {
         self.inner.supports_budgeted_disable_await()
     }
-    fn set_enable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
-        self.inner.set_enable_authority(deadline, expected_lease_gen);
-    }
-    fn set_disable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
-        self.inner.set_disable_authority(deadline, expected_lease_gen);
-    }
     fn driver_clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
         self.inner.driver_clock()
     }
@@ -173,9 +164,6 @@ impl ArmDriver for DropWatchDamiao {
     }
     fn begin_control_release(&mut self, release_id: u64) {
         self.inner.begin_control_release(release_id);
-    }
-    fn set_output_lease_gen(&mut self, lease_gen: u64) {
-        self.inner.set_output_lease_gen(lease_gen);
     }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         self.inner.read_joint_states()
@@ -232,9 +220,6 @@ impl ArmDriver for DropWatchDamiao {
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.inner.begin_disable_torque(kind)
     }
-    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> {
-        self.inner.finish_dispatched_disable()
-    }
     fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
         self.inner.poll_torque(deadline)
     }
@@ -258,13 +243,6 @@ impl ArmDriver for DropWatchDamiao {
         max_rx_frames: u16,
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.inner.poll_torque_budgeted(deadline, max_rx_frames)
-    }
-    fn panic_disable_step(
-        &mut self,
-        first: bool,
-        deadline: Instant,
-    ) -> Option<Result<Vec<usize>, ArmDriverError>> {
-        self.inner.panic_disable_step(first, deadline)
     }
     fn unconfirmed_disable_joints(&self) -> Vec<usize> {
         self.inner.unconfirmed_disable_joints()
@@ -298,6 +276,29 @@ impl ArmDriver for DropWatchDamiao {
     }
     fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
         self.inner.position_limits(joint)
+    }
+    armd::ext_accessors!(tx, joint_mode, bus_recovery);
+}
+impl armd::driver::BoundedTxExt for DropWatchDamiao {
+    fn set_enable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
+        self.inner.set_enable_authority(deadline, expected_lease_gen);
+    }
+    fn set_disable_authority(&mut self, deadline: Option<Instant>, expected_lease_gen: Option<u64>) {
+        self.inner.set_disable_authority(deadline, expected_lease_gen);
+    }
+    fn set_output_lease_gen(&mut self, lease_gen: u64) { self.inner.set_output_lease_gen(lease_gen); }
+}
+impl armd::driver::JointModeExt for DropWatchDamiao {
+    fn joint_hold_mode_verified(&self, joint: usize) -> bool { self.inner.joint_hold_mode_verified(joint) }
+}
+impl armd::driver::BusRecoveryExt for DropWatchDamiao {
+    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
+    fn panic_disable_step(
+        &mut self,
+        first: bool,
+        deadline: Instant,
+    ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+        self.inner.panic_disable_step(first, deadline)
     }
 }
 

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use armd::api::{create_router_full, proxy::DetectorUpstream};
 use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
 use armd::diagnostics::DiagnosticsState;
-use armd::driver::{
+use armd::driver::{BoundedTxExt, BusRecoveryExt, CommissioningExt, JointModeExt, MitExt, PosForceExt,
     is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, GripperPosForce, JointMode,
     JointTarget, TxBatchOutcome, TxBudget,
 };
@@ -5006,7 +5006,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
             "production file src/{rel} must not reference POS_FORCE_BASE_ID"
         );
 
-        // Outside driver.rs and joint_zero.rs (trait + zero-offset wrapper), `emit_pos_force_j7(`
+        // Outside driver.rs, driver/ext.rs and driver/zero_offset.rs (trait + zero-offset wrapper), `emit_pos_force_j7(`
         // may be invoked ONLY inside `SupervisorInner::emit_and_merge_pos_force_j7` in supervisor.rs,
         // which itself is called ONLY from `emit_j7_tick_epilogue`, which is called ONLY once in
         // `tick_control_inner` (shared by BOTH Legacy and RT Executor owners).
@@ -5052,7 +5052,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
                 1,
                 "emit_j7_tick_epilogue must have no callers outside tick_control_inner"
             );
-        } else if rel != "joint_zero.rs" {
+        } else if !["driver/zero_offset.rs", "driver/ext.rs"].contains(&rel.as_str()) {
             assert_eq!(
                 compact.matches("emit_pos_force_j7(").count(),
                 0,

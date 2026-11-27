@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use armd::diagnostics::blackbox::{BlackBox, Offer, Sink};
-use armd::driver::{
+use armd::driver::{ShadowExt,
     ArmDriver, DamiaoArmDriver, FeetechArmDriver, RobStrideArmDriver,
 };
 use armd::joint_zero::ZeroOffsetDriver;
