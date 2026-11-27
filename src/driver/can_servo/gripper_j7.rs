@@ -1429,3 +1429,14 @@ pub struct MotorCurrentCap {
 /// Feedback freshness bound for position-force gripper mode writes, pre-enable holds,
 /// stale-feedback recovery, and opening-speed allowance.
 pub(in crate::driver) const POS_FORCE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
+
+/// Safety margin below `POS_FORCE_FEEDBACK_MAX_AGE` when `poll_readback` decides whether J7
+/// can proceed directly to `finish_pos_force_readback` without a `PreEnableRefresh`, closing
+/// any boundary race near 100 ms.
+pub(in crate::driver::can_servo) const POS_FORCE_READBACK_FRESH_MARGIN: Duration = Duration::from_millis(85);
+/// Bounded causal `0xCC` refresh window during `DamiaoTorque::Enable` (clamped to the enable
+/// confirmation deadline and authority deadline; accommodates 30-60 ms Damiao replies across
+/// 20 ms releases while staying strictly inside `POS_FORCE_FEEDBACK_MAX_AGE`).
+pub(in crate::driver::can_servo) const ENABLE_PF_REFRESH_TIMEOUT: Duration = Duration::from_millis(80);
+/// Maximum bounded causal J7 `0xCC` refreshes permitted within one `DamiaoTorque::Enable` window.
+pub(in crate::driver::can_servo) const MAX_ENABLE_PF_REFRESHES: u8 = 2;
