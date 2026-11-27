@@ -56,7 +56,7 @@ AP_CONF=/var/run/hostapd_arm.conf
 AP_PIDFILE=/var/run/hostapd_arm.pid
 AP_GUARD_PIDFILE=/var/run/rebot-teleop-apguard.pid
 AP_GUARD_TICKS=30  # x 2 s
-# network.hotspot: "off" starts no hotspot and no guard, and stops ours if it survives
+# network.hotspot: "off" skips starting the AP hotspot, AP dnsmasq and guard (takes effect after reboot if already running)
 HOTSPOT="on"
 
 # SG2002 RT priority tuning (applied only when device-tree compatible matches SG2002/CV181x)
@@ -267,25 +267,26 @@ start_own_ap() {
     ifconfig wlan1 "$AP_IP" netmask 255.255.255.0 up 2>/dev/null || true
 }
 
-# Stop only our hostapd (its pidfile and config), SIGTERM then SIGKILL.
+# Stop only our hostapd (its pidfile and config), SIGTERM.
 stop_own_ap() {
     if OPID=$(own_ap_pid); then
         kill -TERM "$OPID" 2>/dev/null || true
         k=0
-        while [ "$k" -lt 8 ] && [ -d "/proc/$OPID" ]; do sleep 0.25; k=$((k + 1)); done
-        if [ -d "/proc/$OPID" ]; then
-            kill -KILL "$OPID" 2>/dev/null || true
-            k=0
-            while [ "$k" -lt 4 ] && [ -d "/proc/$OPID" ]; do sleep 0.25; k=$((k + 1)); done
-        fi
-        if [ -d "/proc/$OPID" ]; then
-            echo "[rebot-teleop] failed to stop hostapd (PID $OPID); keeping $AP_PIDFILE"
-            logger -t "$NAME" "failed to stop hostapd (PID $OPID); keeping $AP_PIDFILE" 2>/dev/null || true
-            return 1
-        fi
+        while [ "$k" -lt 4 ] && [ -d "/proc/$OPID" ]; do sleep 0.25; k=$((k + 1)); done
     fi
     rm -f "$AP_PIDFILE"
-    return 0
+}
+
+# True when our AP hostapd or AP guard process is already running.
+ap_stack_running() {
+    if own_ap_pid >/dev/null; then
+        return 0
+    fi
+    GPID=$(cat "$AP_GUARD_PIDFILE" 2>/dev/null)
+    case "$GPID" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -d "/proc/$GPID" ]
 }
 
 # Background guard for the boot race (the console can start its hotspot just after ours):
@@ -294,8 +295,9 @@ stop_own_ap() {
 ap_guard() {
     has_wifi || { rm -f "$AP_GUARD_PIDFILE"; return 0; }
     if [ "${HOTSPOT:-on}" = off ]; then
-        hotspot_off
-        return $?
+        echo "[rebot-teleop] hotspot off takes effect after reboot"
+        logger -t "$NAME" "hotspot off takes effect after reboot" 2>/dev/null || true
+        return 0
     fi
     t=0
     off=0
@@ -326,56 +328,20 @@ ap_guard() {
     rm -f "$AP_GUARD_PIDFILE"
 }
 
-is_ap_guard_cmdline() {
-    SCRIPT_BASE=$(basename "$INIT_SCRIPT")
-    case " $1 " in
-        *" $INIT_SCRIPT ap-guard "*) return 0 ;;
-        *"/$SCRIPT_BASE ap-guard "*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# Stop a previous AP guard from its pidfile if that process is the guard (never kill self).
+# Stop the AP guard from its pidfile if that process is the guard.
 stop_ap_guard() {
     GPID=$(cat "$AP_GUARD_PIDFILE" 2>/dev/null)
     case "$GPID" in ''|*[!0-9]*) rm -f "$AP_GUARD_PIDFILE"; return 0 ;; esac
-    if [ "$GPID" = "$$" ]; then
-        rm -f "$AP_GUARD_PIDFILE"
-        return 0
-    fi
-    if [ -d "/proc/$GPID" ] && is_ap_guard_cmdline "$(proc_cmdline "$GPID")"; then
-        kill -TERM "$GPID" 2>/dev/null || true
-        k=0
-        while [ "$k" -lt 8 ] && [ -d "/proc/$GPID" ]; do sleep 0.25; k=$((k + 1)); done
-        if [ -d "/proc/$GPID" ]; then
-            kill -KILL "$GPID" 2>/dev/null || true
-            k=0
-            while [ "$k" -lt 4 ] && [ -d "/proc/$GPID" ]; do sleep 0.25; k=$((k + 1)); done
-        fi
-        if [ -d "/proc/$GPID" ]; then
-            echo "[rebot-teleop] failed to stop ap-guard (PID $GPID); keeping $AP_GUARD_PIDFILE"
-            logger -t "$NAME" "failed to stop ap-guard (PID $GPID); keeping $AP_GUARD_PIDFILE" 2>/dev/null || true
-            return 1
-        fi
-    fi
+    case "$(proc_cmdline "$GPID")" in
+        *ap-guard*) kill -TERM "$GPID" 2>/dev/null || true ;;
+    esac
     rm -f "$AP_GUARD_PIDFILE"
     return 0
 }
 
 start_ap_guard() {
-    stop_ap_guard || return 1
+    stop_ap_guard
     start-stop-daemon -S -b -m -p "$AP_GUARD_PIDFILE" -a /bin/sh -- "$INIT_SCRIPT" ap-guard "$1" "$2" >/dev/null 2>&1 || true
-}
-
-# network.hotspot = off: stop our guard and our hostapd if they survive from an earlier start.
-# Wait for any previous guard to exit before stopping hostapd.
-# The console's own hotspot and any other hostapd are not touched; dnsmasq is not restarted.
-hotspot_off() {
-    echo "[rebot-teleop] network.hotspot is off: Wi-Fi AP hotspot and its guard not started"
-    logger -t "$NAME" "network.hotspot=off: AP hotspot and guard not started" 2>/dev/null || true
-    stop_ap_guard || return 1
-    stop_own_ap || return 1
-    return 0
 }
 
 # True when the device has a Wi-Fi interface. Some models (e.g. PoE) have none; then the STA
@@ -410,10 +376,17 @@ start_wifi() {
         fi
     fi
 
-    # network.hotspot = off: STA only, no wlan1, no AP, no console takeover, no guard
+    # network.hotspot = off: STA only; never start wlan1, AP hostapd, AP dnsmasq, or guard.
+    # If our AP stack is already running, leave it untouched (takes effect after reboot).
     if [ "${HOTSPOT:-on}" = off ]; then
-        hotspot_off
-        return $?
+        if ap_stack_running; then
+            echo "[rebot-teleop] hotspot off takes effect after reboot"
+            logger -t "$NAME" "hotspot off takes effect after reboot" 2>/dev/null || true
+        else
+            echo "[rebot-teleop] network.hotspot is off: Wi-Fi AP hotspot and its guard not started"
+            logger -t "$NAME" "network.hotspot=off: AP hotspot and guard not started" 2>/dev/null || true
+        fi
+        return 0
     fi
 
     # 2. 确保虚拟网卡 wlan1 存在

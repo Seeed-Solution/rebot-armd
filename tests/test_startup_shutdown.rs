@@ -607,31 +607,12 @@ iw() {{
 }}
 kill() {{
     echo "$1 $2" >> "$T/signals"
-    if [ "$1" = "-TERM" ] && [ -f "$T/proc/$2/delay_term" ]; then
-        return 0
-    fi
-    if [ "$1" = "-TERM" ] && [ -f "$T/proc/$2/stubborn" ]; then
-        return 0
-    fi
-    if [ "$1" = "-KILL" ] && [ -f "$T/proc/$2/unkillable" ]; then
-        return 0
-    fi
     rm -rf "$T/proc/$2"
     [ "$2" = "$(cat "$T/console_on_air_pid" 2>/dev/null)" ] && rm -f "$T/console_on_air"
     return 0
 }}
 sleep() {{
     if [ -f "$T/late" ]; then rm -f "$T/late"; sh -c "$(cat "$T/late_cmd")"; fi
-    for d in "$T"/proc/[0-9]*; do
-        [ -f "$d/delay_term" ] || continue
-        n=$(cat "$d/delay_term" 2>/dev/null)
-        case "$n" in ''|*[!0-9]*) n=0 ;; esac
-        if [ "$n" -le 1 ]; then
-            rm -rf "$d"
-        else
-            echo $((n - 1)) > "$d/delay_term"
-        fi
-    done
 }}
 logger() {{ shift 2; echo "$*" >> "$T/log"; }}
 ifconfig() {{ echo "ifconfig $*" >> "$T/calls"; echo wlan1; }}
@@ -670,102 +651,83 @@ fn init_skips_wifi_without_a_wifi_interface() {
     assert!(!env.read("calls").contains("ap-guard"), "{}", env.read("calls"));
 }
 
-/// network.hotspot = off with the STA configured: the client is set up, then no wlan1, no AP,
-/// no console takeover, no guard and no dnsmasq restart.
+/// network.hotspot = off at start with the STA configured: the client is set up, then no wlan1,
+/// no AP hostapd, no guard and no AP dnsmasq restart; existing USB DHCP dnsmasq and console
+/// hostapd stay untouched.
 #[cfg(unix)]
 #[test]
 fn init_hotspot_off_starts_no_ap_guard_or_takeover() {
     let env = ApEnv::new();
+    env.process(400, "/usr/sbin/dnsmasq -C /etc/dnsmasq/usb.conf");
+    std::fs::write(env.p("run/dnsmasq.pid"), "400\n").unwrap();
     env.process(500, "hostapd -B /etc/hostapd_2g4.conf");
     let out = env.run("HOTSPOT=off; STA_SSID=office; wpa_supplicant() { echo wpa >> \"$T/calls\"; }; wpa_cli() { echo \"wpa_cli $*\" >> \"$T/calls\"; echo 0; }; start_wifi");
     let calls = env.read("calls");
     assert!(calls.contains("wpa_cli -i wlan0 enable_network"), "STA still set up: {calls}");
-    assert_eq!(env.read("signals"), "", "console hostapd untouched: {out}");
+    assert_eq!(env.read("signals"), "", "no process signalled: {out}");
+    assert!(env.p("proc/400").is_dir(), "USB DHCP dnsmasq untouched");
+    assert!(env.p("run/dnsmasq.pid").exists(), "USB DHCP pidfile untouched");
     assert!(out.contains("hostapd now: 500 \n"), "{out}");
     assert!(!env.p("run/hostapd_arm.conf").exists(), "{out}");
-    for forbidden in ["hostapd ", "ap-guard", "ifconfig", "ssd -K", "interface add", "dnsmasq", "killall", "iw "] {
+    for forbidden in ["hostapd ", "ap-guard", "ifconfig", "ssd ", "interface add", "dnsmasq", "killall", "iw "] {
         assert!(!calls.contains(forbidden), "{forbidden}: {calls}");
     }
-    assert!(env.read("log").contains("network.hotspot=off"), "{}", env.read("log"));
+    let log = env.read("log");
+    assert!(log.contains("network.hotspot=off"), "{log}");
+    assert!(!log.contains("takes effect after reboot"), "{log}");
 }
 
-/// off stops our own hostapd and guard that survive from an earlier start (escalating to KILL if
-/// TERM is ignored); a console/foreign hostapd and unrelated `ap-guard` cmdlines stay; an
-/// unkillable process keeps its PID file and logs a cleanup failure.
+/// network.hotspot = off when the AP stack is already running: no runtime stop (nothing signalled,
+/// pidfiles and running processes stay intact, USB DHCP untouched) and logs one line stating
+/// "hotspot off takes effect after reboot". Direct `ap-guard` entry with off also signals nothing
+/// and logs the same message.
 #[cfg(unix)]
 #[test]
-fn init_hotspot_off_cleans_up_surviving_rebot_processes_only() {
+fn init_hotspot_off_leaves_running_ap_stack_untouched_and_logs_reboot() {
     let env = ApEnv::new();
-    let out = env.run("start_wifi; : > \"$T/calls\"; : > \"$T/signals\"");
+    let out = env.run("start_wifi; : > \"$T/calls\"; : > \"$T/signals\"; : > \"$T/log\"");
     let own = env.own_pid();
     assert!(env.p(&format!("proc/{own}")).is_dir(), "{out}");
+    env.process(400, "/usr/sbin/dnsmasq -C /etc/dnsmasq/usb.conf");
     env.process(800, "/bin/sh /etc/init.d/K92rebot-teleop ap-guard 5g 44");
-    std::fs::write(env.p("proc/800/stubborn"), "").unwrap();
-    env.process(900, "python3 /tmp/ap-guard-helper.py");
-    env.process(700, "hostapd -B /etc/other_ap.conf");
-    std::fs::write(env.p("run/apguard.pid"), "800\n").unwrap();
-    let out = env.run("HOTSPOT=off; start_wifi");
-    let signals = env.read("signals");
-    assert!(signals.contains("-TERM 800\n") && signals.contains("-KILL 800\n"), "{signals} / {out}");
-    assert!(signals.contains(&format!("-TERM {own}\n")), "{signals} / {out}");
-    assert!(!signals.contains("700") && !signals.contains("900"), "{signals}");
-    assert!(!env.p("run/apguard.pid").exists());
-    assert!(!env.p("run/hostapd_arm.pid").exists());
-    assert!(out.contains("hostapd now: 700 \n"), "{out}");
-
-    // When the guard survives both TERM and KILL, cleanup fails, keeps apguard.pid, and logs it.
-    env.process(801, "/bin/sh /etc/init.d/K92rebot-teleop ap-guard 5g 44");
-    std::fs::write(env.p("proc/801/stubborn"), "").unwrap();
-    std::fs::write(env.p("proc/801/unkillable"), "").unwrap();
-    std::fs::write(env.p("run/apguard.pid"), "801\n").unwrap();
-    let out_fail = env.run("HOTSPOT=off; start_wifi || echo cleanup-failed");
-    assert!(out_fail.contains("cleanup-failed") && out_fail.contains("failed to stop ap-guard"), "{out_fail}");
-    assert!(env.p("run/apguard.pid").exists(), "pidfile kept when process survives");
-    assert!(env.read("log").contains("failed to stop ap-guard"), "{}", env.read("log"));
-}
-
-/// The direct `ap-guard` entry exercises real config loading + dispatch: with hotspot off it
-/// stops a previous guard (waiting for delayed TERM), does not kill self, stops own hostapd,
-/// and exits without starting a new AP or guard ticks.
-#[cfg(unix)]
-#[test]
-fn init_ap_guard_with_hotspot_off_exits_without_ticks() {
-    let env = ApEnv::new();
-    let _ = env.run("start_wifi; : > \"$T/calls\"; : > \"$T/signals\"");
-    let own = env.own_pid();
-    assert!(env.p(&format!("proc/{own}")).is_dir());
-    env.process(800, "/bin/sh /etc/init.d/K92rebot-teleop ap-guard 5g 44");
-    std::fs::write(env.p("proc/800/delay_term"), "2").unwrap();
     std::fs::write(env.p("run/apguard.pid"), "800\n").unwrap();
 
+    let out_off = env.run("HOTSPOT=off; start_wifi");
+    assert_eq!(env.read("signals"), "", "running AP stack must not be signalled: {out_off}");
+    assert!(env.p(&format!("proc/{own}")).is_dir(), "own hostapd remains running");
+    assert!(env.p("proc/800").is_dir(), "ap-guard remains running");
+    assert!(env.p("proc/400").is_dir(), "USB DHCP remains running");
+    assert!(env.p("run/hostapd_arm.pid").exists(), "hostapd pidfile untouched");
+    assert!(env.p("run/apguard.pid").exists(), "apguard pidfile untouched");
+    let calls = env.read("calls");
+    for forbidden in ["hostapd ", "ap-guard", "ifconfig", "ssd ", "interface add", "dnsmasq", "killall", "iw "] {
+        assert!(!calls.contains(forbidden), "{forbidden}: {calls}");
+    }
+    assert!(out_off.contains("hotspot off takes effect after reboot"), "{out_off}");
+    assert!(env.read("log").contains("hotspot off takes effect after reboot"), "{}", env.read("log"));
+
+    // Direct ap-guard invocation with hotspot=off loaded from real config: no ticks, nothing signalled.
     let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
     let parse = init_section(source, "config_shell_vars() {", "\n# 读取 supervisor");
     let cfg = env.p("rebot-teleop.config.json");
     std::fs::write(&cfg, r#"{"network":{"hotspot":"off"}}"#).unwrap();
     let body = format!(
-        "{parse}\nHOTSPOT=on\neval \"$(config_shell_vars '{c}')\"\nset -- ap-guard 5g 44\ncase \"$1\" in ap-guard) ap_guard \"$2\" \"$3\" ;; esac\necho guard-returned\n",
+        ": > \"$T/calls\"; : > \"$T/signals\"; : > \"$T/log\"\n\
+         {parse}\nHOTSPOT=on\neval \"$(config_shell_vars '{c}')\"\n\
+         ap_guard 5g 44\necho guard-returned\n",
         c = cfg.display()
     );
-    let out = env.run(&body);
-    assert!(out.contains("guard-returned"), "{out}");
-    let signals = env.read("signals");
-    assert!(signals.contains("-TERM 800\n"), "{signals}");
-    assert!(signals.contains(&format!("-TERM {own}\n")), "{signals}");
-    let pos_800 = signals.find("-TERM 800").unwrap();
-    let pos_own = signals.find(&format!("-TERM {own}")).unwrap();
-    assert!(pos_800 < pos_own, "previous guard must be stopped before hostapd: {signals}");
-    assert!(!env.p("run/apguard.pid").exists());
-    assert!(!env.p("run/hostapd_arm.pid").exists());
-    let calls = env.read("calls");
-    assert!(!calls.contains("hostapd ") && !calls.contains("dnsmasq") && !calls.contains("iw "), "{calls}");
-
-    // Self-PID in apguard.pid: direct ap-guard with off must not kill itself.
-    let out_self = env.run("HOTSPOT=off; echo $$ > \"$AP_GUARD_PIDFILE\"; ap_guard 5g 44; echo self-survived");
-    assert!(out_self.contains("self-survived"), "{out_self}");
-    assert!(!env.p("run/apguard.pid").exists());
+    let out_guard = env.run(&body);
+    assert!(out_guard.contains("guard-returned"), "{out_guard}");
+    assert!(out_guard.contains("hotspot off takes effect after reboot"), "{out_guard}");
+    assert_eq!(env.read("signals"), "", "ap-guard with hotspot=off must not signal any process");
+    assert!(env.read("log").contains("hotspot off takes effect after reboot"), "{}", env.read("log"));
+    let guard_calls = env.read("calls");
+    assert!(!guard_calls.contains("hostapd ") && !guard_calls.contains("dnsmasq") && !guard_calls.contains("iw "), "{guard_calls}");
 }
 
-/// The setting is read from network.hotspot; absent, "on" and invalid values keep the hotspot.
+/// The setting is read from network.hotspot; absent, "on" and invalid values keep the hotspot,
+/// and the manifest text in both languages says the setting takes effect after reboot.
 #[cfg(unix)]
 #[test]
 fn init_parses_network_hotspot_default_on() {
@@ -791,21 +753,51 @@ fn init_parses_network_hotspot_default_on() {
         assert!(out.status.success(), "{json}: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{json}");
     }
+    let manifest: serde_json::Value = serde_json::from_str(
+        include_str!("../kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-teleop.json"),
+    )
+    .unwrap();
+    let net_group = manifest["config_schema"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["key"] == "network")
+        .unwrap();
+    let item = net_group["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["key"] == "hotspot")
+        .expect("rebot-teleop.json network group must declare hotspot");
+    assert_eq!(item["default"], "on");
+    assert_eq!(item["options"], serde_json::json!(["on", "off"]));
+    assert!(
+        item["title"].as_str().unwrap().contains("takes effect after reboot"),
+        "{}",
+        item["title"]
+    );
+    assert!(
+        item["title_zh"].as_str().unwrap().contains("重启后生效"),
+        "{}",
+        item["title_zh"]
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn init_takes_wlan1_over_from_the_console_hotspot_at_start() {
-    let env = ApEnv::new();
-    env.process(500, "hostapd -B /etc/hostapd_2g4.conf");
-    let out = env.run("start_wifi");
-    assert_eq!(env.read("signals"), "-TERM 500\n", "{out}");
-    let own = env.own_pid();
-    assert!(env.p(&format!("proc/{own}")).is_dir(), "{out}");
-    assert!(out.contains(&format!("hostapd now: {own} \n")), "exactly one hostapd, ours: {out}");
-    assert!(env.read("run/hostapd_arm.conf").contains("ssid=reCamera-Arm-Teleop\nhw_mode=a\nchannel=44\n"));
-    assert!(env.read("log").contains("AP takeover at start: stopped the console's hostapd (PID 500"), "{}", env.read("log"));
-    assert!(env.read("calls").contains("ap-guard 5g 44"), "{}", env.read("calls"));
+    for mode in ["", "HOTSPOT=on; "] {
+        let env = ApEnv::new();
+        env.process(500, "hostapd -B /etc/hostapd_2g4.conf");
+        let out = env.run(&format!("{mode}start_wifi"));
+        assert_eq!(env.read("signals"), "-TERM 500\n", "{mode}: {out}");
+        let own = env.own_pid();
+        assert!(env.p(&format!("proc/{own}")).is_dir(), "{mode}: {out}");
+        assert!(out.contains(&format!("hostapd now: {own} \n")), "{mode}: exactly one hostapd, ours: {out}");
+        assert!(env.read("run/hostapd_arm.conf").contains("ssid=reCamera-Arm-Teleop\nhw_mode=a\nchannel=44\n"));
+        assert!(env.read("log").contains("AP takeover at start: stopped the console's hostapd (PID 500"), "{}", env.read("log"));
+        assert!(env.read("calls").contains("ap-guard 5g 44"), "{}", env.read("calls"));
+    }
 }
 
 #[cfg(unix)]
