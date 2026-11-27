@@ -2619,7 +2619,7 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
           </div>
           <div class="oc-sub" id="grasp-sub"><span></span><span id="meas-sub"></span></div>
           <button class="oc-task" id="grasp-task" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer"><span data-i18n="oc.task">抓取任务</span><b id="grasp-task-name">默认</b><span class="oc-task-set" data-i18n="oc.task.set">设置 ›</span></button>
-          <button class="oc-task" id="grasp-orient" type="button"><span data-i18n="oc.orient">夹取姿态</span><b id="grasp-orient-name">自适应</b><span class="oc-task-set" data-i18n="oc.orient.switch">切换 ›</span></button>
+          <button class="oc-task" id="grasp-orient" type="button"><span data-i18n="oc.orient">夹取姿态</span><b id="grasp-orient-name">顶部垂直</b><span class="oc-task-set" data-i18n="oc.orient.switch">切换 ›</span></button>
         </div>
         <div class="s-objhint only-simple" id="s-objhint" role="status" hidden></div>
         <div class="meas-card" id="meas-card" role="region" aria-live="polite" data-i18n-aria="ms.title" aria-label="尺寸测量" hidden></div>
@@ -14387,8 +14387,9 @@ function placeMeasCard(card) {
    tasks the loaded detector serves without a switch (requires.model_kind = the loaded kind, models.detector = the loaded
    model or unset). The choice stays in this browser (rebot.grasp.task) and goes into the grasp request as `task`. */
 GR.task = store('rebot.grasp.task') || null;
-// Grasp approach (`strategy` in the grasp request): adaptive (default, may choose an angled approach) or legacy (top-down).
-GR.strategy = store('rebot.grasp.strategy') === 'legacy' ? 'legacy' : 'adaptive';
+// Grasp approach (`strategy` in the grasp request): legacy (top-down, default) or adaptive (may choose an
+// angled approach; in 1.6.0 it can refuse wide objects that top-down grasps, see the 1.6.1 plan).
+GR.strategy = store('rebot.grasp.strategy') === 'adaptive' ? 'adaptive' : 'legacy';
 function graspTasks() { return (GR.setup && GR.setup.tasks && typeof GR.setup.tasks === 'object') ? GR.setup.tasks : {}; }
 function taskUsable(tk) {
   if (S.ui !== 'simple' || !tk) return true;
