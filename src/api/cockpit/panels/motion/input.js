@@ -335,13 +335,9 @@ document.addEventListener('visibilitychange', () => {
     handleBackgroundHide();
   } else {
     loadAuthStatus();
-    // Returning from background/sleep: refresh telemetry & reconnect if half-open
-    if (!S.ws || S.ws.readyState !== WebSocket.OPEN || Date.now() - S.obsAt > 1500) {
-      // Same retirement as a dropped socket (warning, release notice), then reconnect now instead of after the backoff.
-      if (S.ws) retireSocket(S.ws, { reconnect: true, markReleased: true, toastExpired: true });
-      connectWS();
-      loadSchema();
-    }
+    // Returning from background/sleep: a stale or half-open socket is retired like a drop (warning, release
+    // notice); a queued retry keeps its backoff (resumeConnection in shared/ws.js).
+    if (resumeConnection()) loadSchema();
   }
 });
 

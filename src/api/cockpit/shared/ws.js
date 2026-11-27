@@ -2,8 +2,10 @@
    Telemetry WebSocket (50 Hz) + heartbeat
    ================================================================= */
 // Reconnect after a dropped socket: one timer, 1, 2, 4, 8 s, then every 15 s. The first valid observation
-// on the new socket resets the backoff and clears S.connLost (the "connection lost" warning).
-const WS_RETRY_MS = [1000, 2000, 4000, 8000, 15000];
+// on the new socket resets the backoff and clears S.connLost (the "connection lost" warning). A socket that
+// delivers no valid observation for WS_TELEMETRY_DEADLINE_MS (opened but silent, or half-open) is retired
+// through the same path, so its retry keeps the backoff.
+const WS_RETRY_MS = [1000, 2000, 4000, 8000, 15000], WS_TELEMETRY_DEADLINE_MS = 4000;
 let wsOpenedOnce = false, wsReconnectTimer = null, wsRetryN = 0;
 const VALID_SAFETY_STR = new Set(['Booting', 'Idle', 'Armed', 'Moving', 'EStop']), VALID_FAULT_STR = new Set(['BusLoss', 'WatchdogTimeout', 'CanTxStalled']);
 const isPlainObj = (v) => !!(v && typeof v === 'object' && !Array.isArray(v));
@@ -19,7 +21,7 @@ function isValidSafetyState(s) {
   if (k === 'JointLimitExceeded') return isPlainObj(v) && Number.isSafeInteger(v.joint_idx) && v.joint_idx >= 0 && typeof v.joint_name === 'string' && Number.isFinite(v.value) && Number.isFinite(v.min) && Number.isFinite(v.max);
   return k === 'ThermalTrip' && isPlainObj(v) && Number.isSafeInteger(v.joint_idx) && v.joint_idx >= 0 && Number.isFinite(v.temperature) && Number.isFinite(v.limit);
 }
-const isCompleteObservation = (o) => isPlainObj(o) && Array.isArray(o.positions) && (S.schemaLoaded && S.dof > 0 ? o.positions.length === S.dof : o.positions.length > 0) && o.positions.every(Number.isFinite) && Number.isFinite(o.timestamp) && Number.isSafeInteger(o.epoch_id) && o.epoch_id >= 0 && isValidSafetyState(o.safety_state) && (o.lease_holder === null || typeof o.lease_holder === 'string');
+const isCompleteObservation = (o) => isPlainObj(o) && Array.isArray(o.positions) && (S.schemaLoaded && S.dof > 0 ? o.positions.length === S.dof : o.positions.length > 0) && o.positions.every(Number.isFinite) && Number.isFinite(o.timestamp) && Number.isSafeInteger(o.epoch_id) && o.epoch_id >= 0 && typeof o.is_torqued === 'boolean' && isValidSafetyState(o.safety_state) && (o.lease_holder === null || typeof o.lease_holder === 'string');
 const clearReconnectTimer = () => { if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; } };
 const scheduleReconnect = () => {
   clearReconnectTimer();
@@ -27,6 +29,26 @@ const scheduleReconnect = () => {
   wsRetryN++;
   wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; if (!S.ws) connectWS(); }, delayMs);
 };
+// Per-socket telemetry deadline: retire `ws` when no valid observation arrived on it for the deadline.
+function armTelemetryDeadline(ws) {
+  ws.lastValidAt = Date.now();
+  ws.deadlineTimer = setInterval(() => {
+    if (S.ws !== ws) { clearInterval(ws.deadlineTimer); return; }
+    if (Date.now() - ws.lastValidAt > WS_TELEMETRY_DEADLINE_MS) retireSocket(ws, { reconnect: true, markReleased: true, toastExpired: true });
+  }, 500);
+}
+// Returning to the tab: an already-queued retry or a socket still connecting keeps its schedule; a dead or
+// stale socket is retired like a drop, and only a socket that had valid telemetry retries at once.
+function resumeConnection() {
+  if (wsReconnectTimer) return false;
+  const ws = S.ws;
+  if (ws && ws.readyState === 0) return false;
+  if (ws && ws.readyState === 1 && Date.now() - (ws.lastValidAt || 0) <= 1500) return false;
+  const hadTelemetry = !ws || wsRetryN === 0;
+  if (ws) retireSocket(ws, { reconnect: true, markReleased: true, toastExpired: true });
+  if (hadTelemetry) connectWS();
+  return true;
+}
 // Arm state for the release notice, from fresh telemetry only. "Parked" needs armd's evidence (a finished
 // park action and torque off): a clean close can reconnect while the arm is still torqued.
 function connArmText(o) {
@@ -47,6 +69,7 @@ function retireSocket(ws, { reconnect = false, markReleased = false, toastExpire
   if (markReleased && hadLease) S.leaseReleased = { reason: 'reconnect' };
   if (toastExpired && hadLease) toast(t('toast.lease_expired'), 'warn');
   S.ws = null; S.wsObsSeen = false; S.obsWs = null; S.obsTs = -Infinity; S.minObsTs = -Infinity; S.epoch = null;
+  clearInterval(ws.deadlineTimer);
   ws.onclose = null; ws.onerror = null; try { ws.close(); } catch (_) {}
   S.detections = []; S.detLastReceivedAt = 0; clearOverlayCanvas();
   if (leaseOp) { const op = leaseOp; leaseOp = null; if (op.timer) clearTimeout(op.timer); if (op.reject) op.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' })); }
@@ -86,7 +109,7 @@ function acceptObservation(o, fromWs, ws = S.ws) {
   const ts = o.timestamp;
   if (fromWs) {
     if ((S.minObsTs !== -Infinity && ts <= S.minObsTs) || (S.obsTs !== -Infinity && ts <= S.obsTs)) return 'stale';
-    S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; wsRetryN = 0; S.connLost = false; applyObservation(o, true); return 'applied';
+    S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; ws.lastValidAt = Date.now(); wsRetryN = 0; S.connLost = false; applyObservation(o, true); return 'applied';
   }
   S.minObsTs = Math.max(S.minObsTs, ts);
   if (!S.wsObsSeen || S.obsWs !== ws || ts > S.obsTs) { S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; applyObservation(o, false); return 'applied'; }
@@ -101,6 +124,7 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/api/v1/ws`);
   S.ws = ws;
+  armTelemetryDeadline(ws);
   resetLease();
   S.sequenceId = 0;
   ws.onopen = () => {
