@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""File-level source line limit ratchet for first-party code.
+
+Policy (Fable 5.2 review / arch-sprint-1.6.1):
+  - First-party source files: .rs, .js, .mjs, .css, .html (excluding vendor/third_party).
+  - 1501..=3000 physical lines: WARN (non-blocking).
+  - >3000 physical lines: BLOCK unless covered by .config/source_limits_allowlist.json
+    and not exceeding either the allowlist cap or the merge-base line count.
+  - Allowlist may only shrink relative to the merge base:
+      * No new entries added.
+      * No cap increases.
+      * No stale entries (deleted files or files now <= 3000 lines).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+WARN_LINES = 1500
+BLOCK_LINES = 3000
+SOURCE_EXTS = (".rs", ".js", ".mjs", ".css", ".html")
+EXCLUDED_DIRS = frozenset(
+    {
+        "vendor",
+        "third_party",
+        "node_modules",
+        "target",
+        "dist",
+        ".git",
+        ".cache",
+        "pkg_staging",
+    }
+)
+DEFAULT_ALLOWLIST_REL = ".config/source_limits_allowlist.json"
+
+
+def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def count_physical_lines(data: bytes) -> int:
+    if not data:
+        return 0
+    return len(data.splitlines())
+
+
+def is_first_party_source(rel_posix: str) -> bool:
+    if not rel_posix.endswith(SOURCE_EXTS):
+        return False
+    parts = Path(rel_posix).parts
+    return not any(part in EXCLUDED_DIRS for part in parts)
+
+
+def list_candidate_files(root: Path) -> List[str]:
+    proc = run_git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    raw_paths = [p.decode("utf-8", errors="surrogateescape") for p in proc.stdout.split(b"\0") if p]
+    seen = set()
+    out: List[str] = []
+    for rel in sorted(raw_paths):
+        rel_posix = rel.replace("\\", "/")
+        if rel_posix in seen or not is_first_party_source(rel_posix):
+            continue
+        full = root / rel_posix
+        if full.is_symlink() or not full.is_file():
+            continue
+        seen.add(rel_posix)
+        out.append(rel_posix)
+    return out
+
+
+def git_file_lines(root: Path, rev: str, rel_posix: str) -> Optional[int]:
+    proc = run_git(root, "show", f"{rev}:{rel_posix}", check=False)
+    if proc.returncode != 0:
+        return None
+    return count_physical_lines(proc.stdout)
+
+
+def parse_allowlist_bytes(raw: bytes, label: str) -> Tuple[int, int, Dict[str, int]]:
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"{label}: invalid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"{label}: root must be a JSON object")
+    warn = obj.get("warn_lines", WARN_LINES)
+    block = obj.get("block_lines", BLOCK_LINES)
+    files = obj.get("files")
+    if not isinstance(warn, int) or not isinstance(block, int) or not isinstance(files, dict):
+        raise ValueError(f"{label}: expected integer warn_lines/block_lines and object 'files'")
+    parsed: Dict[str, int] = {}
+    for k, v in files.items():
+        if not isinstance(k, str) or not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+            raise ValueError(f"{label}: invalid entry {k!r}: {v!r}")
+        parsed[k.replace("\\", "/")] = v
+    return warn, block, parsed
+
+
+def resolve_merge_base(root: Path, base_arg: Optional[str]) -> Optional[str]:
+    if base_arg is not None:
+        proc = run_git(root, "merge-base", "HEAD", base_arg, check=False)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"cannot compute merge-base with {base_arg!r}: {err}")
+        return proc.stdout.decode("utf-8").strip()
+
+    gh_base = os.environ.get("GITHUB_BASE_REF")
+    if gh_base:
+        for cand in (f"origin/{gh_base}", gh_base):
+            proc = run_git(root, "merge-base", "HEAD", cand, check=False)
+            if proc.returncode == 0:
+                return proc.stdout.decode("utf-8").strip()
+        raise RuntimeError(
+            f"GITHUB_BASE_REF={gh_base!r} is set but merge-base could not be resolved "
+            "(ensure checkout uses fetch-depth: 0)"
+        )
+
+    for cand in ("origin/main", "main"):
+        proc = run_git(root, "merge-base", "HEAD", cand, check=False)
+        if proc.returncode == 0:
+            return proc.stdout.decode("utf-8").strip()
+    return None
+
+
+def write_allowlist(path: Path, entries: Dict[str, int]) -> None:
+    payload = {
+        "warn_lines": WARN_LINES,
+        "block_lines": BLOCK_LINES,
+        "files": {k: entries[k] for k in sorted(entries)},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Check first-party source file line limits.")
+    parser.add_argument("--root", type=Path, default=None, help="Repository root (default: git top-level)")
+    parser.add_argument(
+        "--allowlist",
+        default=DEFAULT_ALLOWLIST_REL,
+        help=f"Repo-relative allowlist path (default: {DEFAULT_ALLOWLIST_REL})",
+    )
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="Git ref for merge-base comparison (default: GITHUB_BASE_REF or main if present)",
+    )
+    parser.add_argument(
+        "--no-base",
+        action="store_true",
+        help="Skip git merge-base ratchet check (still validates files against current allowlist)",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Ratchet down existing allowlist caps to current line counts and prune <=3000/deleted entries (never adds new entries)",
+    )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Generate initial allowlist from all current >3000 first-party files",
+    )
+    parser.add_argument(
+        "--quiet-warnings",
+        action="store_true",
+        help="Suppress per-file 1501..=3000 warning lines (still shown in summary)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.root is not None:
+        root = args.root.resolve()
+    else:
+        script_dir = Path(__file__).resolve().parent
+        proc = run_git(script_dir, "rev-parse", "--show-toplevel", check=False)
+        if proc.returncode != 0:
+            print("source_limits: ERROR: not inside a git repository", file=sys.stderr)
+            return 2
+        root = Path(proc.stdout.decode("utf-8").strip()).resolve()
+
+    allowlist_rel = args.allowlist.replace("\\", "/")
+    allowlist_path = root / allowlist_rel
+
+    files = list_candidate_files(root)
+    counts: Dict[str, int] = {}
+    for rel in files:
+        counts[rel] = count_physical_lines((root / rel).read_bytes())
+
+    if args.init:
+        over = {rel: n for rel, n in counts.items() if n > BLOCK_LINES}
+        write_allowlist(allowlist_path, over)
+        print(f"source_limits: wrote {len(over)} entries to {allowlist_rel}")
+        return 0
+
+    if not allowlist_path.is_file():
+        print(f"source_limits: ERROR: allowlist not found: {allowlist_rel}", file=sys.stderr)
+        return 2
+
+    try:
+        cur_warn, cur_block, cur_allow = parse_allowlist_bytes(allowlist_path.read_bytes(), allowlist_rel)
+    except ValueError as exc:
+        print(f"source_limits: ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.update:
+        updated: Dict[str, int] = {}
+        for rel, cap in cur_allow.items():
+            actual = counts.get(rel)
+            if actual is None or actual <= BLOCK_LINES:
+                continue
+            updated[rel] = min(cap, actual)
+        write_allowlist(allowlist_path, updated)
+        print(
+            f"source_limits: updated {allowlist_rel} "
+            f"({len(cur_allow)} -> {len(updated)} entries)"
+        )
+        return 0
+
+    errors: List[str] = []
+    warnings: List[Tuple[int, str]] = []
+    tighten_hints: List[str] = []
+
+    if cur_warn != WARN_LINES or cur_block != BLOCK_LINES:
+        errors.append(
+            f"{allowlist_rel}: thresholds must be warn_lines={WARN_LINES}, block_lines={BLOCK_LINES} "
+            f"(got warn_lines={cur_warn}, block_lines={cur_block})"
+        )
+
+    merge_base: Optional[str] = None
+    base_allow: Optional[Dict[str, int]] = None
+    if not args.no_base:
+        try:
+            merge_base = resolve_merge_base(root, args.base)
+        except RuntimeError as exc:
+            print(f"source_limits: ERROR: {exc}", file=sys.stderr)
+            return 2
+        if merge_base is not None:
+            proc = run_git(root, "show", f"{merge_base}:{allowlist_rel}", check=False)
+            if proc.returncode == 0:
+                try:
+                    _, _, base_allow = parse_allowlist_bytes(proc.stdout, f"{merge_base}:{allowlist_rel}")
+                except ValueError as exc:
+                    print(f"source_limits: ERROR: {exc}", file=sys.stderr)
+                    return 2
+
+    # 1. Ratchet checks on the allowlist itself.
+    if base_allow is not None:
+        for rel, cap in sorted(cur_allow.items()):
+            if rel not in base_allow:
+                errors.append(
+                    f"ALLOWLIST ADD: {rel} ({cap} lines) was not in {allowlist_rel} at merge-base "
+                    f"{merge_base[:8]}; allowlist may only shrink"
+                )
+            elif cap > base_allow[rel]:
+                errors.append(
+                    f"ALLOWLIST GROW: {rel} cap increased from {base_allow[rel]} to {cap} "
+                    f"relative to merge-base {merge_base[:8]}"
+                )
+    elif merge_base is not None:
+        # Bootstrap case: allowlist did not exist at merge-base yet.
+        # Still verify no newly created file or grown cap sneaks in above merge-base.
+        for rel, cap in sorted(cur_allow.items()):
+            base_n = git_file_lines(root, merge_base, rel)
+            if base_n is None:
+                errors.append(
+                    f"ALLOWLIST NEW FILE: {rel} did not exist at merge-base {merge_base[:8]}; "
+                    f"cannot add new >{BLOCK_LINES}-line file to allowlist"
+                )
+            elif cap > base_n:
+                errors.append(
+                    f"ALLOWLIST CAP ABOVE BASE: {rel} cap {cap} exceeds merge-base line count {base_n}"
+                )
+
+    # 2. Stale entry checks on current allowlist.
+    for rel, cap in sorted(cur_allow.items()):
+        actual = counts.get(rel)
+        if actual is None:
+            errors.append(
+                f"STALE ALLOWLIST: {rel} no longer exists (or is excluded); remove from {allowlist_rel}"
+            )
+        elif actual <= BLOCK_LINES:
+            errors.append(
+                f"STALE ALLOWLIST: {rel} is now {actual} lines (<= {BLOCK_LINES}); "
+                f"remove from {allowlist_rel} (run scripts/check_source_limits --update)"
+            )
+        elif actual < cap:
+            tighten_hints.append(f"NOTE  {rel}: shrunk {cap} -> {actual} (can ratchet via --update)")
+
+    # 3. Check every first-party source file against warn/block thresholds and merge-base cap.
+    allowlisted_count = 0
+    for rel, actual in sorted(counts.items()):
+        if actual > BLOCK_LINES:
+            if rel not in cur_allow:
+                errors.append(
+                    f"OVER LIMIT: {rel} has {actual} lines (block threshold > {BLOCK_LINES}); "
+                    "split the file before extending it"
+                )
+            else:
+                allowlisted_count += 1
+                cap = cur_allow[rel]
+                if actual > cap:
+                    errors.append(
+                        f"OVER ALLOWLIST: {rel} has {actual} lines (allowlist cap {cap}); "
+                        "allowlisted files may only shrink"
+                    )
+                if merge_base is not None:
+                    base_n = git_file_lines(root, merge_base, rel)
+                    if base_n is not None and actual > base_n:
+                        errors.append(
+                            f"GREW ABOVE BASE: {rel} grew from {base_n} lines at merge-base "
+                            f"{merge_base[:8]} to {actual} lines"
+                        )
+        elif actual > WARN_LINES:
+            warnings.append((actual, rel))
+
+    if not args.quiet_warnings:
+        for n, rel in sorted(warnings, key=lambda item: (-item[0], item[1])):
+            print(f"WARN  {n:5d}  {rel}  ({WARN_LINES + 1}..={BLOCK_LINES})")
+
+    for hint in tighten_hints:
+        print(hint)
+
+    for err in errors:
+        print(f"ERROR {err}", file=sys.stderr)
+
+    base_label = merge_base[:8] if merge_base else "none"
+    status = "PASS" if not errors else "FAIL"
+    print(
+        f"source_limits: {status} "
+        f"(checked={len(counts)}, warn_1501_3000={len(warnings)}, "
+        f"allowlisted_gt3000={allowlisted_count}, errors={len(errors)}, base={base_label})"
+    )
+    return 0 if not errors else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
