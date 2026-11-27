@@ -1025,3 +1025,11 @@ impl<C: CanTransport> JointModeExt for DamiaoArmDriver<C> {
     }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamiaoControlMode {
+    PosVel,
+    Mit,
+    /// Position-force (CTRL_MODE 4): every frame carries a motor current limit.
+    PosForce,
+}

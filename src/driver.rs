@@ -2044,13 +2044,6 @@ impl PendingDisableShadowBatch {
 // 3. Damiao Brushless Arm Driver (reBot Arm B601-DM)
 // =========================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DamiaoControlMode {
-    PosVel,
-    Mit,
-    /// Position-force (CTRL_MODE 4): every frame carries a motor current limit.
-    PosForce,
-}
 
 /// Gripper joint driven in position-force mode with a motor current ceiling
 /// ([`DamiaoArmDriver::with_gripper_pos_force`]).
