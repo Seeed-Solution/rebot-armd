@@ -79,7 +79,7 @@ impl ForwardingTestBus {
 
 impl CanTransport for ForwardingTestBus {
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
-        self.tx.lock().unwrap().push(frame.clone());
+        self.tx.lock().unwrap().push(*frame);
         let now = self.clock.now();
         let mut rx = self.rx.lock().unwrap();
         if frame.id == 0x7FF && frame.dlc == 8 {
