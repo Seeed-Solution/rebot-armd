@@ -477,6 +477,7 @@ mod tests {
             poly_lo: poly.clone(), poly_hi: poly.clone(), poly, source: FootprintSource::Contour, fallback_reason: None, table_z: 0.0, height: [0.03, 0.04], height_source: "evidence",
             centroid: c, axis, aspect, axis_ambiguous: aspect < 1.2, projection_spread_m: 0.0, hard_error_m: 0.005, scale_error_m: 0.005,
             hand_eye_error_m: 0.002, contour_error_m: 0.001, view_distance_m: 0.25,
+            margin: crate::grasp_select::margin::margin(&Default::default(), 0.005, 0.001, 0.25, 0.0),
         }
     }
 

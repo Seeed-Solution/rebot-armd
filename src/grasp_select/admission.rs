@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use super::candidates::{self, CheapStats, Chord, DirClass, Hypothesis, Rejection, MIN_OPENING_RESERVE_M};
 use super::feasibility::{self, Work};
 use super::geometry as g;
+use super::margin::ErrorMargin;
 use super::snapshot::{self, Snapshot, Target};
 use super::{score, AdaptiveRoute, Candidate};
 use crate::grasp::PendingAdaptive;
@@ -81,6 +82,8 @@ pub struct JawAdmission {
     pub full_route_checked: bool,
     /// Set when the planning check was deferred to the live measured width (and why).
     pub deferred: Option<String>,
+    /// The error budget behind `hard_error_m` (active fallback, reported measured budget).
+    pub error_margin: ErrorMargin,
 }
 
 impl JawAdmission {
@@ -93,7 +96,8 @@ impl JawAdmission {
         json!({"candidate_id": self.candidate_id, "width_m": self.width_m, "opening_reserve_m": self.opening_reserve_m,
             "hard_error_m": self.hard_error_m, "open_width_m": self.open_width_m, "max_grasp_width_m": self.max_grasp_width_m,
             "bound_m": MIN_OPENING_RESERVE_M, "full_route_checked": self.full_route_checked,
-            "status": if self.deferred.is_some() { "deferred" } else { "checked" }, "deferred_reason": self.deferred})
+            "status": if self.deferred.is_some() { "deferred" } else { "checked" }, "deferred_reason": self.deferred,
+            "error_margin": self.error_margin.to_json()})
     }
 }
 
@@ -181,9 +185,10 @@ pub(super) fn evaluate_top_down(
 
 /// The refusal of a legacy grasp as [`ArmError::Detailed`] (422): `[phase] message` with the
 /// structured refusal in the details.
-fn legacy_refusal(_s: &Snapshot, _t: Option<&Target>, r: &Rejection, id: Option<String>) -> ArmError {
+fn legacy_refusal(s: &Snapshot, t: Option<&Target>, r: &Rejection, id: Option<String>) -> ArmError {
     let refusal = BestRefusal::from_rejection(id, r);
-    let details = json!({"failing_phase": r.phase, "outcome": "infeasible", "best_refusal": refusal.to_json()});
+    let margin = t.map(|t| t.margin.clone()).unwrap_or_else(|| fallback_margin(s));
+    let details = json!({"failing_phase": r.phase, "outcome": "infeasible", "best_refusal": refusal.to_json(), "error_margin": margin.to_json()});
     ArmError::Detailed { status: 422, code: r.code.clone(), message: format!("[{}] {}", r.phase, r.message), details: Box::new(details) }
 }
 
@@ -202,17 +207,18 @@ fn legacy_refusal(_s: &Snapshot, _t: Option<&Target>, r: &Rejection, id: Option<
 pub fn legacy_admission(pa: &PendingAdaptive) -> Result<JawAdmission, ArmError> {
     let s = &pa.snapshot;
     let id = top_down_id(s);
-    let deferred = |hard_error_m: f64, why: String| JawAdmission {
-        candidate_id: id.clone(), width_m: f64::NAN, opening_reserve_m: f64::NAN, hard_error_m,
+    let deferred = |margin: ErrorMargin, why: String| JawAdmission {
+        candidate_id: id.clone(), width_m: f64::NAN, opening_reserve_m: f64::NAN, hard_error_m: margin.hard_error_m,
         open_width_m: s.tool.open_width_m, max_grasp_width_m: s.tool.max_grasp_width_m, full_route_checked: false, deferred: Some(why),
+        error_margin: margin,
     };
     let t = match snapshot::target(s) {
         Ok(t) => t,
-        Err(m) if !has_footprint_evidence(s) => return Ok(deferred(fallback_hard_error(s), format!("box-only evidence: {m}"))),
+        Err(m) if !has_footprint_evidence(s) => return Ok(deferred(fallback_margin(s), format!("box-only evidence: {m}"))),
         Err(m) => return Err(legacy_refusal(s, None, &Rejection::new("evidence", "NO_WIDTH_EVIDENCE", format!("evidence: {m}")), None)),
     };
     if t.source == snapshot::FootprintSource::Box {
-        return Ok(deferred(t.hard_error_m, "box-only evidence: the width is checked on the measured width at close range".into()));
+        return Ok(deferred(t.margin.clone(), "box-only evidence: the width is checked on the measured width at close range".into()));
     }
     let refuse = |r: &Rejection| legacy_refusal(s, Some(&t), r, Some(id.clone()));
     let td = crate::grasp::top_down_pose(&s.input, &s.setup, &s.cam, &s.envelope, &s.box_norm)?;
@@ -228,6 +234,7 @@ pub fn legacy_admission(pa: &PendingAdaptive) -> Result<JawAdmission, ArmError> 
         max_grasp_width_m: s.tool.max_grasp_width_m,
         full_route_checked: false,
         deferred: None,
+        error_margin: t.margin.clone(),
     })
 }
 
@@ -238,13 +245,19 @@ fn has_footprint_evidence(s: &Snapshot) -> bool {
     e.contour_norm.is_some() || e.obb_corners_norm.is_some() || e.angle_conf.is_some_and(|c| c >= s.setup.align_min_angle_conf) && e.angle_deg.is_some()
 }
 
-/// The fallback hard error at the box-centre target when no footprint could be projected
-/// (scale and hand-eye terms at the camera-to-target distance plus the contour term).
-fn fallback_hard_error(s: &Snapshot) -> f64 {
+/// The margin at the box-centre target when no footprint could be projected (scale and
+/// hand-eye terms at the camera-to-target distance plus the contour term; NaN hard error when
+/// the box centre ray misses the grasp plane).
+fn fallback_margin(s: &Snapshot) -> ErrorMargin {
     let pose_end = s.input.arm.fk(&s.input.q0);
-    let Ok(td) = crate::grasp::top_down_pose(&s.input, &s.setup, &s.cam, &s.envelope, &s.box_norm) else { return f64::NAN };
-    let dist = kinematics::norm(&kinematics::sub(&s.cam.origin(&pose_end), &td.target));
+    let Ok(td) = crate::grasp::top_down_pose(&s.input, &s.setup, &s.cam, &s.envelope, &s.box_norm) else {
+        return super::margin::margin(&s.calib, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    };
+    let o = s.cam.origin(&pose_end);
+    let dist = kinematics::norm(&kinematics::sub(&o, &td.target));
     let scale = snapshot::SCALE_ERROR * td.target[0].hypot(td.target[1]);
     let he = snapshot::HAND_EYE_ERROR_DEG.to_radians().tan() * dist;
-    scale.max(he) + snapshot::CONTOUR_ERROR_PX * dist / s.cam.fx.min(s.cam.fy)
+    let contour = snapshot::CONTOUR_ERROR_PX * dist / s.cam.fx.min(s.cam.fy);
+    let cam_tan = (o[0] - td.target[0]).hypot(o[1] - td.target[1]) / (o[2] - td.target[2]).abs().max(1e-3);
+    super::margin::margin(&s.calib, scale.max(he) + contour, contour, dist, cam_tan)
 }

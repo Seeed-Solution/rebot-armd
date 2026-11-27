@@ -415,6 +415,9 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
         if let Some(r) = &sel.selection.best_refusal {
             details.insert("best_refusal".into(), r.to_json());
         }
+        if let Some(m) = sel.selection.evidence.get("uncertainty").and_then(|u| u.get("error_margin")) {
+            details.insert("error_margin".into(), m.clone());
+        }
         return Err(ArmError::Detailed {
             status: 422,
             code,

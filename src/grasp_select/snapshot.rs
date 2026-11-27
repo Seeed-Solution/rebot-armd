@@ -199,6 +199,8 @@ pub struct Snapshot {
     pub torque_limits: Option<(Vec<f64>, &'static str)>,
     pub prefs: PosePreferences,
     pub budget: Budget,
+    /// Residuals of the calibration in effect (reported margin, [`super::margin`]).
+    pub calib: super::margin::CalibQuality,
 }
 
 /// Request fields of the adaptive strategy (besides the legacy grasp fields).
@@ -230,6 +232,7 @@ pub fn capture_mode(inner: &SupervisorInner, pending: &PendingGrasp, body: &Valu
         inner.requires_real_jaw_curve(),
         inner.config.gravity_comp.as_ref(),
         inner.config.damiao_ranges.as_deref(),
+        inner.calibration.as_ref(),
         strict,
     )
 }
@@ -260,6 +263,7 @@ pub fn capture_from_env_mode(
         env.requires_real_jaw_curve,
         env.config.gravity_comp.as_ref(),
         env.config.damiao_ranges.as_deref(),
+        env.calibration.as_ref(),
         strict,
     )
 }
@@ -271,6 +275,7 @@ fn capture_from_parts(
     requires_real_jaw_curve: bool,
     gravity_comp: Option<&crate::model::GravityCompPolicy>,
     damiao_ranges: Option<&[crate::model::DamiaoRange]>,
+    calibration: Option<&crate::calibration::CalibrationFile>,
     strict: bool,
 ) -> Result<Snapshot, ArmError> {
     let (evidence, prefs, wall_ms) = if strict {
@@ -306,6 +311,7 @@ fn capture_from_parts(
         frame_id: request.frame_id, evidence, open_rad: pending.open_rad, closed_rad: policy.closed_rad, envelope,
         tool: ToolVolumes::b601dm_assumed(open_width, max_w), torque_limits, prefs,
         budget: Budget { wall_ms, cancel: None },
+        calib: super::margin::quality(calibration),
     };
     snap.id = snapshot_id(&snap);
     Ok(snap)
@@ -393,6 +399,8 @@ pub struct Target {
     pub contour_error_m: f64,
     /// Camera centre to target distance at capture (m).
     pub view_distance_m: f64,
+    /// The active (fallback) and the reported measured error budget.
+    pub margin: super::margin::ErrorMargin,
 }
 
 /// Fractional scale error of the image-to-base mapping (user report: 12 mm at 0.40 m).
@@ -456,11 +464,13 @@ pub fn target(s: &Snapshot) -> Result<Target, String> {
     let scale_e = SCALE_ERROR * c[0].hypot(c[1]);
     let he_e = HAND_EYE_ERROR_DEG.to_radians().tan() * dist;
     let contour_e = CONTOUR_ERROR_PX * dist / s.cam.fx.min(s.cam.fy);
+    let cam_tan = (cam_o[0] - c[0]).hypot(cam_o[1] - c[1]) / (cam_o[2] - z_mid).abs().max(1e-3);
+    let margin = super::margin::margin(&s.calib, scale_e.max(he_e) + contour_e, contour_e, dist, cam_tan);
     Ok(Target {
         poly, poly_lo: lo, poly_hi: hi, source, fallback_reason: if source == FootprintSource::Contour { None } else { fallback }, table_z: table, height, height_source,
         centroid: c, axis, aspect, axis_ambiguous: source == FootprintSource::Box || aspect < 1.2,
         projection_spread_m: spread, hard_error_m: scale_e.max(he_e) + contour_e, scale_error_m: scale_e, hand_eye_error_m: he_e,
-        contour_error_m: contour_e, view_distance_m: dist,
+        contour_error_m: contour_e, view_distance_m: dist, margin,
     })
 }
 

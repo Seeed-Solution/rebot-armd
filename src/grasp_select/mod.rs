@@ -18,6 +18,7 @@ pub mod admission;
 pub mod candidates;
 pub mod feasibility;
 pub mod geometry;
+pub mod margin;
 pub mod score;
 pub mod snapshot;
 
@@ -629,6 +630,7 @@ fn evidence_json(s: &Snapshot, t: Option<&snapshot::Target>) -> Value {
             "hard_error_m": t.hard_error_m, "scale_error_m": t.scale_error_m, "hand_eye_error_m": t.hand_eye_error_m,
             "contour_error_m": t.contour_error_m, "projection_spread_m": t.projection_spread_m, "table_error_m": snapshot::TABLE_ERROR_M,
             "view_distance_m": t.view_distance_m,
+            "error_margin": t.margin.to_json(),
         });
     }
     v
