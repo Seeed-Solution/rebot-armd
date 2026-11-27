@@ -2056,9 +2056,6 @@ impl PendingDisableShadowBatch {
 
 
 
-/// Feedback freshness bound for position-force gripper mode writes, pre-enable holds,
-/// stale-feedback recovery, and opening-speed allowance.
-const POS_FORCE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
 /// Feedback freshness threshold for skipping enable's initial bounded `0xCC` FRESHEN phase
 /// on a `PosForce` gripper joint. Any age beyond this bound (or missing empty-queue bound)
 /// triggers FRESHEN across every joint before CTRL_MODE restore/readback, hold, and `CMD_ENABLE`.

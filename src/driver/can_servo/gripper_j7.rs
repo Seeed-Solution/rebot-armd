@@ -1425,3 +1425,7 @@ pub struct MotorCurrentCap {
     pub close_speed_rad_s: Option<f32>,
     pub note: &'static str,
 }
+
+/// Feedback freshness bound for position-force gripper mode writes, pre-enable holds,
+/// stale-feedback recovery, and opening-speed allowance.
+pub(in crate::driver) const POS_FORCE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
