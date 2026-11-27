@@ -19,6 +19,535 @@ use crate::protocol::damiao::{self, DamiaoLimits};
 use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
+    /// Remaining per-release RX frames allowed on this driver under the active control release.
+    #[inline]
+    pub(in crate::driver::can_servo) fn driver_remaining_release_rx(&self) -> u16 {
+        if self.in_active_control_release() {
+            self.release_rx_limit.saturating_sub(self.release_rx_frames)
+        } else {
+            crate::rt_core::ops::RX_FRAME_BUDGET
+        }
+    }
+
+    /// Tightens a caller-supplied RX frame limit against the active control release ledger.
+    #[inline]
+    pub(in crate::driver::can_servo) fn clamp_release_rx_limit(&self, max_rx_frames: u16) -> u16 {
+        if self.in_active_control_release() {
+            max_rx_frames.min(self.driver_remaining_release_rx())
+        } else {
+            max_rx_frames.min(crate::rt_core::ops::RX_FRAME_BUDGET)
+        }
+    }
+
+    /// Compute the fixed `u64` bitmask of joints lacking recent feedback at `now` (zero alloc).
+    ///
+    /// Covers every joint J1–J7 (including J7 under `NoOutputUntilFresh`). When
+    /// `defer_active_pf_freeze` is true and an enabled, verified `PosForce` joint is already
+    /// emitting `0x307` freeze frames during an output pass (`pf_last_fresh_position.is_some()`),
+    /// its `0xCC` slot is left for `emit_pos_force_j7_impl` after `0x307` freeze so tight
+    /// stopped-hold budgets keep Class 1/3 arm holds + J7 freeze prioritized. Under
+    /// `NoOutputUntilFresh` (`pf_last_fresh_position.is_none()`), `FailedHold`, `Idle`-torqued,
+    /// stopped, or any stale arm joint J1–J6, the joint is served directly here before ordinary TX.
+    pub(in crate::driver::can_servo) fn compute_stale_refresh_mask(&self, now: Instant, defer_active_pf_freeze: bool) -> u64 {
+        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+        let active_pf = self.active_pos_force_joint();
+        let pf_configured = self.pos_force.as_ref().map(|pf| pf.joint);
+        // During active operational output (enabled, output running every tick, not stopped),
+        // arm joints J1–J6 receive reply-producing motion frames in this very tick; reserve the
+        // single 0xCC slot for joints lacking reply-producing traffic (NoOutputUntilFresh J7,
+        // or post-freeze J7). In FailedHold, Idle-torqued (!output_ran_since_rx), and stopped
+        // states, every stale joint J1–J7 is served directly here.
+        let active_operational_output = self.is_enabled
+            && self.output_ran_since_rx
+            && !self.is_stopped_for_disable()
+            && self.is_feedback_valid();
+        let mut stale = 0u64;
+        for i in 0..n {
+            let is_stale = if pf_configured == Some(i) {
+                if defer_active_pf_freeze
+                    && self.is_enabled
+                    && active_pf == Some(i)
+                    && self.pf_last_fresh_position.is_some()
+                    && (self.output_ran_since_rx || self.tx_budget.max_frames <= self.motor_ids.len())
+                {
+                    false
+                } else {
+                    !self.pos_force_feedback_valid(i, now)
+                }
+            } else if active_operational_output {
+                false
+            } else {
+                self.last_feedback_instant[i]
+                    .is_none_or(|t| now.saturating_duration_since(t) >= DAMIAO_REFRESH_AFTER)
+            };
+            if is_stale {
+                stale |= 1u64 << i;
+            }
+        }
+        stale
+    }
+
+    /// Service the unified owner-local `0xCC` refresh scheduler: transmits and flushes at most
+    /// ONE `0xCC` read-only status refresh frame per tick, reserved before ordinary TX.
+    ///
+    /// Preserves all stop, MIT fence (`poll_tx_allowed`), deadline, and RX-provenance
+    /// (`last_read_drained && !awaiting_rx_boundary`) checks with zero locks and zero heap
+    /// allocations. (Enable-transition causal `0xCC` refreshes run through
+    /// [`Self::send_refresh_with_boundary_opts`] sharing the same `slot_used_this_tick` cap.)
+    pub(in crate::driver::can_servo) fn service_refresh_scheduler(
+        &mut self,
+        expected_stamp: StopStamp,
+        deadline: Option<Deadline>,
+        defer_active_pf_freeze: bool,
+        allowed_mask: u64,
+    ) -> Result<bool, ArmDriverError> {
+        if self.is_enabling || !self.refresh_scheduler.slot_available() {
+            return Ok(false);
+        }
+        if !self.last_read_drained || self.awaiting_rx_boundary || !self.poll_tx_allowed() {
+            return Ok(false);
+        }
+        if self.pending_stop_check(Some(expected_stamp)).is_err() {
+            return Ok(false);
+        }
+        let now = self.now();
+        if deadline.is_some_and(|d| d.passed(now)) {
+            return Ok(false);
+        }
+        // Optional background 0xCC refresh: defer to the next release when remaining release
+        // budget is below the optional-work margin so it never pushes a release past deadline.
+        if !self.has_optional_release_budget() {
+            self.refresh_scheduler.record_deferred();
+            return Ok(false);
+        }
+        let stale_mask = self.compute_stale_refresh_mask(now, defer_active_pf_freeze) & allowed_mask;
+        let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+        let Some(joint) =
+            self.refresh_scheduler
+                .pick_next(stale_mask, n, now, DAMIAO_REFRESH_AFTER)
+        else {
+            return Ok(false);
+        };
+        let _ = self.ensure_tx_pass();
+        match self.send_plain(TxKind::Refresh, Some(expected_stamp), deadline, false, |d| {
+            Some(damiao::build_refresh_frame(d.motor_ids[joint]))
+        }) {
+            Ok(_) => {
+                if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                    self.discard_all_pending_tx();
+                    self.refresh_scheduler.record_deferred();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                if self.flush_cutoff_exceeded() {
+                    self.mark_tx_pass_backpressured();
+                    self.discard_all_pending_tx();
+                    self.refresh_scheduler.record_deferred();
+                    return Err(TransportError::Timeout.into());
+                }
+                if let Err(e) = self.flush_can_and_commit() {
+                    self.mark_tx_pass_backpressured();
+                    self.discard_all_pending_tx();
+                    self.refresh_scheduler.record_deferred();
+                    return Err(e.into());
+                }
+                self.refresh_scheduler.commit_sent(joint, n, self.now());
+                if self.active_pos_force_joint() == Some(joint) {
+                    self.pf_refresh_pending = false;
+                    self.pf_refresh_deferred_ticks = 0;
+                }
+                Ok(true)
+            }
+            Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed) => {
+                self.refresh_scheduler.record_deferred();
+                if self.active_pos_force_joint() == Some(joint) {
+                    self.pf_refresh_deferred_ticks =
+                        self.pf_refresh_deferred_ticks.saturating_add(1);
+                }
+                Ok(false)
+            }
+            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                self.discard_all_pending_tx();
+                Err(ArmDriverError::EstopInhibited)
+            }
+            Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
+                if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                    self.discard_all_pending_tx();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                self.refresh_scheduler.record_deferred();
+                if self.active_pos_force_joint() == Some(joint) {
+                    self.pf_refresh_deferred_ticks =
+                        self.pf_refresh_deferred_ticks.saturating_add(1);
+                }
+                Ok(false)
+            }
+            Err(_) => {
+                self.refresh_scheduler.skip_non_retryable(joint, n, self.now());
+                Ok(false)
+            }
+        }
+    }
+
+    /// Receive boundary of an MIT transaction, established before its requests go out: read until
+    /// the receive queue is observed empty (bounded). Every frame dequeued afterwards (RX sequence
+    /// number larger than the returned one) was enqueued after the boundary, so frames queued
+    /// before the transaction never count, and a reply arriving right after its request does.
+    /// Pure RX-only drain (no autonomous recovery/refresh TX, no `begin_tx_tick`, zero heap
+    /// allocation). Returns `true` when the transport explicitly reported an empty RX queue.
+    pub(in crate::driver::can_servo) fn drain_rx_frames_only(&mut self, deadline: Option<Deadline>, max_frames: usize) -> bool {
+        let limit = if self.in_active_control_release() {
+            max_frames.min(usize::from(self.driver_remaining_release_rx()))
+        } else {
+            max_frames
+        };
+        let mut effective_deadline = deadline.map(|d| d.at);
+        if let Some(tx_dl) = self.tx_release_deadline {
+            effective_deadline = Some(effective_deadline.map_or(tx_dl, |d| d.min(tx_dl)));
+        }
+        if let Some(rx_dl) = self.rx_deadline {
+            effective_deadline = Some(effective_deadline.map_or(rx_dl, |d| d.min(rx_dl)));
+        }
+        let mut frames = 0usize;
+        let mut drained = false;
+        while frames < limit {
+            let attempt = self.now();
+            if effective_deadline.is_some_and(|d| attempt >= d) {
+                break;
+            }
+            match self.receive_with_rx_time_timed() {
+                Ok((frame, rx_time)) => {
+                    frames += 1;
+                    self.process_rx_frame(&frame, false, rx_time);
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    self.mark_rx_empty(attempt);
+                    drained = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        if frames > 0 {
+            let f_u16 = u16::try_from(frames).unwrap_or(u16::MAX);
+            if let Some(rem) = self.rx_frame_limit.as_mut() {
+                *rem = rem.saturating_sub(f_u16);
+            }
+        }
+        drained
+    }
+
+    /// Transmit a read-only `0xCC` status refresh probe on an empty software queue through the
+    /// single `send()` chokepoint, flush, and check for fresh post-probe feedback.
+    /// Zero heap allocations when `blocking == false` (RT executor path).
+    pub(in crate::driver::can_servo) fn probe_tx_ready_inner(
+        &mut self,
+        deadline: Option<Deadline>,
+        blocking: bool,
+    ) -> Result<bool, ArmDriverError> {
+        if !blocking && (!self.can.supports_nonblocking_rt() || !self.can.supports_bounded_flush()) {
+            return Err(ArmDriverError::Protocol(
+                "UNSUPPORTED: transport does not support non-blocking RT I/O and bounded flush".into(),
+            ));
+        }
+        let pending = self.total_pending_tx_len() as usize;
+        if pending > 0 {
+            self.tx_probe = None;
+            return Err(ArmDriverError::TxDeferred { pending });
+        }
+        if self.motor_ids.is_empty() {
+            return Ok(true);
+        }
+        let start_stamp = self.current_stop_stamp();
+        self.pending_stop_check(Some(start_stamp))?;
+        if let Some((_, at)) = self.mit_fence_trip {
+            if self.since(at) < self.mit_fence_holdoff {
+                return Err(ArmDriverError::Transport(TransportError::WouldBlock));
+            }
+        }
+        let release_cap_passed = |d: &Self| d.tx_release_deadline.is_some_and(|cap| d.now() >= cap);
+        if deadline.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        // Pre-drain pre-existing queued RX backlog before writing the probe.
+        let mut drained = self.drain_rx_frames_only(deadline, 64);
+        if !drained && blocking {
+            for _ in 0..7 {
+                drained = self.drain_rx_frames_only(deadline, 64);
+                if drained {
+                    break;
+                }
+            }
+        }
+        if !drained {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        self.pending_stop_check(Some(start_stamp))?;
+        if deadline.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        self.tx_probe = None;
+        // Preserve any active `self.tx_release_deadline` cap and already-spent release TX
+        // attempts installed by the release owner so the clear-fault probe uses the exact same
+        // release ledger and cutoff as every other TX in the release.
+        self.ensure_release_tx_tick();
+        let probe_joint = 0usize;
+        match self.send_plain(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
+            Some(damiao::build_refresh_frame(d.motor_ids[probe_joint]))
+        }) {
+            Ok(_) => {}
+            Err(TxRefusal::DeadlinePassed) => {
+                return Err(ArmDriverError::Transport(TransportError::Timeout));
+            }
+            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                return Err(ArmDriverError::EstopInhibited);
+            }
+            Err(TxRefusal::Deferred) => {
+                if release_cap_passed(self) {
+                    return Err(ArmDriverError::Transport(TransportError::Timeout));
+                }
+                return Err(ArmDriverError::TxDeferred { pending: 1 });
+            }
+            Err(TxRefusal::Transport(e)) => {
+                return Err(ArmDriverError::Transport(e));
+            }
+            Err(r) => {
+                return Err(Self::refusal_to_driver_err(r));
+            }
+        }
+        self.pending_stop_check(Some(start_stamp))?;
+        if deadline.is_some_and(|d| d.passed(self.now())) || self.flush_cutoff_exceeded() {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        if let Err(e) = self.flush_can_and_commit() {
+            self.mark_tx_pass_backpressured();
+            return Err(ArmDriverError::Transport(e));
+        }
+        // Snapshot the empty-queue RX sequence boundary strictly AFTER the probe write and flush
+        // return successfully, draining any pre-probe frames that arrived between the pre-drain
+        // and the probe write. Because Linux SocketCAN supplies no per-frame hardware arrival
+        // timestamps (`CanTransport::receive_timestamped` returns `None`), this post-write empty
+        // sequence boundary is the causal proof: only feedback decoded strictly after it
+        // (`last_feedback_seq[probe_joint] > boundary_seq`) can satisfy `tx_probe_confirmed()`.
+        let mut post_drained = self.drain_rx_frames_only(deadline, 64);
+        if !post_drained && blocking {
+            for _ in 0..7 {
+                post_drained = self.drain_rx_frames_only(deadline, 64);
+                if post_drained {
+                    break;
+                }
+            }
+        }
+        if !post_drained {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        let boundary_seq = self.rx_empty_seq;
+        let sent_at = self.now();
+        self.tx_probe = Some(TxProbeState {
+            joint: probe_joint,
+            boundary_seq,
+            sent_at,
+        });
+        if blocking {
+            loop {
+                let _ = self.drain_rx_frames_only(deadline, 64);
+                if self.tx_probe_confirmed() {
+                    return Ok(true);
+                }
+                if self.since(sent_at) >= REGISTER_REPLY_TIMEOUT
+                    || deadline.is_some_and(|d| d.passed(self.now()))
+                {
+                    return Ok(false);
+                }
+                self.pause(Duration::from_micros(500));
+            }
+        } else {
+            let _ = self.drain_rx_frames_only(deadline, 64);
+            Ok(self.tx_probe_confirmed())
+        }
+    }
+
+    pub(in crate::driver::can_servo) fn rx_boundary(&mut self) -> Result<u64, ArmDriverError> {
+        for _ in 0..8 {
+            let _ = self.read_joint_states();
+            if self.last_read_drained { return Ok(self.rx_empty_seq); }
+        }
+        Err(ArmDriverError::HardwareFault("receive queue not drained: no boundary for the register transaction".into()))
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn receive_with_rx_time_timed(&mut self) -> Result<(CanFrame, Option<crate::transport::CanRxTime>), TransportError> {
+        let res = if crate::diagnostics::tick::hold_io_active() {
+            let t0 = Instant::now();
+            let res = self.can.receive_with_rx_time();
+            let wall_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            crate::diagnostics::tick::record_hold_rx_ns(wall_ns);
+            res
+        } else {
+            self.can.receive_with_rx_time()
+        };
+        // Single convergence point charging every managed-release CAN RX frame exactly once
+        // (poll, transitions, wakes, ModeSwitch, commissioning, and MIT recovery — including
+        // discarded frames and error exits) into the active release's shared ledger counter.
+        if res.is_ok() && self.in_active_control_release() {
+            self.release_rx_frames = self.release_rx_frames.saturating_add(1);
+        }
+        res
+    }
+
+    /// Recovery writes (cached MIT replay, POS_VEL hold at the measured pose): never while the
+    /// fence is armed or tripped.
+    pub(in crate::driver::can_servo) fn recovery_tx_allowed(&self) -> bool { self.mit_fence.is_none() && self.mit_fence_trip.is_none() }
+
+    /// Read-only status polls: never while the fence is armed; after a trip only once the
+    /// operator cleared it and its hold-off has passed (whether a poll refreshes the motor
+    /// watchdog is not verified, so elapsed time alone never resumes them).
+    pub(in crate::driver::can_servo) fn poll_tx_allowed(&self) -> bool {
+        match &self.mit_fence_trip {
+            Some((_, at)) => self.mit_fence_acked && self.since(*at) >= self.mit_fence_holdoff,
+            None => self.mit_fence.is_none(),
+        }
+    }
+
+    /// Remaining frames allowed in the current budgeted RX pass (defaults to 64 when unbudgeted,
+    /// tightened by the active control release ledger when `control_release_managed`).
+    pub(in crate::driver::can_servo) fn remaining_rx_frame_limit(&self) -> usize {
+        let base = self
+            .rx_frame_limit
+            .unwrap_or(crate::rt_core::ops::RX_FRAME_BUDGET)
+            .min(crate::rt_core::ops::RX_FRAME_BUDGET);
+        usize::from(if self.in_active_control_release() {
+            base.min(self.driver_remaining_release_rx())
+        } else {
+            base
+        })
+    }
+
+    /// Account frames consumed by an RX pass (including discarded frames) into `last_poll_rx` and
+    /// active `rx_frame_limit` (`release_rx_frames` is charged once per frame at the single
+    /// `receive_with_rx_time_timed` convergence point).
+    pub(in crate::driver::can_servo) fn account_rx_pass(&mut self, frames_processed: usize, exhausted: bool) {
+        let frames = u16::try_from(frames_processed).unwrap_or(u16::MAX);
+        if let Some(rem) = self.rx_frame_limit.as_mut() {
+            *rem = rem.saturating_sub(frames);
+        }
+        let (prev_frames, prev_exhausted) = self.last_poll_rx.unwrap_or((0, false));
+        self.last_poll_rx = Some((
+            prev_frames.saturating_add(frames),
+            prev_exhausted || exhausted,
+        ));
+    }
+
+    /// Drain up to the remaining `rx_frame_limit` (max 64) RX frames within `rx_over` and
+    /// `deadline`, stopping on `Timeout` / `WouldBlock` and marking the empty-queue boundary.
+    /// Every frame consumed counts against the release's RX budget and `last_poll_rx`.
+    pub(in crate::driver::can_servo) fn drain_rx_for_boundary(&mut self, deadline: Deadline) -> bool {
+        let max_frames = self.remaining_rx_frame_limit();
+        self.last_read_drained = false;
+        let t0 = self.now();
+        let mut frames_processed = 0usize;
+        let mut rx_drained = false;
+        let mut hit_err = false;
+        while frames_processed < max_frames && !self.rx_over(t0) && !deadline.passed(self.now()) {
+            let attempt = self.now();
+            match self.receive_with_rx_time_timed() {
+                Ok((frame, rx_time)) => {
+                    frames_processed += 1;
+                    self.process_rx_frame(&frame, true, rx_time);
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    rx_drained = true;
+                    self.mark_rx_empty(attempt);
+                    break;
+                }
+                Err(_) => {
+                    hit_err = true;
+                    break;
+                }
+            }
+        }
+        self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
+        rx_drained
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn damiao_command_motor_index(&self, frame: &CanFrame) -> Option<usize> {
+        if frame.is_extended || frame.is_rtr || frame.dlc != 8 || frame.id == 0x7FF {
+            return None;
+        }
+        if let Some(pf_idx) = self.frame_pos_force_joint(frame) {
+            return Some(pf_idx);
+        }
+        self.motor_ids.iter().position(|&id| {
+            let base = u32::from(id);
+            frame.id == base || frame.id == (0x100 + base)
+        })
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn capture_rx_clock_sample(&self, mono_now: Instant) -> (CanRxTime, Option<i128>) {
+        if let Some(sample) = self.can.rx_clock_sample() {
+            (sample.rx_now, sample.realtime_minus_monotonic_ns)
+        } else {
+            (CanRxTime::Monotonic(mono_now), None)
+        }
+    }
+
+    /// A command acknowledgement must be separated from buffered pre-command telemetry.
+    /// Drained telemetry frames update the feedback cache so pre-write checks (state 0,
+    /// stationarity, position) reflect the newest bus state; stale register replies are
+    /// ignored so they cannot satisfy a subsequent register transaction.
+    pub(in crate::driver::can_servo) fn drain_rx_before_command(&mut self) -> bool {
+        self.drain_rx_before_command_limit(128)
+    }
+
+    pub(in crate::driver::can_servo) fn drain_rx_before_command_limit(&mut self, max_frames: usize) -> bool {
+        let base = self
+            .rx_frame_limit
+            .map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
+        let limit = if self.in_active_control_release() {
+            base.min(usize::from(self.driver_remaining_release_rx()))
+        } else {
+            base
+        };
+        self.last_read_drained = false;
+        let start = self.now();
+        let mut effective_deadline = start + Duration::from_millis(5);
+        if let Some(tx_dl) = self.tx_release_deadline {
+            effective_deadline = effective_deadline.min(tx_dl);
+        }
+        if let Some(rx_dl) = self.rx_deadline {
+            effective_deadline = effective_deadline.min(rx_dl);
+        }
+        let mut frames_processed = 0usize;
+        let mut rx_drained = false;
+        let mut hit_err = false;
+        while frames_processed < limit {
+            let attempt = self.now();
+            if attempt >= effective_deadline {
+                break;
+            }
+            match self.receive_with_rx_time_timed() {
+                Ok((frame, rx_time)) => {
+                    frames_processed += 1;
+                    self.process_rx_frame(&frame, false, rx_time);
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    rx_drained = true;
+                    self.mark_rx_empty(attempt);
+                    break;
+                }
+                Err(_) => {
+                    hit_err = true;
+                    break;
+                }
+            }
+        }
+        if self.rx_frame_limit.is_some() {
+            self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
+        }
+        rx_drained
+    }
+
 }
 
 impl<C: CanTransport> BusRecoveryExt for DamiaoArmDriver<C> {

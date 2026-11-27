@@ -19,6 +19,536 @@ use crate::protocol::damiao::{self, DamiaoLimits};
 use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
+    pub(in crate::driver::can_servo) fn emit_pos_force_j7_with_policy(
+        &mut self,
+        intent: PosForceIntent,
+        current: PosForceIntentStamp,
+        tx_deadline: Option<Deadline>,
+        hold_bypass: ContinuityBypass,
+    ) -> Result<PosForceEmitOutcome, ArmDriverError> {
+        if self.control_release_managed && self.control_release_id != 0 {
+            if let Some(pf) = self.pos_force.as_ref() {
+                if pf.joint < 32 && (self.release_ctrl_tx_mask & (1u32 << pf.joint)) != 0 {
+                    return Ok(PosForceEmitOutcome::NotApplicable);
+                }
+            }
+        }
+        let res = pos_force_emitter::emit_tick_with_deadline(
+            self,
+            intent,
+            current,
+            hold_bypass,
+            tx_deadline,
+        );
+        if let Ok(
+            PosForceEmitOutcome::Sent { joint, .. }
+            | PosForceEmitOutcome::SentHoldInsteadOfTarget { joint, .. },
+        ) = res
+        {
+            if self.mit_fence.is_some() && joint < self.mit_fence_last_cmd.len() {
+                self.mit_fence_last_cmd[joint] = Some(self.now());
+            }
+            if self.control_release_managed && self.control_release_id != 0 && joint < 32 {
+                self.release_ctrl_tx_mask |= 1u32 << joint;
+            }
+        }
+        res
+    }
+
+    /// Current driver-gate `(stop_gen, estop_epoch, lease_gen)` stamp for direct-driver callers of
+    /// [`ArmDriver::emit_pos_force_j7`].
+    #[inline]
+    pub fn current_j7_intent_stamp(&self) -> PosForceIntentStamp {
+        let s = self.current_stop_stamp();
+        PosForceIntentStamp {
+            stop_gen: s.stop_gen,
+            estop_epoch: s.estop_gen,
+            lease_gen: self.current_lease_gen(),
+        }
+    }
+
+    /// Per-call continuity bypass policy for stationary J7 `Hold`/`Stop` frames.
+    /// Never applied to motion `Target` intents (enforced inside `pos_force_emitter` and `send`).
+    #[inline]
+    pub(in crate::driver::can_servo) fn j7_hold_continuity_bypass(&self) -> ContinuityBypass {
+        if self.mit_fence.is_some() && self.mit_fence_trip.is_none() {
+            if self.in_active_control_release() {
+                ContinuityBypass::LedgerAndReleaseDeadline
+            } else {
+                ContinuityBypass::Ledger
+            }
+        } else {
+            ContinuityBypass::None
+        }
+    }
+
+    /// Priority `(class, slot_last_tx_seq)` of the active `PosForce` J7 joint's `0x307` frame
+    /// for the current tick epilogue, or `None` when J7 has no `0x307` frame to send.
+    ///
+    /// - Class 1 (`TX_CLASS_STOP_TRANSITION`): J7 is not yet in an unchanged hold/freeze
+    ///   (`slot_in_unchanged_hold[pf_j * 2] == false`) and is about to emit stop / hold / freeze.
+    /// - Class 2 (`TX_CLASS_MOTION_TARGET`): J7 fresh moving target.
+    /// - Class 3 (`TX_CLASS_HOLD_RESEND`): J7 re-send of an unchanged hold / freeze.
+    #[inline]
+    pub(in crate::driver::can_servo) fn j7_tx_priority(&self, is_hold_pass: bool) -> Option<(u8, u64)> {
+        if !self.is_enabled && !is_hold_pass && !self.pf_next_intent_is_hold {
+            return None;
+        }
+        let pf_j = self.active_pos_force_joint()?;
+        let now = self.now();
+        let fresh = self.pos_force_feedback_valid(pf_j, now);
+        if !fresh && self.pos_force_freeze_params(pf_j).is_none() {
+            return None;
+        }
+        let j7_emitting_hold_or_freeze =
+            is_hold_pass || self.pf_next_intent_is_hold || self.pf_hold_on_first_fresh || !fresh;
+        let flat = pf_j.saturating_mul(2);
+        let j7_in_hold = self.slot_in_unchanged_hold.get(flat).copied().unwrap_or(false);
+        let class = if j7_emitting_hold_or_freeze {
+            if j7_in_hold {
+                TX_CLASS_HOLD_RESEND
+            } else {
+                TX_CLASS_STOP_TRANSITION
+            }
+        } else {
+            TX_CLASS_MOTION_TARGET
+        };
+        let seq = self.slot_last_tx_seq.get(flat).copied().unwrap_or(0);
+        Some((class, seq))
+    }
+
+    /// Drive `cfg.joint` in position-force mode with `cfg.current_raw` on every frame. The mode
+    /// (RAM) is written at the next enable with torque off and confirmed by its register reply
+    /// and a readback; until then no command frame reaches that joint.
+    pub fn with_gripper_pos_force(mut self, cfg: GripperPosForce) -> Result<Self, ArmDriverError> {
+        if cfg.joint >= self.motor_ids.len() {
+            return Err(ArmDriverError::Protocol(format!("pos-force gripper joint {} outside {} joints", cfg.joint + 1, self.motor_ids.len())));
+        }
+        if cfg.current_raw == 0 || cfg.current_raw > damiao::POS_FORCE_I_DES_FULL
+            || !(cfg.close_speed_rad_s.is_finite() && cfg.close_speed_rad_s > 0.0)
+            || damiao::pos_force_vel_raw(cfg.close_speed_rad_s) == 0
+            || !(cfg.closed_rad.is_finite() && cfg.open_rad.is_finite()) || cfg.closed_rad == cfg.open_rad {
+            return Err(ArmDriverError::Protocol("pos-force gripper: current_raw 1..=10000, close_speed quantizing >= 0.01 rad/s, closed_rad != open_rad".into()));
+        }
+        self.base_modes[cfg.joint] = DamiaoControlMode::PosForce;
+        self.pos_force = Some(cfg);
+        Ok(self)
+    }
+
+    /// Apply the profile's gripper drive (`gripper_drive_from_profile`).
+    pub fn with_gripper_drive(self, drive: Option<GripperDrive>) -> Result<Self, ArmDriverError> {
+        match drive {
+            None => Ok(self),
+            Some(GripperDrive::PosVel(j)) => Ok(self.with_gripper_pos_vel(j)),
+            Some(GripperDrive::PosForce(cfg)) => self.with_gripper_pos_force(cfg),
+        }
+    }
+
+    /// Legacy profile: `joint` is the gripper, driven in POS_VEL; reported as "no motor current cap".
+    pub fn with_gripper_pos_vel(mut self, joint: usize) -> Self {
+        self.legacy_gripper = Some(joint);
+        self
+    }
+
+    /// Joint index of the active, verified `PosForce` gripper (if configured and currently in `PosForce`).
+    #[inline]
+    pub(in crate::driver::can_servo) fn active_pos_force_joint(&self) -> Option<usize> {
+        let pf = self.pos_force.as_ref()?;
+        let uncertain = pf.joint < 32 && (self.mode_write_uncertain_mask & (1u32 << pf.joint)) != 0;
+        (self.pos_force_verified
+            && !uncertain
+            && self.joint_modes.get(pf.joint).copied().flatten() == Some(DamiaoControlMode::PosForce))
+            .then_some(pf.joint)
+    }
+
+    /// Single freshness authority for the `PosForce` gripper: inclusive `<= 100 ms` on BOTH
+    /// `last_feedback_instant[joint]` AND `feedback_queue_bound[joint]`, plus finite position.
+    #[inline]
+    pub(in crate::driver::can_servo) fn pos_force_feedback_valid(&self, joint: usize, now: Instant) -> bool {
+        self.fresh_measured_position_at(joint, POS_FORCE_FEEDBACK_MAX_AGE, now).is_some()
+    }
+
+    /// Diagnostic staleness age for `joint` at `now`: max of receive age and receive-queue-bound
+    /// age ONLY when both timestamps exist and the cached position is finite; otherwise `None` so
+    /// non-finite or unbounded samples fall back to the episode elapsed timer cleanly.
+    pub(in crate::driver::can_servo) fn pos_force_stale_age(&self, joint: usize, now: Instant) -> Option<Duration> {
+        if !self.cached_states.get(joint).is_some_and(|s| s.position.is_finite()) {
+            return None;
+        }
+        let rx_age = self
+            .last_feedback_instant
+            .get(joint)
+            .copied()
+            .flatten()
+            .map(|t| now.saturating_duration_since(t))?;
+        let qb_age = self
+            .feedback_queue_bound
+            .get(joint)
+            .copied()
+            .flatten()
+            .map(|b| now.saturating_duration_since(b))?;
+        Some(rx_age.max(qb_age))
+    }
+
+    /// Returns `Some(pf.joint)` iff `frame` is a Damiao `0x300 + motor_id` PosForce command frame
+    /// targeting the configured `PosForce` gripper joint.
+    #[inline]
+    pub(in crate::driver::can_servo) fn frame_pos_force_joint(&self, frame: &CanFrame) -> Option<usize> {
+        let pf = self.pos_force.as_ref()?;
+        let motor_id = *self.motor_ids.get(pf.joint)?;
+        let expected_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(motor_id);
+        (frame.id == expected_id).then_some(pf.joint)
+    }
+
+    /// Pure parameter computation `(position, vel_raw = 0, i_des)` for the Damiao `0x307` FREEZE
+    /// frame of joint `i` — performs NO `CanFrame` construction.
+    /// - When at least one provably fresh (`<= 100 ms` at decode time) J7 sample has been observed
+    ///   since this `armd` process started (`pf_last_fresh_position == Some(pos)`):
+    ///   `Some((pos, 0, pf.current_raw))`.
+    /// - When NO provably fresh J7 sample has ever been observed since boot
+    ///   (`pf_last_fresh_position == None`, [`PosForceBootFallback::NoOutputUntilFresh`]):
+    ///   `None` (send NO `0x307` frame until the first fresh sample is decoded).
+    pub(in crate::driver) fn pos_force_freeze_params(&self, i: usize) -> Option<(f32, u16, u16)> {
+        let pf = self.pos_force.as_ref().filter(|pf| pf.joint == i)?;
+        let _ = self.motor_ids.get(i)?;
+        match self.pf_last_fresh_position.filter(|p| p.is_finite()) {
+            Some(pos) => Some((pos, 0, pf.current_raw)),
+            None => match POS_FORCE_BOOT_FALLBACK {
+                PosForceBootFallback::NoOutputUntilFresh => None,
+            },
+        }
+    }
+
+    /// True iff `frame` matches bit-for-bit the expected `0x307` FREEZE (or boot-fallback) payload
+    /// produced by [`Self::pos_force_freeze_params`] for the configured `PosForce` joint.
+    /// Guarantees stale moving targets (`vel_raw != 0` or any new target position) can never
+    /// bypass `send()`'s freshness check while freeze frames always reach the wire.
+    pub(in crate::driver::can_servo) fn is_pos_force_freeze_frame(&self, frame: &CanFrame) -> bool {
+        let Some(pf) = self.pos_force.as_ref() else {
+            return false;
+        };
+        let Some(&motor_id) = self.motor_ids.get(pf.joint) else {
+            return false;
+        };
+        let expected_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(motor_id);
+        if frame.id != expected_id || frame.dlc != 8 {
+            return false;
+        }
+        let Some((pos, vel_raw, cur_raw)) = self.pos_force_freeze_params(pf.joint) else {
+            return false;
+        };
+        frame.data[0..4] == pos.to_le_bytes()
+            && frame.data[4..6] == vel_raw.to_le_bytes()
+            && frame.data[6..8] == cur_raw.to_le_bytes()
+    }
+
+    /// Single shared J7 position-force freshness gate used by the single J7 emitter.
+    ///
+    /// - When J7 feedback is provably fresh (`<= 100 ms`), records `Fresh` (unless already marked
+    ///   `Stale` in this pass), clears `pf_refresh_pending` / `pf_refresh_deferred_ticks`, and
+    ///   returns `None`.
+    /// - When J7 feedback is stale (`> 100 ms` or missing queue bound), records
+    ///   `Stale { joint, age, fresh_gen }`, schedules a `0xCC` refresh (`pf_refresh_pending = true`),
+    ///   and returns `Some(pf_joint)`.
+    pub(in crate::driver::can_servo) fn check_pos_force_freshness_for_tx_at(&mut self, now: Instant) -> Option<usize> {
+        let pf_joint = self.active_pos_force_joint()?;
+        if self.pos_force_feedback_valid(pf_joint, now) {
+            if !matches!(self.last_tx_pf_status, PosForceTxStatus::Stale { .. }) {
+                self.last_tx_pf_status = PosForceTxStatus::Fresh;
+            }
+            self.pf_refresh_pending = false;
+            self.pf_refresh_deferred_ticks = 0;
+            return None;
+        }
+        let age = self.pos_force_stale_age(pf_joint, now);
+        self.last_tx_pf_status = PosForceTxStatus::Stale {
+            joint: pf_joint,
+            age,
+            fresh_gen: self.pf_fresh_gen,
+        };
+        self.pf_refresh_pending = true;
+        Some(pf_joint)
+    }
+
+    pub(in crate::driver::can_servo) fn check_pos_force_freshness_for_tx(&mut self) -> Option<usize> {
+        let now = self.now();
+        self.check_pos_force_freshness_for_tx_at(now)
+    }
+
+    /// Post-freeze `0xCC` refresh slot for a stale active `PosForce` joint, sharing the single
+    /// [`RefreshScheduler`] per-tick 1-slot cap (`slot_available()`). Callers own flushing when
+    /// this returns `Ok(true)`.
+    pub(in crate::driver::can_servo) fn try_send_pf_refresh(
+        &mut self,
+        expected_stamp: StopStamp,
+        explicit_deadline: Option<Deadline>,
+    ) -> Result<bool, ArmDriverError> {
+        let Some(pf_joint) = self.active_pos_force_joint() else {
+            self.pf_refresh_pending = false;
+            self.pf_refresh_deferred_ticks = 0;
+            return Ok(false);
+        };
+        if !self.pf_refresh_pending
+            || !self.refresh_scheduler.slot_available()
+            || !self.poll_tx_allowed()
+        {
+            return Ok(false);
+        }
+        let effective_deadline = match (explicit_deadline, self.active_release_cutoff_deadline()) {
+            (Some(a), Some(b)) => Some(Deadline { at: a.at.min(b.at) }),
+            (a, b) => a.or(b),
+        };
+        match self.send_plain(
+            TxKind::Refresh,
+            Some(expected_stamp),
+            effective_deadline,
+            false,
+            |d| Some(damiao::build_refresh_frame(d.motor_ids[pf_joint])),
+        ) {
+            Ok(_) => {
+                self.refresh_scheduler.mark_slot_used();
+                self.pf_refresh_pending = false;
+                self.pf_refresh_deferred_ticks = 0;
+                Ok(true)
+            }
+            Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed) => {
+                self.refresh_scheduler.record_deferred();
+                self.pf_refresh_pending = true;
+                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
+                Ok(false)
+            }
+            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                self.discard_all_pending_tx();
+                Err(ArmDriverError::EstopInhibited)
+            }
+            Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
+                if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                    self.discard_all_pending_tx();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                self.refresh_scheduler.record_deferred();
+                self.pf_refresh_pending = true;
+                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
+                Ok(false)
+            }
+            Err(_) => {
+                self.refresh_scheduler.record_deferred();
+                self.pf_refresh_pending = true;
+                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
+                Ok(false)
+            }
+        }
+    }
+
+    /// True when joint `i` is the configured `PosForce` joint, has provably fresh (`<= 100 ms`)
+    /// measured feedback at `now`, and `target` encodes a valid finite target with `vel_raw >= 1`
+    /// (NO CAN frame construction — all `0x307` frames are constructed solely in
+    /// [`Self::emit_pos_force_frame`]).
+    pub(in crate::driver::can_servo) fn pos_force_target_valid_at(&self, i: usize, target: &JointTarget, now: Instant) -> bool {
+        let Some(pf) = self.pos_force.as_ref().filter(|pf| pf.joint == i) else {
+            return false;
+        };
+        if !target.position.is_finite() || target.velocity.is_some_and(|v| !v.is_finite()) {
+            return false;
+        }
+        let Some(measured) = self.fresh_measured_position_at(i, POS_FORCE_FEEDBACK_MAX_AGE, now) else {
+            return false;
+        };
+        let requested = target.velocity.filter(|v| *v != 0.0).map_or(self.vlim(), f32::abs).min(self.vlim());
+        let strictly_opening = (target.position - measured) * (pf.closed_rad - pf.open_rad) < 0.0;
+        let speed = if strictly_opening { requested } else { requested.min(pf.close_speed_rad_s) };
+        damiao::pos_force_vel_raw(speed) != 0
+    }
+
+    pub(in crate::driver::can_servo) fn pos_force_target_valid(&self, i: usize, target: &JointTarget) -> bool {
+        self.pos_force_target_valid_at(i, target, self.now())
+    }
+
+    /// True if joint `i`'s mode hold slot `slot` must be emitted via the single `PosForce` emitter
+    /// ([`Self::emit_pos_force_frame`]).
+    #[inline]
+    pub(in crate::driver::can_servo) fn is_pos_force_mode_hold_slot(&self, i: usize, mode: DamiaoControlMode, dual: bool, slot: usize) -> bool {
+        slot == 0
+            && (mode == DamiaoControlMode::PosForce
+                || (dual && self.base_mode(i) == DamiaoControlMode::PosForce))
+    }
+
+    /// Validate that every position-force joint switching into `PosForce` can produce a valid
+    /// capped hold frame before any `CTRL_MODE` write goes on the bus.
+    pub(in crate::driver::can_servo) fn validate_pos_force_holds(&self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], require_when_disabled: bool) -> Result<(), ArmDriverError> {
+        for &i in joints {
+            if modes[i] == DamiaoControlMode::PosForce
+                && (require_when_disabled || self.is_enabled)
+                && !self.pos_force_target_valid(i, &hold[i])
+            {
+                return Err(ArmDriverError::HardwareFault(format!(
+                    "joint {} position-force mode switch refused: hold target invalid or feedback stale", i + 1)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a `PosForce` target's static parameters (configured joint, finite position/velocity,
+    /// nonzero wire speed encoding, nonzero current cap) WITHOUT checking live feedback freshness.
+    pub(in crate::driver::can_servo) fn validate_pos_force_target_static(&self, i: usize, target: &JointTarget) -> Result<u32, ArmDriverError> {
+        let Some(pf) = self.pos_force.as_ref().filter(|pf| pf.joint == i) else {
+            return Err(ArmDriverError::PosForceTargetUnavailable { joint: i });
+        };
+        if !target.position.is_finite() || target.velocity.is_some_and(|v| !v.is_finite()) {
+            return Err(ArmDriverError::PosForceTargetNotFinite { joint: i });
+        }
+        let requested = target
+            .velocity
+            .filter(|v| *v != 0.0)
+            .map_or(self.vlim(), f32::abs)
+            .min(self.vlim());
+        if damiao::pos_force_vel_raw(requested) == 0
+            || damiao::pos_force_vel_raw(pf.close_speed_rad_s) == 0
+        {
+            return Err(ArmDriverError::PosForceSpeedZero { joint: i });
+        }
+        Ok(u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(self.motor_ids[i]))
+    }
+
+    /// Start a bounded causal `0xCC` feedback refresh for J7 while `DamiaoTorque::Enable` is in
+    /// flight. The refresh deadline is fixed before any drain/TX and clamped to both
+    /// `window_deadline` and `enable_tx_deadline`.
+    pub(in crate::driver::can_servo) fn start_enable_pf_refresh(
+        &mut self,
+        joint: usize,
+        window_deadline: Deadline,
+        drained_now: bool,
+    ) -> Result<FeedbackRefresh, ArmDriverError> {
+        self.enable_estop_inhibited()?;
+        self.check_enable_tx_authority()?;
+        self.refresh_capture = None;
+        let start = self.now();
+        let mut refresh_at = (start + ENABLE_PF_REFRESH_TIMEOUT).min(window_deadline.at);
+        if let Some(auth_dl) = self.enable_tx_deadline {
+            refresh_at = refresh_at.min(auth_dl);
+        }
+        let deadline = Deadline { at: refresh_at };
+        let boundary = if drained_now && !deadline.passed(self.now()) {
+            match self.send_refresh_with_boundary_opts(joint, deadline, true) {
+                Ok(b) => b,
+                Err(e) if is_estop_inhibited(&e) => return Err(e),
+                Err(e) => {
+                    self.enable_failed();
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        Ok(FeedbackRefresh { joint, boundary, deadline })
+    }
+
+    pub(in crate::driver::can_servo) fn pos_force_sample_refused(&self, joint: usize, label: &str, fresh: bool, velocity: f32, status: u8) -> Option<ArmDriverError> {
+        let still = velocity.is_finite() && velocity.abs() <= 0.05;
+        let off = !self.is_enabled && status == 0;
+        if fresh && still && off {
+            return None;
+        }
+        let fault = damiao_fault_name(status).map_or(String::new(), |name| format!(" ({name})"));
+        Some(ArmDriverError::HardwareFault(format!(
+            "joint {} {label}: needs fresh stationary feedback with torque off (fresh {fresh}, still {still}, torque off {off}, status {status}{fault}); capped operation unavailable",
+            joint + 1
+        )))
+    }
+
+    /// With torque off, the position-force gripper's mode is written only on fresh (100 ms),
+    /// stationary (|v| <= 0.05 rad/s), state-0 feedback.
+    pub(in crate::driver::can_servo) fn pos_force_write_refused(&self, stray: &[usize]) -> Option<ArmDriverError> {
+        let j = self.pos_force.as_ref()?.joint;
+        if !stray.contains(&j) { return None; }
+        let fresh = self.fresh_measured_position(j, POS_FORCE_FEEDBACK_MAX_AGE).is_some();
+        self.pos_force_sample_refused(j, "position-force mode not written", fresh, self.cached_states[j].velocity, self.motor_status[j])
+    }
+
+    /// Revalidate at `now` that a position-force gripper joint still has provably fresh (`<= 100 ms`)
+    /// non-faulted feedback (both decode instant and empty-queue bound) and verified CTRL_MODE 4
+    /// right before transmitting an initial, carried, or retried `CMD_ENABLE` frame.
+    pub(in crate::driver::can_servo) fn pf_enable_feedback_fresh_at(&self, joint: usize, now: Instant) -> bool {
+        if !self.pos_force.as_ref().is_some_and(|pf| pf.joint == joint) {
+            return true;
+        }
+        if !self.pos_force_verified {
+            return false;
+        }
+        let Some((rx_at, queue_bound)) = self.pf_last_fresh_feedback else {
+            return false;
+        };
+        let status = self.motor_status.get(joint).copied().unwrap_or(0xFF);
+        let status_ok = status == 0 || status == 1;
+        let state_ok = self.cached_states.get(joint).is_some_and(|s| {
+            s.position.is_finite()
+                && if status == 0 {
+                    s.velocity.is_finite() && s.velocity.abs() <= 0.05
+                } else {
+                    s.velocity.is_finite()
+                }
+        });
+        status_ok
+            && state_ok
+            && now.saturating_duration_since(rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
+            && now.saturating_duration_since(queue_bound) <= POS_FORCE_FEEDBACK_MAX_AGE
+    }
+
+    pub(in crate::driver::can_servo) fn pf_enable_feedback_fresh(&self, joint: usize) -> bool {
+        self.pf_enable_feedback_fresh_at(joint, self.now())
+    }
+
+    /// Fail closed immediately if the configured `PosForce` gripper has decoded a hardware fault.
+    pub(in crate::driver::can_servo) fn check_pf_enable_hardware_fault(&mut self, pf_joint: Option<usize>) -> Result<(), ArmDriverError> {
+        if let Some(pf_j) = pf_joint {
+            let status = self.motor_status.get(pf_j).copied().unwrap_or(0);
+            if damiao_fault_name(status).is_some() {
+                let motor_id = self.motor_ids[pf_j];
+                self.torque_hs = None;
+                self.enable_failed();
+                return Err(ArmDriverError::MotorHardwareFault {
+                    joint: pf_j,
+                    motor_id,
+                    status,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Single J7 enable refresh-arming helper shared across initial, carried, and retry passes:
+    /// refuses immediately on a decoded J7 hardware fault, and if J7 is pending in `unsent_mask`
+    /// and not fresh, reserves the bounded causal `0xCC` refresh slot (failing closed once the
+    /// bounded slot budget is exhausted).
+    pub(in crate::driver::can_servo) fn ensure_enable_pf_refresh(
+        &mut self,
+        pf_joint: Option<usize>,
+        unsent_mask: u32,
+        deadline: Deadline,
+        pf_refresh: &mut Option<FeedbackRefresh>,
+        pf_refresh_count: &mut u8,
+    ) -> Result<(), ArmDriverError> {
+        self.check_pf_enable_hardware_fault(pf_joint)?;
+        let Some(pf_j) = pf_joint else {
+            return Ok(());
+        };
+        let pf_bit = 1u32 << pf_j;
+        if pf_refresh.is_none()
+            && (unsent_mask & pf_bit) != 0
+            && !self.pf_enable_feedback_fresh(pf_j)
+        {
+            if *pf_refresh_count >= MAX_ENABLE_PF_REFRESHES {
+                self.torque_hs = None;
+                self.enable_failed();
+                return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+            }
+            *pf_refresh_count += 1;
+            let drained_now = self.last_read_drained;
+            *pf_refresh = Some(self.start_enable_pf_refresh(pf_j, deadline, drained_now)?);
+        }
+        Ok(())
+    }
+
 }
 
 /// Capability-checked transmit kind for [`DamiaoArmDriver::send`].

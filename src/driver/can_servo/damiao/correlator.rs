@@ -19,6 +19,394 @@ use crate::protocol::damiao::{self, DamiaoLimits};
 use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
+    pub(in crate::driver::can_servo) fn prune_comm_reg_replies_for_motor(&mut self, motor_id: u16, up_to_seq: u64) {
+        let mut write_idx = 0usize;
+        for read_idx in 0..self.comm_reg_reply_len {
+            let slot = self.comm_reg_replies[read_idx];
+            let drop_entry = slot.is_some_and(|rep| rep.motor_id == motor_id && rep.rx_seq <= up_to_seq);
+            if !drop_entry {
+                self.comm_reg_replies[write_idx] = slot;
+                write_idx += 1;
+            }
+        }
+        for slot in &mut self.comm_reg_replies[write_idx..self.comm_reg_reply_len] {
+            *slot = None;
+        }
+        self.comm_reg_reply_len = write_idx;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::driver::can_servo) fn feedback_matches_mit_probe(
+        &self,
+        now: Instant,
+        phase_deadline: Instant,
+        idx: usize,
+        req_boundary: u64,
+        dis_at: Instant,
+        prev_seq: u64,
+        prev_at: Instant,
+        min_fb_seq: u64,
+        probe_tx_seq: u64,
+        probe_tx_at: Instant,
+        probe_tx_off: Option<i128>,
+        probe_timeout: Duration,
+    ) -> Option<(u64, Instant)> {
+        if self.awaiting_rx_boundary
+            || !self.last_read_drained
+            || self.motor_status[idx] != 0
+            || now >= phase_deadline
+        {
+            return None;
+        }
+        let fb_seq = self.last_feedback_seq[idx];
+        if fb_seq <= req_boundary
+            || fb_seq <= prev_seq
+            || fb_seq <= min_fb_seq
+            || fb_seq <= probe_tx_seq
+        {
+            return None;
+        }
+        let fb_at = self.last_feedback_instant[idx]?;
+        // Strict `>` timestamp ordering: a reply must arrive strictly AFTER CMD_DISABLE,
+        // strictly AFTER the previous confirming reply, strictly AFTER this probe's submission,
+        // and strictly BEFORE both the per-probe timeout and the phase deadline.
+        if fb_at <= dis_at || fb_at <= prev_at || fb_at <= probe_tx_at || fb_at >= phase_deadline {
+            return None;
+        }
+        if probe_tx_at.checked_add(probe_timeout).is_some_and(|dl| fb_at >= dl) {
+            return None;
+        }
+        let offset_ok = match (
+            probe_tx_off,
+            self.last_feedback_decode_offset_ns.get(idx).copied().flatten(),
+        ) {
+            (Some(w_off), Some(d_off)) => {
+                (d_off - w_off).abs() <= MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !offset_ok {
+            return None;
+        }
+        if now.saturating_duration_since(fb_at) > STOPPED_DISABLE_FEEDBACK_MAX_AGE {
+            return None;
+        }
+        if !self.feedback_queue_bound[idx]
+            .is_some_and(|b| now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+        {
+            return None;
+        }
+        Some((fb_seq, fb_at))
+    }
+
+    pub(in crate::driver::can_servo) fn harvest_mit_expiry_confirmations_into(
+        &self,
+        now: Instant,
+        phase_deadline: Instant,
+        n: usize,
+        req_boundary: u64,
+        probe_timeout: Duration,
+        axes: &mut [MitExpiryAxisState; MAX_MODE_JOINTS],
+    ) -> (u64, u64) {
+        let mut reset_mask = 0u64;
+        let mut reclear_mask = 0u64;
+        if self.awaiting_rx_boundary || !self.last_read_drained || now >= phase_deadline {
+            return (0, 0);
+        }
+        for (i, axis) in axes.iter_mut().enumerate().take(n) {
+            // Any ambiguous or unaccounted feedback observed during Round 1, Round 2, or even
+            // after `probe2_ack` was latched while waiting on other axes immediately invalidates
+            // this axis and restarts from CMD_DISABLE (and ClearFault if faulted).
+            if axis.reply_ambiguous {
+                axis.reset_attempt(self.last_feedback_seq[i]);
+                if i < 64 {
+                    reset_mask |= 1u64 << i;
+                    if self.motor_status[i] >= 8 {
+                        reclear_mask |= 1u64 << i;
+                    }
+                }
+                continue;
+            }
+
+            if let Some((b_tx_seq, b_tx_at, b_tx_off)) = axis.barrier_tx {
+                let max_rx_at = Some(
+                    b_tx_at
+                        .checked_add(REGISTER_REPLY_TIMEOUT)
+                        .map_or(phase_deadline, |dl| dl.min(phase_deadline)),
+                );
+                match self.commissioning_find_register_reply(
+                    i,
+                    false,
+                    damiao::RID_CTRL_MODE,
+                    b_tx_seq,
+                    b_tx_at,
+                    max_rx_at,
+                    b_tx_off,
+                ) {
+                    crate::mit::CommissioningRegMatch::Matched(rep) => {
+                        let valid_post_dis = self.valid_register_reply_id(i, rep.reply_id)
+                            && rep.rx_at > b_tx_at
+                            && rep.rx_at < phase_deadline
+                            && axis
+                                .dis_tx
+                                .is_some_and(|(dis_seq, dis_at)| rep.rx_seq > dis_seq && rep.rx_at > dis_at);
+                        if !valid_post_dis {
+                            axis.reset_attempt(self.last_feedback_seq[i]);
+                            if i < 64 {
+                                reset_mask |= 1u64 << i;
+                                if self.motor_status[i] >= 8 {
+                                    reclear_mask |= 1u64 << i;
+                                }
+                            }
+                            continue;
+                        }
+                        match axis.barrier_ack {
+                            None => axis.barrier_ack = Some((rep.rx_seq, rep.rx_at)),
+                            Some(prev) if prev == (rep.rx_seq, rep.rx_at) => {}
+                            Some(_) => {
+                                axis.reset_attempt(self.last_feedback_seq[i]);
+                                if i < 64 {
+                                    reset_mask |= 1u64 << i;
+                                    if self.motor_status[i] >= 8 {
+                                        reclear_mask |= 1u64 << i;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    crate::mit::CommissioningRegMatch::Ambiguous => {
+                        axis.reset_attempt(self.last_feedback_seq[i]);
+                        if i < 64 {
+                            reset_mask |= 1u64 << i;
+                            if self.motor_status[i] >= 8 {
+                                reclear_mask |= 1u64 << i;
+                            }
+                        }
+                        continue;
+                    }
+                    crate::mit::CommissioningRegMatch::Pending => {}
+                }
+            }
+
+            let Some((_, dis_at)) = axis.dis_tx else {
+                continue;
+            };
+            let Some((b_ack_seq, b_ack_at)) = axis.barrier_ack else {
+                continue;
+            };
+
+            // Any adverse (non-disabled) feedback after barrier confirmation immediately
+            // invalidates the axis and restarts from CMD_DISABLE (and ClearFault if faulted).
+            if self.last_adverse_feedback_seq[i] > b_ack_seq
+                || (self.last_feedback_seq[i] > b_ack_seq && self.motor_status[i] != 0)
+            {
+                axis.reset_attempt(self.last_feedback_seq[i]);
+                if i < 64 {
+                    reset_mask |= 1u64 << i;
+                    if self.motor_status[i] >= 8 {
+                        reclear_mask |= 1u64 << i;
+                    }
+                }
+                continue;
+            }
+
+            // Round 1: confirm first post-barrier `state == 0` reply strictly after probe 1 TX.
+            if axis.probe1_ack.is_none() {
+                if let Some((p1_tx_seq, p1_tx_at, p1_tx_off)) = axis.probe1_tx {
+                    if let Some((fb_seq, fb_at)) = self.feedback_matches_mit_probe(
+                        now,
+                        phase_deadline,
+                        i,
+                        req_boundary,
+                        dis_at,
+                        b_ack_seq,
+                        b_ack_at,
+                        axis.min_next_fb_seq,
+                        p1_tx_seq,
+                        p1_tx_at,
+                        p1_tx_off,
+                        probe_timeout,
+                    ) {
+                        axis.probe1_ack = Some((fb_seq, fb_at));
+                        axis.min_next_fb_seq = axis.min_next_fb_seq.max(fb_seq);
+                    }
+                }
+                continue;
+            }
+
+            // Round 2: confirm second consecutive `state == 0` reply strictly after probe 2 TX
+            // AND strictly after Round 1's confirming reply (`p2_tx_at > p1_ack_at`).
+            if axis.probe2_ack.is_none() {
+                if let Some((p1_ack_seq, p1_ack_at)) = axis.probe1_ack {
+                    if now.saturating_duration_since(p1_ack_at) > STOPPED_DISABLE_FEEDBACK_MAX_AGE {
+                        axis.reset_probes(self.last_feedback_seq[i]);
+                        continue;
+                    }
+                    if let Some((p2_tx_seq, p2_tx_at, p2_tx_off)) = axis.probe2_tx {
+                        if p2_tx_at <= p1_ack_at {
+                            axis.reset_probes(self.last_feedback_seq[i]);
+                            continue;
+                        }
+                        if let Some((fb_seq, fb_at)) = self.feedback_matches_mit_probe(
+                            now,
+                            phase_deadline,
+                            i,
+                            req_boundary,
+                            dis_at,
+                            p1_ack_seq,
+                            p1_ack_at,
+                            axis.min_next_fb_seq.max(p1_ack_seq),
+                            p2_tx_seq,
+                            p2_tx_at,
+                            p2_tx_off,
+                            probe_timeout,
+                        ) {
+                            axis.probe2_ack = Some((fb_seq, fb_at));
+                            axis.min_next_fb_seq = axis.min_next_fb_seq.max(fb_seq);
+                        }
+                    }
+                }
+            }
+        }
+        (reset_mask, reclear_mask)
+    }
+
+    pub(in crate::driver::can_servo) fn expire_timed_out_mit_probes(
+        &self,
+        now: Instant,
+        n: usize,
+        barrier_timeout: Duration,
+        probe_timeout: Duration,
+        axes: &mut [MitExpiryAxisState; MAX_MODE_JOINTS],
+    ) -> u64 {
+        let mut barrier_retried_mask = 0u64;
+        for (i, axis) in axes.iter_mut().enumerate().take(n) {
+            if axis.barrier_ack.is_none() {
+                if let Some((_, b_tx_at, _)) = axis.barrier_tx {
+                    if now.saturating_duration_since(b_tx_at) >= barrier_timeout {
+                        axis.barrier_tx = None;
+                        axis.min_next_fb_seq = axis.min_next_fb_seq.max(self.last_feedback_seq[i]);
+                        if i < 64 {
+                            barrier_retried_mask |= 1u64 << i;
+                        }
+                    }
+                }
+            }
+            if axis.probe1_ack.is_none() {
+                if let Some((_, p1_tx_at, _)) = axis.probe1_tx {
+                    if now.saturating_duration_since(p1_tx_at) >= probe_timeout {
+                        axis.probe1_tx = None;
+                        axis.clear_reply_window();
+                        axis.min_next_fb_seq = axis.min_next_fb_seq.max(self.last_feedback_seq[i]);
+                    }
+                }
+            }
+            if axis.probe2_ack.is_none() {
+                if let Some((_, p2_tx_at, _)) = axis.probe2_tx {
+                    if now.saturating_duration_since(p2_tx_at) >= probe_timeout {
+                        // Reset back to Round 1 on Round 2 timeout so a delayed reply from the
+                        // timed-out probe landing in the retry window can at most credit Round 1
+                        // and NEVER complete confirmation by itself.
+                        axis.reset_probes(self.last_feedback_seq[i]);
+                    }
+                }
+            } else if axis
+                .probe2_ack
+                .is_some_and(|(_, t)| now.saturating_duration_since(t) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+            {
+                axis.reset_probes(self.last_feedback_seq[i]);
+            }
+        }
+        barrier_retried_mask
+    }
+
+    pub(in crate::driver::can_servo) fn is_mit_expiry_axis_causally_disabled(
+        &self,
+        now: Instant,
+        phase_deadline: Instant,
+        idx: usize,
+        req_boundary: u64,
+        axis: &MitExpiryAxisState,
+    ) -> bool {
+        if now >= phase_deadline || axis.reply_ambiguous {
+            return false;
+        }
+        let Some((dis_seq, dis_at)) = axis.dis_tx else {
+            return false;
+        };
+        let Some((b_ack_seq, b_ack_at)) = axis.barrier_ack else {
+            return false;
+        };
+        let Some((p1_tx_seq, p1_tx_at, _)) = axis.probe1_tx else {
+            return false;
+        };
+        let Some((p1_ack_seq, p1_ack_at)) = axis.probe1_ack else {
+            return false;
+        };
+        let Some((p2_tx_seq, p2_tx_at, _)) = axis.probe2_tx else {
+            return false;
+        };
+        let Some((p2_ack_seq, p2_ack_at)) = axis.probe2_ack else {
+            return false;
+        };
+        !self.awaiting_rx_boundary
+            && self.last_read_drained
+            && b_ack_seq > dis_seq
+            && b_ack_at > dis_at
+            && b_ack_at < phase_deadline
+            && p1_ack_seq > req_boundary
+            && p1_ack_seq > b_ack_seq
+            && p1_ack_seq > p1_tx_seq
+            && p1_ack_at > dis_at
+            && p1_ack_at > b_ack_at
+            && p1_ack_at > p1_tx_at
+            && p1_ack_at < phase_deadline
+            && p2_tx_seq >= p1_ack_seq
+            && p2_tx_at > p1_ack_at
+            && p2_ack_seq > p2_tx_seq
+            && p2_ack_seq > p1_ack_seq
+            && p2_ack_at > dis_at
+            && p2_ack_at > p2_tx_at
+            && p2_ack_at > p1_ack_at
+            && p2_ack_at < phase_deadline
+            && self.last_feedback_seq[idx] >= p2_ack_seq
+            && self.last_adverse_feedback_seq[idx] <= b_ack_seq
+            && self.motor_status[idx] == 0
+            && now.saturating_duration_since(p2_ack_at) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
+            && self.feedback_queue_bound[idx].is_some_and(|b| {
+                now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
+            })
+    }
+
+    /// Compute the bitmask of axes currently satisfying the full two-round causal disable
+    /// confirmation predicate (zero alloc).
+    pub(in crate::driver::can_servo) fn mit_expiry_confirmed_mask(
+        &self,
+        now: Instant,
+        phase_deadline: Instant,
+        n: usize,
+        req_boundary: u64,
+        axes: &[MitExpiryAxisState; MAX_MODE_JOINTS],
+    ) -> u64 {
+        let mut mask = 0u64;
+        for (i, axis) in axes.iter().enumerate().take(n) {
+            if i < 64
+                && self.is_mit_expiry_axis_causally_disabled(
+                    now,
+                    phase_deadline,
+                    i,
+                    req_boundary,
+                    axis,
+                )
+            {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
+    }
+
     /// The bounded receive of `read_joint_states` (at most 64 frames or 5 ms) with its
     /// recovery holds and stale-motor refresh; updates `cached_states`.
     /// The receive pass started at `t0` is over: 5 ms, or the caller's service deadline
