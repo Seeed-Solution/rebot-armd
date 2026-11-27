@@ -950,17 +950,22 @@ stop_vision() {
     return 0
 }
 
-stop() {
-    echo "Stopping $NAME..."
+stop_companions() {
     stop_ap_guard
     stop_rt_settle
     stop_app
     stop_vision
+    stop_video
+}
+
+stop() {
+    echo "Stopping $NAME..."
     if [ ! -f "$PIDFILE" ]; then
         if ! command -v pidof >/dev/null 2>&1 || pidof armd >/dev/null 2>&1; then
             echo "Cannot confirm armd stopped: pidfile missing; leaving processes untouched"
             return 1
         fi
+        stop_companions
         echo "$NAME is not running"
         return 0
     fi
@@ -975,7 +980,7 @@ stop() {
             return 1
         fi
         rm -f "$PIDFILE"
-        stop_video
+        stop_companions
         return 0
     fi
     PROC_EXE=$(readlink "/proc/$PID/exe" 2>/dev/null | sed 's/ (deleted)$//')
@@ -985,13 +990,14 @@ stop() {
         return 1
     fi
 
-    # armd may refuse shutdown while hardware disable is unconfirmed.
+    # armd may refuse shutdown while hardware disable is unconfirmed; stop companion
+    # processes only after armd exits so a refused stop leaves vision/app intact.
     kill -TERM "$PID" 2>/dev/null || return 1
     i=0
     while [ "$i" -lt 16 ]; do
         if [ ! -d "/proc/$PID" ]; then
             rm -f "$PIDFILE"
-            stop_video
+            stop_companions
             echo "OK"
             return 0
         fi
