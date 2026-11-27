@@ -72,18 +72,21 @@ async function startArmd(port) {
     cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, RUST_LOG: 'warn', ARMD_APP_CONFIG: 'off', ARMD_POSES: path.join(state, 'poses.json'), ARMD_SEQUENCES: path.join(state, 'sequences.json') },
   });
+  let spawnErr = null;
+  child.once('error', (err) => { spawnErr = err; });
   child.stdout.on('data', (c) => logs.push(String(c)));
   child.stderr.on('data', (c) => logs.push(String(c)));
-  // stop() ends the child and removes the temp state, also when the child already exited.
+  // stop() ends the child and removes the temp state, also when spawn failed or the child already exited.
   const stop = () => new Promise((resolve) => {
     const done = () => { fs.rmSync(state, { recursive: true, force: true }); resolve(); };
-    if (child.exitCode !== null || child.signalCode !== null) { done(); return; }
-    const kt = setTimeout(() => child.kill('SIGKILL'), 3000);
+    if (spawnErr || child.pid == null || child.exitCode !== null || child.signalCode !== null) { done(); return; }
+    const kt = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} }, 3000);
     child.once('exit', () => { clearTimeout(kt); done(); });
-    child.kill('SIGTERM');
+    try { child.kill('SIGTERM'); } catch (_) { clearTimeout(kt); done(); }
   });
   try {
     await waitFor(async () => {
+      if (spawnErr) throw new Error(`failed to spawn armd (${ARMD_BIN}): ${spawnErr.message}`);
       if (child.exitCode !== null) throw new Error(`armd exited early:\n${logs.join('')}`);
       try { const o = await getObs(port); return Array.isArray(o.positions) && o.positions.length > 0; } catch (_) { return false; }
     }, { timeoutMs: 15000, intervalMs: 100, label: 'armd ready' });
@@ -281,9 +284,9 @@ async function scenarios(browser, port, cp) {
   if (want('silent')) await silentOpen(page, link, attempts);
   if (want('resume')) await repeatedResume(page, link, attempts);
   if (want('torque')) await missingTorque(page, link, attempts);
-  if (want('countdown')) await countdownAndReconnectNow(page, link, attempts);
+  if (want('countdown')) await countdownAndReconnectNow(page, link, attempts, cp.acquires);
   if (want('phone')) await phoneExpert(browser, port);
-  if (want('armtext')) { await live(page); await armTextCases(page); }
+  if (want('armtext')) { await live(page); await armTextCases(page, port, link); }
 
   assert.deepEqual(cp.pageErrors, [], 'page errors');
   const errors = cp.consoleLines.filter((l) => l.startsWith('error:'));
@@ -358,11 +361,12 @@ async function missingTorque(page, link, attempts) {
   log('PASS missing is_torqued: frames refused, warning kept, no parked notice, backoff intact');
 }
 
-// 8. The lost status counts down to the queued retry; "reconnect now" retries at once.
-async function countdownAndReconnectNow(page, link, attempts) {
+// 8. The lost status counts down to the queued retry; "reconnect now" retries at once, sends
+//    0 acquire_lease, and cancels the old queued timer (exactly 1 attempt through the old deadline).
+async function countdownAndReconnectNow(page, link, attempts, acquires) {
   await live(page);
   const n0 = attempts.length;
-  await dropAndWaitLost(page, link, true);
+  const tCut = await dropAndWaitLost(page, link, true);
   await waitFor(() => attempts.length >= n0 + 3, { timeoutMs: 10000, intervalMs: 50, label: 'three retries' });
   await sleep(300);
   const retryTxt = () => page.evaluate(() => { const e = document.getElementById('lease-retry-txt'); return { hidden: e.hidden, txt: e.textContent.trim(), btn: !document.getElementById('btn-reconnect-now').hidden }; });
@@ -376,6 +380,8 @@ async function countdownAndReconnectNow(page, link, attempts) {
   const b = await retryTxt();
   const m2 = /^(\d+) 秒后重试$/.exec(b.txt);
   assert(m2 && Number(m2[1]) < Number(m[1]), `countdown did not decrease: ${a.txt} -> ${b.txt}`);
+  const oldDueAt = await page.evaluate(() => wsReconnectDueAt);
+  assert(oldDueAt > Date.now() + 2000, `queued retry deadline should be > 2 s ahead, got ${oldDueAt - Date.now()} ms`);
   link.outage = false;
   const n1 = attempts.length, tClick = Date.now();
   await page.click('#btn-reconnect-now');
@@ -383,46 +389,96 @@ async function countdownAndReconnectNow(page, link, attempts) {
   await live(page, 3000);
   await page.waitForFunction(() => document.getElementById('btn-reconnect-now').hidden && document.getElementById('lease-retry-txt').hidden, null, { timeout: 2000 })
     .catch(() => { throw new Error('countdown and reconnect-now still shown after recovery'); });
-  log(`PASS countdown ${a.txt} -> ${b.txt}; reconnect now: attempt after ${attempts[n1] - tClick} ms, live again`);
+  const waitPast = Math.max(0, oldDueAt + 500 - Date.now());
+  if (waitPast > 0) await sleep(waitPast);
+  assert.equal(attempts.length - n1, 1, `manual reconnect made ${attempts.length - n1} attempts through old retry deadline, want 1`);
+  assert.equal(acquires(tCut).length, 0, `manual reconnect sent ${acquires(tCut).length} acquire_lease, want 0`);
+  log(`PASS countdown ${a.txt} -> ${b.txt}; reconnect now: 1 attempt (${attempts[n1] - tClick} ms), 0 acquire_lease through old deadline`);
 }
 
-// Arm-state text of the release notice: pending torque off vs. a running park, and the notice for a
-// lease held by another client carries the same arm state.
-async function armTextCases(page) {
+// Arm-state text of the release notice: pending torque off vs. a running park, and the actual
+// rendered #lease-released notice when another real client holds the lease on reconnect.
+async function armTextCases(page, port, link) {
   const r = await page.evaluate(() => {
     const o = { ...S.obs, watchdog_park_blocked_reason: null };
     return {
       pending: connArmText({ ...o, is_torqued: true, disable_pending: true, action: null }),
       parking: connArmText({ ...o, is_torqued: true, disable_pending: true, action: { kind: 'park', state: 'running' } }),
-      other: t('lease.released.other', { who: 'rebot-mcp', arm: connArmText({ ...o, is_torqued: false, disable_pending: false, action: null }) }),
-      pendingKey: t('conn.arm.disable_pending'), parkingKey: t('conn.arm.parking'), offKey: t('conn.arm.off'),
+      pendingKey: t('conn.arm.disable_pending'), parkingKey: t('conn.arm.parking'),
     };
   });
   assert.equal(r.pending, r.pendingKey, 'disable_pending alone is a pending torque off');
   assert.equal(r.parking, r.parkingKey, 'a running park action is parking');
-  assert(r.other.includes(r.offKey), `release notice for another holder carries the arm state: ${r.other}`);
-  log(`PASS arm text: pending "${r.pending}", parking "${r.parking}", other holder "${r.other}"`);
+
+  // Hold the lease, drop the socket, let a second real WS client acquire the lease, then reconnect
+  // and assert the rendered #lease-released notice (not just the i18n formatter).
+  if (await page.evaluate(() => S.leaseGeneration == null)) {
+    await page.evaluate(() => acquireLeaseDirect());
+    await page.waitForFunction(() => S.leaseGeneration != null, null, { timeout: 5000 });
+  }
+  await dropAndWaitLost(page, link, true);
+  const otherId = 'rebot-mcp-other';
+  const otherWs = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws`);
+  try {
+    await new Promise((resolve, reject) => {
+      otherWs.addEventListener('open', resolve, { once: true });
+      otherWs.addEventListener('error', () => reject(new Error('other client WS open failed')), { once: true });
+    });
+    otherWs.send(JSON.stringify({ type: 'acquire_lease', seq: 1, client_id: otherId, force: true }));
+    await waitFor(async () => (await getObs(port)).lease_holder === otherId, { timeoutMs: 5000, intervalMs: 50, label: 'other client holds lease' });
+    link.outage = false;
+    await live(page, 20000);
+    await page.waitForFunction(() => !document.getElementById('lease-released').hidden, null, { timeout: 4000 });
+    const rel = await releaseNotice(page);
+    const obs = await getObs(port);
+    const wantArm = !obs.is_torqued && obs.action?.kind === 'park' && obs.action?.state === 'done' ? PARKED_ZH : TORQUE_OFF_ZH;
+    const ui = await page.evaluate(() => ({
+      retakeDisabled: document.getElementById('btn-retake').disabled,
+      lsCls: document.getElementById('lease-status').className,
+    }));
+    assert(!obs.is_torqued && !rel.hidden && rel.txt.includes(otherId) && rel.txt.includes(wantArm),
+      `rendered other-holder release notice (want ${wantArm}): ${JSON.stringify(rel)}`);
+    assert.equal(ui.retakeDisabled, true, '#btn-retake must be disabled while another client holds the lease');
+    assert(ui.lsCls.includes('is-other'), `lease status class while other holds: ${ui.lsCls}`);
+    log(`PASS arm text & rendered other-holder notice: pending "${r.pending}", parking "${r.parking}", rendered "${rel.txt}"`);
+  } finally {
+    otherWs.close();
+    await waitFor(async () => (await getObs(port)).lease_holder === null, { timeoutMs: 5000, intervalMs: 50, label: 'other client lease released' }).catch(() => {});
+  }
 }
 
-// 9. Phone expert layout: #lease-status is in the hidden status line, the header badge shows the warning.
+// 9. Phone expert layout: header badge shows the warning AND #btn-reconnect-now is exposed and usable
+//    via the same handler (not trapped inside hidden #ex-sline).
 async function phoneExpert(browser, port) {
   const cp = await openCockpit(browser, port, { width: 400, height: 860 });
   try {
-    const { page, link } = cp;
+    const { page, link, attempts } = cp;
     await page.goto(`http://127.0.0.1:${port}/?ui=expert`, { waitUntil: 'domcontentloaded' });
     await live(page);
-    await dropAndWaitLost(page, link, true);
+    assert.equal(await page.locator('#lease-status').boundingBox(), null, 'connected phone expert keeps #lease-status hidden');
+    const n0 = attempts.length;
+    const tCut = await dropAndWaitLost(page, link, true);
+    await waitFor(() => attempts.length >= n0 + 2, { timeoutMs: 8000, intervalMs: 50, label: 'phone retries' });
     // the badge is narrow: "连接已断开 · {s} 秒后重试" while a retry is queued, else the full warning
     await page.waitForFunction((t) => (document.getElementById('ex-ph-status')?.textContent || '').startsWith(t), LOST_T_ZH, { timeout: 2000 }).catch(() => {});
     const ph = await page.evaluate(() => { const e = document.getElementById('ex-ph-status'); const r = e.getBoundingClientRect(); return { txt: e.textContent.trim(), cls: e.className, visible: r.width > 0 && r.height > 0 && getComputedStyle(e).display !== 'none' }; });
     assert(ph.visible && ph.cls.includes('is-danger') && (ph.txt === LOST_ZH || /^连接已断开 · \d+ 秒后重试$/.test(ph.txt)), `phone expert badge: ${JSON.stringify(ph)}`);
     const fits = await page.evaluate(() => { const e = document.getElementById('ex-ph-status'); return e.scrollWidth <= e.clientWidth + 1; });
     assert(fits, `phone expert badge text is clipped: ${ph.txt}`);
+    const btnBox = await page.locator('#btn-reconnect-now').boundingBox();
+    assert(btnBox && btnBox.width > 0 && btnBox.height > 0, `phone expert #btn-reconnect-now must be visible, got ${JSON.stringify(btnBox)}`);
+    const clipped = await page.evaluate(() => [...document.querySelectorAll('#lease-status > *')].filter((e) => !e.hidden && e.scrollWidth > e.clientWidth + 1).map((e) => e.id));
+    assert.deepEqual(clipped, [], 'phone expert lost status text clipped');
     await page.screenshot({ path: path.join(SHOT_DIR, 's3r2_phone_expert_lost_zh.png') });
     link.outage = false;
-    await live(page, 20000);
+    const n1 = attempts.length, tClick = Date.now();
+    await page.click('#btn-reconnect-now');
+    await waitFor(() => attempts.length > n1, { timeoutMs: 1000, intervalMs: 20, label: 'phone reconnect now attempt' });
+    await live(page, 3000);
+    assert.equal(cp.acquires(tCut).length, 0, 'phone reconnect now must send 0 acquire_lease');
+    await waitFor(async () => (await page.locator('#lease-status').boundingBox()) === null, { timeoutMs: 2000, intervalMs: 50, label: 'phone #lease-status hidden after recovery' });
     assert.deepEqual(cp.pageErrors, [], 'phone page errors');
-    log(`PASS phone expert: header badge "${ph.txt}" (${ph.cls})`);
+    log(`PASS phone expert: header badge "${ph.txt}" (${ph.cls}), #btn-reconnect-now clicked (${attempts[n1] - tClick} ms)`);
   } finally {
     await cp.ctx.close().catch(() => {});
   }

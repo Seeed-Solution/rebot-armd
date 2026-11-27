@@ -33,17 +33,20 @@ async function startMockArmd() {
     env: { ...process.env, RUST_LOG: 'warn', ARMD_APP_CONFIG: 'off',
       ARMD_POSES: path.join(state, 'poses.json'), ARMD_SEQUENCES: path.join(state, 'sequences.json') },
   });
-  // stop() ends the child and removes the temp state, also when the child already exited.
+  let spawnErr = null;
+  child.once('error', (err) => { spawnErr = err; });
+  // stop() ends the child and removes the temp state, also when spawn failed or the child already exited.
   const stop = () => new Promise((resolve) => {
     const done = () => { fs.rmSync(state, { recursive: true, force: true }); resolve(); };
-    if (child.exitCode !== null || child.signalCode !== null) { done(); return; }
-    const kt = setTimeout(() => child.kill('SIGKILL'), 3000);
+    if (spawnErr || child.pid == null || child.exitCode !== null || child.signalCode !== null) { done(); return; }
+    const kt = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} }, 3000);
     child.once('exit', () => { clearTimeout(kt); done(); });
-    child.kill('SIGTERM');
+    try { child.kill('SIGTERM'); } catch (_) { clearTimeout(kt); done(); }
   });
   try {
     const deadline = Date.now() + 15000;
     for (;;) {
+      if (spawnErr) throw new Error(`failed to spawn armd (${ARMD_BIN}): ${spawnErr.message}`);
       if (child.exitCode !== null) throw new Error(`armd exited early (${child.exitCode})`);
       try { if ((await fetch(`http://127.0.0.1:${port}/api/v1/observation`)).ok) break; } catch (_) {}
       if (Date.now() > deadline) throw new Error('armd not ready');
