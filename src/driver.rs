@@ -2056,9 +2056,6 @@ impl PendingDisableShadowBatch {
 
 
 
-/// Time allowed per motor for the four register replies of the startup range check
-/// (7 silent motors: 140 ms).
-const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
 /// Feedback freshness bound for position-force gripper mode writes, pre-enable holds,
 /// stale-feedback recovery, and opening-speed allowance.
 const POS_FORCE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);

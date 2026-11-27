@@ -1121,3 +1121,7 @@ pub(in crate::driver::can_servo) enum RefreshStep {
     Pending(FeedbackRefresh),
     TimedOut,
 }
+
+/// Time allowed per motor for the four register replies of the startup range check
+/// (7 silent motors: 140 ms).
+pub(in crate::driver::can_servo) const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
