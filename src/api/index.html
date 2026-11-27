@@ -2619,6 +2619,7 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
           </div>
           <div class="oc-sub" id="grasp-sub"><span></span><span id="meas-sub"></span></div>
           <button class="oc-task" id="grasp-task" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer"><span data-i18n="oc.task">抓取任务</span><b id="grasp-task-name">默认</b><span class="oc-task-set" data-i18n="oc.task.set">设置 ›</span></button>
+          <button class="oc-task" id="grasp-orient" type="button"><span data-i18n="oc.orient">夹取姿态</span><b id="grasp-orient-name">自适应</b><span class="oc-task-set" data-i18n="oc.orient.switch">切换 ›</span></button>
         </div>
         <div class="s-objhint only-simple" id="s-objhint" role="status" hidden></div>
         <div class="meas-card" id="meas-card" role="region" aria-live="polite" data-i18n-aria="ms.title" aria-label="尺寸测量" hidden></div>
@@ -4052,7 +4053,7 @@ Object.assign(I18N.zh, {
   'sv.other': '其他视觉', 'sv.aruco': 'ArUco 标记', 'sv.gset': '抓取设置 ›',
   'sv.hint': '点选画面中的物体，可抓取或测量尺寸', 'sv.hint0': '画面中没有识别到物体。物体进入画面并被识别后，点选它可抓取或测量尺寸',
   'oc.x': '取消选择', 'oc.src.seg': '分割轮廓', 'oc.src.box': '检测框', 'oc.meas.sub': '臂会移动 ±{cm} cm · 约 15 s',
-  'oc.task': '抓取任务', 'oc.task.def': '默认', 'oc.task.set': '设置 ›',
+  'oc.task': '抓取任务', 'oc.task.def': '默认', 'oc.task.set': '设置 ›', 'oc.orient': '夹取姿态', 'oc.orient.adaptive': '自适应（可斜向）', 'oc.orient.legacy': '顶部垂直', 'oc.orient.switch': '切换 ›',
   'gset.tasks': '抓取任务', 'gset.task.def.d': '用下面的高度和夹爪位置抓取选中的物体。',
   'gset.tasks.hidden': '另有 {n} 个任务需要别的识别模型，简易模式不列出（在专家模式使用）。',
   'lease.tq.on': '扭矩开', 'lease.tq.off': '扭矩关',
@@ -4150,7 +4151,7 @@ Object.assign(I18N.en, {
   'sv.other': 'Other vision', 'sv.aruco': 'ArUco markers', 'sv.gset': 'Grasp settings ›',
   'sv.hint': 'Tap an object in the video to grasp it or measure its size', 'sv.hint0': 'No object recognised. Once an object is in view and recognised, tap it to grasp it or measure its size',
   'oc.x': 'Clear selection', 'oc.src.seg': 'outline', 'oc.src.box': 'box', 'oc.meas.sub': 'arm moves ±{cm} cm · about 15 s',
-  'oc.task': 'Grasp task', 'oc.task.def': 'Default', 'oc.task.set': 'Settings ›',
+  'oc.task': 'Grasp task', 'oc.task.def': 'Default', 'oc.task.set': 'Settings ›', 'oc.orient': 'Grasp approach', 'oc.orient.adaptive': 'Adaptive (angled allowed)', 'oc.orient.legacy': 'Top-down', 'oc.orient.switch': 'Switch ›',
   'gset.tasks': 'Grasp task', 'gset.task.def.d': 'Grasps the selected object with the heights and gripper position below.',
   'gset.tasks.hidden': '{n} more tasks need another detection model and are not listed in simple mode (use expert mode).',
   'lease.tq.on': 'torque on', 'lease.tq.off': 'torque off',
@@ -13211,7 +13212,7 @@ async function graspGo() {
   try {
     const b = s.box.map((v) => Math.round(Math.min(1, Math.max(0, v)) * 10000) / 10000);
     const task = graspTaskCur();
-    const ack = await graspRPC('/api/v1/action/grasp', { label: s.label, box_norm: b, ts_ms: Date.now(), tag: 'cockpit', ...(task ? { task } : {}) });
+    const ack = await graspRPC('/api/v1/action/grasp', { label: s.label, box_norm: b, ts_ms: Date.now(), tag: 'cockpit', strategy: GR.strategy, ...(task ? { task } : {}) });
     GR.id = ack.action_id ?? null;
     if (GR.setup == null) graspLoadSetup(true);
   } catch (_) {
@@ -13242,6 +13243,8 @@ function renderGrasp() {
   $('grasp-task').hidden = !!run || !(GR.supported || (S.caps && S.caps.grasp));
   const tk = graspTaskCur();
   setText($('grasp-task-name'), tk || t('oc.task.def'));
+  $('grasp-orient').hidden = $('grasp-task').hidden;
+  setText($('grasp-orient-name'), t(GR.strategy === 'legacy' ? 'oc.orient.legacy' : 'oc.orient.adaptive'));
   bar.querySelector('.grasp-acts').classList.toggle('one', !!run || !measOk);
   $('grasp-prog').hidden = !run;
   $('grasp-go').hidden = !!run;
@@ -13627,6 +13630,7 @@ function initSVis() {
   $('sv-gset').addEventListener('click', () => { visPopOpen(false); gsetOpen(true); });
   $('grasp-x').addEventListener('click', () => { GR.sel = null; renderGrasp(); });
   $('grasp-task').addEventListener('click', () => gsetOpen(true));
+  $('grasp-orient').addEventListener('click', () => { GR.strategy = GR.strategy === 'legacy' ? 'adaptive' : 'legacy'; store('rebot.grasp.strategy', GR.strategy); renderGrasp(); });
   i18nHooks.push(renderSVis);
   renderSVis();
 }
@@ -14383,6 +14387,8 @@ function placeMeasCard(card) {
    tasks the loaded detector serves without a switch (requires.model_kind = the loaded kind, models.detector = the loaded
    model or unset). The choice stays in this browser (rebot.grasp.task) and goes into the grasp request as `task`. */
 GR.task = store('rebot.grasp.task') || null;
+// Grasp approach (`strategy` in the grasp request): adaptive (default, may choose an angled approach) or legacy (top-down).
+GR.strategy = store('rebot.grasp.strategy') === 'legacy' ? 'legacy' : 'adaptive';
 function graspTasks() { return (GR.setup && GR.setup.tasks && typeof GR.setup.tasks === 'object') ? GR.setup.tasks : {}; }
 function taskUsable(tk) {
   if (S.ui !== 'simple' || !tk) return true;
