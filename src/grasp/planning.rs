@@ -109,8 +109,20 @@ pub struct PendingGrasp {
     /// Populated only when `strategy: "adaptive"` is requested (`None` for legacy).
     pub adaptive: Option<Box<PendingAdaptive>>,
     /// Legacy requests: the same snapshot state, for the shared admission of the top-down
-    /// candidate ([`crate::grasp_select::admission::legacy_admission`]).
+    /// candidate ([`crate::grasp_select::admission::plan_legacy_top_down`]).
     pub shared: Option<Box<PendingAdaptive>>,
+}
+
+impl PendingGrasp {
+    /// Attach a cooperative cancellation flag (e.g. WS connection close) to the planning snapshot.
+    pub fn set_cancel(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        if let Some(pa) = &mut self.adaptive {
+            pa.snapshot.budget.cancel = Some(cancel.clone());
+        }
+        if let Some(sh) = &mut self.shared {
+            sh.snapshot.budget.cancel = Some(cancel);
+        }
+    }
 }
 
 /// A grasp whose coarse approach (legacy) or whole adaptive route was found reachable.
@@ -140,10 +152,19 @@ fn adaptive_prep_err(phase: &'static str, err: ArmError) -> ArmError {
     let api = ApiError::from(err);
     let status = api.status.as_u16();
     let code = api.code.unwrap_or(api.error);
-    let msg = if api.message.starts_with(&format!("[{phase}]")) {
-        api.message
+    let raw_msg = api.message;
+    let msg = if raw_msg.starts_with(&format!("[{phase}]")) {
+        raw_msg.clone()
     } else {
-        format!("[{phase}] {}", api.message)
+        format!("[{phase}] {raw_msg}")
+    };
+    let refusal = crate::grasp_select::BestRefusal {
+        candidate_id: None,
+        phase: phase.to_string(),
+        code: code.clone(),
+        message: raw_msg,
+        value: None,
+        bound: None,
     };
     ArmError::Detailed {
         status,
@@ -152,6 +173,7 @@ fn adaptive_prep_err(phase: &'static str, err: ArmError) -> ArmError {
         details: Box::new(serde_json::json!({
             "failing_phase": phase,
             "outcome": "infeasible",
+            "best_refusal": refusal.to_json(),
         })),
     }
 }
@@ -579,8 +601,17 @@ pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn Detectio
             code = Some(err_code.to_string());
             message = reason.clone();
             if let Some(Value::Object(ref mut obj)) = adaptive {
+                let br = crate::grasp_select::BestRefusal {
+                    candidate_id: None,
+                    phase: phase.to_string(),
+                    code: err_code.to_string(),
+                    message: reason.clone().unwrap_or_default(),
+                    value: None,
+                    bound: None,
+                };
                 obj.insert("outcome".into(), serde_json::json!("infeasible"));
                 obj.insert("failing_phase".into(), serde_json::json!(phase));
+                obj.insert("best_refusal".into(), br.to_json());
             }
         }
     }
@@ -687,12 +718,29 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
                     .map(str::to_string),
                 _ => None,
             };
+            let existing_refusal = match &e {
+                ArmError::Detailed { details, .. } => details.get("best_refusal").cloned(),
+                _ => None,
+            };
             let (reachable, code, message) = rejected(e);
             let adaptive = (strategy == crate::grasp_select::Strategy::Adaptive).then(|| {
+                let phase = failing_phase.as_deref().unwrap_or("request");
+                let br = existing_refusal.unwrap_or_else(|| {
+                    crate::grasp_select::BestRefusal {
+                        candidate_id: None,
+                        phase: phase.to_string(),
+                        code: code.clone().unwrap_or_else(|| "INVALID_COMMAND".into()),
+                        message: message.clone().unwrap_or_default(),
+                        value: None,
+                        bound: None,
+                    }
+                    .to_json()
+                });
                 serde_json::json!({
                     "strategy": "adaptive",
                     "outcome": "infeasible",
-                    "failing_phase": failing_phase.as_deref().unwrap_or("request"),
+                    "failing_phase": phase,
+                    "best_refusal": br,
                 })
             });
             (reachable, code, message, None, adaptive, None)

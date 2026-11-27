@@ -68,6 +68,22 @@ pub fn preference_penalty(p: &PosePreferences, hy: &Hypothesis) -> f64 {
 /// hand-eye error (tangentially) and the contour error (along the jaws), the table moved by
 /// ±[`TABLE_ERROR_M`], the chord scaled by ±3 %; contact and pre-grasp IK at the shifted poses.
 pub fn robustness(s: &Snapshot, t: &Target, hy: &Hypothesis, c: &Checked, work: &mut Work) -> Robustness {
+    robustness_budget(s, t, hy, c, work, &|| false).expect("unbounded robustness never expires")
+}
+
+/// [`robustness`] checking `out_of_budget()` across every perturbed IK solve; returns `None` if
+/// the budget or cancellation flag trips.
+pub fn robustness_budget(
+    s: &Snapshot,
+    t: &Target,
+    hy: &Hypothesis,
+    c: &Checked,
+    work: &mut Work,
+    out_of_budget: &dyn Fn() -> bool,
+) -> Option<Robustness> {
+    if out_of_budget() {
+        return None;
+    }
     let rho = g::unit2([hy.g[0], hy.g[1]]);
     let lam = g::perp2(rho);
     let y = kinematics::column(&hy.r, 1);
@@ -86,14 +102,24 @@ pub fn robustness(s: &Snapshot, t: &Target, hy: &Hypothesis, c: &Checked, work: 
     for sh in &shifts {
         let d = [sh[0], sh[1], 0.0];
         for (pose, seed) in [(hy.grasp_pose(), c.q_grasp), (hy.pregrasp_pose(), c.q_pre)] {
+            if out_of_budget() {
+                return None;
+            }
             tried += 1;
             let p = Pose::new(pose.r, kinematics::add(&pose.p, &d));
-            if let Ok(q) = feasibility::endpoint_ik(&s.input, &p, &[seed], work) {
-                if feasibility::joint_margin(&s.input, &q) > 0.0 { ok += 1; }
+            match feasibility::endpoint_ik_budget(&s.input, &p, &[seed], work, out_of_budget) {
+                Ok(q) => {
+                    if feasibility::joint_margin(&s.input, &q) > 0.0 { ok += 1; }
+                }
+                Err(feasibility::EndpointIkError::BudgetExhausted) => return None,
+                Err(_) => {}
             }
         }
     }
-    Robustness { worst_opening_reserve_m: worst_reserve, worst_pad_overlap_m: worst_overlap, worst_table_clearance_m: worst_table, ik_ok: ok, ik_tried: tried }
+    if out_of_budget() {
+        return None;
+    }
+    Some(Robustness { worst_opening_reserve_m: worst_reserve, worst_pad_overlap_m: worst_overlap, worst_table_clearance_m: worst_table, ik_ok: ok, ik_tried: tried })
 }
 
 /// The scores of a checked candidate.

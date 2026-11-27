@@ -501,7 +501,15 @@ impl Candidate {
 
 /// A rejected hypothesis kept for the reply.
 #[derive(Debug, Clone)]
-pub struct Rejected { pub id: String, pub hy: Hypothesis, pub rejection: Rejection, pub shortlisted: bool }
+pub struct Rejected {
+    pub id: String,
+    pub hy: Hypothesis,
+    pub rejection: Rejection,
+    pub shortlisted: bool,
+    /// True when the rejection came from a path-preflight phase (rather than cheap geometry or
+    /// endpoint IK screening).
+    pub path_stage: bool,
+}
 
 /// Search counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -574,36 +582,59 @@ fn phase_rank(p: &str, path: bool) -> usize {
 
 struct Search<'a> {
     s: &'a Snapshot,
+    /// Total planning start time (never reset; reported in `elapsed_ms`).
+    total_start: Instant,
+    /// Optional-search budget start time (checked against `s.budget.wall_ms`).
     start: Instant,
     stats: Stats,
     rejected: Vec<Rejected>,
+    /// Rejections without a constructed hypothesis: `(candidate_id, index, rejection, path_stage)`.
+    bare_rejected: Vec<(Option<String>, usize, Rejection, bool)>,
     by_phase: BTreeMap<&'static str, usize>,
     by_code: BTreeMap<String, usize>,
 }
 
 impl Search<'_> {
+    fn cancelled(&self) -> bool {
+        self.s.budget.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
     fn out_of_budget(&self) -> bool {
-        self.start.elapsed().as_secs_f64() * 1000.0 > self.s.budget.wall_ms as f64
-            || self.s.budget.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        self.start.elapsed().as_secs_f64() * 1000.0 > self.s.budget.wall_ms as f64 || self.cancelled()
     }
     fn id(&self, hy: &Hypothesis) -> String {
         if hy.index == admission::TOP_DOWN_INDEX { admission::top_down_id(self.s) } else { format!("{}-{:03}", self.s.id, hy.index) }
     }
-    /// A rejection without a hypothesis (counted only).
-    fn reject_bare(&mut self, r: Rejection) {
+    /// A rejection without a hypothesis (counted and ranked for `best_refusal`).
+    fn reject_bare(&mut self, candidate_id: Option<String>, index: usize, r: Rejection, path_stage: bool) {
         *self.by_phase.entry(r.phase).or_default() += 1;
         *self.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
+        self.bare_rejected.push((candidate_id, index, r, path_stage));
     }
-    fn reject(&mut self, hy: &Hypothesis, r: Rejection, shortlisted: bool) {
+    fn reject(&mut self, hy: &Hypothesis, r: Rejection, shortlisted: bool, path_stage: bool) {
         *self.by_phase.entry(r.phase).or_default() += 1;
         *self.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
-        self.rejected.push(Rejected { id: self.id(hy), hy: hy.clone(), rejection: r, shortlisted });
+        self.rejected.push(Rejected { id: self.id(hy), hy: hy.clone(), rejection: r, shortlisted, path_stage });
+    }
+    /// Deepest rejection across every recorded rejection (cheap, endpoint IK, path preflight,
+    /// `-top`, and bare), ordered by `(phase_rank(phase, path_stage), lowest candidate index)`
+    /// BEFORE `alternatives` are truncated.
+    fn pick_best_refusal(&self) -> Option<(Option<String>, Rejection)> {
+        let hyp_iter = self.rejected.iter().map(|r| {
+            (phase_rank(r.rejection.phase, r.path_stage), r.hy.index, Some(r.id.clone()), &r.rejection)
+        });
+        let bare_iter = self.bare_rejected.iter().map(|(cid, idx, r, path_stage)| {
+            (phase_rank(r.phase, *path_stage), *idx, cid.clone(), r)
+        });
+        hyp_iter
+            .chain(bare_iter)
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+            .map(|(_, _, cid, r)| (cid, r.clone()))
     }
     fn finish(self, outcome: Outcome, code: Option<String>, message: Option<String>, ranked: Vec<Candidate>, evidence: Value) -> Selection {
         let plan = (outcome == Outcome::Selected).then(|| ranked.first().map(|c| c.plan(self.s))).flatten();
         Selection {
             snapshot_id: self.s.id.clone(), outcome, code, message, ranked, rejected: self.rejected, rejections_by_phase: self.by_phase, rejections_by_code: self.by_code,
-            evidence, stats: self.stats, elapsed_ms: self.start.elapsed().as_secs_f64() * 1000.0, budget_ms: self.s.budget.wall_ms, plan,
+            evidence, stats: self.stats, elapsed_ms: self.total_start.elapsed().as_secs_f64() * 1000.0, budget_ms: self.s.budget.wall_ms, plan,
             best_refusal: None,
         }
     }
@@ -715,8 +746,8 @@ fn canonical_seed(s: &Snapshot, t: &snapshot::Target) -> [f64; 6] {
     })
 }
 
-/// Budget exhaustion of the optional search: the verified top-down route when there is one,
-/// else no winner.
+/// Budget exhaustion of the optional search: the verified top-down route when there is one
+/// (unless explicitly cancelled via `budget.cancel`), else no winner.
 fn exhausted_or_top(
     se: Search,
     n: usize,
@@ -724,20 +755,20 @@ fn exhausted_or_top(
     top: &Option<(Candidate, AdaptiveRoute)>,
     legacy: admission::LegacyVerdict,
 ) -> AdaptiveSelection {
-    match top {
-        Some((c, route)) if c.checked.insufficient_evidence.is_none() => {
-            let mut se = se;
-            se.stats.fully_checked = 1;
-            let sel = se.finish(Outcome::Selected, None, None, vec![c.clone()], ev);
-            AdaptiveSelection { selection: sel, route: Some(route.clone()), failing_phase: None, checked_hint: None, legacy }
-        }
-        _ => {
-            let hint = legacy.reachable.then(|| {
-                "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
-            });
-            AdaptiveSelection { selection: se.exhausted(n, ev), route: None, failing_phase: Some("budget"), checked_hint: hint, legacy }
+    if !se.cancelled() {
+        if let Some((c, route)) = top {
+            if c.checked.insufficient_evidence.is_none() {
+                let mut se = se;
+                se.stats.fully_checked = 1;
+                let sel = se.finish(Outcome::Selected, None, None, vec![c.clone()], ev);
+                return AdaptiveSelection { selection: sel, route: Some(route.clone()), failing_phase: None, checked_hint: None, legacy };
+            }
         }
     }
+    let hint = (!se.cancelled() && legacy.reachable).then(|| {
+        "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
+    });
+    AdaptiveSelection { selection: se.exhausted(n, ev), route: None, failing_phase: Some("budget"), checked_hint: hint, legacy }
 }
 
 pub fn select_adaptive_route(
@@ -773,17 +804,22 @@ fn select_adaptive_route_inner(
     let total_start = Instant::now();
     let mut se = Search {
         s,
+        total_start,
         start: total_start,
         stats: Stats::default(),
         rejected: Vec::new(),
+        bare_rejected: Vec::new(),
         by_phase: BTreeMap::new(),
         by_code: BTreeMap::new(),
     };
     let mut work = Work::default();
+    // Start the reserved top-down budget BEFORE any charged top-down / legacy work.
+    let top_deadline = admission::top_down_deadline(total_start);
+    let top_over = admission::top_down_budget_fn(s, top_deadline);
     let t = match snapshot::target(s) {
         Ok(t) => t,
         Err(m) => {
-            let td_out = admission::plan_legacy_top_down(s, Some(Err(&m)), &mut work);
+            let td_out = admission::plan_legacy_top_down_budget(s, Some(Err(&m)), &mut work, &top_over);
             let legacy = match td_out.route {
                 Ok(tr) => admission::LegacyVerdict::from_ok(&tr),
                 Err(e) => admission::LegacyVerdict::from_err(e),
@@ -810,17 +846,13 @@ fn select_adaptive_route_inner(
         }
     };
     let ev = evidence_json(s, Some(&t));
-    // Start the reserved top-down budget BEFORE any charged top-down / legacy work.
-    let top_deadline = admission::top_down_deadline(Instant::now());
-    let top_over = admission::top_down_budget_fn(s, top_deadline);
-    let td_out = admission::plan_legacy_top_down(s, Some(Ok(&t)), &mut work);
+    let td_out = admission::plan_legacy_top_down_budget(s, Some(Ok(&t)), &mut work, &top_over);
     let acq_res = td_out.acq;
     let acq_seed = acq_res.as_ref().ok().copied();
 
     let (mut chords, chord_rej) = candidates::chords(&t, &s.tool);
     let mut cheap = candidates::CheapStats::default();
     let ctx = admission::Ctx { policy: gripper_policy, limit: gripper_limit, close_speed_limit, has_gravity_model };
-    let mut top_rej: Option<Rejection> = None;
     let (legacy, top) = match td_out.route {
         Ok(tr) => {
             let legacy = admission::LegacyVerdict::from_ok(&tr);
@@ -832,11 +864,10 @@ fn select_adaptive_route_inner(
                     Some((cand, route))
                 }
                 Err(b) => {
-                    let (hy, r) = *b;
-                    top_rej = Some(r.clone());
+                    let (hy, r, path_stage) = *b;
                     match hy {
-                        Some(hy) => se.reject(&hy, r, true),
-                        None => se.reject_bare(r),
+                        Some(hy) => se.reject(&hy, r, path_stage, path_stage),
+                        None => se.reject_bare(Some(admission::top_down_id(s)), admission::TOP_DOWN_INDEX, r, path_stage),
                     }
                     None
                 }
@@ -848,27 +879,32 @@ fn select_adaptive_route_inner(
             // When acquisition itself failed, keep `acq_res` for the wholly-unreachable path so
             // `rejections.acquisition` is counted once rather than twice.
             if acq_res.is_ok() {
-                if let Some(r) = td_out.rejection {
-                    top_rej = Some(r.clone());
-                    se.reject_bare(r);
+                if let Some((r, path_stage)) = td_out.rejection {
+                    se.reject_bare(Some(admission::top_down_id(s)), admission::TOP_DOWN_INDEX, r, path_stage);
                 }
             }
             (legacy, None)
         }
     };
+    if se.cancelled() {
+        se.stats.work = work;
+        se.stats.lattice_tests = cheap.lattice_tests;
+        return exhausted_or_top(se, 0, ev, &top, legacy);
+    }
+    // Optional-search budget starts here; `total_start` stays untouched for total `elapsed_ms`.
     se.start = Instant::now();
     se.stats.chords = chords.len();
     for r in chord_rej {
-        *se.by_phase.entry(r.phase).or_default() += 1;
-        *se.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
+        se.reject_bare(None, usize::MAX, r, false);
     }
     let (hyps, hyp_rej) = candidates::hypotheses(s, &t, &chords, &mut cheap);
     se.stats.generated = cheap.generated;
     se.stats.geometric_survivors = hyps.len();
     for (hy, r) in hyp_rej {
-        se.reject(&hy, r, false);
+        se.reject(&hy, r, false, false);
     }
     if se.out_of_budget() {
+        se.stats.work = work;
         se.stats.lattice_tests = cheap.lattice_tests;
         return exhausted_or_top(se, 0, ev, &top, legacy);
     }
@@ -891,11 +927,19 @@ fn select_adaptive_route_inner(
             seeds.push(qa);
         }
         seeds.push(canonical_seed);
-        let q_g = match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
-            Ok(q) => q,
-            Err(err) => {
-                se.reject(&hy, err.into_rejection("contact pose"), false);
-                continue;
+        let q_g = {
+            let over = || se.out_of_budget();
+            match feasibility::endpoint_ik_budget(&s.input, &hy.grasp_pose(), &seeds, &mut work, &over) {
+                Ok(q) => q,
+                Err(feasibility::EndpointIkError::BudgetExhausted) => {
+                    se.stats.work = work;
+                    se.stats.lattice_tests = cheap.lattice_tests;
+                    return exhausted_or_top(se, 0, ev, &top, legacy);
+                }
+                Err(err) => {
+                    se.reject(&hy, err.into_rejection("contact pose"), false, false);
+                    continue;
+                }
             }
         };
         let mut pre_seeds = vec![q_g, s.input.q0];
@@ -903,11 +947,19 @@ fn select_adaptive_route_inner(
             pre_seeds.push(qa);
         }
         pre_seeds.push(canonical_seed);
-        let q_pre_seed = match feasibility::endpoint_ik(&s.input, &hy.pregrasp_pose(), &pre_seeds, &mut work) {
-            Ok(q) => q,
-            Err(err) => {
-                se.reject(&hy, err.into_rejection("pre-grasp pose"), false);
-                continue;
+        let q_pre_seed = {
+            let over = || se.out_of_budget();
+            match feasibility::endpoint_ik_budget(&s.input, &hy.pregrasp_pose(), &pre_seeds, &mut work, &over) {
+                Ok(q) => q,
+                Err(feasibility::EndpointIkError::BudgetExhausted) => {
+                    se.stats.work = work;
+                    se.stats.lattice_tests = cheap.lattice_tests;
+                    return exhausted_or_top(se, 0, ev, &top, legacy);
+                }
+                Err(err) => {
+                    se.reject(&hy, err.into_rejection("pre-grasp pose"), false, false);
+                    continue;
+                }
             }
         };
         seed_cache.insert((hy.class, hy.half_turn), q_g);
@@ -927,7 +979,8 @@ fn select_adaptive_route_inner(
                 "acquisition: {} (a different contact pose cannot fix the observation pose)",
                 r.message
             );
-            let sel = se.finish(Outcome::Infeasible, Some(r.code), Some(m), Vec::new(), ev);
+            let mut sel = se.finish(Outcome::Infeasible, Some(r.code.clone()), Some(m), Vec::new(), ev);
+            sel.best_refusal = Some(admission::BestRefusal::from_rejection(None, &r));
             return AdaptiveSelection {
                 selection: sel,
                 route: None,
@@ -966,15 +1019,14 @@ fn select_adaptive_route_inner(
 
     let acq_ok = acq_res.is_ok();
     let mut entries: Vec<(Candidate, AdaptiveRoute)> = Vec::new();
-    let mut deepest: Option<(usize, Rejection, String)> = top_rej.map(|r| (phase_rank(r.phase, true), r, admission::top_down_id(s)));
     entries.extend(top.iter().cloned());
 
+    // Returns `true` when the optional-search budget or cancellation flag tripped.
     let evaluate = |se: &mut Search,
                         hy: &Hypothesis,
                         q_pre_seed: [f64; 6],
                         work: &mut Work,
-                        entries: &mut Vec<(Candidate, AdaptiveRoute)>,
-                        deepest: &mut Option<(usize, Rejection, String)>| {
+                        entries: &mut Vec<(Candidate, AdaptiveRoute)>| -> bool {
         let budget_check = || se.out_of_budget();
         let ch_ref = &chords[hy.chord];
         match preflight_candidate_from_start(
@@ -992,7 +1044,9 @@ fn select_adaptive_route_inner(
             &budget_check,
         ) {
             Ok((checked, mut route)) => {
-                let rob = score::robustness(s, &t, hy, &checked, work);
+                let Some(rob) = score::robustness_budget(s, &t, hy, &checked, work, &budget_check) else {
+                    return true;
+                };
                 let ch = ch_ref.clone();
                 let scores = score::score(s, &t, &ch, hy, &checked, &rob);
                 let vis = visible(s, &t, &hy.pregrasp_pose());
@@ -1011,13 +1065,12 @@ fn select_adaptive_route_inner(
                     visible_at_pregrasp: vis,
                 };
                 entries.push((cand, route));
+                se.out_of_budget()
             }
+            Err(r) if r.phase == "budget" && r.code == "BUDGET_EXHAUSTED" => true,
             Err(r) => {
-                let rank = phase_rank(r.phase, true);
-                if deepest.as_ref().is_none_or(|(d, _, _)| rank > *d) {
-                    *deepest = Some((rank, r.clone(), se.id(hy)));
-                }
-                se.reject(hy, r, true);
+                se.reject(hy, r, true, true);
+                se.out_of_budget()
             }
         }
     };
@@ -1030,7 +1083,12 @@ fn select_adaptive_route_inner(
             return exhausted_or_top(se, n, ev, &top, legacy);
         }
         let (hy, _, q_pre_seed, _) = &screened[i];
-        evaluate(&mut se, hy, *q_pre_seed, &mut work, &mut entries, &mut deepest);
+        if evaluate(&mut se, hy, *q_pre_seed, &mut work, &mut entries) {
+            let n = entries.len();
+            se.stats.work = work;
+            se.stats.lattice_tests = cheap.lattice_tests;
+            return exhausted_or_top(se, n, ev, &top, legacy);
+        }
     }
 
     // Refinement around best feasible oblique (same schedule as Phase A).
@@ -1080,32 +1138,47 @@ fn select_adaptive_route_inner(
             ) {
                 Ok(hy) => {
                     let seeds = [b_qg, s.input.q0];
-                    match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
+                    let q_g_res = {
+                        let over = || se.out_of_budget();
+                        feasibility::endpoint_ik_budget(&s.input, &hy.grasp_pose(), &seeds, &mut work, &over)
+                    };
+                    match q_g_res {
                         Ok(q_g) => {
                             let pre_seeds = [b_qp, q_g, s.input.q0];
-                            match feasibility::endpoint_ik(
-                                &s.input,
-                                &hy.pregrasp_pose(),
-                                &pre_seeds,
-                                &mut work,
-                            ) {
-                                Ok(q_pre_seed) => evaluate(
-                                    &mut se,
-                                    &hy,
-                                    q_pre_seed,
-                                    &mut work,
-                                    &mut entries,
-                                    &mut deepest,
-                                ),
-                                Err(err) => se.reject(&hy, err.into_rejection("refined pre-grasp pose"), true),
+                            let q_pre_res = {
+                                let over = || se.out_of_budget();
+                                feasibility::endpoint_ik_budget(&s.input, &hy.pregrasp_pose(), &pre_seeds, &mut work, &over)
+                            };
+                            match q_pre_res {
+                                Ok(q_pre_seed) => {
+                                    if evaluate(&mut se, &hy, q_pre_seed, &mut work, &mut entries) {
+                                        let n = entries.len();
+                                        se.stats.work = work;
+                                        se.stats.lattice_tests = cheap.lattice_tests;
+                                        return exhausted_or_top(se, n, ev, &top, legacy);
+                                    }
+                                }
+                                Err(feasibility::EndpointIkError::BudgetExhausted) => {
+                                    let n = entries.len();
+                                    se.stats.work = work;
+                                    se.stats.lattice_tests = cheap.lattice_tests;
+                                    return exhausted_or_top(se, n, ev, &top, legacy);
+                                }
+                                Err(err) => se.reject(&hy, err.into_rejection("refined pre-grasp pose"), true, false),
                             }
                         }
-                        Err(err) => se.reject(&hy, err.into_rejection("refined contact pose"), true),
+                        Err(feasibility::EndpointIkError::BudgetExhausted) => {
+                            let n = entries.len();
+                            se.stats.work = work;
+                            se.stats.lattice_tests = cheap.lattice_tests;
+                            return exhausted_or_top(se, n, ev, &top, legacy);
+                        }
+                        Err(err) => se.reject(&hy, err.into_rejection("refined contact pose"), true, false),
                     }
                 }
                 Err(b) => {
                     let (hy, r) = *b;
-                    se.reject(&hy, r, true);
+                    se.reject(&hy, r, true, false);
                 }
             }
         }
@@ -1167,37 +1240,21 @@ fn select_adaptive_route_inner(
             }
         }
         None => {
-            let mut best = None;
-            let (phase, code, m) = match deepest {
-                Some((_, r, id)) => {
-                    best = Some(admission::BestRefusal::from_rejection(Some(id), &r));
-                    (r.phase, r.code.clone(), format!("no candidate passed; deepest failure in {}: {}", r.phase, r.message))
-                }
-                None => {
-                    let top = se.rejected.iter().max_by(|a, b| {
-                        phase_rank(a.rejection.phase, false)
-                            .cmp(&phase_rank(b.rejection.phase, false))
-                            .then(b.hy.index.cmp(&a.hy.index))
-                    });
-                    if let Some(r) = top {
-                        best = Some(admission::BestRefusal::from_rejection(Some(r.id.clone()), &r.rejection));
-                    }
-                    match top {
-                        Some(r) => (
-                            r.rejection.phase,
-                            r.rejection.code.clone(),
-                            format!(
-                                "no candidate passed; deepest failure in {}: {}",
-                                r.rejection.phase, r.rejection.message
-                            ),
-                        ),
-                        None => (
-                            "geometry",
-                            "NO_CANDIDATE".into(),
-                            "no contact chord on the footprint".into(),
-                        ),
-                    }
-                }
+            let picked = se.pick_best_refusal();
+            let best = picked
+                .as_ref()
+                .map(|(cid, r)| admission::BestRefusal::from_rejection(cid.clone(), r));
+            let (phase, code, m) = match picked {
+                Some((_, r)) => (
+                    r.phase,
+                    r.code.clone(),
+                    format!("no candidate passed; deepest failure in {}: {}", r.phase, r.message),
+                ),
+                None => (
+                    "geometry",
+                    "NO_CANDIDATE".into(),
+                    "no contact chord on the footprint".into(),
+                ),
             };
             let hint = legacy.reachable.then(|| {
                 "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
@@ -1713,7 +1770,8 @@ fn preflight_candidate_from_start(
 
 /// Run the selection on a snapshot (outside the supervisor lock).
 pub fn select(s: &Snapshot) -> Selection {
-    let mut se = Search { s, start: Instant::now(), stats: Stats::default(), rejected: Vec::new(), by_phase: BTreeMap::new(), by_code: BTreeMap::new() };
+    let now = Instant::now();
+    let mut se = Search { s, total_start: now, start: now, stats: Stats::default(), rejected: Vec::new(), bare_rejected: Vec::new(), by_phase: BTreeMap::new(), by_code: BTreeMap::new() };
     let t = match snapshot::target(s) {
         Ok(t) => t,
         Err(m) => {
@@ -1726,14 +1784,13 @@ pub fn select(s: &Snapshot) -> Selection {
     let (chords, chord_rej) = candidates::chords(&t, &s.tool);
     se.stats.chords = chords.len();
     for r in chord_rej {
-        *se.by_phase.entry(r.phase).or_default() += 1;
-        *se.by_code.entry(format!("{}:{}", r.phase, r.code)).or_default() += 1;
+        se.reject_bare(None, usize::MAX, r, false);
     }
     let mut cheap = candidates::CheapStats::default();
     let (hyps, hyp_rej) = candidates::hypotheses(s, &t, &chords, &mut cheap);
     se.stats.generated = cheap.generated;
     se.stats.geometric_survivors = hyps.len();
-    for (hy, r) in hyp_rej { se.reject(&hy, r, false); }
+    for (hy, r) in hyp_rej { se.reject(&hy, r, false, false); }
     if se.out_of_budget() { se.stats.lattice_tests = cheap.lattice_tests; return se.exhausted(0, ev); }
     // the acquisition prefix every candidate shares
     let mut work = Work::default();
@@ -1756,10 +1813,10 @@ pub fn select(s: &Snapshot) -> Selection {
         if let Some(q) = seed_cache.get(&(hy.class, hy.half_turn)) { seeds.insert(0, *q); }
         let q_g = match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
             Ok(q) => q,
-            Err(err) => { se.reject(&hy, err.into_rejection("contact pose"), false); continue; }
+            Err(err) => { se.reject(&hy, err.into_rejection("contact pose"), false, false); continue; }
         };
         if let Err(err) = feasibility::endpoint_ik(&s.input, &hy.pregrasp_pose(), &[q_g, acq.q_end], &mut work) {
-            se.reject(&hy, err.into_rejection("pre-grasp pose"), false);
+            se.reject(&hy, err.into_rejection("pre-grasp pose"), false, false);
             continue;
         }
         seed_cache.insert((hy.class, hy.half_turn), q_g);
@@ -1779,8 +1836,7 @@ pub fn select(s: &Snapshot) -> Selection {
     short.sort_unstable();
     se.stats.shortlisted = short.len();
     let mut ranked: Vec<Candidate> = Vec::new();
-    let mut deepest: Option<(usize, Rejection)> = None;
-    let run = |se: &mut Search, hy: &Hypothesis, work: &mut Work, ranked: &mut Vec<Candidate>, deepest: &mut Option<(usize, Rejection)>| {
+    let run = |se: &mut Search, hy: &Hypothesis, work: &mut Work, ranked: &mut Vec<Candidate>| {
         match feasibility::check(s, &t, &acq, hy, work) {
             Ok(c) => {
                 let r = score::robustness(s, &t, hy, &c, work);
@@ -1790,16 +1846,14 @@ pub fn select(s: &Snapshot) -> Selection {
                 ranked.push(Candidate { id: se.id(hy), hy: hy.clone(), chord: ch, checked: c, robustness: r, scores, visible_at_pregrasp: vis });
             }
             Err(r) => {
-                let rank = phase_rank(r.phase, true);
-                if deepest.as_ref().is_none_or(|(d, _)| rank > *d) { *deepest = Some((rank, r.clone())); }
-                se.reject(hy, r, true);
+                se.reject(hy, r, true, true);
             }
         }
     };
     for &i in &short {
         if se.out_of_budget() { let n = ranked.len(); se.stats.work = work; se.stats.lattice_tests = cheap.lattice_tests; return se.exhausted(n, ev); }
         let hy = screened[i].0.clone();
-        run(&mut se, &hy, &mut work, &mut ranked, &mut deepest);
+        run(&mut se, &hy, &mut work, &mut ranked);
     }
     // refinement around the best feasible oblique: tilt ±10 deg, then azimuth ±20 deg
     let best_oblique = ranked.iter().filter(|c| c.hy.tilt_deg > 0.0).max_by(|a, b| a.scores.total.total_cmp(&b.scores.total).then(b.hy.index.cmp(&a.hy.index))).map(|c| c.hy.clone());
@@ -1817,11 +1871,11 @@ pub fn select(s: &Snapshot) -> Selection {
                 Ok(hy) => {
                     let seeds = [ranked.iter().find(|c| c.hy.index == b.index).map_or(acq.q_end, |c| c.checked.q_grasp), acq.q_end];
                     match feasibility::endpoint_ik(&s.input, &hy.grasp_pose(), &seeds, &mut work) {
-                        Ok(_) => run(&mut se, &hy, &mut work, &mut ranked, &mut deepest),
-                        Err(err) => se.reject(&hy, err.into_rejection("refined contact pose"), true),
+                        Ok(_) => run(&mut se, &hy, &mut work, &mut ranked),
+                        Err(err) => se.reject(&hy, err.into_rejection("refined contact pose"), true, false),
                     }
                 }
-                Err(b) => { let (hy, r) = *b; se.reject(&hy, r, true) }
+                Err(b) => { let (hy, r) = *b; se.reject(&hy, r, true, false) }
             }
         }
     }
@@ -1841,18 +1895,15 @@ pub fn select(s: &Snapshot) -> Selection {
             se.finish(Outcome::InsufficientEvidence, Some("INSUFFICIENT_EVIDENCE".into()), Some(m), ranked, ev)
         }
         None => {
-            // the deepest failure of the path checks, else the most frequent cheap one
-            let (code, m) = match deepest {
+            let picked = se.pick_best_refusal();
+            let best = picked.as_ref().map(|(cid, r)| admission::BestRefusal::from_rejection(cid.clone(), r));
+            let (code, m) = match picked {
                 Some((_, r)) => (r.code.clone(), format!("no candidate passed; deepest failure in {}: {}", r.phase, r.message)),
-                None => {
-                    let top = se.rejected.iter().max_by(|a, b| phase_rank(a.rejection.phase, false).cmp(&phase_rank(b.rejection.phase, false)).then(b.hy.index.cmp(&a.hy.index)));
-                    match top {
-                        Some(r) => (r.rejection.code.clone(), format!("no candidate passed; deepest failure in {}: {}", r.rejection.phase, r.rejection.message)),
-                        None => ("NO_CANDIDATE".into(), "no contact chord on the footprint".into()),
-                    }
-                }
+                None => ("NO_CANDIDATE".into(), "no contact chord on the footprint".into()),
             };
-            se.finish(Outcome::Infeasible, Some(code), Some(m), ranked, ev)
+            let mut sel = se.finish(Outcome::Infeasible, Some(code), Some(m), ranked, ev);
+            sel.best_refusal = best;
+            sel
         }
     }
 }

@@ -238,8 +238,9 @@ pub struct TopDownOutcome {
     pub route: Result<TopDownRoute, ArmError>,
     /// Result of the legacy approach (acquisition) prefix, reused by adaptive without replanning.
     pub acq: Result<[f64; 6], Rejection>,
-    /// Structured rejection of the legacy top-down route (when `route` is `Err`).
-    pub rejection: Option<Rejection>,
+    /// Structured rejection of the legacy top-down route (when `route` is `Err`), and whether
+    /// it occurred in a path phase (`true`) vs a cheap/geometry/evidence phase (`false`).
+    pub rejection: Option<(Rejection, bool)>,
 }
 
 /// What the top-down adaptive preflight needs besides the snapshot.
@@ -353,6 +354,25 @@ pub fn plan_legacy_top_down(
     target_res: Option<Result<&Target, &str>>,
     work: &mut Work,
 ) -> TopDownOutcome {
+    plan_legacy_top_down_budget(s, target_res, work, &|| false)
+}
+
+/// [`plan_legacy_top_down`] checking `out_of_budget()` before every charged planning stage.
+pub fn plan_legacy_top_down_budget(
+    s: &Snapshot,
+    target_res: Option<Result<&Target, &str>>,
+    work: &mut Work,
+    out_of_budget: &dyn Fn() -> bool,
+) -> TopDownOutcome {
+    let budget_err = |acq: Result<[f64; 6], Rejection>| {
+        let r = Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded");
+        let e = legacy_refusal(s, None, &r, Some(top_down_id(s)));
+        TopDownOutcome { route: Err(e), acq, rejection: Some((r, true)) }
+    };
+    if out_of_budget() {
+        let r = Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded");
+        return budget_err(Err(r));
+    }
     let setup = &s.setup;
     let is_5dof = s.input.arm.arm_dof() == 5;
     let pose_end = s.input.arm.fk(&s.input.q0);
@@ -360,7 +380,7 @@ pub fn plan_legacy_top_down(
         Ok(td) => td,
         Err(e) => {
             let r = arm_error_to_rejection("acquisition", &e);
-            return TopDownOutcome { route: Err(e), acq: Err(r.clone()), rejection: Some(r) };
+            return TopDownOutcome { route: Err(e), acq: Err(r.clone()), rejection: Some((r, false)) };
         }
     };
     let TopDown { target, goal, tool, camera_down, .. } = td;
@@ -369,13 +389,13 @@ pub fn plan_legacy_top_down(
         let tool_end = motion::tcp_to_end(&tool, &s.input.tcp_offset);
         if let Some(e) = table_violation(&goal, &tool_end, &s.envelope, setup.table_z_m) {
             let r = feasibility::motion_rejection("acquisition", &e);
-            return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some(r) };
+            return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some((r, true)) };
         }
     }
     let goal_end = if camera_down { goal } else { motion::tcp_to_end(&goal, &s.input.tcp_offset) };
     if let Some(e) = table_violation(&pose_end, &goal_end, &s.envelope, setup.table_z_m) {
         let r = feasibility::motion_rejection("acquisition", &e);
-        return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some(r) };
+        return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some((r, true)) };
     }
     let mut cur = s.input.clone();
     cur.j7 = s.open_rad;
@@ -396,7 +416,7 @@ pub fn plan_legacy_top_down(
         Err(e) => {
             work.ik_iterations += motion::ik_iterations() - before;
             let r = feasibility::motion_rejection("acquisition", &e);
-            return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some(r) };
+            return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some((r, true)) };
         }
     };
     if let Err(r) = feasibility::grasp_table_clear(s, "acquisition", &path) {
@@ -408,9 +428,12 @@ pub fn plan_legacy_top_down(
         )
         .unwrap_err()
         .into_motion_error();
-        return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some(r) };
+        return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some((r, true)) };
     }
     let q_acq = q6_of(&path.last());
+    if out_of_budget() {
+        return budget_err(Ok(q_acq));
+    }
     cur.q0 = q_acq;
     cur.goal_frame = GoalFrame::Tcp;
     let (q_tool, transition_duration) = if camera_down {
@@ -430,7 +453,7 @@ pub fn plan_legacy_top_down(
             Err(e) => {
                 work.ik_iterations += motion::ik_iterations() - before;
                 let r = feasibility::motion_rejection("transition", &e);
-                return TopDownOutcome { route: Err(e.into()), acq: Ok(q_acq), rejection: Some(r) };
+                return TopDownOutcome { route: Err(e.into()), acq: Ok(q_acq), rejection: Some((r, true)) };
             }
         };
         if let Err(r) = feasibility::grasp_table_clear(s, "transition", &trans_path) {
@@ -442,7 +465,7 @@ pub fn plan_legacy_top_down(
             )
             .unwrap_err()
             .into_motion_error();
-            return TopDownOutcome { route: Err(e.into()), acq: Ok(q_acq), rejection: Some(r) };
+            return TopDownOutcome { route: Err(e.into()), acq: Ok(q_acq), rejection: Some((r, true)) };
         }
         let qt = q6_of(&trans_path.last());
         cur.q0 = qt;
@@ -450,6 +473,9 @@ pub fn plan_legacy_top_down(
     } else {
         (q_acq, 0.0)
     };
+    if out_of_budget() {
+        return budget_err(Ok(q_acq));
+    }
     let before = motion::ik_iterations();
     work.path_checks += 1;
     let descend_path = match motion::plan_cartesian_ex(
@@ -466,10 +492,13 @@ pub fn plan_legacy_top_down(
         Err(e) => {
             work.ik_iterations += motion::ik_iterations() - before;
             let r = feasibility::motion_rejection("insertion", &e);
-            return TopDownOutcome { route: Err(e.into()), acq: Ok(q_acq), rejection: Some(r) };
+            return TopDownOutcome { route: Err(e.into()), acq: Ok(q_acq), rejection: Some((r, true)) };
         }
     };
     let q_grasp = q6_of(&descend_path.last());
+    if out_of_budget() {
+        return budget_err(Ok(q_acq));
+    }
 
     // Target footprint and shared jaw rule on the exact box-centre contact along the actual
     // closing axis (checking whether `align_j6` fits in J6 planning limits).
@@ -524,7 +553,7 @@ pub fn plan_legacy_top_down(
         Err(m) => {
             let r = Rejection::new("evidence", "NO_WIDTH_EVIDENCE", format!("evidence: {m}"));
             let e = legacy_refusal(s, None, &r, None);
-            return TopDownOutcome { route: Err(e), acq: Ok(q_acq), rejection: Some(r) };
+            return TopDownOutcome { route: Err(e), acq: Ok(q_acq), rejection: Some((r, false)) };
         }
     };
     let (grasp_r, closing_axis, q_tool, q_grasp) =
@@ -573,8 +602,6 @@ pub fn plan_legacy_top_down(
             }
         }
         (FootprintSource::Box, Err(rej)) => {
-            // Axis-aligned box is an upper bound: defer legacy admission to live close-range
-            // measurement (which must resolve before descent or return NO_WIDTH_EVIDENCE).
             let jaw = make_deferred(
                 t.margin.clone(),
                 "box-only evidence: the width is checked on the measured width at close range".into(),
@@ -598,7 +625,9 @@ pub fn plan_legacy_top_down(
         }
         (_, Err(rej)) => {
             let e = legacy_refusal(s, Some(t), &rej, Some(id));
-            TopDownOutcome { route: Err(e), acq: Ok(q_acq), rejection: Some(rej) }
+            // Cheap geometry jaw refusal (`path_stage = false`) so deeper endpoint/path refusals
+            // from other candidates are never masked.
+            TopDownOutcome { route: Err(e), acq: Ok(q_acq), rejection: Some((rej, false)) }
         }
     }
 }
@@ -607,6 +636,8 @@ pub fn plan_legacy_top_down(
 /// contact point, height, pregrasp, and closing orientation; no `PAD_OVERLAP` check) and run
 /// Phase B whole-route preflight (`separation`, `lift`, carried-object keepout, payload torque,
 /// `withdrawal`, parent budget) within the reserved top-down deadline.
+///
+/// Error payload: `(hypothesis, rejection, path_stage)`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_top_down_from_legacy(
     s: &Snapshot,
@@ -617,7 +648,7 @@ pub(super) fn evaluate_top_down_from_legacy(
     acq_ok: bool,
     work: &mut Work,
     out_of_budget: &dyn Fn() -> bool,
-) -> Result<(Chord, Candidate, AdaptiveRoute), Box<(Option<Hypothesis>, Rejection)>> {
+) -> Result<(Chord, Candidate, AdaptiveRoute), Box<(Option<Hypothesis>, Rejection, bool)>> {
     let contact_xy = [tr.td.target[0], tr.td.target[1]];
     let tangent = g::perp2(tr.closing_axis);
     let (lo, hi) = g::extent_along(&t.poly, t.centroid, tangent);
@@ -663,12 +694,13 @@ pub(super) fn evaluate_top_down_from_legacy(
         jaw_elevation_deg: 0.0,
     };
     if let Some(rej) = &tr.box_refusal {
-        return Err(Box::new((Some(hy), rej.clone())));
+        return Err(Box::new((Some(hy), rej.clone(), false)));
     }
     if out_of_budget() {
         return Err(Box::new((
             Some(hy),
             Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded"),
+            true,
         )));
     }
     let (checked, mut route) = super::preflight_candidate_from_start(
@@ -685,14 +717,14 @@ pub(super) fn evaluate_top_down_from_legacy(
         work,
         out_of_budget,
     )
-    .map_err(|r| Box::new((Some(hy.clone()), r)))?;
-    let rob = score::robustness(s, t, &hy, &checked, work);
-    if out_of_budget() {
+    .map_err(|r| Box::new((Some(hy.clone()), r, true)))?;
+    let Some(rob) = score::robustness_budget(s, t, &hy, &checked, work, out_of_budget) else {
         return Err(Box::new((
             Some(hy),
             Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded"),
+            true,
         )));
-    }
+    };
     let scores = score::score(s, t, &chord, &hy, &checked, &rob);
     let vis = super::visible(s, t, &hy.pregrasp_pose());
     let id = top_down_id(s);
