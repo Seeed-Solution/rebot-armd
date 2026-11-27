@@ -15,20 +15,12 @@ use tokio::net::TcpListener;
 
 const SERVED: &str = include_str!(concat!(env!("OUT_DIR"), "/cockpit/index.html"));
 
-/// sha256 of src/api/index.html before the split (2626d1fa). Move-only commits keep it.
-const PRE_SPLIT_SHA256: &str = "10315408c7d4c85f96356d0448857998779c7d16edceece8f113cdfc6a454f17";
-
 fn api_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api")
 }
 
 fn source_page() -> String {
     assemble::assemble(&api_dir()).unwrap_or_else(|e| panic!("{e}")).page
-}
-
-#[test]
-fn assembled_page_is_byte_identical_to_the_pre_split_page() {
-    assert_eq!(armd::gravity::compute_sha256(SERVED.as_bytes()), PRE_SPLIT_SHA256);
 }
 
 #[test]

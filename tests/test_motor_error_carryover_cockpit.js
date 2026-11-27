@@ -14,9 +14,11 @@ function source(name) {
 }
 
 function i18nSource() {
-  const start = html.indexOf('const I18N = {');
+  const start = html.indexOf('const I18N = {};');
   assert.notEqual(start, -1, 'missing I18N');
-  return html.slice(start, html.indexOf('\n};', start) + 3);
+  const end = html.indexOf('\nlet LANG', start);
+  assert.notEqual(end, -1, 'missing LANG after the dictionaries');
+  return html.slice(start, end + 1);
 }
 
 const context = vm.createContext({ console });
