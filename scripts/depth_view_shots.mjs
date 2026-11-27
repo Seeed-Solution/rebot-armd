@@ -28,12 +28,13 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = process.env.OUT || path.join(root, '.cache/depth-view-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 const wizard = fs.readFileSync(path.join(root, 'src/api/calib_wizard.js'));
 
 // ---- synthetic depth map

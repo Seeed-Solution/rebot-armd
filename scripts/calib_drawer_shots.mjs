@@ -12,12 +12,13 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = path.join(root, '.cache/calib-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 // stateful mock of rebot-vision's mode API (VPOSTS records the POST bodies), subscriptions and trigger
 // (CALLS records [method, path, body]); V2 = perception API 2
 let VMODE = { mode: 'yolo', enabled: false };

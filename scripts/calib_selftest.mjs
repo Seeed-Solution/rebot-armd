@@ -13,9 +13,10 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { readCockpitHtml } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'), 'utf8');
+const html = readCockpitHtml();
 const a = html.indexOf('/* CALIB-MATH-BEGIN */'), b = html.indexOf('/* CALIB-MATH-END */');
 if (a < 0 || b < a) throw new Error('CALIB-MATH block not found in index.html');
 const ctx = vm.createContext({});

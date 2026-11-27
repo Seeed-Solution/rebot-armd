@@ -11,12 +11,13 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = process.env.OUT || path.join(root, '.cache/estop-reach-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 const js = fs.readFileSync(path.join(root, 'src/api/calib_wizard.js'));
 const POSES = [{ id: 'P1', name: 'scan', positions: [0, -0.4, 0.8, 0, 0, 0, 0] }, { id: 'P2', name: 'bin_a', positions: [0.5, -0.3, 0.7, 0, 0, 0, 0] }];
 const TOOLS = {

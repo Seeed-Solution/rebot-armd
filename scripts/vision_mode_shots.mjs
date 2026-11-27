@@ -17,12 +17,13 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = process.env.OUT || path.join(root, '.cache/vision-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer();
 
 // V.v2: perception API 2 (subscriptions, per-request pipelines); false = API 1 (global mode)
 // V.depth: depth model resident and metric; V.models / V.ion: the model catalogue and ION budget (null = not reported)

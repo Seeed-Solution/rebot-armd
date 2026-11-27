@@ -18,12 +18,13 @@ import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { readCockpitHtmlBuffer } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 const out = process.env.OUT || path.join(root, '.cache/task-monitor-shots');
 fs.mkdirSync(out, { recursive: true });
-const html = fs.readFileSync(process.env.HTML || path.join(root, 'src/api/index.html'));
+const html = readCockpitHtmlBuffer(process.env.HTML);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let armd = null, base = process.env.BASE;

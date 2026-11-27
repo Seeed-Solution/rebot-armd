@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readCockpitHtml } from './source_paths.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CW = await import(pathToFileURL(path.join(root, 'src/api/calib_wizard.js')).href);
@@ -143,7 +144,7 @@ const synth = (R, t, Kx = K) => CW.stickerObject().map((X) => CW.project(Kx, R, 
 
 // ---- g. hover plan and apply body
 {
-  const html = fs.readFileSync(path.join(root, 'src/api/index.html'), 'utf8');
+  const html = readCockpitHtml();
   const block = (name) => html.slice(html.indexOf(`/* ${name}-BEGIN */`), html.indexOf(`/* ${name}-END */`));
   const { CALM, VIK } = vm.runInContext(block('CALIB-MATH') + '\n' + block('VIEW-IK') + '\n({ CALM, VIK });', vm.createContext({}));
   const ch = CW.kinChain(CALM.CHAIN), zero = new Array(42).fill(0);
