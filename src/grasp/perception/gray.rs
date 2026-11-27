@@ -309,4 +309,3 @@ pub fn parse_gray_frame_with_format(
         parse_ms,
     })
 }
-

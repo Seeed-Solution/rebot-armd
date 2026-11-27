@@ -166,8 +166,7 @@ pub fn envelope_with_contact(
 
 /// Samples of the straight Cartesian path `from` → `to` as `motion::plan_cartesian`
 /// interpolates it (linear position, rotation along the geodesic): (s, pose), s in (0, 1].
-#[doc(hidden)]
-pub fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
+fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
     let dp = kinematics::sub(&to.p, &from.p);
     let w = kinematics::log_v(&kinematics::mul_t(&to.r, &from.r));
     let n = (kinematics::norm(&dp) / 0.005).max(kinematics::norm(&w) / 0.02).ceil().clamp(1.0, 2000.0) as usize;
@@ -243,3 +242,97 @@ pub fn transition_pose(pose: &Pose, px: [f64; 2], plane: f64, setup: &GraspSetup
     Some((t, approach_pose(&pose.r, &t, setup)))
 }
 
+
+// Private-seam unit tests (`path_samples`, `approach_pose`, `grasp_plane`); move to tests/grasp/ once S6 adds `feature = "testing"`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grasp::{grasp_plane, transition_estimate};
+    use crate::motion;
+
+    fn v8() -> (GraspSetup, CameraMount, CamModel) {
+        let setup = GraspSetup { camera_tilt_deg: -38.0, ..Default::default() };
+        let mount = CameraMount { rot_deg: 0.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &mount);
+        (setup, mount, cam)
+    }
+
+    fn inspect_r() -> Mat3 { crate::chain::ArmModel::REBOT_DEV_ARM.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 0.0]).r }
+
+    fn close(a: &Vec3, b: &Vec3, tol: f64) -> bool { kinematics::norm(&kinematics::sub(a, b)) < tol }
+
+    #[test]
+    fn acquisition_height_keeps_the_pitched_envelope_clear() {
+        // rot 90, tilt -38: pitch about end_link z, the axis along which the kit check points
+        // are 92.5 mm out
+        let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, approach_height_m: 0.035, ..Default::default() };
+        let mount = CameraMount { rot_deg: 90.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &mount);
+        let pts = envelope(crate::model::ArmConfig::rebot_dm().workspace.as_ref(), &mount, &cam.rec);
+        assert_eq!(pts.len(), 18, "TCP, 8 check points, lens centre, 8 body corners");
+        let target = [0.28, 0.0, setup.table_z_m + setup.grasp_height_m];
+        let low = camera_down_pose(&inspect_r(), &target, &setup, &cam, &[]);
+        assert!((low.p[2] - 0.135).abs() < 1e-12, "TCP only: approach height");
+        let bound = setup.table_z_m + TABLE_CLEARANCE_M;
+        let min_z = |pose: &Pose| pts.iter().map(|p| pose.transform_point(p)[2]).fold(f64::INFINITY, f64::min);
+        assert!(min_z(&low) < setup.table_z_m - 0.02, "unraised: {:.4}", min_z(&low));
+        let pose = camera_down_pose(&inspect_r(), &target, &setup, &cam, &pts);
+        assert!(pose.p[2] > low.p[2] + 0.02 && (min_z(&pose) - bound).abs() < 1e-3, "raised to the bound: {:.4}", min_z(&pose));
+        let tool = approach_pose(&pose.r, &target, &setup);
+        assert!(path_samples(&pose, &tool).iter().all(|(_, p)| min_z(p) >= bound - 1e-3), "transition clear");
+        assert!(table_violation(&pose, &tool, &pts, setup.table_z_m).is_none());
+        let from = Pose::new(pose.r, [pose.p[0], pose.p[1], pose.p[2] + 0.1]);
+        assert!(table_violation(&from, &low, &pts, setup.table_z_m).is_some(), "a path into the table is reported");
+        // a path from below the bound may move sideways but not lower
+        let side = Pose::new(low.r, [low.p[0] + 0.01, low.p[1], low.p[2]]);
+        assert!(table_violation(&low, &side, &pts, setup.table_z_m).is_none());
+    }
+
+    #[test]
+    fn below_clearance_exception_is_per_point() {
+        // two points 0.1 m either side of the TCP along x, TCP 4 mm above the table. A roll
+        // about y from -5.73 to +5.16 deg swaps which point is lowest: -x starts lowest at
+        // -6 mm (below the table), +x starts at 14 mm and ends at -5 mm, through the table but
+        // above the lowest start height. Only -x may sit below the bound, +x must stay above it.
+        let table_z = 0.0;
+        let pts = [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]];
+        let roll = |deg: f64| kinematics::exp_r(&[0.0, deg.to_radians(), 0.0]);
+        let a = (0.01f64 / 0.1).asin().to_degrees();
+        let from = Pose::new(roll(-a), [0.0, 0.0, 0.004]);
+        let to = Pose::new(roll(0.9 * a), [0.0, 0.0, 0.004]);
+        let z = |pose: &Pose, i: usize| pose.transform_point(&pts[i])[2];
+        let bound = table_z + TABLE_CLEARANCE_M;
+        assert!(z(&from, 2) < table_z && z(&from, 1) > bound, "-x starts lowest, below the table; +x above the bound");
+        assert!(z(&to, 1) < table_z && z(&to, 1) > z(&from, 2) + 1e-4, "+x ends in the table, above the lowest start");
+        assert!(path_samples(&from, &to).iter().all(|(_, p)| (0..3).all(|i| z(p, i) >= z(&from, 2) - 1e-6)),
+            "no sample goes below the lowest start height, so a single-minimum check accepts the path");
+        match table_violation(&from, &to, &pts, table_z) {
+            Some(MotionError::WorkspaceViolation { point, value, .. }) => assert!(point == 1 && value < bound, "{point} {value}"),
+            other => panic!("expected a violation of point 1, got {other:?}"),
+        }
+        // the lowest point may stay where it started
+        assert!(table_violation(&from, &from, &pts, table_z).is_none());
+    }
+
+    #[test]
+    fn transition_goes_tool_vertical_above_the_centred_target() {
+        let (setup, _, cam) = v8();
+        let r_now = inspect_r();
+        let target = [0.30, 0.03, setup.table_z_m + setup.grasp_height_m];
+        let pose = camera_down_pose(&r_now, &target, &setup, &cam, &[]);
+        let (t, goal) = transition_pose(&pose, [cam.cx, cam.cy], grasp_plane(&setup), &setup, &cam).unwrap();
+        assert!(close(&t, &target, 1e-9), "{t:?}");
+        assert!(close(&goal.p, &[target[0], target[1], setup.table_z_m + setup.approach_height_m], 1e-9), "{:?}", goal.p);
+        assert!(kinematics::column(&goal.r, 0)[2] < -1.0 + 1e-12, "tool axis down");
+        assert!(kinematics::angle_between(&goal.r, &look_down(&r_now)) < 1e-9, "heading of the approach kept");
+        // a box centre off the image centre maps to its own table point
+        let off_px = [cam.cx + 30.0, cam.cy - 20.0];
+        let (t2, _) = transition_pose(&pose, off_px, grasp_plane(&setup), &setup, &cam).unwrap();
+        let px = cam.project(&pose, &t2).unwrap();
+        assert!((px[0] - off_px[0]).abs() < 1e-6 && (px[1] - off_px[1]).abs() < 1e-6);
+        // expected duration of the move: rotation of 38 deg at 0.5 rad/s dominates here
+        let est = transition_estimate(&pose, &target, &setup);
+        let rot = 1.1 * 1.875 * 38f64.to_radians() / motion::DEFAULT_ANGULAR_RPS;
+        assert!(est >= rot - 1e-9 && est < rot + 3.0, "{est} vs {rot}");
+    }
+}

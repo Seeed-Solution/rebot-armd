@@ -84,7 +84,7 @@ pub struct GraspSetup {
     /// re-orient to the tool-vertical pose above the target. `auto` = on when
     /// |`camera_tilt_deg`| > [`CAMERA_DOWN_AUTO_TILT_DEG`] and `camera_mount.offset_m` is set.
     pub acquire_camera_down: AcquireCameraDown,
-    /// Height probe after the centring: move straight up this far (m; [`PROBE_FALLBACK_DZ_M`]
+    /// Height probe after the centring: move straight up this far (m; [`crate::grasp::PROBE_FALLBACK_DZ_M`]
     /// when that pose is unreachable), estimate the object's top from the change of the box
     /// size and move back; 0 disables the probe in either `height_probe_mode`.
     pub height_probe_m: f64,
@@ -776,4 +776,3 @@ pub(super) fn refuse_calibrated_request(base: &GraspSetup, body: &Value) -> Resu
     if let Some(o) = body.get("overrides").and_then(Value::as_object) { refuse_calibrated_fields(base, o, "overrides.")?; }
     Ok(())
 }
-

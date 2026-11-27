@@ -130,8 +130,7 @@ pub fn iou(a: &[f64; 4], b: &[f64; 4]) -> f64 {
     if union > 0.0 { inter / union } else { 0.0 }
 }
 
-#[doc(hidden)]
-pub fn median(v: &mut [f64]) -> f64 {
+pub(in crate::grasp) fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
     if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
@@ -172,4 +171,3 @@ impl Tracker {
         self.predicted = [self.predicted[0] + dx, self.predicted[1] + dy, self.predicted[2] + dx, self.predicted[3] + dy];
     }
 }
-

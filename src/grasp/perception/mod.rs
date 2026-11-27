@@ -22,6 +22,4 @@ pub use http::{
 pub(crate) use http::TRIGGER_WAIT_MS;
 
 pub use tracking::{box_centre, box_changed_px, iou, parse_detections, parse_markers, Tracker};
-#[doc(hidden)]
-pub use tracking::median;
-pub(super) use tracking::f;
+pub(super) use tracking::{f, median};

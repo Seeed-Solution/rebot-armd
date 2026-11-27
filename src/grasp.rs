@@ -53,8 +53,6 @@ pub use geometry::{
     envelope_with_contact, look_down, table_violation, transition_pose, CamModel,
     TABLE_CLEARANCE_M,
 };
-#[doc(hidden)]
-pub use geometry::path_samples;
 
 pub use orchestrator::{
     align_guard, border_free_aim, frames_angle, frames_angle_by, frames_width_px,
@@ -74,17 +72,14 @@ pub use perception::{
     GRAY_V1_STRIDE, GRAY_V1_WIDTH, GRASP_PIPELINES, MAX_CONTOUR_VERTICES,
 };
 pub(crate) use perception::TRIGGER_WAIT_MS;
-#[doc(hidden)]
-pub use perception::median;
-use perception::{f, refusal_message};
+use perception::{f, median, refusal_message};
 
 pub use planning::{
     dry_run, dry_run_task, expected_duration, parse_grasp, plan, prepare, prepare_from_snapshot,
     transition_estimate, DryRun, GraspRequest, PendingAdaptive, PendingGrasp, PlannedAdaptive,
     PlannedGrasp,
 };
-#[doc(hidden)]
-pub use planning::{approach_pose, grasp_plane};
+use planning::{approach_pose, grasp_plane};
 
 pub use setup::{
     commit_setup_update, grasp_width_check_json, grasp_width_check_json_from_published, load_into,
@@ -100,6 +95,4 @@ use setup::refuse_calibrated_request;
 pub use tasks::{
     preflight, DepthReq, GraspTask, ModelKind, TaskModels, TaskRequires, TASK_UNSUPPORTED,
 };
-#[doc(hidden)]
-pub use tasks::task_verdict;
-use tasks::valid_task_name;
+use tasks::{task_verdict, valid_task_name};

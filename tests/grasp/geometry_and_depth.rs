@@ -1,10 +1,6 @@
-use std::time::Instant;
-
-use armd::api::proxy::DetectorUpstream;
 use armd::grasp::*;
 use armd::kinematics::{self, Pose, Vec3};
 use armd::model::CameraMount;
-use armd::motion::{self, MotionError};
 
 use crate::{det, inspect_r};
 
@@ -111,59 +107,6 @@ fn tilted_ray_meets_the_table_ahead_by_the_tilt() {
 }
 
 #[test]
-fn acquisition_height_keeps_the_pitched_envelope_clear() {
-    // rot 90, tilt -38: pitch about end_link z, the axis along which the kit check points
-    // are 92.5 mm out
-    let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, approach_height_m: 0.035, ..Default::default() };
-    let mount = CameraMount { rot_deg: 90.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
-    let cam = CamModel::assumed(&armd::chain::ArmModel::REBOT_DEV_ARM, &setup, &mount);
-    let pts = envelope(armd::model::ArmConfig::rebot_dm().workspace.as_ref(), &mount, &cam.rec);
-    assert_eq!(pts.len(), 18, "TCP, 8 check points, lens centre, 8 body corners");
-    let target = [0.28, 0.0, setup.table_z_m + setup.grasp_height_m];
-    let low = camera_down_pose(&inspect_r(), &target, &setup, &cam, &[]);
-    assert!((low.p[2] - 0.135).abs() < 1e-12, "TCP only: approach height");
-    let bound = setup.table_z_m + TABLE_CLEARANCE_M;
-    let min_z = |pose: &Pose| pts.iter().map(|p| pose.transform_point(p)[2]).fold(f64::INFINITY, f64::min);
-    assert!(min_z(&low) < setup.table_z_m - 0.02, "unraised: {:.4}", min_z(&low));
-    let pose = camera_down_pose(&inspect_r(), &target, &setup, &cam, &pts);
-    assert!(pose.p[2] > low.p[2] + 0.02 && (min_z(&pose) - bound).abs() < 1e-3, "raised to the bound: {:.4}", min_z(&pose));
-    let tool = approach_pose(&pose.r, &target, &setup);
-    assert!(path_samples(&pose, &tool).iter().all(|(_, p)| min_z(p) >= bound - 1e-3), "transition clear");
-    assert!(table_violation(&pose, &tool, &pts, setup.table_z_m).is_none());
-    let from = Pose::new(pose.r, [pose.p[0], pose.p[1], pose.p[2] + 0.1]);
-    assert!(table_violation(&from, &low, &pts, setup.table_z_m).is_some(), "a path into the table is reported");
-    // a path from below the bound may move sideways but not lower
-    let side = Pose::new(low.r, [low.p[0] + 0.01, low.p[1], low.p[2]]);
-    assert!(table_violation(&low, &side, &pts, setup.table_z_m).is_none());
-}
-
-#[test]
-fn below_clearance_exception_is_per_point() {
-    // two points 0.1 m either side of the TCP along x, TCP 4 mm above the table. A roll
-    // about y from -5.73 to +5.16 deg swaps which point is lowest: -x starts lowest at
-    // -6 mm (below the table), +x starts at 14 mm and ends at -5 mm, through the table but
-    // above the lowest start height. Only -x may sit below the bound, +x must stay above it.
-    let table_z = 0.0;
-    let pts = [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]];
-    let roll = |deg: f64| kinematics::exp_r(&[0.0, deg.to_radians(), 0.0]);
-    let a = (0.01f64 / 0.1).asin().to_degrees();
-    let from = Pose::new(roll(-a), [0.0, 0.0, 0.004]);
-    let to = Pose::new(roll(0.9 * a), [0.0, 0.0, 0.004]);
-    let z = |pose: &Pose, i: usize| pose.transform_point(&pts[i])[2];
-    let bound = table_z + TABLE_CLEARANCE_M;
-    assert!(z(&from, 2) < table_z && z(&from, 1) > bound, "-x starts lowest, below the table; +x above the bound");
-    assert!(z(&to, 1) < table_z && z(&to, 1) > z(&from, 2) + 1e-4, "+x ends in the table, above the lowest start");
-    assert!(path_samples(&from, &to).iter().all(|(_, p)| (0..3).all(|i| z(p, i) >= z(&from, 2) - 1e-6)),
-        "no sample goes below the lowest start height, so a single-minimum check accepts the path");
-    match table_violation(&from, &to, &pts, table_z) {
-        Some(MotionError::WorkspaceViolation { point, value, .. }) => assert!(point == 1 && value < bound, "{point} {value}"),
-        other => panic!("expected a violation of point 1, got {other:?}"),
-    }
-    // the lowest point may stay where it started
-    assert!(table_violation(&from, &from, &pts, table_z).is_none());
-}
-
-#[test]
 fn envelope_has_the_camera_when_a_lens_or_body_is_set() {
     let ws = armd::model::ArmConfig::rebot_dm().workspace;
     let rec = kinematics::cam_mount(false, 0.0, -38.0);
@@ -173,28 +116,6 @@ fn envelope_has_the_camera_when_a_lens_or_body_is_set() {
     // a body size without a lens centre: the lens at the end_link origin, as CamModel assumes
     let pts = envelope(ws.as_ref(), &CameraMount { body_size_m: Some([0.05, 0.05, 0.04]), ..Default::default() }, &rec);
     assert_eq!((pts.len(), pts[9]), (18, [0.0; 3]));
-}
-
-#[test]
-fn transition_goes_tool_vertical_above_the_centred_target() {
-    let (setup, _, cam) = v8();
-    let r_now = inspect_r();
-    let target = [0.30, 0.03, setup.table_z_m + setup.grasp_height_m];
-    let pose = camera_down_pose(&r_now, &target, &setup, &cam, &[]);
-    let (t, goal) = transition_pose(&pose, [cam.cx, cam.cy], grasp_plane(&setup), &setup, &cam).unwrap();
-    assert!(close(&t, &target, 1e-9), "{t:?}");
-    assert!(close(&goal.p, &[target[0], target[1], setup.table_z_m + setup.approach_height_m], 1e-9), "{:?}", goal.p);
-    assert!(kinematics::column(&goal.r, 0)[2] < -1.0 + 1e-12, "tool axis down");
-    assert!(kinematics::angle_between(&goal.r, &look_down(&r_now)) < 1e-9, "heading of the approach kept");
-    // a box centre off the image centre maps to its own table point
-    let off_px = [cam.cx + 30.0, cam.cy - 20.0];
-    let (t2, _) = transition_pose(&pose, off_px, grasp_plane(&setup), &setup, &cam).unwrap();
-    let px = cam.project(&pose, &t2).unwrap();
-    assert!((px[0] - off_px[0]).abs() < 1e-6 && (px[1] - off_px[1]).abs() < 1e-6);
-    // expected duration of the move: rotation of 38 deg at 0.5 rad/s dominates here
-    let est = transition_estimate(&pose, &target, &setup);
-    let rot = 1.1 * 1.875 * 38f64.to_radians() / motion::DEFAULT_ANGULAR_RPS;
-    assert!(est >= rot - 1e-9 && est < rot + 3.0, "{est} vs {rot}");
 }
 
 #[test]
@@ -430,111 +351,3 @@ fn test_anisotropic_camera_sizing() {
     assert!((meas.width_m.unwrap() - expected_w).abs() < 1e-6);
     assert!((meas.length_m.unwrap() - expected_l).abs() < 1e-6);
 }
-
-#[test]
-fn test_http_detection_source_rescaling() {
-    let src = HttpDetectionSource {
-        upstream: DetectorUpstream::parse("http://127.0.0.1:8090").unwrap(),
-        image_size_px: [640.0, 360.0],
-    };
-    let raw = serde_json::json!({
-        "frame_id": 1,
-        "width": 1280,
-        "height": 720,
-        "depth": {
-            "metric_model": true,
-            "table_samples": [[100.0, 200.0, 0.85]],
-        },
-        "detections": [{
-            "label": "cup",
-            "score": 0.9,
-            "format": "xywh_center",
-            "x": 640.0,
-            "y": 360.0,
-            "w": 100.0,
-            "h": 100.0,
-            "length_px": 80.0,
-            "grasp_width_px": 40.0,
-        }]
-    });
-    let now = Instant::now();
-    let mut frame = src.frame(&raw, None, now, now, 0).expect("frame parsed");
-    assert_eq!(frame.image_size_px, [1280.0, 720.0]);
-    assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [100.0, 200.0, 0.85]);
-    assert_eq!(frame.detections[0].length_px, Some(80.0));
-    assert_eq!(frame.detections[0].grasp_width_px, Some(40.0));
-
-    let cam_iso = CamModel {
-        rec: armd::kinematics::IDENTITY,
-        offset: [0.0; 3],
-        fx: 900.0,
-        fy: 900.0,
-        cx: 480.0,
-        cy: 270.0,
-        size: [960.0, 540.0],
-    };
-    rescale_frame_to_cam(&mut frame, &cam_iso);
-    assert_eq!(frame.image_size_px, [960.0, 540.0]);
-    assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [75.0, 150.0, 0.85]);
-    assert_eq!(frame.detections[0].length_px, Some(60.0));
-    assert_eq!(frame.detections[0].grasp_width_px, Some(30.0));
-
-    let cal = DepthCalibration { a: 1.0, b: 0.0, source: "test" };
-    let pose = Pose::new(armd::kinematics::IDENTITY, [0.0; 3]);
-    let mut det_iso = frame.detections[0].clone();
-    det_iso.depth_conf = Some(0.9);
-    det_iso.disp_fg = Some(1.0);
-    det_iso.disp_bg = Some(0.5);
-    let meas_iso = measure_detection_depth_with_cal(&cam_iso, &pose, &det_iso, &cal).expect("measured");
-    let expected_l_iso = 80.0 / 1200.0;
-    let expected_w_iso = 40.0 / 1200.0;
-    assert!((meas_iso.length_m.unwrap() - expected_l_iso).abs() < 1e-9);
-    assert!((meas_iso.width_m.unwrap() - expected_w_iso).abs() < 1e-9);
-
-    // Anisotropic rescaling:
-    let now_aniso = Instant::now();
-    let mut frame_aniso = DetectionFrame {
-        frame_id: 2,
-        captured_at: now_aniso,
-        policy_captured_at: Some(now_aniso),
-        image_size_px: [640.0, 360.0],
-        detections: vec![Detection {
-            label: "cup".into(),
-            score: 0.9,
-            raw_score_valid: true,
-            box_norm: [0.3, 0.3, 0.7, 0.7],
-            angle_deg: Some(45.0),
-            angle_conf: Some(0.9),
-            grasp_width_px: Some(120.0),
-            mask_focus: false,
-            disp_fg: Some(1.0),
-            disp_bg: Some(0.5),
-            depth_conf: Some(0.9),
-            length_px: Some(240.0),
-            jaw_clear: Some(true),
-            depth_angle_deg: None,
-            depth_angle_conf: None,
-            depth_width_px: None, contour_norm: None,
-        }],
-        depth: None,
-        model_generation: None,
-    };
-    let cam_aniso = CamModel {
-        rec: armd::kinematics::IDENTITY,
-        offset: [0.0; 3],
-        fx: 1200.0,
-        fy: 1800.0,
-        cx: 640.0,
-        cy: 540.0,
-        size: [1280.0, 1080.0],
-    };
-    rescale_frame_to_cam(&mut frame_aniso, &cam_aniso);
-    assert_eq!(frame_aniso.image_size_px, [1280.0, 1080.0]);
-
-    let meas_aniso = measure_detection_depth_with_cal(&cam_aniso, &pose, &frame_aniso.detections[0], &cal).expect("measured");
-    let expected_l_aniso = 240.0 / 600.0;
-    let expected_w_aniso = 120.0 / 600.0;
-    assert!((meas_aniso.length_m.unwrap() - expected_l_aniso).abs() < 1e-9);
-    assert!((meas_aniso.width_m.unwrap() - expected_w_aniso).abs() < 1e-9);
-}
-

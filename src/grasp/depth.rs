@@ -386,4 +386,3 @@ pub fn measure_detection_depth(
     let cal = calibrate_depth(cam, pose, depth, prior, table_z_m)?;
     measure_detection_depth_with_cal(cam, pose, det, &cal)
 }
-

@@ -117,47 +117,6 @@ fn mode_info_parse_and_task_requirement_check() {
 }
 
 #[test]
-fn task_models_are_tri_state_per_slot() {
-    let s = tasks_setup(serde_json::json!({
-        "a": {"models": {"detector": "seg"}}, "b": {"models": {"depth": null}}, "c": {"models": {"detector": null, "depth": "zd"}}})).unwrap();
-    let m = |t: &str| s.tasks[t].models.clone().unwrap();
-    assert_eq!(m("a"), TaskModels { detector: Some(Some("seg".into())), depth: None });
-    assert_eq!(m("b"), TaskModels { detector: None, depth: Some(None) });
-    assert_eq!(m("c"), TaskModels { detector: Some(None), depth: Some(Some("zd".into())) });
-    // round trip: absent stays absent, null stays null
-    assert_eq!(serde_json::to_value(&s.tasks["b"]).unwrap(), serde_json::json!({"overrides": {}, "models": {"depth": null}}));
-    for bad in [serde_json::json!({"models": {}}), serde_json::json!({"models": {"detector": ""}}),
-                serde_json::json!({"models": {"detector": "x".repeat(65)}}), serde_json::json!({"models": {"gpu": "x"}}),
-                serde_json::json!({"models": {"detector": 3}})] {
-        assert!(tasks_setup(serde_json::json!({"a": bad.clone()})).is_err(), "{bad}");
-    }
-    // the switch body names every slot of the task when the resident set differs
-    let mode = |det: Option<&str>, depth: Option<&str>| ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo",
-        "models": {"generation": 3, "swap": {"state": "idle", "generation": 3}, "resident": {"detector": det, "depth": depth},
-                   "catalogue": [{"name": "seg", "kind": "segment", "ion_mb": 19.5}, {"name": "zd", "kind": "depth", "ion_mb": 20.5},
-                                 {"name": "det", "kind": "detect"}]},
-        "ion": {"base_mb": 21.5, "used_mb": 41.0, "total_mb": 62.9, "reserve_mb": 8.0}})));
-    assert_eq!(m("a").switch_body(&mode(Some("seg"), Some("zd"))), None);
-    assert_eq!(m("a").switch_body(&mode(Some("det"), None)), Some(serde_json::json!({"detector": "seg"})));
-    assert_eq!(m("c").switch_body(&mode(Some("det"), None)), Some(serde_json::json!({"detector": null, "depth": "zd"})));
-    assert_eq!(m("b").switch_body(&mode(Some("det"), None)), None);
-    assert!(m("b").switch_body(&ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo"})))).is_some(), "no models: always switch");
-    // provider state and the catalogue budget
-    let pm = mode(Some("det"), None).models.unwrap();
-    assert_eq!((pm.generation, pm.swap_state.as_str(), pm.ion), (3, "idle", Some([21.5, 62.9, 8.0])));
-    assert_eq!(pm.catalogue.get("det"), Some(&None));
-    let set = |d: &str, z: Option<&str>| ResidentModels { detector: Some(d.into()), depth: z.map(str::to_string) };
-    assert_eq!(pm.budget(&set("seg", None)), Some(Ok(())));
-    assert_eq!(pm.budget(&set("seg", Some("zd"))), Some(Err("ION_BUDGET (need 69.5 MB, limit 62.9 MB)".into())));
-    assert_eq!(pm.budget(&set("det", Some("zd"))), None, "det has no ion_mb");
-    let req = TaskRequires { model_kind: Some(ModelKind::Segment), depth: None };
-    assert_eq!(task_verdict("a", &req, Some(&m("a")), &mode(Some("det"), Some("zd"))),
-               (false, Some("task a: model switch refused: ION_BUDGET (need 69.5 MB, limit 62.9 MB)".into())));
-    assert_eq!(task_verdict("a", &req, Some(&m("a")), &mode(Some("det"), None)), (true, Some("needs model switch".into())));
-    assert!(!task_verdict("a", &req, Some(&m("a")), &mode(Some("seg"), None)).0, "model.kind not reported");
-}
-
-#[test]
 fn patch_rejects_unknown_and_invalid_fields() {
     let s = GraspSetup::default();
     assert!(s.validate().is_ok());
@@ -374,6 +333,12 @@ fn top_face_feature_for_the_parallax() {
     assert!(top_face_u(&[[330.0, 0.0, 380.0, 1.0]], &[[250.0, 0.0, 300.0, 1.0]], cx).is_none());
 }
 
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+}
+
 /// The former downward probe's estimator (lens-to-top distance at the start pose from the
 /// start sizes and the sizes `dz` closer), kept here only for the comparison below.
 fn down_probe_distance(start: &[f64], near: &[f64], dz: f64) -> f64 {
@@ -458,4 +423,3 @@ fn detector_angle_parsing_and_doubled_mean() {
     assert!((t - (-120f64 + 180.0).to_radians()).abs() < 1e-9, "{}", t.to_degrees());
     assert!(GraspSetup::default().patched(&serde_json::json!({"align_min_angle_conf": 1.5})).is_err());
 }
-

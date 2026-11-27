@@ -122,7 +122,7 @@ pub struct PlannedGrasp {
     pub camera_down: bool,
     /// Estimated duration of the camera-down → tool-vertical move (0 without camera-down).
     pub transition_duration: f64,
-    /// The provider's mode read by [`preflight`] (a task with requirements or adaptive grasp);
+    /// The provider's mode read by [`crate::grasp::preflight`] (a task with requirements or adaptive grasp);
     /// the orchestrator reads it itself when None.
     pub mode: Option<Result<ModeInfo, String>>,
     /// Populated only when `strategy: "adaptive"` is requested (`None` for legacy).
@@ -346,12 +346,10 @@ fn prepare_from_read_only(
 }
 
 /// TCP height of the grasp plane (where box centres are assumed to lie).
-#[doc(hidden)]
-pub fn grasp_plane(setup: &GraspSetup) -> f64 { setup.table_z_m + setup.grasp_height_m }
+pub(super) fn grasp_plane(setup: &GraspSetup) -> f64 { setup.table_z_m + setup.grasp_height_m }
 
 /// Look-down approach pose above `target`.
-#[doc(hidden)]
-pub fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
+pub(super) fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
     Pose::new(look_down(r_now), [target[0], target[1], setup.table_z_m + setup.approach_height_m])
 }
 
@@ -698,4 +696,3 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
         }
     }
 }
-

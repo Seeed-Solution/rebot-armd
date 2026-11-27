@@ -1,14 +1,12 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::Value;
 
 use armd::api::proxy::DetectorUpstream;
 use armd::grasp::*;
 use armd::kinematics::{self, Pose};
-use armd::macro_action::MacroCtx;
 use armd::model::CameraMount;
-use armd::supervisor::{ArmSupervisor, SupervisorInner};
+use armd::supervisor::SupervisorInner;
 
 use crate::{det, inspect_r};
 
@@ -237,77 +235,6 @@ fn depth_calibration_and_measurement_report_why_they_fail() {
     assert_eq!(m(Detection { disp_fg: None, ..ok.clone() }), Some("no_disparity"));
     assert_eq!(m(Detection { disp_fg: Some(4.0), ..ok.clone() }), Some("bad_disparity"));
     assert_eq!(m(Detection { disp_fg: Some(5.001), ..ok.clone() }), Some("too_flat"));
-}
-
-struct DummyDetectionSource;
-impl DetectionSource for DummyDetectionSource {
-    fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async { Ok(true) }) }
-    fn set_inference(&self, _enabled: bool) -> BoxFuture<'_, Result<(), String>> { Box::pin(async { Ok(()) }) }
-    fn next_frame(&self, _after: Option<u64>, _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> { Box::pin(async { Ok(None) }) }
-}
-
-#[tokio::test]
-async fn test_orchestrator_holding_now_load_and_gap_on_6dof() {
-    let config = armd::model::ArmConfig::from_profile_file("profiles/so_arm101.json").expect("loads");
-    let policy = config.gripper_policy.clone().expect("gripper_policy");
-
-    let mut setup = GraspSetup::default();
-    setup.post_lift_settle_ms = 10;
-
-    let sup = Arc::new(ArmSupervisor::new(config));
-    let (id, stamp) = {
-        let mut inner = sup.inner().write().await;
-        inner.lease_enabled = false;
-        let stamp = inner.current_admission_stamp();
-        let admitted = inner.check_admission(stamp).unwrap();
-        SupervisorInner::enable_torque(admitted).unwrap();
-        inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
-        inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
-        inner.loads = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.35];
-        let stamp = inner.current_admission_stamp();
-        let plan_in = inner.plan_input().unwrap();
-        let admitted = inner.check_admission(stamp).unwrap();
-        (SupervisorInner::begin_macro(admitted, "grasp", &plan_in, None).unwrap(), stamp)
-    };
-
-    let source = Arc::new(DummyDetectionSource);
-    let cam = CamModel::assumed(&sup.inner().read().await.config.arm_model, &setup, &CameraMount::default());
-    let ctx = MacroCtx {
-        sup: sup.clone(),
-        id,
-        stamp,
-        deadline: Instant::now() + Duration::from_secs(10),
-        phase_timeout_s: setup.phase_timeout_s,
-        timeout_code: "GRASP_TIMEOUT",
-        timeout_message: "timeout".into(),
-    };
-    let orch = Orchestrator {
-        ctx,
-        source,
-        setup: setup.clone(),
-        cam,
-        envelope: vec![],
-        tcp_offset: [0.0; 3],
-        triggered: false,
-        lens_known: false,
-        depth_available: false,
-        generation: None,
-    };
-
-    let (holding, gap) = orch.holding_now().await.expect("holding_now should succeed");
-    assert!(holding);
-    assert!((gap - 0.5).abs() < 1e-4);
-
-    // Test held_width calculation on 6-DOF
-    let held_width = {
-        let inner = sup.inner().read().await;
-        inner.config.gripper_policy.as_ref().map(|p| {
-            let idx = inner.config.gripper_index().unwrap_or(6);
-            let m = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
-            p.opening_m(m)
-        })
-    };
-    assert_eq!(held_width, Some(policy.opening_m(0.5)));
 }
 
 #[test]

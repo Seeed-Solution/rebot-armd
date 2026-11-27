@@ -300,8 +300,7 @@ impl ProviderModels {
 
     /// The ION budget check of `set` from the catalogue (`Err(reason)` when it does not fit);
     /// None when the provider does not report the catalogue's `ion_mb` or its `ion` budget.
-    #[doc(hidden)]
-    pub fn budget(&self, set: &ResidentModels) -> Option<Result<(), String>> {
+    pub(in crate::grasp) fn budget(&self, set: &ResidentModels) -> Option<Result<(), String>> {
         let [base, total, reserve] = self.ion?;
         let mut need = base + reserve;
         for name in [&set.detector, &set.depth].into_iter().flatten() {
@@ -368,4 +367,3 @@ impl ModeInfo {
         })
     }
 }
-

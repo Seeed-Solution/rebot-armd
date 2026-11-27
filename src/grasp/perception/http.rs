@@ -139,8 +139,7 @@ pub struct HttpDetectionSource {
 
 impl HttpDetectionSource {
     /// A result envelope (`latest` or `trigger`) as a frame; `None` when it carries no new frame.
-    #[doc(hidden)]
-    pub fn frame(
+    fn frame(
         &self,
         v: &Value,
         after: Option<u64>,
@@ -504,3 +503,118 @@ impl DetectionSource for HttpDetectionSource {
     }
 }
 
+
+// Private-seam unit test (`HttpDetectionSource::frame`); move to tests/grasp/ once S6 adds `feature = "testing"`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grasp::{measure_detection_depth_with_cal, DepthCalibration, Detection};
+    use crate::kinematics::Pose;
+
+    #[test]
+    fn test_http_detection_source_rescaling() {
+        let src = HttpDetectionSource {
+            upstream: DetectorUpstream::parse("http://127.0.0.1:8090").unwrap(),
+            image_size_px: [640.0, 360.0],
+        };
+        let raw = serde_json::json!({
+            "frame_id": 1,
+            "width": 1280,
+            "height": 720,
+            "depth": {
+                "metric_model": true,
+                "table_samples": [[100.0, 200.0, 0.85]],
+            },
+            "detections": [{
+                "label": "cup",
+                "score": 0.9,
+                "format": "xywh_center",
+                "x": 640.0,
+                "y": 360.0,
+                "w": 100.0,
+                "h": 100.0,
+                "length_px": 80.0,
+                "grasp_width_px": 40.0,
+            }]
+        });
+        let now = Instant::now();
+        let mut frame = src.frame(&raw, None, now, now, 0).expect("frame parsed");
+        assert_eq!(frame.image_size_px, [1280.0, 720.0]);
+        assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [100.0, 200.0, 0.85]);
+        assert_eq!(frame.detections[0].length_px, Some(80.0));
+        assert_eq!(frame.detections[0].grasp_width_px, Some(40.0));
+
+        let cam_iso = CamModel {
+            rec: crate::kinematics::IDENTITY,
+            offset: [0.0; 3],
+            fx: 900.0,
+            fy: 900.0,
+            cx: 480.0,
+            cy: 270.0,
+            size: [960.0, 540.0],
+        };
+        rescale_frame_to_cam(&mut frame, &cam_iso);
+        assert_eq!(frame.image_size_px, [960.0, 540.0]);
+        assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [75.0, 150.0, 0.85]);
+        assert_eq!(frame.detections[0].length_px, Some(60.0));
+        assert_eq!(frame.detections[0].grasp_width_px, Some(30.0));
+
+        let cal = DepthCalibration { a: 1.0, b: 0.0, source: "test" };
+        let pose = Pose::new(crate::kinematics::IDENTITY, [0.0; 3]);
+        let mut det_iso = frame.detections[0].clone();
+        det_iso.depth_conf = Some(0.9);
+        det_iso.disp_fg = Some(1.0);
+        det_iso.disp_bg = Some(0.5);
+        let meas_iso = measure_detection_depth_with_cal(&cam_iso, &pose, &det_iso, &cal).expect("measured");
+        let expected_l_iso = 80.0 / 1200.0;
+        let expected_w_iso = 40.0 / 1200.0;
+        assert!((meas_iso.length_m.unwrap() - expected_l_iso).abs() < 1e-9);
+        assert!((meas_iso.width_m.unwrap() - expected_w_iso).abs() < 1e-9);
+
+        // Anisotropic rescaling:
+        let now_aniso = Instant::now();
+        let mut frame_aniso = DetectionFrame {
+            frame_id: 2,
+            captured_at: now_aniso,
+            policy_captured_at: Some(now_aniso),
+            image_size_px: [640.0, 360.0],
+            detections: vec![Detection {
+                label: "cup".into(),
+                score: 0.9,
+                raw_score_valid: true,
+                box_norm: [0.3, 0.3, 0.7, 0.7],
+                angle_deg: Some(45.0),
+                angle_conf: Some(0.9),
+                grasp_width_px: Some(120.0),
+                mask_focus: false,
+                disp_fg: Some(1.0),
+                disp_bg: Some(0.5),
+                depth_conf: Some(0.9),
+                length_px: Some(240.0),
+                jaw_clear: Some(true),
+                depth_angle_deg: None,
+                depth_angle_conf: None,
+                depth_width_px: None, contour_norm: None,
+            }],
+            depth: None,
+            model_generation: None,
+        };
+        let cam_aniso = CamModel {
+            rec: crate::kinematics::IDENTITY,
+            offset: [0.0; 3],
+            fx: 1200.0,
+            fy: 1800.0,
+            cx: 640.0,
+            cy: 540.0,
+            size: [1280.0, 1080.0],
+        };
+        rescale_frame_to_cam(&mut frame_aniso, &cam_aniso);
+        assert_eq!(frame_aniso.image_size_px, [1280.0, 1080.0]);
+
+        let meas_aniso = measure_detection_depth_with_cal(&cam_aniso, &pose, &frame_aniso.detections[0], &cal).expect("measured");
+        let expected_l_aniso = 240.0 / 600.0;
+        let expected_w_aniso = 120.0 / 600.0;
+        assert!((meas_aniso.length_m.unwrap() - expected_l_aniso).abs() < 1e-9);
+        assert!((meas_aniso.width_m.unwrap() - expected_w_aniso).abs() < 1e-9);
+    }
+}
