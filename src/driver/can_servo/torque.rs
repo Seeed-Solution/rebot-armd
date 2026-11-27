@@ -1,22 +1,11 @@
 //! Damiao torque state machine, rest-pose gate, disable initiation, and disarm probing.
 
-#[allow(unused_imports)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[allow(unused_imports)]
-use std::sync::Arc;
-#[allow(unused_imports)]
 use std::time::{Duration, Instant};
 
-#[allow(unused_imports)]
 use crate::driver::*;
-#[allow(unused_imports)]
 use crate::driver::can_servo::*;
-#[allow(unused_imports)]
-use crate::model::JointState;
-#[allow(unused_imports)]
-use crate::protocol::damiao::{self, DamiaoLimits};
-#[allow(unused_imports)]
-use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
+use crate::protocol::damiao;
+use crate::transport::CanTransport;
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
     pub(in crate::driver::can_servo) fn probe_hardware_disarmed_until_impl(&mut self, wall_deadline: Instant) -> bool {
@@ -1086,7 +1075,7 @@ pub(in crate::driver::can_servo) const TICKED_RANGE_CHECK_REPLY_TIMEOUT: Duratio
 /// transmit-time RX sequence barrier established after draining RX right before sending 0xCC
 /// (None: waiting to drain RX and send 0xCC).
 #[derive(Debug)]
-pub(in crate::driver::can_servo) struct FeedbackRefresh { joint: usize, boundary: Option<u64>, deadline: Deadline }
+pub(in crate::driver::can_servo) struct FeedbackRefresh { pub(in crate::driver::can_servo) joint: usize, pub(in crate::driver::can_servo) boundary: Option<u64>, pub(in crate::driver::can_servo) deadline: Deadline }
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::driver::can_servo) struct RefreshSample {
@@ -1142,6 +1131,6 @@ pub(in crate::driver::can_servo) const ENABLE_FRESHEN_EXIT_ARM_MAX_AGE: Duration
 /// phase (leaves >= 40 ms margin before `POS_FORCE_FEEDBACK_MAX_AGE` for readback + hold).
 pub(in crate::driver::can_servo) const ENABLE_FRESHEN_EXIT_PF_MAX_AGE: Duration = Duration::from_millis(60);
 /// Bounded wall-clock budget for enable's initial `0xCC` FRESHEN phase (<= 200 ms).
-pub(in crate::driver::can_servo) const ENABLE_FRESHEN_TIMEOUT: Duration = Duration::from_millis(180);
+pub(in crate::driver) const ENABLE_FRESHEN_TIMEOUT: Duration = Duration::from_millis(180);
 /// Minimum interval before retrying `0xCC` for unanswered joints within one FRESHEN window.
 pub(in crate::driver::can_servo) const ENABLE_FRESHEN_RETRY_INTERVAL: Duration = Duration::from_millis(60);

@@ -1,16 +1,10 @@
 //! Damiao bounded target batch TX and target-frame validation helpers.
 
-#[allow(unused_imports)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-#[allow(unused_imports)]
 use crate::driver::*;
-#[allow(unused_imports)]
 use crate::driver::can_servo::*;
-#[allow(unused_imports)]
-use crate::protocol::damiao;
-#[allow(unused_imports)]
-use crate::transport::{CanFrame, CanTransport};
+use crate::transport::{CanFrame, CanTransport, TransportError};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
     pub(in crate::driver::can_servo) fn write_joint_targets_bounded_impl(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {

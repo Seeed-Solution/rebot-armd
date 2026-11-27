@@ -1,22 +1,11 @@
 //! Damiao J7 position-force gripper types, sealed `pos_force_emitter`, and `PosForceExt`.
 
-#[allow(unused_imports)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[allow(unused_imports)]
-use std::sync::Arc;
-#[allow(unused_imports)]
 use std::time::{Duration, Instant};
 
-#[allow(unused_imports)]
 use crate::driver::*;
-#[allow(unused_imports)]
 use crate::driver::can_servo::*;
-#[allow(unused_imports)]
-use crate::model::JointState;
-#[allow(unused_imports)]
-use crate::protocol::damiao::{self, DamiaoLimits};
-#[allow(unused_imports)]
-use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
+use crate::protocol::damiao;
+use crate::transport::{CanFrame, CanTransport, TransportError};
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
     pub(in crate::driver::can_servo) fn emit_pos_force_j7_with_policy(
@@ -557,7 +546,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 /// `DamiaoArmDriver::send` rejects any `0x307` frame with `TxRefusal::BuildRefused`. Only
 /// private `mod pos_force_emitter` can construct a [`PosForceSendToken`] and supply
 /// `Some(&PosForceSendToken)` via `pos_force_emitter::authorize_kind`.
-pub(in crate::driver::can_servo) trait DamiaoTxKind {
+pub(in crate::driver) trait DamiaoTxKind {
     fn tx_kind(&self) -> TxKind;
     fn pos_force_token(&self) -> Option<&pos_force_emitter::PosForceSendToken> {
         None
@@ -827,7 +816,7 @@ pub(in crate::driver) mod pos_force_emitter {
     /// Narrow standalone-driver recovery API: called ONLY from `DamiaoArmDriver::receive_feedback`
     /// when `external_pos_force_emitter == false`. Refuses with `BuildRefused` whenever an
     /// external tick epilogue owner (`SupervisorInner`) owns J7 emission.
-    pub(in crate::driver::can_servo) fn emit_standalone_recovery_hold<C: CanTransport>(
+    pub(in crate::driver) fn emit_standalone_recovery_hold<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         expected_stamp: Option<StopStamp>,
         hold_pos: f32,

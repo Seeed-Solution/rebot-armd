@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
@@ -6,10 +6,10 @@ use thiserror::Error;
 
 use crate::model::JointState;
 pub use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointRangeReading, MotorZeroSupport, RangeCheckStatus};
-use crate::protocol::damiao::{self, DamiaoLimits};
 pub use crate::protocol::damiao::DAMIAO_GRIPPER_POSFORCE_VEL_RAW;
-use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
+use crate::transport::{TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 #[cfg(test)] use crate::transport::Transport;
+#[cfg(test)] use crate::protocol::damiao::{self, DamiaoLimits};
 
 pub mod ext;
 pub mod zero_offset;
@@ -18,7 +18,17 @@ pub mod bus_servo;
 pub use bus_servo::FashionStarArmDriver;
 pub use bus_servo::FeetechArmDriver;
 pub mod can_servo;
-pub use can_servo::RobStrideArmDriver;
+pub use can_servo::{
+    gripper_drive_from_profile, DamiaoArmDriver, DamiaoControlMode, GripperDrive,
+    GripperPosForce, GripperPosForceInfo, MotorCurrentCap, RobStrideArmDriver,
+};
+pub(crate) use can_servo::{PosForceSendToken, OPTIONAL_WORK_RELEASE_MARGIN};
+use can_servo::ENABLE_FRESHEN_TIMEOUT;
+#[cfg(test)]
+use can_servo::{
+    pos_force_emitter, ContinuityBypass, ModeWrite, TxKind, TxRefusal, MAX_MODE_JOINTS,
+    POS_FORCE_FEEDBACK_MAX_AGE, REGISTER_REPLY_TIMEOUT,
+};
 pub use handshake::{TorqueOutcome, TorqueProgress};
 pub use ext::{
     BoundedTxExt, BusRecoveryExt, CommissioningExt, JointModeExt, JointZeroExt, MitExt, ModeSwitchExt,
@@ -2038,41 +2048,6 @@ impl PendingDisableShadowBatch {
         *slot = Some(incoming);
     }
 }
-
-
-// =========================================================================
-// 3. Damiao Brushless Arm Driver (reBot Arm B601-DM)
-// =========================================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/// Damiao diagnostics that left the `ArmDriver` trait in S4 (allocating twins of
-/// `JointModeExt::with_range_check`, `JointModeExt::take_recovery_writes_into` and
-/// `MitExt::mit_fence_trip_bounded`); for tests and tools, not for owners.
-impl<C: CanTransport> DamiaoArmDriver<C> {
-}
-
-
-
-
-
-
-
-
-
-
-pub(crate) use pos_force_emitter::PosForceSendToken;
 
 
 #[cfg(test)]

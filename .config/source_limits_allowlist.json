@@ -9,7 +9,7 @@
     "src/calibration.rs": 3787,
     "src/chain.rs": 3125,
     "src/diagnostics/tick.rs": 3337,
-    "src/driver.rs": 24302,
+    "src/driver.rs": 3406,
     "src/measure_multiview.rs": 3317,
     "src/mit.rs": 7568,
     "src/model.rs": 5210,

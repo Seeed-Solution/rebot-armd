@@ -1,22 +1,10 @@
 //! Damiao bounded TX queue, pass accounting, refresh scheduler, and TX priority types.
 
-#[allow(unused_imports)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[allow(unused_imports)]
-use std::sync::Arc;
-#[allow(unused_imports)]
 use std::time::{Duration, Instant};
 
-#[allow(unused_imports)]
 use crate::driver::*;
-#[allow(unused_imports)]
 use crate::driver::can_servo::*;
-#[allow(unused_imports)]
-use crate::model::JointState;
-#[allow(unused_imports)]
-use crate::protocol::damiao::{self, DamiaoLimits};
-#[allow(unused_imports)]
-use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
+use crate::transport::TransportError;
 
 /// Transmit priority classes (lower value = higher priority):
 /// 1. Transition from motion to stop / hold / freeze for ANY joint (including J7).
@@ -47,7 +35,7 @@ pub(in crate::driver::can_servo) struct TickTxPass {
 /// Any E-stop or authorized stop (even after `requested == applied`) changes this stamp so
 /// older deferred frames are never transmitted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::driver::can_servo) struct StopStamp {
+pub(in crate::driver) struct StopStamp {
     pub(in crate::driver::can_servo) estop_gen: u64,
     pub(in crate::driver::can_servo) stop_gen: u64,
 }
