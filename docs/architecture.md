@@ -251,7 +251,6 @@ The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop
 | `/etc/init.d/K92rebot-teleop` (postinst adds `S92rebot-teleop` only without the reCamera console) | `packaging/rootfs/etc/init.d/K92rebot-teleop` |
 | `/usr/share/rebot-teleop/rebot-vision-run` (respawn loop, nice 10), `vision.json.default` | `packaging/rootfs/usr/share/rebot-teleop/` |
 | `/usr/share/doc/rebot-teleop/` (`LICENSE`, `LICENSE-APACHE`, `THIRD_PARTY_NOTICES.md`) | repository root, `kits/recamera-b601dm/vision/LICENSE-APACHE` |
-| `/usr/share/rebot-teleop/index.html` | `src/api/index.html` |
 | `/usr/share/rebot-teleop/assets/reBot-DevArm_gripper.urdf` | `packaging/rootfs/usr/share/rebot-teleop/assets/` |
 | `/usr/share/rebot-teleop/profile/rebot-b601dm.json` | `kits/recamera-b601dm/profile/` |
 | `/usr/share/rebot-teleop/rebot-teleop.json` (+ `.md`, `.zh.md`) | gallery manifest for the reCamera console, `"requires": ["can"]` |

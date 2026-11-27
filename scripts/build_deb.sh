@@ -7,8 +7,8 @@ set -euo pipefail
 # Usage: build_deb.sh [--flavor recamera|lite] [--dry-run] [VERSION]
 #
 #   --flavor recamera  (default) core + kits/recamera-b601dm: the rebot-teleop
-#                      deb (armd, rebot-vision, init script, Wi-Fi AP, CAN setup,
-#                      cockpit, URDF, gallery manifest)
+#                      deb (armd with embedded cockpit, rebot-vision, init script,
+#                      Wi-Fi AP, CAN setup, URDF, gallery manifest)
 #                      -> dist/rebot-teleop_<VERSION>_riscv64.deb
 #                      VERSION default: kits/recamera-b601dm/packaging/debian/control
 #                      rebot-vision: REBOT_VISION_BIN=<prebuilt binary>, or
@@ -120,7 +120,8 @@ fi
 # 1. Compile armd binary for RISC-V musl
 if [ "$FLAVOR" = "lite" ]; then echo "[1/3] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; else echo "[1/5] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; fi
 cd "${REPO_ROOT}"
-CARGO_ARGS=(build --release --target "${TARGET_TRIPLE}")
+TARGET_DIR="${REPO_ROOT}/target"
+CARGO_ARGS=(build --release --target "${TARGET_TRIPLE}" --target-dir "${TARGET_DIR}")
 if [ "$FLAVOR" = "recamera" ]; then
     CARGO_ARGS+=(--features xthead-ncc)
 fi
@@ -128,25 +129,10 @@ echo "      + cargo ${CARGO_ARGS[*]}"
 if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
-# JSON messages on stdout (diagnostics still rendered on stderr): the armd build-script message of this
-# invocation names the OUT_DIR whose cockpit page is the one compiled into the packaged binary.
-CARGO_MESSAGES="${REPO_ROOT}/target/deb_cargo_messages.$$.json"
-cargo "${CARGO_ARGS[@]}" --message-format=json-render-diagnostics > "${CARGO_MESSAGES}"
-ARMD_OUT_DIRS="$(grep -F '"reason":"build-script-executed"' "${CARGO_MESSAGES}" \
-    | grep -F "\"package_id\":\"path+file://$(cd "${REPO_ROOT}" && pwd -P)#" \
-    | sed -n 's/.*"out_dir":"\([^"]*\)".*/\1/p' | sort -u || true)"
-rm -f "${CARGO_MESSAGES}"
-if [ "$(printf '%s\n' "${ARMD_OUT_DIRS}" | grep -c .)" -ne 1 ]; then
-    echo "Error: expected one armd build-script OUT_DIR from cargo, got: '${ARMD_OUT_DIRS}'" >&2
-    exit 1
-fi
-COCKPIT_PAGE="${ARMD_OUT_DIRS}/cockpit/index.html"
-if [ ! -f "${COCKPIT_PAGE}" ]; then
-    echo "Error: assembled cockpit page not found at ${COCKPIT_PAGE}" >&2
-    exit 1
-fi
+mkdir -p "${TARGET_DIR}"
+cargo "${CARGO_ARGS[@]}"
 
-BIN_PATH="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/armd"
+BIN_PATH="${TARGET_DIR}/${TARGET_TRIPLE}/release/armd"
 if [ ! -f "${BIN_PATH}" ]; then
     echo "Error: compiled binary not found at ${BIN_PATH}" >&2
     exit 1
@@ -161,7 +147,7 @@ mkdir -p "${DIST_DIR}"
 # Lite flavor: core only. Deterministic tarball (sorted, root-owned, fixed mtime).
 if [ "$FLAVOR" = "lite" ]; then
     LITE_NAME="armd-lite_${VERSION}_riscv64"
-    LITE_STAGING="${REPO_ROOT}/target/lite_staging/${LITE_NAME}"
+    LITE_STAGING="${TARGET_DIR}/lite_staging/${LITE_NAME}"
     rm -rf "${LITE_STAGING}"
     mkdir -p "${LITE_STAGING}"
     echo "[2/3] Assembling ${LITE_NAME}..."
@@ -190,7 +176,7 @@ else
     echo "[2/5] Building rebot-vision in container ${RECAMERA_DOCKER}..."
     # build_vision.sh copies its own generation here under its publish lock; the shared
     # target/vision-riscv/current may be switched by a concurrent build
-    VISION_COPY="${REPO_ROOT}/target/deb_vision.$$"
+    VISION_COPY="${TARGET_DIR}/deb_vision.$$"
     rm -rf "${VISION_COPY}"
     trap 'rm -rf "${VISION_COPY}"' EXIT
     REBOT_VISION_COPY_TO="${VISION_COPY}" "${SCRIPT_DIR}/build_vision.sh"
@@ -202,7 +188,7 @@ if [ ! -f "${VISION_BIN}" ]; then
 fi
 
 # 3. Prepare staging directory
-STAGING_DIR="${REPO_ROOT}/target/deb_staging/rebot-teleop"
+STAGING_DIR="${TARGET_DIR}/deb_staging/rebot-teleop"
 rm -rf "${STAGING_DIR}"
 mkdir -p "${STAGING_DIR}/DEBIAN"
 mkdir -p "${STAGING_DIR}/etc/init.d"
@@ -246,7 +232,7 @@ fi
 # Bundled vision models from kits/recamera-b601dm/vision/models/models.tsv ->
 # /usr/share/rebot-teleop/models/ (read-only package payload, owned by the package).
 MODELS_MANIFEST="${REPO_ROOT}/kits/recamera-b601dm/vision/models/models.tsv"
-MODELS_CACHE_DIR="${REBOT_MODELS_DIR:-${REPO_ROOT}/target/models-cache}"
+MODELS_CACHE_DIR="${REBOT_MODELS_DIR:-${TARGET_DIR}/models-cache}"
 MODELS_DEST="${STAGING_DIR}/usr/share/rebot-teleop/models"
 if [ ! -f "${MODELS_MANIFEST}" ]; then
     echo "Error: vision models manifest not found at ${MODELS_MANIFEST}" >&2
@@ -310,8 +296,6 @@ if [ -d "${REPO_ROOT}/assets/so101_meshes" ]; then
     cp -rf "${REPO_ROOT}/assets/so101_meshes/"* "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_meshes/"
 fi
 
-# Web UI: the page build.rs assembled for the packaged binary (same bytes as its GET /)
-cp "${COCKPIT_PAGE}" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
 # Gallery manifest: its "version" is the package version (the console reports it as the
 # installed version), written here so the two cannot differ.
 MANIFEST="${STAGING_DIR}/usr/share/rebot-teleop/rebot-teleop.json"

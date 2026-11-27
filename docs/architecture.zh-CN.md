@@ -177,7 +177,6 @@ schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`w
 | `/etc/init.d/K92rebot-teleop`（postinst 仅在没有 reCamera 控制台时添加 `S92rebot-teleop`） | `packaging/rootfs/etc/init.d/K92rebot-teleop` |
 | `/usr/share/rebot-teleop/rebot-vision-run`（重启循环，nice 10）、`vision.json.default` | `packaging/rootfs/usr/share/rebot-teleop/` |
 | `/usr/share/doc/rebot-teleop/`（`LICENSE`、`LICENSE-APACHE`、`THIRD_PARTY_NOTICES.md`） | 仓库根目录、`kits/recamera-b601dm/vision/LICENSE-APACHE` |
-| `/usr/share/rebot-teleop/index.html` | `src/api/index.html` |
 | `/usr/share/rebot-teleop/assets/reBot-DevArm_gripper.urdf` | `packaging/rootfs/usr/share/rebot-teleop/assets/` |
 | `/usr/share/rebot-teleop/profile/rebot-b601dm.json` | `kits/recamera-b601dm/profile/` |
 | `/usr/share/rebot-teleop/rebot-teleop.json`（及 `.md`、`.zh.md`） | reCamera 控制台的应用列表 manifest，`"requires": ["can"]` |
