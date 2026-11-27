@@ -9316,7 +9316,7 @@ impl SupervisorInner {
                 let snapshot = self.driver.as_mut().and_then(|d| {
                     d.with_mut(|drv| {
                         let states = drv.read_joint_states().ok()?;
-                        let ages = drv.feedback_ages_snapshot();
+                        let ages = drv.feedback_ages();
                         let loads = drv.joint_loads_snapshot();
                         let caps = drv.capabilities();
                         let modes_uncertain = drv.joint_mode().joint_modes_uncertain();
@@ -9491,7 +9491,7 @@ impl SupervisorInner {
                         return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(e.to_string())));
                     }
                 };
-                let ages = drv.feedback_ages_snapshot();
+                let ages = drv.feedback_ages();
                 let loads = drv.joint_loads_snapshot();
                 let caps = drv.capabilities();
                 let disabling = drv.clear_fault_disables_joints();
@@ -9625,7 +9625,7 @@ impl SupervisorInner {
                             drv.check_hardware_status().is_err(),
                             drv.is_feedback_valid(),
                             drv.pos_force().pos_force_feedback_fresh(),
-                            drv.feedback_ages_snapshot(),
+                            drv.feedback_ages(),
                         ))
                     })
                     .ok_or(ClearFaultLegacyInnerError::Safety(SafetyError::FeedbackUnavailable))?
