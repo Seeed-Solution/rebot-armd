@@ -285,6 +285,13 @@ overrides the channel; `0` or unset keeps the default. If hostapd is not running
 channel after start (checked with `iw dev wlan1 info`), the init script restarts it on
 2.4 GHz channel 6 and writes the fallback to syslog.
 
+`network.hotspot` (`on` default, `off`) in the settings group "Wi-Fi Hotspot & Client" turns the
+hotspot off: after the Wi-Fi client is set up the init script starts no access point, no guard and
+no dnsmasq restart, and stops its own hostapd and guard if they survive from an earlier start. The
+console's own hotspot and other hostapd processes are not touched. The USB address `192.168.42.1`
+is the way in when the Wi-Fi client is down and the hotspot is off; that path (SSH and cockpit
+over USB after a restart and a cold boot) is not verified on hardware yet.
+
 On a device without a Wi-Fi interface (no `wlan0`/`wlan1`, for example the PoE model) the
 init script skips the Wi-Fi client, the hotspot and its guard, logs that to syslog, and armd is
 reached over the wired network.
