@@ -31,11 +31,16 @@ pub fn configured_entries_in(root: &Path, key: &str) -> Vec<String> {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", reg_path.display()));
     let mut entries = Vec::new();
     for (idx, line) in raw.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let Some((k, v)) = trimmed.split_once('\t') else {
+        let mut fields = line.split('\t');
+        let Some(k) = fields.next() else {
+            panic!("invalid row {}:{} in {}", REGISTRY_REL, idx + 1, reg_path.display());
+        };
+        let Some(v) = fields.next() else {
             panic!(
                 "invalid row {}:{} in {}: expected `<key>\\t<path>`",
                 REGISTRY_REL,
@@ -43,12 +48,27 @@ pub fn configured_entries_in(root: &Path, key: &str) -> Vec<String> {
                 reg_path.display()
             );
         };
-        if k.trim() == key {
-            let rel = v.trim().replace('\\', "/");
-            assert!(
-                !rel.is_empty() && !rel.starts_with('/') && !rel.split('/').any(|s| s == ".."),
-                "invalid repo-relative path `{rel}` for key `{key}` in {REGISTRY_REL}"
-            );
+        assert!(
+            fields.next().is_none(),
+            "invalid row {}:{} in {}: expected exactly 2 tab-separated fields",
+            REGISTRY_REL,
+            idx + 1,
+            reg_path.display()
+        );
+        let k = k.trim();
+        assert!(
+            !k.is_empty(),
+            "empty key on row {}:{} in {}",
+            REGISTRY_REL,
+            idx + 1,
+            reg_path.display()
+        );
+        let rel = v.trim().replace('\\', "/");
+        assert!(
+            !rel.is_empty() && !rel.starts_with('/') && !rel.split('/').any(|s| s == ".."),
+            "invalid repo-relative path `{rel}` for key `{k}` in {REGISTRY_REL}"
+        );
+        if k == key {
             entries.push(rel);
         }
     }
@@ -283,15 +303,28 @@ mod tests {
     #[test]
     fn cockpit_html_env_override_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let root = repo_root();
+        let tmp = std::env::temp_dir().join(format!(
+            "armd_cockpit_override_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".config")).unwrap();
+        fs::write(
+            tmp.join(".config/source_paths.tsv"),
+            "cockpit_html\tsrc/api/assembled.html\r\n",
+        )
+        .unwrap();
         let prev = std::env::var_os("ARMD_COCKPIT_HTML");
 
         std::env::remove_var("ARMD_COCKPIT_HTML");
-        assert!(cockpit_html_path_in(&root).ends_with("src/api/index.html"));
+        assert_eq!(
+            cockpit_html_path_in(&tmp),
+            tmp.join("src/api/assembled.html")
+        );
 
         std::env::set_var("ARMD_COCKPIT_HTML", "/tmp/custom_cockpit.html");
         assert_eq!(
-            cockpit_html_path_in(&root),
+            cockpit_html_path_in(&tmp),
             PathBuf::from("/tmp/custom_cockpit.html")
         );
 
@@ -299,6 +332,7 @@ mod tests {
             Some(v) => std::env::set_var("ARMD_COCKPIT_HTML", v),
             None => std::env::remove_var("ARMD_COCKPIT_HTML"),
         }
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
