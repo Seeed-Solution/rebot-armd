@@ -120,7 +120,9 @@ fi
 # 1. Compile armd binary for RISC-V musl
 if [ "$FLAVOR" = "lite" ]; then echo "[1/3] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; else echo "[1/5] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; fi
 cd "${REPO_ROOT}"
-TARGET_DIR="${REPO_ROOT}/target"
+# One output dir per flavor: a concurrent build of the other flavor cannot replace release/armd
+# between compilation and the copy into the package.
+TARGET_DIR="${REPO_ROOT}/target/deb-${FLAVOR}"
 CARGO_ARGS=(build --release --target "${TARGET_TRIPLE}" --target-dir "${TARGET_DIR}")
 if [ "$FLAVOR" = "recamera" ]; then
     CARGO_ARGS+=(--features xthead-ncc)
