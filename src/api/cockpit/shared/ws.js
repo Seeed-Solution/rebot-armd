@@ -50,15 +50,16 @@ function resumeConnection() {
   return true;
 }
 // Arm state for the release notice, from fresh telemetry only. "Parked" needs armd's evidence (a finished
-// park action and torque off): a clean close can reconnect while the arm is still torqued.
+// park action and is_torqued === false): a clean close can reconnect while the arm is still torqued.
+// "Parking" needs a running park action; disable_pending alone is a pending torque off.
 function connArmText(o) {
   if (!o) return '';
-  const a = o.action, parking = !!o.disable_pending || (a?.kind === 'park' && a?.state === 'running');
-  const held = o.watchdog_park_blocked_reason;
-  if (o.is_torqued && typeof held === 'string' && held) return t('conn.arm.held', { reason: held });
-  if (parking) return t('conn.arm.parking');
-  if (!o.is_torqued) return t(a?.kind === 'park' && a?.state === 'done' ? 'conn.arm.parked' : 'conn.arm.off');
-  return t('conn.arm.torqued');
+  const a = o.action, held = o.watchdog_park_blocked_reason;
+  if (o.is_torqued === true && typeof held === 'string' && held) return t('conn.arm.held', { reason: held });
+  if (a?.kind === 'park' && a?.state === 'running') return t('conn.arm.parking');
+  if (o.disable_pending === true) return t('conn.arm.disable_pending');
+  if (o.is_torqued === false) return t(a?.kind === 'park' && a?.state === 'done' ? 'conn.arm.parked' : 'conn.arm.off');
+  return o.is_torqued === true ? t('conn.arm.torqued') : '';
 }
 function retireSocket(ws, { reconnect = false, markReleased = false, toastExpired = false } = {}) {
   if (!ws || S.ws !== ws) return;

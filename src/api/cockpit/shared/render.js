@@ -105,7 +105,7 @@ function frame(ts) {
   const showReleased = fresh && !leaseOp && S.leaseGeneration == null && S.leaseReleased != null;
   $('lease-released').hidden = !showReleased;
   if (showReleased) {
-    setText($('lease-released-txt'), holder != null ? t('lease.released.other', { who: leaseHolderDetail(holder) }) : t(S.leaseReleased.reason === 'expired' ? 'lease.released.expired' : 'lease.released.reconnect', { arm: connArmText(S.obs) }));
+    setText($('lease-released-txt'), holder != null ? t('lease.released.other', { who: leaseHolderDetail(holder), arm: connArmText(S.obs) }) : t(S.leaseReleased.reason === 'expired' ? 'lease.released.expired' : 'lease.released.reconnect', { arm: connArmText(S.obs) }));
     $('btn-retake').disabled = holder != null || !fresh || !!leaseOp;
   }
 
