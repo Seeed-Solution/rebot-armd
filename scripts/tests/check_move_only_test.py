@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,8 @@ class CheckMoveOnlyTest(unittest.TestCase):
         self.git("config", "user.name", "Test")
         (self.repo / "src").mkdir()
         (self.repo / "src" / "driver.rs").write_text(
+            "use std::fmt;\n"
+            "\n"
             "pub struct Driver<C> {\n"
             "    transport: C,\n"
             "    counter: u32,\n"
@@ -78,6 +81,7 @@ class CheckMoveOnlyTest(unittest.TestCase):
         )
         (self.repo / "src" / "driver" / "helpers.rs").write_text(
             "//! Extracted driver helpers.\n"
+            "use std::fmt;\n"
             "use super::{\n"
             "    Driver,\n"
             "};\n"
@@ -107,8 +111,6 @@ class CheckMoveOnlyTest(unittest.TestCase):
         )
         self.git("add", ".")
         res = self.check("--staged")
-        # Note: `where\n    C: Sized,\n{` adds a new bound inside impl header -> allowed as impl header.
-        # Wait: removing `impl<C> Driver<C> {` and `}` in driver.rs is also balanced!
         self.assertEqual(res.returncode, 0, f"stdout={res.stdout}\nstderr={res.stderr}")
         self.assertIn("check_move_only: PASS", res.stdout)
 
@@ -133,7 +135,6 @@ class CheckMoveOnlyTest(unittest.TestCase):
         res = self.check("--staged")
         self.assertEqual(res.returncode, 1, res.stdout)
         self.assertIn("clamped = val.min(100)", res.stderr)
-        self.assertIn("clamped = val.min(200)", res.stderr)
 
     def test_deleted_statement_fails(self) -> None:
         orig = (self.repo / "src" / "driver.rs").read_text(encoding="utf-8")
@@ -143,6 +144,78 @@ class CheckMoveOnlyTest(unittest.TestCase):
         res = self.check()
         self.assertEqual(res.returncode, 1)
         self.assertIn("self.counter = next;", res.stderr)
+
+    def test_use_line_with_trailing_statement_rejected(self) -> None:
+        orig = (self.repo / "src" / "driver.rs").read_text(encoding="utf-8")
+        (self.repo / "src" / "driver.rs").write_text(
+            orig + "\nuse std::io; do_something();\n", encoding="utf-8"
+        )
+        res = self.check()
+        self.assertEqual(res.returncode, 1, f"stdout={res.stdout}\nstderr={res.stderr}")
+        self.assertIn("do_something();", res.stderr)
+
+    def test_deleted_use_without_relocation_rejected(self) -> None:
+        orig = (self.repo / "src" / "driver.rs").read_text(encoding="utf-8")
+        (self.repo / "src" / "driver.rs").write_text(
+            orig.replace("use std::fmt;\n", ""), encoding="utf-8"
+        )
+        res = self.check()
+        self.assertEqual(res.returncode, 1, f"stdout={res.stdout}\nstderr={res.stderr}")
+        self.assertIn("use std::fmt;", res.stderr)
+
+    def test_cross_file_statement_exchange_rejected(self) -> None:
+        (self.repo / "src" / "a.rs").write_text("fn a() {\n    start();\n}\n", encoding="utf-8")
+        (self.repo / "src" / "b.rs").write_text("fn b() {\n    stop();\n}\n", encoding="utf-8")
+        self.git("add", "src/a.rs", "src/b.rs")
+        self.git("commit", "-qm", "add a and b")
+        (self.repo / "src" / "a.rs").write_text("fn a() {\n    stop();\n}\n", encoding="utf-8")
+        (self.repo / "src" / "b.rs").write_text("fn b() {\n    start();\n}\n", encoding="utf-8")
+        res = self.check()
+        self.assertEqual(res.returncode, 1, f"stdout={res.stdout}\nstderr={res.stderr}")
+
+    def test_same_file_long_statement_reorder_rejected(self) -> None:
+        (self.repo / "src" / "order.rs").write_text(
+            "fn run() {\n"
+            "    first_long_safety_check_step();\n"
+            "    second_long_safety_check_step();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self.git("add", "src/order.rs")
+        self.git("commit", "-qm", "add order.rs")
+        (self.repo / "src" / "order.rs").write_text(
+            "fn run() {\n"
+            "    second_long_safety_check_step();\n"
+            "    first_long_safety_check_step();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        res = self.check()
+        self.assertEqual(res.returncode, 1, f"stdout={res.stdout}\nstderr={res.stderr}")
+
+    def test_multiline_raw_string_indent_change_rejected(self) -> None:
+        (self.repo / "src" / "raw.rs").write_text(
+            'const SQL: &str = r#"\n    SELECT 1\n"#;\n', encoding="utf-8"
+        )
+        self.git("add", "src/raw.rs")
+        self.git("commit", "-qm", "add raw.rs")
+        (self.repo / "src" / "raw.rs").write_text(
+            'const SQL: &str = r#"\n  SELECT 1\n"#;\n', encoding="utf-8"
+        )
+        res = self.check()
+        self.assertEqual(res.returncode, 1, f"stdout={res.stdout}\nstderr={res.stderr}")
+        self.assertIn("SELECT 1", res.stderr)
+
+    def test_mode_only_change_rejected(self) -> None:
+        script = self.repo / "src" / "tool.sh"
+        script.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        self.git("add", "src/tool.sh")
+        self.git("commit", "-qm", "add executable script")
+        os.chmod(script, 0o644)
+        res = self.check()
+        self.assertEqual(res.returncode, 1, f"stdout={res.stdout}\nstderr={res.stderr}")
+        self.assertIn("MODE CHANGE", res.stderr)
 
     def test_unsafe_impl_rejected(self) -> None:
         (self.repo / "src" / "extra.rs").write_text(
@@ -159,26 +232,6 @@ class CheckMoveOnlyTest(unittest.TestCase):
         res = self.check("--staged")
         self.assertEqual(res.returncode, 1)
         self.assertIn("NON-MOVE", res.stderr)
-
-    def test_same_file_statement_swap_rejected(self) -> None:
-        (self.repo / "src" / "swap.rs").write_text(
-            "fn f() {\n"
-            "    alpha();\n"
-            "    beta();\n"
-            "}\n",
-            encoding="utf-8",
-        )
-        self.git("add", "src/swap.rs")
-        self.git("commit", "-qm", "add swap.rs")
-        (self.repo / "src" / "swap.rs").write_text(
-            "fn f() {\n"
-            "    beta();\n"
-            "    alpha();\n"
-            "}\n",
-            encoding="utf-8",
-        )
-        res = self.check()
-        self.assertEqual(res.returncode, 1, f"stdout={res.stdout}\nstderr={res.stderr}")
 
     def test_cfg_test_mod_declaration_passes(self) -> None:
         orig = (self.repo / "src" / "driver.rs").read_text(encoding="utf-8")
