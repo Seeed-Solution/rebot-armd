@@ -1547,6 +1547,11 @@ pub struct SupervisorInner {
     consumed_stamps: ConsumedStamps,
     /// Bounded, preallocated single-use tracker for consumed RT broker `RequestId` values.
     consumed_broker_stamps: ConsumedStamps,
+    /// Separate tracker for RT-internal IDs (`RT_INTERNAL_REQUEST_ID_BIT`, one per executor
+    /// servo/jog frame). They share the counter with ordinary IDs, so in one tracker the two
+    /// namespaces fragment each other; at the interval cap the fail-closed fold then moved the
+    /// watermark past every ordinary ID (all ordinary commands refused with STAMP_REUSED).
+    consumed_internal_stamps: ConsumedStamps,
     /// Shared per-connection bounded action-terminal FIFO broadcaster (wired by `ArmSupervisor::new`;
     /// `None` on standalone `SupervisorInner::new`, never locked on `armd-control`).
     terminals: Option<Arc<TerminalBroadcaster>>,
@@ -2864,6 +2869,7 @@ impl SupervisorInner {
             evicted_conn_spare: String::with_capacity(64),
             consumed_stamps: ConsumedStamps::new(),
             consumed_broker_stamps: ConsumedStamps::new(),
+            consumed_internal_stamps: ConsumedStamps::new(),
             terminals: None,
             defer_terminal_capture: false,
             terminal_capture_tx: None,
@@ -4158,6 +4164,9 @@ impl SupervisorInner {
         if (request_id & BROKER_REQUEST_ID_BIT) != 0 {
             self.consumed_broker_stamps
                 .contains(request_id & !BROKER_REQUEST_ID_BIT)
+        } else if (request_id & RT_INTERNAL_REQUEST_ID_BIT) != 0 {
+            self.consumed_internal_stamps
+                .contains(request_id & !RT_INTERNAL_REQUEST_ID_BIT)
         } else {
             self.consumed_stamps.contains(request_id)
         }
@@ -4170,6 +4179,9 @@ impl SupervisorInner {
         if (request_id & BROKER_REQUEST_ID_BIT) != 0 {
             self.consumed_broker_stamps
                 .record(request_id & !BROKER_REQUEST_ID_BIT);
+        } else if (request_id & RT_INTERNAL_REQUEST_ID_BIT) != 0 {
+            self.consumed_internal_stamps
+                .record(request_id & !RT_INTERNAL_REQUEST_ID_BIT);
         } else {
             self.consumed_stamps.record(request_id);
         }
@@ -24023,5 +24035,41 @@ mod observation_snapshot_tests {
             !inner.safety.state().is_stopped(),
             "clean park stop-gate cancellation must not latch E-stop/stopped fault"
         );
+    }
+}
+
+#[cfg(test)]
+mod stamp_namespace_tests {
+    use super::*;
+
+    /// 2026-11-27 real arm (rc7, executor): after cockpit jogging, grasp/Home were refused with
+    /// STAMP_REUSED. Interleaved RT-internal (servo frame) and ordinary IDs from the shared
+    /// counter fragmented one tracker; the capacity fold moved the watermark past every
+    /// ordinary ID. Each namespace now has its own tracker.
+    #[test]
+    fn jog_frames_do_not_consume_future_ordinary_ids() {
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        let mut ordinary_used = Vec::new();
+        for i in 0..4000u32 {
+            let internal = next_admission_request_id() | RT_INTERNAL_REQUEST_ID_BIT;
+            assert!(!inner.is_stamp_consumed(internal));
+            inner.record_consumed_stamp(internal);
+            // an ordinary ID allocated between frames (most are never consumed here)
+            let ordinary = next_admission_request_id();
+            if i % 7 == 0 {
+                inner.record_consumed_stamp(ordinary);
+                ordinary_used.push(ordinary);
+            }
+        }
+        let fresh = next_admission_request_id();
+        assert!(!inner.is_stamp_consumed(fresh), "a fresh ordinary ID must stay admissible after jogging");
+        let fresh_internal = next_admission_request_id() | RT_INTERNAL_REQUEST_ID_BIT;
+        assert!(!inner.is_stamp_consumed(fresh_internal));
+        // replay protection is kept in both namespaces
+        assert!(ordinary_used.iter().all(|&id| inner.is_stamp_consumed(id)));
+        inner.record_consumed_stamp(fresh_internal);
+        assert!(inner.is_stamp_consumed(fresh_internal));
+        inner.record_consumed_stamp(fresh);
+        assert!(inner.is_stamp_consumed(fresh));
     }
 }
