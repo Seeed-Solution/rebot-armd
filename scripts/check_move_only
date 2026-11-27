@@ -48,6 +48,10 @@ MOD_OPEN_RE = re.compile(r"^(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-
 USE_START_RE = re.compile(r"^(?:pub(?:\s*\([^)]*\))?\s+)?use\s+")
 USE_TREE_LINE_RE = re.compile(r"^[A-Za-z0-9_:,{}\s*;#]+$")
 IMPL_START_RE = re.compile(r"^impl(?:\s*<|\s+)")
+IMPL_FORBIDDEN_CONT_RE = re.compile(
+    r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+|unsafe\s+|const\s+)?"
+    r"(?:fn|let|struct|enum|trait|mod|use|static|if|match|return|loop|while|for)\b"
+)
 CLOSING_BRACE_RE = re.compile(r"^\}\s*$")
 CFG_TEST_RE = re.compile(r"^#\[cfg\(test\)\]\s*$")
 
@@ -147,6 +151,8 @@ def run_git_diff(root: Path, git_args: List[str]) -> str:
         "color.diff.newMovedAlternative=yellow",
         "-c",
         "color.diff.whitespace=normal",
+        "-c",
+        "core.quotePath=false",
         "diff",
         "--no-ext-diff",
         "--color=always",
@@ -458,7 +464,7 @@ def check_boilerplate_for_side(
                     found_open = False
                     while j < n and flines[j].line_no == flines[j - 1].line_no + 1:
                         j_code = strip_line_comment(flines[j].raw.strip())
-                        if ";" in j_code:
+                        if ";" in j_code or IMPL_FORBIDDEN_CONT_RE.match(j_code):
                             break
                         if "{" in j_code:
                             if j_code.endswith("{"):

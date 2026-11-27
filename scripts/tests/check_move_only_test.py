@@ -188,6 +188,15 @@ class CheckMoveOnlyTest(unittest.TestCase):
         res = self.check()
         self.assertEqual(res.returncode, 0, res.stderr)
 
+    def test_malformed_impl_followed_by_fn_rejected(self) -> None:
+        (self.repo / "src" / "bad.rs").write_text(
+            "impl Foo\nfn sneaky() {\n}\n", encoding="utf-8"
+        )
+        self.git("add", ".")
+        res = self.check("--staged")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("fn sneaky()", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
