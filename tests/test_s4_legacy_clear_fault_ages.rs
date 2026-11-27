@@ -212,7 +212,7 @@ impl SteppingClock {
 }
 
 impl DriverClock for SteppingClock {
-    fn clock_id(&self) -> u64 { 0x54_52_32 }
+    fn clock_id(&self) -> u64 { 0x5452_0001 }
 
     fn now(&self) -> Instant {
         let ms = if self.step_on_now.load(Ordering::SeqCst) {
