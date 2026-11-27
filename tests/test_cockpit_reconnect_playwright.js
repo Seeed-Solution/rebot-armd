@@ -7,7 +7,14 @@
 // - recovery is read-only (0 acquire_lease) and shows the release notice with the arm state taken from
 //   fresh telemetry ("parked" only when armd reports a finished park action and torque off; the lease
 //   watchdog park is not an action in the observation, so after it the notice says "torque off");
-// - "Take control" sends exactly one acquire_lease.
+// - "Take control" sends exactly one acquire_lease;
+// - a retry socket that opens but delivers no observation is retired after the telemetry deadline and the
+//   retries keep backing off (silent-open);
+// - returning to the tab (visibilitychange) while a retry is queued does not add attempts (repeated resume);
+// - observations without a boolean is_torqued are not accepted: the warning stays, no arm-state notice,
+//   the backoff is not reset;
+// - the lost status counts down to the next retry and "reconnect now" retries at once;
+// - phone expert layout (400 px): the header badge carries the warning.
 // Screenshots (zh) and the page console go to SHOT_DIR (default: a temp dir).
 // Run: cargo build --bin armd && node tests/test_cockpit_reconnect_playwright.js
 'use strict';
@@ -26,7 +33,7 @@ const B601_CONFIG = path.join(ROOT, 'kits', 'recamera-b601dm', 'profile', 'rebot
 const SHOT_DIR = process.env.SHOT_DIR || fs.mkdtempSync(path.join(os.tmpdir(), 'armd-cockpit-reconnect-'));
 const FORBIDDEN_PORTS = new Set([18765, 18001, 18990, 8001, 8090, 8765]);
 const RETRY_MS = [1000, 2000, 4000, 8000, 15000, 15000];
-const LOST_ZH = '连接已断开 · 正在重连', LOST_EN = 'Connection lost · reconnecting';
+const LOST_ZH = '连接已断开 · 正在重连', LOST_EN = 'Connection lost · reconnecting', LOST_T_ZH = '连接已断开';
 const PARKED_ZH = '机械臂已停靠，力矩已关闭', TORQUE_OFF_ZH = '机械臂力矩已关闭', TORQUED_ZH = '机械臂仍带力矩';
 
 const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 23)}]`, ...a);
@@ -67,22 +74,31 @@ async function startArmd(port) {
   });
   child.stdout.on('data', (c) => logs.push(String(c)));
   child.stderr.on('data', (c) => logs.push(String(c)));
-  await waitFor(async () => {
-    if (child.exitCode !== null) throw new Error(`armd exited early:\n${logs.join('')}`);
-    try { const o = await getObs(port); return Array.isArray(o.positions) && o.positions.length > 0; } catch (_) { return false; }
-  }, { timeoutMs: 15000, intervalMs: 100, label: 'armd ready' });
+  // stop() ends the child and removes the temp state, also when the child already exited.
   const stop = () => new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+    const done = () => { fs.rmSync(state, { recursive: true, force: true }); resolve(); };
+    if (child.exitCode !== null || child.signalCode !== null) { done(); return; }
     const kt = setTimeout(() => child.kill('SIGKILL'), 3000);
-    child.once('exit', () => { clearTimeout(kt); fs.rmSync(state, { recursive: true, force: true }); resolve(); });
+    child.once('exit', () => { clearTimeout(kt); done(); });
     child.kill('SIGTERM');
   });
+  try {
+    await waitFor(async () => {
+      if (child.exitCode !== null) throw new Error(`armd exited early:\n${logs.join('')}`);
+      try { const o = await getObs(port); return Array.isArray(o.positions) && o.positions.length > 0; } catch (_) { return false; }
+    }, { timeoutMs: 15000, intervalMs: 100, label: 'armd ready' });
+  } catch (e) {
+    await stop();
+    throw e;
+  }
   return { stop };
 }
 
-// Page + routed WebSocket proxy. `net.outage = true` closes the open socket pair and every new one.
-async function openCockpit(browser, port) {
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, locale: 'zh-CN' });
+// Page + routed WebSocket proxy. `link.outage = true` closes the open socket pair and every new one;
+// `link.silent = true` lets new sockets open but forwards nothing from armd; `link.stripTorque = true`
+// removes is_torqued from every observation armd sends.
+async function openCockpit(browser, port, viewport = { width: 1280, height: 800 }) {
+  const ctx = await browser.newContext({ viewport, locale: 'zh-CN', hasTouch: viewport.width < 1000 });
   const page = await ctx.newPage();
   const consoleLines = [], pageErrors = [];
   page.on('console', (m) => consoleLines.push(`${m.type()}: ${m.text()}`));
@@ -97,7 +113,7 @@ async function openCockpit(browser, port) {
     }
     return route.continue();
   });
-  const sent = [], attempts = [], link = { outage: false, pair: null };
+  const sent = [], attempts = [], link = { outage: false, silent: false, stripTorque: false, pair: null };
   await page.routeWebSocket(/.*/, (ws) => {
     const u = new URL(ws.url());
     if (u.hostname !== '127.0.0.1' || Number(u.port) !== port || u.pathname !== '/api/v1/ws') { ws.close(); return; }
@@ -107,7 +123,14 @@ async function openCockpit(browser, port) {
     const pair = { ws, server };
     link.pair = pair;
     ws.onMessage((raw) => { let j = null; try { j = JSON.parse(String(raw)); } catch (_) {} sent.push({ ts: Date.now(), json: j }); server.send(raw); });
-    server.onMessage((raw) => ws.send(raw));
+    server.onMessage((raw) => {
+      if (link.silent && link.pair === pair) return;
+      if (link.stripTorque) {
+        let j = null; try { j = JSON.parse(String(raw)); } catch (_) {}
+        if (j && !j.type && 'is_torqued' in j) { delete j.is_torqued; ws.send(JSON.stringify(j)); return; }
+      }
+      ws.send(raw);
+    });
   });
   link.cut = async () => {
     link.outage = true;
@@ -141,14 +164,37 @@ async function assertLostShown(page, label) {
   assert(!ls.hidden && ls.cls.includes('is-lost') && ls.txt === LOST_ZH, `${label}: lease status ${JSON.stringify(ls)}`);
 }
 
+// Returning to the tab, as the page sees it (document.hidden false + visibilitychange).
+const resume = (page) => page.evaluate(() => {
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+  document.dispatchEvent(new Event('visibilitychange'));
+});
+const gapsOf = (times) => times.slice(1).map((t, i) => t - times[i]);
+
 async function main() {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
   const port = await freePort();
   const armd = await startArmd(port);
-  const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  const cp = await openCockpit(browser, port);
-  const { page, link, attempts } = cp;
+  let browser = null, cp = null;
   try {
+    browser = await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    cp = await openCockpit(browser, port);
+    await scenarios(browser, port, cp);
+  } finally {
+    if (cp) await cp.ctx.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    await armd.stop();
+  }
+}
+
+// ONLY=silent,resume,torque,countdown,phone,armtext runs just those cases (skips 1-4); default: all.
+const ONLY = process.env.ONLY ? new Set(process.env.ONLY.split(',')) : null;
+const want = (name) => !ONLY || ONLY.has(name);
+
+async function scenarios(browser, port, cp) {
+  const { page, link, attempts } = cp;
+  if (ONLY) await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
+  if (!ONLY) {
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
     await live(page);
     await holdEnable(page);
@@ -231,16 +277,154 @@ async function main() {
     const rel4 = await releaseNotice(page);
     assert(rel4.txt.includes(PARKED_ZH), `parked notice: ${rel4.txt}`);
     log(`PASS parked evidence: action ${done.action.kind}/${done.action.state}, torque off -> "${rel4.txt}"`);
+  }
+  if (want('silent')) await silentOpen(page, link, attempts);
+  if (want('resume')) await repeatedResume(page, link, attempts);
+  if (want('torque')) await missingTorque(page, link, attempts);
+  if (want('countdown')) await countdownAndReconnectNow(page, link, attempts);
+  if (want('phone')) await phoneExpert(browser, port);
+  if (want('armtext')) { await live(page); await armTextCases(page); }
 
-    assert.deepEqual(cp.pageErrors, [], 'page errors');
-    const errors = cp.consoleLines.filter((l) => l.startsWith('error:'));
-    fs.writeFileSync(path.join(SHOT_DIR, 's3_console.log'), cp.consoleLines.join('\n') + '\n');
-    assert.deepEqual(errors, [], 'console errors');
-    log(`ALL RECONNECT SCENARIOS PASSED (shots and console log in ${SHOT_DIR})`);
+  assert.deepEqual(cp.pageErrors, [], 'page errors');
+  const errors = cp.consoleLines.filter((l) => l.startsWith('error:'));
+  fs.writeFileSync(path.join(SHOT_DIR, 's3_console.log'), cp.consoleLines.join('\n') + '\n');
+  assert.deepEqual(errors, [], 'console errors');
+  log(`ALL RECONNECT SCENARIOS PASSED (shots and console log in ${SHOT_DIR})`);
+}
+
+// Drop the live socket and wait for the warning (the drop itself counts as the start of the outage).
+async function dropAndWaitLost(page, link, outage = true) {
+  link.outage = outage;
+  const t0 = Date.now();
+  await link.cut();
+  link.outage = outage;
+  await page.waitForFunction(() => S.connLost === true, null, { timeout: 3000 });
+  return t0;
+}
+
+// 5. Silent-open: the retry socket opens but armd's frames never arrive. The socket is retired after the
+//    telemetry deadline (4 s) and the retries continue with the backoff; the warning stays.
+async function silentOpen(page, link, attempts) {
+  await live(page);
+  link.silent = true;
+  const n0 = attempts.length;
+  const t0 = await dropAndWaitLost(page, link, false);
+  await waitFor(() => attempts.length >= n0 + 3, { timeoutMs: 25000, intervalMs: 100, label: 'retries after silent sockets' });
+  const gaps = gapsOf([t0, ...attempts.slice(n0, n0 + 3)]);
+  log(`silent-open retry gaps (ms): ${gaps.join(', ')}`);
+  // drop -> 1 s retry; each silent socket: 4 s deadline + the next backoff step (2 s, 4 s)
+  [1000, 4000 + 2000, 4000 + 4000].forEach((want, i) => assert(gaps[i] >= want - 300 && gaps[i] <= want + 1500, `silent retry ${i + 1}: gap ${gaps[i]} ms, want ~${want}`));
+  await assertLostShown(page, 'silent-open');
+  link.silent = false;
+  await live(page, 30000);
+  log('PASS silent-open: silent sockets retired after the telemetry deadline, backoff kept, warning shown until valid telemetry');
+}
+
+// 6. Repeated resume while a retry is queued adds no attempt and does not shorten the backoff.
+async function repeatedResume(page, link, attempts) {
+  await live(page);
+  const n0 = attempts.length;
+  const t0 = await dropAndWaitLost(page, link, true);
+  await waitFor(() => attempts.length >= n0 + 2, { timeoutMs: 6000, intervalMs: 50, label: 'two retries' });
+  const tq = attempts[n0 + 1];
+  for (let i = 0; i < 8; i++) { await resume(page); await sleep(250); }
+  await waitFor(() => attempts.length >= n0 + 3, { timeoutMs: 8000, intervalMs: 50, label: 'third retry' });
+  const gaps = gapsOf([t0, ...attempts.slice(n0, n0 + 3)]);
+  log(`repeated-resume retry gaps (ms): ${gaps.join(', ')} (8 resumes during the 4 s gap)`);
+  assert(attempts[n0 + 2] - tq >= 4000 - 250, `resume shortened the 4 s backoff: ${attempts[n0 + 2] - tq} ms`);
+  await assertLostShown(page, 'repeated resume');
+  link.outage = false;
+  await live(page, 20000);
+  log('PASS repeated resume: queued retry kept, no extra attempts');
+}
+
+// 7. Frames without is_torqued are not valid telemetry: no recovery, no arm-state notice, backoff not reset.
+async function missingTorque(page, link, attempts) {
+  await live(page);
+  link.stripTorque = true;
+  const n0 = attempts.length;
+  const t0 = await dropAndWaitLost(page, link, false);
+  await waitFor(() => attempts.length >= n0 + 3, { timeoutMs: 25000, intervalMs: 100, label: 'retries with frames lacking is_torqued' });
+  const st = await page.evaluate(() => ({ lost: S.connLost, notice: !document.getElementById('lease-released').hidden, txt: document.getElementById('lease-released-txt').textContent }));
+  assert(st.lost && !st.notice, `frames without is_torqued accepted: ${JSON.stringify(st)}`);
+  const armTxt = await page.evaluate(() => connArmText({ ...S.obs, is_torqued: undefined, disable_pending: false, action: { kind: 'park', state: 'done' } }));
+  assert(!armTxt.includes(PARKED_ZH) && !armTxt.includes(TORQUE_OFF_ZH), `arm text without is_torqued: ${armTxt}`);
+  const gaps = gapsOf([t0, ...attempts.slice(n0, n0 + 3)]);
+  log(`missing is_torqued retry gaps (ms): ${gaps.join(', ')}`);
+  [1000, 4000 + 2000, 4000 + 4000].forEach((want, i) => assert(gaps[i] >= want - 300 && gaps[i] <= want + 1500, `missing is_torqued retry ${i + 1}: gap ${gaps[i]} ms, want ~${want}`));
+  await assertLostShown(page, 'missing is_torqued');
+  link.stripTorque = false;
+  await live(page, 30000);
+  log('PASS missing is_torqued: frames refused, warning kept, no parked notice, backoff intact');
+}
+
+// 8. The lost status counts down to the queued retry; "reconnect now" retries at once.
+async function countdownAndReconnectNow(page, link, attempts) {
+  await live(page);
+  const n0 = attempts.length;
+  await dropAndWaitLost(page, link, true);
+  await waitFor(() => attempts.length >= n0 + 3, { timeoutMs: 10000, intervalMs: 50, label: 'three retries' });
+  await sleep(300);
+  const retryTxt = () => page.evaluate(() => { const e = document.getElementById('lease-retry-txt'); return { hidden: e.hidden, txt: e.textContent.trim(), btn: !document.getElementById('btn-reconnect-now').hidden }; });
+  const a = await retryTxt();
+  const m = /^(\d+) 秒后重试$/.exec(a.txt);
+  assert(!a.hidden && m && a.btn, `countdown: ${JSON.stringify(a)}`);
+  const clipped = await page.evaluate(() => [...document.querySelectorAll('#lease-status > *')].filter((e) => !e.hidden && e.scrollWidth > e.clientWidth + 1).map((e) => e.id));
+  assert.deepEqual(clipped, [], 'lost status text clipped next to the countdown');
+  await page.screenshot({ path: path.join(SHOT_DIR, 's3r2_countdown_zh.png') });
+  await sleep(1200);
+  const b = await retryTxt();
+  const m2 = /^(\d+) 秒后重试$/.exec(b.txt);
+  assert(m2 && Number(m2[1]) < Number(m[1]), `countdown did not decrease: ${a.txt} -> ${b.txt}`);
+  link.outage = false;
+  const n1 = attempts.length, tClick = Date.now();
+  await page.click('#btn-reconnect-now');
+  await waitFor(() => attempts.length > n1, { timeoutMs: 1000, intervalMs: 20, label: 'attempt after reconnect now' });
+  await live(page, 3000);
+  await page.waitForFunction(() => document.getElementById('btn-reconnect-now').hidden && document.getElementById('lease-retry-txt').hidden, null, { timeout: 2000 })
+    .catch(() => { throw new Error('countdown and reconnect-now still shown after recovery'); });
+  log(`PASS countdown ${a.txt} -> ${b.txt}; reconnect now: attempt after ${attempts[n1] - tClick} ms, live again`);
+}
+
+// Arm-state text of the release notice: pending torque off vs. a running park, and the notice for a
+// lease held by another client carries the same arm state.
+async function armTextCases(page) {
+  const r = await page.evaluate(() => {
+    const o = { ...S.obs, watchdog_park_blocked_reason: null };
+    return {
+      pending: connArmText({ ...o, is_torqued: true, disable_pending: true, action: null }),
+      parking: connArmText({ ...o, is_torqued: true, disable_pending: true, action: { kind: 'park', state: 'running' } }),
+      other: t('lease.released.other', { who: 'rebot-mcp', arm: connArmText({ ...o, is_torqued: false, disable_pending: false, action: null }) }),
+      pendingKey: t('conn.arm.disable_pending'), parkingKey: t('conn.arm.parking'), offKey: t('conn.arm.off'),
+    };
+  });
+  assert.equal(r.pending, r.pendingKey, 'disable_pending alone is a pending torque off');
+  assert.equal(r.parking, r.parkingKey, 'a running park action is parking');
+  assert(r.other.includes(r.offKey), `release notice for another holder carries the arm state: ${r.other}`);
+  log(`PASS arm text: pending "${r.pending}", parking "${r.parking}", other holder "${r.other}"`);
+}
+
+// 9. Phone expert layout: #lease-status is in the hidden status line, the header badge shows the warning.
+async function phoneExpert(browser, port) {
+  const cp = await openCockpit(browser, port, { width: 400, height: 860 });
+  try {
+    const { page, link } = cp;
+    await page.goto(`http://127.0.0.1:${port}/?ui=expert`, { waitUntil: 'domcontentloaded' });
+    await live(page);
+    await dropAndWaitLost(page, link, true);
+    // the badge is narrow: "连接已断开 · {s} 秒后重试" while a retry is queued, else the full warning
+    await page.waitForFunction((t) => (document.getElementById('ex-ph-status')?.textContent || '').startsWith(t), LOST_T_ZH, { timeout: 2000 }).catch(() => {});
+    const ph = await page.evaluate(() => { const e = document.getElementById('ex-ph-status'); const r = e.getBoundingClientRect(); return { txt: e.textContent.trim(), cls: e.className, visible: r.width > 0 && r.height > 0 && getComputedStyle(e).display !== 'none' }; });
+    assert(ph.visible && ph.cls.includes('is-danger') && (ph.txt === LOST_ZH || /^连接已断开 · \d+ 秒后重试$/.test(ph.txt)), `phone expert badge: ${JSON.stringify(ph)}`);
+    const fits = await page.evaluate(() => { const e = document.getElementById('ex-ph-status'); return e.scrollWidth <= e.clientWidth + 1; });
+    assert(fits, `phone expert badge text is clipped: ${ph.txt}`);
+    await page.screenshot({ path: path.join(SHOT_DIR, 's3r2_phone_expert_lost_zh.png') });
+    link.outage = false;
+    await live(page, 20000);
+    assert.deepEqual(cp.pageErrors, [], 'phone page errors');
+    log(`PASS phone expert: header badge "${ph.txt}" (${ph.cls})`);
   } finally {
     await cp.ctx.close().catch(() => {});
-    await browser.close().catch(() => {});
-    await armd.stop();
   }
 }
 
