@@ -14,6 +14,8 @@ use axum::http::StatusCode;
 
 // ws leaf modules (armd 1.6 RT-core foundation)
 mod lease;
+#[doc(hidden)]
+pub mod refusal_log;
 #[allow(unused_imports)]
 use lease::*;
 mod motion;
@@ -1006,6 +1008,7 @@ async fn flush_urgent_then_fatal_and_close(
         }
         if let Ok(mut val) = estop_out_rx.try_recv() {
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            refusal_log::note(connection_id, &val);
             match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await {
                 Ok(()) => { *estop_replies_delivered += 1; }
                 Err(WriteErr::Timeout) => {}
@@ -1013,6 +1016,7 @@ async fn flush_urgent_then_fatal_and_close(
             }
         } else if let Ok(mut val) = stop_out_rx.try_recv() {
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            refusal_log::note(connection_id, &val);
             if matches!(
                 write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await,
                 Err(WriteErr::Closed)
@@ -1040,6 +1044,7 @@ async fn flush_urgent_then_fatal_and_close(
                 Some(mut val) => {
                     let r2 = urgent_rem().max(Duration::from_millis(1));
                     enforce_monotonic_epoch(last_wire_epoch, &mut val);
+                    refusal_log::note(connection_id, &val);
                     match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r2)).await {
                         Ok(()) => { *estop_replies_delivered += 1; }
                         Err(WriteErr::Timeout) => {}
@@ -1052,6 +1057,7 @@ async fn flush_urgent_then_fatal_and_close(
                 Some(mut val) => {
                     let r2 = urgent_rem().max(Duration::from_millis(1));
                     enforce_monotonic_epoch(last_wire_epoch, &mut val);
+                    refusal_log::note(connection_id, &val);
                     if matches!(
                         write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r2)).await,
                         Err(WriteErr::Closed)
@@ -1074,6 +1080,7 @@ async fn flush_urgent_then_fatal_and_close(
         }
         if let Ok(mut val) = estop_out_rx.try_recv() {
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            refusal_log::note(connection_id, &val);
             match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await {
                 Ok(()) => { *estop_replies_delivered += 1; }
                 Err(WriteErr::Timeout) => {}
@@ -1081,6 +1088,7 @@ async fn flush_urgent_then_fatal_and_close(
             }
         } else if let Ok(mut val) = stop_out_rx.try_recv() {
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            refusal_log::note(connection_id, &val);
             if matches!(
                 write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await,
                 Err(WriteErr::Closed)
@@ -2245,6 +2253,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let writer_urgent_notify = urgent_done_notify.clone();
     let writer_ack_tracker = Arc::clone(&wire_ack_tracker);
     let mut writer_task = tokio::spawn(async move {
+        let _refusal_log_guard = refusal_log::RefusalLogGuard::new(&writer_connection);
         let mut last_sent: Option<f64> = None;
         let mut last_wire_epoch: Option<(u64, Option<Value>)> = None;
         let mut max_granted_gen: u64 = 0;
@@ -2301,6 +2310,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 reply = estop_out_rx.recv(), if !estop_closed => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
+                        refusal_log::note(&writer_connection, &val);
                         match write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             Ok(()) => { estop_replies_delivered += 1; }
                             Err(e) => {
@@ -2322,6 +2332,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 reply = stop_out_rx.recv(), if !stop_closed => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
+                        refusal_log::note(&writer_connection, &val);
                         if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
                                 let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
@@ -2416,6 +2427,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         };
                         if is_control_msg {
                             enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
+                            refusal_log::note(&writer_connection, &val);
                         }
                         if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
