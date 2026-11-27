@@ -23,8 +23,14 @@ jobs:
       # cargo fmt --check is not run: the code base is not rustfmt-formatted yet.
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.152
       - name: Test
-        run: cargo test --locked
+        run: cargo nextest run --workspace --profile ci --locked
+      - name: Doctests
+        # nextest does not run doctests (29 at 83928c3b)
+        run: cargo test --doc --locked
 
   web:
     # Self-tests of the web cockpit (src/api/index.html), run in Node without a browser.
