@@ -566,17 +566,18 @@ impl Orchestrator {
         }).await;
         if let Some(w) = measured_width_m {
             let max_w = self.max_grasp_width().await;
+            let cap = (max_w > 0.0).then_some(max_w);
             // the shared jaw predicate of the admission, on the fresh measured width
             match &planned.jaw {
-                Some(jaw) if max_w > 0.0 => {
-                    if let Err(r) = jaw.recheck(w, max_w) {
+                Some(jaw) => {
+                    if let Err(r) = jaw.recheck(w, cap) {
                         return Err(fail(&r.code, format!("Object width {w:.3} m: {}", r.message)));
                     }
                 }
-                _ if max_w > 0.0 && w > max_w => {
+                None if max_w > 0.0 && w > max_w => {
                     return Err(fail("TOO_WIDE", format!("Object width {w:.3} m exceeds max_grasp_width_m {:.3} m", max_w)));
                 }
-                _ => {}
+                None => {}
             }
         }
 

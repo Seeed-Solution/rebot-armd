@@ -396,7 +396,7 @@ fn build(s: &Snapshot, t: &Target, ch: &Chord, mut hy: Hypothesis, y_in: Vec3, p
     if width < MIN_CHORD_M && width.is_finite() {
         return Err(Rejection::new("geometry", "TOO_NARROW", format!("chord {width:.4} m")).with(width, MIN_CHORD_M));
     }
-    let reserve = super::admission::jaw_check(width, t.hard_error_m, tool.open_width_m, tool.max_grasp_width_m)?;
+    let reserve = super::admission::jaw_check(width, t.hard_error_m, tool.open_width_m, tool.max_grasp_width_cap)?;
     // shallowest admissible contact: envelope points (in end_link frame) and open fingers (in
     // TCP/jaw frame) TABLE_CLEARANCE_M above the table, the tips at least grasp_height_m
     let finger_low = lowest(&r, &gripper_lattice(tool, tool.open_width_m));

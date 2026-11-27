@@ -233,6 +233,9 @@ pub struct AdaptiveRoute {
     pub torque_limits: Option<Vec<f64>>,
     pub has_gravity_model: bool,
     pub target_centroid: [f64; 2],
+    /// Contact chord centre on the table plane (box-centre target for `-top`, chord midpoint for
+    /// adaptive chord candidates), used for fresh-evidence jaw revalidation.
+    pub contact_centre: [f64; 2],
     pub target_table_z: f64,
     pub target_height: [f64; 2],
     pub target_poly: Vec<[f64; 2]>,
@@ -255,6 +258,7 @@ pub struct AdaptiveRoute {
     pub insert_mps: f64,
     pub loaded_mps: f64,
     pub has_oriented_evidence: bool,
+    pub has_contour_evidence: bool,
 }
 
 impl AdaptiveRoute {
@@ -342,8 +346,13 @@ pub struct AdaptiveSelection {
     pub route: Option<AdaptiveRoute>,
     pub failing_phase: Option<&'static str>,
     /// Checked-alternative hint populated ONLY when an actually checked alternative exists
-    /// (e.g. an `InsufficientEvidence` candidate with a verified payload capacity bound).
+    /// (e.g. an `InsufficientEvidence` candidate with a verified payload capacity bound, or a
+    /// verified legacy vertical grasp when adaptive safety checks such as lift torque or
+    /// carried-object keepout refuse).
     pub checked_hint: Option<String>,
+    /// Legacy vertical admission verdict from the same [`admission::plan_legacy_top_down`] call
+    /// that built and checked the `-top` candidate.
+    pub legacy: admission::LegacyVerdict,
 }
 
 impl AdaptiveSelection {
@@ -352,8 +361,8 @@ impl AdaptiveSelection {
     }
 
     /// Adaptive dry-run reply JSON (parity with Phase A fields plus authoritative Phase B
-    /// route summary, `failing_phase`, and checked-alternative `hint` only when verified; the
-    /// top-down candidate is part of the search, so no legacy-pass hint exists).
+    /// route summary, `failing_phase`, nested `legacy` verdict from the shared top-down check,
+    /// and checked-alternative `hint` only when verified).
     pub fn to_json(&self, s: &Snapshot) -> Value {
         let mut v = self.selection.to_json(s);
         if let Some(route) = &self.route {
@@ -370,6 +379,7 @@ impl AdaptiveSelection {
         if let Some(h) = self.checked_hint.clone() {
             v["hint"] = json!(h);
         }
+        v["legacy"] = self.legacy.to_json();
         v
     }
 }
@@ -707,15 +717,26 @@ fn canonical_seed(s: &Snapshot, t: &snapshot::Target) -> [f64; 6] {
 
 /// Budget exhaustion of the optional search: the verified top-down route when there is one,
 /// else no winner.
-fn exhausted_or_top(se: Search, n: usize, ev: Value, top: &Option<(Candidate, AdaptiveRoute)>) -> AdaptiveSelection {
+fn exhausted_or_top(
+    se: Search,
+    n: usize,
+    ev: Value,
+    top: &Option<(Candidate, AdaptiveRoute)>,
+    legacy: admission::LegacyVerdict,
+) -> AdaptiveSelection {
     match top {
         Some((c, route)) if c.checked.insufficient_evidence.is_none() => {
             let mut se = se;
             se.stats.fully_checked = 1;
             let sel = se.finish(Outcome::Selected, None, None, vec![c.clone()], ev);
-            AdaptiveSelection { selection: sel, route: Some(route.clone()), failing_phase: None, checked_hint: None }
+            AdaptiveSelection { selection: sel, route: Some(route.clone()), failing_phase: None, checked_hint: None, legacy }
         }
-        _ => AdaptiveSelection { selection: se.exhausted(n, ev), route: None, failing_phase: Some("budget"), checked_hint: None },
+        _ => {
+            let hint = legacy.reachable.then(|| {
+                "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
+            });
+            AdaptiveSelection { selection: se.exhausted(n, ev), route: None, failing_phase: Some("budget"), checked_hint: hint, legacy }
+        }
     }
 }
 
@@ -749,17 +770,27 @@ fn select_adaptive_route_inner(
     close_speed_limit: Option<f32>,
     has_gravity_model: bool,
 ) -> AdaptiveSelection {
+    let total_start = Instant::now();
     let mut se = Search {
         s,
-        start: Instant::now(),
+        start: total_start,
         stats: Stats::default(),
         rejected: Vec::new(),
         by_phase: BTreeMap::new(),
         by_code: BTreeMap::new(),
     };
+    let mut work = Work::default();
     let t = match snapshot::target(s) {
         Ok(t) => t,
         Err(m) => {
+            let td_out = admission::plan_legacy_top_down(s, Some(Err(&m)), &mut work);
+            let legacy = match td_out.route {
+                Ok(tr) => admission::LegacyVerdict::from_ok(&tr),
+                Err(e) => admission::LegacyVerdict::from_err(e),
+            };
+            let hint = legacy.reachable.then(|| {
+                "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
+            });
             *se.by_phase.entry("evidence").or_default() += 1;
             let ev = evidence_json(s, None);
             let sel = se.finish(
@@ -773,33 +804,56 @@ fn select_adaptive_route_inner(
                 selection: sel,
                 route: None,
                 failing_phase: Some("evidence"),
-                checked_hint: None,
+                checked_hint: hint,
+                legacy,
             };
         }
     };
     let ev = evidence_json(s, Some(&t));
+    // Start the reserved top-down budget BEFORE any charged top-down / legacy work.
+    let top_deadline = admission::top_down_deadline(Instant::now());
+    let top_over = admission::top_down_budget_fn(s, top_deadline);
+    let td_out = admission::plan_legacy_top_down(s, Some(Ok(&t)), &mut work);
+    let acq_res = td_out.acq;
+    let acq_seed = acq_res.as_ref().ok().copied();
+
     let (mut chords, chord_rej) = candidates::chords(&t, &s.tool);
-    // the top-down (legacy) candidate first, with its own reserved budget: when the optional
-    // search below runs out of budget, the verified top-down route is returned
-    let mut work = Work::default();
-    let acq_res = feasibility::acquisition(s, &mut work);
-    let acq_seed = acq_res.as_ref().ok().map(|a| a.q_end);
     let mut cheap = candidates::CheapStats::default();
     let ctx = admission::Ctx { policy: gripper_policy, limit: gripper_limit, close_speed_limit, has_gravity_model };
     let mut top_rej: Option<Rejection> = None;
-    let top = match admission::top_down_hypothesis(s, &t, chords.len(), &mut cheap) {
-        Ok((chord, hy)) => {
-            let r = admission::evaluate_top_down(s, &t, &chord, &hy, &ctx, (acq_res.is_ok(), acq_seed), &mut work);
-            chords.push(chord);
-            match r {
-                Ok(entry) => Some(entry),
-                Err(f) => { top_rej = Some(f.rejection.clone()); if let Some(hy) = f.hy { se.reject(&hy, f.rejection, true); } None }
-            }
+    let (legacy, top) = match td_out.route {
+        Ok(tr) => {
+            let legacy = admission::LegacyVerdict::from_ok(&tr);
+            let top = match admission::evaluate_top_down_from_legacy(
+                s, &t, &tr, chords.len(), &ctx, acq_res.is_ok(), &mut work, &top_over,
+            ) {
+                Ok((chord, cand, route)) => {
+                    chords.push(chord);
+                    Some((cand, route))
+                }
+                Err(b) => {
+                    let (hy, r) = *b;
+                    top_rej = Some(r.clone());
+                    match hy {
+                        Some(hy) => se.reject(&hy, r, true),
+                        None => se.reject_bare(r),
+                    }
+                    None
+                }
+            };
+            (legacy, top)
         }
-        Err(f) => {
-            top_rej = Some(f.rejection.clone());
-            match f.hy { Some(hy) => se.reject(&hy, f.rejection, true), None => se.reject_bare(f.rejection) }
-            None
+        Err(e) => {
+            let legacy = admission::LegacyVerdict::from_err(e);
+            // When acquisition itself failed, keep `acq_res` for the wholly-unreachable path so
+            // `rejections.acquisition` is counted once rather than twice.
+            if acq_res.is_ok() {
+                if let Some(r) = td_out.rejection {
+                    top_rej = Some(r.clone());
+                    se.reject_bare(r);
+                }
+            }
+            (legacy, None)
         }
     };
     se.start = Instant::now();
@@ -816,15 +870,9 @@ fn select_adaptive_route_inner(
     }
     if se.out_of_budget() {
         se.stats.lattice_tests = cheap.lattice_tests;
-        return exhausted_or_top(se, 0, ev, &top);
+        return exhausted_or_top(se, 0, ev, &top, legacy);
     }
 
-    // Check acquisition as a reference seed / diagnostic only — NEVER hard-blocking direct-from-q0
-    // candidates when acquisition itself is blocked (e.g. overhead keep-out box above target).
-    // Seed endpoint IK from cache, actual start q0, optional acq_seed, and a canonical
-    // target-facing front-branch seed (clamped to joint limits) so starting on an alternate IK
-    // branch does not trap endpoint IK in a local minimum and can cleanly fall back to a
-    // swept-joint pregrasp transition.
     let canonical_seed = canonical_seed(s, &t);
     let mut seed_cache: BTreeMap<(DirClass, bool), [f64; 6]> = BTreeMap::new();
     let mut screened: Vec<(Hypothesis, [f64; 6], [f64; 6], f64)> = Vec::new();
@@ -832,7 +880,7 @@ fn select_adaptive_route_inner(
         if se.out_of_budget() {
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
-            return exhausted_or_top(se, 0, ev, &top);
+            return exhausted_or_top(se, 0, ev, &top, legacy);
         }
         let mut seeds = Vec::with_capacity(4);
         if let Some(q) = seed_cache.get(&(hy.class, hy.half_turn)) {
@@ -868,9 +916,9 @@ fn select_adaptive_route_inner(
     }
     se.stats.ik_survivors = screened.len();
 
-    // If acquisition failed AND no candidate even passed endpoint IK (wholly unreachable target,
-    // e.g. table 0.30 m below base), preserve the exact acquisition failure diagnostics.
-    if screened.is_empty() {
+    // If acquisition failed AND no candidate passed endpoint IK AND no verified top-down route
+    // exists, preserve the exact acquisition failure diagnostics.
+    if screened.is_empty() && top.is_none() {
         if let Err(r) = acq_res {
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
@@ -885,6 +933,7 @@ fn select_adaptive_route_inner(
                 route: None,
                 failing_phase: Some("acquisition"),
                 checked_hint: None,
+                legacy,
             };
         }
     }
@@ -927,10 +976,12 @@ fn select_adaptive_route_inner(
                         entries: &mut Vec<(Candidate, AdaptiveRoute)>,
                         deepest: &mut Option<(usize, Rejection, String)>| {
         let budget_check = || se.out_of_budget();
+        let ch_ref = &chords[hy.chord];
         match preflight_candidate_from_start(
             s,
             &t,
             hy,
+            ch_ref,
             q_pre_seed,
             acq_ok,
             gripper_policy,
@@ -942,7 +993,7 @@ fn select_adaptive_route_inner(
         ) {
             Ok((checked, mut route)) => {
                 let rob = score::robustness(s, &t, hy, &checked, work);
-                let ch = chords[hy.chord].clone();
+                let ch = ch_ref.clone();
                 let scores = score::score(s, &t, &ch, hy, &checked, &rob);
                 let vis = visible(s, &t, &hy.pregrasp_pose());
                 let cid = se.id(hy);
@@ -976,7 +1027,7 @@ fn select_adaptive_route_inner(
             let n = entries.len();
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
-            return exhausted_or_top(se, n, ev, &top);
+            return exhausted_or_top(se, n, ev, &top, legacy);
         }
         let (hy, _, q_pre_seed, _) = &screened[i];
         evaluate(&mut se, hy, *q_pre_seed, &mut work, &mut entries, &mut deepest);
@@ -1012,7 +1063,7 @@ fn select_adaptive_route_inner(
                 let n = entries.len();
                 se.stats.work = work;
                 se.stats.lattice_tests = cheap.lattice_tests;
-                return exhausted_or_top(se, n, ev, &top);
+                return exhausted_or_top(se, n, ev, &top, legacy);
             }
             next += 1;
             se.stats.refined += 1;
@@ -1067,7 +1118,7 @@ fn select_adaptive_route_inner(
     // cannot exceed `budget_ms` and still return `Outcome::Selected`.
     if se.out_of_budget() {
         let n = entries.len();
-        return exhausted_or_top(se, n, ev, &top);
+        return exhausted_or_top(se, n, ev, &top, legacy);
     }
     entries.sort_by(|a, b| {
         let ia = a.0.checked.insufficient_evidence.is_some();
@@ -1086,6 +1137,7 @@ fn select_adaptive_route_inner(
                 route: Some(route),
                 failing_phase: None,
                 checked_hint: None,
+                legacy,
             }
         }
         Some((c, _)) => {
@@ -1111,6 +1163,7 @@ fn select_adaptive_route_inner(
                 route: None,
                 failing_phase: Some("lift"),
                 checked_hint: hint,
+                legacy,
             }
         }
         None => {
@@ -1146,13 +1199,17 @@ fn select_adaptive_route_inner(
                     }
                 }
             };
+            let hint = legacy.reachable.then(|| {
+                "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
+            });
             let mut sel = se.finish(Outcome::Infeasible, Some(code), Some(m), ranked, ev);
             sel.best_refusal = best;
             AdaptiveSelection {
                 selection: sel,
                 route: None,
                 failing_phase: Some(phase),
-                checked_hint: None,
+                checked_hint: hint,
+                legacy,
             }
         }
     }
@@ -1166,6 +1223,7 @@ fn preflight_candidate_from_start(
     s: &Snapshot,
     t: &snapshot::Target,
     hy: &Hypothesis,
+    chord: &Chord,
     q_pre_seed: [f64; 6],
     acq_ok: bool,
     gripper_policy: &crate::model::GripperPolicy,
@@ -1610,6 +1668,7 @@ fn preflight_candidate_from_start(
         torque_limits: s.torque_limits.as_ref().map(|(l, _)| l.clone()),
         has_gravity_model,
         target_centroid: t.centroid,
+        contact_centre: chord.centre,
         target_table_z: t.table_z,
         target_height: t.height,
         target_poly: t.poly.clone(),
@@ -1647,6 +1706,7 @@ fn preflight_candidate_from_start(
         insert_mps: st.descend_speed_mps,
         loaded_mps: st.descend_speed_mps,
         has_oriented_evidence,
+        has_contour_evidence: t.source == snapshot::FootprintSource::Contour,
     };
     Ok((checked, route))
 }

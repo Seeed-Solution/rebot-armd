@@ -455,8 +455,8 @@ impl Orchestrator {
                     let p = [route.plan.grasp.p[0], route.plan.grasp.p[1]];
                     if let Some(w) = crate::grasp_select::candidates::cut_width_near(&wpts, p, u) {
                         let max_w = self.max_grasp_width().await;
-                        let max_w = if max_w > 0.0 { max_w } else { f64::INFINITY };
-                        if let Err(r) = crate::grasp_select::admission::jaw_check(w, route.target_hard_error_m, route.plan.jaw_opening_m, max_w) {
+                        let cap = (max_w > 0.0).then_some(max_w);
+                        if let Err(r) = crate::grasp_select::admission::jaw_check(w, route.target_hard_error_m, route.plan.jaw_opening_m, cap) {
                             return Err(fail(&r.code, format!("[{phase}] fresh contour of '{label}': {}", r.message)));
                         }
                     }

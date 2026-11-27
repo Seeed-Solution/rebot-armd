@@ -224,12 +224,21 @@ async fn over_cap_width_is_too_wide_for_both_strategies() {
 #[tokio::test]
 async fn box_only_legacy_request_defers_the_jaw_check_to_the_measured_width() {
     let sc = mounted_scene(0.30, 0.0, 0.26).await;
-    let mut body = legacy_of(&request(&sc, &bar([0.30, 0.0], 0.08, 0.03, 0.0), 0.035));
-    body.as_object_mut().unwrap().remove("evidence");
-    let leg = dry(&sc, &body).await;
+    // Narrow box-only: the axis-aligned box upper bound already satisfies the jaw predicate -> checked.
+    let mut narrow = legacy_of(&request(&sc, &bar([0.30, 0.0], 0.08, 0.03, 0.0), 0.035));
+    narrow.as_object_mut().unwrap().remove("evidence");
+    let leg = dry(&sc, &narrow).await;
     assert_eq!(leg["reachable"], true, "{leg:?}");
-    assert_eq!(leg["jaw"]["status"], "deferred", "{}", leg["jaw"]);
+    assert_eq!(leg["jaw"]["status"], "checked", "{}", leg["jaw"]);
     assert!(f(&leg["jaw"]["hard_error_m"]) > 0.0);
+
+    // Wide / rotated box-only: the box upper bound exceeds the jaw predicate -> deferred to close range.
+    let mut wide = legacy_of(&request(&sc, &bar([0.30, 0.0], 0.09, 0.03, 45.0), 0.035));
+    wide.as_object_mut().unwrap().remove("evidence");
+    let leg_w = dry(&sc, &wide).await;
+    assert_eq!(leg_w["reachable"], true, "{leg_w:?}");
+    assert_eq!(leg_w["jaw"]["status"], "deferred", "{}", leg_w["jaw"]);
+    assert!(f(&leg_w["jaw"]["hard_error_m"]) > 0.0);
 }
 
 #[tokio::test]
@@ -267,7 +276,8 @@ async fn best_refusal_and_margin_reach_http_and_ws_replies() {
     let (mut ws, generation, epoch, _sup, addr) = common::torqued_rig(sc.sup.clone(), &q).await;
     let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/action/grasp", body.clone()).await;
     assert_eq!(ack["reachable"], false, "{ack}");
-    for k in ["phase", "code", "value", "bound"] { assert_eq!(ack["best_refusal"][k], expected["best_refusal"][k], "{k}: {ack}"); }
+    for k in ["phase", "code", "bound"] { assert_eq!(ack["best_refusal"][k], expected["best_refusal"][k], "{k}: {ack}"); }
+    assert!((f(&ack["best_refusal"]["value"]) - f(&expected["best_refusal"]["value"])).abs() < 1e-12, "{ack} vs {expected:?}");
     assert_eq!(ack["evidence"]["uncertainty"]["error_margin"]["error_margin_source"], "fallback", "{ack}");
     assert_eq!(ack["legacy"]["best_refusal"]["code"], "OPENING", "{ack}");
     let http: Value = reqwest::Client::new().post(format!("http://{addr}/api/v1/action/grasp")).json(&legacy_of(&body))

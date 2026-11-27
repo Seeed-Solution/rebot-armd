@@ -4,14 +4,13 @@ use serde_json::Value;
 
 use crate::api::rest::ApiError;
 use crate::kinematics::{self, Mat3, Pose, Vec3};
-use crate::motion::{self, GoalFrame, MotionError, PlanInput, Speed};
+use crate::motion::{self, GoalFrame, MotionError, PlanInput};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
 use super::{
-    box_centre, camera_down_mode, camera_down_pose, envelope_with_contact, look_down,
-    refuse_calibrated_request, table_violation, task_verdict, CamModel, DetectionSource,
-    GraspSetup, HeightProbeMode, ModeInfo, TaskModels, TaskRequires, TABLE_CLEARANCE_M,
-    TASK_UNSUPPORTED,
+    box_centre, camera_down_mode, camera_down_pose, look_down, refuse_calibrated_request,
+    task_verdict, CamModel, DetectionSource, GraspSetup, HeightProbeMode, ModeInfo, TaskModels,
+    TaskRequires, TASK_UNSUPPORTED,
 };
 
 // ---- request ----
@@ -367,7 +366,7 @@ pub(super) fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> 
 /// Outside the lock: estimate the target from the box-centre ray and plan the approach
 /// (legacy) or select & preflight the whole adaptive route (`strategy: "adaptive"`).
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
-    let PendingGrasp { input, request, open_rad, physical_contact_end_m, adaptive, shared } = pending;
+    let PendingGrasp { input, request, open_rad: _, physical_contact_end_m: _, adaptive, shared } = pending;
     if let Some(pa) = adaptive {
         let sel = crate::grasp_select::select_adaptive_route(
             &pa.snapshot,
@@ -399,8 +398,8 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
         let code = sel.selection.code.unwrap_or_else(|| "NO_CANDIDATE".into());
         let phase = sel.failing_phase.unwrap_or("selection");
         let base_msg = sel.selection.message.unwrap_or_else(|| "adaptive grasp infeasible".into());
-        // only checked hints (the top-down candidate is part of the search, so a legacy pass
-        // cannot exist where adaptive refuses)
+        // Checked hints only (e.g. verified payload capacity bound, or verified legacy top-down
+        // pass when adaptive safety checks such as lift torque or carried-object keepout refuse).
         let checked_hint = sel.checked_hint;
         let message = match &checked_hint {
             Some(hint) => format!("[{phase}] {base_msg}; hint: {hint}"),
@@ -425,45 +424,22 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
             details: Box::new(Value::Object(details)),
         });
     }
-    let request = *request;
-    let setup = &request.setup;
-    let pose_end = input.arm.fk(&input.q0);
-    let cam = CamModel::assumed(&input.arm, setup, &input.cam);
-    let pts = envelope_with_contact(input.ws.as_ref(), &input.cam, &cam.rec, physical_contact_end_m);
-    let is_5dof = input.arm.arm_dof() == 5;
-    let td = top_down_pose(&input, setup, &cam, &pts, &request.box_norm)?;
-    let TopDown { target, goal, tool, camera_down, .. } = td;
-    // the envelope stays above the table on the approach and (camera-down) the transition
-    if camera_down {
-        let tool_end = motion::tcp_to_end(&tool, &input.tcp_offset);
-        if let Some(e) = table_violation(&goal, &tool_end, &pts, setup.table_z_m) { return Err(e.into()); }
-    }
-    let goal_end = if camera_down { goal } else { motion::tcp_to_end(&goal, &input.tcp_offset) };
-    if let Some(e) = table_violation(&pose_end, &goal_end, &pts, setup.table_z_m) { return Err(e.into()); }
-    let mut cur = input.clone();
-    cur.j7 = open_rad;
-    cur.goal_frame = if camera_down { GoalFrame::EndLink } else { GoalFrame::Tcp };
-    let path = motion::plan_cartesian_ex(&cur, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
-    crate::backlash::check_table_clear(&input.arm, &pts, setup.table_z_m + TABLE_CLEARANCE_M, path.q.iter().map(|q| q.as_slice()))
-        .map_err(|v| ArmError::from(v.into_motion_error()))?;
-    let last = path.last();
-    cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
-    cur.goal_frame = GoalFrame::Tcp;
-    let transition_duration = if camera_down {
-        let trans_path = motion::plan_cartesian_ex(&cur, tool, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
-        crate::backlash::check_table_clear(&input.arm, &pts, setup.table_z_m + TABLE_CLEARANCE_M, trans_path.q.iter().map(|q| q.as_slice()))
-            .map_err(|v| ArmError::from(v.into_motion_error()))?;
-        let last = trans_path.last();
-        cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
-        transition_estimate(&goal, &target, setup)
-    } else {
-        0.0
-    };
-    let _descend_path = motion::plan_cartesian_ex(&cur, td.grasp, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
-    // the shared admission of the top-down candidate (jaw fit and, on 6-DOF, the full route)
+    // Single shared top-down route builder + checker (legacy approach, optional camera-down
+    // transition, nominal descent, table clearance, and shared jaw predicate).
     let shared = shared.ok_or_else(|| ArmError::from(MotionError::InvalidCommand("grasp admission state missing".into())))?;
-    let jaw = crate::grasp_select::admission::legacy_admission(&shared)?;
-    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration, mode: None, adaptive: None, jaw: Some(jaw) })
+    let mut work = crate::grasp_select::Work::default();
+    let tr = crate::grasp_select::admission::plan_legacy_top_down(&shared.snapshot, None, &mut work).route?;
+    Ok(PlannedGrasp {
+        input,
+        request: *request,
+        target: tr.td.target,
+        approach_duration: tr.approach_duration,
+        camera_down: tr.td.camera_down,
+        transition_duration: tr.transition_duration,
+        mode: None,
+        adaptive: None,
+        jaw: Some(tr.jaw),
+    })
 }
 
 /// The top-down (legacy) grasp of a request, shared by the legacy plan, the adaptive
@@ -645,64 +621,61 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
         Ok(s) => s,
         Err(e) => { let (r, c, m) = rejected(e.into()); return (r, c, m, None, None, None); }
     };
-    // adaptive requests also carry the legacy verdict (`legacy`), from the same snapshot
-    let pending_res: Result<(PendingGrasp, Option<Box<PendingAdaptive>>), ArmError> =
+    // Adaptive requests carry `legacy` directly from `select_adaptive_route`'s single shared
+    // `plan_legacy_top_down` call; legacy requests run `plan(pending)` once.
+    let pending_res: Result<PendingGrasp, ArmError> =
         if supervisor.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
-            // Lease-free read-only snapshot on RT Executor (0 SupervisorLock, no AdmissionStamp).
             match crate::rt_core::requests::actions::ReadOnlySnapshot::capture(supervisor).await {
-                Ok(ro) => prepare_from_read_only(&ro, body, strategy).and_then(|mut p| {
-                    let pa = p.adaptive.take();
-                    if pa.is_some() { p.shared = Some(shared_env(&ro.env, &ro.commanded_positions, &p, body, false)?); }
-                    Ok((p, pa))
-                }),
+                Ok(ro) => prepare_from_read_only(&ro, body, strategy),
                 Err(e) => Err(e),
             }
         } else {
             let inner = supervisor.inner().read().await;
             prepare_any(&inner, body, inner.safety.epoch_id()).and_then(|mut p| {
-                p.shared = Some(shared_inner(&inner, &p, body, false)?);
-                let pa = match strategy {
-                    crate::grasp_select::Strategy::Adaptive => Some(shared_inner(&inner, &p, body, true)?),
-                    crate::grasp_select::Strategy::Legacy => None,
-                };
-                Ok((p, pa))
+                if strategy == crate::grasp_select::Strategy::Adaptive {
+                    p.adaptive = Some(shared_inner(&inner, &p, body, true)?);
+                } else {
+                    p.shared = Some(shared_inner(&inner, &p, body, false)?);
+                }
+                Ok(p)
             })
         };
     match pending_res {
-        Ok((pending, pa)) => {
+        Ok(mut pending) => {
             let task = Some((pending.request.task.clone(), pending.request.requires, pending.request.models.clone()));
+            let pa = pending.adaptive.take();
             let joined = tokio::task::spawn_blocking(move || {
-                let legacy = plan(pending).map(|p| p.jaw.map(|j| j.to_json()));
-                let adaptive_sel = pa.map(|pa| {
-                    let sel = crate::grasp_select::select_adaptive_route(
-                        &pa.snapshot,
-                        &pa.gripper_policy,
-                        &pa.gripper_limit,
-                        pa.close_speed_limit,
-                        pa.has_gravity_model,
-                    );
-                    (pa.snapshot, sel)
-                });
-                (legacy, adaptive_sel)
+                match pa {
+                    Some(pa) => {
+                        let sel = crate::grasp_select::select_adaptive_route(
+                            &pa.snapshot,
+                            &pa.gripper_policy,
+                            &pa.gripper_limit,
+                            pa.close_speed_limit,
+                            pa.has_gravity_model,
+                        );
+                        (None, Some((pa.snapshot, sel)))
+                    }
+                    None => {
+                        let legacy = plan(pending).map(|p| p.jaw.map(|j| j.to_json()));
+                        (Some(legacy), None)
+                    }
+                }
             }).await;
             match joined {
-                Ok((legacy, None)) => {
+                Ok((Some(legacy), None)) => {
                     let admission = admission_fields(&legacy);
                     let (reachable, code, message) = match legacy { Ok(_) => (true, None, None), Err(e) => rejected(e) };
                     (reachable, code, message, task, None, admission)
                 }
-                Ok((legacy, Some((snap, sel)))) => {
-                    let admission = admission_fields(&legacy);
-                    let (lr, lc, lm) = match legacy { Ok(_) => (true, None, None), Err(e) => rejected(e) };
-                    let mut v = sel.to_json(&snap);
-                    let mut lv = serde_json::json!({"reachable": lr, "code": lc, "message": lm});
-                    for (k, x) in admission.into_iter().flatten() { lv[k] = x; }
-                    v["legacy"] = lv;
+                Ok((None, Some((snap, sel)))) => {
+                    let v = sel.to_json(&snap);
                     let reachable = sel.reachable();
                     let code = sel.selection.code;
                     let message = sel.selection.message;
                     (reachable, code, message, task, Some(v), None)
                 }
+                Ok(_) => (false, Some("INTERNAL".into()), Some("planner returned unexpected variant".into()), task, None, None),
                 Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}")), task, None, None),
             }
         }
