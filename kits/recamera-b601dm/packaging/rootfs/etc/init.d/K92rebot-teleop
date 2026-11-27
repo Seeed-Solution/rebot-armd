@@ -277,7 +277,7 @@ stop_own_ap() {
     rm -f "$AP_PIDFILE"
 }
 
-# True when our AP hostapd or AP guard process is already running.
+# True when our AP hostapd or AP guard process is already running (read-only /proc check).
 ap_stack_running() {
     if own_ap_pid >/dev/null; then
         return 0
@@ -286,7 +286,12 @@ ap_stack_running() {
     case "$GPID" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    [ -d "/proc/$GPID" ]
+    [ -d "/proc/$GPID" ] || return 1
+    SCRIPT_BASE=$(basename "$INIT_SCRIPT")
+    case " $(proc_cmdline "$GPID") " in
+        *" $INIT_SCRIPT ap-guard "*|*"/$SCRIPT_BASE ap-guard "*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # Background guard for the boot race (the console can start its hotspot just after ours):
@@ -805,6 +810,10 @@ start() {
         if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
             # armd already up (boot S92 then a console switch, or app_restore): make sure vision runs too
             echo "$NAME is already running (PID: $PID)"
+            if [ "${HOTSPOT:-on}" = off ] && ap_stack_running; then
+                echo "[rebot-teleop] hotspot off takes effect after reboot"
+                logger -t "$NAME" "hotspot off takes effect after reboot" 2>/dev/null || true
+            fi
             start_vision
             apply_rt_priorities
             if [ "$APP_ENABLED" = 1 ] && [ -n "$APP_NAME" ] && ! app_pid >/dev/null; then start_app || true; fi

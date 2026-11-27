@@ -724,6 +724,110 @@ fn init_hotspot_off_leaves_running_ap_stack_untouched_and_logs_reboot() {
     assert!(env.read("log").contains("hotspot off takes effect after reboot"), "{}", env.read("log"));
     let guard_calls = env.read("calls");
     assert!(!guard_calls.contains("hostapd ") && !guard_calls.contains("dnsmasq") && !guard_calls.contains("iw "), "{guard_calls}");
+
+    // Stale apguard.pid whose PID was reused by an unrelated process must not trigger a false notice
+    // and must never be signalled.
+    for (pid, cmd) in [(901u32, "/usr/bin/other"), (902u32, "python3 /tmp/ap-guard-helper.py")] {
+        let env2 = ApEnv::new();
+        env2.process(pid, cmd);
+        std::fs::write(env2.p("run/apguard.pid"), format!("{pid}\n")).unwrap();
+        let out_stale = env2.run("HOTSPOT=off; start_wifi");
+        assert_eq!(env2.read("signals"), "", "reused PID {pid} must not be signalled: {out_stale}");
+        assert!(env2.p(&format!("proc/{pid}")).is_dir(), "reused PID {pid} untouched");
+        assert!(!out_stale.contains("takes effect after reboot"), "reused PID {pid} must not emit false notice: {out_stale}");
+        assert!(!env2.read("log").contains("takes effect after reboot"), "reused PID {pid}: {}", env2.read("log"));
+        assert!(env2.read("log").contains("network.hotspot=off"), "reused PID {pid}: {}", env2.read("log"));
+    }
+}
+
+/// Real `K92rebot-teleop start` entrypoint when `armd` is already running and `network.hotspot=off`:
+/// emits "hotspot off takes effect after reboot" if our AP hostapd or real ap-guard is live, emits
+/// no false notice if apguard.pid holds a reused unrelated PID, and sends zero signals.
+#[cfg(unix)]
+#[test]
+fn init_start_entry_when_armd_already_running_logs_hotspot_off_reboot_notice() {
+    use std::os::unix::fs::PermissionsExt;
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+
+    let run_case = |with_hostapd: bool, guard_pid_cmd: Option<(u32, &str)>| -> (String, String, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let r = temp.path();
+        for d in ["bin", "etc/init.d", "proc/5001", "userdata/local/apps", "var/run", "var/log"] {
+            std::fs::create_dir_all(r.join(d)).unwrap();
+        }
+        let rs = r.display().to_string();
+        let init = r.join("etc/init.d/K92rebot-teleop");
+        let rebased = source
+            .replace("/etc/init.d/", &format!("{rs}/etc/init.d/"))
+            .replace("/userdata/", &format!("{rs}/userdata/"))
+            .replace("/usr/share/", &format!("{rs}/usr/share/"))
+            .replace("/usr/bin/", &format!("{rs}/usr/bin/"))
+            .replace("/usr/local/bin/", &format!("{rs}/usr/local/bin/"))
+            .replace("/var/run/", &format!("{rs}/var/run/"))
+            .replace("/var/log/", &format!("{rs}/var/log/"))
+            .replace("/proc/", &format!("{rs}/proc/"));
+        std::fs::write(&init, rebased).unwrap();
+        std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(r.join("userdata/local/apps/rebot-teleop.config.json"), r#"{"network":{"hotspot":"off"}}"#).unwrap();
+        std::fs::write(r.join("var/run/rebot-teleop.pid"), "5001\n").unwrap();
+
+        if with_hostapd {
+            std::fs::create_dir_all(r.join("proc/6001")).unwrap();
+            std::fs::write(
+                r.join("proc/6001/cmdline"),
+                format!("hostapd\0-B\0-P\0{rs}/var/run/hostapd_arm.pid\0{rs}/var/run/hostapd_arm.conf\0"),
+            ).unwrap();
+            std::fs::write(r.join("var/run/hostapd_arm.pid"), "6001\n").unwrap();
+        }
+        if let Some((gpid, cmd)) = guard_pid_cmd {
+            std::fs::create_dir_all(r.join(format!("proc/{gpid}"))).unwrap();
+            std::fs::write(r.join(format!("proc/{gpid}/cmdline")), cmd.replace(' ', "\0") + "\0").unwrap();
+            std::fs::write(r.join("var/run/rebot-teleop-apguard.pid"), format!("{gpid}\n")).unwrap();
+        }
+
+        let log_file = r.join("syslog");
+        let sig_file = r.join("signals");
+        for (name, body) in [
+            ("logger", format!("#!/bin/sh\nshift 2\necho \"$*\" >> '{}'\n", log_file.display())),
+            ("kill", format!("#!/bin/sh\necho \"$*\" >> '{}'\n", sig_file.display())),
+        ] {
+            let p = r.join("bin").join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        let out = Command::new("/bin/sh")
+            .arg(&init)
+            .arg("start")
+            .env("PATH", format!("{}:{base_path}", r.join("bin").display()))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "K92 start failed: {}", String::from_utf8_lossy(&out.stderr));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            std::fs::read_to_string(&log_file).unwrap_or_default(),
+            std::fs::read_to_string(&sig_file).unwrap_or_default(),
+        )
+    };
+
+    // 1. Live hostapd + armd already running -> reboot notice emitted, zero signals.
+    let (out1, log1, sig1) = run_case(true, None);
+    assert!(out1.contains("rebot-teleop is already running (PID: 5001)"), "{out1}");
+    assert!(out1.contains("hotspot off takes effect after reboot"), "{out1}");
+    assert!(log1.contains("hotspot off takes effect after reboot"), "{log1}");
+    assert_eq!(sig1, "", "must not signal any process");
+
+    // 2. Live ap-guard + armd already running -> reboot notice emitted, zero signals.
+    let (out2, log2, sig2) = run_case(false, Some((7001, "/bin/sh /etc/init.d/K92rebot-teleop ap-guard 5g 44")));
+    assert!(out2.contains("hotspot off takes effect after reboot"), "{out2}");
+    assert!(log2.contains("hotspot off takes effect after reboot"), "{log2}");
+    assert_eq!(sig2, "", "must not signal any process");
+
+    // 3. Stale apguard.pid reused by unrelated process + armd already running -> no false notice, zero signals.
+    let (out3, log3, sig3) = run_case(false, Some((7002, "/usr/bin/other-daemon --ap-guard")));
+    assert!(!out3.contains("takes effect after reboot"), "reused PID must not trigger notice: {out3}");
+    assert!(!log3.contains("takes effect after reboot"), "reused PID must not log notice: {log3}");
+    assert_eq!(sig3, "", "must not signal any process");
 }
 
 /// The setting is read from network.hotspot; absent, "on" and invalid values keep the hotspot,
