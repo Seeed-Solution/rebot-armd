@@ -753,6 +753,8 @@ start_vision() {
 # Start armd in the background. A configured operator PIN reaches armd only as ARMD_OPERATOR_PIN in
 # its environment (the subshell keeps it away from vision and the user program), never on the
 # command line, which every process can read in /proc/<pid>/cmdline.
+# Positional parameters ("$@") are passed verbatim as armd argv through a fixed exec wrapper so
+# config-derived values are never re-parsed by a shell.
 launch_armd() {
     (
         if [ -n "$OPERATOR_PIN" ]; then
@@ -761,7 +763,7 @@ launch_armd() {
         else
             unset ARMD_OPERATOR_PIN
         fi
-        start-stop-daemon -S -b -m -p $PIDFILE -a /bin/sh -- -c "exec $DAEMON $DAEMON_OPTS >> $LOGFILE 2>&1"
+        start-stop-daemon -S -b -m -p "$PIDFILE" -a /bin/sh -- -c 'log=$1; shift; exec "$@" >>"$log" 2>&1' sh "$LOGFILE" "$DAEMON" "$@"
     )
 }
 
@@ -817,29 +819,29 @@ start() {
         fi
     fi
 
-    DAEMON_OPTS="--follower $FOLLOWER_MODEL"
+    set -- --follower "$FOLLOWER_MODEL"
     # armd rejects --follower-port for the mock follower (no hardware).
     if [ "$FOLLOWER_MODEL" != "mock" ]; then
-        DAEMON_OPTS="$DAEMON_OPTS --follower-port $FOLLOWER_PORT"
+        set -- "$@" --follower-port "$FOLLOWER_PORT"
     fi
-    DAEMON_OPTS="$DAEMON_OPTS --port $PORT"
+    set -- "$@" --port "$PORT"
     # The profile is for the 7-joint B601-DM; the mock follower uses it too so that it simulates
     # that arm (7 joints, Cartesian actions). Other followers keep their built-in profile.
     if { [ "$FOLLOWER_MODEL" = "rebot-dm" ] || [ "$FOLLOWER_MODEL" = "mock" ]; } && [ -f "$PROFILE" ]; then
-        DAEMON_OPTS="$DAEMON_OPTS --config $PROFILE"
+        set -- "$@" --config "$PROFILE"
     elif [ "$FOLLOWER_MODEL" = "so-arm101" ] && [ -f "/userdata/rebot-teleop/profile/so_arm101.json" ]; then
-        DAEMON_OPTS="$DAEMON_OPTS --config /userdata/rebot-teleop/profile/so_arm101.json"
+        set -- "$@" --config "/userdata/rebot-teleop/profile/so_arm101.json"
     elif [ "$FOLLOWER_MODEL" = "so-arm101" ] && [ -f "/usr/share/rebot-teleop/profile/so_arm101.json" ]; then
-        DAEMON_OPTS="$DAEMON_OPTS --config /usr/share/rebot-teleop/profile/so_arm101.json"
+        set -- "$@" --config "/usr/share/rebot-teleop/profile/so_arm101.json"
     elif [ "$FOLLOWER_MODEL" = "so-arm100" ] && [ -f "/userdata/rebot-teleop/profile/so_arm100.json" ]; then
-        DAEMON_OPTS="$DAEMON_OPTS --config /userdata/rebot-teleop/profile/so_arm100.json"
+        set -- "$@" --config "/userdata/rebot-teleop/profile/so_arm100.json"
     elif [ "$FOLLOWER_MODEL" = "so-arm100" ] && [ -f "/usr/share/rebot-teleop/profile/so_arm100.json" ]; then
-        DAEMON_OPTS="$DAEMON_OPTS --config /usr/share/rebot-teleop/profile/so_arm100.json"
+        set -- "$@" --config "/usr/share/rebot-teleop/profile/so_arm100.json"
     fi
 
     # armd runs as root; it falls back to stdout only when these cannot be written
     mkdir -p "$PERSIST_LOG_DIR" "$BLACKBOX_DIR" "$EPISODES_DIR" 2>/dev/null || true
-    DAEMON_OPTS="$DAEMON_OPTS --log-dir $PERSIST_LOG_DIR --blackbox-dir $BLACKBOX_DIR --episodes-dir $EPISODES_DIR"
+    set -- "$@" --log-dir "$PERSIST_LOG_DIR" --blackbox-dir "$BLACKBOX_DIR" --episodes-dir "$EPISODES_DIR"
     ARMD_RT_OWNER_TRIMMED=$(printf '%s' "${ARMD_RT_OWNER:-}" | tr -d ' \t\r\n')
     if [ -z "$ARMD_RT_OWNER_TRIMMED" ]; then
         if [ "$ARMD_OWNER_INVALID" = 1 ]; then
@@ -847,14 +849,14 @@ start() {
             return 1
         fi
         if [ -n "$ARMD_OWNER" ]; then
-            DAEMON_OPTS="$DAEMON_OPTS --owner $ARMD_OWNER"
+            set -- "$@" --owner "$ARMD_OWNER"
         fi
     fi
 
     if [ "$OPERATOR_PIN_INVALID" = 1 ]; then
         echo "[rebot-teleop] Operator PIN setting ignored (use 4-12 digits); armd writes a random PIN to /userdata/rebot-teleop/operator.pin"
     fi
-    launch_armd
+    launch_armd "$@"
     if [ $? -ne 0 ]; then
         echo "$NAME failed to start (start-stop-daemon error)"
         rm -f $PIDFILE
