@@ -2056,34 +2056,6 @@ impl PendingDisableShadowBatch {
 
 
 
-/// Proactive watchdog hold cadence for already-enabled arm joints during multi-tick handshakes:
-/// refreshes every 50 Hz tick (20 ms >= 15 ms) whenever spare TX budget remains.
-const WATCHDOG_HOLD_PROACTIVE_INTERVAL: Duration = Duration::from_millis(15);
-/// Urgent watchdog hold threshold: strictly below one 50 Hz release (20 ms) so every release
-/// during a multi-tick enable refreshes already-enabled arm joints FIRST before handshake TX,
-/// guaranteeing <= 40 ms between control frames even with jitter or a 1-tick TX budget squeeze.
-const WATCHDOG_HOLD_URGENT_INTERVAL: Duration = Duration::from_millis(18);
-/// Sub-release wake threshold for watchdog continuity: strictly above one 50 Hz release (20 ms)
-/// so healthy 50 Hz releases service energized motors once per release without scheduling a
-/// redundant Window 2 sleep at t + 16 ms, while still waking before 40 ms if a release misses TX
-/// or runs at a slower period.
-const WATCHDOG_HOLD_WAKE_INTERVAL: Duration = Duration::from_millis(22);
-/// Remaining release budget margin required to start optional (deferrable) CAN work such as
-/// background `0xCC` status polls or autonomous recovery frames without pushing a release past
-/// its deadline.
-pub(crate) const OPTIONAL_WORK_RELEASE_MARGIN: Duration = Duration::from_millis(6);
-/// Maximum autonomous stale-feedback recovery TX frames transmitted inside `receive_feedback`
-/// during a single managed/release-bounded control release (round-robin across joints).
-const DAMIAO_MAX_RECOVERY_PER_RELEASE: u8 = 2;
-/// Fallback watchdog hold threshold during `AwaitRestGate` / `Disable` Phase A (`repeats_sent == 0`):
-/// strictly above one 50 Hz control tick (20 ms) so normal ticked control (whose Step 3 already
-/// runs `service_stopped_measured_hold` every 20 ms) never emits duplicate holds, while blocking
-/// `disable_torque` and headless fallback still keep enabled motors refreshed within <= 40 ms.
-const WATCHDOG_DISABLE_FALLBACK_INTERVAL: Duration = Duration::from_millis(30);
-/// Fail-closed enable abort threshold: if a sustained multi-tick TX squeeze prevents refreshing an
-/// energized arm joint for >= 60 ms during enable, abort the handshake cleanly into `FailedHold`
-/// BEFORE Damiao's `TIMEOUT = 2000` (~100 ms) can expire with `0xD`.
-const WATCHDOG_ENABLE_ABORT_AGE: Duration = Duration::from_millis(60);
 
 /// Damiao diagnostics that left the `ArmDriver` trait in S4 (allocating twins of
 /// `JointModeExt::with_range_check`, `JointModeExt::take_recovery_writes_into` and
