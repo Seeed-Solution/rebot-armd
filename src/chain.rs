@@ -993,6 +993,128 @@ impl ArmModel {
     }
 }
 
+/// Human-readable part name (`"camera"`, `"arm"`, or `"gripper"`) for a workspace geometry id.
+pub fn workspace_geometry_part(gid: &str) -> &'static str {
+    if gid == "camera_mount" {
+        "camera"
+    } else if gid.starts_with("capsule:") {
+        "arm"
+    } else {
+        "gripper"
+    }
+}
+
+/// Formats a positive workspace intrusion depth in metres (`1.0 cm` when `>= 1 mm`, else `0.1 mm`+).
+pub fn write_workspace_depth(w: &mut impl core::fmt::Write, depth: f64) {
+    if depth >= 0.001 {
+        let cm = depth * 100.0;
+        let _ = write!(w, "{cm:.1} cm");
+    } else {
+        let mm = (depth * 1000.0).max(0.1);
+        let _ = write!(w, "{mm:.1} mm");
+    }
+}
+
+/// Actionable Cartesian direction that moves an intruding point back inside the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRecoveryDir {
+    MoveBack,
+    MoveForward,
+    MoveRight,
+    MoveLeft,
+    MoveDown,
+    MoveUp,
+}
+
+impl WorkspaceRecoveryDir {
+    pub const fn as_en_str(self) -> &'static str {
+        match self {
+            Self::MoveBack => "move back",
+            Self::MoveForward => "move forward",
+            Self::MoveRight => "move right",
+            Self::MoveLeft => "move left",
+            Self::MoveDown => "move down",
+            Self::MoveUp => "move up",
+        }
+    }
+
+    fn from_vec(v: [f64; 3]) -> Self {
+        let [ax, ay, az] = [v[0].abs(), v[1].abs(), v[2].abs()];
+        if ax >= ay && ax >= az {
+            if v[0] >= 0.0 { Self::MoveForward } else { Self::MoveBack }
+        } else if ay >= az {
+            if v[1] >= 0.0 { Self::MoveLeft } else { Self::MoveRight }
+        } else if v[2] >= 0.0 {
+            Self::MoveUp
+        } else {
+            Self::MoveDown
+        }
+    }
+}
+
+/// Deepest measured-pose workspace intrusion across box faces, `max_reach`, `floor_z`, and
+/// keep-out boxes (excludes self-collision). Stored inline (`Copy`, zero heap allocations).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceOutsideInfo {
+    /// Constraint identifier (`box_{min,max}_{x,y,z}`, `max_reach`, `floor_z`, or `keepout:<name>`).
+    pub edge: crate::model::HolderLabel,
+    /// Human-readable part tag (`0` = gripper, `1` = camera, `2` = arm).
+    pub part_kind: u8,
+    /// Intrusion depth beyond the boundary in metres (`> 0`).
+    pub depth_m: f64,
+    /// Steepest-descent / nearest-face direction back inside the workspace.
+    pub recovery_dir: WorkspaceRecoveryDir,
+}
+
+impl WorkspaceOutsideInfo {
+    pub const fn part_name(self) -> &'static str {
+        match self.part_kind {
+            1 => "camera",
+            2 => "arm",
+            _ => "gripper",
+        }
+    }
+}
+
+/// Formats an actionable English refusal message for `GC_EXIT_OUTSIDE_WORKSPACE` naming the
+/// violated edge, intrusion depth, and inward direction back inside the workspace.
+pub fn write_gc_exit_outside_workspace_message(
+    w: &mut impl core::fmt::Write,
+    info: &WorkspaceOutsideInfo,
+) {
+    let cid = info.edge.as_str();
+    let part = info.part_name();
+    let dir = info.recovery_dir.as_en_str();
+    let _ = write!(w, "{part} is ");
+    write_workspace_depth(w, info.depth_m);
+    if let Some((edge, recover)) = crate::workspace_msg::box_edge_info(cid) {
+        let _ = write!(
+            w,
+            " beyond the workspace {edge} ({cid}); {recover} inside the workspace before exiting"
+        );
+    } else if cid == "max_reach" {
+        let _ = write!(
+            w,
+            " beyond max reach (max_reach); {dir} inside the workspace before exiting"
+        );
+    } else if cid == "floor_z" {
+        let _ = write!(
+            w,
+            " below the workspace floor (floor_z); {dir} inside the workspace before exiting"
+        );
+    } else if let Some(name) = cid.strip_prefix("keepout:") {
+        let _ = write!(
+            w,
+            " inside keep-out '{name}' ({cid}); {dir} clear of keep-out '{name}' before exiting"
+        );
+    } else {
+        let _ = write!(
+            w,
+            " outside workspace ({cid}); {dir} inside the workspace before exiting"
+        );
+    }
+}
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::workspace_msg::attach_workspace_refusal_fields;
 pub use crate::workspace_msg::{decode_workspace_refusal, WorkspaceRefusalRt, WorkspaceWitness};
@@ -1828,6 +1950,129 @@ impl<'a> WorkspaceEvaluator<'a> {
             }
         }
         Ok(())
+    }
+
+    fn keepout_exit_dir_for_point(p: [f64; 3], lo: [f64; 3], hi: [f64; 3]) -> WorkspaceRecoveryDir {
+        let clamped = [p[0].clamp(lo[0], hi[0]), p[1].clamp(lo[1], hi[1]), p[2].clamp(lo[2], hi[2])];
+        let out = [p[0] - clamped[0], p[1] - clamped[1], p[2] - clamped[2]];
+        if out[0] * out[0] + out[1] * out[1] + out[2] * out[2] > 1e-12 {
+            return WorkspaceRecoveryDir::from_vec(out);
+        }
+        let faces = [
+            (p[0] - lo[0], WorkspaceRecoveryDir::MoveBack),
+            (hi[0] - p[0], WorkspaceRecoveryDir::MoveForward),
+            (p[1] - lo[1], WorkspaceRecoveryDir::MoveRight),
+            (hi[1] - p[1], WorkspaceRecoveryDir::MoveLeft),
+            (p[2] - lo[2], WorkspaceRecoveryDir::MoveDown),
+            (hi[2] - p[2], WorkspaceRecoveryDir::MoveUp),
+        ];
+        faces
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(WorkspaceRecoveryDir::MoveUp, |(_, d)| d)
+    }
+
+    fn recovery_dir_for_slot(&self, slot: usize, q: &[f32]) -> WorkspaceRecoveryDir {
+        if self.has_reach && slot >= self.num_geoms * self.slots_per_geom {
+            let reach_idx = slot - self.num_geoms * self.slots_per_geom;
+            if let Some(f) = self.model.frames_f32(q) {
+                let p = if reach_idx == 0 { f.end.p } else { f.end.transform_point(&self.tcp_offset) };
+                let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                let dr = r - self.shoulder[0];
+                let dz = p[2] - self.shoulder[1];
+                let grad = if r > 1e-9 {
+                    [-dr * (p[0] / r), -dr * (p[1] / r), -dz]
+                } else {
+                    [-dr, 0.0, -dz]
+                };
+                return WorkspaceRecoveryDir::from_vec(grad);
+            }
+            return WorkspaceRecoveryDir::MoveBack;
+        }
+        let gi = slot / self.slots_per_geom;
+        let ci = slot % self.slots_per_geom;
+        match ci {
+            0 => WorkspaceRecoveryDir::MoveUp,
+            1 => WorkspaceRecoveryDir::MoveForward,
+            2 => WorkspaceRecoveryDir::MoveLeft,
+            3 => WorkspaceRecoveryDir::MoveUp,
+            4 => WorkspaceRecoveryDir::MoveBack,
+            5 => WorkspaceRecoveryDir::MoveRight,
+            6 => WorkspaceRecoveryDir::MoveDown,
+            _ => {
+                let bi = ci - 7;
+                if let (Some(&(lo, hi)), Some(f)) = (self.keepouts.get(bi), self.model.frames_f32(q)) {
+                    let p = if gi < self.num_end_pts {
+                        f.end.transform_point(&self.end_locals[gi])
+                    } else if let Some((Some(fr), a_loc, b_loc, _)) = self.capsules.get(gi - self.num_end_pts) {
+                        let pose = fr.pose(&f);
+                        let a = pose.transform_point(a_loc);
+                        let b = pose.transform_point(b_loc);
+                        let ctr = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])];
+                        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                        let ab2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                        let t = if ab2 > 1e-12 {
+                            (((ctr[0] - a[0]) * ab[0] + (ctr[1] - a[1]) * ab[1] + (ctr[2] - a[2]) * ab[2]) / ab2)
+                                .clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        };
+                        [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]]
+                    } else {
+                        f.end.p
+                    };
+                    Self::keepout_exit_dir_for_point(p, lo, hi)
+                } else {
+                    WorkspaceRecoveryDir::MoveUp
+                }
+            }
+        }
+    }
+
+    /// Evaluates `q` against all workspace boundary constraints — box faces, `max_reach`,
+    /// `floor_z`, and keep-out boxes (slots `0..self.self_collision_slot_start`; excludes
+    /// self-collision) — with zero heap allocations on `armd-control`.
+    /// Returns the deepest violation (`clearance < -WORKSPACE_EPS`), or `None` when inside.
+    pub fn deepest_workspace_outside_rt(
+        &self,
+        q: &[f32],
+        scratch_clr: &mut [f64],
+        world_caps: &mut Vec<([f64; 3], [f64; 3], f64)>,
+    ) -> Result<Option<WorkspaceOutsideInfo>, WorkspaceFailureRt> {
+        const PHASE: &str = "gravity_comp_workspace";
+        self.eval_into_slice_rt(q, scratch_clr, world_caps, PHASE)?;
+        let ws_slots = self.self_collision_slot_start.min(self.total_slots);
+        let mut deepest: Option<(usize, f64)> = None;
+        for (slot, &clr) in scratch_clr[..ws_slots].iter().enumerate() {
+            if !clr.is_finite() {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::Invalid("non-finite workspace clearance"),
+                    phase: PHASE,
+                });
+            }
+            if clr < -k::WORKSPACE_EPS {
+                let depth = -clr;
+                if deepest.is_none_or(|(_, best)| depth > best) {
+                    deepest = Some((slot, depth));
+                }
+            }
+        }
+        let Some((slot, depth_m)) = deepest else {
+            return Ok(None);
+        };
+        let (_, cid, _, gid, _, _, _) = self.slot_meta_bounded(slot, -depth_m, depth_m);
+        let part_kind = match workspace_geometry_part(gid.as_str()) {
+            "camera" => 1,
+            "arm" => 2,
+            _ => 0,
+        };
+        let recovery_dir = self.recovery_dir_for_slot(slot, q);
+        Ok(Some(WorkspaceOutsideInfo {
+            edge: crate::model::HolderLabel::new(cid.as_str()),
+            part_kind,
+            depth_m,
+            recovery_dir,
+        }))
     }
 
     #[inline]

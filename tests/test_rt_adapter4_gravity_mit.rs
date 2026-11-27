@@ -57,6 +57,8 @@ use tokio_tungstenite::tungstenite::Message;
 const TIMEOUT_2000_COUNTS: u32 = 2000; // 100 ms at 50 us/count
 const PERIOD_50HZ: Duration = Duration::from_millis(20);
 const RAISED_POSE: [f32; 7] = [0.20, 0.35, -0.35, 0.15, -0.15, 0.10, -0.14];
+/// Raised pose strictly inside B601-DM workspace (`INSPECT` with J7 open) for user-exit tests.
+const INSIDE_RAISED_POSE: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -0.14];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerKind {
@@ -446,7 +448,9 @@ impl LiveRig {
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         cfg.control_frequency_hz = 50;
-        cfg.lease_timeout_ms = 600_000;
+        if cfg.lease_timeout_ms >= 2500 {
+            cfg.lease_timeout_ms = 600_000;
+        }
         if let Some(gc) = cfg.gravity_comp.as_mut() {
             // Shorten ramp/exit hold slightly so multi-owner tests stay deterministic and snappy
             // while still exercising multi-tick RampIn -> Active -> Exiting -> ModeSwitch.
@@ -866,7 +870,7 @@ async fn dual_owner_rest_gravity_comp_parity() {
         let rig = LiveRig::start(
             owner,
             ArmConfig::rebot_dm(),
-            RAISED_POSE,
+            INSIDE_RAISED_POSE,
             OperatorAuth::enforced("123456", 1800),
             None,
             false,
@@ -941,7 +945,7 @@ async fn dual_owner_ws_gravity_comp_hardware_lifecycle_and_auth_parity() {
         let rig = LiveRig::start(
             owner,
             ArmConfig::rebot_dm(),
-            RAISED_POSE,
+            INSIDE_RAISED_POSE,
             OperatorAuth::enforced("123456", 1800),
             None,
             false,
@@ -1643,7 +1647,7 @@ async fn executor_gravity_comp_router_terminal_credit_and_zero_rt_reclaim() {
     let rig = LiveRig::start(
         OwnerKind::Executor,
         ArmConfig::rebot_dm(),
-        RAISED_POSE,
+        INSIDE_RAISED_POSE,
         OperatorAuth::disabled(),
         None,
         true,
@@ -2349,7 +2353,7 @@ async fn executor_watchdog_continuity_exit_failed_and_tracking_rejection_zero_al
         let rig = LiveRig::start(
             OwnerKind::Executor,
             cfg,
-            RAISED_POSE,
+            INSIDE_RAISED_POSE,
             OperatorAuth::disabled(),
             None,
             true,
@@ -3492,7 +3496,7 @@ async fn legacy_sync_mit_driver_gravity_comp_enter_switches_driver_modes() {
     let mode_history = Arc::new(Mutex::new(Vec::new()));
     let fail_next = Arc::new(AtomicBool::new(false));
     let drv = SyncMitSimLikeDriver {
-        pose: RAISED_POSE,
+        pose: INSIDE_RAISED_POSE,
         enabled: false,
         modes: vec![JointMode::Position; 7],
         mode_history: mode_history.clone(),
@@ -8392,5 +8396,362 @@ fn mit_expiry_recovery_r2_ambiguity_initial_drain_and_per_axis_drain() {
             j2_disables, 1,
             "J2 must confirm on first pass without spurious ambiguity reset when drained per-axis"
         );
+    }
+}
+
+// ============================================================================
+// 26. Drag-teach exit workspace gate, obs fields, and unblocked safety exits
+// ============================================================================
+
+#[test]
+fn gc_outside_workspace_evaluator_covers_box_reach_floor_keepout() {
+    use armd::chain::{write_gc_exit_outside_workspace_message, EvalBufs, WorkspaceEvaluator};
+    use armd::model::CameraMount;
+
+    let cfg = ArmConfig::rebot_dm();
+    let cam = CameraMount::default();
+    let incident = [0.0f32, -2.046, -1.855, -0.297, -0.053, 0.123, 0.0];
+    let safe_limit_outside = [0.0f32, -1.95, -1.855, -0.297, -0.053, 0.123, 0.0];
+    let eval_pose = |ws: &armd::model::WorkspacePolicy, q: &[f32]| {
+        let mut bufs = EvalBufs::default();
+        bufs.prepare_for(&cfg.arm_model, ws, &cam, cfg.tcp_offset);
+        let eval = WorkspaceEvaluator::new_with_tcp_in(&cfg.arm_model, ws, &cam, cfg.tcp_offset, &mut bufs);
+        let (mut clr, mut world_caps) = (vec![0.0; eval.total_slots], Vec::new());
+        eval.deepest_workspace_outside_rt(q, &mut clr, &mut world_caps).unwrap()
+    };
+    let fmt = |info: &armd::chain::WorkspaceOutsideInfo| {
+        let mut msg = String::new();
+        write_gc_exit_outside_workspace_message(&mut msg, info);
+        msg
+    };
+
+    let ws = cfg.workspace.clone().unwrap();
+    assert!(eval_pose(&ws, &INSIDE_RAISED_POSE).is_none());
+    for pose in [incident, safe_limit_outside] {
+        let info = eval_pose(&ws, &pose).expect("pose outside workspace");
+        assert!(info.depth_m > 0.01);
+        let msg = fmt(&info);
+        assert!(msg.contains(info.edge.as_str()) && msg.contains("cm"), "{msg}");
+    }
+    let mut ws_wide = ws.clone();
+    ws_wide.box_min_m = [-2.0; 3];
+    ws_wide.box_max_m = [2.0; 3];
+    let info_reach = eval_pose(&ws_wide, &incident).expect("max_reach");
+    assert_eq!(info_reach.edge.as_str(), "max_reach");
+    assert!(fmt(&info_reach).contains(info_reach.recovery_dir.as_en_str()));
+    // Verify reach steepest-descent when vertical offset dominates (r <= shoulder_r or high z).
+    let mut ws_reach_small = ws_wide.clone();
+    ws_reach_small.max_reach_m = Some(0.05);
+    let info_reach_dir = eval_pose(&ws_reach_small, &INSIDE_RAISED_POSE).expect("small reach");
+    let end_p = cfg.arm_model.frames_f32(&INSIDE_RAISED_POSE).unwrap().end.p;
+    let sr = cfg.arm_model.shoulder_rz();
+    let r_before = armd::kinematics::shoulder_reach_from(&end_p, &sr);
+    let step = match info_reach_dir.recovery_dir {
+        armd::chain::WorkspaceRecoveryDir::MoveForward => [0.005, 0.0, 0.0],
+        armd::chain::WorkspaceRecoveryDir::MoveBack => [-0.005, 0.0, 0.0],
+        armd::chain::WorkspaceRecoveryDir::MoveLeft => [0.0, 0.005, 0.0],
+        armd::chain::WorkspaceRecoveryDir::MoveRight => [0.0, -0.005, 0.0],
+        armd::chain::WorkspaceRecoveryDir::MoveUp => [0.0, 0.0, 0.005],
+        armd::chain::WorkspaceRecoveryDir::MoveDown => [0.0, 0.0, -0.005],
+    };
+    let r_after = armd::kinematics::shoulder_reach_from(&[end_p[0] + step[0], end_p[1] + step[1], end_p[2] + step[2]], &sr);
+    assert!(r_after < r_before, "reach recovery_dir {:?} must decrease reach ({r_before} -> {r_after})", info_reach_dir.recovery_dir);
+
+    let mut ws_floor = ws_wide.clone();
+    ws_floor.max_reach_m = None;
+    ws_floor.floor_z_m = 0.80;
+    let info_floor = eval_pose(&ws_floor, &INSIDE_RAISED_POSE).expect("floor_z");
+    assert_eq!((info_floor.edge.as_str(), info_floor.recovery_dir), ("floor_z", armd::chain::WorkspaceRecoveryDir::MoveUp));
+    assert!(fmt(&info_floor).contains("move up"));
+
+    // Keep-out box with nearest exit face along +Y (MoveLeft) around end_p.
+    let mut ws_ko = ws_wide.clone();
+    ws_ko.max_reach_m = None;
+    ws_ko.check_points_end_m.clear();
+    ws_ko.link_capsules.clear();
+    ws_ko.keepout_boxes.push(KeepoutBox {
+        name: "camera".into(),
+        min_m: [(end_p[0] - 0.5) as f32, (end_p[1] - 0.5) as f32, (end_p[2] - 0.5) as f32],
+        max_m: [(end_p[0] + 0.5) as f32, (end_p[1] + 0.02) as f32, (end_p[2] + 0.5) as f32],
+    });
+    let info_ko = eval_pose(&ws_ko, &INSIDE_RAISED_POSE).expect("keepout");
+    assert_eq!((info_ko.edge.as_str(), info_ko.recovery_dir), ("keepout:camera", armd::chain::WorkspaceRecoveryDir::MoveLeft));
+    assert!(fmt(&info_ko).contains("move left clear of keep-out 'camera'"));
+
+    // >256-slot workspace path (32 check points * 10 slots > 256).
+    let mut ws_big = ws_wide.clone();
+    ws_big.max_reach_m = None;
+    ws_big.check_points_end_m = (0..32).map(|i| [0.0, 0.0, (i as f32) * 0.001]).collect();
+    for k in 0..3 {
+        ws_big.keepout_boxes.push(KeepoutBox { name: format!("k{k}"), min_m: [2.0; 3], max_m: [2.1; 3] });
+    }
+    ws_big.box_max_m[0] = 0.05;
+    let mut big_bufs = EvalBufs::default();
+    big_bufs.prepare_for(&cfg.arm_model, &ws_big, &cam, cfg.tcp_offset);
+    let big_eval = WorkspaceEvaluator::new_with_tcp_in(&cfg.arm_model, &ws_big, &cam, cfg.tcp_offset, &mut big_bufs);
+    assert!(big_eval.total_slots > armd::kinematics::MAX_STACK_WORKSPACE_SLOTS);
+    let (mut clr_big, mut wc_big) = (vec![0.0; big_eval.total_slots], Vec::new());
+    let info_big = big_eval.deepest_workspace_outside_rt(&incident, &mut clr_big, &mut wc_big).unwrap().expect(">256 box_max_x");
+    assert_eq!((info_big.edge.as_str(), info_big.recovery_dir), ("box_max_x", armd::chain::WorkspaceRecoveryDir::MoveBack));
+    assert!(fmt(&info_big).contains("front edge (box_max_x)") && fmt(&info_big).contains("move back"));
+
+    // Retained inside pose + invalid feedback must fail closed on user exit BEFORE tick, while safety tick exits FEEDBACK_STALE.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.measured_positions = INSIDE_RAISED_POSE.to_vec();
+            inner.commanded_positions = INSIDE_RAISED_POSE.to_vec();
+            inner.target_positions = INSIDE_RAISED_POSE.to_vec();
+        }
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        let enter_res = gravity_comp_command_with_auth(&sup, capture_config_admission(&sup, 0, 0, None), None, OperatorRequirement::NotRequired, ClientId(0), true, None, None).await;
+        assert!(enter_res.is_ok(), "{enter_res:?}");
+        { sup.inner().write().await.feedback_numeric_valid = false; }
+        let exit_res = gravity_comp_command_with_auth(&sup, capture_config_admission(&sup, 0, 0, None), None, OperatorRequirement::NotRequired, ClientId(0), false, None, None).await;
+        match exit_res {
+            Err(armd::supervisor::ArmError::Detailed { status, code, details, .. }) => {
+                assert_eq!((status, code.as_str(), details["workspace_unverified"].as_bool()), (409, "GC_EXIT_OUTSIDE_WORKSPACE", Some(true)));
+            }
+            other => panic!("expected 409 GC_EXIT_OUTSIDE_WORKSPACE (workspace_unverified=true), got {other:?}"),
+        }
+        let obs_after = sup.tick(0.02).await;
+        assert_eq!(obs_after.gravity_comp.last_exit.unwrap().code.as_str(), "FEEDBACK_STALE");
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_owner_gc_exit_outside_workspace_obs_and_safety_exits() {
+    // J2 = -1.95 stays inside the 0.05 rad joint_limit_margin (-2.0944 + 0.05 = -2.0444)
+    // while extending past the B601-DM workspace boundary.
+    const OUTSIDE_POSE: [f32; 7] = [0.0, -1.95, -1.855, -0.297, -0.053, 0.123, -0.14];
+
+    let set_pose = |bus: &FakeBus, q: [f32; 7]| {
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = q[i]; m.v = 0.0; }
+            s.push_all_feedback();
+        });
+    };
+    let wait_gc_active = |sup: Arc<ArmSupervisor>| async move {
+        let dl = Instant::now() + Duration::from_secs(3);
+        loop {
+            let o = sup.get_observation().await;
+            if o.control_mode == ControlMode::GravityComp && o.gravity_comp.phase.as_deref() == Some("active") { return o; }
+            assert!(Instant::now() < dl, "gc active timeout: {:?}", o.gravity_comp);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    };
+    let wait_position = |sup: Arc<ArmSupervisor>| async move {
+        let dl = Instant::now() + Duration::from_secs(3);
+        loop {
+            let o = sup.get_observation().await;
+            if o.control_mode == ControlMode::Position && o.gravity_comp.phase.is_none() { return o; }
+            assert!(Instant::now() < dl, "position handback timeout: {:?}", o.gravity_comp);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    };
+
+    let mut parity = Vec::new();
+    for owner in [OwnerKind::Legacy, OwnerKind::Executor] {
+        let rig = LiveRig::start(owner, ArmConfig::rebot_dm(), INSIDE_RAISED_POSE, OperatorAuth::disabled(), None, true).await;
+        let mut ws = ws_connect(&rig.ws_url).await;
+        let granted = ws_send_wait_types(&mut ws, json!({"type": "acquire_lease", "client_id": "gc-ws-gate", "seq": 1}), &["lease_granted"]).await;
+        let mut gen = granted["generation"].as_u64().unwrap();
+        let mut req_id = 1u64;
+
+        // 1. Enter inside -> obs reports workspace_outside=false.
+        let epoch = rig.sup.get_observation().await.epoch_id;
+        let ack = ws_rpc(&mut ws, req_id, gen, epoch, "/api/v1/mode/gravity_comp", json!({"enable": true})).await;
+        req_id += 1;
+        assert_eq!(ack["type"], "command_ack", "{owner:?}: {ack}");
+        let obs_in = wait_gc_active(Arc::clone(&rig.sup)).await;
+        assert!(!obs_in.gravity_comp.workspace_outside);
+        assert_eq!((obs_in.gravity_comp.workspace_edge, obs_in.gravity_comp.workspace_depth_m), (None, None));
+
+        // 2. Drag outside -> obs reports outside + edge + depth; user exit refused with GC_EXIT_OUTSIDE_WORKSPACE.
+        set_pose(&rig.bus, OUTSIDE_POSE);
+        let dl = Instant::now() + Duration::from_secs(2);
+        let obs_out = loop {
+            let o = rig.sup.get_observation().await;
+            if o.gravity_comp.workspace_outside { break o; }
+            assert!(Instant::now() < dl, "{owner:?}: obs never reported workspace_outside");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        };
+        let edge = obs_out.gravity_comp.workspace_edge.expect("edge").as_str().to_string();
+        assert!(obs_out.gravity_comp.workspace_depth_m.expect("depth") > 0.01);
+
+        let rej = ws_rpc(&mut ws, req_id, gen, obs_out.epoch_id, "/api/v1/mode/gravity_comp", json!({"enable": false})).await;
+        req_id += 1;
+        assert_eq!((rej["type"].as_str(), rej["status"].as_u64(), rej["code"].as_str()), (Some("command_reject"), Some(409), Some("GC_EXIT_OUTSIDE_WORKSPACE")), "{owner:?}: {rej}");
+        assert_eq!(rej["workspace_edge"].as_str(), Some(edge.as_str()), "{owner:?}: {rej}");
+        assert_eq!(rej["workspace_unverified"].as_bool(), Some(false), "{owner:?}: {rej}");
+        assert!(obs_out.gravity_comp.workspace_recovery_dir.is_some() && rej["workspace_recovery_dir"].is_string());
+        let msg = rej["message"].as_str().unwrap_or("");
+        assert!(msg.contains(&edge) && (msg.contains("cm") || msg.contains("mm")), "{owner:?}: {msg}");
+        assert_eq!(rig.sup.get_observation().await.control_mode, ControlMode::GravityComp);
+        parity.push((edge, rej["code"].as_str().unwrap().to_string()));
+
+        // 3. Drag back inside -> obs clears, user exit succeeds cleanly.
+        set_pose(&rig.bus, INSIDE_RAISED_POSE);
+        let dl = Instant::now() + Duration::from_secs(2);
+        while rig.sup.get_observation().await.gravity_comp.workspace_outside {
+            assert!(Instant::now() < dl, "{owner:?}: workspace_outside did not clear");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let obs_back = rig.sup.get_observation().await;
+        assert_eq!((obs_back.gravity_comp.workspace_edge, obs_back.gravity_comp.workspace_depth_m), (None, None));
+        let ack = ws_rpc(&mut ws, req_id, gen, obs_back.epoch_id, "/api/v1/mode/gravity_comp", json!({"enable": false})).await;
+        req_id += 1;
+        assert_eq!(ack["type"], "command_ack", "{owner:?}: {ack}");
+        let obs_pos = wait_position(Arc::clone(&rig.sup)).await;
+        assert_eq!(obs_pos.gravity_comp.last_exit.as_ref().map(|e| e.code.as_str()), Some("REQUESTED"));
+
+        // 4–7. Safety exits while outside workspace: Stop, E-stop, Lease loss, Hardware fault.
+        for kind in ["STOPPED", "ESTOP", "LEASE_LOST", "FAULT"] {
+            set_pose(&rig.bus, INSIDE_RAISED_POSE);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let ep = rig.sup.get_observation().await.epoch_id;
+            let ack = ws_rpc(&mut ws, req_id, gen, ep, "/api/v1/mode/gravity_comp", json!({"enable": true})).await;
+            req_id += 1;
+            assert_eq!(ack["type"], "command_ack", "{owner:?} {kind}: {ack}");
+            wait_gc_active(Arc::clone(&rig.sup)).await;
+            set_pose(&rig.bus, OUTSIDE_POSE);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(rig.sup.get_observation().await.gravity_comp.workspace_outside, "{owner:?} {kind}");
+            match kind {
+                "STOPPED" => {
+                    let ack = ws_rpc(&mut ws, req_id, gen, rig.sup.get_observation().await.epoch_id, "/api/v1/motion/stop", json!({})).await;
+                    req_id += 1;
+                    assert_eq!(ack["type"], "command_ack", "{owner:?}: {ack}");
+                    assert_eq!(wait_position(Arc::clone(&rig.sup)).await.gravity_comp.last_exit.unwrap().code.as_str(), "STOPPED");
+                }
+                "ESTOP" => {
+                    ws_send_wait_types(&mut ws, json!({"type": "estop"}), &["epoch_sync"]).await;
+                    let clr = ws_rpc(&mut ws, req_id, gen, rig.sup.get_observation().await.epoch_id, "/api/v1/safety/clear_fault", json!({})).await;
+                    req_id += 1;
+                    assert_eq!(clr["type"], "command_ack", "{owner:?}: {clr}");
+                    let obs_es = wait_position(Arc::clone(&rig.sup)).await;
+                    assert_eq!(obs_es.gravity_comp.last_exit.unwrap().code.as_str(), "ESTOP");
+                    let rearm = ws_rpc(&mut ws, req_id, gen, obs_es.epoch_id, "/api/v1/torque", json!({"enable": true})).await;
+                    req_id += 1;
+                    assert_eq!(rearm["type"], "command_ack", "{owner:?}: {rearm}");
+                }
+                "LEASE_LOST" => {
+                    ws_send_wait_types(&mut ws, json!({"type": "release_lease", "generation": gen, "seq": 99}), &["lease_released"]).await;
+                    assert_eq!(wait_position(Arc::clone(&rig.sup)).await.gravity_comp.last_exit.unwrap().code.as_str(), "LEASE_LOST");
+                    let g2 = ws_send_wait_types(&mut ws, json!({"type": "acquire_lease", "client_id": "gc-ws-gate-2", "seq": 100}), &["lease_granted"]).await;
+                    gen = g2["generation"].as_u64().unwrap();
+                }
+                _ => {
+                    rig.bus.with(|s| { s.motors[0].state_override = Some(0x8); s.push_all_feedback(); });
+                    let dl = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        let o = rig.sup.get_observation().await;
+                        if o.gravity_comp.last_exit.as_ref().is_some_and(|e| e.code.as_str() == "FAULT") { break; }
+                        assert!(Instant::now() < dl, "{owner:?}: fault exit stalled: {:?}", o.gravity_comp);
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                    }
+                    rig.bus.with(|s| { s.motors[0].state_override = None; });
+                }
+            }
+        }
+        rig.assert_rt_clean(&format!("gc outside workspace + safety exits {owner:?}"));
+        rig.shutdown_emergency().await;
+    }
+    assert_eq!(parity[0], parity[1], "Legacy vs Executor parity mismatch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_owner_gc_outside_watchdog_handback_and_shutdown() {
+    const OUTSIDE_POSE: [f32; 7] = [0.0, -1.95, -1.855, -0.297, -0.053, 0.123, -0.14];
+    let set_pose = |bus: &FakeBus, q: [f32; 7]| {
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = q[i]; m.v = 0.0; }
+            s.push_all_feedback();
+        });
+    };
+    let wait_gc_active = |sup: Arc<ArmSupervisor>| async move {
+        let dl = Instant::now() + Duration::from_secs(3);
+        loop {
+            let o = sup.get_observation().await;
+            if o.control_mode == ControlMode::GravityComp && o.gravity_comp.phase.as_deref() == Some("active") { return o; }
+            assert!(Instant::now() < dl, "gc active timeout: {:?}", o.gravity_comp);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    };
+    let wait_position = |sup: Arc<ArmSupervisor>| async move {
+        let dl = Instant::now() + Duration::from_secs(3);
+        loop {
+            let o = sup.get_observation().await;
+            if o.control_mode == ControlMode::Position && o.gravity_comp.phase.is_none() { return o; }
+            assert!(Instant::now() < dl, "position handback timeout: {:?}", o.gravity_comp);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    };
+
+    for owner in [OwnerKind::Legacy, OwnerKind::Executor] {
+        // 8. Safety exit: Watchdog timeout while outside.
+        let mut wd_cfg = ArmConfig::rebot_dm();
+        wd_cfg.lease_timeout_ms = 500;
+        let rig_wd = LiveRig::start(owner, wd_cfg, INSIDE_RAISED_POSE, OperatorAuth::disabled(), None, true).await;
+        let mut ws_wd = ws_connect(&rig_wd.ws_url).await;
+        let g = ws_send_wait_types(&mut ws_wd, json!({"type": "acquire_lease", "client_id": "gc-wd", "seq": 1}), &["lease_granted"]).await;
+        let g_gen = g["generation"].as_u64().unwrap();
+        let ack = ws_rpc(&mut ws_wd, 1, g_gen, rig_wd.sup.get_observation().await.epoch_id, "/api/v1/mode/gravity_comp", json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "{owner:?}: {ack}");
+        let dl = Instant::now() + Duration::from_secs(2);
+        while rig_wd.sup.get_observation().await.gravity_comp.phase.as_deref() != Some("active") {
+            assert!(Instant::now() < dl);
+            let _ = ws_wd.send(Message::Text(json!({"type": "heartbeat", "generation": g_gen}).to_string().into())).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        set_pose(&rig_wd.bus, OUTSIDE_POSE);
+        let obs_wd = wait_position(Arc::clone(&rig_wd.sup)).await;
+        assert_eq!(obs_wd.gravity_comp.last_exit.as_ref().map(|e| e.code.as_str()), Some("WATCHDOG"));
+        rig_wd.assert_rt_clean(&format!("gc watchdog exit outside {owner:?}"));
+        rig_wd.shutdown_emergency().await;
+
+        // 9. Entry while already outside -> obs immediately outside & exit refused; active-outside Executor handback and separate active-outside shutdown both complete cleanly.
+        {
+            let mut rig_hb = LiveRig::start(owner, ArmConfig::rebot_dm(), OUTSIDE_POSE, OperatorAuth::disabled(), None, true).await;
+            let mut ws_hb = ws_connect(&rig_hb.ws_url).await;
+            let gh = ws_send_wait_types(&mut ws_hb, json!({"type": "acquire_lease", "client_id": "gc-hb", "seq": 1}), &["lease_granted"]).await;
+            let gh_gen = gh["generation"].as_u64().unwrap();
+            let ack = ws_rpc(&mut ws_hb, 1, gh_gen, rig_hb.sup.get_observation().await.epoch_id, "/api/v1/mode/gravity_comp", json!({"enable": true})).await;
+            assert_eq!(ack["type"], "command_ack", "{owner:?}: {ack}");
+            let obs_entry_out = wait_gc_active(Arc::clone(&rig_hb.sup)).await;
+            assert!(obs_entry_out.gravity_comp.workspace_outside, "{owner:?}: entry while outside must set workspace_outside");
+            let rej_entry = ws_rpc(&mut ws_hb, 2, gh_gen, obs_entry_out.epoch_id, "/api/v1/mode/gravity_comp", json!({"enable": false})).await;
+            assert_eq!(rej_entry["code"], "GC_EXIT_OUTSIDE_WORKSPACE", "{owner:?}: {rej_entry}");
+            if owner == OwnerKind::Executor {
+                let (stop_leg, jh_leg) = rig_hb.sup.handback_to_legacy_with_live_loop(Duration::from_secs(2), PERIOD_50HZ).await.expect("handback outside workspace must not be blocked");
+                rig_hb.assert_rt_clean("gc handback outside workspace");
+                rig_hb.exec = None;
+                rig_hb.sup.legacy_safe_hold_control().request_process_exit_disable(Instant::now() + Duration::from_secs(2));
+                stop_leg.store(true, Ordering::Release);
+                let _ = tokio::task::spawn_blocking(move || jh_leg.join()).await;
+                rig_hb.shutdown_emergency().await;
+            } else {
+                let bus_hb = rig_hb.bus.clone();
+                rig_hb.shutdown_emergency().await;
+                bus_hb.with(|s| assert!(s.motors.iter().all(|m| !m.enabled), "all motors must be disabled after Legacy shutdown"));
+            }
+        }
+        if owner == OwnerKind::Executor {
+            // Separate active-outside Executor shutdown (NOT after handback): asserts Confirmed + all motors disabled.
+            let mut rig_sd = LiveRig::start(OwnerKind::Executor, ArmConfig::rebot_dm(), OUTSIDE_POSE, OperatorAuth::disabled(), None, true).await;
+            let mut ws_sd = ws_connect(&rig_sd.ws_url).await;
+            let gs = ws_send_wait_types(&mut ws_sd, json!({"type": "acquire_lease", "client_id": "gc-sd", "seq": 1}), &["lease_granted"]).await;
+            let ack_sd = ws_rpc(&mut ws_sd, 1, gs["generation"].as_u64().unwrap(), rig_sd.sup.get_observation().await.epoch_id, "/api/v1/mode/gravity_comp", json!({"enable": true})).await;
+            assert_eq!(ack_sd["type"], "command_ack", "{ack_sd}");
+            assert!(wait_gc_active(Arc::clone(&rig_sd.sup)).await.gravity_comp.workspace_outside);
+            rig_sd.server_jh.abort();
+            let exec_sd = rig_sd.exec.take().unwrap();
+            let outcome = tokio::task::spawn_blocking(move || exec_sd.emergency_disable_and_join()).await.unwrap();
+            assert_eq!(outcome, armd::supervisor::PanicDisableOutcome::Confirmed, "Executor shutdown while outside must confirm disable");
+            rig_sd.bus.with(|s| assert!(s.motors.iter().all(|m| !m.enabled), "all motors must be disabled after Executor shutdown"));
+        }
     }
 }

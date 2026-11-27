@@ -262,6 +262,10 @@ pub(crate) struct TerminalCaptureRecord {
     pub(crate) gravity_comp_damping_kd: [f32; CAPTURE_MAX_DOF],
     pub(crate) gravity_comp_tau_ff_len: u8,
     pub(crate) gravity_comp_tau_ff: [f32; CAPTURE_MAX_DOF],
+    pub(crate) gravity_comp_workspace_outside: bool,
+    pub(crate) gravity_comp_workspace_edge: Option<HolderLabel>,
+    pub(crate) gravity_comp_workspace_depth_m: Option<f64>,
+    pub(crate) gravity_comp_workspace_recovery_dir: Option<crate::chain::WorkspaceRecoveryDir>,
     pub(crate) feedback_age_ms: [Option<u64>; CAPTURE_MAX_DOF],
     pub(crate) is_torqued: bool,
     pub(crate) disable_pending: bool,
@@ -467,10 +471,15 @@ impl TerminalCaptureRecord {
             gravity_comp_damping_kd_len,
             gravity_comp_tau_ff,
             gravity_comp_tau_ff_len,
+            gravity_comp_workspace_outside,
+            gravity_comp_workspace_edge,
+            gravity_comp_workspace_depth_m,
+            gravity_comp_workspace_recovery_dir,
         ) = match &inner.gravity_comp {
             Some(run) => {
                 let (kd, kd_len) = copy_f32_slice(&run.damping_kd);
                 let (tau, tau_len) = copy_f32_slice(&run.tau_ff);
+                let out = run.workspace_status.outside_info();
                 (
                     Some(HolderLabel::new(run.phase.name())),
                     run.ramp(),
@@ -479,6 +488,10 @@ impl TerminalCaptureRecord {
                     kd_len,
                     tau,
                     tau_len,
+                    out.is_some(),
+                    out.map(|w| w.edge),
+                    out.map(|w| w.depth_m),
+                    out.map(|w| w.recovery_dir),
                 )
             }
             None => {
@@ -494,7 +507,7 @@ impl TerminalCaptureRecord {
                     }
                     None => (0.0, [0.0; CAPTURE_MAX_DOF], 0),
                 };
-                (None, 0.0, scale, kd, kd_len, [0.0; CAPTURE_MAX_DOF], 0)
+                (None, 0.0, scale, kd, kd_len, [0.0; CAPTURE_MAX_DOF], 0, false, None, None, None)
             }
         };
 
@@ -559,6 +572,10 @@ impl TerminalCaptureRecord {
             gravity_comp_damping_kd,
             gravity_comp_tau_ff_len,
             gravity_comp_tau_ff,
+            gravity_comp_workspace_outside,
+            gravity_comp_workspace_edge,
+            gravity_comp_workspace_depth_m,
+            gravity_comp_workspace_recovery_dir,
             feedback_age_ms,
             is_torqued: inner.is_torqued,
             disable_pending: inner.disable_pending,
@@ -774,6 +791,10 @@ impl TerminalCaptureRecord {
         obs.gravity_comp
             .tau_ff
             .extend_from_slice(&self.gravity_comp_tau_ff[..tau_len]);
+        obs.gravity_comp.workspace_outside = self.gravity_comp_workspace_outside;
+        obs.gravity_comp.workspace_edge = self.gravity_comp_workspace_edge;
+        obs.gravity_comp.workspace_depth_m = self.gravity_comp_workspace_depth_m;
+        obs.gravity_comp.workspace_recovery_dir = self.gravity_comp_workspace_recovery_dir;
         obs.driver_capabilities = self.driver_caps;
         obs.enable_state = self.enable_state;
         obs.lease_holder = self.lease_holder;

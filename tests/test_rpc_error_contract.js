@@ -29,6 +29,11 @@ const toast = (...args) => messages.push(args);
 let api = async () => { throw rejection; };
 let controlledUnload = () => { unloadCalls++; };
 ${source('formatWorkspaceViolation')}
+${source('formatWsDist')}
+${source('wsEdgeAndDir')}
+${source('formatGcWorkspaceBanner')}
+${source('formatGcExitBlocked')}
+${source('formatGcExitOutsideError')}
 ${source('rpcError')}
 ${source('disableTorque')}
 `, context);
@@ -174,4 +179,65 @@ ${source('disableTorque')}
     })`, context);
   assert.equal(graspWs, '夹爪 (end_point:5) 超出工作空间前方边界 1.0 cm（box_max_x 0.610 m，上限 0.600 m；原超出 0.000 m，新超出 0.010 m），请向后移动或按 Home');
   console.log('PASS: workspace refusals (box edges + Park/Home, sweep_budget, max_reach) translate cleanly in zh/en');
+
+  // Drag-teach outside-workspace banner, inline exit block reason, and GC_EXIT_OUTSIDE_WORKSPACE error strings (zh & en).
+  const gcBanner = (lang, gc) => vm.runInContext(`LANG = ${JSON.stringify(lang)}; formatGcWorkspaceBanner(${JSON.stringify(gc)})`, context);
+  const gcBlocked = (lang, gc) => vm.runInContext(`LANG = ${JSON.stringify(lang)}; formatGcExitBlocked(${JSON.stringify(gc)})`, context);
+  assert.equal(
+    gcBanner('zh', { workspace_outside: true, workspace_edge: 'box_max_x', workspace_depth_m: 0.045 }),
+    '已拖出工作范围（前方边界 4.5 cm），请拖回范围内后再退出拖动',
+  );
+  assert.equal(
+    gcBanner('en', { workspace_outside: true, workspace_edge: 'box_max_x', workspace_depth_m: 0.045 }),
+    'Dragged outside workspace (front edge 4.5 cm) — drag back inside before exiting',
+  );
+  assert.equal(
+    gcBanner('zh', { workspace_outside: true, workspace_edge: 'max_reach', workspace_depth_m: 0.031 }),
+    '已拖出工作范围（最大臂展 3.1 cm），请拖回范围内后再退出拖动',
+  );
+  assert.equal(
+    gcBanner('en', { workspace_outside: true, workspace_edge: 'floor_z', workspace_depth_m: 0.0005 }),
+    'Dragged outside workspace (floor 0.5 mm) — drag back inside before exiting',
+  );
+  assert.equal(
+    gcBanner('zh', { workspace_outside: true, workspace_edge: 'keepout:camera', workspace_depth_m: 0.02 }),
+    '已拖出工作范围（禁区「camera」 2.0 cm），请拖回范围内后再退出拖动',
+  );
+  assert.equal(gcBanner('zh', { workspace_outside: false, workspace_edge: null, workspace_depth_m: null }), '');
+  assert.match(gcBlocked('zh', { workspace_outside: true, workspace_edge: 'box_max_x', workspace_depth_m: 0.045 }), /前方边界 4\.5 cm.*向后移动/);
+  assert.match(gcBlocked('en', { workspace_outside: true, workspace_edge: 'box_max_x', workspace_depth_m: 0.045 }), /4\.5 cm beyond front edge.*move back/);
+  assert.equal(
+    wsErr('zh', {
+      code: 'GC_EXIT_OUTSIDE_WORKSPACE',
+      message: 'gripper is 4.5 cm beyond the workspace front edge (box_max_x); move back inside the workspace before exiting',
+    }),
+    '已拖出工作范围（前方边界 4.5 cm），请拖回范围内后再退出拖动',
+  );
+  assert.equal(
+    wsErr('en', {
+      code: 'GC_EXIT_OUTSIDE_WORKSPACE',
+      message: 'gripper is 4.5 cm beyond the workspace front edge (box_max_x); move back inside the workspace before exiting',
+    }),
+    'gripper is 4.5 cm beyond the workspace front edge (box_max_x); move back inside the workspace before exiting',
+  );
+  assert.equal(wsErr('zh', { code: 'GC_EXIT_OUTSIDE_WORKSPACE', message: '' }), '已拖出工作范围，请拖回范围内后再退出拖动');
+  assert.equal(wsErr('en', { code: 'GC_EXIT_OUTSIDE_WORKSPACE', message: '' }), 'Arm is outside the workspace — drag back inside before exiting hand-guiding');
+  // Structured fields handle keep-out names with parentheses and unverified feedback cleanly.
+  assert.equal(
+    wsErr('zh', {
+      code: 'GC_EXIT_OUTSIDE_WORKSPACE',
+      workspace_edge: 'keepout:rack (floor_z)',
+      workspace_depth_m: 0.02,
+      workspace_recovery_dir: 'move_left',
+      message: "gripper is 2.0 cm inside keep-out 'rack (floor_z)' (keepout:rack (floor_z)); move left clear of keep-out 'rack (floor_z)' before exiting",
+    }),
+    '已拖出工作范围（禁区「rack (floor_z)」 2.0 cm），请拖回范围内后再退出拖动',
+  );
+  assert.equal(
+    wsErr('zh', { code: 'GC_EXIT_OUTSIDE_WORKSPACE', workspace_unverified: true, message: 'measured pose workspace clearance could not be verified; wait for fresh feedback or use Stop/E-stop' }),
+    '无法确认机械臂是否在工作范围内，请等待电机反馈恢复或按停止/急停',
+  );
+  assert.match(gcBlocked('zh', { workspace_outside: true, workspace_edge: 'keepout:rack', workspace_depth_m: 0.02, workspace_recovery_dir: 'move_left' }), /禁区「rack」 2\.0 cm.*向左移动/);
+  assert.match(gcBlocked('en', { workspace_outside: true, workspace_edge: 'max_reach', workspace_depth_m: 0.031, workspace_recovery_dir: 'move_down' }), /3\.1 cm beyond max reach.*move down/);
+  console.log('PASS: drag-teach outside-workspace banner, inline exit block, and GC_EXIT_OUTSIDE_WORKSPACE strings verified in zh/en');
 })().catch(error => { console.error(error); process.exitCode = 1; });
