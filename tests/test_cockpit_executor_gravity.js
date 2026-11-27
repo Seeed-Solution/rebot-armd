@@ -24,7 +24,8 @@ function lineMatching(prefix) {
 function i18nSource() {
   const start = html.indexOf('const I18N = {');
   assert.notEqual(start, -1, 'missing I18N');
-  return html.slice(start, html.indexOf('\n};', start) + 3);
+  const assignEnd = html.indexOf('\n});', html.indexOf('Object.assign(I18N.en', start));
+  return html.slice(start, assignEnd !== -1 ? assignEnd + 4 : html.indexOf('\n};', start) + 3);
 }
 
 function makeEl() {
@@ -55,6 +56,9 @@ const els = {
   'gc-ramp-bar': makeEl(),
   'gc-ramp': makeEl(),
   'gc-hint': makeEl(),
+  'gc-ws-warn': makeEl(),
+  'btn-gc-exit': makeEl(),
+  'gc-exit-why': makeEl(),
   'btn-gc-rec': makeEl(),
   'gc-chip': makeEl(),
 };
@@ -88,6 +92,10 @@ ${lineMatching('const gcOn = ')}
 ${lineMatching('const gcExecutorUnsupported = ')}
 ${lineMatching('const cwGcSupported = ')}
 ${fnSource('gcBlockText')}
+${fnSource('formatWsDist')}
+${fnSource('wsEdgeAndDir')}
+${fnSource('formatGcWorkspaceBanner')}
+${fnSource('formatGcExitBlocked')}
 ${fnSource('renderGc')}
 `, context);
 
@@ -109,7 +117,30 @@ assert.equal(els['btn-gc'].classList.contains('on'), true);
 assert.equal(els['btn-gc'].getAttribute('aria-checked'), 'true');
 assert.equal(els['btn-gc'].getAttribute('aria-disabled'), 'false');
 assert.equal(els['gc-banner'].hidden, false);
+assert.equal(els['gc-ws-warn'].hidden, true);
+assert.equal(els['gc-exit-why'].hidden, true);
+assert.equal(els['btn-gc-exit'].classList.contains('blocked'), false);
 assert.equal(bodyEl.classList.contains('gc'), true);
+
+// 2b. Dragged outside workspace shows banner and inline exit block reason (zh and en), then clears back inside.
+run("LANG = 'zh'; S.obs.gravity_comp.workspace_outside = true; S.obs.gravity_comp.workspace_edge = 'box_max_x'; S.obs.gravity_comp.workspace_depth_m = 0.045; renderGc();");
+assert.equal(els['gc-banner'].classList.contains('ws-outside'), true);
+assert.equal(els['gc-ws-warn'].hidden, false);
+assert.equal(els['gc-ws-warn'].textContent, '已拖出工作范围（前方边界 4.5 cm），请拖回范围内后再退出拖动');
+assert.equal(els['btn-gc-exit'].classList.contains('blocked'), true);
+assert.equal(els['btn-gc-exit'].getAttribute('aria-disabled'), 'true');
+assert.equal(els['gc-exit-why'].hidden, false);
+assert.match(els['gc-exit-why'].textContent, /前方边界 4\.5 cm/);
+assert.match(els['gc-sub'].textContent, /前方边界 4\.5 cm/);
+run("LANG = 'en'; renderGc();");
+assert.equal(els['gc-ws-warn'].textContent, 'Dragged outside workspace (front edge 4.5 cm) — drag back inside before exiting');
+assert.match(els['gc-exit-why'].textContent, /4\.5 cm beyond front edge/);
+run("S.obs.gravity_comp.workspace_outside = false; S.obs.gravity_comp.workspace_edge = null; S.obs.gravity_comp.workspace_depth_m = null; renderGc();");
+assert.equal(els['gc-banner'].classList.contains('ws-outside'), false);
+assert.equal(els['gc-ws-warn'].hidden, true);
+assert.equal(els['gc-exit-why'].hidden, true);
+assert.equal(els['btn-gc-exit'].classList.contains('blocked'), false);
+assert.equal(els['btn-gc-exit'].getAttribute('aria-disabled'), 'false');
 
 // 3. Generic fallback remains intact if a driver/profile still reports EXECUTOR_CAPABILITY_UNSUPPORTED.
 run("S.obs.control_mode = 'position'; S.obs.gravity_comp = { supported: false, active: false, phase: null, ramp: 0, blocker: { code: 'EXECUTOR_CAPABILITY_UNSUPPORTED', message: 'unsupported' } }; S.caps.gravity_comp = false; renderGc();");

@@ -1412,6 +1412,7 @@ fn estop_never_blocks_when_driver_mutex_held_by_another_thread() {
                 overspeed_count: 0,
                 prev_measured: None,
                 lease_generation: None,
+                workspace_outside: None,
             });
         }
         inner

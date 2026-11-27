@@ -23678,6 +23678,7 @@ mod observation_snapshot_tests {
             overspeed_count: 0,
             prev_measured: Some([0.0; 6]),
             lease_generation,
+            workspace_outside: None,
         };
 
         // (a) Periodic output suppresses non-hold write when disconnect arrives in `enable_state()`

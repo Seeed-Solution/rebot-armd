@@ -4432,9 +4432,32 @@ pub struct GravityCompObservation {
     /// Feed-forward torque sent to J1-J6 this tick (N·m).
     pub tau_ff: Vec<f32>,
     pub last_exit: Option<GravityCompExit>,
+    /// True while in gravity compensation and the measured pose is outside the active workspace
+    /// (any box face, max reach, floor, or keep-out box). Always false outside gravity comp.
+    #[serde(default)]
+    pub workspace_outside: bool,
+    /// Deepest violated workspace constraint identifier while `workspace_outside` is true
+    /// (`box_{min,max}_{x,y,z}`, `max_reach`, `floor_z`, or `keepout:<name>`). Inline (0 alloc).
+    #[serde(default)]
+    pub workspace_edge: Option<HolderLabel>,
+    /// Deepest intrusion depth in metres while `workspace_outside` is true.
+    #[serde(default)]
+    pub workspace_depth_m: Option<f64>,
 }
 
-crate::fieldwise_clone!(GravityCompObservation { supported, blocker, phase, ramp, scale, damping_kd, tau_ff, last_exit });
+crate::fieldwise_clone!(GravityCompObservation {
+    supported,
+    blocker,
+    phase,
+    ramp,
+    scale,
+    damping_kd,
+    tau_ff,
+    last_exit,
+    workspace_outside,
+    workspace_edge,
+    workspace_depth_m
+});
 
 /// Field description in the observation schema
 #[derive(Debug, Clone, Serialize, Deserialize)]

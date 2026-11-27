@@ -834,10 +834,16 @@ body.offline .banner { display: block; }
 .gc-ramp { height: 6px; border-radius: 3px; background: rgba(212,136,6,0.22); overflow: hidden; }
 .gc-ramp i { display: block; height: 100%; width: 0; background: #d48806; transition: width .12s linear; }
 .gc-banner.active .gc-ramp i { background: var(--sc-color-primary); }
+.gc-banner.ws-outside { border-color: var(--sc-status-danger-fg); }
 .gc-hint { font-size: 12px; line-height: 1.4; }
+.gc-ws-warn { padding: 8px 10px; border-radius: var(--sc-radius-md); border: 1px solid #f87171; border-left: 4px solid var(--sc-status-danger-fg); background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); font-size: 12px; font-weight: 600; line-height: 1.45; }
+.gc-ws-warn[hidden] { display: none; }
 .gc-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .gc-actions .btn { flex: 1 1 auto; min-height: 40px; justify-content: center; }
 .gc-banner .btn.btn-gc-exit { background: #d48806; border-color: #d48806; color: #fff; font-weight: 700; }
+.gc-banner .btn.btn-gc-exit.blocked { opacity: .55; }
+.gc-exit-why { font-size: 12px; line-height: 1.4; color: var(--sc-status-danger-fg); font-weight: 500; }
+.gc-exit-why[hidden] { display: none; }
 .gc-banner .btn.gc-rec { background: #fff; color: #1f2937; }
 .gc-banner .btn.gc-rec.rec-on { color: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
 .owner-banner { display: grid; gap: 4px; padding: 10px 12px; border-radius: var(--sc-radius-md); border: 1px solid #f59e0b; border-left: 4px solid #d48806; background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; line-height: 1.45; }
@@ -2976,10 +2982,12 @@ body.controls-unavailable .ex-pre-btn { opacity: .5; filter: saturate(.25); }
           </div>
           <div class="gc-ramp" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="gc-ramp"><i id="gc-ramp-bar"></i></div>
           <div class="gc-hint" id="gc-hint" data-i18n="gc.hint">用手扶住机械臂移动。摇杆和按键已停用，夹爪可用。</div>
+          <div class="gc-ws-warn" id="gc-ws-warn" role="alert" hidden></div>
           <div class="gc-actions">
             <button class="btn gc-rec" id="btn-gc-rec" type="button"></button>
             <button class="btn btn-gc-exit" id="btn-gc-exit" type="button" data-i18n="gc.exit">退出并锁定位置</button>
           </div>
+          <div class="gc-exit-why" id="gc-exit-why" hidden></div>
         </div>
       <!-- external controller / task status: in the cockpit after the safety block (simple) or right after #gc-banner (expert), moved by setUi -->
         <div class="sc-card ext-banner" id="ext-banner" role="status" aria-live="polite" hidden>
@@ -3600,6 +3608,9 @@ const I18N = {
     'gc.x.WATCHDOG': '心跳超时：已退出拖动示教并锁定位置', 'gc.x.LEASE_LOST': '控制权丢失：已退出拖动示教并锁定位置', 'gc.x.TORQUE_LOST': '电机已失能：拖动示教结束',
     'gc.x.GRAVITY_COMP_OVERSPEED': '关节速度过快（可能在下坠）：已锁定位置', 'gc.x.GRAVITY_COMP_SAG': '补偿不足，机械臂在下沉：已锁定位置',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
+    'gc.ws.banner': '已拖出工作范围（{edge} {dist}），请拖回范围内后再退出拖动', 'gc.ws.banner_nodist': '已拖出工作范围（{edge}），请拖回范围内后再退出拖动',
+    'gc.ws.exit_blocked': '暂不可退出：超出{edge} {dist}，请{dir}回范围内', 'gc.ws.exit_blocked_nodist': '暂不可退出：超出{edge}，请{dir}回范围内',
+    'err.gc_exit_outside_workspace': '已拖出工作范围，请拖回范围内后再退出拖动',
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障', 'en.clear_motor_err_s': '⚠️ 清除电机错误', 'en.sub_clear_motor_err': '仅收纳位 · 保持未使能',
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.armed_readonly': '力矩已开 · 未控制', 'en.sub_readonly': '按住 0.6 秒：先确认控制权，再停靠卸力',
@@ -3874,6 +3885,9 @@ const I18N = {
     'gc.x.WATCHDOG': 'Heartbeat timeout: hand-guiding ended, pose held', 'gc.x.LEASE_LOST': 'Control lost: hand-guiding ended, pose held', 'gc.x.TORQUE_LOST': 'Motors disabled: hand-guiding ended',
     'gc.x.GRAVITY_COMP_OVERSPEED': 'Joint too fast (falling?): pose held', 'gc.x.GRAVITY_COMP_SAG': 'Compensation too weak, the arm sagged: pose held',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
+    'gc.ws.banner': 'Dragged outside workspace ({edge} {dist}) — drag back inside before exiting', 'gc.ws.banner_nodist': 'Dragged outside workspace ({edge}) — drag back inside before exiting',
+    'gc.ws.exit_blocked': 'Exit blocked: {dist} beyond {edge}; {dir} to return inside', 'gc.ws.exit_blocked_nodist': 'Exit blocked: outside {edge}; {dir} to return inside',
+    'err.gc_exit_outside_workspace': 'Arm is outside the workspace — drag back inside before exiting hand-guiding',
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.clear_motor_err_s': '⚠️ Clear motor error', 'en.sub_clear_motor_err': 'Rest pose only · stays disabled',
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.armed_readonly': 'Torque on · not in control', 'en.sub_readonly': 'Hold 0.6 s: confirm control, then park & torque off',
@@ -4084,6 +4098,10 @@ Object.assign(I18N.zh, {
   'ws.edge.box_min_y': '右侧边界', 'ws.dir.box_min_y': '向左移动',
   'ws.edge.box_max_z': '顶部边界', 'ws.dir.box_max_z': '向下移动',
   'ws.edge.box_min_z': '底部边界', 'ws.dir.box_min_z': '向上移动',
+  'ws.edge.max_reach': '最大臂展', 'ws.dir.max_reach': '向底座收回',
+  'ws.edge.floor_z': '底部平面', 'ws.dir.floor_z': '向上抬起',
+  'ws.edge.keepout': '禁区「{name}」', 'ws.dir.keepout': '移出禁区「{name}」',
+  'ws.edge.unknown': '工作空间边界', 'ws.dir.unknown': '移回工作范围内',
 });
 Object.assign(I18N.en, {
   'ui.to_expert': 'Expert mode', 'ui.to_simple': 'Simple mode',
@@ -4097,6 +4115,10 @@ Object.assign(I18N.en, {
   'ws.edge.box_min_y': 'right edge', 'ws.dir.box_min_y': 'move left',
   'ws.edge.box_max_z': 'top edge', 'ws.dir.box_max_z': 'move down',
   'ws.edge.box_min_z': 'bottom edge', 'ws.dir.box_min_z': 'move up',
+  'ws.edge.max_reach': 'max reach', 'ws.dir.max_reach': 'move closer to the base',
+  'ws.edge.floor_z': 'floor', 'ws.dir.floor_z': 'move up',
+  'ws.edge.keepout': "keep-out '{name}'", 'ws.dir.keepout': "move clear of keep-out '{name}'",
+  'ws.edge.unknown': 'workspace boundary', 'ws.dir.unknown': 'move back inside',
   'sv.title': 'Recognition', 'sv.chip.n': 'Recognition · {n} objects', 'sv.chip.0': 'Recognition · no objects', 'sv.chip.wait': 'Recognition · on', 'sv.on.aria': 'Recognition on/off',
   'sv.meta.video': 'video {fps} fps · {ms} ms', 'sv.meta.det': 'recognition {fps} fps', 'sv.meta.off': 'recognition off',
   'sv.kind': 'Detection kind', 'sv.kind.detect': 'Detect (boxes)', 'sv.kind.segment': 'Segment (outlines)',
@@ -5006,6 +5028,53 @@ function formatWorkspaceViolation(o) {
   if (m) return t('ws.box_edge', { ...args, dist: m[1] + ' ' + m[2].toLowerCase() });
   return t('ws.box_edge_nocm', args);
 }
+function formatWsDist(depthM) {
+  if (typeof depthM !== 'number' || !Number.isFinite(depthM) || depthM <= 0) return '';
+  if (depthM >= 0.001) return (depthM * 100).toFixed(1) + ' cm';
+  return Math.max(0.1, depthM * 1000).toFixed(1) + ' mm';
+}
+function wsEdgeAndDir(edgeId) {
+  if (!edgeId || typeof edgeId !== 'string') {
+    return { edge: t('ws.edge.unknown'), dir: t('ws.dir.unknown') };
+  }
+  if (edgeId.startsWith('keepout:')) {
+    const name = edgeId.slice('keepout:'.length) || '?';
+    return { edge: t('ws.edge.keepout', { name }), dir: t('ws.dir.keepout', { name }) };
+  }
+  const ek = 'ws.edge.' + edgeId, dk = 'ws.dir.' + edgeId;
+  return {
+    edge: t(ek) !== ek ? t(ek) : edgeId,
+    dir: t(dk) !== dk ? t(dk) : t('ws.dir.unknown'),
+  };
+}
+function formatGcWorkspaceBanner(gc) {
+  if (!gc || !gc.workspace_outside) return '';
+  const { edge } = wsEdgeAndDir(gc.workspace_edge);
+  const dist = formatWsDist(gc.workspace_depth_m);
+  return dist ? t('gc.ws.banner', { edge, dist }) : t('gc.ws.banner_nodist', { edge });
+}
+function formatGcExitBlocked(gc) {
+  if (!gc || !gc.workspace_outside) return '';
+  const { edge, dir } = wsEdgeAndDir(gc.workspace_edge);
+  const dist = formatWsDist(gc.workspace_depth_m);
+  return dist
+    ? t('gc.ws.exit_blocked', { edge, dist, dir })
+    : t('gc.ws.exit_blocked_nodist', { edge, dir });
+}
+function formatGcExitOutsideError(response) {
+  if (!response || typeof response !== 'object') return t('err.gc_exit_outside_workspace');
+  const raw = String(response.message || response.reason || '');
+  if (LANG === 'en' && raw) return raw;
+  const cidMatch = /\((box_(?:min|max)_[xyz]|max_reach|floor_z|keepout:[^)]+)\)/.exec(raw);
+  const distMatch = /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
+  const cid = response.workspace_edge || response.constraint_id || (cidMatch ? cidMatch[1] : '');
+  if (cid) {
+    const { edge } = wsEdgeAndDir(cid);
+    const dist = distMatch ? distMatch[1] + ' ' + distMatch[2].toLowerCase() : formatWsDist(response.workspace_depth_m);
+    return dist ? t('gc.ws.banner', { edge, dist }) : t('gc.ws.banner_nodist', { edge });
+  }
+  return t('err.gc_exit_outside_workspace');
+}
 function rpcError(response) {
   let message;
   if (response.code === 'HANDOVER_SETTLING') {
@@ -5019,6 +5088,8 @@ function rpcError(response) {
     opRefused();
   } else if (response.code === 'WORKSPACE_VIOLATION') {
     message = formatWorkspaceViolation(response) || response.reason || response.message || response.error || t('err.workspace');
+  } else if (response.code === 'GC_EXIT_OUTSIDE_WORKSPACE') {
+    message = formatGcExitOutsideError(response);
   } else {
     message = response.message || response.error || t('err.rejected');
   }
@@ -11514,22 +11585,41 @@ function renderGc() {
   const execUnsup = gcExecutorUnsupported();
   sw.hidden = !supported && !execUnsup;
   const why = on ? null : gcBlockText();
+  const phase = (gc && gc.phase) || 'active';
+  const wsOut = on && (phase === 'ramp_in' || phase === 'active') && !!(gc && gc.workspace_outside);
+  const exitWhy = wsOut ? formatGcExitBlocked(gc) : '';
   sw.classList.toggle('on', on);
   sw.classList.toggle('blocked', !on && !!why);
   sw.setAttribute('aria-checked', String(on));
-  sw.setAttribute('aria-disabled', String(!on && !!why));
-  sw.title = (!on && why) ? why : '';
-  setText($('gc-sub'), on ? t('gc.exit') : why || t('gc.hold'));
+  sw.setAttribute('aria-disabled', String((!on && !!why) || wsOut));
+  sw.title = !on ? (why || '') : exitWhy;
+  setText($('gc-sub'), on ? (exitWhy || t('gc.exit')) : why || t('gc.hold'));
   const banner = $('gc-banner');
   banner.hidden = !on || !live;
+  banner.classList.toggle('ws-outside', wsOut);
   if (!on) return;
-  const phase = gc.phase || 'active';
   const pct = Math.round((phase === 'ramp_in' ? gc.ramp : phase === 'active' ? 1 : 1) * 100);
   banner.classList.toggle('active', phase === 'active');
   setText($('gc-phase'), t('gc.ph.' + phase, { n: Math.round((gc.ramp || 0) * 100) }));
   $('gc-ramp-bar').style.width = pct + '%';
   $('gc-ramp').setAttribute('aria-valuenow', String(pct));
   setText($('gc-hint'), phase === 'ramp_in' ? t('gc.hint.ramp') : t('gc.hint'));
+  const wsWarn = $('gc-ws-warn');
+  if (wsWarn) {
+    wsWarn.hidden = !wsOut;
+    setText(wsWarn, wsOut ? formatGcWorkspaceBanner(gc) : '');
+  }
+  const exitBtn = $('btn-gc-exit');
+  if (exitBtn) {
+    exitBtn.classList.toggle('blocked', wsOut);
+    exitBtn.setAttribute('aria-disabled', String(wsOut));
+    exitBtn.title = exitWhy;
+  }
+  const exitWhyEl = $('gc-exit-why');
+  if (exitWhyEl) {
+    exitWhyEl.hidden = !wsOut;
+    setText(exitWhyEl, exitWhy);
+  }
   const rb = $('btn-gc-rec');
   rb.classList.toggle('rec-on', !!S.rec.active);
   setText(rb, S.rec.active ? t('gc.rec.on', { t: fmtTime(Date.now() - S.rec.startedAt) }) : t('gc.rec.start'));

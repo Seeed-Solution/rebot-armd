@@ -993,6 +993,41 @@ impl ArmModel {
     }
 }
 
+/// Human-readable `(edge_label, inward_direction)` for the 6 outer workspace box faces.
+pub fn workspace_box_edge_labels(cid: &str) -> Option<(&'static str, &'static str)> {
+    match cid {
+        "box_max_x" => Some(("front edge", "move back")),
+        "box_min_x" => Some(("back edge", "move forward")),
+        "box_max_y" => Some(("left edge", "move right")),
+        "box_min_y" => Some(("right edge", "move left")),
+        "box_max_z" => Some(("top edge", "move down")),
+        "box_min_z" => Some(("bottom edge", "move up")),
+        _ => None,
+    }
+}
+
+/// Human-readable part name (`"camera"`, `"arm"`, or `"gripper"`) for a workspace geometry id.
+pub fn workspace_geometry_part(gid: &str) -> &'static str {
+    if gid == "camera_mount" {
+        "camera"
+    } else if gid.starts_with("capsule:") {
+        "arm"
+    } else {
+        "gripper"
+    }
+}
+
+/// Formats a positive workspace intrusion depth in metres (`1.0 cm` when `>= 1 mm`, else `0.1 mm`+).
+pub fn write_workspace_depth(w: &mut impl core::fmt::Write, depth: f64) {
+    if depth >= 0.001 {
+        let cm = depth * 100.0;
+        let _ = write!(w, "{cm:.1} cm");
+    } else {
+        let mm = (depth * 1000.0).max(0.1);
+        let _ = write!(w, "{mm:.1} mm");
+    }
+}
+
 /// Failure produced by [`WorkspaceChecker`].
 /// Formats an actionable English rejection message for outer workspace box boundaries
 /// (`box_min/max x/y/z`), returning `true` when `cid` matched a workspace box edge.
@@ -1002,36 +1037,64 @@ pub fn write_workspace_box_edge_reason(
     gid: &str,
     depth: f64,
 ) -> bool {
-    let (edge, recover) = match cid {
-        "box_max_x" => ("front edge", "move back"),
-        "box_min_x" => ("back edge", "move forward"),
-        "box_max_y" => ("left edge", "move right"),
-        "box_min_y" => ("right edge", "move left"),
-        "box_max_z" => ("top edge", "move down"),
-        "box_min_z" => ("bottom edge", "move up"),
-        _ => return false,
+    let Some((edge, recover)) = workspace_box_edge_labels(cid) else {
+        return false;
     };
-    let part = if gid == "camera_mount" {
-        "camera"
-    } else if gid.starts_with("capsule:") {
-        "arm"
-    } else {
-        "gripper"
-    };
-    if depth >= 0.001 {
-        let cm = depth * 100.0;
+    let part = workspace_geometry_part(gid);
+    let _ = write!(w, "{part} is ");
+    write_workspace_depth(w, depth);
+    let _ = write!(w, " beyond the workspace {edge} ({cid}); {recover} or press Home");
+    true
+}
+
+/// Deepest measured-pose workspace intrusion across box faces, `max_reach`, `floor_z`, and
+/// keep-out boxes (excludes self-collision). Stored inline (`Copy`, zero heap allocations).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceOutsideInfo {
+    /// Constraint identifier (`box_{min,max}_{x,y,z}`, `max_reach`, `floor_z`, or `keepout:<name>`).
+    pub edge: crate::model::HolderLabel,
+    /// Geometry identifier (`end_origin`, `end_point:<n>`, `camera_mount`, `tcp_origin`, or `capsule:<id>`).
+    pub geometry: crate::model::HolderLabel,
+    /// Intrusion depth beyond the boundary in metres (`> 0`).
+    pub depth_m: f64,
+}
+
+/// Formats an actionable English refusal message for `GC_EXIT_OUTSIDE_WORKSPACE` naming the
+/// violated edge, intrusion depth, and inward direction back inside the workspace.
+pub fn write_gc_exit_outside_workspace_message(
+    w: &mut impl core::fmt::Write,
+    info: &WorkspaceOutsideInfo,
+) {
+    let cid = info.edge.as_str();
+    let part = workspace_geometry_part(info.geometry.as_str());
+    let _ = write!(w, "{part} is ");
+    write_workspace_depth(w, info.depth_m);
+    if let Some((edge, recover)) = workspace_box_edge_labels(cid) {
         let _ = write!(
             w,
-            "{part} is {cm:.1} cm beyond the workspace {edge} ({cid}); {recover} or press Home"
+            " beyond the workspace {edge} ({cid}); {recover} inside the workspace before exiting"
+        );
+    } else if cid == "max_reach" {
+        let _ = write!(
+            w,
+            " beyond max reach (max_reach); move closer to the base before exiting"
+        );
+    } else if cid == "floor_z" {
+        let _ = write!(
+            w,
+            " below the workspace floor (floor_z); move up inside the workspace before exiting"
+        );
+    } else if let Some(name) = cid.strip_prefix("keepout:") {
+        let _ = write!(
+            w,
+            " inside keep-out '{name}' ({cid}); move clear of keep-out '{name}' before exiting"
         );
     } else {
-        let mm = (depth * 1000.0).max(0.1);
         let _ = write!(
             w,
-            "{part} is {mm:.1} mm beyond the workspace {edge} ({cid}); {recover} or press Home"
+            " outside workspace ({cid}); move back inside the workspace before exiting"
         );
     }
-    true
 }
 
 /// Decodes a compact [`crate::rt_core::mailbox::RefusalDetail::WorkspaceBoxEdge`] payload back
@@ -1898,6 +1961,82 @@ impl<'a> WorkspaceEvaluator<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Evaluates `q` against all workspace boundary constraints — box faces, `max_reach`,
+    /// `floor_z`, and keep-out boxes (slots `0..self.self_collision_slot_start`; excludes
+    /// self-collision) — with zero heap allocations on `armd-control`.
+    /// Returns the deepest violation (`clearance < -WORKSPACE_EPS`), or `None` when inside.
+    pub fn deepest_workspace_outside_rt(
+        &self,
+        q: &[f32],
+        scratch_clr: &mut [f64],
+        world_caps: &mut Vec<([f64; 3], [f64; 3], f64)>,
+    ) -> Result<Option<WorkspaceOutsideInfo>, WorkspaceFailureRt> {
+        use core::fmt::Write as _;
+        const PHASE: &str = "gravity_comp_workspace";
+        self.eval_into_slice_rt(q, scratch_clr, world_caps, PHASE)?;
+        let ws_slots = self.self_collision_slot_start.min(self.total_slots);
+        let mut deepest: Option<(usize, f64)> = None;
+        for (slot, &clr) in scratch_clr[..ws_slots].iter().enumerate() {
+            if !clr.is_finite() {
+                return Err(WorkspaceFailureRt {
+                    kind: WorkspaceFailureKindRt::Invalid("non-finite workspace clearance"),
+                    phase: PHASE,
+                });
+            }
+            if clr < -k::WORKSPACE_EPS {
+                let depth = -clr;
+                if deepest.is_none_or(|(_, best)| depth > best) {
+                    deepest = Some((slot, depth));
+                }
+            }
+        }
+        let Some((slot, depth_m)) = deepest else {
+            return Ok(None);
+        };
+        let mut edge_buf = crate::safety::BoundedText::<128>::empty();
+        let mut geom_buf = crate::safety::BoundedText::<128>::empty();
+        if self.has_reach && slot >= self.num_geoms * self.slots_per_geom {
+            let reach_idx = slot - self.num_geoms * self.slots_per_geom;
+            let _ = edge_buf.write_str("max_reach");
+            let _ = geom_buf.write_str(if reach_idx == 0 { "end_origin" } else { "tcp_origin" });
+        } else {
+            let gi = slot / self.slots_per_geom;
+            let ci = slot % self.slots_per_geom;
+            if gi == 0 {
+                let _ = geom_buf.write_str("end_origin");
+            } else if gi < self.num_end_pts {
+                if self.has_cam && gi + 1 == self.num_end_pts {
+                    let _ = geom_buf.write_str("camera_mount");
+                } else {
+                    let _ = write!(geom_buf, "end_point:{gi}");
+                }
+            } else {
+                let id = self
+                    .ws
+                    .link_capsules
+                    .get(gi - self.num_end_pts)
+                    .map_or("?", |c| c.id.as_str());
+                let _ = write!(geom_buf, "capsule:{id}");
+            }
+            if ci == 0 {
+                let _ = edge_buf.write_str("floor_z");
+            } else if ci <= 3 {
+                let _ = edge_buf.write_str(k::BOX_CONSTRAINT_IDS[ci - 1][0]);
+            } else if ci <= 6 {
+                let _ = edge_buf.write_str(k::BOX_CONSTRAINT_IDS[ci - 4][1]);
+            } else {
+                let bi = ci - 7;
+                let name = self.ws.keepout_boxes.get(bi).map_or("?", |b| b.name.as_str());
+                let _ = write!(edge_buf, "keepout:{name}");
+            }
+        }
+        Ok(Some(WorkspaceOutsideInfo {
+            edge: crate::model::HolderLabel::new(edge_buf.as_str()),
+            geometry: crate::model::HolderLabel::new(geom_buf.as_str()),
+            depth_m,
+        }))
     }
 
     /// Formats a [`WorkspaceFailureRt`] into preallocated [`k::WorkspaceViolationDetail`] string

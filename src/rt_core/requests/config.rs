@@ -3990,6 +3990,19 @@ fn install_gravity_comp(
                     message: "Operator unlock is required for /api/v1/mode/gravity_comp",
                 });
             }
+            // User-initiated drag-teach exit is refused while the measured pose is outside the
+            // active workspace so the arm cannot be stranded in position mode outside the limits.
+            // Safety exits (Stop, E-stop, lease loss, watchdog, faults, owner handback, shutdown)
+            // bypass `GravityCompOp::Exit` and call `exit_gravity_comp_rt` /
+            // `exit_gravity_comp_inner` (or E-stop hold) directly, so they are NOT blocked here.
+            if core.gravity_comp.as_ref().is_some_and(|r| r.phase.floating()) {
+                if let Err(reason_msg) = core.check_user_gravity_comp_exit_workspace_rt() {
+                    return Err(ConfigError::GravityCompRejected {
+                        code: BoundedText::new("GC_EXIT_OUTSIDE_WORKSPACE"),
+                        message: reason_msg,
+                    });
+                }
+            }
             core.exit_gravity_comp_rt(code, message);
             Ok(GravityCompReply {
                 active: core.gravity_comp_active(),
