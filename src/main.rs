@@ -759,6 +759,8 @@ struct StartedControlOwner {
     legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg_attr(not(test), allow(dead_code))]
     fell_back_to_legacy: bool,
+    #[cfg(test)]
+    fallback_error: Option<String>,
 }
 
 fn spawn_legacy_control_loop(
@@ -849,6 +851,8 @@ async fn start_control_owner_with_hooks(
                 executor_handle: None,
                 legacy_control_stop: Some(stop),
                 fell_back_to_legacy: false,
+                #[cfg(test)]
+                fallback_error: None,
             })
         }
         armd::rt_core::executor::RtOwner::Executor => {
@@ -886,6 +890,8 @@ async fn start_control_owner_with_hooks(
                         executor_handle: Some(handle),
                         legacy_control_stop: None,
                         fell_back_to_legacy: false,
+                        #[cfg(test)]
+                        fallback_error: None,
                     })
                 }
                 Err(e) if supervisor.has_detached_safe_hold() => {
@@ -901,6 +907,8 @@ async fn start_control_owner_with_hooks(
                         executor_handle: None,
                         legacy_control_stop: None,
                         fell_back_to_legacy: false,
+                        #[cfg(test)]
+                        fallback_error: None,
                     })
                 }
                 Err(e)
@@ -933,6 +941,8 @@ async fn start_control_owner_with_hooks(
                         executor_handle: None,
                         legacy_control_stop: Some(stop),
                         fell_back_to_legacy: true,
+                        #[cfg(test)]
+                        fallback_error: Some(e.to_string()),
                     })
                 }
                 Err(e) => Err(format!("Failed to start RT executor: {e}")),
@@ -1280,6 +1290,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 executor_handle: None,
                 legacy_control_stop: None,
                 fell_back_to_legacy: false,
+                #[cfg(test)]
+                fallback_error: None,
             }
         }
         Some("startup_fallback") => {
@@ -1300,6 +1312,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 executor_handle: None,
                 legacy_control_stop: Some(stop),
                 fell_back_to_legacy: true,
+                #[cfg(test)]
+                fallback_error: None,
             }
         }
         Some(_) => unreachable!("ARMD_MOCK_TEST_OWNER_MODE validated before hardware mount"),
@@ -2226,6 +2240,82 @@ mod shutdown_tests {
         .err()
         .expect("mock executor startup failure must fail fast");
         assert!(mock_err.contains("Failed to start RT executor"), "{mock_err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_follower_fail_control_spawn_falls_back_to_legacy_holding_without_torque_off() {
+        let state = Arc::new(std::sync::Mutex::new(EnableState::Enabled));
+        let enable_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let disable_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drv = ToggleableRtDriver {
+            state: state.clone(),
+            enable_sent: enable_sent.clone(),
+            disable_sent: disable_sent.clone(),
+        };
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        sup.start_dispatcher().unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+
+        let hooks = armd::rt_core::executor::PersistTestHooks {
+            fail_control_spawn: true,
+            ..Default::default()
+        };
+        let started = start_control_owner_with_hooks(
+            &sup,
+            "rebot-dm",
+            armd::rt_core::executor::RtOwner::Executor,
+            Duration::from_millis(10),
+            armd::rt_core::sched::RtSchedConfig::default(),
+            armd::rt_core::sched::MemoryLock::Skipped("test".into()),
+            false,
+            false,
+            armd::rt_core::executor::PanicPolicy::StopExecutor,
+            hooks,
+        )
+        .await
+        .expect("fail_control_spawn on rebot-dm must fall back to legacy");
+
+        assert!(started.fell_back_to_legacy);
+        assert!(started.executor_handle.is_none());
+        let err_msg = started
+            .fallback_error
+            .as_deref()
+            .expect("fallback_error must record the injected spawn failure");
+        assert!(
+            err_msg.contains("simulated armd-control spawn failure"),
+            "unexpected fallback error: {err_msg}"
+        );
+        let leg_stop = started
+            .legacy_control_stop
+            .expect("fallback must start a live legacy control loop");
+        assert_eq!(sup.owner_mode(), armd::supervisor::OWNER_LEGACY);
+        assert_eq!(
+            sup.owner_reason(),
+            armd::OwnerReason::StartupFallbackToLegacy,
+            "owner_reason must be StartupFallbackToLegacy"
+        );
+
+        // Wait for at least 3 legacy control ticks to prove the fallback loop is actively holding.
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while sup.tick_stats().releases_total < 3 && std::time::Instant::now() < wait_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snap = sup.tick_stats();
+        assert_eq!(snap.owner_mode, "legacy");
+        assert!(snap.loop_active, "fallback legacy loop must be active: {snap:?}");
+        assert!(snap.releases_total >= 3, "fallback legacy loop must advance releases: {snap:?}");
+        assert_eq!(
+            disable_sent.load(Ordering::SeqCst),
+            0,
+            "fallback to legacy holding must NEVER send torque-off away from rest"
+        );
+        assert_eq!(*state.lock().unwrap(), EnableState::Enabled);
+
+        sup.signal_legacy_stop(&leg_stop);
+        let _ = sup
+            .emergency_process_exit_disable_until(std::time::Instant::now() + Duration::from_millis(500))
+            .await;
     }
 
     #[test]
