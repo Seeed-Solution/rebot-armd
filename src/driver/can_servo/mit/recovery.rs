@@ -900,3 +900,114 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
 }
+
+/// Maximum unconsumed causal TX events (1 probe + up to 3 subsequent continuity holds) tracked
+/// per axis within one MIT expiry probe window (zero alloc; overflow fails closed as ambiguous).
+pub(in crate::driver::can_servo) const MIT_EXPIRY_MAX_CAUSES: usize = 4;
+
+/// Per-axis sequential causal disable confirmation state for MIT expiry recovery (zero alloc).
+///
+/// SocketCAN timestamps host submission and `flush()` is a no-op, so replies cannot be correlated
+/// by transport flush alone. Confirmation is strictly sequential per axis:
+/// 1. `CMD_DISABLE` (`dis_tx`)
+/// 2. Drain RX -> `REG_READ(RID_CTRL_MODE)` barrier (`barrier_tx` -> `barrier_ack`)
+/// 3. Drain RX -> Round 1 `0xCC` status probe (`probe1_tx` -> `probe1_ack`, `state == 0`)
+/// 4. Drain RX -> Round 2 `0xCC` status probe (`probe2_tx` -> `probe2_ack`, `state == 0`),
+///    submitted strictly after `probe1_ack` (`p2_tx_at > p1_ack_at`).
+///
+/// Retries advance `min_next_fb_seq` and drain RX before submitting a fresh probe so a retry
+/// never reuses a prior reply identity. Any feedback arriving strictly after `reply_window_start`
+/// without a strictly earlier unconsumed probe/hold cause latches `reply_ambiguous = true` and
+/// invalidates the axis (both before and after `probe2_ack` is latched).
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::driver::can_servo) struct MitExpiryAxisState {
+    pub(in crate::driver::can_servo) dis_tx: Option<(u64, Instant)>,
+    pub(in crate::driver::can_servo) barrier_tx: Option<(u64, Instant, Option<i128>)>,
+    pub(in crate::driver::can_servo) barrier_ack: Option<(u64, Instant)>,
+    pub(in crate::driver::can_servo) probe1_tx: Option<(u64, Instant, Option<i128>)>,
+    pub(in crate::driver::can_servo) probe1_ack: Option<(u64, Instant)>,
+    pub(in crate::driver::can_servo) probe2_tx: Option<(u64, Instant, Option<i128>)>,
+    pub(in crate::driver::can_servo) probe2_ack: Option<(u64, Instant)>,
+    pub(in crate::driver::can_servo) min_next_fb_seq: u64,
+    pub(in crate::driver::can_servo) reply_window_start: Option<Instant>,
+    pub(in crate::driver::can_servo) pending_causes: [Option<Instant>; MIT_EXPIRY_MAX_CAUSES],
+    pub(in crate::driver::can_servo) pending_causes_len: u8,
+    pub(in crate::driver::can_servo) reply_ambiguous: bool,
+}
+
+impl MitExpiryAxisState {
+    #[inline]
+    pub(in crate::driver::can_servo) fn clear_reply_window(&mut self) {
+        self.reply_window_start = None;
+        self.pending_causes = [None; MIT_EXPIRY_MAX_CAUSES];
+        self.pending_causes_len = 0;
+        self.reply_ambiguous = false;
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn open_reply_window(&mut self, probe_tx_at: Instant) {
+        self.reply_window_start = Some(probe_tx_at);
+        self.pending_causes = [None; MIT_EXPIRY_MAX_CAUSES];
+        self.pending_causes[0] = Some(probe_tx_at);
+        self.pending_causes_len = 1;
+        self.reply_ambiguous = false;
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn record_hold_cause(&mut self, hold_at: Instant) {
+        if let Some(w) = self.reply_window_start {
+            if hold_at >= w {
+                let len = self.pending_causes_len as usize;
+                if len < MIT_EXPIRY_MAX_CAUSES {
+                    self.pending_causes[len] = Some(hold_at);
+                    self.pending_causes_len = (len + 1) as u8;
+                } else {
+                    self.reply_ambiguous = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn observe_feedback(&mut self, rx_at: Instant) {
+        if let Some(w) = self.reply_window_start {
+            if rx_at > w {
+                let len = self.pending_causes_len as usize;
+                if len > 0 && self.pending_causes[0].is_some_and(|c| c < rx_at) {
+                    for k in 1..len {
+                        self.pending_causes[k - 1] = self.pending_causes[k];
+                    }
+                    self.pending_causes[len - 1] = None;
+                    self.pending_causes_len = (len - 1) as u8;
+                } else {
+                    self.reply_ambiguous = true;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn observe_untimestamped_feedback(&mut self) {
+        if self.reply_window_start.is_some() {
+            self.reply_ambiguous = true;
+        }
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn reset_probes(&mut self, seen_fb_seq: u64) {
+        self.probe1_tx = None;
+        self.probe1_ack = None;
+        self.probe2_tx = None;
+        self.probe2_ack = None;
+        self.clear_reply_window();
+        self.min_next_fb_seq = self.min_next_fb_seq.max(seen_fb_seq);
+    }
+
+    #[inline]
+    pub(in crate::driver::can_servo) fn reset_attempt(&mut self, seen_fb_seq: u64) {
+        self.dis_tx = None;
+        self.barrier_tx = None;
+        self.barrier_ack = None;
+        self.reset_probes(seen_fb_seq);
+    }
+}
