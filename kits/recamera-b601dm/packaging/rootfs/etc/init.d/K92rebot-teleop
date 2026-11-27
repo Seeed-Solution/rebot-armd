@@ -56,6 +56,8 @@ AP_CONF=/var/run/hostapd_arm.conf
 AP_PIDFILE=/var/run/hostapd_arm.pid
 AP_GUARD_PIDFILE=/var/run/rebot-teleop-apguard.pid
 AP_GUARD_TICKS=30  # x 2 s
+# network.hotspot: "off" skips starting the AP hotspot, AP dnsmasq and guard (takes effect after reboot if already running)
+HOTSPOT="on"
 
 # SG2002 RT priority tuning (applied only when device-tree compatible matches SG2002/CV181x)
 RT_PROC_ROOT=${RT_PROC_ROOT:-/proc}
@@ -112,6 +114,7 @@ try:
     if 'ap_ssid' in net and net['ap_ssid']: put('AP_SSID', net['ap_ssid'])
     if 'ap_password' in net and net['ap_password']: put('AP_PASS', net['ap_password'])
     if 'ap_ip' in net and net['ap_ip']: put('AP_IP', net['ap_ip'])
+    if str(net.get('hotspot', 'on')).strip().lower() in ('off', 'false', '0'): put('HOTSPOT', 'off')
     if net.get('ap_band') in ('5g', '2g4'): put('AP_BAND', net['ap_band'])
     ap_channel = str(net.get('ap_channel', '') or '').strip()
     if ap_channel.isdigit() and int(ap_channel) > 0: put('AP_CHANNEL', int(ap_channel))
@@ -276,11 +279,33 @@ stop_own_ap() {
     rm -f "$AP_PIDFILE"
 }
 
+# True when our AP hostapd or AP guard process is already running (read-only /proc check).
+ap_stack_running() {
+    if own_ap_pid >/dev/null; then
+        return 0
+    fi
+    GPID=$(cat "$AP_GUARD_PIDFILE" 2>/dev/null)
+    case "$GPID" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -d "/proc/$GPID" ] || return 1
+    SCRIPT_BASE=$(basename "$INIT_SCRIPT")
+    case " $(proc_cmdline "$GPID") " in
+        *" $INIT_SCRIPT ap-guard "*|*"/$SCRIPT_BASE ap-guard "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Background guard for the boot race (the console can start its hotspot just after ours):
 # every 2 s for AP_GUARD_TICKS ticks, stop a console hostapd that appeared and restart ours
 # (band $1, channel $2) when it is no longer running or no longer on its channel.
 ap_guard() {
     has_wifi || { rm -f "$AP_GUARD_PIDFILE"; return 0; }
+    if [ "${HOTSPOT:-on}" = off ]; then
+        echo "[rebot-teleop] hotspot off takes effect after reboot"
+        logger -t "$NAME" "hotspot off takes effect after reboot" 2>/dev/null || true
+        return 0
+    fi
     t=0
     off=0
     while [ "$t" -lt "${AP_GUARD_TICKS:-30}" ]; do
@@ -356,6 +381,19 @@ start_wifi() {
             wpa_cli -i wlan0 enable_network "$NID" >/dev/null 2>&1 || true
             wpa_cli -i wlan0 select_network "$NID" >/dev/null 2>&1 || true
         fi
+    fi
+
+    # network.hotspot = off: STA only; never start wlan1, AP hostapd, AP dnsmasq, or guard.
+    # If our AP stack is already running, leave it untouched (takes effect after reboot).
+    if [ "${HOTSPOT:-on}" = off ]; then
+        if ap_stack_running; then
+            echo "[rebot-teleop] hotspot off takes effect after reboot"
+            logger -t "$NAME" "hotspot off takes effect after reboot" 2>/dev/null || true
+        else
+            echo "[rebot-teleop] network.hotspot is off: Wi-Fi AP hotspot and its guard not started"
+            logger -t "$NAME" "network.hotspot=off: AP hotspot and guard not started" 2>/dev/null || true
+        fi
+        return 0
     fi
 
     # 2. 确保虚拟网卡 wlan1 存在
@@ -776,6 +814,10 @@ start() {
         if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
             # armd already up (boot S92 then a console switch, or app_restore): make sure vision runs too
             echo "$NAME is already running (PID: $PID)"
+            if [ "${HOTSPOT:-on}" = off ] && ap_stack_running; then
+                echo "[rebot-teleop] hotspot off takes effect after reboot"
+                logger -t "$NAME" "hotspot off takes effect after reboot" 2>/dev/null || true
+            fi
             start_vision
             apply_rt_priorities
             if [ "$APP_ENABLED" = 1 ] && [ -n "$APP_NAME" ] && ! app_pid >/dev/null; then start_app || true; fi

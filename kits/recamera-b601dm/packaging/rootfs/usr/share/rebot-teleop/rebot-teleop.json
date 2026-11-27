@@ -87,6 +87,14 @@
         "title_zh": "Wi-Fi 热点与联网配置",
         "items": [
           {
+            "key": "hotspot",
+            "type": "select",
+            "title": "reBot Wi-Fi Hotspot (on = start the reBot AP hotspot; off = do not start the reBot hotspot, keep the Wi-Fi client; takes effect after reboot; USB recovery at 192.168.42.1 is not yet verified on hardware)",
+            "title_zh": "reBot Wi-Fi 热点（on = 启动 reBot AP 热点；off = 不启动 reBot 热点，保留 Wi-Fi 客户端；重启后生效；USB 192.168.42.1 恢复尚未在硬件上实测验证）",
+            "options": ["on", "off"],
+            "default": "on"
+          },
+          {
             "key": "ap_ssid",
             "type": "text",
             "title": "AP Hotspot SSID",

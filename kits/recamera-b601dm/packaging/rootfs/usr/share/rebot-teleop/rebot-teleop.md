@@ -3,7 +3,7 @@
 reBot Teleoperation transforms Seeed reCamera SG2002 into an integrated Embodied AI and Robotic Arm controller.
 
 ## Features
-- **Auto Wi-Fi AP Hotspot**: Broadcasts `reCamera-Arm-Teleop` AP (`192.168.42.1`) for zero-router phone connection.
+- **Auto Wi-Fi AP Hotspot**: Broadcasts `reCamera-Arm-Teleop` AP (`192.168.42.1`) for zero-router phone connection. Set `network.hotspot` to `off` in the settings to disable it (default `on`).
 - **Built-in vision (rebot-vision)**: H.264 video, YOLO object detection on the SG2002 TPU and ArUco markers, modes Off / YOLO / ArUco / Both chosen in the cockpit. No other camera app is needed; activating another camera app in the console stops this app.
 - **YOLO model**: not included in the package; the model already on the device is used (`/userdata/rebot-teleop/models/yolo11n.cvimodel`, else the console's or yolo-detector's yolo11n). Without a model, ArUco still works.
 - **reBot B601-DM arm driver**: Damiao motors on the B4 board CAN bus.
