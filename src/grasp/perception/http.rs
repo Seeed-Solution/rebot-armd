@@ -139,7 +139,8 @@ pub struct HttpDetectionSource {
 
 impl HttpDetectionSource {
     /// A result envelope (`latest` or `trigger`) as a frame; `None` when it carries no new frame.
-    pub(in crate::grasp) fn frame(
+    #[doc(hidden)]
+    pub fn frame(
         &self,
         v: &Value,
         after: Option<u64>,

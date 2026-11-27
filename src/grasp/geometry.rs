@@ -166,7 +166,8 @@ pub fn envelope_with_contact(
 
 /// Samples of the straight Cartesian path `from` → `to` as `motion::plan_cartesian`
 /// interpolates it (linear position, rotation along the geodesic): (s, pose), s in (0, 1].
-pub(super) fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
+#[doc(hidden)]
+pub fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
     let dp = kinematics::sub(&to.p, &from.p);
     let w = kinematics::log_v(&kinematics::mul_t(&to.r, &from.r));
     let n = (kinematics::norm(&dp) / 0.005).max(kinematics::norm(&w) / 0.02).ceil().clamp(1.0, 2000.0) as usize;

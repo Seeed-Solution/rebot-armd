@@ -346,10 +346,12 @@ fn prepare_from_read_only(
 }
 
 /// TCP height of the grasp plane (where box centres are assumed to lie).
-pub(super) fn grasp_plane(setup: &GraspSetup) -> f64 { setup.table_z_m + setup.grasp_height_m }
+#[doc(hidden)]
+pub fn grasp_plane(setup: &GraspSetup) -> f64 { setup.table_z_m + setup.grasp_height_m }
 
 /// Look-down approach pose above `target`.
-pub(super) fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
+#[doc(hidden)]
+pub fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
     Pose::new(look_down(r_now), [target[0], target[1], setup.table_z_m + setup.approach_height_m])
 }
 

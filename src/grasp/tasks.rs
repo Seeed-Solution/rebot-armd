@@ -285,7 +285,8 @@ async fn switch_models(source: &dyn DetectionSource, body: &Value, task: &str) -
 /// The dry-run task verdict on one mode reading (no switch): a budget refusal computed from the
 /// provider's catalogue, else `needs model switch` (supported) when the resident set differs,
 /// else the requirement check on the current set.
-pub(super) fn task_verdict(task: &str, requires: &TaskRequires, models: Option<&TaskModels>, mode: &ModeInfo) -> (bool, Option<String>) {
+#[doc(hidden)]
+pub fn task_verdict(task: &str, requires: &TaskRequires, models: Option<&TaskModels>, mode: &ModeInfo) -> (bool, Option<String>) {
     if let Some(want) = models.filter(|w| w.switch_body(mode).is_some()) {
         let budget = mode.models.as_ref().and_then(|pm| pm.budget(&want.after(&pm.resident)));
         return match budget {

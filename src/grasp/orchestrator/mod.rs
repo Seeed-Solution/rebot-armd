@@ -725,7 +725,8 @@ impl Orchestrator {
 
     /// `holding` after `post_lift_settle_ms` from the measured gripper joint, with the gripper policy's rule
     /// (matching GripperMotion in motion.rs). Returns (holding, gap).
-    pub(in crate::grasp) async fn holding_now(&self) -> Result<(bool, f32), Stop> {
+    #[doc(hidden)]
+    pub async fn holding_now(&self) -> Result<(bool, f32), Stop> {
         self.holding_now_fenced(None).await
     }
 
