@@ -916,3 +916,44 @@ fn fallback_margin(s: &Snapshot) -> ErrorMargin {
         (o[0] - td.target[0]).hypot(o[1] - td.target[1]) / (o[2] - td.target[2]).abs().max(1e-3);
     super::margin::margin(&s.calib, scale.max(he) + contour, contour, dist, cam_tan)
 }
+
+#[cfg(test)]
+mod sealed_token_tests {
+    use super::*;
+
+    #[test]
+    fn interval_jaw_check_asymmetric_cut_and_sealed_gate_pass() {
+        // [-5, +45] mm at 85 mm opening, 10 mm hard error:
+        // reserve_pos = 42.5 - 45 - 10 = -12.5 mm, reserve_neg = 42.5 + (-5) - 10 = +27.5 mm.
+        let cut = JawCut::new(-0.005, 0.045, "contour");
+        let err = jaw_check(&cut, 0.010, 0.085, Some(0.075)).expect_err("asymmetric cut must fail OPENING");
+        assert_eq!(err.code, "OPENING");
+        assert!((err.value.unwrap() - (-0.0125)).abs() < 1e-12, "{err:?}");
+        assert!((err.bound.unwrap() - MIN_OPENING_RESERVE_M).abs() < 1e-12, "{err:?}");
+
+        // Sealed JawGatePass is only constructed by JawAdmission::live_gate.
+        let ok_cut = JawCut::new(-0.010, 0.025, "contour");
+        let fit = jaw_check(&ok_cut, 0.010, 0.085, None).expect("symmetric/offset fit passes");
+        assert!((fit.reserve_pos_m - 0.0075).abs() < 1e-12);
+        assert!((fit.reserve_neg_m - 0.0225).abs() < 1e-12);
+        assert!((fit.reserve_m - 0.0075).abs() < 1e-12);
+        assert!((fit.min_opening_m - 2.0 * (0.025 + 0.010 + 0.003)).abs() < 1e-12);
+        let adm = JawAdmission {
+            candidate_id: "test-top".into(),
+            fit: Some(fit),
+            hard_error_m: 0.010,
+            open_width_m: 0.085,
+            max_grasp_width_m: 0.075,
+            full_route_checked: false,
+            deferred: None,
+            evidence: "contour",
+            error_margin: super::super::margin::margin(&super::super::margin::quality(None), 0.010, 0.001, 0.25, 0.5),
+        };
+        let pass: JawGatePass = adm.live_gate(&ok_cut, 0.085, None, "post_transition").expect("gate passes");
+        assert_eq!(pass.fit(), fit);
+        assert_eq!(pass.evidence_age(), "post_transition");
+        assert_eq!(adm.to_json()["evidence"], "contour");
+        assert_eq!(adm.to_json()["evidence_age"], "pre_transition");
+        assert_eq!(adm.live_gate(&cut, 0.085, None, "post_transition").unwrap_err().code, "OPENING");
+    }
+}

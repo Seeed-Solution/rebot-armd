@@ -202,12 +202,17 @@ async fn exact_threshold_passes_both_strategies_and_just_over_refuses_both() {
 
     let sc = mounted_scene(0.30, 0.0, 0.26).await;
     let (open, max_w, he) = jaw_numbers(&sc).await;
-    // End-to-end camera projection: solve the exact drawn width whose projected contour width
-    // equals `open - 2 * hard_error - 0.006` (zero backoff below equality).
+    // End-to-end camera projection: solve the exact drawn width whose projected interval reserve
+    // at legacy box-centre equals `0.003` (zero backoff below equality).
     let w0 = open - 2.0 * he - 0.006;
     let probe = exact(request(&sc, &bar([0.30, 0.0], 0.08, w0, 0.0), 0.035), 0.035);
-    let probe_ad = dry(&sc, &probe).await;
-    let probe_res = probe_ad["best_refusal"]["value"].as_f64().unwrap_or(0.003);
+    let probe_leg = dry(&sc, &legacy_of(&probe)).await;
+    let probe_res = probe_leg
+        .get("jaw")
+        .and_then(|j| j.get("opening_reserve_m"))
+        .and_then(Value::as_f64)
+        .or_else(|| probe_leg["best_refusal"]["value"].as_f64())
+        .unwrap_or(0.003);
     // Reserve error = (0.003 - probe_res) per side -> adjust drawn width by 2 * (probe_res - 0.003).
     let w = w0 + 2.0 * (probe_res - 0.003);
     assert!(w < max_w, "threshold {w} inside the cap {max_w}");
@@ -245,7 +250,9 @@ async fn wide_banana_is_refused_by_both_strategies_with_the_measured_reserve() {
     println!("legacy {leg:?}");
     assert_eq!((leg["reachable"].clone(), leg["code"].clone(), leg["failing_phase"].clone()), (json!(false), json!("OPENING"), json!("geometry")), "{leg:?}");
     let br = &leg["best_refusal"];
-    assert!((f(&br["value"]) + 0.003).abs() < 0.0015 && f(&br["bound"]) == 0.003, "{br}");
+    // Interval jaw_check catches the curved banana's box-centre offset (~6.15 mm) on top of the
+    // width excess (~3 mm), giving a stricter negative reserve (~-9.3 mm < -3 mm).
+    assert!(f(&br["value"]) < -0.003 && f(&br["bound"]) == 0.003, "{br}");
     assert_eq!(leg["error_margin"]["error_margin_source"], "fallback");
     let ad = dry(&sc, &body).await;
     println!("adaptive {}", summary(&ad));
@@ -831,10 +838,11 @@ async fn live_legacy_insertion_enforces_77mm_opening_cap_off_absent_width_skippe
     let a2 = run_live_legacy_case(s2, [0.025, 0.015], Some(310.0), None).await;
     assert_eq!((a2.state.as_str(), a2.code.as_deref()), ("failed", Some("OPENING")), "{a2:?}");
 
-    // 3. Deferred box-only (wide box > jaw reserve) with absent live width -> NO_WIDTH_EVIDENCE!
+    // 3. Deferred box-only (wide box > jaw reserve) with absent scalar width: Rung 3 fresh
+    // projected box cut (~88 mm) exceeds the 85 mm cap -> TOO_WIDE before descent!
     let s3 = GraspSetup { max_grasp_width_m: 0.10, ..GraspSetup::default() };
     let a3 = run_live_legacy_case(s3, [0.036, 0.036], None, None).await;
-    assert_eq!((a3.state.as_str(), a3.code.as_deref()), ("failed", Some("NO_WIDTH_EVIDENCE")), "{a3:?}");
+    assert_eq!((a3.state.as_str(), a3.code.as_deref()), ("failed", Some("TOO_WIDE")), "{a3:?}");
 
     // 4. Skipped alignment (align_j6 = false) on elongated object (60 mm along Y, 30 mm along X):
     // detector reports short side 120 px (~27 mm) + confident angle, but jaws stay unaligned along

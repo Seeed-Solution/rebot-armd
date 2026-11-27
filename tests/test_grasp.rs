@@ -2106,8 +2106,8 @@ async fn grasp_diagnostics_phase_ms_and_motions_with_tracking_error() {
 
 #[tokio::test]
 async fn orchestrator_test_pre_open_j7_before_descend() {
-    // 4 cm object with pre_open "on": preopens to width (0.040) + margin (0.015) = 0.055 m.
-    // Sim model: [[0, 0], [-5.7, 0.085]] -> j7_for(0.055) ≈ -3.688 rad.
+    // 4 cm object with pre_open "on": preopens to max(w + margin, min_opening) ≈ 66.469 mm.
+    // Sim model: [[0, 0], [-5.7, 0.085]] -> j7_for(0.06647) ≈ -4.457 rad.
     // Also tests that pre-open is allowed without an accepted angle (angle_conf low 0.1).
     let setup = GraspSetup {
         pre_open: armd::grasp::PreOpen::On,
@@ -2142,7 +2142,7 @@ async fn orchestrator_test_pre_open_j7_before_descend() {
     assert_eq!(a.holding, Some(true));
     assert_eq!(a.pre_open.as_deref(), Some("done"));
     let pre_w = a.pre_open_m.expect("pre_open_m recorded");
-    assert!((pre_w - 0.055).abs() < 0.008, "pre_open_m {pre_w} should be near 0.055 m");
+    assert!((pre_w - 0.066469).abs() < 0.001, "pre_open_m {pre_w} should be near 0.066469 m");
 
     let j7 = pre_descend_j7.expect("J7 captured during descend phase");
     let expected_j7 = -5.7 * (pre_w / 0.085);
