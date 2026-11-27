@@ -423,6 +423,7 @@ impl Orchestrator {
 
         let mut close_h = s.grasp_height_m;
         let mut plane = plane;
+        let height_is_setup = chosen.is_none();
         let depth_chosen = chosen.as_ref().is_some_and(|(_, source)| source.starts_with("depth"));
         match chosen {
             Some((h, source)) => {
@@ -506,35 +507,49 @@ impl Orchestrator {
         }
 
         // camera-down: re-orient to the tool-vertical pose above the target's table point
-        if camera_down {
+        let fresh_view = if camera_down {
             self.phase("transition", 0.5).await?;
             // the ray of the last centring box from the pose it was seen at (before the probe)
             let Some((t, goal)) = transition_pose(&c.pose, self.cam.to_px(box_centre(&last.box_norm)), plane, s, &self.cam) else {
                 return Err(fail("CENTRING_FAILED", "The target ray does not meet the table plane"));
             };
             let done = self.move_arm_in(GoalFrame::Tcp, "transition", GoalSpec::Absolute { p: goal.p, r: Some(goal.r) }, s.approach_speed_mps).await?;
-            // verify the target where the model expects it before descending
-            self.recheck(&planned.request.label, &last, &t, grip_px, done.at, &mut after).await?;
-        }
+            // verify the target where the model expects it before descending; returns Some(FreshView)
+            // when expected in FOV, Ok(None) when outside the post-transition FOV.
+            self.recheck(&planned.request.label, &last, &t, grip_px, done.at, &mut after).await?
+        } else {
+            None
+        };
+        // A border-clipped FreshView is incomplete for width/orientation: keep the recheck centre
+        // verification (already ran above) and fall back to the full pre-transition frame `c` with
+        // the settled wrist orientation (Addendum 2 Q4). Non-clipped FreshView still decides.
+        let (view, evidence_age) = match fresh_view {
+            Some(fv) if !touches_border(&fv.det.box_norm, self.cam.size) => (
+                Centred { last: fv.det.clone(), frames: vec![fv.det], pose: fv.pose, iterations: 0 },
+                "post_transition",
+            ),
+            _ => (c.clone(), "pre_transition"),
+        };
 
-        // J6 alignment: close the jaws across the object's short side
+        // J6 alignment: close the jaws across the object's short side (using FreshView when available)
         self.phase("align", 0.55).await?;
-        let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
+        let (turn, align) = if s.align_j6 { self.align_turn(&view, plane).await } else { (None, "off".to_string()) };
         self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Align {
             align: crate::rt_core::action_diag::ShortLabel::new_truncated(&align),
             turn_rad: turn.map(|t| t as f32),
         });
         self.update_action_if_legacy(|a| { a.align = Some(align.clone()); a.align_turn_rad = turn.map(|t| t as f32); }).await;
+        if let Some(turn) = turn {
+            self.move_arm_in(GoalFrame::Tcp, "align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false, auto_yaw: None }, s.approach_speed_mps).await?;
+        }
 
         // grasp width: `width_record` sources first (reported only), then `width_sources` in
-        // order until one accepts; one limit check on the chosen width. The width is measured
-        // whatever the angle confidence: a disc or a square has a low angle_conf but a valid
-        // width (any closing direction sees about the same width)
+        // order until one accepts (mask width uses FreshView when available).
         let width_record: Vec<WidthSource> = s.width_record.iter().copied().filter(|x| !s.width_sources.contains(x)).collect();
         let mut wchain = EstimateChain::new();
         let width_of = |src: WidthSource| -> SourceResult {
             let r = match src {
-                WidthSource::Mask => self.mask_width_m(&c, plane),
+                WidthSource::Mask => self.mask_width_m(&view, plane),
                 WidthSource::Depth => match depth_res {
                     Ok(m) => m.width_m.ok_or("no_width"),
                     Err(why) => Err(if depth { why } else { "unavailable" }),
@@ -564,38 +579,36 @@ impl Orchestrator {
             a.width_estimates = width_entries;
             if let Some(w) = measured_width_m { a.grasp_width_m = Some(w as f32); }
         }).await;
-        // Actual post-align closing axis (after J6 alignment succeeds, keeps, or skips/turns off).
-        let pose_pre_align = self.pose().await;
-        let tcp_pre_align = self.tcp_pose().await;
-        let tcp_xy = [tcp_pre_align.p[0], tcp_pre_align.p[1]];
-        let actual_grasp_r = match turn {
-            Some(t) => kinematics::mat_mul(&pose_pre_align.r, &kinematics::axis_r(&[1.0, 0.0, 0.0], t)),
-            None => pose_pre_align.r,
-        };
-        let actual_jaw_col = kinematics::column(&actual_grasp_r, 1);
-        let actual_jaw_xy = crate::grasp_select::geometry::unit2([actual_jaw_col[0], actual_jaw_col[1]]);
+
+        // Live legacy jaw gate AFTER the J6 align move, using the SETTLED TCP pose and closing
+        // axis and fresh evidence (rungs 1 contour, 2 scalar across actual axis, restricted
+        // Addendum 3 admission_shifted when height_source == "setup" & non-deferred & no
+        // non-clipped FreshView, 3 box; else NO_WIDTH_EVIDENCE).
+        let settled_tcp = self.tcp_pose().await;
         let aligned_to_angle = matches!(align.as_str(), "turned:angle" | "kept:angle" | "turned:depth" | "kept:depth");
-        let consistent_elongated_angle = frames_angle(&c.frames, s.align_min_angle_conf)
+        let consistent_elongated_angle = frames_angle(&view.frames, s.align_min_angle_conf)
             .is_some_and(|(_a, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
         let scalar_across_actual = aligned_to_angle || !consistent_elongated_angle;
-        let live_cut = self
-            .footprint_interval_along_axis(&c.last, &c.pose, plane, tcp_xy, actual_jaw_xy, false)
-            .or_else(|| {
-                if !scalar_across_actual {
-                    return None;
-                }
-                let w = measured_width_m?;
-                let bc = self.cam.plane_point(&c.pose, self.cam.to_px(box_centre(&c.last.box_norm)), plane)?;
-                let off = crate::grasp_select::geometry::dot2([bc[0] - tcp_xy[0], bc[1] - tcp_xy[1]], actual_jaw_xy);
-                Some(crate::grasp_select::JawCut::from_offset(off, w, "scalar"))
-            })
-            .or_else(|| {
-                self.footprint_interval_along_axis(&c.last, &c.pose, plane, tcp_xy, actual_jaw_xy, true)
-            });
         let width_cap = self.effective_max_grasp_width_cap().await;
         let jaw = planned.jaw.as_ref().ok_or_else(|| {
             fail("NO_WIDTH_EVIDENCE", "Legacy grasp is missing its jaw admission state")
         })?;
+        let admission_shifted_width_m = if height_is_setup
+            && evidence_age != "post_transition"
+            && !jaw.is_deferred()
+        {
+            jaw.fit().map(|f| f.width_m)
+        } else {
+            None
+        };
+        let live_cut = self.resolve_live_jaw_cut(
+            &view,
+            plane,
+            &settled_tcp,
+            measured_width_m,
+            scalar_across_actual,
+            admission_shifted_width_m,
+        );
         let Some(live_cut) = live_cut else {
             return Err(fail(
                 "NO_WIDTH_EVIDENCE",
@@ -603,12 +616,18 @@ impl Orchestrator {
             ));
         };
         let mut gate_pass = jaw
-            .live_gate(&live_cut, jaw.open_width_m(), width_cap, "pre_transition")
-            .map_err(|r| fail(&r.code, format!("Object width {:.3} m: {}", live_cut.width_m(), r.message)))?;
-
-        if let Some(turn) = turn {
-            self.move_arm_in(GoalFrame::Tcp, "align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false, auto_yaw: None }, s.approach_speed_mps).await?;
-        }
+            .live_gate(&live_cut, jaw.open_width_m(), width_cap, evidence_age)
+            .map_err(|r| fail(&r.code, format!("Object width {:.3} m ({}): {}", live_cut.width_m(), live_cut.evidence, r.message)))?;
+        tracing::info!(
+            "Grasp {}: live jaw gate passed (evidence={}, evidence_age={}, interval=[{:.4}, {:.4}] m, reserve={:.4} m, min_opening={:.4} m)",
+            self.id,
+            live_cut.evidence,
+            evidence_age,
+            live_cut.lo_m,
+            live_cut.hi_m,
+            gate_pass.fit().reserve_m,
+            gate_pass.fit().min_opening_m,
+        );
 
         // width-based pre-open before descend
         let (pre_open_decision, pre_open_target) = {
@@ -622,13 +641,13 @@ impl Orchestrator {
                     } else if s.pre_open == PreOpen::Auto && !calibrated {
                         (Some("skipped:uncalibrated".to_string()), None)
                     } else if !aligned_to_angle
-                        && frames_angle(&c.frames, s.align_min_angle_conf).is_some()
+                        && frames_angle(&view.frames, s.align_min_angle_conf).is_some()
                     {
                         // an elongated mask (confident angle): its narrowest cross-section is the
                         // width across the jaws only once J6 is aligned to it; a round or square
                         // mask (no confident angle) has about the same width in every direction
                         (Some("skipped:not_aligned".to_string()), None)
-                    } else if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) {
+                    } else if let Err(reason) = align_guard(&view.last, &view.frames, self.cam.size) {
                         (Some(format!("skipped:{reason}")), None)
                     } else if let Some(w) = measured_width_m {
                         let min_open = gate_pass.fit().min_opening_m;
@@ -667,10 +686,12 @@ impl Orchestrator {
             }
         };
 
+        let mut active_open_w = jaw.open_width_m();
         if let Some((fraction, target_w, actual_open_w)) = pre_open_target {
             gate_pass = jaw
                 .live_gate(&live_cut, actual_open_w, width_cap, gate_pass.evidence_age())
                 .map_err(|r| fail(&r.code, format!("Pre-open width {actual_open_w:.3} m for object {:.3} m: {}", live_cut.width_m(), r.message)))?;
+            active_open_w = actual_open_w;
             self.phase("preopen", 0.6).await?;
             self.gripper_move("preopen", fraction).await?;
             self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PreOpen {
@@ -700,7 +721,7 @@ impl Orchestrator {
         // descend (look-down: re-centre at mid height on the way), close, check
         self.phase("descend", 0.65).await?;
         if !camera_down {
-            let (recentre, iterations) = self.recentre(&c, plane, close_h, &planned.request.label, &mut after).await?;
+            let (recentre, iterations, rec_view) = self.recentre(&c, plane, close_h, &planned.request.label, &mut after).await?;
             if self.is_executor() {
                 let status = self.sup.hub().intern_action_diag_str(self.id, &recentre);
                 self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Recentre {
@@ -709,6 +730,38 @@ impl Orchestrator {
                 });
             } else {
                 self.update_action_if_legacy(|a| { a.recentre = Some(recentre); a.recentre_iterations = iterations; }).await;
+            }
+            if let Some(rec_c) = rec_view {
+                let rec_tcp = self.tcp_pose().await;
+                let rec_width_m = if s.width_sources.contains(&WidthSource::Mask) {
+                    self.mask_width_m(&rec_c, plane).ok()
+                } else {
+                    None
+                };
+                let Some(rec_cut) = self.resolve_live_jaw_cut(
+                    &rec_c,
+                    plane,
+                    &rec_tcp,
+                    rec_width_m,
+                    scalar_across_actual,
+                    admission_shifted_width_m,
+                ) else {
+                    return Err(fail(
+                        "NO_WIDTH_EVIDENCE",
+                        "No fresh object width evidence along the closing axis after mid-descent recentre",
+                    ));
+                };
+                gate_pass = jaw
+                    .live_gate(&rec_cut, active_open_w, width_cap, "recentre")
+                    .map_err(|r| fail(&r.code, format!("Post-recentre object width {:.3} m ({}): {}", rec_cut.width_m(), rec_cut.evidence, r.message)))?;
+                tracing::info!(
+                    "Grasp {}: post-recentre jaw gate passed (evidence={}, evidence_age=recentre, interval=[{:.4}, {:.4}] m, reserve={:.4} m)",
+                    self.id,
+                    rec_cut.evidence,
+                    rec_cut.lo_m,
+                    rec_cut.hi_m,
+                    gate_pass.fit().reserve_m,
+                );
             }
             self.phase("descend", 0.75).await?;
         }

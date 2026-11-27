@@ -14,15 +14,35 @@ use crate::grasp::{
     TRIGGER_WAIT_MS,
 };
 
+/// Post-transition observation returned by [`Orchestrator::recheck`] when the target is expected
+/// in the post-transition camera field of view: the matched fresh detection paired with the
+/// end-link pose at which it was captured.
+#[derive(Debug, Clone)]
+pub(super) struct FreshView {
+    pub det: Detection,
+    pub pose: Pose,
+}
+
 impl Orchestrator {
     /// After the camera-down transition, when the model projects the target `t` into the
     /// image: one fresh frame must show it (else TARGET_LOST / DETECTION_UNAVAILABLE), within
     /// `recheck_tol_px` of the projection (else TARGET_DISPLACED). Records the box centre minus
-    /// `grip_px` as `final_offset_px`. Nothing is checked when the target is not expected in view.
-    pub(super) async fn recheck(&self, label: &str, last: &Detection, t: &Vec3, grip_px: [f64; 2], since: Instant, after: &mut Option<u64>) -> Result<(), Stop> {
+    /// `grip_px` as `final_offset_px` and returns `Some(FreshView { det, pose })`. Returns
+    /// `Ok(None)` when the target is not expected in the post-transition camera FOV.
+    pub(super) async fn recheck(
+        &self,
+        label: &str,
+        last: &Detection,
+        t: &Vec3,
+        grip_px: [f64; 2],
+        since: Instant,
+        after: &mut Option<u64>,
+    ) -> Result<Option<FreshView>, Stop> {
         let pose = self.pose().await;
-        let Some(p) = self.cam.project(&pose, t) else { return Ok(()) };
-        if !(p[0] >= 0.0 && p[0] <= self.cam.size[0] && p[1] >= 0.0 && p[1] <= self.cam.size[1]) { return Ok(()); }
+        let Some(p) = self.cam.project(&pose, t) else { return Ok(None); };
+        if !(p[0] >= 0.0 && p[0] <= self.cam.size[0] && p[1] >= 0.0 && p[1] <= self.cam.size[1]) {
+            return Ok(None);
+        }
         let mut tracker = Tracker { label: label.to_string(), predicted: last.box_norm, gate_px: self.setup.acquire_dist_px };
         tracker.predict_at(self.cam.to_norm(p));
         let d = self.fresh_match(&tracker, since, after).await?;
@@ -37,7 +57,7 @@ impl Orchestrator {
         if moved > self.setup.recheck_tol_px {
             return Err(fail("TARGET_DISPLACED", format!("Target {moved:.0} px from where it was expected after the transition (recheck_tol_px {:.0})", self.setup.recheck_tol_px)));
         }
-        Ok(())
+        Ok(Some(FreshView { det: d, pose }))
     }
 
     /// Closed-loop centring: drive the target's median box centre onto `aim_px` (pixel errors
@@ -504,11 +524,19 @@ impl Orchestrator {
     /// Look-down mid-height re-centre: descend to `recentre_height_m`, then centre the target
     /// on the grip pixel for that height: the model's projection of the point under the TCP on
     /// the plane z = `plane`, plus the calibration offset (`grip_pixel_norm` minus the model's
-    /// projection of that point at the centring pose). Returns the `recentre` status and the
-    /// corrections; target lost, table clearance or an unusable aim skip it (the descent goes on).
-    pub(super) async fn recentre(&self, c: &Centred, plane: f64, close_h: f64, label: &str, after: &mut Option<u64>) -> Result<(String, Option<u32>), Stop> {
+    /// projection of that point at the centring pose). Returns the `recentre` status, the
+    /// corrections, and `Some(Centred)` when fresh frames were produced (for re-running the live
+    /// jaw gate); target lost, table clearance or an unusable aim skip it without horizontal shift.
+    pub(super) async fn recentre(
+        &self,
+        c: &Centred,
+        plane: f64,
+        close_h: f64,
+        label: &str,
+        after: &mut Option<u64>,
+    ) -> Result<(String, Option<u32>, Option<Centred>), Stop> {
         let s = &self.setup;
-        let skip = |r: &str| Ok((format!("skipped:{r}"), None));
+        let skip = |r: &str| Ok((format!("skipped:{r}"), None, None));
         if s.recentre_height_m <= 0.0 { return skip("disabled"); }
         if !self.lens_known { return skip("no_lens_centre"); }
         let pose = self.pose().await;
@@ -532,10 +560,13 @@ impl Orchestrator {
         let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
         if let Some(p) = self.cam.project(&now, &t3) { tracker.predict_at(self.cam.to_norm(p)); }
         match self.centre("recentre", 0.7, &mut tracker, aim, "the grip point", plane, done.at, after, s.recentre_max_iterations, false).await {
-            Ok(r) => Ok(("done".into(), Some(r.iterations))),
+            Ok(r) => {
+                let iters = r.iterations;
+                Ok(("done".into(), Some(iters), Some(r)))
+            }
             Err(Stop::Fail(code, _)) if code == "TARGET_LOST" => skip("target_lost"),
             Err(Stop::Fail(code, _)) if code == "WORKSPACE_VIOLATION" => skip("table_clearance"),
-            Err(Stop::Fail(code, _)) if code == "CENTRING_FAILED" => Ok(("unconverged".into(), Some(s.recentre_max_iterations))),
+            Err(Stop::Fail(code, _)) if code == "CENTRING_FAILED" => Ok(("unconverged".into(), Some(s.recentre_max_iterations), None)),
             Err(e) => Err(e),
         }
     }
@@ -807,6 +838,57 @@ impl Orchestrator {
         Some(crate::grasp_select::JawCut::new(lo, hi, "box"))
     }
 
+    /// Resolve [`crate::grasp_select::JawCut`] at the live gate using settled TCP pose
+    /// `settled_tcp`:
+    /// (1) fresh contour cut along the settled closing axis `u`;
+    /// (2) fresh scalar width measured across the actual closing axis as `[off - w/2, off + w/2]`
+    ///     with `off = (fresh box centre - TCP) · u`;
+    /// (2b, restricted Addendum 3) when no fresh contour and no fresh scalar width exist and
+    ///     `admission_shifted_width_m` is `Some(w)` (`height_source == "setup"`, non-deferred
+    ///     admission, no non-clipped post-transition `FreshView`), shift `w` by live `off` as
+    ///     `"admission_shifted"`;
+    /// (3) fresh projected box cut (upper bound) along `u`.
+    /// Returns `None` when no evidence covers the closing axis (caller refuses `NO_WIDTH_EVIDENCE`).
+    pub(super) fn resolve_live_jaw_cut(
+        &self,
+        view: &Centred,
+        plane: f64,
+        settled_tcp: &Pose,
+        measured_width_m: Option<f64>,
+        scalar_across_actual: bool,
+        admission_shifted_width_m: Option<f64>,
+    ) -> Option<crate::grasp_select::JawCut> {
+        let tcp_xy = [settled_tcp.p[0], settled_tcp.p[1]];
+        let jaw_col = kinematics::column(&settled_tcp.r, 1);
+        let u = crate::grasp_select::geometry::unit2([jaw_col[0], jaw_col[1]]);
+        // Rung 1: fresh contour cut
+        if let Some(cut) = self.footprint_interval_along_axis(&view.last, &view.pose, plane, tcp_xy, u, false) {
+            return Some(cut);
+        }
+        // Rung 2: fresh scalar width across the actual closing axis
+        if scalar_across_actual {
+            if let Some(w) = measured_width_m {
+                if let Some(bc) = self.cam.plane_point(&view.pose, self.cam.to_px(box_centre(&view.last.box_norm)), plane) {
+                    let off = crate::grasp_select::geometry::dot2([bc[0] - tcp_xy[0], bc[1] - tcp_xy[1]], u);
+                    return Some(crate::grasp_select::JawCut::from_offset(off, w, "scalar"));
+                }
+            }
+        }
+        // Restricted Addendum 3 fallback: admission-checked width shifted by live offset when
+        // height_source == "setup", non-deferred admission, no non-clipped FreshView, and no
+        // fresh contour or scalar width.
+        if measured_width_m.is_none() {
+            if let Some(ad_w) = admission_shifted_width_m {
+                if let Some(bc) = self.cam.plane_point(&view.pose, self.cam.to_px(box_centre(&view.last.box_norm)), plane) {
+                    let off = crate::grasp_select::geometry::dot2([bc[0] - tcp_xy[0], bc[1] - tcp_xy[1]], u);
+                    return Some(crate::grasp_select::JawCut::from_offset(off, ad_w, "admission_shifted"));
+                }
+            }
+        }
+        // Rung 3: fresh projected box cut (upper bound)
+        self.footprint_interval_along_axis(&view.last, &view.pose, plane, tcp_xy, u, true)
+    }
+
     /// TOO_WIDE limit (m; 0 = off): the calibrated full opening minus `pre_open_margin_m`, at
     /// most `max_grasp_width_m` (when > 0); `max_grasp_width_m` without a calibrated policy.
     #[allow(dead_code)]
@@ -956,6 +1038,7 @@ pub enum Lateral {
 }
 
 /// Matched frames of the last centring pose.
+#[derive(Debug, Clone)]
 pub struct Centred {
     pub last: Detection,
     pub frames: Vec<Detection>,

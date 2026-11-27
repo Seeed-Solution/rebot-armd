@@ -277,6 +277,7 @@ impl JawAdmission {
         json!({
             "candidate_id": self.candidate_id,
             "evidence": self.evidence,
+            "evidence_age": "pre_transition",
             "lo_m": self.fit.map(|f| f.lo_m),
             "hi_m": self.fit.map(|f| f.hi_m),
             "width_m": self.fit.map(|f| f.width_m),
