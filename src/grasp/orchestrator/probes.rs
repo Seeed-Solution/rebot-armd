@@ -726,8 +726,75 @@ impl Orchestrator {
         }
     }
 
+    /// Optional TOO_WIDE cap (m) enforced independently of the opening reserve: `None` when the
+    /// cap is disabled (`max_grasp_width_m <= 0`) on an uncalibrated policy.
+    pub(super) async fn effective_max_grasp_width_cap(&self) -> Option<f64> {
+        let s = &self.setup;
+        if self.is_executor() {
+            let Some(env) = self.sup.hub().prep_env() else {
+                return (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m);
+            };
+            match env.config.gripper_policy.as_ref() {
+                Some(p) if p.is_calibrated() => {
+                    let calib_limit = f64::from(p.opening_m(p.open_rad)) - s.pre_open_margin_m;
+                    Some(if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit })
+                }
+                Some(p) if s.max_grasp_width_m > 0.0 => {
+                    let check = crate::model::check_grasp_width(p, s.max_grasp_width_m, env.requires_real_jaw_curve);
+                    Some(check.effective_max_m(s.max_grasp_width_m))
+                }
+                Some(_) => None,
+                None => (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m),
+            }
+        } else {
+            let inner = self.sup.inner().read().await;
+            match inner.config.gripper_policy.as_ref() {
+                Some(p) if p.is_calibrated() => {
+                    let calib_limit = f64::from(p.opening_m(p.open_rad)) - s.pre_open_margin_m;
+                    Some(if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit })
+                }
+                Some(_) if s.max_grasp_width_m > 0.0 => {
+                    Some(inner.grasp_width_check(s.max_grasp_width_m)
+                        .map_or(s.max_grasp_width_m, |c| c.effective_max_m(s.max_grasp_width_m)))
+                }
+                Some(_) => None,
+                None => (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m),
+            }
+        }
+    }
+
+    /// Projected width of a centred detection's contour (or axis-aligned box when `allow_box` is
+    /// true) along the actual base-frame closing axis `closing_xy` on `plane`.
+    pub(super) fn footprint_width_along_axis(&self, c: &Centred, plane: f64, closing_xy: [f64; 2], allow_box: bool) -> Option<f64> {
+        let u = crate::grasp_select::geometry::unit2(closing_xy);
+        let centre_world = self.cam.plane_point(&c.pose, self.cam.to_px(box_centre(&c.last.box_norm)), plane)?;
+        let p = [centre_world[0], centre_world[1]];
+        if let Some(Ok(ref pts)) = c.last.contour_norm {
+            let world: Option<Vec<[f64; 2]>> = pts
+                .iter()
+                .map(|v| self.cam.plane_point(&c.pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
+                .collect();
+            if let Some(mut wpts) = world.filter(|w| w.len() >= 3) {
+                crate::grasp_select::geometry::ensure_ccw(&mut wpts);
+                return crate::grasp_select::candidates::cut_width_near(&wpts, p, u);
+            }
+        }
+        if !allow_box {
+            return None;
+        }
+        let b = c.last.box_norm;
+        let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+        let mut wpts: Vec<[f64; 2]> = corners
+            .iter()
+            .map(|v| self.cam.plane_point(&c.pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
+            .collect::<Option<Vec<_>>>()?;
+        crate::grasp_select::geometry::ensure_ccw(&mut wpts);
+        crate::grasp_select::candidates::cut_width_near(&wpts, p, u)
+    }
+
     /// TOO_WIDE limit (m; 0 = off): the calibrated full opening minus `pre_open_margin_m`, at
     /// most `max_grasp_width_m` (when > 0); `max_grasp_width_m` without a calibrated policy.
+    #[allow(dead_code)]
     pub(super) async fn max_grasp_width(&self) -> f64 {
         let s = &self.setup;
         if self.is_executor() {

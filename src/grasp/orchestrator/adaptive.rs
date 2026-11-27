@@ -441,26 +441,75 @@ impl Orchestrator {
                 }
             }
 
-            // The shared jaw predicate on the fresh contour (when the detection carries one):
-            // the cut along the planned closing axis through the planned contact.
-            if let Some(Ok(ref pts)) = best.contour_norm {
-                let world: Option<Vec<[f64; 2]>> = pts
-                    .iter()
-                    .map(|v| self.cam.plane_point(pose_end, self.cam.to_px(*v), z_mid).map(|p| [p[0], p[1]]))
-                    .collect();
-                if let Some(mut wpts) = world.filter(|w| w.len() >= 3) {
+            // The shared jaw predicate on fresh evidence at the planned contact and closing axis,
+            // with jaw-elevation tilt correction and actual insertion opening (never silently
+            // skipping missing/malformed contour evidence or substituting a disjoint chord).
+            let y = kinematics::column(&route.plan.grasp.r, 1);
+            let cos_elev = y[0].hypot(y[1]).clamp(1e-6, 1.0);
+            let u = crate::grasp_select::geometry::unit2([y[0], y[1]]);
+            let p = route.contact_centre;
+            let cut_tol = route.opening_reserve_m.clamp(0.005, 0.015);
+            let fresh_poly: Vec<[f64; 2]> = match &best.contour_norm {
+                Some(Ok(pts)) => {
+                    let world: Option<Vec<[f64; 2]>> = pts
+                        .iter()
+                        .map(|v| self.cam.plane_point(pose_end, self.cam.to_px(*v), z_mid).map(|q| [q[0], q[1]]))
+                        .collect();
+                    let Some(mut wpts) = world.filter(|w| w.len() >= 3) else {
+                        return Err(fail(
+                            "NO_WIDTH_EVIDENCE",
+                            format!("[{phase}] fresh contour of '{label}' could not be projected onto the target plane"),
+                        ));
+                    };
                     crate::grasp_select::geometry::ensure_ccw(&mut wpts);
-                    let y = kinematics::column(&route.plan.grasp.r, 1);
-                    let u = crate::grasp_select::geometry::unit2([y[0], y[1]]);
-                    let p = [route.plan.grasp.p[0], route.plan.grasp.p[1]];
-                    if let Some(w) = crate::grasp_select::candidates::cut_width_near(&wpts, p, u) {
-                        let max_w = self.max_grasp_width().await;
-                        let cap = (max_w > 0.0).then_some(max_w);
-                        if let Err(r) = crate::grasp_select::admission::jaw_check(w, route.target_hard_error_m, route.plan.jaw_opening_m, cap) {
-                            return Err(fail(&r.code, format!("[{phase}] fresh contour of '{label}': {}", r.message)));
-                        }
-                    }
+                    wpts
                 }
+                Some(Err(why)) => {
+                    return Err(fail(
+                        "NO_WIDTH_EVIDENCE",
+                        format!("[{phase}] fresh contour of '{label}' malformed: {why}"),
+                    ));
+                }
+                None if route.has_contour_evidence => {
+                    return Err(fail(
+                        "NO_WIDTH_EVIDENCE",
+                        format!("[{phase}] fresh detection of '{label}' is missing its contour"),
+                    ));
+                }
+                None => {
+                    let b = best.box_norm;
+                    let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+                    let world: Option<Vec<[f64; 2]>> = corners
+                        .iter()
+                        .map(|v| self.cam.plane_point(pose_end, self.cam.to_px(*v), z_mid).map(|q| [q[0], q[1]]))
+                        .collect();
+                    let Some(mut wpts) = world.filter(|w| w.len() >= 3) else {
+                        return Err(fail(
+                            "NO_WIDTH_EVIDENCE",
+                            format!("[{phase}] fresh box of '{label}' could not be projected onto the target plane"),
+                        ));
+                    };
+                    crate::grasp_select::geometry::ensure_ccw(&mut wpts);
+                    wpts
+                }
+            };
+            let Some(w_horiz) = crate::grasp_select::candidates::cut_width_at(&fresh_poly, p, u, cut_tol) else {
+                return Err(fail(
+                    "TARGET_DISPLACED",
+                    format!("[{phase}] fresh footprint of '{label}' no longer covers the planned contact along the closing axis"),
+                ));
+            };
+            let w_eff = w_horiz / cos_elev;
+            let cap = self.effective_max_grasp_width_cap().await;
+            let open_w = match (route.pre_open_fraction, self.gripper_policy().await) {
+                (Some(frac), Some(pol)) => {
+                    let j7 = pol.closed_rad + (frac as f32) * (pol.open_rad - pol.closed_rad);
+                    f64::from(pol.opening_m(j7))
+                }
+                _ => route.plan.jaw_opening_m,
+            };
+            if let Err(r) = crate::grasp_select::admission::jaw_check(w_eff, route.target_hard_error_m, open_w, cap) {
+                return Err(fail(&r.code, format!("[{phase}] fresh evidence of '{label}': {}", r.message)));
             }
 
             // Orientation consistency when target long axis is non-ambiguous (tightened to 12 deg).

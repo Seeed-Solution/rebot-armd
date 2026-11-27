@@ -564,21 +564,51 @@ impl Orchestrator {
             a.width_estimates = width_entries;
             if let Some(w) = measured_width_m { a.grasp_width_m = Some(w as f32); }
         }).await;
-        if let Some(w) = measured_width_m {
-            let max_w = self.max_grasp_width().await;
-            let cap = (max_w > 0.0).then_some(max_w);
-            // the shared jaw predicate of the admission, on the fresh measured width
+        // Actual post-align closing axis (after J6 alignment succeeds, keeps, or skips/turns off).
+        let pose_pre_align = self.pose().await;
+        let actual_grasp_r = match turn {
+            Some(t) => kinematics::mat_mul(&pose_pre_align.r, &kinematics::axis_r(&[1.0, 0.0, 0.0], t)),
+            None => pose_pre_align.r,
+        };
+        let actual_jaw_col = kinematics::column(&actual_grasp_r, 1);
+        let actual_jaw_xy = [actual_jaw_col[0], actual_jaw_col[1]];
+        let aligned_to_angle = matches!(align.as_str(), "turned:angle" | "kept:angle");
+        let consistent_elongated_angle = frames_angle(&c.frames, s.align_min_angle_conf)
+            .is_some_and(|(_a, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
+        // When J6 did not align to a confident, consistent elongated mask angle, `grasp_width_px`
+        // reflects the short side rather than the actual closing axis; measure along the actual
+        // post-align closing axis from the fresh contour (or centred box when no contour exists).
+        let actual_axis_width_m = if !aligned_to_angle && consistent_elongated_angle {
+            self.footprint_width_along_axis(&c, plane, actual_jaw_xy, true)
+        } else {
+            self.footprint_width_along_axis(&c, plane, actual_jaw_xy, false)
+        };
+        let effective_width_m = match (measured_width_m, actual_axis_width_m) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let width_cap = self.effective_max_grasp_width_cap().await;
+        if let Some(w) = effective_width_m {
+            // The shared jaw predicate of the admission, on the fresh width along the actual
+            // closing axis (cap optional independently of the +3 mm per-side reserve).
             match &planned.jaw {
                 Some(jaw) => {
-                    if let Err(r) = jaw.recheck(w, cap) {
+                    if let Err(r) = jaw.recheck(w, width_cap) {
                         return Err(fail(&r.code, format!("Object width {w:.3} m: {}", r.message)));
                     }
                 }
-                None if max_w > 0.0 && w > max_w => {
+                None if width_cap.is_some_and(|max_w| w > max_w) => {
+                    let max_w = width_cap.unwrap();
                     return Err(fail("TOO_WIDE", format!("Object width {w:.3} m exceeds max_grasp_width_m {:.3} m", max_w)));
                 }
                 None => {}
             }
+        } else if planned.jaw.as_ref().is_some_and(|j| j.deferred.is_some()) {
+            // Deferred box-only admission MUST resolve a live width before descent.
+            return Err(fail(
+                "NO_WIDTH_EVIDENCE",
+                "Deferred jaw check could not resolve object width before descent",
+            ));
         }
 
         if let Some(turn) = turn {
@@ -596,7 +626,7 @@ impl Orchestrator {
                         (Some("off".to_string()), None)
                     } else if s.pre_open == PreOpen::Auto && !calibrated {
                         (Some("skipped:uncalibrated".to_string()), None)
-                    } else if !matches!(align.as_str(), "turned:angle" | "kept:angle")
+                    } else if !aligned_to_angle
                         && frames_angle(&c.frames, s.align_min_angle_conf).is_some()
                     {
                         // an elongated mask (confident angle): its narrowest cross-section is the
@@ -606,7 +636,19 @@ impl Orchestrator {
                     } else if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) {
                         (Some(format!("skipped:{reason}")), None)
                     } else if let Some(w) = measured_width_m {
-                        let target_w = (w + s.pre_open_margin_m) as f32;
+                        let req_w = effective_width_m.unwrap_or(w);
+                        let mut target_w = (req_w + s.pre_open_margin_m) as f32;
+                        // Never narrow jaws below the minimum opening required by the shared jaw
+                        // predicate (`width + 2*hard_error + 2*MIN_OPENING_RESERVE_M`).
+                        if let Some(jaw) = &planned.jaw {
+                            let min_safe = (req_w
+                                + 2.0 * jaw.hard_error_m
+                                + 2.0 * crate::grasp_select::candidates::MIN_OPENING_RESERVE_M)
+                                as f32;
+                            if min_safe.is_finite() && target_w < min_safe {
+                                target_w = min_safe;
+                            }
+                        }
                         let target_j7 = policy.j7_for(target_w);
                         let full_open_w = policy.opening_m(policy.open_rad);
                         let at_or_beyond_open = target_w >= full_open_w
@@ -634,6 +676,11 @@ impl Orchestrator {
         };
 
         if let Some((fraction, target_w)) = pre_open_target {
+            if let (Some(w), Some(jaw)) = (effective_width_m, &planned.jaw) {
+                if let Err(r) = jaw.recheck_opening(w, f64::from(target_w), width_cap) {
+                    return Err(fail(&r.code, format!("Pre-open width {target_w:.3} m for object {w:.3} m: {}", r.message)));
+                }
+            }
             self.phase("preopen", 0.6).await?;
             self.gripper_move("preopen", fraction).await?;
             self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::PreOpen {

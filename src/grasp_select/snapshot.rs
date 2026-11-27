@@ -460,7 +460,12 @@ pub const DEFAULT_HEIGHT_M: [f64; 2] = [0.02, 0.06];
 pub fn target(s: &Snapshot) -> Result<Target, String> {
     let st = &s.setup;
     let pose_end = s.input.arm.fk(&s.input.q0);
-    let (height, height_source) = match (s.evidence.height_m, st.height_priors.iter().find(|(k, _)| k.eq_ignore_ascii_case(&s.label))) {
+    let prior = st
+        .height_sources
+        .contains(&crate::grasp::HeightSource::Prior)
+        .then(|| st.height_priors.iter().find(|(k, _)| k.eq_ignore_ascii_case(&s.label)))
+        .flatten();
+    let (height, height_source) = match (s.evidence.height_m, prior) {
         (Some(h), _) => ([h[0], h[1]], "evidence"),
         (None, Some((_, h))) => ([0.8 * h, 1.2 * h], "height_prior"),
         _ => (DEFAULT_HEIGHT_M, "default"),

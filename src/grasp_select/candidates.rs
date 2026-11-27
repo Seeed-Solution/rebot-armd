@@ -108,6 +108,16 @@ pub fn cut_width_near(poly: &[V2], p: V2, u: V2) -> Option<f64> {
         .map(|(a, b)| b.t - a.t)
 }
 
+/// Width of the inside interval of the line through `p` along `u` that contains `p` or lies
+/// within `max_gap_m` of `p` (never substituting a disjoint chord far from the planned contact).
+pub fn cut_width_at(poly: &[V2], p: V2, u: V2, max_gap_m: f64) -> Option<f64> {
+    g::inside_intervals(poly, p, u)
+        .into_iter()
+        .filter(|iv| interval_gap(iv) <= max_gap_m + 1e-9)
+        .min_by(|a, b| interval_gap(a).total_cmp(&interval_gap(b)))
+        .map(|(a, b)| b.t - a.t)
+}
+
 fn interval_gap(iv: &(g::Crossing, g::Crossing)) -> f64 {
     if iv.0.t <= 0.0 && iv.1.t >= 0.0 { 0.0 } else { iv.0.t.abs().min(iv.1.t.abs()) }
 }
