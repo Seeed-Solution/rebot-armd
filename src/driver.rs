@@ -2056,25 +2056,6 @@ impl PendingDisableShadowBatch {
 
 
 
-/// Feedback freshness threshold for skipping enable's initial bounded `0xCC` FRESHEN phase
-/// on a `PosForce` gripper joint. Any age beyond this bound (or missing empty-queue bound)
-/// triggers FRESHEN across every joint before CTRL_MODE restore/readback, hold, and `CMD_ENABLE`.
-const ENABLE_FRESHEN_ENTRY_PF_MAX_AGE: Duration = Duration::from_millis(40);
-/// Feedback freshness threshold for skipping enable's initial bounded `0xCC` FRESHEN phase
-/// on non-`PosForce` arm joints (strictly below the 100 ms refresh/rest-gate bound so any
-/// disabled idle period triggers FRESHEN while avoiding spurious stalls on freshly-read rigs).
-const ENABLE_FRESHEN_ENTRY_ARM_MAX_AGE: Duration = Duration::from_millis(80);
-/// Maximum feedback age allowed for arm joints when exiting enable's FRESHEN phase (matches
-/// `DAMIAO_FEEDBACK_VALID_WINDOW` so an early arm reply stays confirmed while waiting on a
-/// slower joint within the 180 ms FRESHEN budget).
-const ENABLE_FRESHEN_EXIT_ARM_MAX_AGE: Duration = DAMIAO_FEEDBACK_VALID_WINDOW;
-/// Maximum feedback age allowed for a `PosForce` gripper joint when exiting enable's FRESHEN
-/// phase (leaves >= 40 ms margin before `POS_FORCE_FEEDBACK_MAX_AGE` for readback + hold).
-const ENABLE_FRESHEN_EXIT_PF_MAX_AGE: Duration = Duration::from_millis(60);
-/// Bounded wall-clock budget for enable's initial `0xCC` FRESHEN phase (<= 200 ms).
-const ENABLE_FRESHEN_TIMEOUT: Duration = Duration::from_millis(180);
-/// Minimum interval before retrying `0xCC` for unanswered joints within one FRESHEN window.
-const ENABLE_FRESHEN_RETRY_INTERVAL: Duration = Duration::from_millis(60);
 /// Safety margin below `POS_FORCE_FEEDBACK_MAX_AGE` when `poll_readback` decides whether J7
 /// can proceed directly to `finish_pos_force_readback` without a `PreEnableRefresh`, closing
 /// any boundary race near 100 ms.
