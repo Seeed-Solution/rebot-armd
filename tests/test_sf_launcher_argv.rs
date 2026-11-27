@@ -4,15 +4,28 @@
 //! `--test-fail-executor-startup` spellings never split into extra flags or execute shell syntax,
 //! and feeds captured argv to the real `armd` binary to confirm D2 stays disarmed.
 
-#![cfg(unix)]
+const K92_SRC: &str =
+    include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
 
+#[test]
+fn packaged_launcher_never_emits_d2_flag_or_uses_shell_reparsed_daemon_opts() {
+    assert!(
+        !K92_SRC.contains("--test-fail-executor-startup"),
+        "packaged K92 launcher must never emit the attended D2 flag"
+    );
+    assert!(
+        !K92_SRC.contains("DAEMON_OPTS"),
+        "packaged K92 launcher must build argv with positional parameters, not DAEMON_OPTS"
+    );
+}
+
+#[cfg(target_os = "linux")]
+mod linux_proc_launcher {
+use super::K92_SRC;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
-
-const K92_SRC: &str =
-    include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
 
 struct LauncherHarness {
     dir: tempfile::TempDir,
@@ -275,18 +288,6 @@ fn assert_armd_disarmed(argv: &[String], override_port: bool) -> String {
 }
 
 #[test]
-fn packaged_launcher_never_emits_d2_flag_or_uses_shell_reparsed_daemon_opts() {
-    assert!(
-        !K92_SRC.contains("--test-fail-executor-startup"),
-        "packaged K92 launcher must never emit the attended D2 flag"
-    );
-    assert!(
-        !K92_SRC.contains("DAEMON_OPTS"),
-        "packaged K92 launcher must build argv with positional parameters, not DAEMON_OPTS"
-    );
-}
-
-#[test]
 fn k92_start_and_restart_preserve_metacharacters_spaces_and_embedded_d2_tokens() {
     let h = LauncherHarness::new();
     let sentinel = h.dir.path().join("pwned");
@@ -409,4 +410,92 @@ fn k92_embedded_and_standalone_d2_spellings_keep_d2_disarmed_on_start_and_restar
     assert_eq!(a4, want_all_standalone);
     let out4 = assert_armd_disarmed(&a4, false);
     assert!(out4.contains("Missing value for --follower"), "{out4}");
+}
+
+#[test]
+fn k92_trims_surrounding_whitespace_on_numeric_config_in_final_argv() {
+    let h = LauncherHarness::new();
+    h.write_config(&serde_json::json!({
+        "arm": {
+            "follower_model": "rebot-dm",
+            "serial_port": "can_missing0",
+            "armd_owner": "executor"
+        },
+        "port": " 8765 ",
+        "network": { "ap_channel": " 44 " }
+    }));
+
+    let mut want_start = vec![
+        "--follower".into(),
+        "rebot-dm".into(),
+        "--follower-port".into(),
+        "can_missing0".into(),
+        "--port".into(),
+        "8765".into(),
+    ];
+    want_start.extend(h.expected_tail());
+    want_start.extend(["--owner".into(), "executor".into()]);
+
+    let (p1, a1) = h.capture_argv("start");
+    assert_eq!(a1, want_start, "surrounding whitespace on port must be trimmed in final argv");
+
+    // Restart with tab/newline-padded port, ephemeral `" 0 "` parsed directly by real armd, and
+    // whitespace-only fallback to default 8765.
+    h.write_config(&serde_json::json!({
+        "arm": {
+            "follower_model": "rebot-dm",
+            "serial_port": "can_missing0",
+            "armd_owner": "executor"
+        },
+        "port": "\t9090\n"
+    }));
+    let mut want_restart = want_start.clone();
+    want_restart[5] = "9090".into();
+    let (p2, a2) = h.capture_argv("restart");
+    assert_ne!(p1, p2);
+    assert_eq!(a2, want_restart, "tab/newline-padded port must be trimmed on restart");
+
+    h.write_config(&serde_json::json!({
+        "arm": {
+            "follower_model": "rebot-dm",
+            "serial_port": "can_missing0",
+            "armd_owner": "executor"
+        },
+        "port": " 0 "
+    }));
+    let mut want_ephemeral = want_start.clone();
+    want_ephemeral[5] = "0".into();
+    let (_, a_eph) = h.capture_argv("restart");
+    assert_eq!(a_eph, want_ephemeral, "surrounding whitespace on numeric port 0 must be trimmed");
+    let out_eph = assert_armd_disarmed(&a_eph, false);
+    assert!(!out_eph.contains("Invalid port"), "trimmed port must parse in armd: {out_eph}");
+    assert!(out_eph.contains("can_missing0"), "armd must proceed past port parsing to CAN open: {out_eph}");
+
+    h.write_config(&serde_json::json!({
+        "arm": {
+            "follower_model": "rebot-dm",
+            "serial_port": "can_missing0",
+            "armd_owner": "executor"
+        },
+        "port": "   "
+    }));
+    let (_, a3) = h.capture_argv("restart");
+    assert_eq!(a3, want_start, "whitespace-only port must keep default 8765");
+
+    // Verify ap_channel numeric trimming via real config_shell_vars as well.
+    let parse_start = K92_SRC.find("config_shell_vars() {").unwrap();
+    let parse_end = K92_SRC.find("\n# 读取 supervisor").unwrap();
+    let parse = &K92_SRC[parse_start..parse_end];
+    let cfg = h.dir.path().join("ch.json");
+    std::fs::write(&cfg, r#"{"network":{"ap_channel":" 44 "}}"#).unwrap();
+    let ch_out = Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!("{parse}\nAP_CHANNEL=''\neval \"$(config_shell_vars '{}')\"\nprintf '%s' \"$AP_CHANNEL\"", cfg.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(ch_out.status.success());
+    assert_eq!(String::from_utf8_lossy(&ch_out.stdout), "44");
+}
 }
