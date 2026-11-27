@@ -2058,3 +2058,125 @@ async fn m3_streaming_servo_frame_preempted_by_stop_emits_stopped_servo_reject_b
         replies[0], replies[1]
     );
 }
+
+// ============================================================================
+// 10. Executor stamp-namespace isolation: >1000 accepted servo frames interleaved
+//     with ordinary commands must not poison ordinary motion admission (STAMP_REUSED).
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_servo_stream_interleaved_with_ordinary_commands_keeps_ordinary_motion_admissible() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+        lease_timeout_ms: 30_000,
+        ..ArmConfig::rebot_dm()
+    }));
+    let addr = serve(sup.clone()).await;
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(1)))
+        .await
+        .unwrap();
+    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+    wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+
+    let mut ws = connect_ws(addr).await;
+    let gen = acquire(&mut ws, "stamp-ns-owner", false, 1).await;
+    let mut ep = sup.fresh_snapshot(None).await.unwrap().obs.epoch_id;
+    arm_via_ws(&mut ws, gen, ep, 1).await;
+    let q0 = sup.fresh_snapshot(None).await.unwrap().obs.commanded_positions.clone();
+
+    let mut req_id = 1u64;
+    let mut accepted_servo_frames = 0u64;
+    const SERVO_FRAMES: u64 = 1050;
+    for i in 1..=SERVO_FRAMES {
+        if i % 100 == 0 {
+            send(&mut ws, json!({"type": "heartbeat", "generation": gen, "epoch_id": ep})).await;
+        }
+        let mut target = q0.clone();
+        target[0] += if i % 2 == 1 { 0.002 } else { 0.0 };
+        req_id += 1;
+        // WS `/api/v1/motion/servo` routes through `TargetPort::submit_servo` -> RT
+        // `consume_target_frame` (`AdmissionStamp::for_rt_internal`) -> `servo_slice_rt`, and
+        // returns `command_ack` strictly when the owner applied that frame (`Ok(())`).
+        send(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": req_id,
+                "generation": gen,
+                "epoch_id": ep,
+                "path": "/api/v1/motion/servo",
+                "body": {"targets": target},
+            }),
+        )
+        .await;
+        let rep = next_of_any(&mut ws, &["command_ack", "command_reject", "servo_reject"]).await;
+        assert_eq!(rep["type"], "command_ack", "servo frame {i} refused: {rep}");
+        assert_eq!(rep["request_id"], req_id, "{rep}");
+        assert_eq!(rep["status"], "accepted", "{rep}");
+        accepted_servo_frames += 1;
+
+        // Interleave ordinary commands alongside the servo stream.
+        if i % 10 == 0 {
+            req_id += 1;
+            send(
+                &mut ws,
+                json!({
+                    "type": "command",
+                    "request_id": req_id,
+                    "generation": gen,
+                    "epoch_id": ep,
+                    "path": "/api/v1/torque",
+                    "body": {"enable": true},
+                }),
+            )
+            .await;
+            let rep = next_of_any(&mut ws, &["command_ack", "command_reject", "servo_reject"]).await;
+            assert_eq!(rep["type"], "command_ack", "interleaved command at frame {i} rejected: {rep}");
+            assert_eq!(rep["request_id"], req_id, "{rep}");
+            if let Some(next_ep) = rep["epoch_id"].as_u64() {
+                ep = next_ep;
+            }
+        }
+    }
+
+    assert!(
+        accepted_servo_frames > 1000 && handle.servo_coalesced() == 0,
+        "expected >1000 owner-accepted servo frames with 0 coalesced, got accepted={accepted_servo_frames} submitted={} coalesced={}",
+        handle.servo_submitted_count(),
+        handle.servo_coalesced()
+    );
+
+    // Wait for the servo stream to settle back to Armed before submitting an ordinary motion action.
+    wait_until(Duration::from_secs(2), || {
+        sup.hub()
+            .latest()
+            .is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Armed))
+    })
+    .await;
+
+    // Ordinary motion action after >1000 interleaved servo frames must be admitted (not STAMP_REUSED).
+    req_id += 1;
+    send(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": req_id,
+            "generation": gen,
+            "epoch_id": ep,
+            "path": "/api/v1/action/move_to",
+            "body": {"path": "joint", "position": [0.18, 0.05, 0.28], "speed_scale": 0.8},
+        }),
+    )
+    .await;
+    let ack = next_of_any(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!(
+        ack["type"], "command_ack",
+        "ordinary motion command refused after servo stream: {ack}"
+    );
+    assert_eq!(ack["request_id"], req_id, "{ack}");
+    assert_eq!(ack["status"], "accepted", "{ack}");
+    assert!(ack["action_id"].as_u64().unwrap_or(0) > 0, "{ack}");
+
+    drop(ws);
+    handle.stop_and_join();
+}
