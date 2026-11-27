@@ -2823,3 +2823,45 @@ fn phase_b_sdk_doc_request_example_parses_cleanly() {
     assert_eq!(prefs.hard_max_tilt_deg, Some(70.0));
     assert_eq!(grasp_select::snapshot::parse_budget(&body).unwrap(), 500);
 }
+
+// ============================================================================
+// Shared admission: the same jaw refusal (best_refusal) in dry run and live planning, both
+// strategies, both owners
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_admission_refusal_parity_both_strategies_both_owners() {
+    let (cfg, setup) = fast_mounted_config();
+    let q0 = solve_camera_down(&cfg, &setup, [0.30, 0.0, 0.26]);
+    let narrow = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let rig = Rig::start(owner, cfg.clone(), setup.clone(), q0, narrow.clone(), 0.035, Some(-1.5), false).await;
+        let mut probe = adaptive_request(&rig.cam, &rig.start_end, setup.table_z_m, &narrow, 0.035);
+        probe["dry_run"] = json!(true);
+        let p = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &probe).await.fields();
+        let open = p["evidence"]["jaw_open_width_m"].as_f64().unwrap();
+        let he = p["evidence"]["uncertainty"]["hard_error_m"].as_f64().unwrap();
+        // the rc7.3 case: reserve -3 mm per side against the +3 mm bound
+        let wide = banana([0.30, 0.0], 0.12, 30.0, open - 2.0 * he + 0.006, 90.0);
+        let req = adaptive_request(&rig.cam, &rig.start_end, setup.table_z_m, &wide, 0.035);
+        for strategy in ["adaptive", "legacy"] {
+            let mut live = req.clone();
+            live["strategy"] = json!(strategy);
+            let mut d = live.clone();
+            d["dry_run"] = json!(true);
+            let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &d).await.fields();
+            assert_eq!((dry["reachable"].clone(), dry["code"].clone()), (json!(false), json!("OPENING")), "{strategy}: {dry:?}");
+            match rig.plan_adaptive(&live).await.err().expect("live plan refuses") {
+                ArmError::Detailed { code, details, .. } => {
+                    assert_eq!(code, "OPENING", "{strategy}");
+                    for k in ["phase", "code", "value", "bound"] {
+                        assert_eq!(details["best_refusal"][k], dry["best_refusal"][k], "{strategy} {k}: {details} vs {dry:?}");
+                    }
+                    assert_eq!(details["best_refusal"]["bound"], json!(0.003));
+                }
+                other => panic!("{strategy}: expected a detailed refusal, got {other:?}"),
+            }
+        }
+        rig.shutdown();
+    }
+}
