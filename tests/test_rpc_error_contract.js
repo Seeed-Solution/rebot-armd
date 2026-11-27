@@ -103,19 +103,26 @@ ${source('disableTorque')}
     [{ code: 'WORKSPACE_VIOLATION', constraint_id: 'box_max_x', geometry_id: 'end_point:8',
        reason: 'gripper (end_point:8) is 4.5 cm beyond the workspace front edge (box_max_x 0.645 m, limit 0.600 m; previous depth 0.040 m, new depth 0.045 m; this move would go 5 mm deeper); move back or press Park' },
      '夹爪 (end_point:8) 超出工作空间前方边界 4.5 cm（box_max_x 0.645 m，上限 0.600 m；原超出 0.040 m，新超出 0.045 m，将加深 5 mm），请向后移动或按收纳（Park）', null],
-    // Case 1: sweep_budget with no keep-out box (no obstacle/keep-out, suggests Park + jog direction)
+    // Case 1: sweep_budget with no keep-out box (no obstacle/keep-out, suggests Park + jog direction, preserves context in both locales)
     [{ code: 'WORKSPACE_VIOLATION', constraint_id: 'sweep_budget', geometry_id: 'end_origin',
-       reason: 'return path could not be checked (needs more than 4000 FK evaluations near max_reach on end_origin); press Park or make a short jog inward toward the base' },
-     '回程路径无法完成校验（超出 4000 次 FK 评估），请按收纳（Park）或向基座方向小步点动',
-     'return path could not be checked (needs more than 4000 FK evaluations); press Park or make a short jog inward toward the base'],
+       reason: 'return path could not be checked (needs more than 4000 FK evaluations); press Park or make a short jog inward toward the base (near max_reach on end_origin)' },
+     '回程路径无法完成校验（超出 4000 次 FK 评估），请按收纳（Park）或向基座方向小步点动（max_reach，end_origin）', null],
+    // Named keep-out box with apostrophe in name ("operator's bin") parses cleanly without truncation
     [{ code: 'WORKSPACE_VIOLATION', constraint_id: 'sweep_budget', geometry_id: 'end_origin',
-       reason: "path check near keep-out box 'near' (end_origin) needs more than 4 FK evaluations; take a shorter jog or move the obstacle 'near'" },
-     '禁入区「near」附近路径无法完成校验（超出 4 次 FK 评估），请小步点动或调整障碍物「near」',
-     "path check near keep-out box 'near' needs more than 4 FK evaluations; take a shorter jog or move the obstacle 'near'"],
-    // Case 3: max_reach deepening from one witness
+       reason: "path check near keep-out box 'operator's bin' needs more than 4 FK evaluations; take a shorter jog or move the obstacle (end_origin)" },
+     '禁入区「operator\'s bin」附近路径无法完成校验（超出 4 次 FK 评估），请小步点动或调整障碍物（end_origin）', null],
+    // Unboxed sweep with a capsule id containing "keep-out box 'fake'" must NOT be classified as an obstacle
+    [{ code: 'WORKSPACE_VIOLATION', constraint_id: 'sweep_budget', geometry_id: "capsule:keep-out box 'fake'",
+       reason: "return path could not be checked (needs more than 4000 FK evaluations); press Park or make a short jog back (-X) (near box_max_x on capsule:keep-out box 'fake')" },
+     "回程路径无法完成校验（超出 4000 次 FK 评估），请按收纳（Park）或向后（-X）小步点动（box_max_x，capsule:keep-out box 'fake'）", null],
+    // Invalid workspace check with a box constraint id must pass through raw daemon reason (never suggest Home)
+    [{ code: 'WORKSPACE_VIOLATION', constraint_id: 'box_max_x', geometry_id: 'end_origin',
+       reason: 'invalid workspace check for box_max_x (end_origin)' },
+     'invalid workspace check for box_max_x (end_origin)', null],
+    // Case 3: max_reach deepening from one witness (symmetric fields in zh and en)
     [{ code: 'WORKSPACE_VIOLATION', constraint_id: 'max_reach', geometry_id: 'end_origin',
        reason: 'end_origin reach 0.685 m (limit 0.520 m, new depth 0.165 m over, previous depth 0.164 m; this move would go 1.5 mm deeper)' },
-     'end_origin 臂展 0.685 m（上限 0.520 m，原超出 0.164 m，新超出 0.165 m；此移动会再加深 1.5 mm），请向基座方向回缩或按收纳（Park）', null],
+     'end_origin 臂展 0.685 m（上限 0.520 m，新超出 0.165 m，原超出 0.164 m；此移动会再加深 1.5 mm）', null],
   ];
   for (const [payload, expZh, expEn] of wsCases) {
     assert.equal(wsErr('zh', payload), expZh);
@@ -124,6 +131,8 @@ ${source('disableTorque')}
   assert.doesNotMatch(wsErr('zh', wsCases[1][0]), /Home/);
   assert.doesNotMatch(wsErr('zh', wsCases[2][0]), /障碍物|禁入区|Home/);
   assert.doesNotMatch(wsErr('en', wsCases[2][0]), /obstacle|keep-?out|Home/i);
+  assert.doesNotMatch(wsErr('zh', wsCases[4][0]), /障碍物|禁入区|Home/);
+  assert.doesNotMatch(wsErr('zh', wsCases[5][0]), /Home/);
   for (const [cid, zhEdge, zhDir, enEdge, enDir] of [
     ['box_max_x', '前方边界', '向后移动', 'front edge', 'move back'],
     ['box_min_x', '后方边界', '向前移动', 'back edge', 'move forward'],

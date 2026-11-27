@@ -3,13 +3,38 @@
 
 use crate::chain::WorkspaceFailure;
 use crate::kinematics as k;
+use crate::safety::BoundedText;
 
 /// Single witness rendered by [`WorkspaceFailure::write_witness`].
 #[derive(Debug, Clone, Copy)]
 pub enum WorkspaceWitness<'a> {
-    Constraint { cid: &'a str, gid: &'a str, limit: &'a str, value: f64, bound: f64, prev_depth: f64, depth: f64, start_outside: bool },
-    SweepBudget { max_budget: usize, blocking_cid: Option<&'a str>, blocking_gid: Option<&'a str>, keepout_name: Option<&'a str>, start_outside: bool },
+    Constraint {
+        cid: &'a str, gid: &'a str, limit: &'a str,
+        value: f64, bound: f64, prev_depth: f64, depth: f64,
+        start_outside: bool, conservative_bound: bool,
+    },
+    SweepBudget {
+        max_budget: usize, blocking_cid: Option<&'a str>, blocking_gid: Option<&'a str>,
+        keepout_name: Option<&'a str>, start_outside: bool,
+    },
     Invalid { reason: &'a str },
+}
+
+/// Zero-allocation, `Copy` workspace refusal payload carried across the RT mailbox for EVERY
+/// constraint kind (full 64-byte capsule/keep-out IDs, no truncation) and rendered off-RT by
+/// [`WorkspaceFailure::write_witness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceRefusalRt {
+    pub kind: u8, // 0=Constraint, 1=ConservativeBound, 2=SweepBudget, 3=Invalid
+    pub cid: BoundedText<160>,
+    pub gid: BoundedText<80>,
+    pub limit_or_reason: BoundedText<160>,
+    pub value_bits: u64,
+    pub bound_bits: u64,
+    pub prev_depth_bits: u64,
+    pub depth_bits: u64,
+    pub max_budget: u32,
+    pub start_outside: bool,
 }
 
 pub(crate) fn box_edge_info(cid: &str) -> Option<(&'static str, &'static str)> {
@@ -32,11 +57,27 @@ fn recovery_direction(cid: Option<&str>) -> &'static str {
     }
 }
 
+fn write_depth_value(w: &mut impl core::fmt::Write, depth_m: f64) {
+    if depth_m > 0.0 && depth_m < 0.001 {
+        let _ = write!(w, "{:.1} mm", (depth_m * 1000.0).max(0.1));
+    } else {
+        let _ = write!(w, "{depth_m:.3} m");
+    }
+}
+
+fn write_coord_pair(w: &mut impl core::fmt::Write, value: f64, bound: f64, sub_mm: bool) {
+    if sub_mm { let _ = write!(w, "{value:.4} m, limit {bound:.4} m"); }
+    else { let _ = write!(w, "{value:.3} m, limit {bound:.3} m"); }
+}
+
 fn write_deepening(w: &mut impl core::fmt::Write, deepening: bool, delta_m: f64) {
     if !deepening { return; }
     let mm = delta_m * 1000.0;
-    if mm >= 1.0 && ((mm - mm.round()).abs() < 0.05 || mm >= 10.0) { let _ = write!(w, "; this move would go {:.0} mm deeper", mm.round()); }
-    else { let _ = write!(w, "; this move would go {:.1} mm deeper", mm.max(0.1)); }
+    if mm >= 1.0 && ((mm - mm.round()).abs() < 0.05 || mm >= 10.0) {
+        let _ = write!(w, "; this move would go {:.0} mm deeper", mm.round());
+    } else {
+        let _ = write!(w, "; this move would go {:.1} mm deeper", mm.max(0.1));
+    }
 }
 
 impl WorkspaceFailure {
@@ -46,43 +87,73 @@ impl WorkspaceFailure {
             WorkspaceWitness::Invalid { reason } => { let _ = w.write_str(reason); }
             WorkspaceWitness::SweepBudget { max_budget, blocking_cid, blocking_gid, keepout_name, start_outside } => {
                 if let Some(name) = keepout_name {
+                    let act = if start_outside {
+                        "press Park, take a shorter jog away from the obstacle, or move the obstacle"
+                    } else {
+                        "take a shorter jog or move the obstacle"
+                    };
                     let gid = blocking_gid.unwrap_or("end_origin");
-                    let (act, tail) = if start_outside {
-                        ("press Park, take a shorter jog away from obstacle", ", or move the obstacle")
-                    } else { ("take a shorter jog or move the obstacle", "") };
-                    let _ = write!(w, "path check near keep-out box '{name}' ({gid}) needs more than {max_budget} FK evaluations; {act} '{name}'{tail}");
+                    let _ = write!(w, "path check near keep-out box '{name}' needs more than {max_budget} FK evaluations; {act} ({gid})");
                 } else {
-                    let kind = if start_outside { "return path" } else { "path" };
                     let dir = recovery_direction(blocking_cid);
-                    let _ = write!(w, "{kind} could not be checked (needs more than {max_budget} FK evaluations");
-                    if let (Some(cid), Some(gid)) = (blocking_cid, blocking_gid) { let _ = write!(w, " near {cid} on {gid}"); }
-                    let _ = write!(w, "); press Park or make a short jog {dir}");
+                    let _ = write!(w, "return path could not be checked (needs more than {max_budget} FK evaluations); press Park or make a short jog {dir}");
+                    if let (Some(cid), Some(gid)) = (blocking_cid, blocking_gid) {
+                        let _ = write!(w, " (near {cid} on {gid})");
+                    }
                 }
             }
-            WorkspaceWitness::Constraint { cid, gid, limit, value, bound, prev_depth, depth, start_outside } => {
+            WorkspaceWitness::Constraint { cid, gid, limit, value, bound, prev_depth, depth, start_outside, conservative_bound } => {
                 if !depth.is_finite() || !value.is_finite() || !bound.is_finite() {
                     let _ = write!(w, "invalid workspace check for {cid} ({gid})");
                     return;
                 }
                 let depth = depth.max(0.0);
                 let prev = if prev_depth.is_finite() { prev_depth.max(0.0) } else { 0.0 };
-                let (deepening, delta) = (prev > k::WORKSPACE_EPS, (depth - prev).max(0.0));
+                let sub_mm = depth > 0.0 && depth < 0.001;
+                let (deepening, delta) = (!conservative_bound && prev > k::WORKSPACE_EPS, (depth - prev).max(0.0));
+                let depth_lbl = if conservative_bound { "bound depth" } else { "new depth" };
                 if let Some((edge, recover)) = box_edge_info(cid) {
                     let part = if gid == "camera_mount" { "camera" } else if gid.starts_with("capsule:") { "arm" } else { "gripper" };
-                    let esc = if start_outside || deepening { "press Park" } else { "press Home" };
-                    if depth >= 0.001 { let _ = write!(w, "{part} ({gid}) is {:.1} cm", depth * 100.0); }
-                    else { let _ = write!(w, "{part} ({gid}) is {:.1} mm", (depth * 1000.0).max(0.1)); }
-                    let _ = write!(w, " beyond the workspace {edge} ({cid} {value:.3} m, limit {bound:.3} m; previous depth {prev:.3} m, new depth {depth:.3} m");
+                    let esc = if start_outside || prev > k::WORKSPACE_EPS { "press Park" } else { "press Home" };
+                    if conservative_bound {
+                        let _ = write!(w, "{part} ({gid}) sweep could not verify workspace {edge} ({cid} conservative bound ");
+                    } else if depth >= 0.001 {
+                        let _ = write!(w, "{part} ({gid}) is {:.1} cm beyond the workspace {edge} ({cid} ", depth * 100.0);
+                    } else {
+                        let _ = write!(w, "{part} ({gid}) is {:.1} mm beyond the workspace {edge} ({cid} ", (depth * 1000.0).max(0.1));
+                    }
+                    write_coord_pair(w, value, bound, sub_mm);
+                    let _ = w.write_str("; previous depth ");
+                    write_depth_value(w, prev);
+                    let _ = write!(w, ", {depth_lbl} ");
+                    write_depth_value(w, depth);
                     write_deepening(w, deepening, delta);
                     let _ = write!(w, "); {recover} or {esc}");
                 } else if let Some(name) = cid.strip_prefix("keepout:") {
-                    let verb = if deepening { "inside" } else { "enters" };
-                    let _ = write!(w, "{gid} {verb} keepout '{name}' (keep-out obstacle depth {value:.3} m, limit {bound:.3} m; previous depth {prev:.3} m, new depth {depth:.3} m");
+                    let head = if conservative_bound { "sweep could not verify keepout" } else if deepening { "inside keepout" } else { "enters keepout" };
+                    let val_lbl = if conservative_bound { "keep-out obstacle conservative bound" } else { "keep-out obstacle depth" };
+                    let _ = write!(w, "{gid} {head} '{name}' ({val_lbl} ");
+                    write_coord_pair(w, value, bound, sub_mm);
+                    let _ = w.write_str("; previous depth ");
+                    write_depth_value(w, prev);
+                    let _ = write!(w, ", {depth_lbl} ");
+                    write_depth_value(w, depth);
                     write_deepening(w, deepening, delta);
                     let _ = w.write_str(")");
                 } else {
                     let (label, dir_word) = match cid { "max_reach" => ("reach", "over"), "floor_z" => ("floor z", "below"), _ => (limit, "under") };
-                    let _ = write!(w, "{gid} {label} {value:.3} m (limit {bound:.3} m, new depth {depth:.3} m {dir_word}, previous depth {prev:.3} m");
+                    if conservative_bound {
+                        let _ = write!(w, "{gid} sweep could not verify {label} (conservative bound ");
+                        write_coord_pair(w, value, bound, sub_mm);
+                    } else if sub_mm {
+                        let _ = write!(w, "{gid} {label} {value:.4} m (limit {bound:.4} m");
+                    } else {
+                        let _ = write!(w, "{gid} {label} {value:.3} m (limit {bound:.3} m");
+                    }
+                    let _ = write!(w, ", {depth_lbl} ");
+                    write_depth_value(w, depth);
+                    let _ = write!(w, " {dir_word}, previous depth ");
+                    write_depth_value(w, prev);
                     write_deepening(w, deepening, delta);
                     let _ = w.write_str(")");
                 }
@@ -98,7 +169,7 @@ impl WorkspaceFailure {
             let mut buf = String::new();
             Self::write_witness(&mut buf, WorkspaceWitness::Constraint {
                 cid: detail.constraint_id.as_deref().unwrap_or(limit), gid: detail.geometry_id.as_deref().unwrap_or("end_origin"),
-                limit, value, bound, prev_depth: 0.0, depth: (value - bound).abs(), start_outside: false,
+                limit, value, bound, prev_depth: 0.0, depth: (value - bound).abs(), start_outside: false, conservative_bound: false,
             });
             buf
         }, str::to_string);
@@ -111,39 +182,46 @@ impl WorkspaceFailure {
     }
 }
 
-/// Decodes a compact [`crate::rt_core::mailbox::RefusalDetail::WorkspaceBoxEdge`] payload off-RT.
-#[allow(clippy::too_many_arguments)]
-pub fn decode_workspace_box_edge_refusal(
-    edge_idx: u8, geom_kind: u8, capsule_len: u8, capsule_id: &[u8; 32],
-    depth_bits: u64, prev_depth_bits: u64, value_bits: u64, bound_bits: u64, start_outside: bool,
-) -> Option<(&'static str, String, String)> {
-    let (cid, limit) = match edge_idx {
-        0 => ("box_min_x", "box_x_min"), 1 => ("box_max_x", "box_x_max"), 2 => ("box_min_y", "box_y_min"),
-        3 => ("box_max_y", "box_y_max"), 4 => ("box_min_z", "box_z_min"), 5 => ("box_max_z", "box_z_max"),
-        _ => return None,
-    };
-    let gid = match geom_kind {
-        0 => "end_origin".into(), 254 => "camera_mount".into(),
-        255 => format!("capsule:{}", core::str::from_utf8(&capsule_id[..usize::from(capsule_len).min(capsule_id.len())]).unwrap_or("link")),
-        n => format!("end_point:{n}"),
-    };
-    let (depth, prev_depth, value, bound) = (f64::from_bits(depth_bits), f64::from_bits(prev_depth_bits), f64::from_bits(value_bits), f64::from_bits(bound_bits));
-    if ![depth, prev_depth, value, bound].iter().all(|v| v.is_finite()) { return None; }
+/// Decodes a zero-alloc [`WorkspaceRefusalRt`] mailbox payload off the RT thread into
+/// `(constraint_id, geometry_id, reason)` using [`WorkspaceFailure::write_witness`].
+pub fn decode_workspace_refusal(r: &WorkspaceRefusalRt) -> (String, String, String) {
     let mut reason = String::new();
-    WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::Constraint { cid, gid: &gid, limit, value, bound, prev_depth, depth, start_outside });
-    Some((cid, gid, reason))
+    match r.kind {
+        0 | 1 => {
+            let cid = r.cid.as_str();
+            let gid = r.gid.as_str();
+            WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::Constraint {
+                cid, gid, limit: r.limit_or_reason.as_str(),
+                value: f64::from_bits(r.value_bits), bound: f64::from_bits(r.bound_bits),
+                prev_depth: f64::from_bits(r.prev_depth_bits), depth: f64::from_bits(r.depth_bits),
+                start_outside: r.start_outside, conservative_bound: r.kind == 1,
+            });
+            (cid.to_string(), gid.to_string(), reason)
+        }
+        2 => {
+            let b_cid = (!r.cid.as_str().is_empty()).then_some(r.cid.as_str());
+            let gid = if r.gid.as_str().is_empty() { "end_origin" } else { r.gid.as_str() };
+            let ko = b_cid.and_then(|c| c.strip_prefix("keepout:"));
+            WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::SweepBudget {
+                max_budget: r.max_budget as usize, blocking_cid: b_cid, blocking_gid: b_cid.map(|_| gid),
+                keepout_name: ko, start_outside: r.start_outside,
+            });
+            ("sweep_budget".into(), gid.into(), reason)
+        }
+        _ => {
+            let gid = if r.gid.as_str().is_empty() { "end_origin" } else { r.gid.as_str() };
+            WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::Invalid { reason: r.limit_or_reason.as_str() });
+            ("invalid".into(), gid.into(), reason)
+        }
+    }
 }
 
-/// Attaches structured workspace box-edge fields to a JSON rejection reply off the RT thread.
+/// Attaches structured workspace refusal fields to a JSON rejection reply off the RT thread.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn attach_workspace_box_edge_fields(reply: &mut serde_json::Value, detail: crate::rt_core::mailbox::RefusalDetail, phase: &str) -> bool {
-    let crate::rt_core::mailbox::RefusalDetail::WorkspaceBoxEdge {
-        edge_idx, geom_kind, capsule_len, capsule_id, depth_bits, prev_depth_bits, value_bits, bound_bits, start_outside,
-    } = detail else { return false; };
-    let Some((cid, gid, reason)) = decode_workspace_box_edge_refusal(
-        edge_idx, geom_kind, capsule_len, &capsule_id, depth_bits, prev_depth_bits, value_bits, bound_bits, start_outside,
-    ) else { return false; };
-    for (k, v) in [("constraint_id", cid), ("geometry_id", gid.as_str()), ("violation_phase", phase), ("reason", reason.as_str()), ("message", reason.as_str())] {
+pub fn attach_workspace_refusal_fields(reply: &mut serde_json::Value, detail: crate::rt_core::mailbox::RefusalDetail, phase: &str) -> bool {
+    let crate::rt_core::mailbox::RefusalDetail::Workspace(ref r) = detail else { return false; };
+    let (cid, gid, reason) = decode_workspace_refusal(r);
+    for (k, v) in [("constraint_id", cid.as_str()), ("geometry_id", gid.as_str()), ("violation_phase", phase), ("reason", reason.as_str()), ("message", reason.as_str())] {
         reply[k] = serde_json::json!(v);
     }
     true

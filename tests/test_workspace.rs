@@ -1898,7 +1898,7 @@ fn workspace_box_edge_messages_all_six_faces_and_geometries() {
         ("box_min_z", "box_z_min", "end_point:1", -1.006, -1.000, 0.0, 0.006, false,
             "gripper (end_point:1) is 0.6 cm beyond the workspace bottom edge (box_min_z -1.006 m, limit -1.000 m; previous depth 0.000 m, new depth 0.006 m); move up or press Home"),
         ("box_max_x", "box_x_max", "end_point:5", 0.6002, 0.600, 0.0, 0.0002, false,
-            "gripper (end_point:5) is 0.2 mm beyond the workspace front edge (box_max_x 0.600 m, limit 0.600 m; previous depth 0.000 m, new depth 0.000 m); move back or press Home"),
+            "gripper (end_point:5) is 0.2 mm beyond the workspace front edge (box_max_x 0.6002 m, limit 0.6000 m; previous depth 0.000 m, new depth 0.2 mm); move back or press Home"),
         ("box_max_x", "box_x_max", "end_point:8", 0.645, 0.600, 0.040, 0.045, true,
             "gripper (end_point:8) is 4.5 cm beyond the workspace front edge (box_max_x 0.645 m, limit 0.600 m; previous depth 0.040 m, new depth 0.045 m; this move would go 5 mm deeper); move back or press Park"),
     ];
@@ -1906,19 +1906,37 @@ fn workspace_box_edge_messages_all_six_faces_and_geometries() {
         let mut buf = String::new();
         WorkspaceFailure::write_witness(
             &mut buf,
-            WorkspaceWitness::Constraint { cid, gid, limit, value, bound, prev_depth, depth, start_outside },
+            WorkspaceWitness::Constraint { cid, gid, limit, value, bound, prev_depth, depth, start_outside, conservative_bound: false },
         );
         assert_eq!(buf, expected);
     }
+    // Conservative sweep bound is explicitly labelled as unverified, never as a measured endpoint violation.
+    let mut cb = String::new();
+    WorkspaceFailure::write_witness(&mut cb, WorkspaceWitness::Constraint {
+        cid: "box_max_x", gid: "end_point:5", limit: "box_x_max", value: 0.605, bound: 0.600, prev_depth: 0.0, depth: 0.005, start_outside: false, conservative_bound: true,
+    });
+    assert!(cb.contains("sweep could not verify workspace front edge") && cb.contains("conservative bound 0.605 m") && cb.contains("bound depth 0.005 m"), "{cb}");
 
-    // RT mailbox encoding preserves exact capsule id, witness numbers, and Park/Home choice.
-    let mut cap_bytes = [0u8; 32];
-    cap_bytes[..9].copy_from_slice(b"upper_arm");
-    let (cid, gid, reason) = armd::chain::decode_workspace_box_edge_refusal(
-        1, 255, 9, &cap_bytes, 0.00096_f64.to_bits(), 0.0_f64.to_bits(), 0.60096_f64.to_bits(), 0.600_f64.to_bits(), false,
-    ).expect("decode capsule refusal");
-    assert_eq!((cid, gid.as_str()), ("box_max_x", "capsule:upper_arm"));
-    assert_eq!(reason, "arm (capsule:upper_arm) is 1.0 mm beyond the workspace front edge (box_max_x 0.601 m, limit 0.600 m; previous depth 0.000 m, new depth 0.001 m); move back or press Home");
+    // RT mailbox preserves full 64-byte capsule IDs, non-box constraints (max_reach), and sub-mm precision.
+    let long_id = "c".repeat(64);
+    let r_box = armd::chain::WorkspaceRefusalRt {
+        kind: 0, cid: armd::safety::BoundedText::new("box_max_x"), gid: armd::safety::BoundedText::new(&format!("capsule:{long_id}")),
+        limit_or_reason: armd::safety::BoundedText::new("box_x_max"),
+        value_bits: 0.60096_f64.to_bits(), bound_bits: 0.600_f64.to_bits(), prev_depth_bits: 0.0_f64.to_bits(), depth_bits: 0.00096_f64.to_bits(),
+        max_budget: 0, start_outside: false,
+    };
+    let (cid, gid, reason) = armd::chain::decode_workspace_refusal(&r_box);
+    assert_eq!((cid.as_str(), gid.as_str()), ("box_max_x", format!("capsule:{long_id}").as_str()));
+    assert_eq!(reason, format!("arm (capsule:{long_id}) is 1.0 mm beyond the workspace front edge (box_max_x 0.6010 m, limit 0.6000 m; previous depth 0.000 m, new depth 1.0 mm); move back or press Home"));
+    let r_reach = armd::chain::WorkspaceRefusalRt {
+        kind: 0, cid: armd::safety::BoundedText::new("max_reach"), gid: armd::safety::BoundedText::new("end_origin"),
+        limit_or_reason: armd::safety::BoundedText::new("reach"),
+        value_bits: 0.685_f64.to_bits(), bound_bits: 0.520_f64.to_bits(), prev_depth_bits: 0.164_f64.to_bits(), depth_bits: 0.165_f64.to_bits(),
+        max_budget: 0, start_outside: true,
+    };
+    let (rcid, rgid, rrsn) = armd::chain::decode_workspace_refusal(&r_reach);
+    assert_eq!((rcid.as_str(), rgid.as_str()), ("max_reach", "end_origin"));
+    assert_eq!(rrsn, "end_origin reach 0.685 m (limit 0.520 m, new depth 0.165 m over, previous depth 0.164 m; this move would go 1 mm deeper)");
 }
 
 #[tokio::test]
@@ -2070,7 +2088,7 @@ async fn workspace_refusal_messages_three_cases_both_owners_and_rt_bounded() {
     let far_pose = [0.0f32, -2.046, -1.855, -0.297, -0.053, 0.123, 0.0];
     let mut j3_jog = far_pose;
     j3_jog[2] += 0.1;
-    let exp1 = "return path could not be checked (needs more than 4000 FK evaluations near max_reach on end_origin); press Park or make a short jog inward toward the base";
+    let exp1 = "return path could not be checked (needs more than 4000 FK evaluations); press Park or make a short jog inward toward the base (near max_reach on end_origin)";
     let exp2 = "gripper (end_point:8) is 4.5 cm beyond the workspace front edge (box_max_x 0.645 m, limit 0.600 m; previous depth 0.040 m, new depth 0.045 m; this move would go 5 mm deeper); move back or press Park";
     let exp3_rsn = "end_origin reach 0.685 m (limit 0.520 m, new depth 0.165 m over, previous depth 0.164 m; this move would go 1.5 mm deeper)";
     let exp3_msg = format!("Path leaves the safe workspace at s=0.200: {exp3_rsn}");
@@ -2116,7 +2134,7 @@ async fn workspace_refusal_messages_three_cases_both_owners_and_rt_bounded() {
     let min_d = eval.init_min_depths(&c0);
     let alloc_j3 = eval.check_readonly(&c_j3, &min_d, "plan").unwrap_err();
     let rt_j3 = eval.check_readonly_slice_rt(c_j3.as_slice(), min_d.as_slice(), "plan").unwrap_err();
-    let empty_rt = || armd::kinematics::WorkspaceViolationDetail { constraint_id: Some(String::with_capacity(128)), geometry_id: Some(String::with_capacity(128)), violation_phase: Some(String::with_capacity(64)), reason: Some(String::with_capacity(256)) };
+    let empty_rt = || armd::kinematics::WorkspaceViolationDetail { constraint_id: Some(String::with_capacity(160)), geometry_id: Some(String::with_capacity(128)), violation_phase: Some(String::with_capacity(64)), reason: Some(String::with_capacity(384)) };
     let mut rt_detail = empty_rt();
     eval.write_failure_detail_rt(&rt_j3, &mut rt_detail);
     assert_eq!((&rt_detail.constraint_id, &rt_detail.geometry_id, &rt_detail.reason), (&alloc_j3.detail.constraint_id, &alloc_j3.detail.geometry_id, &alloc_j3.detail.reason));
@@ -2127,4 +2145,20 @@ async fn workspace_refusal_messages_three_cases_both_owners_and_rt_bounded() {
     let mut rt_b_detail = empty_rt();
     eval.write_failure_detail_rt(&rt_b, &mut rt_b_detail);
     assert_eq!((rt_b_detail.constraint_id.as_deref(), &rt_b_detail.geometry_id, &rt_b_detail.reason), (Some("sweep_budget"), &leg_b.detail.geometry_id, &leg_b.detail.reason));
+
+    // Max-length 64+64 byte self-collision sweep_budget never truncates Park or jog direction in RT buffer.
+    let mut sc_buf = armd::safety::BoundedText::<256>::empty();
+    let long_a = "a".repeat(64);
+    let long_b = "b".repeat(64);
+    let long_cid = format!("self_collision:{long_a}:{long_b}");
+    let long_gid = format!("capsule:{long_a}");
+    armd::chain::WorkspaceFailure::write_witness(&mut sc_buf, armd::chain::WorkspaceWitness::SweepBudget {
+        max_budget: 4000, blocking_cid: Some(&long_cid), blocking_gid: Some(&long_gid), keepout_name: None, start_outside: true,
+    });
+    assert!(sc_buf.as_str().contains("press Park or make a short jog away from self-collision"), "{}", sc_buf.as_str());
+
+    // RT tracking fallback uses WorkspaceFailure's canonical formatter with evaluator metadata.
+    let mut fb_buf = armd::safety::BoundedText::<384>::empty();
+    armd::tracking::FallbackStepErr::WorkspaceStepViolation(rt_j3).write_with_evaluator(&mut fb_buf, Some(&eval));
+    assert_eq!(fb_buf.as_str(), format!("fallback step violates the workspace: {}", alloc_j3.detail.reason.as_deref().unwrap()));
 }

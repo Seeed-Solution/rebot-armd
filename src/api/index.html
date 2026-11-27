@@ -4076,8 +4076,8 @@ Object.assign(I18N.zh, {
   'ex.task.loads': '抓取时将自动加载：{m}',
   'ex.kind.segment': '分割', 'ex.kind.detect': '检测', 'ex.kind.obb': 'OBB', 'ex.kind.other': '模型',
   'ws.box_edge': '{part}超出工作空间{edge} {dist}，请{dir}或{escape}', 'ws.box_edge_nocm': '{part}超出工作空间{edge}，请{dir}或{escape}',
-  'ws.box_edge_witness': '{part} ({gid}) 超出工作空间{edge} {dist}（{cid} {val} m，上限 {lim} m；原超出 {prev} m，新超出 {depth} m），请{dir}或{escape}',
-  'ws.box_edge_witness_deep': '{part} ({gid}) 超出工作空间{edge} {dist}（{cid} {val} m，上限 {lim} m；原超出 {prev} m，新超出 {depth} m，将加深 {delta}），请{dir}或{escape}',
+  'ws.box_edge_witness': '{part} ({gid}) 超出工作空间{edge} {dist}（{cid} {val} m，上限 {lim} m；原超出 {prev}，新超出 {depth}），请{dir}或{escape}',
+  'ws.box_edge_witness_deep': '{part} ({gid}) 超出工作空间{edge} {dist}（{cid} {val} m，上限 {lim} m；原超出 {prev}，新超出 {depth}，将加深 {delta}），请{dir}或{escape}',
   'ws.escape.home': '按 Home', 'ws.escape.park': '按收纳（Park）', 'ws.part.gripper': '夹爪', 'ws.part.camera': '相机', 'ws.part.arm': '机械臂',
   'ws.edge.box_max_x': '前方边界', 'ws.dir.box_max_x': '向后移动', 'ws.jog.box_max_x': '向后（-X）',
   'ws.edge.box_min_x': '后方边界', 'ws.dir.box_min_x': '向前移动', 'ws.jog.box_min_x': '向前（+X）',
@@ -4086,19 +4086,19 @@ Object.assign(I18N.zh, {
   'ws.edge.box_max_z': '顶部边界', 'ws.dir.box_max_z': '向下移动', 'ws.jog.box_max_z': '向下（-Z）',
   'ws.edge.box_min_z': '底部边界', 'ws.dir.box_min_z': '向上移动', 'ws.jog.box_min_z': '向上（+Z）',
   'ws.jog.floor_z': '向上（+Z）', 'ws.jog.max_reach': '向基座方向', 'ws.jog.self_collision': '向远离自碰撞方向', 'ws.jog.inward': '向工作空间内侧',
-  'ws.sweep_budget': '回程路径无法完成校验（超出 {n} 次 FK 评估），请按收纳（Park）或{dir}小步点动',
-  'ws.sweep_budget_inside': '路径无法完成校验（超出 {n} 次 FK 评估），请按收纳（Park）或{dir}小步点动',
-  'ws.sweep_budget_keepout': '禁入区「{name}」附近路径无法完成校验（超出 {n} 次 FK 评估），请小步点动或调整障碍物「{name}」',
-  'ws.sweep_budget_keepout_park': '禁入区「{name}」附近路径无法完成校验（超出 {n} 次 FK 评估），请按收纳（Park）、向远离障碍物「{name}」方向小步点动，或调整该障碍物',
-  'ws.max_reach': '{gid} 臂展 {val} m（上限 {lim} m，原超出 {prev} m，新超出 {depth} m）',
-  'ws.max_reach_deep': '{gid} 臂展 {val} m（上限 {lim} m，原超出 {prev} m，新超出 {depth} m；此移动会再加深 {delta}），请向基座方向回缩或按收纳（Park）',
+  'ws.sweep_budget': '回程路径无法完成校验（超出 {n} 次 FK 评估），请按收纳（Park）或{dir}小步点动{ctx}',
+  'ws.sweep_budget_ctx': '（{blk}，{gid}）',
+  'ws.sweep_budget_keepout': '禁入区「{name}」附近路径无法完成校验（超出 {n} 次 FK 评估），请小步点动或调整障碍物（{gid}）',
+  'ws.sweep_budget_keepout_park': '禁入区「{name}」附近路径无法完成校验（超出 {n} 次 FK 评估），请按收纳（Park）、向远离障碍物方向小步点动，或调整该障碍物（{gid}）',
+  'ws.max_reach': '{gid} 臂展 {val} m（上限 {lim} m，新超出 {depth}，原超出 {prev}）',
+  'ws.max_reach_deep': '{gid} 臂展 {val} m（上限 {lim} m，新超出 {depth}，原超出 {prev}；此移动会再加深 {delta}）',
 });
 Object.assign(I18N.en, {
   'ui.to_expert': 'Expert mode', 'ui.to_simple': 'Simple mode',
   'ui.to_expert.t': 'Switch to expert mode: joint jog, telemetry, calibration, recording and every grasp parameter', 'ui.to_simple.t': 'Back to simple mode: video, sticks and tap to grasp',
   'ws.box_edge': '{part} is {dist} beyond the workspace {edge} ({cid}); {dir} or {escape}', 'ws.box_edge_nocm': '{part} is beyond the workspace {edge} ({cid}); {dir} or {escape}',
-  'ws.box_edge_witness': '{part} ({gid}) is {dist} beyond the workspace {edge} ({cid} {val} m, limit {lim} m; previous depth {prev} m, new depth {depth} m); {dir} or {escape}',
-  'ws.box_edge_witness_deep': '{part} ({gid}) is {dist} beyond the workspace {edge} ({cid} {val} m, limit {lim} m; previous depth {prev} m, new depth {depth} m; this move would go {delta} deeper); {dir} or {escape}',
+  'ws.box_edge_witness': '{part} ({gid}) is {dist} beyond the workspace {edge} ({cid} {val} m, limit {lim} m; previous depth {prev}, new depth {depth}); {dir} or {escape}',
+  'ws.box_edge_witness_deep': '{part} ({gid}) is {dist} beyond the workspace {edge} ({cid} {val} m, limit {lim} m; previous depth {prev}, new depth {depth}; this move would go {delta} deeper); {dir} or {escape}',
   'ws.escape.home': 'press Home', 'ws.escape.park': 'press Park', 'ws.part.gripper': 'gripper', 'ws.part.camera': 'camera', 'ws.part.arm': 'arm',
   'ws.edge.box_max_x': 'front edge', 'ws.dir.box_max_x': 'move back', 'ws.jog.box_max_x': 'back (-X)',
   'ws.edge.box_min_x': 'back edge', 'ws.dir.box_min_x': 'move forward', 'ws.jog.box_min_x': 'forward (+X)',
@@ -4107,12 +4107,12 @@ Object.assign(I18N.en, {
   'ws.edge.box_max_z': 'top edge', 'ws.dir.box_max_z': 'move down', 'ws.jog.box_max_z': 'down (-Z)',
   'ws.edge.box_min_z': 'bottom edge', 'ws.dir.box_min_z': 'move up', 'ws.jog.box_min_z': 'up (+Z)',
   'ws.jog.floor_z': 'up (+Z)', 'ws.jog.max_reach': 'inward toward the base', 'ws.jog.self_collision': 'away from self-collision', 'ws.jog.inward': 'inward toward the workspace',
-  'ws.sweep_budget': 'return path could not be checked (needs more than {n} FK evaluations); press Park or make a short jog {dir}',
-  'ws.sweep_budget_inside': 'path could not be checked (needs more than {n} FK evaluations); press Park or make a short jog {dir}',
-  'ws.sweep_budget_keepout': "path check near keep-out box '{name}' needs more than {n} FK evaluations; take a shorter jog or move the obstacle '{name}'",
-  'ws.sweep_budget_keepout_park': "path check near keep-out box '{name}' needs more than {n} FK evaluations; press Park, take a shorter jog away from obstacle '{name}', or move the obstacle",
-  'ws.max_reach': '{gid} reach {val} m (limit {lim} m, new depth {depth} m over, previous depth {prev} m)',
-  'ws.max_reach_deep': '{gid} reach {val} m (limit {lim} m, new depth {depth} m over, previous depth {prev} m; this move would go {delta} deeper)',
+  'ws.sweep_budget': 'return path could not be checked (needs more than {n} FK evaluations); press Park or make a short jog {dir}{ctx}',
+  'ws.sweep_budget_ctx': ' (near {blk} on {gid})',
+  'ws.sweep_budget_keepout': "path check near keep-out box '{name}' needs more than {n} FK evaluations; take a shorter jog or move the obstacle ({gid})",
+  'ws.sweep_budget_keepout_park': "path check near keep-out box '{name}' needs more than {n} FK evaluations; press Park, take a shorter jog away from the obstacle, or move the obstacle ({gid})",
+  'ws.max_reach': '{gid} reach {val} m (limit {lim} m, new depth {depth} over, previous depth {prev})',
+  'ws.max_reach_deep': '{gid} reach {val} m (limit {lim} m, new depth {depth} over, previous depth {prev}; this move would go {delta} deeper)',
   'sv.title': 'Recognition', 'sv.chip.n': 'Recognition · {n} objects', 'sv.chip.0': 'Recognition · no objects', 'sv.chip.wait': 'Recognition · on', 'sv.on.aria': 'Recognition on/off',
   'sv.meta.video': 'video {fps} fps · {ms} ms', 'sv.meta.det': 'recognition {fps} fps', 'sv.meta.off': 'recognition off',
   'sv.kind': 'Detection kind', 'sv.kind.detect': 'Detect (boxes)', 'sv.kind.segment': 'Segment (outlines)',
@@ -5014,29 +5014,35 @@ function formatWorkspaceViolation(o) {
   if (!o || typeof o !== 'object' || !o.constraint_id) return '';
   const cid = o.constraint_id, gid = (typeof o.geometry_id === 'string' && o.geometry_id) || 'end_origin';
   const raw = String(o.reason || o.message || '');
+  if (/^(?:invalid workspace check\b|.+sweep could not verify\b)/i.test(raw)) return '';
   if (/^box_(?:min|max)_[xyz]$/.test(cid)) {
     const partKey = gid === 'camera_mount' ? 'ws.part.camera' : gid.startsWith('capsule:') ? 'ws.part.arm' : 'ws.part.gripper';
     const distM = /\bis\s+(\d+(?:\.\d+)?)\s*(cm|mm)\b/i.exec(raw) || /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
     const usePark = /\bpress Park\b/i.test(raw) || /would go .* deeper/i.test(raw);
     const args = { part: t(partKey), gid, edge: t('ws.edge.' + cid), dir: t('ws.dir.' + cid), cid, escape: t(usePark ? 'ws.escape.park' : 'ws.escape.home') };
-    const wm = /box_(?:min|max)_[xyz]\s+(-?\d+(?:\.\d+)?)\s*m,\s*limit\s+(-?\d+(?:\.\d+)?)\s*m;\s*previous depth\s+(\d+(?:\.\d+)?)\s*m,\s*new depth\s+(\d+(?:\.\d+)?)\s*m(?:;\s*this move would go\s+(\d+(?:\.\d+)?\s*mm)\s+deeper)?/i.exec(raw);
+    const wm = /box_(?:min|max)_[xyz]\s+(-?\d+(?:\.\d+)?)\s*m,\s*limit\s+(-?\d+(?:\.\d+)?)\s*m;\s*previous depth\s+(\d+(?:\.\d+)?\s*(?:m|mm)),\s*new depth\s+(\d+(?:\.\d+)?\s*(?:m|mm))(?:;\s*this move would go\s+(\d+(?:\.\d+)?\s*mm)\s+deeper)?/i.exec(raw);
     if (distM && wm) {
       const wArgs = { ...args, dist: distM[1] + ' ' + distM[2].toLowerCase(), val: wm[1], lim: wm[2], prev: wm[3], depth: wm[4] };
       return wm[5] ? t('ws.box_edge_witness_deep', { ...wArgs, delta: wm[5] }) : t('ws.box_edge_witness', wArgs);
     }
-    return distM ? t('ws.box_edge', { ...args, dist: distM[1] + ' ' + distM[2].toLowerCase() }) : t('ws.box_edge_nocm', args);
+    if (distM) return t('ws.box_edge', { ...args, dist: distM[1] + ' ' + distM[2].toLowerCase() });
+    return raw ? '' : t('ws.box_edge_nocm', args);
   }
   if (cid === 'sweep_budget') {
-    const nM = /more than (\d+) FK|exceeded (\d+) FK/i.exec(raw), n = (nM && (nM[1] || nM[2])) || '4000';
-    const koM = /keep-out box '([^']+)'/i.exec(raw);
-    if (koM) return t(/\bpress Park\b/i.test(raw) ? 'ws.sweep_budget_keepout_park' : 'ws.sweep_budget_keepout', { name: koM[1], n });
-    const blk = (/\bnear (box_(?:min|max)_[xyz]|max_reach|floor_z|self_collision:[^\s)]+)/i.exec(raw) || [])[1] || '';
+    const koM = /^path check near keep-out box '(.+)' needs more than (\d+) FK evaluations;\s*(.+)$/i.exec(raw);
+    if (koM) {
+      return t(/\bpress Park\b/i.test(koM[3]) ? 'ws.sweep_budget_keepout_park' : 'ws.sweep_budget_keepout', { name: koM[1], n: koM[2], gid });
+    }
+    const unM = /^return path could not be checked \(needs more than (\d+) FK evaluations\);.*?(?:\(near (box_(?:min|max)_[xyz]|max_reach|floor_z|self_collision:.+?) on (.+)\))?$/i.exec(raw);
+    if (!unM) return '';
+    const n = unM[1], blk = unM[2] || '', blkGid = unM[3] || gid;
     const jogKey = /^box_(?:min|max)_[xyz]$/.test(blk) ? 'ws.jog.' + blk : blk === 'max_reach' ? 'ws.jog.max_reach'
       : blk === 'floor_z' ? 'ws.jog.floor_z' : blk.startsWith('self_collision:') ? 'ws.jog.self_collision' : 'ws.jog.inward';
-    return t(/\breturn path\b/i.test(raw) ? 'ws.sweep_budget' : 'ws.sweep_budget_inside', { n, dir: t(jogKey) });
+    const ctx = blk ? t('ws.sweep_budget_ctx', { blk, gid: blkGid }) : '';
+    return t('ws.sweep_budget', { n, dir: t(jogKey), ctx });
   }
   if (cid === 'max_reach') {
-    const rm = /reach\s+(\d+(?:\.\d+)?)\s*m\s*\(limit\s+(\d+(?:\.\d+)?)\s*m,\s*new depth\s+(\d+(?:\.\d+)?)\s*m\s+over,\s*previous depth\s+(\d+(?:\.\d+)?)\s*m(?:;\s*this move would go\s+(\d+(?:\.\d+)?\s*mm)\s+deeper)?\)/i.exec(raw);
+    const rm = /reach\s+(\d+(?:\.\d+)?)\s*m\s*\(limit\s+(\d+(?:\.\d+)?)\s*m,\s*new depth\s+(\d+(?:\.\d+)?\s*(?:m|mm))\s+over,\s*previous depth\s+(\d+(?:\.\d+)?\s*(?:m|mm))(?:;\s*this move would go\s+(\d+(?:\.\d+)?\s*mm)\s+deeper)?\)/i.exec(raw);
     if (rm) {
       const rArgs = { gid, val: rm[1], lim: rm[2], depth: rm[3], prev: rm[4] };
       return rm[5] ? t('ws.max_reach_deep', { ...rArgs, delta: rm[5] }) : t('ws.max_reach', rArgs);

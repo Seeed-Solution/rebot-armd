@@ -1092,7 +1092,8 @@ pub fn plan_swept_joint_path(
                 }
             })?;
             let min_d = ev.init_min_depths(&c0);
-            Some((c0, min_d, motion::MAX_CARTESIAN_SWEEP_EVALS))
+            let start_outside = crate::chain::WorkspaceEvaluator::any_outside(min_d.as_slice());
+            Some((c0, min_d, motion::MAX_CARTESIAN_SWEEP_EVALS, start_outside))
         }
         None => None,
     };
@@ -1117,8 +1118,8 @@ pub fn plan_swept_joint_path(
             }
         });
         motion::check_planning_limits_f32(&q32, &input.limits, arm_scope, Some(s))?;
-        if let (Some(ev), Some((c_prev, min_d, rem))) = (&ws_eval, &mut ws_state) {
-            match ev.sweep_linear_step(
+        if let (Some(ev), Some((c_prev, min_d, rem, start_outside))) = (&ws_eval, &mut ws_state) {
+            match ev.sweep_linear_step_with_start_outside(
                 &prev_q32,
                 &q32,
                 c_prev,
@@ -1127,6 +1128,7 @@ pub fn plan_swept_joint_path(
                 motion::MAX_CARTESIAN_SWEEP_EVALS,
                 "plan",
                 "sweep",
+                *start_outside,
             ) {
                 Ok(c_next) => *c_prev = c_next,
                 Err((t_seg, f)) => {

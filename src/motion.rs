@@ -843,7 +843,8 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
                 detail: f.detail,
             })?;
             let min_d = ev.init_min_depths(&c0);
-            Some((c0, min_d, MAX_CARTESIAN_SWEEP_EVALS))
+            let start_outside = crate::chain::WorkspaceEvaluator::any_outside(min_d.as_slice());
+            Some((c0, min_d, MAX_CARTESIAN_SWEEP_EVALS, start_outside))
         }
         None => None,
     };
@@ -891,8 +892,8 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
         check_planning_limits_f32(&q32, &input.limits, arm_scope, Some(s))?;
-        if let (Some(ev), Some((c_prev, min_d, rem))) = (&ws_eval, &mut ws_state) {
-            match ev.sweep_linear_step(
+        if let (Some(ev), Some((c_prev, min_d, rem, start_outside))) = (&ws_eval, &mut ws_state) {
+            match ev.sweep_linear_step_with_start_outside(
                 &prev_q32,
                 &q32,
                 c_prev,
@@ -901,6 +902,7 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
                 MAX_CARTESIAN_SWEEP_EVALS,
                 "plan",
                 "sweep",
+                *start_outside,
             ) {
                 Ok(c_next) => *c_prev = c_next,
                 Err((t_seg, f)) => {

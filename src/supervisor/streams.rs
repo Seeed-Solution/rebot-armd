@@ -502,20 +502,20 @@ impl SupervisorInner {
                 || !buf_len_ok(&bufs.scratch_c0, n)
                 || !buf_len_ok(&bufs.scratch_c1, n)
                 || !buf_len_ok(&bufs.scratch_min_d, n)
-                || eval
+            {
+                Err(Refusal::code("WORKSPACE_VIOLATION"))
+            } else {
+                match eval
                     .eval_into_slice_rt(
                         &self.commanded_positions,
                         &mut bufs.scratch_c0,
                         &mut bufs.world_caps,
                         "plan",
                     )
-                    .is_err()
-            {
-                Err(Refusal::code("WORKSPACE_VIOLATION"))
-            } else {
-                eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
-                match eval
-                    .eval_into_slice_rt(target, &mut bufs.scratch_c1, &mut bufs.world_caps, "plan")
+                    .and_then(|()| {
+                        eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
+                        eval.eval_into_slice_rt(target, &mut bufs.scratch_c1, &mut bufs.world_caps, "plan")
+                    })
                     .and_then(|()| {
                         eval.check_and_advance_slice_rt(
                             &bufs.scratch_c1,
@@ -526,7 +526,7 @@ impl SupervisorInner {
                     Ok(()) => Ok(()),
                     Err(f) => Err(Refusal {
                         code: "WORKSPACE_VIOLATION",
-                        detail: eval.box_edge_refusal_detail(&f),
+                        detail: eval.refusal_detail(&f),
                     }),
                 }
             };
@@ -1233,9 +1233,28 @@ impl SupervisorInner {
                 write_res
             }
             Err(why) => {
+                let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+                let mut formatted = crate::safety::BoundedText::<384>::empty();
+                {
+                    let eval = self.workspace_policy().map(|(ws, cam)| {
+                        crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                            &self.config.arm_model,
+                            ws,
+                            cam,
+                            self.config.tcp_offset,
+                            &mut bufs,
+                        )
+                    });
+                    why.write_with_evaluator(&mut formatted, eval.as_ref());
+                    if let Some(ev) = eval {
+                        ev.recycle(&mut bufs);
+                    }
+                }
+                self.ws_eval_bufs = bufs;
                 if !self.safety.deferred_logging() {
                     tracing::error!(
-                        "Joint tracking fallback cannot brake within the limits ({why}): no frame sent"
+                        "Joint tracking fallback cannot brake within the limits ({}): no frame sent",
+                        formatted.as_str()
                     );
                 }
                 self.tracking.recycle_fallback_ramp(ramp);
@@ -1264,7 +1283,7 @@ impl SupervisorInner {
                     crate::safety::FaultDetail::formatted(FaultCode::ServoNoBrake, |buf| {
                         let _ = core::fmt::write(
                             buf,
-                            format_args!("Joint tracking fallback cannot brake within the limits: {why}"),
+                            format_args!("Joint tracking fallback cannot brake within the limits: {}", formatted.as_str()),
                         );
                     }),
                 );
@@ -2958,7 +2977,7 @@ pub mod targets {
                 if let RefusalDetail::CurrentRevision(rev) = refusal.detail {
                     v["current_revision"] = json!(rev);
                 } else {
-                    crate::chain::attach_workspace_box_edge_fields(&mut v, refusal.detail, "servo_target");
+                    crate::chain::attach_workspace_refusal_fields(&mut v, refusal.detail, "servo_target");
                 }
                 v
             }
