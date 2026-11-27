@@ -1011,3 +1011,12 @@ impl MitExpiryAxisState {
         self.reset_probes(seen_fb_seq);
     }
 }
+
+/// Proactive interval between continuity holds on energized axes during synchronous legacy MIT
+/// expiry recovery (12 ms reserves >= 8 ms headroom for bounded RX/TX slices so per-axis
+/// hold-to-hold gaps stay <= 20 ms even when RX/TX advances time, well below Damiao's 100 ms
+/// hardware watchdog).
+pub(in crate::driver::can_servo) const MIT_RECOVERY_CONTINUITY_HOLD_INTERVAL: Duration = Duration::from_millis(12);
+/// Maximum single wait/sleep duration between continuity holds during synchronous legacy MIT
+/// expiry recovery (<= 20 ms).
+pub(in crate::driver::can_servo) const MIT_RECOVERY_MAX_WAIT_BETWEEN_HOLDS: Duration = Duration::from_millis(12);
