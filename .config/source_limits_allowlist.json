@@ -4,7 +4,6 @@
   "files": {
     "crates/mview-stereo/src/pose.rs": 3238,
     "sim/mujoco/src/rebot_sim/perception.py": 3656,
-    "src/api/index.html": 18711,
     "src/api/sandbox.rs": 8656,
     "src/api/ws.rs": 3753,
     "src/calibration.rs": 3787,
