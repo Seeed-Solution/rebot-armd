@@ -14,10 +14,13 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
 
-use armd::api::ws::refusal_log::{RefusalLog, REFUSAL_LOG_INTERVAL, REFUSAL_LOG_TARGET};
-use armd::ArmConfig;
+use armd::api::ws::refusal_log::{RefusalLog, REFUSAL_LOG_TARGET};
+use armd::{ArmConfig, SafetyState};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
+
+/// Expected rate-limit interval tested independently of the production constant.
+const EXPECTED_REFUSAL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct Line {
@@ -89,11 +92,13 @@ fn first_refusal_logs_then_one_line_per_code_per_interval_with_suppressed_count(
     // another code on the same connection is independent
     let other = log.observe(t0 + Duration::from_millis(50), &reject("preset_reject", "IK_UNREACHABLE", None)).expect("separate code");
     assert_eq!((other.code.as_str(), other.request_id, other.suppressed), ("IK_UNREACHABLE", None, 0));
-    // rollover: exactly at the interval the next line carries the 40 suppressed ones
-    let again = log.observe(t0 + REFUSAL_LOG_INTERVAL, &r).expect("rollover");
-    assert_eq!(again.suppressed, 40);
-    assert!(log.observe(t0 + REFUSAL_LOG_INTERVAL + Duration::from_secs(1), &r).is_none());
-    let third = log.observe(t0 + REFUSAL_LOG_INTERVAL * 2, &r).expect("second rollover");
+    // still suppressed 1 ms before the 5 s rollover boundary
+    assert!(log.observe(t0 + EXPECTED_REFUSAL_INTERVAL - Duration::from_millis(1), &r).is_none());
+    // rollover: exactly at 5 s the next line carries the 41 suppressed ones
+    let again = log.observe(t0 + EXPECTED_REFUSAL_INTERVAL, &r).expect("rollover");
+    assert_eq!(again.suppressed, 41);
+    assert!(log.observe(t0 + EXPECTED_REFUSAL_INTERVAL + Duration::from_secs(1), &r).is_none());
+    let third = log.observe(t0 + EXPECTED_REFUSAL_INTERVAL * 2, &r).expect("second rollover");
     assert_eq!(third.suppressed, 1);
 }
 
@@ -130,7 +135,7 @@ fn stopped_is_debug_everything_else_warn_and_connections_are_independent() {
         assert_eq!(lost.level, Level::WARN);
         assert_eq!((lost.f("reply_type"), lost.f("status"), lost.f("request_id"), lost.f("suppressed")), ("command_reject", "409", "2", "0"));
     }
-    log_a.note_at("connection:t-a", &reject("command_reject", "LEASE_LOST", Some(9)), now + REFUSAL_LOG_INTERVAL);
+    log_a.note_at("connection:t-a", &reject("command_reject", "LEASE_LOST", Some(9)), now + EXPECTED_REFUSAL_INTERVAL);
     let a = lines_for("connection:t-a");
     assert_eq!(a.last().unwrap().f("suppressed"), "1");
     assert_eq!(a.last().unwrap().f("request_id"), "9");
@@ -199,13 +204,15 @@ async fn refused_commands_over_websocket_are_logged_on_the_ordinary_and_urgent_p
 struct WriteHookGuard(String);
 impl Drop for WriteHookGuard {
     fn drop(&mut self) {
+        armd::api::ws::set_test_ws_write_stall_once(&self.0, false);
         armd::api::ws::set_test_ws_write_paused(&self.0, false);
         armd::api::ws::set_test_ws_write_timeout(&self.0, None);
     }
 }
 
-/// Force a rejected Stop through `flush_urgent_then_fatal_and_close` using the paused-writer
-/// fixture, and verify the refusal log line, refusal frame, fatal error frame, and Close order.
+/// Force a rejected Stop through `flush_urgent_then_fatal_and_close` by stalling only the first
+/// outbound write, explicitly synchronizing Stop admission via an ordered `release_lease` frame
+/// before triggering fatal drain, and verifying the literal refusal log line and wire frame order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
     lines();
@@ -215,40 +222,70 @@ async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
     let _guard = WriteHookGuard(conn_id.clone());
     let ep = sup.get_observation().await.epoch_id;
 
-    armd::api::ws::set_test_ws_write_timeout(&conn_id, Some(Duration::from_millis(200)));
-    armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+    // Stall ONLY the first outbound write with a long write timeout so no wall-clock timer races
+    // with Stop admission; subsequent writes during fatal drain proceed without stalling.
+    armd::api::ws::set_test_ws_write_timeout(&conn_id, Some(Duration::from_secs(10)));
+    armd::api::ws::set_test_ws_write_stall_once(&conn_id, true);
     ws.send(Message::Text(
         json!({"type": "command", "request_id": 7900, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {}}).to_string().into(),
     )).await.unwrap();
-    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
     while armd::api::ws::test_ws_writer_blocked_count(&conn_id) < 1 && Instant::now() < wait_deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1, "writer must block on paused frame");
+    assert!(armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1, "writer must block on first stalled frame");
 
-    // Urgent Stop with stale generation -> command_reject queued on stop_out_rx while writer is
-    // blocked; when the 200 ms write timeout fires, `flush_urgent_then_fatal_and_close` drains it.
+    // Queue rejected Stop (stale generation -> LEASE_LOST / 409) followed on the same ordered WS
+    // stream by `release_lease`: once `active_lease` becomes None, `reader_task` has already
+    // processed Stop 7901 and registered it in-flight (or queued its reply on `stop_out_rx`).
     ws.send(Message::Text(
         json!({"type": "command", "request_id": 7901, "generation": gen + 99, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}}).to_string().into(),
     )).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(215)).await;
+    ws.send(Message::Text(
+        json!({"type": "release_lease", "generation": gen}).to_string().into(),
+    )).await.unwrap();
+    let sync_deadline = Instant::now() + Duration::from_secs(5);
+    while sup.inner().try_read().map_or(true, |g| g.active_lease.is_some()) && Instant::now() < sync_deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        sup.inner().read().await.active_lease.is_none(),
+        "ordered release_lease must complete to prove Stop 7901 was admitted"
+    );
+    assert!(
+        *sup.inner().read().await.safety.state() != SafetyState::EStop,
+        "test must not latch EStop"
+    );
+    assert!(
+        armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1,
+        "first write must still be stalled when Stop 7901 is admitted"
+    );
 
-    armd::api::ws::set_test_ws_write_paused(&conn_id, false);
+    // Overflow the bounded ordinary outbound queue (capacity 64) to trigger fatal drain without
+    // relying on any wall-clock slack; ordinary replies are discarded on fatal close so only
+    // Stop 7901 is drained and logged by `flush_urgent_then_fatal_and_close`.
+    for i in 0..80u64 {
+        let frame = json!({"type": "release_lease", "generation": gen + i + 1}).to_string();
+        if ws.send(Message::Text(frame.into())).await.is_err() {
+            break;
+        }
+    }
+
     let mut stop_reject: Option<(usize, Value)> = None;
     let mut fatal_idx: Option<usize> = None;
     let mut close_idx: Option<usize> = None;
     let mut idx = 0usize;
     let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+        match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 let v: Value = serde_json::from_str(&text).unwrap();
                 seen.push(format!("{idx}:Text({}:{})", v["type"], v["code"]));
                 if v["type"] == "command_reject" && v["request_id"] == 7901 && stop_reject.is_none() {
                     stop_reject = Some((idx, v.clone()));
                 }
-                if v["type"] == "error" && v["code"] == "WRITE_TIMEOUT" && fatal_idx.is_none() {
+                if v["type"] == "error" && v["code"] == "OUTBOUND_QUEUE_FULL" && fatal_idx.is_none() {
                     fatal_idx = Some(idx);
                 }
                 idx += 1;
@@ -269,14 +306,19 @@ async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
         }
     }
     let (si, reject_val) = stop_reject.unwrap_or_else(|| panic!("rejected Stop must be delivered through fatal drain; seen={seen:?}"));
-    let fi = fatal_idx.unwrap_or_else(|| panic!("fatal WRITE_TIMEOUT error frame must be delivered; seen={seen:?}"));
+    let fi = fatal_idx.unwrap_or_else(|| panic!("fatal OUTBOUND_QUEUE_FULL error frame must be delivered; seen={seen:?}"));
     let ci = close_idx.unwrap_or_else(|| panic!("Close frame must follow fatal error frame; seen={seen:?}"));
-    assert!(si < fi && fi < ci, "expected stop_reject({si}) < fatal({fi}) < close({ci})");
+    assert!(si < fi && fi < ci, "expected stop_reject({si}) < fatal({fi}) < close({ci}); seen={seen:?}");
+    assert_eq!(reject_val["type"], "command_reject");
+    assert_eq!(reject_val["code"], "LEASE_LOST");
+    assert_eq!(reject_val["status"], 409);
 
     let all = lines().lock().unwrap().clone();
     let l = all.iter().find(|l| l.f("request_id") == "7901")
         .unwrap_or_else(|| panic!("no refusal log line for drained Stop 7901: {all:?}"));
+    assert_eq!(l.level, Level::WARN);
     assert_eq!(l.f("reply_type"), "command_reject");
-    assert_eq!(l.f("code"), reject_val["code"].as_str().unwrap());
-    assert_eq!(l.f("status"), reject_val["status"].as_u64().unwrap().to_string());
+    assert_eq!(l.f("code"), "LEASE_LOST");
+    assert_eq!(l.f("status"), "409");
+    assert_eq!(l.f("suppressed"), "0");
 }
