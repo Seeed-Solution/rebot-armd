@@ -1143,7 +1143,12 @@ function renderExpertLive(live, dets, detAge) {
   const lk = $('ex-link');
   if (lk) setText(lk, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : t('no_telemetry'));
   const ph = $('ex-ph-status');
-  if (ph) {
+  if (ph && S.connLost) {
+    // Phone expert: #lease-status sits in the hidden status line, so the header badge carries the warning.
+    const retryS = reconnectInS();
+    setCls(ph, 'sc-status-badge only-expert is-danger');
+    setText(ph, retryS != null ? t('lease.t.lost') + ' · ' + t('lease.retry_in', { s: retryS }) : t('lease.conn_lost'));
+  } else if (ph) {
     const lsTxt = $('lease-status-txt')?.textContent?.trim() || t('st.Offline');
     const isOwn = $('lease-status')?.classList.contains('is-own');
     const isOther = $('lease-status')?.classList.contains('is-other') || $('lease-status')?.classList.contains('is-released');
