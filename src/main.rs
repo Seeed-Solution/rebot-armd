@@ -951,6 +951,38 @@ async fn start_control_owner_with_hooks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn start_control_owner_for_cli(
+    supervisor: &Arc<ArmSupervisor>,
+    follower: &str,
+    rt_owner: armd::rt_core::executor::RtOwner,
+    period: Duration,
+    rt_sched: armd::rt_core::sched::RtSchedConfig,
+    memory_lock: armd::rt_core::sched::MemoryLock,
+    alloc_timing: bool,
+    apply_rt_sched: bool,
+    panic_policy: armd::rt_core::executor::PanicPolicy,
+    cli: &CliArgs,
+) -> Result<StartedControlOwner, String> {
+    let hooks = armd::rt_core::executor::PersistTestHooks {
+        fail_control_spawn: cli.test_fail_executor_startup,
+        ..Default::default()
+    };
+    start_control_owner_with_hooks(
+        supervisor,
+        follower,
+        rt_owner,
+        period,
+        rt_sched,
+        memory_lock,
+        alloc_timing,
+        apply_rt_sched,
+        panic_policy,
+        hooks,
+    )
+    .await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -1317,7 +1349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(_) => unreachable!("ARMD_MOCK_TEST_OWNER_MODE validated before hardware mount"),
-        None => start_control_owner_with_hooks(
+        None => start_control_owner_for_cli(
             &supervisor,
             follower,
             rt_owner,
@@ -1327,10 +1359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             alloc_timing,
             true,
             armd::rt_core::executor::PanicPolicy::AbortProcess,
-            armd::rt_core::executor::PersistTestHooks {
-                fail_control_spawn: cli.test_fail_executor_startup,
-                ..Default::default()
-            },
+            &cli,
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
@@ -2242,27 +2271,40 @@ mod shutdown_tests {
         assert!(mock_err.contains("Failed to start RT executor"), "{mock_err}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_follower_fail_control_spawn_falls_back_to_legacy_holding_without_torque_off() {
+    #[cfg(test)]
+    async fn make_enabled_dm_for_cli_test() -> (
+        Arc<ArmSupervisor>,
+        Arc<std::sync::Mutex<EnableState>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let state = Arc::new(std::sync::Mutex::new(EnableState::Enabled));
         let enable_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let disable_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drv = ToggleableRtDriver {
             state: state.clone(),
-            enable_sent: enable_sent.clone(),
+            enable_sent,
             disable_sent: disable_sent.clone(),
         };
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
         sup.start_dispatcher().unwrap();
         sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        (sup, state, disable_sent)
+    }
 
-        let hooks = armd::rt_core::executor::PersistTestHooks {
-            fail_control_spawn: true,
-            ..Default::default()
-        };
-        let started = start_control_owner_with_hooks(
-            &sup,
+    async fn wait_for_releases(sup: &ArmSupervisor, min: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while sup.tick_stats().releases_total < min && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn start_dm_for_cli(
+        sup: &Arc<ArmSupervisor>,
+        cli: &CliArgs,
+    ) -> Result<StartedControlOwner, String> {
+        start_control_owner_for_cli(
+            sup,
             "rebot-dm",
             armd::rt_core::executor::RtOwner::Executor,
             Duration::from_millis(10),
@@ -2271,49 +2313,64 @@ mod shutdown_tests {
             false,
             false,
             armd::rt_core::executor::PanicPolicy::StopExecutor,
-            hooks,
+            cli,
         )
         .await
-        .expect("fail_control_spawn on rebot-dm must fall back to legacy");
+    }
 
-        assert!(started.fell_back_to_legacy);
-        assert!(started.executor_handle.is_none());
-        let err_msg = started
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_control_owner_for_cli_wires_test_fail_executor_startup_both_ways() {
+        // Case 1: without --test-fail-executor-startup -> executor owns and advances releases.
+        let cli_off = parse_cli_args_from(["--follower", "rebot-dm", "--owner", "executor"]).unwrap();
+        assert!(!cli_off.test_fail_executor_startup);
+        let (sup_off, state_off, disable_off) = make_enabled_dm_for_cli_test().await;
+        let started_off = start_dm_for_cli(&sup_off, &cli_off)
+            .await
+            .expect("rebot-dm without D2 flag must start on executor");
+        assert!(!started_off.fell_back_to_legacy);
+        assert!(started_off.fallback_error.is_none());
+        assert!(started_off.legacy_control_stop.is_none());
+        let exec_handle = started_off.executor_handle.expect("executor_handle must be present");
+        assert_eq!(sup_off.owner_mode(), armd::supervisor::OWNER_EXECUTOR);
+        wait_for_releases(&sup_off, 3).await;
+        let snap_off = sup_off.tick_stats();
+        assert_eq!(snap_off.owner_mode, "executor");
+        assert!(snap_off.loop_active, "executor loop must be active: {snap_off:?}");
+        assert!(snap_off.releases_total >= 3, "executor must advance releases: {snap_off:?}");
+        assert_eq!(disable_off.load(Ordering::SeqCst), 0);
+        assert_eq!(*state_off.lock().unwrap(), EnableState::Enabled);
+        let _ = tokio::task::spawn_blocking(move || exec_handle.stop_and_join()).await;
+
+        // Case 2: with --test-fail-executor-startup -> simulated spawn failure, handback to legacy
+        // holding with StartupFallbackToLegacy, >=3 legacy releases, and 0 torque-off.
+        let cli_on = parse_cli_args_from([
+            "--follower", "rebot-dm", "--owner", "executor", "--test-fail-executor-startup",
+        ])
+        .unwrap();
+        assert!(cli_on.test_fail_executor_startup);
+        let (sup_on, state_on, disable_on) = make_enabled_dm_for_cli_test().await;
+        let started_on = start_dm_for_cli(&sup_on, &cli_on)
+            .await
+            .expect("with D2 flag on rebot-dm must fall back to legacy");
+        assert!(started_on.fell_back_to_legacy);
+        assert!(started_on.executor_handle.is_none());
+        let err_msg = started_on
             .fallback_error
             .as_deref()
             .expect("fallback_error must record the injected spawn failure");
-        assert!(
-            err_msg.contains("simulated armd-control spawn failure"),
-            "unexpected fallback error: {err_msg}"
-        );
-        let leg_stop = started
-            .legacy_control_stop
-            .expect("fallback must start a live legacy control loop");
-        assert_eq!(sup.owner_mode(), armd::supervisor::OWNER_LEGACY);
-        assert_eq!(
-            sup.owner_reason(),
-            armd::OwnerReason::StartupFallbackToLegacy,
-            "owner_reason must be StartupFallbackToLegacy"
-        );
-
-        // Wait for at least 3 legacy control ticks to prove the fallback loop is actively holding.
-        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while sup.tick_stats().releases_total < 3 && std::time::Instant::now() < wait_deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let snap = sup.tick_stats();
-        assert_eq!(snap.owner_mode, "legacy");
-        assert!(snap.loop_active, "fallback legacy loop must be active: {snap:?}");
-        assert!(snap.releases_total >= 3, "fallback legacy loop must advance releases: {snap:?}");
-        assert_eq!(
-            disable_sent.load(Ordering::SeqCst),
-            0,
-            "fallback to legacy holding must NEVER send torque-off away from rest"
-        );
-        assert_eq!(*state.lock().unwrap(), EnableState::Enabled);
-
-        sup.signal_legacy_stop(&leg_stop);
-        let _ = sup
+        assert!(err_msg.contains("simulated armd-control spawn failure"), "unexpected: {err_msg}");
+        let leg_stop = started_on.legacy_control_stop.expect("fallback must start legacy loop");
+        assert_eq!(sup_on.owner_mode(), armd::supervisor::OWNER_LEGACY);
+        assert_eq!(sup_on.owner_reason(), armd::OwnerReason::StartupFallbackToLegacy);
+        wait_for_releases(&sup_on, 3).await;
+        let snap_on = sup_on.tick_stats();
+        assert_eq!(snap_on.owner_mode, "legacy");
+        assert!(snap_on.loop_active, "fallback legacy loop must be active: {snap_on:?}");
+        assert!(snap_on.releases_total >= 3, "fallback legacy loop must advance releases: {snap_on:?}");
+        assert_eq!(disable_on.load(Ordering::SeqCst), 0, "fallback must never send torque-off");
+        assert_eq!(*state_on.lock().unwrap(), EnableState::Enabled);
+        sup_on.signal_legacy_stop(&leg_stop);
+        let _ = sup_on
             .emergency_process_exit_disable_until(std::time::Instant::now() + Duration::from_millis(500))
             .await;
     }

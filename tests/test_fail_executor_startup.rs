@@ -56,13 +56,26 @@ fn flag_is_refused_when_the_resolved_owner_is_legacy() {
     assert!(text(&o).contains("needs the RT executor as owner (resolved owner: legacy)"), "{}", text(&o));
 }
 
+fn assert_expected_can_open_error(out: &str, iface: &str) {
+    #[cfg(target_os = "linux")]
+    assert!(out.contains(iface), "expected missing-CAN failure ({iface}): {out}");
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = iface;
+        assert!(
+            out.contains("rebot-dm requires Linux SocketCAN"),
+            "expected platform SocketCAN error: {out}"
+        );
+    }
+}
+
 #[test]
 fn flag_is_off_by_default_and_armed_only_by_its_explicit_name() {
-    // Without the flag armd on rebot-dm reaches the missing CAN interface and never logs ARMED.
+    // Without the flag armd on rebot-dm reaches the CAN open check and never logs ARMED.
     let o = run_armd(&["--follower", "rebot-dm", "--follower-port", "can_missing0", "--owner", "executor"]);
     let out = text(&o);
     assert!(!o.status.success(), "{out}");
-    assert!(out.contains("can_missing0"), "expected missing-CAN failure: {out}");
+    assert_expected_can_open_error(&out, "can_missing0");
     assert!(!out.contains("ARMED"), "{out}");
     // a near-miss spelling is an unknown argument
     let o = run_armd(&["--follower", "mock", "--fail-executor-startup"]);
@@ -77,5 +90,5 @@ fn flag_with_rebot_dm_and_executor_owner_passes_validation_and_logs_error_before
     assert!(!o.status.success(), "{out}");
     assert!(!out.contains("is only permitted with") && !out.contains("needs the RT executor as owner"), "{out}");
     assert!(out.contains("--test-fail-executor-startup is ARMED"), "{out}");
-    assert!(out.contains("can_missing0"), "expected missing-CAN failure: {out}");
+    assert_expected_can_open_error(&out, "can_missing0");
 }
