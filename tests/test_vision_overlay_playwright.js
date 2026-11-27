@@ -96,7 +96,10 @@ async function startMockArmd() {
 
     for (const vp of viewports) {
       const page = await browser.newPage({ viewport: { width: vp.width, height: vp.height } });
-      await page.goto(armd.url, { waitUntil: 'domcontentloaded' });
+      // Expert layout: the centre crosshairs are drawn outside simple mode only. Without ?ui=expert the
+      // page switches to expert only once the schema of the default (SO-ARM101) profile has loaded,
+      // which raced with the evaluate below.
+      await page.goto(armd.url + '?ui=expert', { waitUntil: 'domcontentloaded' });
 
       const evalResult = await page.evaluate(() => {
         const vhint = document.getElementById('vhint');
