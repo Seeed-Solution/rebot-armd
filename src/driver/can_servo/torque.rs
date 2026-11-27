@@ -967,3 +967,157 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 pub(super) mod disable;
 pub(super) mod enable;
 pub(super) mod enable_freshen;
+
+/// Phase of a pending Damiao torque transition.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // inline ModeReadback avoids RT heap allocation
+pub(in crate::driver::can_servo) enum DamiaoTorque {
+    /// Budgeted legacy enable retrying mapping-range readback for joints still `Unverified` at
+    /// startup before draining/restoring/enabling (zero heap allocations on the control release).
+    RangeCheck(RangeCheckPhase),
+    /// Budgeted enable waiting for an empty RX queue boundary before mode restore / enable TX.
+    DrainBeforeEnable(Deadline),
+    /// Enable, initial bounded FRESHEN phase: polls every joint with read-only `0xCC` status
+    /// refreshes and waits for a fresh causal reply from every joint before CTRL_MODE restore,
+    /// readback, pre-enable hold, and `CMD_ENABLE`.
+    Freshen(EnableFreshen),
+    /// Enable, pre-restore refresh: waiting for a fresh J7 0xCC feedback reply before writing CTRL_MODE.
+    RefreshBeforeRestore {
+        refresh: FeedbackRefresh,
+        stray: [u8; MAX_MODE_JOINTS],
+        stray_len: u8,
+    },
+    /// Enable, first phase: CTRL_MODE writes restoring the base mode, awaiting their replies.
+    Restore { write: ModeWrite, pf_refreshed: bool },
+    /// Enable, second phase: CTRL_MODE readback of the position-force gripper.
+    Readback(ModeReadback),
+    /// Enable, pre-enable refresh: CTRL_MODE 4 confirmed, waiting for a fresh J7 0xCC reply
+    /// before transmitting the capped 0x307 pre-enable hold.
+    PreEnableRefresh(FeedbackRefresh),
+    /// Enable frames sent (or still queued in `unsent_mask` across TX-budgeted polls), awaiting
+    /// fresh state-1 feedback from every motor. Reserves a bounded causal J7 `0xCC` refresh slot
+    /// and fair J7 TX priority so a carried or retried J7 enable neither starves nor goes stale.
+    Enable {
+        window: ConfirmWindow,
+        unsent_mask: u32,
+        tx_cursor: u8,
+        j7_prioritize: bool,
+        pf_refresh: Option<FeedbackRefresh>,
+        pf_refresh_count: u8,
+    },
+    /// Stopped disable waiting for an exhausted RX drain or incomplete K=3 rest-pose window
+    /// to complete inside the 1 s request lifetime before transmitting any `CMD_DISABLE` (L1).
+    AwaitRestGate {
+        kind: DisableKind,
+        next_probe_at: Instant,
+        client_park: bool,
+        expected_stamp: Option<StopStamp>,
+        start_stop_stamp: StopStamp,
+        started_in_estop: bool,
+    },
+    /// Accepted disable dispatching across as many ticks as the per-tick TX budget needs
+    /// (`repeats_sent == 0` for the initial pass while still-enabled joints keep holding,
+    /// `repeats_sent >= 1` for bounded `DAMIAO_DISABLE_REPEATS` passes and status confirmation).
+    Disable {
+        kind: DisableKind,
+        repeats_sent: u8,
+        repeat_pass_mask: u64,
+        next_repeat_at: Instant,
+        next_probe_at: Instant,
+        mit_fenced: bool,
+        start_stop_stamp: StopStamp,
+        started_in_estop: bool,
+        client_park: bool,
+        rest_established: bool,
+    },
+}
+
+/// Inline zero-allocation state for ticked mapping-range verification of joints that were
+/// `RangeCheckStatus::Unverified` at daemon startup (legacy budgeted enable path).
+#[derive(Debug)]
+pub(in crate::driver::can_servo) struct RangeCheckPhase {
+    pub(in crate::driver::can_servo) pending_mask: u32,
+    pub(in crate::driver::can_servo) active_joint: Option<u8>,
+    pub(in crate::driver::can_servo) boundary: Option<u64>,
+    pub(in crate::driver::can_servo) sent_rids: u8,
+    pub(in crate::driver::can_servo) deadline: Deadline,
+}
+
+/// Inline zero-allocation state for enable's initial bounded `0xCC` FRESHEN phase.
+#[derive(Debug)]
+pub(in crate::driver::can_servo) struct EnableFreshen {
+    pub(in crate::driver::can_servo) target_mask: u32,
+    pub(in crate::driver::can_servo) sent_mask: u32,
+    pub(in crate::driver::can_servo) confirmed_mask: u32,
+    pub(in crate::driver::can_servo) started: Instant,
+    pub(in crate::driver::can_servo) base_rx_seq: u64,
+    pub(in crate::driver::can_servo) tx_boundary_delta: [u32; MAX_MODE_JOINTS],
+    pub(in crate::driver::can_servo) tx_offset_ns: [u32; MAX_MODE_JOINTS],
+    pub(in crate::driver::can_servo) next_retry_at: Option<Instant>,
+    pub(in crate::driver::can_servo) deadline: Deadline,
+}
+
+impl EnableFreshen {
+    pub(in crate::driver::can_servo) const UNSET_NS: u32 = u32::MAX;
+
+    pub(in crate::driver::can_servo) fn tx_boundary(&self, j: usize) -> u64 {
+        self.base_rx_seq.saturating_add(u64::from(self.tx_boundary_delta[j]))
+    }
+
+    pub(in crate::driver::can_servo) fn tx_at(&self, j: usize) -> Option<Instant> {
+        let ns = self.tx_offset_ns[j];
+        (ns != Self::UNSET_NS).then(|| self.started + Duration::from_nanos(u64::from(ns)))
+    }
+
+    pub(in crate::driver::can_servo) fn record_tx(&mut self, j: usize, boundary: u64, tx_at: Instant) {
+        self.sent_mask |= 1u32 << j;
+        self.tx_boundary_delta[j] =
+            u32::try_from(boundary.saturating_sub(self.base_rx_seq)).unwrap_or(u32::MAX);
+        let ns = u32::try_from(tx_at.saturating_duration_since(self.started).as_nanos())
+            .unwrap_or(Self::UNSET_NS - 1);
+        self.tx_offset_ns[j] = ns.min(Self::UNSET_NS - 1);
+    }
+}
+
+/// Time allowed for register replies during ticked range-check recovery (safe at 50 Hz ticks).
+pub(in crate::driver::can_servo) const TICKED_RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(60);
+
+/// Bounded 0xCC feedback refresh for the position-force gripper during enable: `boundary` is the
+/// transmit-time RX sequence barrier established after draining RX right before sending 0xCC
+/// (None: waiting to drain RX and send 0xCC).
+#[derive(Debug)]
+pub(in crate::driver::can_servo) struct FeedbackRefresh { joint: usize, boundary: Option<u64>, deadline: Deadline }
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::driver::can_servo) struct RefreshSample {
+    pub(in crate::driver::can_servo) position: f32,
+    pub(in crate::driver::can_servo) velocity: f32,
+    pub(in crate::driver::can_servo) motor_status: u8,
+    pub(in crate::driver::can_servo) rx_at: Instant,
+    pub(in crate::driver::can_servo) queue_bound: Option<Instant>,
+    pub(in crate::driver::can_servo) seq: u64,
+}
+
+#[derive(Debug)]
+pub(in crate::driver::can_servo) struct RefreshCapture {
+    pub(in crate::driver::can_servo) joint: usize,
+    pub(in crate::driver::can_servo) boundary: u64,
+    pub(in crate::driver::can_servo) tx_at: Instant,
+    pub(in crate::driver::can_servo) deadline: Deadline,
+    /// When true (in-enable J7 refresh), `motor_status == 1` (already enabled on a retry after a
+    /// dropped enable reply) is valid and does not trigger an immediate unsafe veto. Hardware
+    /// faults and invalid states still veto immediately.
+    pub(in crate::driver::can_servo) allow_enabled_state: bool,
+    pub(in crate::driver::can_servo) first: Option<RefreshSample>,
+    /// First post-boundary J7 reply observed during this refresh that violated stationary
+    /// torque-off (`|v| > 0.05`, non-finite velocity, or `motor_status != 0`; when
+    /// `allow_enabled_state` is true, `motor_status == 1` with finite velocity is permitted).
+    /// Sticky across polls so a later benign reply cannot mask an intervening motion or fault event.
+    pub(in crate::driver::can_servo) unsafe_sample: Option<RefreshSample>,
+}
+
+pub(in crate::driver::can_servo) enum RefreshStep {
+    Ready(RefreshSample),
+    Pending(FeedbackRefresh),
+    TimedOut,
+}
