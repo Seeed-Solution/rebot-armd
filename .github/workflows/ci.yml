@@ -28,6 +28,9 @@ jobs:
           tool: nextest@0.9.152
       - name: Test
         run: cargo nextest run --workspace --profile ci --locked
+      - name: Doctests
+        # nextest does not run doctests (29 at 83928c3b)
+        run: cargo test --doc --locked
 
   web:
     # Self-tests of the web cockpit (src/api/index.html), run in Node without a browser.
