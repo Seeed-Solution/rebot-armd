@@ -1071,3 +1071,28 @@ pub(in crate::driver::can_servo) struct ModeReadback {
 
 /// Maximum joints supported in inline stack-allocated [`ModeWrite`] buffers.
 pub(in crate::driver) const MAX_MODE_JOINTS: usize = 16;
+
+/// CTRL_MODE writes sent by `write_modes_send`, awaiting their register replies until `deadline`.
+/// Stored inline with `u8` joint indices (no heap vectors) so RT mode-restore completion,
+/// budget-deferred retries across ticks, and E-stop abandonment never allocate or free.
+#[derive(Debug)]
+pub(in crate::driver) struct ModeWrite {
+    pub(in crate::driver) modes: [DamiaoControlMode; MAX_MODE_JOINTS],
+    pub(in crate::driver) sent: [u8; MAX_MODE_JOINTS],
+    pub(in crate::driver) sent_len: u8,
+    pub(in crate::driver) unsent: [u8; MAX_MODE_JOINTS],
+    pub(in crate::driver) unsent_len: u8,
+    pub(in crate::driver) hold_failed: [u8; MAX_MODE_JOINTS],
+    pub(in crate::driver) hold_failed_len: u8,
+    /// Joints with remaining torque-off enable-restore frames deferred by the per-tick TX budget.
+    pub(in crate::driver) deferred: [u8; MAX_MODE_JOINTS],
+    /// Per-entry next frame stage: `0` = CTRL_MODE write, `1` = hold frame 0, `2` = hold frame 1.
+    pub(in crate::driver) deferred_stage: [u8; MAX_MODE_JOINTS],
+    pub(in crate::driver) deferred_len: u8,
+    /// Hold positions per joint for deferred torque-off enable-restore frames.
+    pub(in crate::driver) hold_pos: [f32; MAX_MODE_JOINTS],
+    /// Whether non-PosForce joints emit both POS_VEL and MIT hold frames during restore.
+    pub(in crate::driver) dual_hold: bool,
+    pub(in crate::driver) flush_ok: bool,
+    pub(in crate::driver) deadline: Deadline,
+}

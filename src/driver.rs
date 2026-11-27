@@ -2055,30 +2055,6 @@ impl PendingDisableShadowBatch {
 
 
 
-/// CTRL_MODE writes sent by `write_modes_send`, awaiting their register replies until `deadline`.
-/// Stored inline with `u8` joint indices (no heap vectors) so RT mode-restore completion,
-/// budget-deferred retries across ticks, and E-stop abandonment never allocate or free.
-#[derive(Debug)]
-struct ModeWrite {
-    modes: [DamiaoControlMode; MAX_MODE_JOINTS],
-    sent: [u8; MAX_MODE_JOINTS],
-    sent_len: u8,
-    unsent: [u8; MAX_MODE_JOINTS],
-    unsent_len: u8,
-    hold_failed: [u8; MAX_MODE_JOINTS],
-    hold_failed_len: u8,
-    /// Joints with remaining torque-off enable-restore frames deferred by the per-tick TX budget.
-    deferred: [u8; MAX_MODE_JOINTS],
-    /// Per-entry next frame stage: `0` = CTRL_MODE write, `1` = hold frame 0, `2` = hold frame 1.
-    deferred_stage: [u8; MAX_MODE_JOINTS],
-    deferred_len: u8,
-    /// Hold positions per joint for deferred torque-off enable-restore frames.
-    hold_pos: [f32; MAX_MODE_JOINTS],
-    /// Whether non-PosForce joints emit both POS_VEL and MIT hold frames during restore.
-    dual_hold: bool,
-    flush_ok: bool,
-    deadline: Deadline,
-}
 
 /// Time allowed for register replies (mode switch, range readback).
 const REGISTER_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
