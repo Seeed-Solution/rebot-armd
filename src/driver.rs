@@ -3694,9 +3694,6 @@ const WATCHDOG_DISABLE_FALLBACK_INTERVAL: Duration = Duration::from_millis(30);
 /// BEFORE Damiao's `TIMEOUT = 2000` (~100 ms) can expire with `0xD`.
 const WATCHDOG_ENABLE_ABORT_AGE: Duration = Duration::from_millis(60);
 
-impl<C: CanTransport> DamiaoArmDriver<C> {
-}
-
 /// Damiao diagnostics that left the `ArmDriver` trait in S4 (allocating twins of
 /// `JointModeExt::with_range_check`, `JointModeExt::take_recovery_writes_into` and
 /// `MitExt::mit_fence_trip_bounded`); for tests and tools, not for owners.
@@ -6370,9 +6367,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
 
 
-
-impl<C: CanTransport> DamiaoArmDriver<C> {
-}
 
 pub(crate) use pos_force_emitter::PosForceSendToken;
 
