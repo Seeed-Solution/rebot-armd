@@ -1,9 +1,9 @@
 //! Serial bus-servo driver family.
 
-pub mod engine;
-pub mod fashionstar;
-pub mod feetech;
-pub mod poll;
-pub mod torque;
+mod engine;
+mod fashionstar;
+pub(crate) mod feetech;
+mod poll;
+mod torque;
 pub use fashionstar::FashionStarArmDriver;
 pub use engine::FeetechArmDriver;

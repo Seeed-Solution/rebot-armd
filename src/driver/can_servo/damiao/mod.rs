@@ -1,5 +1,5 @@
 //! Damiao brushless motor protocol and reply correlator.
 
-pub mod codec;
-pub mod correlator;
-pub mod table;
+pub(crate) mod codec;
+mod correlator;
+pub(crate) mod table;

@@ -1,4 +1,4 @@
 //! FashionStar UartServo driver modules.
 
-pub mod legacy;
+mod legacy;
 pub use legacy::FashionStarArmDriver;

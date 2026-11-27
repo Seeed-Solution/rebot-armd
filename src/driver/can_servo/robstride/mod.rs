@@ -1,4 +1,4 @@
 //! RobStride CAN actuator driver modules.
 
-pub mod legacy;
+mod legacy;
 pub use legacy::RobStrideArmDriver;

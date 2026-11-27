@@ -1,13 +1,13 @@
 //! CAN brushless-servo driver family.
 
-pub mod damiao;
-pub mod engine;
-pub mod gripper_j7;
-pub mod mit;
-pub mod modes;
-pub mod registers;
-pub mod robstride;
-pub mod torque;
+pub(crate) mod damiao;
+mod engine;
+mod gripper_j7;
+mod mit;
+mod modes;
+mod registers;
+mod robstride;
+mod torque;
 
 pub use engine::DamiaoArmDriver;
 pub use gripper_j7::{

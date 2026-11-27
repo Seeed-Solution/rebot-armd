@@ -14,10 +14,10 @@ use crate::transport::{TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
 pub mod ext;
 pub mod zero_offset;
 pub mod handshake;
-pub mod bus_servo;
+pub(crate) mod bus_servo;
 pub use bus_servo::FashionStarArmDriver;
 pub use bus_servo::FeetechArmDriver;
-pub mod can_servo;
+pub(crate) mod can_servo;
 pub use can_servo::{
     gripper_drive_from_profile, DamiaoArmDriver, DamiaoControlMode, GripperDrive,
     GripperPosForce, GripperPosForceInfo, MotorCurrentCap, RobStrideArmDriver,
