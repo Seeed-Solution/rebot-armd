@@ -215,6 +215,7 @@ async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
     let _guard = WriteHookGuard(conn_id.clone());
     let ep = sup.get_observation().await.epoch_id;
 
+    armd::api::ws::set_test_ws_write_timeout(&conn_id, Some(Duration::from_millis(200)));
     armd::api::ws::set_test_ws_write_paused(&conn_id, true);
     ws.send(Message::Text(
         json!({"type": "command", "request_id": 7900, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {}}).to_string().into(),
@@ -225,17 +226,12 @@ async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
     }
     assert!(armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1, "writer must block on paused frame");
 
-    // Urgent Stop with stale generation -> command_reject queued on stop_out_rx while writer is blocked.
+    // Urgent Stop with stale generation -> command_reject queued on stop_out_rx while writer is
+    // blocked; when the 200 ms write timeout fires, `flush_urgent_then_fatal_and_close` drains it.
     ws.send(Message::Text(
         json!({"type": "command", "request_id": 7901, "generation": gen + 99, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}}).to_string().into(),
     )).await.unwrap();
-    // Overflow ordinary outbound queue (64 capacity) to trigger FatalClose::outbound_queue_full().
-    for k in 0..100u64 {
-        ws.send(Message::Text(
-            json!({"type": "command", "request_id": 8000 + k, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {}}).to_string().into(),
-        )).await.unwrap();
-    }
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(215)).await;
 
     armd::api::ws::set_test_ws_write_paused(&conn_id, false);
     let mut stop_reject: Option<(usize, Value)> = None;
@@ -252,7 +248,7 @@ async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
                 if v["type"] == "command_reject" && v["request_id"] == 7901 && stop_reject.is_none() {
                     stop_reject = Some((idx, v.clone()));
                 }
-                if v["type"] == "error" && v["code"] == "OUTBOUND_QUEUE_FULL" && fatal_idx.is_none() {
+                if v["type"] == "error" && v["code"] == "WRITE_TIMEOUT" && fatal_idx.is_none() {
                     fatal_idx = Some(idx);
                 }
                 idx += 1;
@@ -273,7 +269,7 @@ async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
         }
     }
     let (si, reject_val) = stop_reject.unwrap_or_else(|| panic!("rejected Stop must be delivered through fatal drain; seen={seen:?}"));
-    let fi = fatal_idx.unwrap_or_else(|| panic!("fatal OUTBOUND_QUEUE_FULL error frame must be delivered; seen={seen:?}"));
+    let fi = fatal_idx.unwrap_or_else(|| panic!("fatal WRITE_TIMEOUT error frame must be delivered; seen={seen:?}"));
     let ci = close_idx.unwrap_or_else(|| panic!("Close frame must follow fatal error frame; seen={seen:?}"));
     assert!(si < fi && fi < ci, "expected stop_reject({si}) < fatal({fi}) < close({ci})");
 
