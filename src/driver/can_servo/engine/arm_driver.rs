@@ -951,3 +951,49 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     #[cfg(not(target_arch = "wasm32"))]
     fn shadow_ext_mut(&mut self) -> Option<&mut dyn ShadowExt> { Some(self) }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<C: CanTransport> ShadowExt for DamiaoArmDriver<C> {
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        crate::torque::VendorKind::Damiao
+    }
+
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.shadow_staging.set_enabled(enabled);
+        if enabled {
+            let now = self.now();
+            for (i, verified) in self
+                .verified_modes
+                .iter()
+                .enumerate()
+                .take(crate::torque::MAX_CHANNELS)
+            {
+                if let Some(m) = *verified {
+                    self.shadow_staging.push(
+                        crate::torque::shadow::ShadowDriverObs::ModeVerified {
+                            channel: i as u8,
+                            mode: damiao_mode_to_shadow_control_mode(m),
+                            now,
+                            provenance: crate::torque::shadow::EvidenceProvenance::HardwareCausal,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        if self.pending_disable_shadow.is_some() {
+            let now = self.now();
+            PendingDisableShadowBatch::flush_into(
+                &mut self.pending_disable_shadow,
+                &mut self.shadow_staging,
+                now,
+            );
+        }
+        self.shadow_staging.drain_into(out)
+    }
+}
