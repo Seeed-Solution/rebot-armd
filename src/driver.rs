@@ -2056,8 +2056,6 @@ impl PendingDisableShadowBatch {
 
 
 
-/// Time allowed for register replies (mode switch, range readback).
-const REGISTER_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
 /// Proactive interval between continuity holds on energized axes during synchronous legacy MIT
 /// expiry recovery (12 ms reserves >= 8 ms headroom for bounded RX/TX slices so per-axis
 /// hold-to-hold gaps stay <= 20 ms even when RX/TX advances time, well below Damiao's 100 ms

@@ -1075,3 +1075,6 @@ impl<C: CanTransport> CommissioningExt for DamiaoArmDriver<C> {
         })
     }
 }
+
+/// Time allowed for register replies (mode switch, range readback).
+pub(in crate::driver) const REGISTER_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
