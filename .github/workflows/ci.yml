@@ -59,9 +59,35 @@ jobs:
             sh -n "$f" && echo "ok $f"
           done
       - name: Build script syntax
-        run: bash -n scripts/build_deb.sh && bash -n scripts/build_vision.sh
+        run: bash -n scripts/build_deb.sh && bash -n scripts/build_vision.sh && bash -n scripts/source_paths.sh
       - name: build_vision.sh publication tests
         run: bash scripts/tests/build_vision_publish_test.sh
+
+  tooling:
+    # File-level source line limit ratchet (>3000 block, 1501..=3000 warn) and split-tooling tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Source limits ratchet
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python3 scripts/check_source_limits
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            python3 scripts/check_source_limits --base "${{ github.event.before }}"
+          else
+            python3 scripts/check_source_limits --no-base
+          fi
+      - name: Tooling self-tests
+        run: |
+          python3 scripts/tests/check_source_limits_test.py -v
+          python3 scripts/tests/check_move_only_test.py -v
+          bash scripts/tests/source_paths_test.sh
 
   vision-host-tests:
     # Portable parts of rebot-vision (kits/recamera-b601dm/vision/tests), no SG2002 SDK.
