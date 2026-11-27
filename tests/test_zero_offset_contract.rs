@@ -307,7 +307,7 @@ fn commands_add_the_offset_and_keep_velocity_torque_and_gains() {
     d.joint_mode_mut().set_mode_switch_hold_targets(&mh);
     d.pos_force().validate_pos_force_intent_target(-1.0, None, None).unwrap();
     let intent_stamp = PosForceIntentStamp { stop_gen: 3, estop_epoch: 5, lease_gen: 11 };
-    let current_stamp = PosForceIntentStamp { stop_gen: 3, estop_epoch: 5, lease_gen: 11 };
+    let current_stamp = PosForceIntentStamp { stop_gen: 7, estop_epoch: 8, lease_gen: 12 };
     let target_intent = PosForceIntent::target(-0.85, Some(0.42), Some(321), intent_stamp);
     let hold_stamp = PosForceIntentStamp { stop_gen: 4, estop_epoch: 6, lease_gen: 0 };
     let hold_intent = PosForceIntent::hold(hold_stamp);
