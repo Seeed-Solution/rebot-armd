@@ -2191,11 +2191,11 @@ async fn pre_open_skip_conditions() {
     };
 
     // 3. PreOpen::On with width reaching/exceeding open_rad skips with "skipped:open_rad"
-    // At approach height 0.15 m, fx 600, 310 px -> ~0.077 m + 0.015 margin = 0.092 m >= 0.085 m (open_rad)
+    // At approach height 0.15 m, fx 600, 220 px -> ~0.055 m (passes w+2e+6mm <= 0.085) + 0.035 margin = 0.090 m >= 0.085 m
     let c3 = async {
         let setup_wide = GraspSetup {
             pre_open: armd::grasp::PreOpen::On,
-            pre_open_margin_m: 0.015,
+            pre_open_margin_m: 0.035,
             max_grasp_width_m: 0.10, // allow wider object to pass TOO_WIDE
             ..GraspSetup::default()
         };
@@ -2204,7 +2204,7 @@ async fn pre_open_skip_conditions() {
         let mut s = setup_wide.clone();
         s.grip_pixel_norm = calibrate_grip(&r, &setup_wide, &start_r);
         r.sup.inner().write().await.set_grasp_setup(s.clone());
-        *r.sim.width_px.lock().unwrap() = Some(310.0);
+        *r.sim.width_px.lock().unwrap() = Some(220.0);
 
         let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
