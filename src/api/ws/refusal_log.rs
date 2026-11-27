@@ -51,6 +51,10 @@ pub struct RefusalLog {
 
 impl RefusalLog {
     /// The line to log for `reply` at `now`, or `None` when it is not a refusal or is suppressed.
+    ///
+    /// At most 64 distinct canonical codes are tracked per connection (`MAX_CODES_PER_CONNECTION`);
+    /// any further unseen codes share the `"OTHER"` bucket (sharing its rate-limit window,
+    /// suppressed counter, and emitted `code = "OTHER"`).
     pub fn observe(&mut self, now: Instant, reply: &Value) -> Option<RefusalLine> {
         let kind = reply.get("type")?.as_str()?;
         if !matches!(kind, "command_reject" | "preset_reject" | "servo_reject") {
