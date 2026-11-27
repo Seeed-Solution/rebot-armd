@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 
-const html = fs.readFileSync(path.join(__dirname, '../src/api/index.html'), 'utf8');
+const html = require('../src/api/cockpit/assembler/assemble.cjs').assemble();
 
 function fnSource(name) {
   const plain = html.indexOf('function ' + name + '(');

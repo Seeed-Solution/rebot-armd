@@ -524,7 +524,7 @@ fn dual_owner_static_overload_trip_alarm_independent_of_torque_limit_and_restric
 
 #[test]
 fn cockpit_static_overload_banner_independent_of_motion_limit() {
-    let html = include_str!("../src/api/index.html");
+    let html = include_str!(concat!(env!("OUT_DIR"), "/cockpit/index.html"));
     assert!(html.contains(r#"id="pwr-alarm""#), "missing #pwr-alarm banner");
     assert!(html.contains(r#"role="alert""#), "missing alert role");
     assert!(html.contains("'pwr.alarm.warn'"), "missing zh/en warn key");
@@ -540,7 +540,7 @@ fn cockpit_static_overload_banner_independent_of_motion_limit() {
     // torque-limit motion_limit priority.
     let script = r#"
 const fs = require('fs');
-const html = fs.readFileSync('src/api/index.html', 'utf8');
+const html = require('./src/api/cockpit/assembler/assemble.cjs').assemble();
 const dictStart = html.indexOf("const I18N = {");
 const dictEnd = html.indexOf("function t(", dictStart);
 const rpStart = html.indexOf("function renderPower(");

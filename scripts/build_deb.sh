@@ -294,11 +294,9 @@ if [ -d "${REPO_ROOT}/assets/so101_meshes" ]; then
     cp -rf "${REPO_ROOT}/assets/so101_meshes/"* "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_meshes/"
 fi
 
-# Ensure web UI index.html is present in usr/share/rebot-teleop (resolved via .config/source_paths.tsv)
-COCKPIT_HTML="$("${SCRIPT_DIR}/source_paths.sh" --repo cockpit_html)"
-if [ -f "${COCKPIT_HTML}" ]; then
-    cp -f "${COCKPIT_HTML}" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
-fi
+# Web UI: the same assembled cockpit page armd serves (shell + fragments, via .config/source_paths.tsv)
+COCKPIT_ASSEMBLER="$("${SCRIPT_DIR}/source_paths.sh" --repo cockpit_assembler)"
+sh "${COCKPIT_ASSEMBLER}" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
 # Gallery manifest: its "version" is the package version (the console reports it as the
 # installed version), written here so the two cannot differ.
 MANIFEST="${STAGING_DIR}/usr/share/rebot-teleop/rebot-teleop.json"

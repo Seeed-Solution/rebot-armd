@@ -21,7 +21,8 @@ use crate::supervisor::ArmSupervisor;
 /// Largest `POST /api/v1/episodes/import` body (a 600 s episode at the control rate is a few MB).
 pub const IMPORT_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
-static INDEX_HTML: &str = include_str!("index.html");
+// The cockpit page assembled by build.rs from src/api/index.html and src/api/cockpit/ fragments.
+static INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/cockpit/index.html"));
 
 pub(super) async fn serve_index() -> Html<&'static str> {
     Html(INDEX_HTML)
