@@ -205,6 +205,16 @@
     }
    },
    "error": "cannot read"
+  },
+  {
+   "name": "orphan_with_literal_backslash",
+   "unix_only": true,
+   "files": {
+    "index.html": "<!-- @include cockpit/a/b.js -->\n",
+    "cockpit/a/b.js": "A\n",
+    "cockpit/a\\b.js": "orphan\n"
+   },
+   "error": "fragments not included by index.html: cockpit/a\\b.js"
   }
  ]
 }

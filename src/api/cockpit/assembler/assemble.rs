@@ -61,7 +61,13 @@ fn collect_files(dir: &Path, api_dir: &Path, out: &mut BTreeSet<String>) -> Resu
     let entries = fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
     for entry in entries {
         let path = entry.map_err(|e| e.to_string())?.path();
-        let rel = path.strip_prefix(api_dir).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(api_dir)
+            .map_err(|e| e.to_string())?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         if path.is_dir() {
             if rel != ASSEMBLER_DIR {
                 collect_files(&path, api_dir, out)?;

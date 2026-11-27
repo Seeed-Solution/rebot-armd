@@ -23,6 +23,7 @@ function writeCase(files) {
 
 let n = 0;
 for (const c of CASES) {
+  if (c.unix_only && process.platform === 'win32') continue;
   const dir = writeCase(c.files);
   try {
     let page = null, error = null;

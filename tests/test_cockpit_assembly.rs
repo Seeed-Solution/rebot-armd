@@ -1,7 +1,7 @@
 //! Cockpit page assembly (build.rs + src/api/cockpit/assembler): the page armd serves is the
 //! assembly of the current sources, the Node assembler produces the same bytes, both assemblers
-//! give the same result on the shared cases in tests/fixtures/cockpit_assembly/cases.json, and the
-//! deb copies the page from the build-script OUT_DIR of its own cargo build.
+//! give the same result on the shared cases in tests/fixtures/cockpit_assembly/cases.json, and
+//! scripts/build_deb.sh packages armd cleanly without shipping a standalone index.html.
 
 #[path = "../src/api/cockpit/assembler/assemble.rs"]
 mod assemble;
@@ -79,6 +79,9 @@ fn shared_cases_with_the_rust_assembler() {
     let cases = doc["cases"].as_array().unwrap();
     assert!(cases.len() >= 20, "{} cases", cases.len());
     for case in cases {
+        if case.get("unix_only").and_then(|v| v.as_bool()).unwrap_or(false) && !cfg!(unix) {
+            continue;
+        }
         let name = case["name"].as_str().unwrap();
         let dir = write_case(case["files"].as_object().unwrap());
         let got = assemble::assemble(dir.path());
@@ -110,12 +113,172 @@ fn splice_order_and_indented_lines() {
     assert_eq!(assemble::splice_target(" <!-- @include cockpit/b.js -->"), None, "indented lines are not splice points");
 }
 
+#[cfg(unix)]
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, content: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+struct DebFixture {
+    _root: tempfile::TempDir,
+    _conflicting_target: tempfile::TempDir,
+    repo: PathBuf,
+    conflicting_target: PathBuf,
+    fake_bin: PathBuf,
+    sdk_dir: PathBuf,
+    vision_bin: PathBuf,
+    models_dir: PathBuf,
+}
+
+#[cfg(unix)]
+fn make_deb_fixture() -> DebFixture {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(repo.join("scripts")).unwrap();
+    std::fs::copy(manifest.join("scripts/build_deb.sh"), repo.join("scripts/build_deb.sh")).unwrap();
+    std::fs::copy(manifest.join("LICENSE"), repo.join("LICENSE")).unwrap();
+    std::fs::copy(manifest.join("THIRD_PARTY_NOTICES.md"), repo.join("THIRD_PARTY_NOTICES.md")).unwrap();
+    std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"armd\"\nversion = \"0.0.1-test\"\n").unwrap();
+    copy_tree(&manifest.join("kits/recamera-b601dm/packaging"), &repo.join("kits/recamera-b601dm/packaging"));
+    std::fs::create_dir_all(repo.join("kits/recamera-b601dm/profile")).unwrap();
+    std::fs::copy(
+        manifest.join("kits/recamera-b601dm/profile/rebot-b601dm.json"),
+        repo.join("kits/recamera-b601dm/profile/rebot-b601dm.json"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("kits/recamera-b601dm/vision/models")).unwrap();
+    std::fs::copy(
+        manifest.join("kits/recamera-b601dm/vision/LICENSE-APACHE"),
+        repo.join("kits/recamera-b601dm/vision/LICENSE-APACHE"),
+    )
+    .unwrap();
+    // md5("test\n") == d8e8fca2dc0f896fd7cb4cb0031ba249, 5 bytes.
+    std::fs::write(
+        repo.join("kits/recamera-b601dm/vision/models/models.tsv"),
+        "detect\tdummy.cvimodel\td8e8fca2dc0f896fd7cb4cb0031ba249\t5\t0\t-\tbundled\n",
+    )
+    .unwrap();
+    let models_dir = root.path().join("models-cache");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(models_dir.join("dummy.cvimodel"), b"test\n").unwrap();
+    let sdk_dir = root.path().join("sdk");
+    std::fs::create_dir_all(sdk_dir.join("rebot")).unwrap();
+    std::fs::write(sdk_dir.join("rebot/__init__.py"), "# stub\n").unwrap();
+    let vision_bin = root.path().join("rebot-vision");
+    write_executable(&vision_bin, "#!/bin/sh\nexit 0\n");
+    let fake_bin = root.path().join("bin");
+    // Cargo shim: respects --target-dir over CARGO_TARGET_DIR, mirroring real cargo.
+    write_executable(
+        &fake_bin.join("cargo"),
+        "#!/usr/bin/env bash\nset -euo pipefail\ntarget=\"\"\ntarget_dir=\"${CARGO_TARGET_DIR:-target}\"\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --target) target=\"$2\"; shift 2 ;;\n    --target=*) target=\"${1#--target=}\"; shift ;;\n    --target-dir) target_dir=\"$2\"; shift 2 ;;\n    --target-dir=*) target_dir=\"${1#--target-dir=}\"; shift ;;\n    *) shift ;;\n  esac\ndone\nout=\"${target_dir}/${target}/release/armd\"\nmkdir -p \"$(dirname \"${out}\")\"\nprintf '#!/bin/sh\\necho fresh-armd-sentinel\\n' > \"${out}\"\nchmod 0755 \"${out}\"\n",
+    );
+    let conflicting = tempfile::tempdir().unwrap();
+    let conflicting_target = conflicting.path().to_path_buf();
+    DebFixture { _root: root, _conflicting_target: conflicting, repo, conflicting_target, fake_bin, sdk_dir, vision_bin, models_dir }
+}
+
+#[cfg(unix)]
+fn run_build_deb(fx: &DebFixture, args: &[&str]) -> std::process::Output {
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    Command::new("bash")
+        .arg(fx.repo.join("scripts/build_deb.sh"))
+        .args(args)
+        .env("PATH", format!("{}:{orig_path}", fx.fake_bin.display()))
+        .env("CARGO_TARGET_DIR", &fx.conflicting_target)
+        .env("RUSTFLAGS", "-C linker=rust-lld")
+        .env("REBOT_SDK_DIR", &fx.sdk_dir)
+        .env("REBOT_VISION_BIN", &fx.vision_bin)
+        .env("REBOT_MODELS_DIR", &fx.models_dir)
+        .output()
+        .expect("run build_deb.sh")
+}
+
+#[cfg(unix)]
 #[test]
-fn deb_copies_the_page_from_the_armd_build_script_out_dir() {
-    let script = include_str!("../scripts/build_deb.sh");
-    assert!(script.contains("--message-format=json-render-diagnostics"), "build_deb.sh reads cargo's build-script messages");
-    assert!(script.contains("COCKPIT_PAGE=\"${ARMD_OUT_DIRS}/cockpit/index.html\""), "page from the armd OUT_DIR");
-    assert!(script.contains("cp \"${COCKPIT_PAGE}\" \"${STAGING_DIR}/usr/share/rebot-teleop/index.html\""), "deb copies that page");
-    assert!(!script.contains("assemble.sh") && !script.contains("cockpit_assembler"), "no second assembler on the deb path");
+fn build_deb_packages_armd_without_standalone_index_html() {
     assert!(!api_dir().join("cockpit/assembler/assemble.sh").exists(), "assemble.sh is gone");
+    let fx = make_deb_fixture();
+    assert!(!fx.repo.join("target").exists(), "clean checkout starts without target/");
+
+    // 1. Dry-run prints explicit --target-dir for both flavors.
+    for args in [&["--dry-run"][..], &["--flavor", "lite", "--dry-run"][..]] {
+        let out = run_build_deb(&fx, args);
+        assert!(out.status.success(), "dry-run {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("--target-dir"), "dry-run {args:?} missing --target-dir:\n{stdout}");
+    }
+
+    // 2. Lite flavor from clean checkout without target/ and with conflicting CARGO_TARGET_DIR.
+    let lite_out = run_build_deb(&fx, &["--flavor", "lite", "0.0.1-test"]);
+    assert!(
+        lite_out.status.success(),
+        "lite build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&lite_out.stdout),
+        String::from_utf8_lossy(&lite_out.stderr)
+    );
+    let tar_path = fx.repo.join("dist/armd-lite_0.0.1-test_riscv64.tar.gz");
+    let tar_list = Command::new("tar").args(["-tzf"]).arg(&tar_path).output().expect("tar -tzf");
+    assert!(tar_list.status.success());
+    let entries: Vec<&str> = std::str::from_utf8(&tar_list.stdout).unwrap().lines().collect();
+    assert!(entries.contains(&"armd-lite_0.0.1-test_riscv64/armd"), "lite missing armd: {entries:?}");
+    assert!(entries.contains(&"armd-lite_0.0.1-test_riscv64/LICENSE"), "lite missing LICENSE: {entries:?}");
+    assert!(
+        entries.contains(&"armd-lite_0.0.1-test_riscv64/THIRD_PARTY_NOTICES.md"),
+        "lite missing THIRD_PARTY_NOTICES.md: {entries:?}"
+    );
+    assert!(!entries.iter().any(|e| e.contains("index.html")), "lite must not contain index.html: {entries:?}");
+    let lite_bin = Command::new("tar")
+        .args(["-xOzf"])
+        .arg(&tar_path)
+        .arg("armd-lite_0.0.1-test_riscv64/armd")
+        .output()
+        .expect("extract lite armd");
+    assert!(String::from_utf8_lossy(&lite_bin.stdout).contains("fresh-armd-sentinel"), "lite armd is not fresh");
+    assert!(std::fs::read_dir(&fx.conflicting_target).unwrap().next().is_none(), "CARGO_TARGET_DIR must not be used");
+
+    // 3. Recamera deb flavor from clean checkout without target/ and with conflicting CARGO_TARGET_DIR.
+    if Command::new("dpkg-deb").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        std::fs::remove_dir_all(fx.repo.join("target")).unwrap();
+        assert!(!fx.repo.join("target").exists());
+        let deb_out = run_build_deb(&fx, &["--flavor", "recamera", "0.0.1-test"]);
+        assert!(
+            deb_out.status.success(),
+            "recamera deb build failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&deb_out.stdout),
+            String::from_utf8_lossy(&deb_out.stderr)
+        );
+        let deb_path = fx.repo.join("dist/rebot-teleop_0.0.1-test_riscv64.deb");
+        let listing = Command::new("dpkg-deb").args(["-c"]).arg(&deb_path).output().expect("dpkg-deb -c");
+        assert!(listing.status.success());
+        let text = String::from_utf8_lossy(&listing.stdout);
+        assert!(text.contains("./usr/bin/armd"), "deb missing ./usr/bin/armd:\n{text}");
+        assert!(text.contains("./usr/local/bin/armd -> /usr/bin/armd"), "deb missing symlink:\n{text}");
+        assert!(!text.contains("index.html"), "deb must not ship standalone index.html:\n{text}");
+        let unpacked = tempfile::tempdir().unwrap();
+        let ex = Command::new("dpkg-deb").arg("-x").arg(&deb_path).arg(unpacked.path()).output().expect("dpkg-deb -x");
+        assert!(ex.status.success());
+        let armd_bytes = std::fs::read_to_string(unpacked.path().join("usr/bin/armd")).unwrap();
+        assert!(armd_bytes.contains("fresh-armd-sentinel"), "deb usr/bin/armd is not fresh");
+        assert!(!unpacked.path().join("usr/share/rebot-teleop/index.html").exists(), "standalone index.html must not exist");
+        assert!(std::fs::read_dir(&fx.conflicting_target).unwrap().next().is_none(), "CARGO_TARGET_DIR must not be used");
+    }
 }
