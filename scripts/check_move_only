@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""Verify that a git diff consists only of moved code plus allowed module-split boilerplate.
+
+Implements the Fable 5.2 / arch-sprint-1.6.1 move-only contract:
+  1. Uses `git diff --color-moved=zebra --color-moved-ws=allow-indentation-change -M -C`
+     with pinned ANSI colors to identify moved blocks regardless of indentation changes.
+  2. Normalizes remaining non-moved `-`/`+` lines by trimming whitespace and stripping
+     leading Rust visibility modifiers (`pub`, `pub(super)`, `pub(crate)`, `pub(self)`,
+     `pub(in ...)`), then pairs:
+       - matching lines within the same hunk (in-place visibility/indentation edits),
+       - matching lines across different files (short moved blocks below git's 20-alnum
+         threshold or moved declaration lines whose visibility changed), and
+       - same-file moved declaration lines whose visibility modifier changed.
+  3. Allows remaining unmatched structural boilerplate per file/side:
+       - blank lines and inner module doc comments (`//! ...`),
+       - `mod <ident>;` and `mod <ident> {` declarations (with optional visibility and
+         immediately preceding `#[cfg(test)]`),
+       - single-line and multi-line `use ...;` imports/re-exports (with optional visibility
+         and immediately preceding `#[cfg(test)]`),
+       - safe `impl ... {` headers (single-line or multi-line with `where` clauses;
+         `unsafe impl` is NOT allowed), and
+       - matching closing `}` lines, strictly balanced against added/removed `impl`/`mod`
+         block openers on the same file and side.
+  4. Any remaining unmatched `-`/`+` line, binary file change, or unbalanced opener fails.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+LEADING_ANSI_RE = re.compile(r"^((?:\x1b\[[0-9;]*m)+)")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+# Strip leading Rust visibility modifier (`pub`, `pub(super)`, `pub(crate)`, `pub(self)`, `pub(in ...)`)
+VIS_PREFIX_RE = re.compile(r"^pub(?:\s*\([^)]*\))?\s+")
+
+# Boilerplate matchers (evaluated on trimmed lines with trailing // comments stripped where needed).
+MOD_DECL_RE = re.compile(r"^(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;\s*$")
+MOD_OPEN_RE = re.compile(r"^(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{\s*$")
+USE_START_RE = re.compile(r"^(?:pub(?:\s*\([^)]*\))?\s+)?use\s+")
+USE_TREE_LINE_RE = re.compile(r"^[A-Za-z0-9_:,{}\s*;#]+$")
+IMPL_START_RE = re.compile(r"^impl(?:\s*<|\s+)")
+CLOSING_BRACE_RE = re.compile(r"^\}\s*$")
+CFG_TEST_RE = re.compile(r"^#\[cfg\(test\)\]\s*$")
+
+
+@dataclass
+class DiffLine:
+    file: str
+    line_no: int
+    hunk_id: int
+    group_id: int
+    sign: str  # '-' or '+'
+    raw: str
+    norm: str
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def strip_line_comment(text: str) -> str:
+    """Strip trailing // comment outside quotes (sufficient for mod/use/impl headers)."""
+    in_str = False
+    escaped = False
+    for i in range(len(text) - 1):
+        ch = text[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_str:
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if not in_str and ch == "/" and text[i + 1] == "/":
+            return text[:i].rstrip()
+    return text.rstrip()
+
+
+def normalize_line(raw: str) -> str:
+    trimmed = raw.strip()
+    if not trimmed:
+        return ""
+    return VIS_PREFIX_RE.sub("", trimmed, count=1)
+
+
+def classify_git_color(raw_ansi_line: str) -> Tuple[str, str]:
+    """Classify a colored git diff line using our pinned ANSI color codes.
+
+    Pinned colors:
+      old=red (31), new=green (32),
+      oldMoved=magenta (35), oldMovedAlternative=blue (34),
+      newMoved=cyan (36), newMovedAlternative=yellow (33).
+    """
+    m = LEADING_ANSI_RE.match(raw_ansi_line)
+    codes = m.group(1) if m else ""
+    plain = strip_ansi(raw_ansi_line)
+    if not plain:
+        return "other", plain
+
+    sign = plain[0]
+    if sign not in ("-", "+"):
+        return "other", plain
+
+    # Check ANSI SGR parameters in the leading escape sequence(s).
+    sgr_nums = set()
+    for seq in re.findall(r"\x1b\[([0-9;]*)m", codes):
+        for part in seq.split(";"):
+            if part.isdigit():
+                sgr_nums.add(int(part))
+
+    if sign == "-" and (35 in sgr_nums or 34 in sgr_nums):
+        return "moved_del", plain[1:]
+    if sign == "+" and (36 in sgr_nums or 33 in sgr_nums):
+        return "moved_add", plain[1:]
+    if sign == "-":
+        return "plain_del", plain[1:]
+    return "plain_add", plain[1:]
+
+
+def run_git_diff(root: Path, git_args: List[str]) -> str:
+    cmd = [
+        "git",
+        "-C",
+        str(root),
+        "-c",
+        "color.diff.old=red",
+        "-c",
+        "color.diff.new=green",
+        "-c",
+        "color.diff.oldMoved=magenta",
+        "-c",
+        "color.diff.oldMovedAlternative=blue",
+        "-c",
+        "color.diff.newMoved=cyan",
+        "-c",
+        "color.diff.newMovedAlternative=yellow",
+        "-c",
+        "color.diff.whitespace=normal",
+        "diff",
+        "--no-ext-diff",
+        "--color=always",
+        "--color-moved=zebra",
+        "--color-moved-ws=allow-indentation-change",
+        "-M",
+        "-C",
+        *git_args,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git diff failed (exit {proc.returncode}): {err}")
+    return proc.stdout.decode("utf-8", errors="surrogateescape")
+
+
+def parse_diff(
+    diff_text: str,
+) -> Tuple[List[DiffLine], List[DiffLine], int, List[str]]:
+    plain_dels: List[DiffLine] = []
+    plain_adds: List[DiffLine] = []
+    moved_count = 0
+    binary_files: List[str] = []
+
+    cur_old_file = ""
+    cur_new_file = ""
+    old_line = 0
+    new_line = 0
+    in_hunk = False
+    hunk_id = 0
+    group_id = 0
+    prev_was_change = False
+
+    for raw_line in diff_text.splitlines():
+        plain = strip_ansi(raw_line)
+        if plain.startswith("diff --git "):
+            in_hunk = False
+            prev_was_change = False
+            cur_old_file = ""
+            cur_new_file = ""
+            continue
+        if plain.startswith("Binary files ") and plain.endswith(" differ"):
+            binary_files.append(plain)
+            continue
+        if plain.startswith("--- "):
+            p = plain[4:].strip()
+            cur_old_file = p[2:] if p.startswith("a/") else p
+            continue
+        if plain.startswith("+++ "):
+            p = plain[4:].strip()
+            cur_new_file = p[2:] if p.startswith("b/") else p
+            continue
+        if plain.startswith("@@ "):
+            m = HUNK_RE.match(plain)
+            if m:
+                old_line = int(m.group(1))
+                new_line = int(m.group(2))
+                in_hunk = True
+                hunk_id += 1
+                group_id += 1
+                prev_was_change = False
+            continue
+        if not in_hunk:
+            continue
+        if plain.startswith("\\ No newline at end of file"):
+            continue
+
+        kind, body = classify_git_color(raw_line)
+        if kind == "other":
+            if plain.startswith(" "):
+                old_line += 1
+                new_line += 1
+                # Only non-blank context lines separate code order; blank context lines
+                # do not reorder statements (e.g. inserting `mod foo;\n\n` above a struct).
+                if prev_was_change and plain[1:].strip():
+                    group_id += 1
+                    prev_was_change = False
+            continue
+
+        prev_was_change = True
+        if kind == "moved_del":
+            moved_count += 1
+            old_line += 1
+        elif kind == "moved_add":
+            moved_count += 1
+            new_line += 1
+        elif kind == "plain_del":
+            norm = normalize_line(body)
+            if norm:
+                plain_dels.append(
+                    DiffLine(
+                        file=cur_old_file or cur_new_file,
+                        line_no=old_line,
+                        hunk_id=hunk_id,
+                        group_id=group_id,
+                        sign="-",
+                        raw=body,
+                        norm=norm,
+                    )
+                )
+            old_line += 1
+        elif kind == "plain_add":
+            norm = normalize_line(body)
+            if norm:
+                plain_adds.append(
+                    DiffLine(
+                        file=cur_new_file or cur_old_file,
+                        line_no=new_line,
+                        hunk_id=hunk_id,
+                        group_id=group_id,
+                        sign="+",
+                        raw=body,
+                        norm=norm,
+                    )
+                )
+            new_line += 1
+
+    return plain_dels, plain_adds, moved_count, binary_files
+
+
+def pair_same_group_lines(
+    dels: List[DiffLine], adds: List[DiffLine]
+) -> Tuple[List[DiffLine], List[DiffLine], int]:
+    """Phase A: pair lines in the same contiguous change group strictly in order."""
+    del_used = [False] * len(dels)
+    add_used = [False] * len(adds)
+    paired = 0
+
+    dels_by_group: Dict[Tuple[str, int], List[int]] = defaultdict(list)
+    adds_by_group: Dict[Tuple[str, int], List[int]] = defaultdict(list)
+    for idx, d in enumerate(dels):
+        dels_by_group[(d.file, d.group_id)].append(idx)
+    for idx, a in enumerate(adds):
+        adds_by_group[(a.file, a.group_id)].append(idx)
+
+    for key, d_idxs in dels_by_group.items():
+        a_idxs = adds_by_group.get(key)
+        if not a_idxs:
+            continue
+        pos_a = 0
+        for di in d_idxs:
+            d_norm = dels[di].norm
+            scan = pos_a
+            while scan < len(a_idxs) and adds[a_idxs[scan]].norm != d_norm:
+                scan += 1
+            if scan < len(a_idxs):
+                ai = a_idxs[scan]
+                del_used[di] = True
+                add_used[ai] = True
+                paired += 1
+                pos_a = scan + 1
+
+    rem_dels = [d for i, d in enumerate(dels) if not del_used[i]]
+    rem_adds = [a for i, a in enumerate(adds) if not add_used[i]]
+    return rem_dels, rem_adds, paired
+
+
+def pair_moved_lines(
+    dels: List[DiffLine], adds: List[DiffLine]
+) -> Tuple[List[DiffLine], List[DiffLine], int]:
+    """Phases B & C: cross-file moved lines and same-file visibility-changed declarations."""
+    del_used = [False] * len(dels)
+    add_used = [False] * len(adds)
+    paired = 0
+
+    adds_by_norm: Dict[str, List[int]] = defaultdict(list)
+    for idx, a in enumerate(adds):
+        adds_by_norm[a.norm].append(idx)
+
+    # Phase B: cross-file moves (short moved blocks <20 alnum or moved lines with visibility edits).
+    for di, d in enumerate(dels):
+        bucket = adds_by_norm.get(d.norm)
+        if not bucket:
+            continue
+        for pos, ai in enumerate(bucket):
+            if adds[ai].file != d.file:
+                bucket.pop(pos)
+                del_used[di] = True
+                add_used[ai] = True
+                paired += 1
+                break
+
+    # Phase C: same-file moved declaration whose visibility modifier changed
+    # (raw trimmed text differs ONLY by visibility prefix; does not match pure statement swaps).
+    for di, d in enumerate(dels):
+        if del_used[di]:
+            continue
+        bucket = adds_by_norm.get(d.norm)
+        if not bucket:
+            continue
+        d_trim = d.raw.strip()
+        for pos, ai in enumerate(bucket):
+            a_trim = adds[ai].raw.strip()
+            if adds[ai].file == d.file and a_trim != d_trim:
+                bucket.pop(pos)
+                del_used[di] = True
+                add_used[ai] = True
+                paired += 1
+                break
+
+    rem_dels = [d for i, d in enumerate(dels) if not del_used[i]]
+    rem_adds = [a for i, a in enumerate(adds) if not add_used[i]]
+    return rem_dels, rem_adds, paired
+
+
+def check_boilerplate_for_side(
+    lines: List[DiffLine],
+) -> Tuple[List[DiffLine], List[str], int]:
+    """Filter allowed structural module-split boilerplate per file on one side ('+' or '-')."""
+    by_file: Dict[str, List[DiffLine]] = defaultdict(list)
+    for ln in lines:
+        by_file[ln.file].append(ln)
+
+    remaining: List[DiffLine] = []
+    balance_errors: List[str] = []
+    boilerplate_count = 0
+
+    for fname in sorted(by_file):
+        flines = sorted(by_file[fname], key=lambda item: item.line_no)
+        n = len(flines)
+        i = 0
+        open_block_braces = 0
+        closing_braces: List[DiffLine] = []
+        file_remaining: List[DiffLine] = []
+
+        while i < n:
+            cur = flines[i]
+            trimmed = cur.raw.strip()
+            code = strip_line_comment(trimmed)
+
+            # 1. Inner module doc comments (`//! ...`).
+            if trimmed.startswith("//!"):
+                boilerplate_count += 1
+                i += 1
+                continue
+
+            # 2. `#[cfg(test)]` immediately preceding an allowed `mod` or `use` line.
+            if CFG_TEST_RE.match(code) and i + 1 < n:
+                nxt = flines[i + 1]
+                nxt_code = strip_line_comment(nxt.raw.strip())
+                if (
+                    nxt.line_no == cur.line_no + 1
+                    and (
+                        MOD_DECL_RE.match(nxt_code)
+                        or MOD_OPEN_RE.match(nxt_code)
+                        or USE_START_RE.match(nxt_code)
+                    )
+                ):
+                    boilerplate_count += 1
+                    i += 1
+                    continue
+
+            # 3. `mod foo;`
+            if MOD_DECL_RE.match(code):
+                boilerplate_count += 1
+                i += 1
+                continue
+
+            # 4. `mod foo {`
+            if MOD_OPEN_RE.match(code):
+                open_block_braces += 1
+                boilerplate_count += 1
+                i += 1
+                continue
+
+            # 5. Single-line or multi-line `use ...;`
+            if USE_START_RE.match(code):
+                brace_depth = code.count("{") - code.count("}")
+                if brace_depth == 0 and code.endswith(";"):
+                    boilerplate_count += 1
+                    i += 1
+                    continue
+                j = i + 1
+                valid_use = brace_depth >= 0
+                while valid_use and j < n:
+                    if flines[j].line_no != flines[j - 1].line_no + 1:
+                        valid_use = False
+                        break
+                    j_code = strip_line_comment(flines[j].raw.strip())
+                    if j_code and not USE_TREE_LINE_RE.match(j_code):
+                        valid_use = False
+                        break
+                    brace_depth += j_code.count("{") - j_code.count("}")
+                    if brace_depth < 0:
+                        valid_use = False
+                        break
+                    if brace_depth == 0 and j_code.endswith(";"):
+                        boilerplate_count += j - i + 1
+                        i = j + 1
+                        break
+                    j += 1
+                else:
+                    valid_use = False
+                if valid_use:
+                    continue
+                file_remaining.append(cur)
+                i += 1
+                continue
+
+            # 6. Safe `impl ... {` header (single-line or multi-line with `where` clauses).
+            if IMPL_START_RE.match(code):
+                if ";" not in code and code.endswith("{"):
+                    open_block_braces += 1
+                    boilerplate_count += 1
+                    i += 1
+                    continue
+                if ";" not in code and "{" not in code:
+                    j = i + 1
+                    found_open = False
+                    while j < n and flines[j].line_no == flines[j - 1].line_no + 1:
+                        j_code = strip_line_comment(flines[j].raw.strip())
+                        if ";" in j_code:
+                            break
+                        if "{" in j_code:
+                            if j_code.endswith("{"):
+                                found_open = True
+                            break
+                        j += 1
+                    if found_open:
+                        open_block_braces += 1
+                        boilerplate_count += j - i + 1
+                        i = j + 1
+                        continue
+                file_remaining.append(cur)
+                i += 1
+                continue
+
+            # 7. Defer bare `}` so git's context-line alignment of identical `}` lines
+            #    does not break balance against `impl`/`mod` openers in the same file.
+            if CLOSING_BRACE_RE.match(code):
+                closing_braces.append(cur)
+                i += 1
+                continue
+
+            file_remaining.append(cur)
+            i += 1
+
+        if open_block_braces > len(closing_braces):
+            side = flines[0].sign if flines else "?"
+            balance_errors.append(
+                f"{fname} ({side}): {open_block_braces - len(closing_braces)} "
+                "unmatched impl/mod opening brace(s)"
+            )
+            boilerplate_count += len(closing_braces)
+        else:
+            boilerplate_count += open_block_braces
+            # Excess closing braces remain for cross-file pairing (e.g. moved short fn `}`).
+            file_remaining.extend(closing_braces[open_block_braces:])
+
+        remaining.extend(file_remaining)
+
+    return remaining, balance_errors, boilerplate_count
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Check that a git diff is move-only (indentation/visibility tolerant)."
+    )
+    parser.add_argument("--root", type=Path, default=None, help="Repository root (default: git top-level)")
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="Compare merge-base(HEAD, BASE)..HEAD (or BASE..HEAD with --direct)",
+    )
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="With --base, diff BASE..HEAD directly instead of merge-base",
+    )
+    parser.add_argument("--staged", "--cached", dest="staged", action="store_true", help="Diff staged changes")
+    parser.add_argument("--max-report", type=int, default=50, help="Max non-move lines to print (default: 50)")
+    parser.add_argument(
+        "revs",
+        nargs="*",
+        help="Optional git diff revision/path args (default: HEAD against working tree)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.root is not None:
+        root = args.root.resolve()
+    else:
+        proc = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            print("check_move_only: ERROR: not inside a git repository", file=sys.stderr)
+            return 2
+        root = Path(proc.stdout.decode("utf-8").strip()).resolve()
+
+    if args.staged and (args.base or args.revs):
+        print("check_move_only: ERROR: --staged cannot be combined with --base or revs", file=sys.stderr)
+        return 2
+
+    git_args: List[str]
+    if args.staged:
+        git_args = ["--cached"]
+    elif args.base is not None:
+        if args.direct:
+            base_rev = args.base
+        else:
+            mb = subprocess.run(
+                ["git", "-C", str(root), "merge-base", "HEAD", args.base],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if mb.returncode != 0:
+                print(
+                    f"check_move_only: ERROR: cannot resolve merge-base with {args.base!r}: "
+                    f"{mb.stderr.decode('utf-8', errors='replace').strip()}",
+                    file=sys.stderr,
+                )
+                return 2
+            base_rev = mb.stdout.decode("utf-8").strip()
+        git_args = [f"{base_rev}..HEAD", *args.revs]
+    elif args.revs:
+        git_args = list(args.revs)
+    else:
+        git_args = ["HEAD"]
+
+    try:
+        diff_text = run_git_diff(root, git_args)
+    except RuntimeError as exc:
+        print(f"check_move_only: ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    plain_dels, plain_adds, moved_count, binary_files = parse_diff(diff_text)
+    rem_dels, rem_adds, paired_a = pair_same_group_lines(plain_dels, plain_adds)
+    rem_dels, del_bal, del_boiler = check_boilerplate_for_side(rem_dels)
+    rem_adds, add_bal, add_boiler = check_boilerplate_for_side(rem_adds)
+    del_offenders, add_offenders, paired_bc = pair_moved_lines(rem_dels, rem_adds)
+    paired_count = paired_a + paired_bc
+
+    offenders = sorted(del_offenders + add_offenders, key=lambda ln: (ln.file, ln.line_no, ln.sign))
+    balance_errors = del_bal + add_bal
+    boilerplate_total = del_boiler + add_boiler
+
+    for b in binary_files:
+        print(f"NON-MOVE BINARY: {b}", file=sys.stderr)
+    for be in balance_errors:
+        print(f"UNBALANCED BLOCK: {be}", file=sys.stderr)
+    for ln in offenders[: args.max_report]:
+        print(f"NON-MOVE {ln.file}:{ln.line_no} {ln.sign} {ln.raw}", file=sys.stderr)
+    if len(offenders) > args.max_report:
+        print(f"... and {len(offenders) - args.max_report} more non-move lines", file=sys.stderr)
+
+    non_move_total = len(offenders) + len(binary_files) + len(balance_errors)
+    status = "PASS" if non_move_total == 0 else "FAIL"
+    print(
+        f"check_move_only: {status} "
+        f"(moved={moved_count}, paired_vis_ws={paired_count}, "
+        f"boilerplate={boilerplate_total}, non_move={non_move_total})"
+    )
+    return 0 if non_move_total == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
