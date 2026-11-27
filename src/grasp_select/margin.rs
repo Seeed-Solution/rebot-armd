@@ -173,8 +173,8 @@ pub fn quality_for(cal: Option<&CalibrationFile>, ctx: Option<&AcceptanceContext
         Some("stale: measured before a joint zero change".into())
     } else if !invalid.is_empty() {
         Some(format!("invalid: {}", invalid.join("; ")))
-    } else if plane_spread_m.is_none() && hover_height_spread_m.is_none() && hover_mismatch.is_some() {
-        Some(format!("mismatched: {}", hover_mismatch.unwrap()))
+    } else if let Some(hm) = hover_mismatch.filter(|_| plane_spread_m.is_none() && hover_height_spread_m.is_none()) {
+        Some(format!("mismatched: {hm}"))
     } else if !missing.is_empty() {
         Some(format!("partial: no {}", missing.join(", ")))
     } else {
