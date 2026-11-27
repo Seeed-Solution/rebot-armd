@@ -261,6 +261,11 @@ pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) ->
 pub fn capture_mode(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value, strict: bool) -> Result<Snapshot, ArmError> {
     let policy = inner.config.gripper_policy.clone()
         .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    let accept_ctx = super::margin::AcceptanceContext {
+        camera_mount: &inner.config.camera_mount,
+        joint_zero_offsets: &inner.joint_zero_offsets,
+        active_tool: &inner.config.active_tool,
+    };
     capture_from_parts(
         pending,
         body,
@@ -269,6 +274,7 @@ pub fn capture_mode(inner: &SupervisorInner, pending: &PendingGrasp, body: &Valu
         inner.config.gravity_comp.as_ref(),
         inner.config.damiao_ranges.as_deref(),
         inner.calibration.as_ref(),
+        &accept_ctx,
         strict,
     )
 }
@@ -292,6 +298,11 @@ pub fn capture_from_env_mode(
 ) -> Result<Snapshot, ArmError> {
     let policy = env.config.gripper_policy.clone()
         .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    let accept_ctx = super::margin::AcceptanceContext {
+        camera_mount: &env.config.camera_mount,
+        joint_zero_offsets: &env.joint_zero_offsets,
+        active_tool: &env.config.active_tool,
+    };
     capture_from_parts(
         pending,
         body,
@@ -300,10 +311,12 @@ pub fn capture_from_env_mode(
         env.config.gravity_comp.as_ref(),
         env.config.damiao_ranges.as_deref(),
         env.calibration.as_ref(),
+        &accept_ctx,
         strict,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_from_parts(
     pending: &PendingGrasp,
     body: &Value,
@@ -312,6 +325,7 @@ fn capture_from_parts(
     gravity_comp: Option<&crate::model::GravityCompPolicy>,
     damiao_ranges: Option<&[crate::model::DamiaoRange]>,
     calibration: Option<&crate::calibration::CalibrationFile>,
+    accept_ctx: &super::margin::AcceptanceContext<'_>,
     strict: bool,
 ) -> Result<Snapshot, ArmError> {
     let (evidence, prefs, wall_ms) = if strict {
@@ -351,7 +365,7 @@ fn capture_from_parts(
         frame_id: request.frame_id, evidence, open_rad: pending.open_rad, closed_rad: policy.closed_rad, envelope,
         tool: ToolVolumes::b601dm_assumed_with_cap(open_width, max_w, max_w_cap), torque_limits, prefs,
         budget: Budget { wall_ms, cancel: None },
-        calib: super::margin::quality(calibration),
+        calib: super::margin::quality_for(calibration, Some(accept_ctx)),
     };
     snap.id = snapshot_id(&snap);
     Ok(snap)
