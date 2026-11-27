@@ -1448,7 +1448,7 @@ impl SupervisorInner {
         match &self.driver {
             None => Some((0, 0)),
             Some(d) => d.with_ref(|drv| {
-                let ages = drv.feedback_ages();
+                let ages = drv.feedback_ages_snapshot();
                 if ages.len() != self.config.dof {
                     return None;
                 }
@@ -1477,7 +1477,7 @@ impl SupervisorInner {
         match &self.driver {
             None => Some(((0, 0), now)),
             Some(d) => d.with_ref(|drv| {
-                let ages = drv.feedback_ages();
+                let ages = drv.feedback_ages_snapshot();
                 if ages.len() != self.config.dof {
                     return None;
                 }

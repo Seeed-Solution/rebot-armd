@@ -3626,7 +3626,7 @@ impl SupervisorInner {
                     }
                     if allow_bus_read && !driver.is_feedback_valid() {
                         if let Ok(states) = driver.read_joint_states() {
-                            let loads = driver.joint_loads();
+                            let loads = driver.joint_loads_snapshot();
                             if !states.is_empty()
                                 && driver.is_feedback_valid()
                                 && SupervisorInner::states_valid(
@@ -9316,8 +9316,8 @@ impl SupervisorInner {
                 let snapshot = self.driver.as_mut().and_then(|d| {
                     d.with_mut(|drv| {
                         let states = drv.read_joint_states().ok()?;
-                        let ages = drv.feedback_ages();
-                        let loads = drv.joint_loads();
+                        let ages = drv.feedback_ages_snapshot();
+                        let loads = drv.joint_loads_snapshot();
                         let caps = drv.capabilities();
                         let modes_uncertain = drv.joint_mode().joint_modes_uncertain();
                         let tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
@@ -9491,8 +9491,8 @@ impl SupervisorInner {
                         return Err(ClearFaultLegacyInnerError::Safety(SafetyError::ClearFaultRejected(e.to_string())));
                     }
                 };
-                let ages = drv.feedback_ages();
-                let loads = drv.joint_loads();
+                let ages = drv.feedback_ages_snapshot();
+                let loads = drv.joint_loads_snapshot();
                 let caps = drv.capabilities();
                 let disabling = drv.clear_fault_disables_joints();
                 let hw_fault = drv.check_hardware_status().is_err();
@@ -9625,7 +9625,7 @@ impl SupervisorInner {
                             drv.check_hardware_status().is_err(),
                             drv.is_feedback_valid(),
                             drv.pos_force().pos_force_feedback_fresh(),
-                            drv.feedback_ages(),
+                            drv.feedback_ages_snapshot(),
                         ))
                     })
                     .ok_or(ClearFaultLegacyInnerError::Safety(SafetyError::FeedbackUnavailable))?

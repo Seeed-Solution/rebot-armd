@@ -5464,7 +5464,7 @@ impl SupervisorInner {
                 return Some("driver lacks load feedback for support load limits".into());
             }
             let max_age = Duration::from_millis(policy.feedback_max_age_ms);
-            let ages = driver.feedback_ages();
+            let ages = driver.feedback_ages_snapshot();
             if !self.feedback_numeric_valid
                 || ages.len() != dof
                 || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
@@ -19026,7 +19026,7 @@ impl ArmSupervisor {
             inner.loads = vec![f32::NAN; inner.config.dof];
         }
         if let Ok(states) = drv.read_joint_states() {
-            let loads = drv.joint_loads();
+            let loads = drv.joint_loads_snapshot();
             if !states.is_empty() && drv.is_feedback_valid() && SupervisorInner::states_valid(&states, caps, inner.config.dof, loads.as_deref()) {
                 inner.sync_driver_feedback(&states, loads.as_deref());
                 for (i, s) in states.iter().enumerate().take(inner.config.dof) {

@@ -1336,10 +1336,14 @@ pub trait ArmDriver: Send {
     ) {}
 
     /// Age of the last received sample for each joint. Reading a cache does not refresh it.
+    /// Implementation primitive (allocates): owners call `feedback_ages_into` (or the
+    /// `dyn ArmDriver` snapshot helper); kept until the test doubles are regrouped (S6).
     fn feedback_ages(&self) -> Vec<Option<Duration>> { Vec::new() }
 
     /// Monotonic receive instant of the last received sample for each joint.
     /// Reading a cache does not refresh it. Default derives it from [`Self::feedback_ages`].
+    /// Implementation primitive (allocates): owners call `feedback_instants_into` (or the
+    /// `dyn ArmDriver` snapshot helper); kept until the test doubles are regrouped (S6).
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         let now = Instant::now();
         self.feedback_ages().into_iter().map(|a| a.and_then(|age| now.checked_sub(age))).collect()
@@ -1348,6 +1352,8 @@ pub trait ArmDriver: Send {
     /// Monotonic per-joint hardware feedback sequence counter, incremented once per decoded
     /// hardware reply for that joint. Reading a cache does not advance it. Empty means the
     /// driver does not report explicit counters (supervisor falls back to instant advances).
+    /// Implementation primitive (allocates): owners call `feedback_seqs_into` (or the
+    /// `dyn ArmDriver` snapshot helper); kept until the test doubles are regrouped (S6).
     fn feedback_seqs(&self) -> Vec<u64> { Vec::new() }
 
     /// Per joint, a monotonic instant at which the driver saw its receive queue empty before it
@@ -1356,9 +1362,13 @@ pub trait ArmDriver: Send {
     /// frames: a bounded drain can decode a backlog several ticks after it arrived. Empty means
     /// the driver has no receive queue between bus and decode (request/response transports);
     /// callers then use [`Self::feedback_instants`].
+    /// Implementation primitive (allocates): owners call `feedback_queue_bounds_into` (or the
+    /// `dyn ArmDriver` snapshot helper); kept until the test doubles are regrouped (S6).
     fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> { Vec::new() }
 
     /// Hardware receive timestamps for each joint's latest feedback packet (if tracked).
+    /// Implementation primitive (allocates): owners call `feedback_receive_instants_into` (or the
+    /// `dyn ArmDriver` snapshot helper); kept until the test doubles are regrouped (S6).
     fn feedback_receive_instants(&self) -> Vec<Option<Instant>> { Vec::new() }
 
     // Allocation-free forms of the per-tick reads (the RT executor calls these with
@@ -1848,11 +1858,15 @@ pub trait ArmDriver: Send {
     }
 
     /// Return per-joint motor status or error code if supported by the driver
+    /// Implementation primitive (allocates): owners call `motor_status_into` (or the
+    /// `dyn ArmDriver` snapshot helper); kept until the test doubles are regrouped (S6).
     fn motor_status(&self) -> Option<Vec<u8>> {
         None
     }
 
     /// Return per-joint load telemetry (normalized fraction in [-1.0, 1.0]) if supported
+    /// Implementation primitive (allocates): owners call `joint_loads_into` (or the
+    /// `dyn ArmDriver` snapshot helper); kept until the test doubles are regrouped (S6).
     fn joint_loads(&self) -> Option<Vec<f32>> {
         None
     }
@@ -1870,18 +1884,10 @@ pub trait ArmDriver: Send {
     /// Update internal software enabled flag without transmitting physical frames
     fn set_torque_flag(&mut self, _enabled: bool) {}
 
-    /// Result of the startup check of the motors' mapping ranges against the
-    /// configured ones; None when the driver has no such check or it has not run.
-    fn range_check(&self) -> Option<DriverRangeCheck> { None }
-
     /// What the motor zero tool can do with this driver (`calibration_tools.motor_zero`).
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::unsupported("this driver has no motor zero command")
     }
-
-    /// Joint indices that received an autonomous driver recovery write during
-    /// `read_joint_states` since the previous call, clearing the record.
-    fn take_recovery_writes(&mut self) -> Vec<usize> { Vec::new() }
 
     /// Current time of the driver's clock (the transport's deterministic clock in tests).
     fn clock_now(&self) -> Instant { Instant::now() }
@@ -1902,9 +1908,6 @@ pub trait ArmDriver: Send {
             std::thread::sleep(d);
         }
     }
-
-    /// Why the MIT deadline fence tripped (None = not tripped).
-    fn mit_fence_trip(&self) -> Option<String> { None }
 
     // Capability extensions (src/driver/ext.rs). Drivers override the pair for each
     // extension they implement; owners call the `dyn ArmDriver` getters (`drv.tx()`, ...).
@@ -1938,6 +1941,30 @@ pub trait ArmDriver: Send {
     /// [`JointZeroExt`] of this driver; `None` = the trait's default bodies ([`NoExt`]).
     fn joint_zero_ext(&self) -> Option<&dyn JointZeroExt> { None }
     fn joint_zero_ext_mut(&mut self) -> Option<&mut dyn JointZeroExt> { None }
+}
+
+/// Allocating snapshots for non-RT owner paths, built on the `_into` methods. The `Vec`
+/// returning trait methods (`feedback_ages`, `motor_status`, ...) are implementation
+/// primitives of drivers and doubles; owners call these helpers or the `_into` forms.
+impl dyn ArmDriver + '_ {
+    pub fn feedback_ages_snapshot(&self) -> Vec<Option<Duration>> {
+        let mut out = Vec::new();
+        self.feedback_ages_into(&mut out);
+        out
+    }
+    pub fn feedback_seqs_snapshot(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.feedback_seqs_into(&mut out);
+        out
+    }
+    pub fn joint_loads_snapshot(&self) -> Option<Vec<f32>> {
+        let mut out = Vec::new();
+        self.joint_loads_into(&mut out).then_some(out)
+    }
+    pub fn motor_status_snapshot(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.motor_status_into(&mut out).then_some(out)
+    }
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.
@@ -19220,6 +19247,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 }
 
+/// Damiao diagnostics that left the `ArmDriver` trait in S4 (allocating twins of
+/// `JointModeExt::with_range_check`, `JointModeExt::take_recovery_writes_into` and
+/// `MitExt::mit_fence_trip_bounded`); for tests and tools, not for owners.
+impl<C: CanTransport> DamiaoArmDriver<C> {
+    /// Result of the startup check of the motors' mapping ranges against the configured ones.
+    pub fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
+
+    /// Joint indices that received an autonomous driver recovery write during
+    /// `read_joint_states` since the previous call, clearing the record.
+    pub fn take_recovery_writes(&mut self) -> Vec<usize> {
+        self.recovery_written_joints.drain(..).collect()
+    }
+
+    /// Why the MIT deadline fence tripped (None = not tripped).
+    pub fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.to_string()) }
+}
+
 impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities {
@@ -19795,20 +19839,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
-    fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.to_string()) }
-
     fn clock_now(&self) -> Instant { self.now() }
 
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
         self.clock.clone()
     }
-
-    fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
-
-    fn take_recovery_writes(&mut self) -> Vec<usize> {
-        self.recovery_written_joints.drain(..).collect()
-    }
-
 
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::set_current("motor_flash", false, vec![

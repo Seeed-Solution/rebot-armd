@@ -222,7 +222,7 @@ struct Feedback { ages: Vec<Option<Duration>>, status: Option<Vec<u8>> }
 
 fn feedback(inner: &SupervisorInner) -> Option<Feedback> {
     let d = inner.driver.as_ref()?;
-    d.with_ref(|drv| Feedback { ages: drv.feedback_ages(), status: drv.motor_status() })
+    d.with_ref(|drv| Feedback { ages: drv.feedback_ages_snapshot(), status: drv.motor_status_snapshot() })
 }
 
 /// Sample newer than `since` for joint `j` (always true for the mock follower).

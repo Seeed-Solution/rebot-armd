@@ -414,10 +414,7 @@ impl ArmDriver for ZeroOffsetDriver {
         self.inner.decode_motor_error_static(code)
     }
     fn set_torque_flag(&mut self, enabled: bool) { self.inner.set_torque_flag(enabled) }
-    fn range_check(&self) -> Option<DriverRangeCheck> { self.inner.range_check() }
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }
-    fn take_recovery_writes(&mut self) -> Vec<usize> { self.inner.take_recovery_writes() }
-    fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
     fn begin_control_release(&mut self, release_seq: u64) { self.inner.begin_control_release(release_seq) }
     fn service_release_watchdog_fallback(

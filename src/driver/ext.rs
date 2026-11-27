@@ -541,7 +541,8 @@ pub trait MitExt {
         Err("fresh status read is not supported by this driver".into())
     }
 
-    /// Zero-allocation bounded version of [`Self::mit_fence_trip`] for RT paths (`armd-control`).
+    /// Why the MIT deadline fence tripped (None = not tripped), as bounded text: zero allocation,
+    /// for RT paths (`armd-control`).
     fn mit_fence_trip_bounded(
         &self,
     ) -> Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>> {

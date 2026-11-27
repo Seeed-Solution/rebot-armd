@@ -2303,7 +2303,7 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
         let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
         drv.read_joint_states().unwrap();
         assert!(!drv.is_feedback_valid(), "1 s without polls must make feedback ages stale (>250 ms)");
-        assert!(drv.mit_fence_trip().is_some(), "MIT fence trip for output must stay active");
+        assert!(drv.mit().mit_fence_trip_bounded().is_some(), "MIT fence trip for output must stay active");
         assert!(
             drv.write_joint_targets(&vec![JointTarget::position(0.0); 7]).is_err(),
             "output must still be refused while MIT fence trip is active"

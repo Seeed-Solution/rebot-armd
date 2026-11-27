@@ -5096,7 +5096,7 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
             rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
             rig.step_dt(DT, false);
             assert!(
-                rig.inner().driver.as_ref().unwrap().read().unwrap().mit_fence_trip().is_some(),
+                rig.inner().driver.as_ref().unwrap().read().unwrap().mit().mit_fence_trip_bounded().is_some(),
                 "{owner:?} (estop={is_estop}): 55 ms J7 outage must trip 45 ms MIT fence"
             );
             assert_eq!(

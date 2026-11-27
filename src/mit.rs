@@ -1886,13 +1886,13 @@ impl crate::supervisor::SupervisorInner {
                     drv.mit_mut().set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
                     let res = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
                     let uncertain = drv.joint_mode().joint_modes_uncertain();
-                    if res.is_err() && !uncertain && drv.mit_fence_trip().is_none() {
+                    if res.is_err() && !uncertain && drv.mit().mit_fence_trip_bounded().is_none() {
                         // switched back and confirmed in position control: nothing to fence
                         drv.mit_mut().set_mit_deadline_fence(None, Duration::ZERO);
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     shadow_rt.drain_from_driver(drv);
-                    (res, uncertain || drv.mit_fence_trip().is_some())
+                    (res, uncertain || drv.mit().mit_fence_trip_bounded().is_some())
                 })
             }) else { return };
             out
@@ -2828,7 +2828,7 @@ impl crate::supervisor::SupervisorInner {
                     }
                     Ok(())
                 };
-                let pre = drv.feedback_seqs();
+                let pre = drv.feedback_seqs_snapshot();
                 let r = drv.mit_mut().mit_expiry_recover_with_gate(&mut pre_tx_gate);
                 if let Some(auth_err) = auth_abort {
                     return PreRecoveryOutcome::Authority(auth_err);
@@ -2930,7 +2930,7 @@ impl crate::supervisor::SupervisorInner {
         let post_read = self.driver.as_mut().and_then(|d| {
             d.with_mut(|drv| {
                 let states = drv.read_joint_states_rx_only().ok()?;
-                let post_seqs = drv.feedback_seqs();
+                let post_seqs = drv.feedback_seqs_snapshot();
                 let seqs_after_recovery = pre_recovery_seqs.len() == dof
                     && post_seqs.len() == dof
                     && post_seqs
@@ -2938,8 +2938,8 @@ impl crate::supervisor::SupervisorInner {
                         .zip(&pre_recovery_seqs)
                         .all(|(&post, &pre)| post > pre);
                 let rx_boundary_ok = drv.mit().mit_feedback_after_recovery(dof);
-                let ages = drv.feedback_ages();
-                let loads = drv.joint_loads();
+                let ages = drv.feedback_ages_snapshot();
+                let loads = drv.joint_loads_snapshot();
                 let caps = drv.capabilities();
                 let fb_fresh = seqs_after_recovery
                     && rx_boundary_ok
