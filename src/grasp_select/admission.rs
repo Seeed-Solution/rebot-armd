@@ -46,23 +46,85 @@ impl TopAdvisory {
     }
 }
 
-/// The jaw predicate: `width` along the closing axis is finite, at most `max_grasp_width_m`
-/// (when the cap is enabled), and `width + 2·hard_error + 2·MIN_OPENING_RESERVE_M <= open_width`.
-/// The cap is optional independently of the opening reserve. Returns the per-side reserve
-/// `(open_width - width - 2·hard_error) / 2`.
+/// Signed object cross-section `[lo_m, hi_m]` along the jaw closing axis relative to the
+/// contact centre (`0`), tagged with the evidence source that produced it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JawCut {
+    pub lo_m: f64,
+    pub hi_m: f64,
+    pub evidence: &'static str,
+}
+
+impl JawCut {
+    pub fn new(lo_m: f64, hi_m: f64, evidence: &'static str) -> Self {
+        Self { lo_m, hi_m, evidence }
+    }
+
+    pub fn centred(width_m: f64, evidence: &'static str) -> Self {
+        Self { lo_m: -width_m / 2.0, hi_m: width_m / 2.0, evidence }
+    }
+
+    pub fn from_offset(offset_m: f64, width_m: f64, evidence: &'static str) -> Self {
+        Self { lo_m: offset_m - width_m / 2.0, hi_m: offset_m + width_m / 2.0, evidence }
+    }
+
+    pub fn width_m(&self) -> f64 {
+        self.hi_m - self.lo_m
+    }
+}
+
+/// Verified jaw clearance returned by [`jaw_check`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JawFit {
+    pub lo_m: f64,
+    pub hi_m: f64,
+    pub width_m: f64,
+    pub reserve_pos_m: f64,
+    pub reserve_neg_m: f64,
+    pub reserve_m: f64,
+    pub min_opening_m: f64,
+    pub evidence: &'static str,
+}
+
+/// Unforgeable live-gate proof token constructed ONLY by [`JawAdmission::live_gate`]; required by
+/// legacy descent so no execution path can descend without passing the live jaw gate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JawGatePass {
+    fit: JawFit,
+    evidence_age: &'static str,
+}
+
+impl JawGatePass {
+    pub fn fit(&self) -> JawFit {
+        self.fit
+    }
+
+    pub fn evidence_age(&self) -> &'static str {
+        self.evidence_age
+    }
+}
+
+/// The interval jaw predicate: `[lo_m, hi_m]` relative to the contact centre along the closing
+/// axis must be finite and ordered (`hi_m > lo_m`), `width = hi_m - lo_m <= cap` when the cap is
+/// enabled, and both jaws must clear the error-shifted interval by at least
+/// [`MIN_OPENING_RESERVE_M`] (3 mm):
+/// `reserve_pos = open_width/2 - hi_m - hard_error >= 3 mm` and
+/// `reserve_neg = open_width/2 + lo_m - hard_error >= 3 mm`.
+/// A centred cut `[-w/2, +w/2]` reduces identically to the scalar rule.
 pub fn jaw_check(
-    width_m: f64,
+    cut: &JawCut,
     hard_error_m: f64,
     open_width_m: f64,
     max_grasp_width_m: Option<f64>,
-) -> Result<f64, Rejection> {
-    if !width_m.is_finite() || width_m <= 0.0 {
+) -> Result<JawFit, Rejection> {
+    if !cut.lo_m.is_finite() || !cut.hi_m.is_finite() || cut.hi_m <= cut.lo_m {
         return Err(Rejection::new(
             "geometry",
             "NO_WIDTH_EVIDENCE",
-            "no finite object width along the jaw closing axis",
+            "no finite ordered object interval along the jaw closing axis",
         ));
     }
+    let width_m = cut.hi_m - cut.lo_m;
     if let Some(cap) = max_grasp_width_m {
         if !cap.is_finite() || width_m > cap + JAW_EPS_M {
             return Err(Rejection::new(
@@ -73,18 +135,32 @@ pub fn jaw_check(
             .with(width_m, cap));
         }
     }
-    let reserve = (open_width_m - width_m - 2.0 * hard_error_m) / 2.0;
-    if !reserve.is_finite() || reserve < MIN_OPENING_RESERVE_M - JAW_EPS_M {
+    let half_open = open_width_m / 2.0;
+    let reserve_pos_m = half_open - cut.hi_m - hard_error_m;
+    let reserve_neg_m = half_open + cut.lo_m - hard_error_m;
+    let reserve_m = reserve_pos_m.min(reserve_neg_m);
+    let min_opening_m = 2.0 * (cut.hi_m.max(-cut.lo_m) + hard_error_m + MIN_OPENING_RESERVE_M);
+    if !reserve_m.is_finite() || reserve_m < MIN_OPENING_RESERVE_M - JAW_EPS_M {
         return Err(Rejection::new(
             "geometry",
             "OPENING",
             format!(
-                "open jaws clear the error-shifted object by {reserve:.4} m per side (width {width_m:.4} m, hard error {hard_error_m:.4} m, opening {open_width_m:.4} m)"
+                "open jaws clear the error-shifted object by {reserve_m:.4} m per side (interval [{:.4}, {:.4}] m, width {width_m:.4} m, hard error {hard_error_m:.4} m, opening {open_width_m:.4} m)",
+                cut.lo_m, cut.hi_m
             ),
         )
-        .with(reserve, MIN_OPENING_RESERVE_M));
+        .with(reserve_m, MIN_OPENING_RESERVE_M));
     }
-    Ok(reserve)
+    Ok(JawFit {
+        lo_m: cut.lo_m,
+        hi_m: cut.hi_m,
+        width_m,
+        reserve_pos_m,
+        reserve_neg_m,
+        reserve_m,
+        min_opening_m,
+        evidence: cut.evidence,
+    })
 }
 
 /// The structured reason of a refusal: the candidate (None for a refusal before any
@@ -123,47 +199,91 @@ impl BestRefusal {
     }
 }
 
-/// The jaw fit a legacy grasp was admitted with; the live measured width is checked against
-/// the same predicate ([`JawAdmission::recheck`]).
+/// The jaw fit a legacy grasp was admitted with; all fields are private and the live gate
+/// ([`JawAdmission::live_gate`]) is the sole constructor of [`JawGatePass`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct JawAdmission {
-    pub candidate_id: String,
-    pub width_m: f64,
-    pub opening_reserve_m: f64,
-    pub hard_error_m: f64,
-    pub open_width_m: f64,
-    pub max_grasp_width_m: f64,
+    candidate_id: String,
+    fit: Option<JawFit>,
+    hard_error_m: f64,
+    open_width_m: f64,
+    max_grasp_width_m: f64,
     /// Whether the top-down candidate's full adaptive preflight was part of the admission
     /// (false for legacy vertical admission).
-    pub full_route_checked: bool,
+    full_route_checked: bool,
     /// Set when the planning check was deferred to the live measured width (and why).
-    pub deferred: Option<String>,
+    deferred: Option<String>,
+    /// Evidence source at admission (`"contour"`, `"obb"`, `"angle"`, `"box"`, or `"deferred"`).
+    evidence: &'static str,
     /// The error budget behind `hard_error_m` (active fallback, reported measured budget).
-    pub error_margin: ErrorMargin,
+    error_margin: ErrorMargin,
 }
 
 impl JawAdmission {
-    /// The jaw predicate on a fresh width with the admitted error, actual insertion opening and
-    /// optional width cap.
-    pub fn recheck_opening(
-        &self,
-        width_m: f64,
-        open_width_m: f64,
-        max_grasp_width_m: Option<f64>,
-    ) -> Result<f64, Rejection> {
-        jaw_check(width_m, self.hard_error_m, open_width_m, max_grasp_width_m)
+    pub fn candidate_id(&self) -> &str {
+        &self.candidate_id
     }
 
-    /// The jaw predicate on a fresh width with the admitted error and full opening.
-    pub fn recheck(&self, width_m: f64, max_grasp_width_m: Option<f64>) -> Result<f64, Rejection> {
-        self.recheck_opening(width_m, self.open_width_m, max_grasp_width_m)
+    pub fn fit(&self) -> Option<JawFit> {
+        self.fit
+    }
+
+    pub fn width_m(&self) -> Option<f64> {
+        self.fit.map(|f| f.width_m)
+    }
+
+    pub fn opening_reserve_m(&self) -> Option<f64> {
+        self.fit.map(|f| f.reserve_m)
+    }
+
+    pub fn hard_error_m(&self) -> f64 {
+        self.hard_error_m
+    }
+
+    pub fn open_width_m(&self) -> f64 {
+        self.open_width_m
+    }
+
+    pub fn max_grasp_width_m(&self) -> f64 {
+        self.max_grasp_width_m
+    }
+
+    pub fn is_deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    pub fn evidence(&self) -> &'static str {
+        self.evidence
+    }
+
+    pub fn error_margin(&self) -> &ErrorMargin {
+        &self.error_margin
+    }
+
+    /// Run the shared interval jaw predicate at the live gate and return the sealed
+    /// [`JawGatePass`] required before descent.
+    pub fn live_gate(
+        &self,
+        cut: &JawCut,
+        open_width_m: f64,
+        max_grasp_width_m: Option<f64>,
+        evidence_age: &'static str,
+    ) -> Result<JawGatePass, Rejection> {
+        let fit = jaw_check(cut, self.hard_error_m, open_width_m, max_grasp_width_m)?;
+        Ok(JawGatePass { fit, evidence_age })
     }
 
     pub fn to_json(&self) -> Value {
         json!({
             "candidate_id": self.candidate_id,
-            "width_m": self.width_m,
-            "opening_reserve_m": self.opening_reserve_m,
+            "evidence": self.evidence,
+            "lo_m": self.fit.map(|f| f.lo_m),
+            "hi_m": self.fit.map(|f| f.hi_m),
+            "width_m": self.fit.map(|f| f.width_m),
+            "opening_reserve_m": self.fit.map(|f| f.reserve_m),
+            "reserve_pos_m": self.fit.map(|f| f.reserve_pos_m),
+            "reserve_neg_m": self.fit.map(|f| f.reserve_neg_m),
+            "min_opening_m": self.fit.map(|f| f.min_opening_m),
             "hard_error_m": self.hard_error_m,
             "open_width_m": self.open_width_m,
             "max_grasp_width_m": self.max_grasp_width_m,
@@ -539,13 +659,13 @@ pub fn plan_legacy_top_down(
     let id = top_down_id(s);
     let make_deferred = |margin: ErrorMargin, why: String| JawAdmission {
         candidate_id: id.clone(),
-        width_m: f64::NAN,
-        opening_reserve_m: f64::NAN,
+        fit: None,
         hard_error_m: margin.hard_error_m,
         open_width_m: s.tool.open_width_m,
         max_grasp_width_m: s.tool.max_grasp_width_m,
         full_route_checked: false,
         deferred: Some(why),
+        evidence: "deferred",
         error_margin: margin,
     };
     let t = match t_res {
@@ -579,7 +699,7 @@ pub fn plan_legacy_top_down(
     let (grasp_r, closing_axis, q_tool, q_grasp) =
         resolve_top_down_alignment(s, Some(t), &td.grasp.r, q_tool, q_grasp);
     let p_contact = [td.target[0], td.target[1]];
-    let jaw_res = candidates::cut_width_near(&t.poly, p_contact, closing_axis)
+    let jaw_res = candidates::cut_interval_near(&t.poly, p_contact, closing_axis, None)
         .ok_or_else(|| {
             Rejection::new(
                 "geometry",
@@ -587,21 +707,21 @@ pub fn plan_legacy_top_down(
                 "the closing line through the top-down target misses the footprint",
             )
         })
-        .and_then(|w| {
-            jaw_check(w, t.hard_error_m, s.tool.open_width_m, s.tool.max_grasp_width_cap)
-                .map(|reserve| (w, reserve))
+        .and_then(|(lo_m, hi_m)| {
+            let cut = JawCut::new(lo_m, hi_m, t.source.name());
+            jaw_check(&cut, t.hard_error_m, s.tool.open_width_m, s.tool.max_grasp_width_cap)
         });
     match (t.source, jaw_res) {
-        (_, Ok((width_m, opening_reserve_m))) => {
+        (_, Ok(fit)) => {
             let jaw = JawAdmission {
                 candidate_id: id,
-                width_m,
-                opening_reserve_m,
+                fit: Some(fit),
                 hard_error_m: t.hard_error_m,
                 open_width_m: s.tool.open_width_m,
                 max_grasp_width_m: s.tool.max_grasp_width_m,
                 full_route_checked: false,
                 deferred: None,
+                evidence: fit.evidence,
                 error_margin: t.margin.clone(),
             };
             TopDownOutcome {
@@ -671,6 +791,12 @@ pub(super) fn advisory_preflight_top_down(
             phase: "advisory".into(),
         });
     }
+    let Some(fit) = tr.jaw.fit() else {
+        return Err(TopAdvisory {
+            code: "NO_WIDTH_EVIDENCE".into(),
+            phase: "advisory".into(),
+        });
+    };
     let contact_xy = [tr.td.target[0], tr.td.target[1]];
     let tangent = g::perp2(tr.closing_axis);
     let (lo, hi) = g::extent_along(&t.poly, t.centroid, tangent);
@@ -682,7 +808,7 @@ pub(super) fn advisory_preflight_top_down(
         axis_index: 0,
         centre: contact_xy,
         dir: tr.closing_axis,
-        width_m: tr.jaw.width_m,
+        width_m: fit.width_m,
         tangent,
         opposition: 1.0,
         moment_q,
@@ -709,9 +835,9 @@ pub(super) fn advisory_preflight_top_down(
         r: tr.grasp_r,
         g: tr.td.grasp.p,
         insertion_m,
-        width_m: tr.jaw.width_m,
+        width_m: fit.width_m,
         pad_overlap_m,
-        opening_reserve_m: tr.jaw.opening_reserve_m,
+        opening_reserve_m: fit.reserve_m,
         table_clearance_m: gz + finger_low.min(env_low) - t.table_z,
         jaw_elevation_deg: 0.0,
     };

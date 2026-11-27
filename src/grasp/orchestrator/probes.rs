@@ -541,9 +541,14 @@ impl Orchestrator {
     }
 
     /// Straight down to `close_h` above the table: the [`Insertion`] along -z that ends at the
-    /// close height, run by [`insert`](Self::insert). With the same-side approach
-    /// (`grasp_final`) it ends with the short segment, never rising towards the target from below.
-    pub(super) async fn descend(&self, close_h: f64, approach: crate::backlash::Request) -> Result<(), Stop> {
+    /// close height, run by [`insert`](Self::insert). Requires a [`crate::grasp_select::JawGatePass`]
+    /// proof token from the live jaw gate.
+    pub(super) async fn descend(
+        &self,
+        close_h: f64,
+        approach: crate::backlash::Request,
+        _gate: &crate::grasp_select::JawGatePass,
+    ) -> Result<(), Stop> {
         let s = &self.setup;
         let p = self.tcp_pose().await.p;
         self.insert(Insertion { goal_tcp: [p[0], p[1], s.table_z_m + close_h], speed_mps: s.descend_speed_mps, approach }).await
@@ -763,33 +768,43 @@ impl Orchestrator {
         }
     }
 
-    /// Projected width of a centred detection's contour (or axis-aligned box when `allow_box` is
-    /// true) along the actual base-frame closing axis `closing_xy` on `plane`.
-    pub(super) fn footprint_width_along_axis(&self, c: &Centred, plane: f64, closing_xy: [f64; 2], allow_box: bool) -> Option<f64> {
+    /// Signed interval cut of a detection's projected contour (rung 1) or projected box (rung 3,
+    /// when `allow_box` is true) relative to `tcp_xy` along the actual base-frame closing axis
+    /// `closing_xy` on `plane`.
+    pub(super) fn footprint_interval_along_axis(
+        &self,
+        det: &Detection,
+        pose: &Pose,
+        plane: f64,
+        tcp_xy: [f64; 2],
+        closing_xy: [f64; 2],
+        allow_box: bool,
+    ) -> Option<crate::grasp_select::JawCut> {
         let u = crate::grasp_select::geometry::unit2(closing_xy);
-        let centre_world = self.cam.plane_point(&c.pose, self.cam.to_px(box_centre(&c.last.box_norm)), plane)?;
-        let p = [centre_world[0], centre_world[1]];
-        if let Some(Ok(ref pts)) = c.last.contour_norm {
+        if let Some(Ok(ref pts)) = det.contour_norm {
             let world: Option<Vec<[f64; 2]>> = pts
                 .iter()
-                .map(|v| self.cam.plane_point(&c.pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
+                .map(|v| self.cam.plane_point(pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
                 .collect();
             if let Some(mut wpts) = world.filter(|w| w.len() >= 3) {
                 crate::grasp_select::geometry::ensure_ccw(&mut wpts);
-                return crate::grasp_select::candidates::cut_width_near(&wpts, p, u);
+                if let Some((lo, hi)) = crate::grasp_select::candidates::cut_interval_near(&wpts, tcp_xy, u, None) {
+                    return Some(crate::grasp_select::JawCut::new(lo, hi, "contour"));
+                }
             }
         }
         if !allow_box {
             return None;
         }
-        let b = c.last.box_norm;
+        let b = det.box_norm;
         let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
         let mut wpts: Vec<[f64; 2]> = corners
             .iter()
-            .map(|v| self.cam.plane_point(&c.pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
+            .map(|v| self.cam.plane_point(pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
             .collect::<Option<Vec<_>>>()?;
         crate::grasp_select::geometry::ensure_ccw(&mut wpts);
-        crate::grasp_select::candidates::cut_width_near(&wpts, p, u)
+        let (lo, hi) = crate::grasp_select::candidates::cut_interval_near(&wpts, tcp_xy, u, None)?;
+        Some(crate::grasp_select::JawCut::new(lo, hi, "box"))
     }
 
     /// TOO_WIDE limit (m; 0 = off): the calibrated full opening minus `pre_open_margin_m`, at

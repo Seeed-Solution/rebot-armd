@@ -146,6 +146,7 @@ impl Orchestrator {
         phase: &str,
         label: &str,
         route: &crate::grasp_select::AdaptiveRoute,
+        contact_pose: &Pose,
         expected_gen: &mut Option<u64>,
         pose_end: &Pose,
         since: Instant,
@@ -441,15 +442,18 @@ impl Orchestrator {
                 }
             }
 
-            // The shared jaw predicate on fresh evidence at the planned contact and closing axis,
-            // with jaw-elevation tilt correction and actual insertion opening (never silently
-            // skipping missing/malformed contour evidence or substituting a disjoint chord).
-            let y = kinematics::column(&route.plan.grasp.r, 1);
+            // The shared interval jaw predicate on fresh evidence at the actual insertion contact
+            // pose and closing axis (consistent with the insertion goal at actual settled wrist
+            // orientation), with jaw-elevation tilt correction and actual insertion opening.
+            let y = kinematics::column(&contact_pose.r, 1);
             let cos_elev = y[0].hypot(y[1]).clamp(1e-6, 1.0);
             let u = crate::grasp_select::geometry::unit2([y[0], y[1]]);
-            let p = route.contact_centre;
+            let p = [
+                route.contact_centre[0] + (contact_pose.p[0] - route.plan.grasp.p[0]),
+                route.contact_centre[1] + (contact_pose.p[1] - route.plan.grasp.p[1]),
+            ];
             let cut_tol = route.opening_reserve_m.clamp(0.005, 0.015);
-            let fresh_poly: Vec<[f64; 2]> = match &best.contour_norm {
+            let (fresh_poly, cut_evidence): (Vec<[f64; 2]>, &'static str) = match &best.contour_norm {
                 Some(Ok(pts)) => {
                     let world: Option<Vec<[f64; 2]>> = pts
                         .iter()
@@ -462,7 +466,7 @@ impl Orchestrator {
                         ));
                     };
                     crate::grasp_select::geometry::ensure_ccw(&mut wpts);
-                    wpts
+                    (wpts, "contour")
                 }
                 Some(Err(why)) => {
                     return Err(fail(
@@ -490,16 +494,22 @@ impl Orchestrator {
                         ));
                     };
                     crate::grasp_select::geometry::ensure_ccw(&mut wpts);
-                    wpts
+                    (wpts, "box")
                 }
             };
-            let Some(w_horiz) = crate::grasp_select::candidates::cut_width_at(&fresh_poly, p, u, cut_tol) else {
+            let Some((lo_h, hi_h)) =
+                crate::grasp_select::candidates::cut_interval_near(&fresh_poly, p, u, Some(cut_tol))
+            else {
                 return Err(fail(
                     "TARGET_DISPLACED",
-                    format!("[{phase}] fresh footprint of '{label}' no longer covers the planned contact along the closing axis"),
+                    format!("[{phase}] fresh footprint of '{label}' no longer covers the contact along the closing axis"),
                 ));
             };
-            let w_eff = w_horiz / cos_elev;
+            let cut = crate::grasp_select::admission::JawCut::new(
+                lo_h / cos_elev,
+                hi_h / cos_elev,
+                cut_evidence,
+            );
             let cap = self.effective_max_grasp_width_cap().await;
             let open_w = match (route.pre_open_fraction, self.gripper_policy().await) {
                 (Some(frac), Some(pol)) => {
@@ -508,7 +518,9 @@ impl Orchestrator {
                 }
                 _ => route.plan.jaw_opening_m,
             };
-            if let Err(r) = crate::grasp_select::admission::jaw_check(w_eff, route.target_hard_error_m, open_w, cap) {
+            if let Err(r) =
+                crate::grasp_select::admission::jaw_check(&cut, route.target_hard_error_m, open_w, cap)
+            {
                 return Err(fail(&r.code, format!("[{phase}] fresh evidence of '{label}': {}", r.message)));
             }
 
@@ -750,6 +762,7 @@ impl Orchestrator {
             "revalidate_start",
             &planned.request.label,
             route,
+            &route.plan.grasp,
             &mut expected_gen,
             &pose0_end,
             Instant::now(),
@@ -864,10 +877,22 @@ impl Orchestrator {
             z_mid,
             &actual_pre_tcp,
         ) {
+            // Actual insertion contact pose matching the insertion goal below (settled wrist
+            // orientation `actual_pre_tcp.r` and translation along `insertion_dir`).
+            let rem_rev = kinematics::dot(
+                &kinematics::sub(&route.plan.grasp.p, &actual_pre_tcp.p),
+                &route.plan.insertion_dir,
+            )
+            .clamp(0.0, route.plan.insertion_m + 0.006);
+            let actual_contact_pose = Pose::new(
+                actual_pre_tcp.r,
+                kinematics::add(&actual_pre_tcp.p, &route.plan.insertion_dir.map(|x| x * rem_rev)),
+            );
             self.fresh_match_adaptive(
                 "revalidate",
                 &planned.request.label,
                 route,
+                &actual_contact_pose,
                 &mut expected_gen,
                 &actual_pre_end,
                 pre_open_done_at,

@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-pub use admission::{BestRefusal, TopAdvisory};
+pub use admission::{BestRefusal, JawCut, JawFit, JawGatePass, TopAdvisory};
 pub use snapshot::{capture, capture_from_env, Snapshot};
 use candidates::{Chord, DirClass, Hypothesis, Rejection};
 pub use feasibility::{
@@ -405,8 +405,12 @@ impl AdaptiveSelection {
                     "pregrasp_mode": "legacy",
                     "expected_duration_s": exp_dur,
                 });
+                let fit = tr.jaw.fit();
                 v["margins"] = json!({
-                    "opening_reserve_m": tr.jaw.opening_reserve_m.is_finite().then_some(tr.jaw.opening_reserve_m),
+                    "opening_reserve_m": fit.map(|f| f.reserve_m),
+                    "reserve_pos_m": fit.map(|f| f.reserve_pos_m),
+                    "reserve_neg_m": fit.map(|f| f.reserve_neg_m),
+                    "min_opening_m": fit.map(|f| f.min_opening_m),
                 });
             }
             None => {}
@@ -968,7 +972,7 @@ fn select_adaptive_route_inner(
 
     let ctx = admission::Ctx { policy: gripper_policy, limit: gripper_limit, close_speed_limit, has_gravity_model };
     let (top_advisory_cand, top_advisory) = match &top_route {
-        Some(tr) if tr.jaw.deferred.is_none() => {
+        Some(tr) if !tr.jaw.is_deferred() => {
             let over = || se.out_of_budget();
             match admission::advisory_preflight_top_down(s, &t, tr, &ctx, acq_res.is_ok(), &mut work, &over) {
                 Ok(cand) => (Some(cand), None),
@@ -1319,7 +1323,7 @@ fn pick_adaptive_winner(
     if let Some(tr) = top_route {
         let chord_wins = if best_chord_ok {
             let best_score = entries[0].0.scores.total;
-            tr.jaw.deferred.is_some()
+            tr.jaw.is_deferred()
                 || top_advisory_cand
                     .as_ref()
                     .is_some_and(|top_c| best_score > top_c.scores.total)

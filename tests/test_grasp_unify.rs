@@ -163,19 +163,41 @@ async fn exact_threshold_passes_both_strategies_and_just_over_refuses_both() {
     let open_p = 0.085_f64;
     let he_p = 0.010_f64;
     let w_exact = open_p - 2.0 * he_p - 0.006;
-    let res = armd::grasp_select::admission::jaw_check(w_exact, he_p, open_p, Some(0.075))
-        .expect("exact width + 2*hard_error + 6 mm == open_width must pass");
-    assert!((res - 0.003).abs() < 1e-12, "reserve={res}");
+    let fit = armd::grasp_select::admission::jaw_check(
+        &armd::grasp_select::JawCut::centred(w_exact, "contour"),
+        he_p,
+        open_p,
+        Some(0.075),
+    )
+    .expect("exact width + 2*hard_error + 6 mm == open_width must pass");
+    assert!((fit.reserve_m - 0.003).abs() < 1e-12, "fit={fit:?}");
     assert_eq!(
-        armd::grasp_select::admission::jaw_check(w_exact + 1e-6, he_p, open_p, Some(0.075)).unwrap_err().code,
+        armd::grasp_select::admission::jaw_check(
+            &armd::grasp_select::JawCut::centred(w_exact + 1e-6, "contour"),
+            he_p,
+            open_p,
+            Some(0.075),
+        )
+        .unwrap_err()
+        .code,
         "OPENING"
     );
     // Optional cap disabled (None) still enforces opening reserve.
-    let res_nocap = armd::grasp_select::admission::jaw_check(w_exact, he_p, open_p, None)
-        .expect("exact equality passes with cap disabled");
-    assert!((res_nocap - 0.003).abs() < 1e-12);
-    let err_nocap = armd::grasp_select::admission::jaw_check(w_exact + 1e-5, he_p, open_p, None)
-        .expect_err("over reserve must refuse even with cap disabled");
+    let fit_nocap = armd::grasp_select::admission::jaw_check(
+        &armd::grasp_select::JawCut::centred(w_exact, "contour"),
+        he_p,
+        open_p,
+        None,
+    )
+    .expect("exact equality passes with cap disabled");
+    assert!((fit_nocap.reserve_m - 0.003).abs() < 1e-12);
+    let err_nocap = armd::grasp_select::admission::jaw_check(
+        &armd::grasp_select::JawCut::centred(w_exact + 1e-5, "contour"),
+        he_p,
+        open_p,
+        None,
+    )
+    .expect_err("over reserve must refuse even with cap disabled");
     assert_eq!(err_nocap.code, "OPENING");
 
     let sc = mounted_scene(0.30, 0.0, 0.26).await;
