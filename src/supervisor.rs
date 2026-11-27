@@ -4821,6 +4821,7 @@ impl SupervisorInner {
     /// Publishes an observation filled in place at `timestamp` with lock/release generation
     /// `generation` without re-running `tick_control`.
     pub fn publish_at(&mut self, timestamp: f64, generation: u64, keep: bool) -> TickPublished {
+        self.refresh_gravity_comp_workspace_rt();
         let mut obs = self.core.take_observation_buffer();
         {
             let (obs_ref, spares) = obs.split_mut();
@@ -23678,7 +23679,8 @@ mod observation_snapshot_tests {
             overspeed_count: 0,
             prev_measured: Some([0.0; 6]),
             lease_generation,
-            workspace_outside: None,
+            workspace_status: crate::gravity_comp::GravityCompWorkspaceStatus::Inside,
+            workspace_cache_key: None,
         };
 
         // (a) Periodic output suppresses non-hold write when disconnect arrives in `enable_state()`

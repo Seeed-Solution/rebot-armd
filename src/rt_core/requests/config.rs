@@ -868,6 +868,12 @@ pub enum ConfigError {
         code: BoundedText<48>,
         message: BoundedText<256>,
     },
+    GcExitOutsideWorkspace {
+        outside_edge: Option<HolderLabel>,
+        outside_part_kind: u8,
+        outside_depth_bits: u64,
+        outside_recovery_dir: Option<crate::chain::WorkspaceRecoveryDir>,
+    },
     CalibPrecondition {
         status: u16,
         code: &'static str,
@@ -973,6 +979,40 @@ impl ConfigError {
                     code: code.as_str().into(),
                     message: message.as_str().into(),
                 }
+            }
+            Self::GcExitOutsideWorkspace {
+                outside_edge,
+                outside_part_kind,
+                outside_depth_bits,
+                outside_recovery_dir,
+            } => {
+                let (message, details) = match (*outside_edge, *outside_recovery_dir) {
+                    (Some(edge), Some(recovery_dir)) => {
+                        let depth_m = f64::from_bits(*outside_depth_bits);
+                        let info = crate::chain::WorkspaceOutsideInfo {
+                            edge,
+                            part_kind: *outside_part_kind,
+                            depth_m,
+                            recovery_dir,
+                        };
+                        let mut msg = String::new();
+                        crate::chain::write_gc_exit_outside_workspace_message(&mut msg, &info);
+                        (
+                            msg,
+                            json!({
+                                "workspace_edge": edge.as_str(),
+                                "workspace_depth_m": depth_m,
+                                "workspace_recovery_dir": recovery_dir,
+                                "workspace_unverified": false,
+                            }),
+                        )
+                    }
+                    _ => (
+                        "measured pose workspace clearance could not be verified; wait for fresh feedback or use Stop/E-stop".to_string(),
+                        json!({ "workspace_unverified": true }),
+                    ),
+                };
+                ArmError::detailed(409, "GC_EXIT_OUTSIDE_WORKSPACE", message, details)
             }
             Self::CalibPrecondition { status, code, message } => ArmError::Rejected {
                 status: *status,
@@ -3996,10 +4036,12 @@ fn install_gravity_comp(
             // bypass `GravityCompOp::Exit` and call `exit_gravity_comp_rt` /
             // `exit_gravity_comp_inner` (or E-stop hold) directly, so they are NOT blocked here.
             if core.gravity_comp.as_ref().is_some_and(|r| r.phase.floating()) {
-                if let Err(reason_msg) = core.check_user_gravity_comp_exit_workspace_rt() {
-                    return Err(ConfigError::GravityCompRejected {
-                        code: BoundedText::new("GC_EXIT_OUTSIDE_WORKSPACE"),
-                        message: reason_msg,
+                if let Err(outside) = core.check_user_gravity_comp_exit_workspace_rt() {
+                    return Err(ConfigError::GcExitOutsideWorkspace {
+                        outside_edge: outside.map(|o| o.edge),
+                        outside_part_kind: outside.map_or(0, |o| o.part_kind),
+                        outside_depth_bits: outside.map_or(0, |o| o.depth_m.to_bits()),
+                        outside_recovery_dir: outside.map(|o| o.recovery_dir),
                     });
                 }
             }

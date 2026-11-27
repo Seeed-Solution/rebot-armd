@@ -4443,6 +4443,9 @@ pub struct GravityCompObservation {
     /// Deepest intrusion depth in metres while `workspace_outside` is true.
     #[serde(default)]
     pub workspace_depth_m: Option<f64>,
+    /// Inward Cartesian direction back inside the workspace while `workspace_outside` is true.
+    #[serde(default)]
+    pub workspace_recovery_dir: Option<crate::chain::WorkspaceRecoveryDir>,
 }
 
 crate::fieldwise_clone!(GravityCompObservation {
@@ -4456,7 +4459,8 @@ crate::fieldwise_clone!(GravityCompObservation {
     last_exit,
     workspace_outside,
     workspace_edge,
-    workspace_depth_m
+    workspace_depth_m,
+    workspace_recovery_dir
 });
 
 /// Field description in the observation schema

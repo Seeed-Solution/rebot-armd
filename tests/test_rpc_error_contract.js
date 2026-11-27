@@ -202,5 +202,22 @@ ${source('disableTorque')}
   );
   assert.equal(wsErr('zh', { code: 'GC_EXIT_OUTSIDE_WORKSPACE', message: '' }), '已拖出工作范围，请拖回范围内后再退出拖动');
   assert.equal(wsErr('en', { code: 'GC_EXIT_OUTSIDE_WORKSPACE', message: '' }), 'Arm is outside the workspace — drag back inside before exiting hand-guiding');
+  // Structured fields handle keep-out names with parentheses and unverified feedback cleanly.
+  assert.equal(
+    wsErr('zh', {
+      code: 'GC_EXIT_OUTSIDE_WORKSPACE',
+      workspace_edge: 'keepout:rack (floor_z)',
+      workspace_depth_m: 0.02,
+      workspace_recovery_dir: 'move_left',
+      message: "gripper is 2.0 cm inside keep-out 'rack (floor_z)' (keepout:rack (floor_z)); move left clear of keep-out 'rack (floor_z)' before exiting",
+    }),
+    '已拖出工作范围（禁区「rack (floor_z)」 2.0 cm），请拖回范围内后再退出拖动',
+  );
+  assert.equal(
+    wsErr('zh', { code: 'GC_EXIT_OUTSIDE_WORKSPACE', workspace_unverified: true, message: 'measured pose workspace clearance could not be verified; wait for fresh feedback or use Stop/E-stop' }),
+    '无法确认机械臂是否在工作范围内，请等待电机反馈恢复或按停止/急停',
+  );
+  assert.match(gcBlocked('zh', { workspace_outside: true, workspace_edge: 'keepout:rack', workspace_depth_m: 0.02, workspace_recovery_dir: 'move_left' }), /禁区「rack」 2\.0 cm.*向左移动/);
+  assert.match(gcBlocked('en', { workspace_outside: true, workspace_edge: 'max_reach', workspace_depth_m: 0.031, workspace_recovery_dir: 'move_down' }), /3\.1 cm beyond max reach.*move down/);
   console.log('PASS: drag-teach outside-workspace banner, inline exit block, and GC_EXIT_OUTSIDE_WORKSPACE strings verified in zh/en');
 })().catch(error => { console.error(error); process.exitCode = 1; });

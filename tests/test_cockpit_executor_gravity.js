@@ -88,6 +88,10 @@ let S = {
 };
 const isLive = () => true;
 const leaseOther = () => null;
+const isCancelledErr = () => false;
+let apiCalls = [], toastCalls = [];
+const api = (p, b) => { apiCalls.push([p, b]); return Promise.resolve({}); };
+const toast = (...args) => toastCalls.push(args);
 ${lineMatching('const gcOn = ')}
 ${lineMatching('const gcExecutorUnsupported = ')}
 ${lineMatching('const cwGcSupported = ')}
@@ -96,6 +100,8 @@ ${fnSource('formatWsDist')}
 ${fnSource('wsEdgeAndDir')}
 ${fnSource('formatGcWorkspaceBanner')}
 ${fnSource('formatGcExitBlocked')}
+${fnSource('gcWorkspaceBlocked')}
+${fnSource('gcExit')}
 ${fnSource('renderGc')}
 `, context);
 
@@ -135,7 +141,13 @@ assert.match(els['gc-sub'].textContent, /前方边界 4\.5 cm/);
 run("LANG = 'en'; renderGc();");
 assert.equal(els['gc-ws-warn'].textContent, 'Dragged outside workspace (front edge 4.5 cm) — drag back inside before exiting');
 assert.match(els['gc-exit-why'].textContent, /4\.5 cm beyond front edge/);
-run("S.obs.gravity_comp.workspace_outside = false; S.obs.gravity_comp.workspace_edge = null; S.obs.gravity_comp.workspace_depth_m = null; renderGc();");
+// Activating gcExit() while outside toasts the banner without firing an RPC; once back inside it fires exit.
+run("apiCalls = []; toastCalls = []; gcExit();");
+assert.equal(run('apiCalls.length'), 0, 'blocked gcExit must not send RPC while outside');
+assert.equal(run('toastCalls[0][2]'), 'GC_EXIT_OUTSIDE_WORKSPACE');
+run("S.obs.gravity_comp.workspace_outside = false; S.obs.gravity_comp.workspace_edge = null; S.obs.gravity_comp.workspace_depth_m = null; renderGc(); gcExit();");
+assert.equal(run('apiCalls.length'), 1, 'gcExit once back inside sends exit RPC');
+assert.equal(run('JSON.stringify(apiCalls[0])'), JSON.stringify(['/api/v1/mode/gravity_comp', { enable: false }]));
 assert.equal(els['gc-banner'].classList.contains('ws-outside'), false);
 assert.equal(els['gc-ws-warn'].hidden, true);
 assert.equal(els['gc-exit-why'].hidden, true);

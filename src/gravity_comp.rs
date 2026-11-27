@@ -70,6 +70,26 @@ impl GravityCompPhase {
     pub fn floating(&self) -> bool { matches!(self, Self::RampIn | Self::Active) }
 }
 
+/// Outcome of evaluating the measured pose against the active workspace during gravity comp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GravityCompWorkspaceStatus {
+    /// Verified inside the active workspace (or no workspace policy is configured).
+    Inside,
+    /// Verified outside the active workspace at the reported deepest constraint.
+    Outside(crate::chain::WorkspaceOutsideInfo),
+    /// Could not verify clearance (invalid/stale arm feedback or workspace evaluation error).
+    Unverified,
+}
+
+impl GravityCompWorkspaceStatus {
+    pub fn outside_info(self) -> Option<crate::chain::WorkspaceOutsideInfo> {
+        match self {
+            Self::Outside(info) => Some(info),
+            Self::Inside | Self::Unverified => None,
+        }
+    }
+}
+
 /// Running session.
 #[derive(Debug, Clone)]
 pub struct GravityCompRun {
@@ -88,9 +108,11 @@ pub struct GravityCompRun {
     pub overspeed_count: u32,
     pub prev_measured: Option<[f32; ARM]>,
     pub lease_generation: Option<u64>,
-    /// Cached deepest workspace violation for the measured pose, updated once per tick in
-    /// `gravity_comp_tick` and refreshed on entry / user exit (zero-alloc on RT).
-    pub workspace_outside: Option<crate::chain::WorkspaceOutsideInfo>,
+    /// Cached workspace status for the current measured arm sample & workspace revision so
+    /// admission, tick, and publication share one evaluation per sample (zero-alloc on RT).
+    pub workspace_status: GravityCompWorkspaceStatus,
+    /// Cache key `(workspace_revision, measured_arm_bits)` for `workspace_status`.
+    pub workspace_cache_key: Option<(u64, [u32; ARM])>,
 }
 
 impl GravityCompRun {
@@ -460,7 +482,8 @@ impl SupervisorInner {
             overspeed_count: 0,
             prev_measured: None,
             lease_generation,
-            workspace_outside: None,
+            workspace_status: GravityCompWorkspaceStatus::Unverified,
+            workspace_cache_key: None,
         });
         self.refresh_gravity_comp_workspace_rt();
         self.bump_motion_generation();
@@ -1028,7 +1051,8 @@ impl SupervisorInner {
             overspeed_count: 0,
             prev_measured: None,
             lease_generation: self.active_lease.as_ref().map(|l| l.generation),
-            workspace_outside: None,
+            workspace_status: GravityCompWorkspaceStatus::Unverified,
+            workspace_cache_key: None,
         });
         self.refresh_gravity_comp_workspace_rt();
         self.bump_motion_generation();
@@ -1362,48 +1386,65 @@ impl SupervisorInner {
         res
     }
 
-    /// Updates `self.gravity_comp.workspace_outside` once per tick (or on entry) so
-    /// `fill_observation` reuses the already-computed value with zero work and zero allocations.
+    /// Shared cached measured-pose workspace evaluation for gravity compensation (zero alloc on RT).
+    /// Checks arm feedback numeric validity & freshness first, then reuses the cached result when
+    /// `(workspace_revision, measured_arm_bits)` matches so user-exit admission, `gravity_comp_tick`,
+    /// and observation publication evaluate the workspace at most once per feedback sample.
+    pub(crate) fn evaluate_gravity_comp_workspace_cached_rt(&mut self) -> GravityCompWorkspaceStatus {
+        let Some(max_age_ms) = self.gravity_comp.as_ref().map(|r| r.policy.feedback_max_age_ms) else {
+            return GravityCompWorkspaceStatus::Inside;
+        };
+        if !self.feedback_numeric_valid
+            || !self.hardware_arm_feedback_fresh(Duration::from_millis(max_age_ms))
+        {
+            if let Some(run) = self.gravity_comp.as_mut() {
+                run.workspace_status = GravityCompWorkspaceStatus::Unverified;
+                run.workspace_cache_key = None;
+            }
+            return GravityCompWorkspaceStatus::Unverified;
+        }
+        let measured = arm6(&self.measured_positions);
+        let key = (self.workspace_revision, measured.map(f32::to_bits));
+        if let Some(run) = self.gravity_comp.as_ref() {
+            if run.workspace_cache_key == Some(key)
+                && run.workspace_status != GravityCompWorkspaceStatus::Unverified
+            {
+                return run.workspace_status;
+            }
+        }
+        let status = match self.evaluate_gravity_comp_workspace_rt() {
+            Ok(None) => GravityCompWorkspaceStatus::Inside,
+            Ok(Some(info)) => GravityCompWorkspaceStatus::Outside(info),
+            Err(_) => GravityCompWorkspaceStatus::Unverified,
+        };
+        if let Some(run) = self.gravity_comp.as_mut() {
+            run.workspace_status = status;
+            run.workspace_cache_key = (status != GravityCompWorkspaceStatus::Unverified).then_some(key);
+        }
+        status
+    }
+
+    /// Updates `self.gravity_comp.workspace_status` at most once per `(workspace_revision, sample)`
+    /// so `fill_observation` reuses the already-computed value with zero work and zero allocations.
     pub(crate) fn refresh_gravity_comp_workspace_rt(&mut self) {
         if self.gravity_comp.is_none() {
             return;
         }
-        let outside = self.evaluate_gravity_comp_workspace_rt().unwrap_or_default();
-        if let Some(run) = self.gravity_comp.as_mut() {
-            run.workspace_outside = outside;
-        }
+        let _ = self.evaluate_gravity_comp_workspace_cached_rt();
     }
 
     /// Checks whether user-initiated drag-teach exit is permitted for the current measured pose.
-    /// Uses the same workspace evaluation as `obs.gravity_comp.workspace_outside` and updates the
-    /// cached status on `GravityCompRun`. Fails closed if evaluation cannot verify clearance.
-    #[allow(clippy::result_large_err)] // inline BoundedText<256> keeps RT exit check zero-alloc
+    /// Uses the same cached workspace evaluation as `obs.gravity_comp` (checking arm feedback
+    /// validity and freshness first). Fails closed when outside or unverified, returning compact
+    /// `Copy` refusal metadata (formatted into human text off the RT thread).
+    #[allow(clippy::result_large_err)] // compact Copy refusal keeps RT exit check zero-alloc
     pub(crate) fn check_user_gravity_comp_exit_workspace_rt(
         &mut self,
-    ) -> Result<(), crate::safety::BoundedText<256>> {
-        let eval = self.evaluate_gravity_comp_workspace_rt();
-        match eval {
-            Ok(None) => {
-                if let Some(run) = self.gravity_comp.as_mut() {
-                    run.workspace_outside = None;
-                }
-                Ok(())
-            }
-            Ok(Some(info)) => {
-                if let Some(run) = self.gravity_comp.as_mut() {
-                    run.workspace_outside = Some(info);
-                }
-                let mut msg = crate::safety::BoundedText::<256>::empty();
-                crate::chain::write_gc_exit_outside_workspace_message(&mut msg, &info);
-                Err(msg)
-            }
-            Err(_) => {
-                let mut msg = crate::safety::BoundedText::<256>::empty();
-                msg.push_str(
-                    "measured pose workspace clearance could not be verified; wait for fresh feedback or use Stop/E-stop",
-                );
-                Err(msg)
-            }
+    ) -> Result<(), Option<crate::chain::WorkspaceOutsideInfo>> {
+        match self.evaluate_gravity_comp_workspace_cached_rt() {
+            GravityCompWorkspaceStatus::Inside => Ok(()),
+            GravityCompWorkspaceStatus::Outside(info) => Err(Some(info)),
+            GravityCompWorkspaceStatus::Unverified => Err(None),
         }
     }
 
@@ -1705,15 +1746,18 @@ impl SupervisorInner {
                 obs.damping_kd.clear();
                 obs.damping_kd.extend_from_slice(&run.damping_kd);
                 obs.tau_ff.extend_from_slice(&run.tau_ff);
-                obs.workspace_outside = run.workspace_outside.is_some();
-                obs.workspace_edge = run.workspace_outside.map(|w| w.edge);
-                obs.workspace_depth_m = run.workspace_outside.map(|w| w.depth_m);
+                let out = run.workspace_status.outside_info();
+                obs.workspace_outside = out.is_some();
+                obs.workspace_edge = out.map(|w| w.edge);
+                obs.workspace_depth_m = out.map(|w| w.depth_m);
+                obs.workspace_recovery_dir = out.map(|w| w.recovery_dir);
             }
             None => {
                 obs.phase = None;
                 obs.workspace_outside = false;
                 obs.workspace_edge = None;
                 obs.workspace_depth_m = None;
+                obs.workspace_recovery_dir = None;
             }
         }
     }

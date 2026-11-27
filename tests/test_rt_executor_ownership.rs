@@ -4004,7 +4004,8 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
             overspeed_count: 0,
             prev_measured: None,
             lease_generation: None,
-            workspace_outside: None,
+            workspace_status: armd::gravity_comp::GravityCompWorkspaceStatus::Inside,
+            workspace_cache_key: None,
         });
     }
     let err_gc = sup_gc

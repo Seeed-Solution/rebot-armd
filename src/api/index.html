@@ -3610,7 +3610,7 @@ const I18N = {
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
     'gc.ws.banner': '已拖出工作范围（{edge} {dist}），请拖回范围内后再退出拖动', 'gc.ws.banner_nodist': '已拖出工作范围（{edge}），请拖回范围内后再退出拖动',
     'gc.ws.exit_blocked': '暂不可退出：超出{edge} {dist}，请{dir}回范围内', 'gc.ws.exit_blocked_nodist': '暂不可退出：超出{edge}，请{dir}回范围内',
-    'err.gc_exit_outside_workspace': '已拖出工作范围，请拖回范围内后再退出拖动',
+    'err.gc_exit_outside_workspace': '已拖出工作范围，请拖回范围内后再退出拖动', 'err.gc_exit_workspace_unverified': '无法确认机械臂是否在工作范围内，请等待电机反馈恢复或按停止/急停',
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障', 'en.clear_motor_err_s': '⚠️ 清除电机错误', 'en.sub_clear_motor_err': '仅收纳位 · 保持未使能',
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.armed_readonly': '力矩已开 · 未控制', 'en.sub_readonly': '按住 0.6 秒：先确认控制权，再停靠卸力',
@@ -3887,7 +3887,7 @@ const I18N = {
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
     'gc.ws.banner': 'Dragged outside workspace ({edge} {dist}) — drag back inside before exiting', 'gc.ws.banner_nodist': 'Dragged outside workspace ({edge}) — drag back inside before exiting',
     'gc.ws.exit_blocked': 'Exit blocked: {dist} beyond {edge}; {dir} to return inside', 'gc.ws.exit_blocked_nodist': 'Exit blocked: outside {edge}; {dir} to return inside',
-    'err.gc_exit_outside_workspace': 'Arm is outside the workspace — drag back inside before exiting hand-guiding',
+    'err.gc_exit_outside_workspace': 'Arm is outside the workspace — drag back inside before exiting hand-guiding', 'err.gc_exit_workspace_unverified': 'Cannot verify workspace clearance on measured pose — wait for fresh feedback or use Stop/E-stop',
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.clear_motor_err_s': '⚠️ Clear motor error', 'en.sub_clear_motor_err': 'Rest pose only · stays disabled',
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.armed_readonly': 'Torque on · not in control', 'en.sub_readonly': 'Hold 0.6 s: confirm control, then park & torque off',
@@ -4102,6 +4102,8 @@ Object.assign(I18N.zh, {
   'ws.edge.floor_z': '底部平面', 'ws.dir.floor_z': '向上抬起',
   'ws.edge.keepout': '禁区「{name}」', 'ws.dir.keepout': '移出禁区「{name}」',
   'ws.edge.unknown': '工作空间边界', 'ws.dir.unknown': '移回工作范围内',
+  'ws.rdir.move_back': '向后移动', 'ws.rdir.move_forward': '向前移动', 'ws.rdir.move_right': '向右移动',
+  'ws.rdir.move_left': '向左移动', 'ws.rdir.move_down': '向下移动', 'ws.rdir.move_up': '向上移动',
 });
 Object.assign(I18N.en, {
   'ui.to_expert': 'Expert mode', 'ui.to_simple': 'Simple mode',
@@ -4119,6 +4121,8 @@ Object.assign(I18N.en, {
   'ws.edge.floor_z': 'floor', 'ws.dir.floor_z': 'move up',
   'ws.edge.keepout': "keep-out '{name}'", 'ws.dir.keepout': "move clear of keep-out '{name}'",
   'ws.edge.unknown': 'workspace boundary', 'ws.dir.unknown': 'move back inside',
+  'ws.rdir.move_back': 'move back', 'ws.rdir.move_forward': 'move forward', 'ws.rdir.move_right': 'move right',
+  'ws.rdir.move_left': 'move left', 'ws.rdir.move_down': 'move down', 'ws.rdir.move_up': 'move up',
   'sv.title': 'Recognition', 'sv.chip.n': 'Recognition · {n} objects', 'sv.chip.0': 'Recognition · no objects', 'sv.chip.wait': 'Recognition · on', 'sv.on.aria': 'Recognition on/off',
   'sv.meta.video': 'video {fps} fps · {ms} ms', 'sv.meta.det': 'recognition {fps} fps', 'sv.meta.off': 'recognition off',
   'sv.kind': 'Detection kind', 'sv.kind.detect': 'Detect (boxes)', 'sv.kind.segment': 'Segment (outlines)',
@@ -5055,7 +5059,9 @@ function formatGcWorkspaceBanner(gc) {
 }
 function formatGcExitBlocked(gc) {
   if (!gc || !gc.workspace_outside) return '';
-  const { edge, dir } = wsEdgeAndDir(gc.workspace_edge);
+  const { edge, dir: fallbackDir } = wsEdgeAndDir(gc.workspace_edge);
+  const rk = gc.workspace_recovery_dir ? 'ws.rdir.' + gc.workspace_recovery_dir : '';
+  const dir = rk && t(rk) !== rk ? t(rk) : fallbackDir;
   const dist = formatWsDist(gc.workspace_depth_m);
   return dist
     ? t('gc.ws.exit_blocked', { edge, dist, dir })
@@ -5064,14 +5070,27 @@ function formatGcExitBlocked(gc) {
 function formatGcExitOutsideError(response) {
   if (!response || typeof response !== 'object') return t('err.gc_exit_outside_workspace');
   const raw = String(response.message || response.reason || '');
+  if (response.workspace_unverified === true || /could not be verified/i.test(raw)) {
+    return LANG === 'en' && raw ? raw : t('err.gc_exit_workspace_unverified');
+  }
   if (LANG === 'en' && raw) return raw;
-  const cidMatch = /\((box_(?:min|max)_[xyz]|max_reach|floor_z|keepout:[^)]+)\)/.exec(raw);
-  const distMatch = /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
-  const cid = response.workspace_edge || response.constraint_id || (cidMatch ? cidMatch[1] : '');
+  const cid = response.workspace_edge || response.constraint_id || '';
   if (cid) {
     const { edge } = wsEdgeAndDir(cid);
-    const dist = distMatch ? distMatch[1] + ' ' + distMatch[2].toLowerCase() : formatWsDist(response.workspace_depth_m);
-    return dist ? t('gc.ws.banner', { edge, dist }) : t('gc.ws.banner_nodist', { edge });
+    const dist = formatWsDist(response.workspace_depth_m);
+    if (dist) return t('gc.ws.banner', { edge, dist });
+    const distMatch = /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
+    return distMatch
+      ? t('gc.ws.banner', { edge, dist: distMatch[1] + ' ' + distMatch[2].toLowerCase() })
+      : t('gc.ws.banner_nodist', { edge });
+  }
+  const tailMatch = /\((box_(?:min|max)_[xyz]|max_reach|floor_z|keepout:.+?)\);/.exec(raw);
+  if (tailMatch) {
+    const { edge } = wsEdgeAndDir(tailMatch[1]);
+    const distMatch = /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
+    return distMatch
+      ? t('gc.ws.banner', { edge, dist: distMatch[1] + ' ' + distMatch[2].toLowerCase() })
+      : t('gc.ws.banner_nodist', { edge });
   }
   return t('err.gc_exit_outside_workspace');
 }
@@ -11503,7 +11522,17 @@ function gcBlockText() {
   const k = 'gc.b.' + b.code;
   return t(k) !== k ? t(k) : (b.message || b.code);
 }
+function gcWorkspaceBlocked() {
+  if (!gcOn()) return false;
+  const gc = S.obs?.gravity_comp;
+  const phase = (gc && gc.phase) || 'active';
+  return (phase === 'ramp_in' || phase === 'active') && !!(gc && gc.workspace_outside);
+}
 function gcExit() {
+  if (gcWorkspaceBlocked()) {
+    toast(formatGcWorkspaceBanner(S.obs.gravity_comp) || t('err.gc_exit_outside_workspace'), 'err', 'GC_EXIT_OUTSIDE_WORKSPACE');
+    return;
+  }
   api('/api/v1/mode/gravity_comp', { enable: false }, { quiet: true }).catch((e) => { if (!isCancelledErr(e)) toast(e.message, 'err', e.code); });
 }
 let gcHintAt = 0;
@@ -11586,7 +11615,7 @@ function renderGc() {
   sw.hidden = !supported && !execUnsup;
   const why = on ? null : gcBlockText();
   const phase = (gc && gc.phase) || 'active';
-  const wsOut = on && (phase === 'ramp_in' || phase === 'active') && !!(gc && gc.workspace_outside);
+  const wsOut = gcWorkspaceBlocked();
   const exitWhy = wsOut ? formatGcExitBlocked(gc) : '';
   sw.classList.toggle('on', on);
   sw.classList.toggle('blocked', !on && !!why);
