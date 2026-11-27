@@ -1195,3 +1195,81 @@ fn init_parses_armd_owner_and_omits_when_unset() {
     assert_eq!(item["default"], "auto");
     assert_eq!(item["options"], serde_json::json!(["auto", "legacy", "executor"]));
 }
+
+#[cfg(unix)]
+#[test]
+fn init_stop_keeps_companions_running_when_armd_refuses_stop() {
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+    let start = source.find("stop_video() {").unwrap();
+    let end = source.find("\nstatus() {").unwrap();
+
+    // (a) When armd refuses SIGTERM (stays alive past the stop wait), companion processes
+    //     (vision, app, rt_settle, ap_guard) MUST NOT be stopped.
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let proc_root = temp.path().join("proc");
+        let pidfile = temp.path().join("armd.pid");
+        let events = temp.path().join("events");
+        std::fs::create_dir_all(proc_root.join("424242")).unwrap();
+        std::fs::write(&pidfile, "424242\n").unwrap();
+        std::os::unix::fs::symlink("/mock/armd", proc_root.join("424242/exe")).unwrap();
+        let functions = source[start..end].replace("/proc/", &format!("{}/", proc_root.display()));
+        let script = format!(
+            "NAME=test\nDAEMON=/mock/armd\nPIDFILE='{}'\n\
+             {functions}\n\
+             stop_ap_guard() {{ echo ap_guard >> '{ev}'; }}\n\
+             stop_rt_settle() {{ echo rt_settle >> '{ev}'; }}\n\
+             stop_app() {{ echo app >> '{ev}'; }}\n\
+             stop_vision() {{ echo vision >> '{ev}'; }}\n\
+             stop_video() {{ echo video >> '{ev}'; }}\n\
+             kill() {{ echo \"kill $*\" >> '{ev}'; }}\n\
+             sleep() {{ :; }}\n\
+             pidof() {{ echo 424242; }}\n\
+             stop\n",
+            pidfile.display(),
+            ev = events.display(),
+        );
+        let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(!out.status.success(), "refused stop must return non-zero");
+        let log = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(log.trim(), "kill -TERM 424242", "refused stop must not stop companions: {log}");
+        assert!(pidfile.exists());
+    }
+
+    // (b) When armd exits cleanly on SIGTERM, companion processes ARE stopped after armd exits.
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let proc_root = temp.path().join("proc");
+        let pidfile = temp.path().join("armd.pid");
+        let events = temp.path().join("events");
+        std::fs::create_dir_all(proc_root.join("424242")).unwrap();
+        std::fs::write(&pidfile, "424242\n").unwrap();
+        std::os::unix::fs::symlink("/mock/armd", proc_root.join("424242/exe")).unwrap();
+        let functions = source[start..end].replace("/proc/", &format!("{}/", proc_root.display()));
+        let script = format!(
+            "NAME=test\nDAEMON=/mock/armd\nPIDFILE='{}'\n\
+             {functions}\n\
+             stop_ap_guard() {{ echo ap_guard >> '{ev}'; }}\n\
+             stop_rt_settle() {{ echo rt_settle >> '{ev}'; }}\n\
+             stop_app() {{ echo app >> '{ev}'; }}\n\
+             stop_vision() {{ echo vision >> '{ev}'; }}\n\
+             stop_video() {{ echo video >> '{ev}'; }}\n\
+             kill() {{ echo \"kill $*\" >> '{ev}'; rm -rf '{p}/424242'; }}\n\
+             sleep() {{ :; }}\n\
+             pidof() {{ return 1; }}\n\
+             stop\n",
+            pidfile.display(),
+            ev = events.display(),
+            p = proc_root.display(),
+        );
+        let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(out.status.success(), "clean stop must return 0: {}", String::from_utf8_lossy(&out.stdout));
+        let log = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec!["kill -TERM 424242", "ap_guard", "rt_settle", "app", "vision", "video"],
+            "companions must stop only after armd exits"
+        );
+        assert!(!pidfile.exists());
+    }
+}
