@@ -420,9 +420,15 @@ async fn dual_owner_vision_detector_camera_rest_proxies_and_auth_fault_parity() 
 // 2. POST /api/v1/vision/detector + mutual exclusion with depth_measure
 // ============================================================================
 
+struct ProviderGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 struct SwitchProvider {
     mode: Mutex<Value>,
-    delay_ms: AtomicU64,
+    set_models_gate: Mutex<Option<ProviderGate>>,
+    trigger_gate: Mutex<Option<ProviderGate>>,
 }
 
 impl SwitchProvider {
@@ -448,8 +454,21 @@ impl SwitchProvider {
                     "catalogue": cat
                 }
             })),
-            delay_ms: AtomicU64::new(0),
+            set_models_gate: Mutex::new(None),
+            trigger_gate: Mutex::new(None),
         })
+    }
+
+    fn arm_gate(
+        slot: &Mutex<Option<ProviderGate>>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release) = tokio::sync::oneshot::channel();
+        *slot.lock().unwrap() = Some(ProviderGate { entered, release });
+        (entered_rx, release_tx)
     }
 }
 
@@ -483,11 +502,12 @@ impl DetectionSource for SwitchProvider {
         Box::pin(async move { Ok(ModeInfo::parse(Some(&v))) })
     }
     fn set_models(&self, body: &Value) -> BoxFuture<'_, Result<(u16, Value), String>> {
-        let delay = self.delay_ms.load(Ordering::SeqCst);
+        let gate = self.set_models_gate.lock().unwrap().take();
         let name = body["detector"].as_str().unwrap().to_string();
         Box::pin(async move {
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate.release.await;
             }
             let mut m = self.mode.lock().unwrap();
             let gen = m["models"]["generation"].as_u64().unwrap() + 1;
@@ -501,10 +521,11 @@ impl DetectionSource for SwitchProvider {
         _pipelines: &[&str],
         _wait_ms: u64,
     ) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
-        let delay = self.delay_ms.load(Ordering::SeqCst);
+        let gate = self.trigger_gate.lock().unwrap().take();
         Box::pin(async move {
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate.release.await;
             }
             Ok(Some(DetectionFrame {
                 frame_id: 1,
@@ -569,7 +590,7 @@ async fn dual_owner_vision_detector_switch_and_measure_mutual_exclusion() {
         let v2 = (r2.status().as_u16(), r2.json::<Value>().await.unwrap());
 
         // Mutual exclusion direction 1: switch in flight blocks depth_measure with 409 VISION_BUSY.
-        provider.delay_ms.store(150, Ordering::SeqCst);
+        let (switch_entered, switch_release) = SwitchProvider::arm_gate(&provider.set_models_gate);
         let http_bg = http.clone();
         let base_bg = base.clone();
         let tok_bg = tok.clone();
@@ -584,7 +605,10 @@ async fn dual_owner_vision_detector_switch_and_measure_mutual_exclusion() {
                 .status()
                 .as_u16()
         });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_secs(5), switch_entered)
+            .await
+            .expect("switch_task did not enter set_models in time")
+            .unwrap();
         let meas_during_switch = http
             .post(format!("{base}/api/v1/grasp/measure"))
             .bearer_auth(&tok)
@@ -598,9 +622,11 @@ async fn dual_owner_vision_detector_switch_and_measure_mutual_exclusion() {
                 .as_str()
                 .map(str::to_owned),
         );
+        let _ = switch_release.send(());
         assert_eq!(switch_task.await.unwrap(), 200);
 
         // Mutual exclusion direction 2: measure in flight blocks switch with 409 VISION_BUSY.
+        let (measure_entered, measure_release) = SwitchProvider::arm_gate(&provider.trigger_gate);
         let http_bg2 = http.clone();
         let base_bg2 = base.clone();
         let tok_bg2 = tok.clone();
@@ -615,7 +641,10 @@ async fn dual_owner_vision_detector_switch_and_measure_mutual_exclusion() {
                 .status()
                 .as_u16()
         });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_secs(5), measure_entered)
+            .await
+            .expect("measure_task did not enter trigger in time")
+            .unwrap();
         let switch_during_meas = http
             .post(format!("{base}/api/v1/vision/detector"))
             .bearer_auth(&tok)
@@ -629,8 +658,8 @@ async fn dual_owner_vision_detector_switch_and_measure_mutual_exclusion() {
                 .as_str()
                 .map(str::to_owned),
         );
+        let _ = measure_release.send(());
         assert_eq!(measure_task.await.unwrap(), 200);
-        provider.delay_ms.store(0, Ordering::SeqCst);
 
         results.push((v1, v2, mds_code, sdm_code));
     }
@@ -1617,6 +1646,7 @@ impl DetectionSource for DualGraspSim {
 
 #[tokio::test]
 async fn dual_owner_grasp_action_status_diagnostics_via_stream_patch() {
+    let _vision_guard = VISION_TEST_LOCK.lock().await;
     let detector = DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
     let mut finals: Vec<ActionStatus> = Vec::new();
 
