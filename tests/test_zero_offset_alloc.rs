@@ -87,9 +87,6 @@ const OFFSETS: [f32; 7] = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7];
 
 #[test]
 fn set_joint_modes_with_nonzero_offsets_allocates_nothing() {
-    let seen = Arc::new(Mutex::new([0.0f32; 7]));
-    let mut wrapped: Box<dyn ArmDriver> =
-        Box::new(ZeroOffsetDriver::new(Box::new(HoldRecorder(seen.clone())), &OFFSETS));
     let hold: [JointTarget; 7] = std::array::from_fn(|i| JointTarget::position(i as f32 * 0.01));
     let modes = [JointMode::Position; 7];
     let want: [f32; 7] = std::array::from_fn(|i| i as f32 * 0.01 + OFFSETS[i]);
@@ -101,11 +98,21 @@ fn set_joint_modes_with_nonzero_offsets_allocates_nothing() {
         ("set_joint_modes_confirmed", |d, m, h| d.joint_mode_mut().set_joint_modes_confirmed(m, h)),
     ];
     for (name, call) in calls {
-        call(&mut *wrapped, &modes, &hold).unwrap(); // warm-up
-        *seen.lock().unwrap() = [0.0; 7];
-        let (r, allocs, frees) = counted(|| call(&mut *wrapped, &modes, &hold));
+        // Freshly constructed wrapper: the very first call (no warm-up) must not allocate
+        // because `ZeroOffsetDriver::new` reserves `motor_targets` upfront.
+        let fresh_seen = Arc::new(Mutex::new([0.0f32; 7]));
+        let mut fresh: Box<dyn ArmDriver> =
+            Box::new(ZeroOffsetDriver::new(Box::new(HoldRecorder(fresh_seen.clone())), &OFFSETS));
+        let (r, allocs, frees) = counted(|| call(&mut *fresh, &modes, &hold));
         r.unwrap();
-        assert_eq!((allocs, frees), (0, 0), "{name} with non-zero offsets touched the allocator");
-        assert_eq!(*seen.lock().unwrap(), want, "{name}: inner driver must see motor = joint + offset");
+        assert_eq!((allocs, frees), (0, 0), "{name} first call on fresh wrapper touched the allocator");
+        assert_eq!(*fresh_seen.lock().unwrap(), want, "{name} first call: inner driver must see motor = joint + offset");
+
+        // Subsequent call on the same wrapper reuses the buffer without allocating.
+        *fresh_seen.lock().unwrap() = [0.0; 7];
+        let (r, allocs, frees) = counted(|| call(&mut *fresh, &modes, &hold));
+        r.unwrap();
+        assert_eq!((allocs, frees), (0, 0), "{name} steady-state call with non-zero offsets touched the allocator");
+        assert_eq!(*fresh_seen.lock().unwrap(), want, "{name} steady-state: inner driver must see motor = joint + offset");
     }
 }
