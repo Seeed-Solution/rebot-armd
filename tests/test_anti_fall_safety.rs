@@ -515,9 +515,15 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
     let obs = supervisor.get_observation().await;
     assert_eq!(obs.safety_state, SafetyState::Fault(FaultReason::BusLoss));
 
-    // In first 250ms ~ 3000ms: continues to write joint targets holding last measured position (velocity 0.0)
+    // In first 250ms ~ 3000ms: continues to write joint targets holding last measured position (velocity 0.0).
+    // Inject a deterministic release clock so OS preemption under CI load cannot expire the 18 ms TX cutoff.
     let initial_writes = write_count.load(Ordering::SeqCst);
-    supervisor.tick(0.02).await;
+    let t0 = Instant::now();
+    supervisor
+        .inner()
+        .write()
+        .await
+        .tick_control_with_deadline(0.02, t0, t0 + Duration::from_millis(20));
     assert!(write_count.load(Ordering::SeqCst) > initial_writes, "Must keep writing during bus loss");
     {
         let guard = written.lock().unwrap();
@@ -534,7 +540,12 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
         inner.last_can_feedback_instant = Some(Instant::now() - Duration::from_millis(3500));
     }
     let writes_before = write_count.load(Ordering::SeqCst);
-    supervisor.tick(0.02).await;
+    let t1 = Instant::now();
+    supervisor
+        .inner()
+        .write()
+        .await
+        .tick_control_with_deadline(0.02, t1, t1 + Duration::from_millis(20));
     let writes_after = write_count.load(Ordering::SeqCst);
     assert!(
         writes_after > writes_before,
@@ -768,8 +779,14 @@ async fn test_clear_fault_mutually_exclusive_branches() {
         drop(inner);
 
         // Control loop tick continues to output holding target to driver
+        // (inject release clock so OS preemption under load cannot expire the 18 ms TX cutoff).
         let count_before = write_count.load(Ordering::SeqCst);
-        supervisor.tick(0.02).await;
+        let t0 = Instant::now();
+        supervisor
+            .inner()
+            .write()
+            .await
+            .tick_control_with_deadline(0.02, t0, t0 + Duration::from_millis(20));
         let count_after = write_count.load(Ordering::SeqCst);
         assert!(count_after > count_before, "Branch C: holding output must continue to be sent to surviving motors");
     }
