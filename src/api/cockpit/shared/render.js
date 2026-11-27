@@ -88,8 +88,10 @@ function frame(ts) {
 
   // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
   const fresh = obsFresh(), holder = leaseOther(), ls = $('lease-status');
-  ls.hidden = !live;
-  if (live) {
+  ls.hidden = !live && !S.connLost;
+  if (S.connLost) {
+    setCls(ls, 'lease-status is-lost'); setText($('lease-status-txt'), t('lease.conn_lost'));
+  } else if (live) {
     const [cls, txt] = leaseOp && leaseOp.kind === 'release' ? ['is-checking', t('lease.releasing')]
       : leaseOp && leaseOp.kind === 'refresh' ? ['is-checking', t('lease.refreshing')]
       : !fresh ? ['is-checking', t('lease.checking')]
@@ -103,7 +105,7 @@ function frame(ts) {
   const showReleased = fresh && !leaseOp && S.leaseGeneration == null && S.leaseReleased != null;
   $('lease-released').hidden = !showReleased;
   if (showReleased) {
-    setText($('lease-released-txt'), holder != null ? t('lease.released.other', { who: leaseHolderDetail(holder) }) : t(S.leaseReleased.reason === 'expired' ? 'lease.released.expired' : 'lease.released.reconnect'));
+    setText($('lease-released-txt'), holder != null ? t('lease.released.other', { who: leaseHolderDetail(holder) }) : t(S.leaseReleased.reason === 'expired' ? 'lease.released.expired' : 'lease.released.reconnect', { arm: connArmText(S.obs) }));
     $('btn-retake').disabled = holder != null || !fresh || !!leaseOp;
   }
 
@@ -213,7 +215,8 @@ function frame(ts) {
   $('t-torque').className = torqued ? 'good' : '';
   const hbAge = S.hb.at ? Date.now() - S.hb.at : null;
   const tl = $('t-lease');
-  const [tlTxt, tlCls] = !fresh ? [t('lease.t.checking'), '']
+  const [tlTxt, tlCls] = S.connLost ? [t('lease.t.lost'), 'bad']
+    : !fresh ? [t('lease.t.checking'), '']
     : leaseOp && leaseOp.kind === 'release' ? [t('lease.releasing'), 'warn']
     : leaseOp && leaseOp.kind === 'refresh' ? [t('lease.refreshing'), 'warn']
     : S.leaseGeneration != null ? [hbAge == null ? t('lease.t.own') : `${S.hb.hz} Hz · ${hbAge} ms`, hbAge == null || hbAge < 300 ? 'good' : hbAge < 500 ? 'warn' : 'bad']

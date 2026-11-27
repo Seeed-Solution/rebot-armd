@@ -948,6 +948,7 @@ body.op-locked .tool-item[data-op] > b::after { content: "\00a0🔒"; font-size:
 .lease-status #lease-status-txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lease-status.is-own { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
 .lease-status.is-other, .lease-status.is-released { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); }
+.lease-status.is-lost { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
 .lease-status.is-readonly, .lease-status.is-checking { background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); }
 .lease-released { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border: 1px solid #ffd591; font-size: 12px; line-height: 1.45; }
 .lease-released[hidden] { display: none; }

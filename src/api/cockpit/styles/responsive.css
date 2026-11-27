@@ -345,6 +345,7 @@ body::before {
   body.ui-simple .lease-status { width: 0; min-width: 100%; box-sizing: border-box; padding: 2px 8px; font-size: 11px; border-radius: 10px; background: rgba(255,255,255,0.65); color: #1f2937; }
   body.ui-simple .lease-status.is-own { background: rgba(239,252,232,0.85); color: var(--sc-status-normal-fg); }
   body.ui-simple .lease-status.is-other, body.ui-simple .lease-status.is-released { background: rgba(255,247,230,0.9); color: var(--sc-status-warning-fg); }
+  body.ui-simple .lease-status.is-lost { background: rgba(255,236,236,0.92); color: var(--sc-status-danger-fg); }
   body.ui-simple .lease-released { width: 0; min-width: 100%; box-sizing: border-box; font-size: 11px; padding: 6px 8px; border-radius: 12px; background: rgba(255,247,230,0.92); color: var(--sc-status-warning-fg); }
   body.ui-simple .owner-banner, body.ui-simple .tool-comm-banner { width: 0; min-width: 100%; box-sizing: border-box; border-radius: 14px; }
   body.ui-simple .btn.btn-park-off, body.ui-simple .btn.btn-preempt { width: 0; min-width: 100%; box-sizing: border-box; margin-top: 0; border-radius: 16px; }

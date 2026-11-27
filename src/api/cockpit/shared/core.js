@@ -216,6 +216,7 @@ const S = {
   minObsTs: -Infinity,        // post-release monotonic floor so pre-release WS frames cannot overwrite REST snapshot
   controlEpoch: 0,            // monotonic local control-intent epoch
   leaseReleased: null,        // null | { reason: 'reconnect' | 'expired' }
+  connLost: false,            // a live socket dropped; true until a new socket delivers a valid observation
   lastIntentAt: 0,            // Date.now() of the last control input (idle lease release)
   preemptCooldownUntil: 0,    // Date.now() until which the preempt confirm button stays disabled
   sequenceId: 0,              // per-connection monotonic servo frame id

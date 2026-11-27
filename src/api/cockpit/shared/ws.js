@@ -1,7 +1,10 @@
 /* =================================================================
    Telemetry WebSocket (50 Hz) + heartbeat
    ================================================================= */
-let wsOpenedOnce = false, wsReconnectTimer = null;
+// Reconnect after a dropped socket: one timer, 1, 2, 4, 8 s, then every 15 s. The first valid observation
+// on the new socket resets the backoff and clears S.connLost (the "connection lost" warning).
+const WS_RETRY_MS = [1000, 2000, 4000, 8000, 15000];
+let wsOpenedOnce = false, wsReconnectTimer = null, wsRetryN = 0;
 const VALID_SAFETY_STR = new Set(['Booting', 'Idle', 'Armed', 'Moving', 'EStop']), VALID_FAULT_STR = new Set(['BusLoss', 'WatchdogTimeout', 'CanTxStalled']);
 const isPlainObj = (v) => !!(v && typeof v === 'object' && !Array.isArray(v));
 function isValidSafetyState(s) {
@@ -18,10 +21,29 @@ function isValidSafetyState(s) {
 }
 const isCompleteObservation = (o) => isPlainObj(o) && Array.isArray(o.positions) && (S.schemaLoaded && S.dof > 0 ? o.positions.length === S.dof : o.positions.length > 0) && o.positions.every(Number.isFinite) && Number.isFinite(o.timestamp) && Number.isSafeInteger(o.epoch_id) && o.epoch_id >= 0 && isValidSafetyState(o.safety_state) && (o.lease_holder === null || typeof o.lease_holder === 'string');
 const clearReconnectTimer = () => { if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; } };
-const scheduleReconnect = (delayMs = 1500) => { clearReconnectTimer(); wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; if (!S.ws) connectWS(); }, delayMs); };
+const scheduleReconnect = () => {
+  clearReconnectTimer();
+  const delayMs = WS_RETRY_MS[Math.min(wsRetryN, WS_RETRY_MS.length - 1)];
+  wsRetryN++;
+  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; if (!S.ws) connectWS(); }, delayMs);
+};
+// Arm state for the release notice, from fresh telemetry only. "Parked" needs armd's evidence (a finished
+// park action and torque off): a clean close can reconnect while the arm is still torqued.
+function connArmText(o) {
+  if (!o) return '';
+  const a = o.action, parking = !!o.disable_pending || (a?.kind === 'park' && a?.state === 'running');
+  const held = o.watchdog_park_blocked_reason;
+  if (o.is_torqued && typeof held === 'string' && held) return t('conn.arm.held', { reason: held });
+  if (parking) return t('conn.arm.parking');
+  if (!o.is_torqued) return t(a?.kind === 'park' && a?.state === 'done' ? 'conn.arm.parked' : 'conn.arm.off');
+  return t('conn.arm.torqued');
+}
 function retireSocket(ws, { reconnect = false, markReleased = false, toastExpired = false } = {}) {
   if (!ws || S.ws !== ws) return;
   const hadLease = S.leaseGeneration != null;
+  // A dropped socket that had delivered telemetry (or a retry during an outage) shows the warning until the
+  // next socket delivers a valid observation.
+  if (reconnect && ((S.wsObsSeen && S.obsWs === ws) || S.connLost)) S.connLost = true;
   if (markReleased && hadLease) S.leaseReleased = { reason: 'reconnect' };
   if (toastExpired && hadLease) toast(t('toast.lease_expired'), 'warn');
   S.ws = null; S.wsObsSeen = false; S.obsWs = null; S.obsTs = -Infinity; S.minObsTs = -Infinity; S.epoch = null;
@@ -29,7 +51,7 @@ function retireSocket(ws, { reconnect = false, markReleased = false, toastExpire
   S.detections = []; S.detLastReceivedAt = 0; clearOverlayCanvas();
   if (leaseOp) { const op = leaseOp; leaseOp = null; if (op.timer) clearTimeout(op.timer); if (op.reject) op.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' })); }
   invalidateControlIntents({ dropOp: true }); resetLease();
-  if (reconnect) { scheduleReconnect(1500); loadOwnerDiagnostics(); }
+  if (reconnect) { scheduleReconnect(); loadOwnerDiagnostics(); }
 }
 function applyObservation(o, fromWs) {
   const prevObsOwner = S.obs && isValidEffectiveOwner(S.obs.effective_owner) ? S.obs.effective_owner : null;
@@ -64,7 +86,7 @@ function acceptObservation(o, fromWs, ws = S.ws) {
   const ts = o.timestamp;
   if (fromWs) {
     if ((S.minObsTs !== -Infinity && ts <= S.minObsTs) || (S.obsTs !== -Infinity && ts <= S.obsTs)) return 'stale';
-    S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; applyObservation(o, true); return 'applied';
+    S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; wsRetryN = 0; S.connLost = false; applyObservation(o, true); return 'applied';
   }
   S.minObsTs = Math.max(S.minObsTs, ts);
   if (!S.wsObsSeen || S.obsWs !== ws || ts > S.obsTs) { S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; applyObservation(o, false); return 'applied'; }
