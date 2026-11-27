@@ -2,7 +2,7 @@
 
 [中文](release_notes_1.6.0.zh-CN.md)
 
-`rebot-armd` for the Seeed reCamera (SG2002) with the reBot B601-DM arm. Follows 1.4.0 (about 1,470 commits).
+`rebot-armd` for the Seeed reCamera (SG2002) with the reBot B601-DM arm. Follows 1.4.0 (1,765 commits).
 
 1.6.0 is the `rel/1.6.0-rc7` line (HEAD `dcc2173a`). Real-arm results below were measured on rc7 (`aebc6ea3`) and on rc7.2 (rc7 plus the five later fixes: `fix/init-stop-companions`, `fix/cockpit-stopped-quiet`, `fix/workspace-messages`, `fix/stamp-namespaces`, `fix/workspace-recovery`). rc7.3 adds only the cockpit "Grasp approach" row; the final 1.6.0 build differs from rc7.3 only in its top-down default.
 
@@ -15,7 +15,6 @@
 | `rebot-vision-1.6.0-riscv64` | The vision binary alone. Use it with `REBOT_VISION_BIN=<path> scripts/build_deb.sh` to build the package without the reCamera SDK. |
 | `SHA256SUMS` | Checksums of the three files. |
 
-The same files are on the CDN: https://sensecraft-statics.seeed.cc/solution-app/rebot/releases/1.6.0/
 
 The OBB model (`yolo11n_obb_cv181x_int8_fuse_qout.cvimodel`) is not in the package: `scripts/fetch_models.sh` downloads it (list and licenses in `kits/recamera-b601dm/vision/models/models.tsv`), then restart rebot-teleop with the arm idle.
 

@@ -2,7 +2,7 @@
 
 [English](release_notes_1.6.0.md)
 
-`rebot-armd`，用于 Seeed reCamera（SG2002）与 reBot B601-DM 机械臂。接续 1.4.0（约 1,470 个提交）。
+`rebot-armd`，用于 Seeed reCamera（SG2002）与 reBot B601-DM 机械臂。接续 1.4.0（1,765 个提交）。
 
 1.6.0 是 `rel/1.6.0-rc7` 这条线（HEAD `dcc2173a`）。下文真机结果测自 rc7（`aebc6ea3`）和 rc7.2（rc7 加上之后的五个修复：`fix/init-stop-companions`、`fix/cockpit-stopped-quiet`、`fix/workspace-messages`、`fix/stamp-namespaces`、`fix/workspace-recovery`）。rc7.3 只增加驾驶舱“抓取方式”一行；最终 1.6.0 构建与 rc7.3 的唯一区别是默认值为 top-down。
 
@@ -14,8 +14,6 @@
 | `armd-1.6.0-riscv64-musl` | 单独的 `armd` 二进制（静态链接，riscv64 musl）。 |
 | `rebot-vision-1.6.0-riscv64` | 单独的视觉二进制。配合 `REBOT_VISION_BIN=<path> scripts/build_deb.sh` 可在没有 reCamera SDK 的机器上打包。 |
 | `SHA256SUMS` | 以上三个文件的校验和。 |
-
-相同文件也在 CDN：https://sensecraft-statics.seeed.cc/solution-app/rebot/releases/1.6.0/
 
 OBB 模型（`yolo11n_obb_cv181x_int8_fuse_qout.cvimodel`）不在包内：用 `scripts/fetch_models.sh` 下载（清单和许可证见 `kits/recamera-b601dm/vision/models/models.tsv`），然后在机械臂空闲时重启 rebot-teleop。
 
