@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::driver::*;
 use crate::protocol::feetech;
-use crate::transport::{Transport, TransportError};
+use crate::transport::Transport;
 
 impl<T: Transport> FeetechArmDriver<T> {
     /// Zero-allocation 1-byte register readback honouring `deadline` and `rx_budget` (R12 M3).

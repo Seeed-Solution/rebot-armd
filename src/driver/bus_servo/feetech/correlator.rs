@@ -76,9 +76,9 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     /// Continuous quiet period (no bytes) required to declare a poisoned half-duplex serial line idle (S2).
-    const LINE_IDLE_QUIET: Duration = Duration::from_millis(20);
+    pub(in crate::driver::bus_servo) const LINE_IDLE_QUIET: Duration = Duration::from_millis(20);
     /// Upper bound for draining a poisoned line before failing closed (S2).
-    const LINE_IDLE_MAX_WAIT: Duration = Duration::from_millis(80);
+    pub(in crate::driver::bus_servo) const LINE_IDLE_MAX_WAIT: Duration = Duration::from_millis(80);
 
     /// Non-blocking poison-drain check for bounded `read_joint_states` polls: drains any pending
     /// bytes (resetting the 20 ms silence timer on any byte), clearing `line_poisoned` ONLY once

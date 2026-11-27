@@ -8,10 +8,8 @@ use crate::model::JointState;
 pub use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointRangeReading, MotorZeroSupport, RangeCheckStatus};
 use crate::protocol::damiao::{self, DamiaoLimits};
 pub use crate::protocol::damiao::DAMIAO_GRIPPER_POSFORCE_VEL_RAW;
-use crate::transport::{
-    CanFrame, CanRxTime, CanTransport, Transport, TransportError,
-    MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS,
-};
+use crate::transport::{CanFrame, CanRxTime, CanTransport, TransportError, MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS};
+#[cfg(test)] use crate::transport::Transport;
 
 pub mod ext;
 pub mod zero_offset;

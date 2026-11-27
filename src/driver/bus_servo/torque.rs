@@ -1,6 +1,5 @@
 //! Feetech STS3215 torque enable/disable, rest-pose gating, and causal readback.
 
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::driver::*;
