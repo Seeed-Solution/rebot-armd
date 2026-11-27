@@ -981,7 +981,7 @@ fn bounded_hold_and_zero_offset_paths_do_not_allocate_or_free() {
     wrapped.read_joint_states_into(&mut scratch).unwrap();
     let (res, a, f) = counted(|| wrapped.write_estop_hold_bounded(&targets));
     assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
-    assert!(wrapped.last_hold_tx_sent_any());
+    assert!(wrapped.tx_ext().unwrap().last_hold_tx_sent_any());
     assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_estop_hold_bounded Complete touched allocator");
 
     // write_estop_hold_bounded: Deferred
@@ -993,7 +993,7 @@ fn bounded_hold_and_zero_offset_paths_do_not_allocate_or_free() {
     }
     let (res, a, f) = counted(|| wrapped.write_estop_hold_bounded(&targets));
     assert_eq!(res.unwrap(), TxBatchOutcome::Deferred { pending: 4 });
-    assert!(wrapped.last_hold_tx_sent_any());
+    assert!(wrapped.tx_ext().unwrap().last_hold_tx_sent_any());
     assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_estop_hold_bounded Deferred touched allocator");
 }
 

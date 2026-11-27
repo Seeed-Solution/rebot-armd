@@ -752,7 +752,7 @@ pub trait JointZeroExt {
     fn set_joint_zero_offsets(&mut self, _offsets: &[f32]) {}
 
     /// The offsets in effect at the boundary; None for a driver without it.
-    fn joint_zero_offsets(&self) -> Option<Vec<f32>> { None }
+    fn joint_zero_offsets(&self) -> Option<&[f32]> { None }
 }
 
 /// The "no extension" object: implements every `*Ext` with the default bodies only.
