@@ -3604,76 +3604,82 @@ fn damiao_has_single_can_transmit_chokepoint_in_driver_rs() {
                 self.can
                     .transmit(&frame);
             }
-            fn sneaky_dot(&mut self) {
-                self
-                    .can
-                    .transmit(&bad);
-            }
-            fn sneaky_ufcs(&mut self) {
-                CanTransport::
-                    transmit(&mut self.can, &bad);
-            }
+            fn sneaky_dot(&mut self) { self.can.transmit(&bad); }
+            fn sneaky_ufcs(&mut self) { CanTransport::transmit(&mut self.can, &bad); }
         }
     "#;
     let (syn_out, syn_in) = partition_damiao_send_body_compact(synthetic_split);
     assert_eq!(syn_in.matches(".transmit(").count(), 1);
-    assert_eq!(syn_out.matches(".transmit(").count(), 1, "must catch multi-line .transmit(: {syn_out}");
-    assert_eq!(syn_out.matches("::transmit(").count(), 1, "must catch multi-line ::transmit(: {syn_out}");
+    assert_eq!(syn_out.matches(".transmit(").count(), 1, "must catch .transmit(: {syn_out}");
+    assert_eq!(syn_out.matches("::transmit(").count(), 1, "must catch ::transmit(: {syn_out}");
 
-    // Production check over the entire Damiao driver section of src/driver.rs.
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver.rs"))
-        .expect("read src/driver.rs");
-    let dm_start = src
-        .find("// 3. Damiao Brushless Arm Driver")
-        .expect("Damiao driver section header");
-    let rs_start = src
-        .find("// 4. RobStride Actuator Arm Driver")
-        .expect("RobStride driver section header");
-    assert!(dm_start < rs_start);
-    let dm_section = &src[dm_start..rs_start];
-    let (outside_compact, send_compact) = partition_damiao_send_body_compact(dm_section);
-
-    assert_eq!(
-        outside_compact.matches(".transmit(").count(),
-        0,
-        "DamiaoArmDriver must have ZERO `.transmit(` calls outside `fn send`"
-    );
-    assert_eq!(
-        outside_compact.matches("::transmit(").count(),
-        0,
-        "DamiaoArmDriver must have ZERO `::transmit(` UFCS calls outside `fn send`"
-    );
-    assert_eq!(
-        send_compact.matches(".transmit(").count(),
-        1,
-        "DamiaoArmDriver::send must contain EXACTLY ONE `.transmit(` call"
-    );
-    assert_eq!(
-        send_compact.matches("::transmit(").count(),
-        0,
-        "DamiaoArmDriver::send must not contain UFCS `::transmit(` calls"
-    );
-    assert!(
-        send_compact.contains("self.can.transmit(&frame)"),
-        "DamiaoArmDriver::send must transmit via `self.can.transmit(&frame)`"
-    );
-
-    // Ensure no legacy bypass or raw-frame helper exists in DamiaoArmDriver.
-    let clean_dm = strip_rust_comments_and_literals(dm_section);
-    for forbidden in [
-        "fn transmit_instrumented",
-        "fn transmit_budgeted_gated",
-        "fn transmit_checked",
-        "fn tx_mit_gated",
-        "fn transmit_with_retry_gated",
-        "fn transmit_with_retry",
-        "fn retransmit(",
-    ] {
-        assert!(
-            !clean_dm.contains(forbidden),
-            "forbidden legacy/raw TX helper `{forbidden}` found in DamiaoArmDriver"
-        );
+    fn check_damiao_tx_chokepoint_sources(files: &[(String, String)]) -> Result<(), String> {
+        let mut send_files = 0usize;
+        for (rel, raw) in files {
+            if rel == "driver/tx_chokepoint_tests.rs" || rel.starts_with("driver/can_servo/robstride/") {
+                continue;
+            }
+            let prod = strip_cfg_test_items(&strip_rust_comments_and_literals(raw));
+            if rel == "driver/can_servo/engine/tx.rs" {
+                send_files += 1;
+                let (outside_compact, send_compact) = partition_damiao_send_body_compact(&prod);
+                if outside_compact.matches(".transmit(").count() != 0 {
+                    return Err(format!("{rel}: `.transmit(` outside `fn send`"));
+                }
+                if outside_compact.matches("::transmit(").count() != 0 {
+                    return Err(format!("{rel}: `::transmit(` outside `fn send`"));
+                }
+                if send_compact.matches(".transmit(").count() != 1 {
+                    return Err(format!("{rel}: `fn send` must have exactly 1 `.transmit(`"));
+                }
+                if send_compact.matches("::transmit(").count() != 0 {
+                    return Err(format!("{rel}: `fn send` must not use UFCS `::transmit(`"));
+                }
+                if !send_compact.contains("self.can.transmit(&frame)") {
+                    return Err(format!("{rel}: `fn send` must call `self.can.transmit(&frame)`"));
+                }
+            } else {
+                let compact: String = prod.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                if compact.matches(".transmit(").count() != 0 || compact.matches("::transmit(").count() != 0 {
+                    return Err(format!("{rel}: `.transmit(`/`::transmit(` forbidden outside DamiaoArmDriver::send"));
+                }
+            }
+            if rel == "driver.rs" || rel.starts_with("driver/can_servo/") {
+                for forbidden in [
+                    "fn transmit_instrumented", "fn transmit_budgeted_gated", "fn transmit_checked",
+                    "fn tx_mit_gated", "fn transmit_with_retry_gated", "fn transmit_with_retry", "fn retransmit(",
+                ] {
+                    if prod.contains(forbidden) {
+                        return Err(format!("{rel}: forbidden legacy/raw TX helper `{forbidden}`"));
+                    }
+                }
+            }
+        }
+        if send_files != 1 {
+            return Err(format!("expected 1 Damiao tx.rs choke-point file, found {send_files}"));
+        }
+        Ok(())
     }
+
+    // Production scan across src/driver.rs + ALL src/driver/**/*.rs files.
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = vec![src_root.join("driver.rs")];
+    collect_rs_files(&src_root.join("driver"), &mut paths);
+    paths.sort();
+    let files: Vec<(String, String)> = paths.iter().map(|p| {
+        let rel = p.strip_prefix(&src_root).unwrap().to_string_lossy().replace('\\', "/");
+        (rel, std::fs::read_to_string(p).unwrap())
+    }).collect();
+    assert!(files.iter().any(|(r, s)| r == "driver.rs" && s.contains("#[cfg(test)]\nmod tx_chokepoint_tests;")));
+    check_damiao_tx_chokepoint_sources(&files).unwrap_or_else(|e| panic!("{e}"));
+
+    // Negative check: injecting a `.transmit(` or `::transmit(` violation in any src/driver/** file must fail.
+    let mut bad = files.clone();
+    bad.push(("driver/can_servo/injected_violation.rs".into(), "impl Foo { fn sneaky(&mut self) { self.can.transmit(&f); } }".into()));
+    assert!(check_damiao_tx_chokepoint_sources(&bad).is_err(), "scanner must reject extra .transmit( in src/driver/**");
+    let mut bad_ufcs = files;
+    bad_ufcs.push(("driver/bus_servo/injected_violation.rs".into(), "fn sneaky<C: CanTransport>(c: &mut C, f: &CanFrame) { let _ = CanTransport::transmit(c, f); }".into()));
+    assert!(check_damiao_tx_chokepoint_sources(&bad_ufcs).is_err(), "scanner must reject extra ::transmit( in src/driver/**");
 }
 
 #[test]
@@ -4756,324 +4762,223 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
     );
 
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    collect_rs_files(&src_root, &mut files);
-    assert!(!files.is_empty(), "expected Rust source files under src/");
+    let mut paths = Vec::new();
+    collect_rs_files(&src_root, &mut paths);
+    paths.sort();
+    assert!(!paths.is_empty(), "expected Rust source files under src/");
+    let files: Vec<(String, String)> = paths.iter().map(|p| {
+        let rel = p.strip_prefix(&src_root).expect("relative under src/").to_string_lossy().replace('\\', "/");
+        (rel, std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())))
+    }).collect();
 
-    let mut total_driver_build_sites = 0usize;
-    let mut total_owner_emit_j7_calls = 0usize;
+    let scan_pos_force_emitter = |src_files: &[(String, String)]| -> Result<(), String> {
+        let mut total_driver_build_sites = 0usize;
+        let mut total_owner_emit_j7_calls = 0usize;
+        let mut codec_def_files = 0usize;
+        let mut emitter_files = 0usize;
+        let mut narrow_hits = [0usize; 4];
+        let mut emit_tick_hits = [0usize; 4];
+        const NARROW_API: [&str; 4] = [
+            "pos_force_emitter::emit_pre_enable_hold(",
+            "pos_force_emitter::emit_mode_switch_hold(",
+            "pos_force_emitter::emit_mode_switch_hold(",
+            "pos_force_emitter::emit_standalone_recovery_hold(",
+        ];
 
-    for path in &files {
-        let rel = path
-            .strip_prefix(&src_root)
-            .expect("relative under src/")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let prod = strip_cfg_test_items(&strip_rust_comments_and_literals(&raw));
-        let compact: String = prod.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        let compact_lower = compact.to_ascii_lowercase();
+        for (rel, raw) in src_files {
+            if rel == "driver/tx_chokepoint_tests.rs" {
+                continue;
+            }
+            let prod = strip_cfg_test_items(&strip_rust_comments_and_literals(raw));
+            let compact: String = prod.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            let compact_lower = compact.to_ascii_lowercase();
+            let is_driver_file = rel == "driver.rs" || rel.starts_with("driver/");
+            let is_damiao_driver_file = rel.starts_with("driver/can_servo/")
+                && !rel.starts_with("driver/can_servo/robstride/")
+                && !rel.starts_with("driver/can_servo/damiao/codec.rs")
+                && !rel.starts_with("driver/can_servo/damiao/table.rs");
 
-        // Raw CAN ID `0x307` is forbidden across ALL production source files, INCLUDING driver.rs
-        // and protocol/damiao.rs.
-        assert!(
-            !has_hex_literal_token(&compact_lower, "0x307"),
-            "production file src/{rel} must not hardcode CAN ID 0x307"
-        );
+            if has_hex_literal_token(&compact_lower, "0x307") {
+                return Err(format!("production file src/{rel} must not hardcode CAN ID 0x307"));
+            }
+            if rel == "driver/can_servo/damiao/codec.rs" {
+                codec_def_files += 1;
+                if compact.matches("build_pos_force_frame(").count() != 1
+                    || !compact.contains("pub(crate)fnbuild_pos_force_frame(_token:&crate::driver::PosForceSendToken,")
+                    || compact.contains("pubfnbuild_pos_force_frame(")
+                {
+                    return Err(format!("src/{rel} must contain only sealed pub(crate) build_pos_force_frame"));
+                }
+                if has_hex_literal_token(&compact_lower, "0x300") {
+                    return Err(format!("src/{rel} must not hardcode 0x300"));
+                }
+                continue;
+            }
+            if rel == "driver/can_servo/damiao/table.rs" {
+                if compact.matches("build_pos_force_frame(").count() != 0 {
+                    return Err(format!("src/{rel} must not call build_pos_force_frame("));
+                }
+                continue;
+            }
+            if has_hex_literal_token(&compact_lower, "0x300") {
+                return Err(format!("production file src/{rel} must not hardcode PosForce base CAN ID 0x300"));
+            }
+            if is_driver_file && count_raw_can_frame_ctors(&compact) != 0 {
+                return Err(format!("src/{rel} must not hand-construct raw CanFrame literals/constructors"));
+            }
 
-        if rel == "protocol/damiao.rs" {
-            // `build_pos_force_frame` MUST be `pub(crate)` and require `&crate::driver::PosForceSendToken`
-            // so only private `driver::pos_force_emitter` can invoke it at compile time.
-            assert_eq!(
-                compact.matches("build_pos_force_frame(").count(),
-                1,
-                "src/protocol/damiao.rs must contain only the build_pos_force_frame definition"
-            );
-            assert!(
-                compact.contains("pub(crate)fnbuild_pos_force_frame(_token:&crate::driver::PosForceSendToken,"),
-                "build_pos_force_frame in src/protocol/damiao.rs must be pub(crate) and sealed by &PosForceSendToken"
-            );
-            assert!(
-                !compact.contains("pubfnbuild_pos_force_frame("),
-                "build_pos_force_frame must not be publicly callable without PosForceSendToken"
-            );
-            continue;
-        }
+            // `build_pos_force_frame(` & `PosForceSendToken(` sealed exclusively in gripper_j7.rs.
+            if rel == "driver/can_servo/gripper_j7.rs" {
+                emitter_files += 1;
+                let (outside_build, inside_build) = partition_unique_fn_compact(&prod, "fn build_wire_frame(");
+                if inside_build.matches("build_pos_force_frame(").count() != 1 || outside_build.matches("build_pos_force_frame(").count() != 0 {
+                    return Err(format!("src/{rel}: build_pos_force_frame( must exist once inside build_wire_frame"));
+                }
+                total_driver_build_sites += 1;
+                let (outside_sf, inside_sf) = partition_unique_fn_compact(&prod, "fn send_frame<");
+                if inside_sf.matches("PosForceSendToken(").count() != 1
+                    || outside_sf.matches("PosForceSendToken(").count() != 1
+                    || !outside_sf.contains("pub(crate)structPosForceSendToken(())")
+                    || compact.contains("pubmodpos_force_emitter")
+                    || compact.contains("pub(crate)modpos_force_emitter")
+                {
+                    return Err(format!("src/{rel}: PosForceSendToken seal invariant broken"));
+                }
+            } else {
+                if compact.matches("build_pos_force_frame(").count() != 0 {
+                    return Err(format!("production file src/{rel} must not call build_pos_force_frame("));
+                }
+                if compact.matches("PosForceSendToken(").count() != 0 {
+                    return Err(format!("production file src/{rel} must not construct PosForceSendToken("));
+                }
+            }
 
-        // Raw base ID `0x300` is forbidden across ALL production source files outside protocol/damiao.rs,
-        // INCLUDING src/driver.rs!
-        assert!(
-            !has_hex_literal_token(&compact_lower, "0x300"),
-            "production file src/{rel} must not hardcode PosForce base CAN ID 0x300"
-        );
+            // Explicit allow-list for EVERY `POS_FORCE_BASE_ID` reference across src/.
+            let base_id_allow: &[(&str, &str)] = match rel.as_str() {
+                "driver/can_servo/gripper_j7.rs" => &[
+                    ("fn build_wire_frame(", "sole constructor"),
+                    ("fn frame_pos_force_joint(", "CAN ID predicate"),
+                    ("fn is_pos_force_freeze_frame(", "freeze predicate"),
+                    ("fn validate_pos_force_target_static(", "static validation"),
+                ],
+                "driver/can_servo/damiao/correlator.rs" => &[
+                    ("fn process_rx_frame(", "RX echo filter"),
+                    ("fn receive_feedback(", "last_target_frames match"),
+                ],
+                _ => &[],
+            };
+            let outside_base_id = if base_id_allow.is_empty() {
+                compact.clone()
+            } else {
+                partition_allowlisted_fns_compact(&prod, base_id_allow).0
+            };
+            if outside_base_id.matches("POS_FORCE_BASE_ID").count() != 0 {
+                return Err(format!("src/{rel} references POS_FORCE_BASE_ID outside its explicit allow-list"));
+            }
 
-        if rel == "driver.rs" {
-            // 1. No raw `CanFrame { ... }` struct literal or `CanFrame::new*` constructor in
-            //    production driver.rs (prevents bypassing `damiao::build_pos_force_frame` with
-            //    hand-built CAN frames).
-            assert_eq!(
-                count_raw_can_frame_ctors(&compact),
-                0,
-                "src/driver.rs must not hand-construct raw CanFrame literals/constructors in production code"
-            );
+            // ZERO `pos_force_emitter::` calls outside Damiao (`can_servo/mod.rs` only re-exports PosForceSendToken).
+            if !is_damiao_driver_file && compact.matches("pos_force_emitter::").count() != 0 {
+                return Err(format!("src/{rel} must have ZERO pos_force_emitter:: calls outside DamiaoArmDriver"));
+            }
 
-            // 2a. `build_pos_force_frame(` exists ONLY inside private `pos_force_emitter::build_wire_frame`.
-            let (outside_build, inside_build) =
-                partition_unique_fn_compact(&prod, "fn build_wire_frame(");
-            assert_eq!(
-                inside_build.matches("build_pos_force_frame(").count(),
-                1,
-                "pos_force_emitter::build_wire_frame must contain EXACTLY ONE build_pos_force_frame( call"
-            );
-            assert_eq!(
-                outside_build.matches("build_pos_force_frame(").count(),
-                0,
-                "src/driver.rs must have ZERO build_pos_force_frame( calls outside pos_force_emitter::build_wire_frame"
-            );
-            total_driver_build_sites += inside_build.matches("build_pos_force_frame(").count();
-
-            // 2b. `PosForceSendToken(` is defined and constructed ONLY inside private `mod pos_force_emitter`
-            //     (`struct PosForceSendToken(())` + `PosForceSendToken(())` inside `fn send_frame(`).
-            let (outside_send_frame, inside_send_frame) =
-                partition_unique_fn_compact(&prod, "fn send_frame<");
-            assert_eq!(
-                inside_send_frame.matches("PosForceSendToken(").count(),
-                1,
-                "pos_force_emitter::send_frame must construct PosForceSendToken(()) once"
-            );
-            assert_eq!(
-                outside_send_frame.matches("PosForceSendToken(").count(),
-                1,
-                "outside send_frame, only `struct PosForceSendToken(())` may contain `PosForceSendToken(`"
-            );
-            assert!(
-                outside_send_frame.contains("pub(crate)structPosForceSendToken(())"),
-                "PosForceSendToken must be a private-field tuple struct inside private mod pos_force_emitter"
-            );
-            assert!(
-                !compact.contains("pubmodpos_force_emitter"),
-                "mod pos_force_emitter must remain private"
-            );
-
-            // 3. Explicit allow-list for EVERY `POS_FORCE_BASE_ID` reference in production driver.rs:
-            //    all non-emitter sites are strictly read-only CAN ID predicates or key lookups.
-            const POS_FORCE_BASE_ID_ALLOWLIST: &[(&str, &str)] = &[
-                (
-                    "fn build_wire_frame(",
-                    "Sole production constructor inside private mod pos_force_emitter calling damiao::build_pos_force_frame",
-                ),
-                (
-                    "fn frame_pos_force_joint(",
-                    "Read-only CAN ID predicate used by DamiaoArmDriver::send submission guard",
-                ),
-                (
-                    "fn is_pos_force_freeze_frame(",
-                    "Read-only bit-for-bit freeze payload predicate (constructs no frame)",
-                ),
-                (
-                    "fn validate_pos_force_target_static(",
-                    "Pure static validation returning expected CAN ID (constructs no frame)",
-                ),
-                (
-                    "fn process_rx_frame(",
-                    "Read-only SocketCAN local-echo RX filter (drops echoed 0x300+id TX frames)",
-                ),
-                (
-                    "fn receive_feedback(",
-                    "Read-only last_target_frames CAN ID match for standalone recovery speed lookup",
-                ),
-            ];
-            let (outside_base_id, _) =
-                partition_allowlisted_fns_compact(&prod, POS_FORCE_BASE_ID_ALLOWLIST);
-            assert_eq!(
-                outside_base_id.matches("POS_FORCE_BASE_ID").count(),
-                0,
-                "src/driver.rs references POS_FORCE_BASE_ID outside its explicit allow-list"
-            );
-
-            // 4. Secondary text check on EVERY caller of `pos_force_emitter::send_frame` and the
-            //    narrow `pos_force_emitter::emit_*` APIs in production driver.rs.
-            const NARROW_EMITTER_CALLERS: &[(&str, &str, &str)] = &[
-                (
-                    "fn finish_pos_force_readback(",
-                    "pos_force_emitter::emit_pre_enable_hold(",
-                    "Pre-enable stationary hold during torque-on handshake right after CTRL_MODE readback while motor is still disabled (allow_freeze = false)",
-                ),
-                (
-                    "fn write_modes_send(",
-                    "pos_force_emitter::emit_mode_switch_hold(",
-                    "Immediate hold frame directly following a CTRL_MODE register switch (allow_freeze = false)",
-                ),
-                (
-                    "fn write_modes_confirmed(",
-                    "pos_force_emitter::emit_mode_switch_hold(",
-                    "Immediate hold frame directly following a confirmed CTRL_MODE register switch (allow_freeze = false)",
-                ),
-                (
-                    "fn receive_feedback(",
-                    "pos_force_emitter::emit_standalone_recovery_hold(",
-                    "Standalone-driver recovery only (refuses with BuildRefused whenever external_pos_force_emitter == true; allow_freeze = false)",
-                ),
-            ];
-            let narrow_allowlist: Vec<(&str, &str)> = NARROW_EMITTER_CALLERS
-                .iter()
-                .map(|&(fn_sig, _, why)| (fn_sig, why))
-                .collect();
-            let (outside_narrow, narrow_bodies) =
-                partition_allowlisted_fns_compact(&prod, &narrow_allowlist);
-            for &(_, api, _) in NARROW_EMITTER_CALLERS {
-                assert_eq!(
-                    outside_narrow.matches(api).count(),
-                    0,
-                    "src/driver.rs calls {api} outside its explicit allow-list"
-                );
+            // Narrow `pos_force_emitter::emit_*` allow-list.
+            let narrow_allow: &[(&str, &str, usize)] = match rel.as_str() {
+                "driver/can_servo/torque/enable.rs" => &[("fn finish_pos_force_readback(", NARROW_API[0], 0)],
+                "driver/can_servo/modes/write.rs" => &[
+                    ("fn write_modes_send(", NARROW_API[1], 1),
+                    ("fn write_modes_confirmed(", NARROW_API[2], 2),
+                ],
+                "driver/can_servo/damiao/correlator.rs" => &[("fn receive_feedback(", NARROW_API[3], 3)],
+                _ => &[],
+            };
+            let (outside_narrow, narrow_bodies) = if narrow_allow.is_empty() {
+                (compact.clone(), Vec::new())
+            } else {
+                let specs: Vec<(&str, &str)> = narrow_allow.iter().map(|&(s, a, _)| (s, a)).collect();
+                partition_allowlisted_fns_compact(&prod, &specs)
+            };
+            for api in NARROW_API {
+                if outside_narrow.matches(api).count() != 0 {
+                    return Err(format!("src/{rel} calls {api} outside its explicit allow-list"));
+                }
             }
             for (fn_name, body) in &narrow_bodies {
-                let &(_, api, _) = NARROW_EMITTER_CALLERS
-                    .iter()
-                    .find(|&&(sig, _, _)| sig == *fn_name)
-                    .unwrap_or_else(|| panic!("unexpected narrow allow-list entry {fn_name}"));
-                assert_eq!(
-                    body.matches(api).count(),
-                    1,
-                    "allow-listed {fn_name} expected exactly 1 {api} call"
-                );
+                let &(_, api, slot) = narrow_allow.iter().find(|&&(s, _, _)| s == *fn_name).unwrap();
+                if body.matches(api).count() != 1 {
+                    return Err(format!("src/{rel} {fn_name} expected exactly 1 {api} call"));
+                }
+                narrow_hits[slot] += 1;
             }
-            // Partition `DamiaoArmDriver` vs the rest of `driver.rs` (trait default methods and
-            // other arm drivers) so `EMIT_TICK_ALLOWLIST` matches Damiao's unique trait impls and
-            // proves ZERO `pos_force_emitter::` calls exist anywhere outside Damiao.
-            let dm_impl_start = prod
-                .find("impl<C: CanTransport> DamiaoArmDriver<C>")
-                .expect("DamiaoArmDriver impl block");
-            let rs_impl_start = prod
-                .find("pub struct RobStrideArmDriver")
-                .expect("RobStrideArmDriver struct");
-            assert!(dm_impl_start < rs_impl_start);
-            let outside_dm_compact: String = format!("{}{}", &prod[..dm_impl_start], &prod[rs_impl_start..])
-                .chars()
-                .filter(|c| !c.is_ascii_whitespace())
-                .collect();
-            assert_eq!(
-                outside_dm_compact.matches("pos_force_emitter::").count(),
-                0,
-                "src/driver.rs must have ZERO pos_force_emitter:: calls outside DamiaoArmDriver"
-            );
-            let dm_prod = &prod[dm_impl_start..rs_impl_start];
-            const EMIT_TICK_ALLOWLIST: &[(&str, &str)] = &[
-                (
-                    "fn emit_pos_force_j7(",
-                    "ArmDriver trait entrypoint called once per tick from SupervisorInner tick epilogue (Legacy & RT Executor)",
-                ),
-                (
-                    "fn write_estop_hold_bounded(",
-                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
-                ),
-                (
-                    "fn write_joint_targets_bounded(",
-                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
-                ),
-                (
-                    "fn drain_pending_tx(",
-                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
-                ),
-            ];
-            let (outside_emit_tick, emit_tick_bodies) =
-                partition_allowlisted_fns_compact(dm_prod, EMIT_TICK_ALLOWLIST);
-            assert_eq!(
-                outside_emit_tick.matches("pos_force_emitter::emit_tick(").count(),
-                0,
-                "src/driver.rs calls pos_force_emitter::emit_tick( outside its explicit allow-list"
-            );
-            for (fn_name, body) in emit_tick_bodies {
-                assert!(
-                    body.matches("pos_force_emitter::emit_tick(").count() >= 1,
-                    "allow-listed {fn_name} expected at least 1 pos_force_emitter::emit_tick( call"
-                );
+
+            // `pos_force_emitter::emit_tick(` allow-list across Damiao modules.
+            let tick_allow: &[(&str, usize)] = match rel.as_str() {
+                "driver/can_servo/gripper_j7.rs" => &[("fn emit_pos_force_j7(", 0)],
+                "driver/can_servo/engine/estop_hold.rs" => &[("fn write_estop_hold_bounded_impl(", 1)],
+                "driver/can_servo/engine/target_tx.rs" => &[("fn write_joint_targets_bounded_impl(", 2)],
+                "driver/can_servo/engine/tx.rs" => &[("fn drain_pending_tx(", 3)],
+                _ => &[],
+            };
+            let (outside_tick, tick_bodies) = if tick_allow.is_empty() {
+                (compact.clone(), Vec::new())
+            } else {
+                let specs: Vec<(&str, &str)> = tick_allow.iter().map(|&(s, _)| (s, "emit_tick")).collect();
+                partition_allowlisted_fns_compact(&prod, &specs)
+            };
+            if outside_tick.matches("pos_force_emitter::emit_tick(").count() != 0 {
+                return Err(format!("src/{rel} calls pos_force_emitter::emit_tick( outside its explicit allow-list"));
             }
-            continue;
+            for (fn_name, body) in &tick_bodies {
+                let &(_, slot) = tick_allow.iter().find(|&&(s, _)| s == *fn_name).unwrap();
+                if body.matches("pos_force_emitter::emit_tick(").count() < 1 {
+                    return Err(format!("src/{rel} {fn_name} expected >= 1 pos_force_emitter::emit_tick( call"));
+                }
+                emit_tick_hits[slot] += 1;
+            }
+
+            // Owner-side `emit_pos_force_j7(` invariant outside driver.rs / driver/**.
+            if rel == "supervisor.rs" {
+                let (outside_merge, inside_merge) = partition_unique_fn_compact(&prod, "fn emit_and_merge_pos_force_j7(");
+                if inside_merge.matches("emit_pos_force_j7(").count() != 1 || outside_merge.matches("emit_pos_force_j7(").count() != 0 {
+                    return Err("supervisor.rs emit_pos_force_j7 invariant violated".into());
+                }
+                total_owner_emit_j7_calls += 1;
+                let (outside_ep, inside_ep) = partition_unique_fn_compact(&prod, "fn emit_j7_tick_epilogue(");
+                if inside_ep.matches("emit_and_merge_pos_force_j7(").count() != 1 || outside_ep.matches("emit_and_merge_pos_force_j7(").count() != 1 {
+                    return Err("supervisor.rs emit_j7_tick_epilogue invariant violated".into());
+                }
+                let (outside_tc, inside_tc) = partition_unique_fn_compact(&prod, "fn tick_control_inner(");
+                if inside_tc.matches("emit_j7_tick_epilogue(").count() != 1 || outside_tc.matches("emit_j7_tick_epilogue(").count() != 1 {
+                    return Err("supervisor.rs tick_control_inner invariant violated".into());
+                }
+            } else if !is_driver_file
+                && (compact.matches("emit_pos_force_j7(").count() != 0
+                    || compact.matches("emit_and_merge_pos_force_j7(").count() != 0)
+            {
+                return Err(format!("production file src/{rel} must not call emit_pos_force_j7/emit_and_merge_pos_force_j7"));
+            }
         }
-
-        // Every other production source file in src/: ZERO POS_FORCE_BASE_ID / build_pos_force_frame.
-        assert_eq!(
-            compact.matches("build_pos_force_frame(").count(),
-            0,
-            "production file src/{rel} must not call build_pos_force_frame("
-        );
-        assert_eq!(
-            compact.matches("POS_FORCE_BASE_ID").count(),
-            0,
-            "production file src/{rel} must not reference POS_FORCE_BASE_ID"
-        );
-
-        // Outside driver.rs, driver/ext.rs and driver/zero_offset.rs (trait + zero-offset wrapper), `emit_pos_force_j7(`
-        // may be invoked ONLY inside `SupervisorInner::emit_and_merge_pos_force_j7` in supervisor.rs,
-        // which itself is called ONLY from `emit_j7_tick_epilogue`, which is called ONLY once in
-        // `tick_control_inner` (shared by BOTH Legacy and RT Executor owners).
-        if rel == "supervisor.rs" {
-            let (outside_merge, inside_merge) =
-                partition_unique_fn_compact(&prod, "fn emit_and_merge_pos_force_j7(");
-            assert_eq!(
-                inside_merge.matches("emit_pos_force_j7(").count(),
-                1,
-                "SupervisorInner::emit_and_merge_pos_force_j7 must call emit_pos_force_j7( once"
-            );
-            assert_eq!(
-                outside_merge.matches("emit_pos_force_j7(").count(),
-                0,
-                "src/supervisor.rs must have ZERO emit_pos_force_j7( calls outside emit_and_merge_pos_force_j7"
-            );
-            total_owner_emit_j7_calls += inside_merge.matches("emit_pos_force_j7(").count();
-
-            let (outside_epilogue, inside_epilogue) =
-                partition_unique_fn_compact(&prod, "fn emit_j7_tick_epilogue(");
-            assert_eq!(
-                inside_epilogue.matches("emit_and_merge_pos_force_j7(").count(),
-                1,
-                "emit_j7_tick_epilogue must call emit_and_merge_pos_force_j7( once"
-            );
-            // Outside `emit_j7_tick_epilogue`, only the definition `fn emit_and_merge_pos_force_j7(` exists.
-            assert_eq!(
-                outside_epilogue.matches("emit_and_merge_pos_force_j7(").count(),
-                1,
-                "emit_and_merge_pos_force_j7 must have no callers outside emit_j7_tick_epilogue"
-            );
-
-            let (outside_tick, inside_tick) =
-                partition_unique_fn_compact(&prod, "fn tick_control_inner(");
-            assert_eq!(
-                inside_tick.matches("emit_j7_tick_epilogue(").count(),
-                1,
-                "tick_control_inner must call emit_j7_tick_epilogue( exactly once"
-            );
-            // Outside `tick_control_inner`, only the definition `fn emit_j7_tick_epilogue(` exists.
-            assert_eq!(
-                outside_tick.matches("emit_j7_tick_epilogue(").count(),
-                1,
-                "emit_j7_tick_epilogue must have no callers outside tick_control_inner"
-            );
-        } else if !["driver/zero_offset.rs", "driver/ext.rs"].contains(&rel.as_str()) {
-            assert_eq!(
-                compact.matches("emit_pos_force_j7(").count(),
-                0,
-                "production file src/{rel} must not call emit_pos_force_j7("
-            );
-            assert_eq!(
-                compact.matches("emit_and_merge_pos_force_j7(").count(),
-                0,
-                "production file src/{rel} must not call emit_and_merge_pos_force_j7("
-            );
+        if codec_def_files != 1 || emitter_files != 1 || total_driver_build_sites != 1 || total_owner_emit_j7_calls != 1 {
+            return Err(format!("anchor count mismatch: codec={codec_def_files} emitter={emitter_files} build={total_driver_build_sites} owner={total_owner_emit_j7_calls}"));
         }
-    }
+        if narrow_hits != [1, 1, 1, 1] || emit_tick_hits != [1, 1, 1, 1] {
+            return Err(format!("allowlist hit mismatch: narrow={narrow_hits:?} emit_tick={emit_tick_hits:?}"));
+        }
+        Ok(())
+    };
 
-    assert_eq!(
-        total_driver_build_sites, 1,
-        "expected exactly 1 production build_pos_force_frame call site across src/"
-    );
-    assert_eq!(
-        total_owner_emit_j7_calls, 1,
-        "expected exactly 1 owner-side emit_pos_force_j7 call site across src/"
-    );
+    assert!(files.iter().any(|(r, s)| r == "driver.rs" && s.contains("#[cfg(test)]\nmod tx_chokepoint_tests;")));
+    scan_pos_force_emitter(&files).unwrap_or_else(|e| panic!("{e}"));
+
+    // Negative check: injecting a 0x307/build_pos_force_frame/emit_tick violation in any src/driver/** file must fail.
+    let mut bad_build = files.clone();
+    bad_build.push(("driver/can_servo/injected_pf.rs".into(), "fn sneaky(t: &PosForceSendToken) { let _ = damiao::build_pos_force_frame(t, 1, 7, 0.0, 0, 1); }".into()));
+    assert!(scan_pos_force_emitter(&bad_build).is_err(), "scanner must reject build_pos_force_frame( in src/driver/**");
+    let mut bad_hex = files.clone();
+    bad_hex.push(("driver/bus_servo/injected_pf.rs".into(), "fn sneaky() -> u16 { 0x307 }".into()));
+    assert!(scan_pos_force_emitter(&bad_hex).is_err(), "scanner must reject raw 0x307 in src/driver/**");
+    let mut bad_emit = files;
+    bad_emit.push(("driver/can_servo/injected_tick.rs".into(), "fn sneaky() { let _ = pos_force_emitter::emit_tick(); }".into()));
+    assert!(scan_pos_force_emitter(&bad_emit).is_err(), "scanner must reject unlisted emit_tick( in src/driver/**");
 }
 
 /// Round 7 M2 regression: under tight per-tick budgets (`max_frames = 1, 2, 3`), J1–J6 stopped
