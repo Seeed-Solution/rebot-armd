@@ -161,6 +161,7 @@ I18N.zh = {
   'lease.released.reconnect': '连接中断后已重连，控制权已释放。{arm}确认现场后点击「重新获取控制权」。',
   'lease.released.expired': '租约超时，控制权已释放。{arm}确认现场后点击「重新获取控制权」。',
   'lease.conn_lost': '连接已断开 · 正在重连', 'lease.t.lost': '连接已断开',
+  'lease.retry_in': '{s} 秒后重试', 'lease.reconnect_now': '立即重连',
   'conn.arm.parked': '机械臂已停靠，力矩已关闭。', 'conn.arm.parking': '机械臂正在自动停靠。', 'conn.arm.off': '机械臂力矩已关闭。',
   'conn.arm.disable_pending': '机械臂力矩即将关闭。', 'conn.arm.torqued': '机械臂仍带力矩。', 'conn.arm.held': '机械臂带力矩保持位置，未自动停靠（{reason}）。',
   'lease.released.other': '控制权已释放，当前由 {who} 控制。{arm}可等对方释放后再点击「重新获取控制权」，或点击下方「接管控制权」。',

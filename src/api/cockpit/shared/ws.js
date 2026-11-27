@@ -6,7 +6,7 @@
 // delivers no valid observation for WS_TELEMETRY_DEADLINE_MS (opened but silent, or half-open) is retired
 // through the same path, so its retry keeps the backoff.
 const WS_RETRY_MS = [1000, 2000, 4000, 8000, 15000], WS_TELEMETRY_DEADLINE_MS = 4000;
-let wsOpenedOnce = false, wsReconnectTimer = null, wsRetryN = 0;
+let wsOpenedOnce = false, wsReconnectTimer = null, wsReconnectDueAt = 0, wsRetryN = 0;
 const VALID_SAFETY_STR = new Set(['Booting', 'Idle', 'Armed', 'Moving', 'EStop']), VALID_FAULT_STR = new Set(['BusLoss', 'WatchdogTimeout', 'CanTxStalled']);
 const isPlainObj = (v) => !!(v && typeof v === 'object' && !Array.isArray(v));
 function isValidSafetyState(s) {
@@ -22,13 +22,18 @@ function isValidSafetyState(s) {
   return k === 'ThermalTrip' && isPlainObj(v) && Number.isSafeInteger(v.joint_idx) && v.joint_idx >= 0 && Number.isFinite(v.temperature) && Number.isFinite(v.limit);
 }
 const isCompleteObservation = (o) => isPlainObj(o) && Array.isArray(o.positions) && (S.schemaLoaded && S.dof > 0 ? o.positions.length === S.dof : o.positions.length > 0) && o.positions.every(Number.isFinite) && Number.isFinite(o.timestamp) && Number.isSafeInteger(o.epoch_id) && o.epoch_id >= 0 && typeof o.is_torqued === 'boolean' && isValidSafetyState(o.safety_state) && (o.lease_holder === null || typeof o.lease_holder === 'string');
-const clearReconnectTimer = () => { if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; } };
+const clearReconnectTimer = () => { if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; } wsReconnectDueAt = 0; };
 const scheduleReconnect = () => {
   clearReconnectTimer();
   const delayMs = WS_RETRY_MS[Math.min(wsRetryN, WS_RETRY_MS.length - 1)];
   wsRetryN++;
-  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; if (!S.ws) connectWS(); }, delayMs);
+  wsReconnectDueAt = Date.now() + delayMs;
+  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; wsReconnectDueAt = 0; if (!S.ws) connectWS(); }, delayMs);
 };
+// Seconds until the queued retry (null when none is queued), for the lost-connection status.
+const reconnectInS = () => (wsReconnectTimer && wsReconnectDueAt ? Math.max(0, Math.ceil((wsReconnectDueAt - Date.now()) / 1000)) : null);
+// "Reconnect now" on the lost-connection status: the user's explicit retry replaces the queued one.
+function reconnectNow() { if (S.connLost && !(S.ws && S.ws.readyState === 0)) connectWS(); }
 // Per-socket telemetry deadline: retire `ws` when no valid observation arrived on it for the deadline.
 function armTelemetryDeadline(ws) {
   ws.lastValidAt = Date.now();
@@ -508,6 +513,7 @@ $('take-confirm').addEventListener('click', () => {
   const btn = $('take-confirm'); btn.disabled = true; setText(btn, t('take.taking'));
   acquireLeaseDirect().then(() => toast(t('toast.take_acquired'), 'info')).catch((e) => { closeTakeModal(); if (!isCancelledErr(e)) toast(e.message, 'err', e.code); });
 });
+$('btn-reconnect-now').addEventListener('click', reconnectNow);
 $('btn-retake').addEventListener('click', () => {
   if (leaseModalOrPending() || !obsFresh()) return;
   const other = leaseOther();

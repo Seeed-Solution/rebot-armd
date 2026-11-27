@@ -155,6 +155,7 @@ I18N.en = {
   'lease.released.reconnect': 'Control released after reconnecting. {arm} Check the arm, then click "Take control".',
   'lease.released.expired': 'Control released after lease timeout. {arm} Check the arm, then click "Take control".',
   'lease.conn_lost': 'Connection lost · reconnecting', 'lease.t.lost': 'Connection lost',
+  'lease.retry_in': 'retry in {s} s', 'lease.reconnect_now': 'Reconnect now',
   'conn.arm.parked': 'The arm parked; torque is off.', 'conn.arm.parking': 'The arm is parking.', 'conn.arm.off': 'Arm torque is off.',
   'conn.arm.disable_pending': 'Arm torque off is pending.', 'conn.arm.torqued': 'The arm is still torqued.', 'conn.arm.held': 'The arm holds position with torque on, no automatic park ({reason}).',
   'lease.released.other': 'Control was released and is now held by {who}. {arm} Wait for release to use "Take control", or use the force takeover button below.',

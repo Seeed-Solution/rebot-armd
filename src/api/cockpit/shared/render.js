@@ -89,6 +89,10 @@ function frame(ts) {
   // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
   const fresh = obsFresh(), holder = leaseOther(), ls = $('lease-status');
   ls.hidden = !live && !S.connLost;
+  const retryS = S.connLost ? reconnectInS() : null;
+  $('lease-retry-txt').hidden = retryS == null;
+  if (retryS != null) setText($('lease-retry-txt'), t('lease.retry_in', { s: retryS }));
+  $('btn-reconnect-now').hidden = !S.connLost;
   if (S.connLost) {
     setCls(ls, 'lease-status is-lost'); setText($('lease-status-txt'), t('lease.conn_lost'));
   } else if (live) {
