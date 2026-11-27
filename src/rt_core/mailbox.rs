@@ -110,20 +110,10 @@ pub enum RefusalDetail {
     LeaseLoss { reason: &'static str },
     /// `WORKSPACE_VIOLATION` / `JOINT_LIMIT`: the joint (or axis) that violated, if known.
     Limit { joint: Option<u8> },
-    /// `WORKSPACE_VIOLATION` on one of the 6 outer workspace box edges (`box_min/max x/y/z`),
-    /// carried zero-alloc across the RT boundary so executor `servo_reject` matches legacy.
-    WorkspaceBoxEdge {
-        /// 0=box_min_x, 1=box_max_x, 2=box_min_y, 3=box_max_y, 4=box_min_z, 5=box_max_z.
-        edge_idx: u8,
-        /// 0=end_origin, 1..=253=end_point:N, 254=camera_mount, 255=capsule:<capsule_id>.
-        geom_kind: u8,
-        /// Valid UTF-8 byte length in `capsule_id` when `geom_kind == 255`.
-        capsule_len: u8,
-        /// Bounded UTF-8 capsule identifier when `geom_kind == 255`.
-        capsule_id: [u8; 32],
-        /// Finite intrusion depth (m) encoded via `f32::to_bits` so formatting happens once off-RT.
-        depth_bits: u32,
-    },
+    /// `WORKSPACE_VIOLATION` carried zero-alloc across the RT boundary for any workspace
+    /// constraint (box edges, floor, reach, keep-out, self-collision, sweep budget, or invalid),
+    /// preserving full 64-byte capsule/keep-out IDs so executor replies match legacy.
+    Workspace(crate::workspace_msg::WorkspaceRefusalRt),
 }
 
 impl Refusal {

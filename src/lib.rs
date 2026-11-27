@@ -57,6 +57,7 @@ pub mod urdf;
 #[cfg(not(target_arch = "wasm32"))] pub mod transport;
 #[cfg(not(target_arch = "wasm32"))] pub mod vision_detector;
 pub mod wasm_api;
+pub mod workspace_msg;
 
 #[cfg(not(target_arch = "wasm32"))] pub use api::{create_router, create_router_with_auth};
 #[cfg(not(target_arch = "wasm32"))] pub use auth::OperatorAuth;

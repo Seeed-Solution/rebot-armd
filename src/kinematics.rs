@@ -644,10 +644,10 @@ impl WorkspaceViolationDetail {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn preallocated_rt() -> Self {
         Self {
-            constraint_id: Some(String::with_capacity(128)),
+            constraint_id: Some(String::with_capacity(160)),
             geometry_id: Some(String::with_capacity(128)),
             violation_phase: Some(String::with_capacity(64)),
-            reason: Some(String::with_capacity(256)),
+            reason: Some(String::with_capacity(384)),
         }
     }
 

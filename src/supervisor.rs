@@ -5414,13 +5414,10 @@ impl SupervisorInner {
                     .enumerate()
                     .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)
                 {
-                    let f = eval.describe_failure(slot, clr, -clr, 0.0, phase);
+                    let f = eval.describe_failure_with_context(slot, clr, -clr, 0.0, phase, true);
+                    let cid = f.detail.constraint_id.as_deref().unwrap_or(f.limit.as_str());
                     let detail = f.detail.reason.as_deref().unwrap_or(f.limit.as_str());
-                    let geom = f.detail.geometry_id.as_deref().unwrap_or("end_link");
-                    Some(format!(
-                        "measured pose violates workspace constraint '{}' (point {} [{}]: {detail}, value {:.4} m vs bound {:.4} m)",
-                        f.limit, f.point, geom, f.value, f.bound
-                    ))
+                    Some(format!("measured pose violates workspace ({cid}, point {}): {detail}", f.point))
                 } else {
                     None
                 }
@@ -14664,10 +14661,12 @@ pub fn check_path_with_tcp_tol<'a>(
     let mut c0 = eval.alloc_buf();
     eval.eval_into(start, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
     let mut min_depths = eval.init_min_depths(&c0);
+    let start_outside = crate::chain::WorkspaceEvaluator::any_outside(min_depths.as_slice());
     let mut clr = eval.alloc_buf();
     for q in samples {
         eval.eval_into(q, &mut clr, "plan").map_err(SafetyError::from_workspace)?;
-        eval.check_and_advance(&clr, &mut min_depths, "plan").map_err(SafetyError::from_workspace)?;
+        eval.check_and_advance_with_start_outside(&clr, &mut min_depths, "plan", start_outside)
+            .map_err(SafetyError::from_workspace)?;
     }
     Ok(())
 }

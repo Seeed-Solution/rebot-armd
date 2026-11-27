@@ -428,14 +428,37 @@ fn fmt_ws_failure_rt(
         WorkspaceFailureKindRt::InvalidSelfPair(pi) => {
             write!(f, "{prefix}: invalid self-collision pair (index {pi})")
         }
-        WorkspaceFailureKindRt::BudgetExceeded { max_budget } => {
-            write!(f, "{prefix}: sweep exceeded {max_budget} FK evaluations")
+        WorkspaceFailureKindRt::BudgetExceeded { max_budget, .. } => {
+            write!(f, "{prefix}: return path could not be checked (needs more than {max_budget} FK evaluations); press Park or make a short jog inward toward the workspace")
         }
-        WorkspaceFailureKindRt::Constraint { slot, depth, min_d } => {
-            write!(
-                f,
-                "{prefix} (slot {slot}, depth={depth:.4}m, min_depth={min_d:.4}m)"
-            )
+        WorkspaceFailureKindRt::Constraint { slot, depth, min_d, conservative_bound, .. } => {
+            let lbl = if conservative_bound { "bound depth" } else { "new depth" };
+            write!(f, "{prefix} (slot {slot}, previous depth {:.3} m, {lbl} {:.3} m)", min_d.max(0.0), depth)
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FallbackStepErr {
+    /// Writes this error into `w` using [`crate::chain::WorkspaceEvaluator::write_failure_rt`]
+    /// (owned by `WorkspaceFailure`) when workspace metadata is available, zero-alloc.
+    pub fn write_with_evaluator(
+        &self,
+        w: &mut impl core::fmt::Write,
+        eval: Option<&crate::chain::WorkspaceEvaluator<'_>>,
+    ) {
+        let ws = match *self {
+            Self::WorkspaceStartViolation(err) => Some(("fallback start violates the workspace", err)),
+            Self::WorkspaceStepViolation(err) => Some(("fallback step violates the workspace", err)),
+            Self::WorkspaceMeasuredViolation(err) => Some(("measured pose violates the workspace", err)),
+            Self::WorkspaceMeasuredSweepViolation(err) => Some(("fallback step from measured violates the workspace", err)),
+            _ => None,
+        };
+        if let (Some((prefix, err)), Some(ev)) = (ws, eval) {
+            let _ = write!(w, "{prefix}: ");
+            ev.write_failure_rt(w, &err);
+        } else {
+            let _ = write!(w, "{self}");
         }
     }
 }
@@ -1596,12 +1619,7 @@ impl crate::supervisor::SupervisorInner {
         match err {
             TrackingRejectRt::JointLimit(msg) => TrackingReject::JointLimit(msg.as_str().to_string()),
             TrackingRejectRt::Workspace(f) => {
-                let mut detail = crate::kinematics::WorkspaceViolationDetail {
-                    constraint_id: Some(String::with_capacity(64)),
-                    geometry_id: Some(String::with_capacity(64)),
-                    violation_phase: Some(String::with_capacity(32)),
-                    reason: Some(String::with_capacity(128)),
-                };
+                let mut detail = crate::kinematics::WorkspaceViolationDetail::preallocated_rt();
                 if let Some((ws, cam)) = self.workspace_policy() {
                     let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
                         &self.config.arm_model,

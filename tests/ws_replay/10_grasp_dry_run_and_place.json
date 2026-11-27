@@ -32,7 +32,7 @@
     {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/action/place","request_id":4,"type":"command"}},
     {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"exactly one of pose or position is required","request_id":4,"safety_state":null,"status":400,"type":"command_reject"}},
     {"ev":"client_frame","client":"c0","frame":{"body":{"position":[2.0,2.0,2.0]},"epoch_id":1,"generation":1,"path":"/api/v1/action/place","request_id":5,"type":"command"}},
-    {"ev":"server_frame","client":"c0","frame":{"code":"WORKSPACE_VIOLATION","constraint_id":"max_reach","epoch_id":1,"error":"WORKSPACE_VIOLATION","geometry_id":"end_origin","message":"Path leaves the safe workspace at s=0.220: check point 0 reach 0.524 m beyond bound 0.520 m","reason":"new intrusion into max_reach by 0.004m (geometry end_origin)","request_id":5,"safety_state":null,"status":422,"type":"command_reject","violation_phase":"plan"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"WORKSPACE_VIOLATION","constraint_id":"max_reach","epoch_id":1,"error":"WORKSPACE_VIOLATION","geometry_id":"end_origin","message":"Path leaves the safe workspace at s=0.220: end_origin reach 0.524 m (limit 0.520 m, new depth 0.004 m over, previous depth 0.000 m)","reason":"end_origin reach 0.524 m (limit 0.520 m, new depth 0.004 m over, previous depth 0.000 m)","request_id":5,"safety_state":null,"status":422,"type":"command_reject","violation_phase":"plan"}},
     {"ev":"client_closed","client":"c0"}
   ]
 }

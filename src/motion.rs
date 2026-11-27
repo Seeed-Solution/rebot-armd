@@ -62,23 +62,8 @@ pub enum MotionError {
     StaticLoadLimit,
 }
 
-fn format_motion_workspace_violation(
-    s: f64,
-    point: usize,
-    limit: &str,
-    value: f64,
-    bound: f64,
-    detail: &kinematics::WorkspaceViolationDetail,
-) -> String {
-    if let (Some(cid), Some(reason)) = (detail.constraint_id.as_deref(), detail.reason.as_deref()) {
-        if matches!(
-            cid,
-            "box_min_x" | "box_max_x" | "box_min_y" | "box_max_y" | "box_min_z" | "box_max_z"
-        ) {
-            return reason.to_string();
-        }
-    }
-    format!("Path leaves the safe workspace at s={s:.3}: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")
+fn format_motion_workspace_violation(s: f64, point: usize, limit: &str, value: f64, bound: f64, detail: &kinematics::WorkspaceViolationDetail) -> String {
+    crate::chain::WorkspaceFailure::format_error_message(Some(s), point, limit, value, bound, detail)
 }
 
 impl MotionError {
@@ -858,7 +843,8 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
                 detail: f.detail,
             })?;
             let min_d = ev.init_min_depths(&c0);
-            Some((c0, min_d, MAX_CARTESIAN_SWEEP_EVALS))
+            let start_outside = crate::chain::WorkspaceEvaluator::any_outside(min_d.as_slice());
+            Some((c0, min_d, MAX_CARTESIAN_SWEEP_EVALS, start_outside))
         }
         None => None,
     };
@@ -906,8 +892,8 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
         check_planning_limits_f32(&q32, &input.limits, arm_scope, Some(s))?;
-        if let (Some(ev), Some((c_prev, min_d, rem))) = (&ws_eval, &mut ws_state) {
-            match ev.sweep_linear_step(
+        if let (Some(ev), Some((c_prev, min_d, rem, start_outside))) = (&ws_eval, &mut ws_state) {
+            match ev.sweep_linear_step_with_start_outside(
                 &prev_q32,
                 &q32,
                 c_prev,
@@ -916,6 +902,7 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
                 MAX_CARTESIAN_SWEEP_EVALS,
                 "plan",
                 "sweep",
+                *start_outside,
             ) {
                 Ok(c_next) => *c_prev = c_next,
                 Err((t_seg, f)) => {

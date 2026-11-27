@@ -3724,7 +3724,7 @@ const I18N = {
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
     'err.rejected': '指令被拒绝', 'err.rejected_fix': '指令被拒绝：{why}。请检查控制状态后重试', 'err.telemetry_stale': '遥测数据已过期，等待新鲜遥测后再试', 'err.nolease': '当前页面没有控制权（只读模式）：请长按「使能」或确认获取控制权后再试', 'err.cmdtimeout': '设备未在时限内确认指令，请检查实际状态',
-    'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'act.running': '外部控制：移动中', 'act.done': '外部控制：完成', 'act.failed': '外部控制：失败（{code}）', 'act.cancelled': '外部控制：已取消（{code}）', 'err.disconnected': '控制连接已断开或控制权已变化',
+    'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标或路径超出安全工作空间（边界/臂展/地面），已拒绝；若当前已在边界外请按收纳（Park）', 'act.running': '外部控制：移动中', 'act.done': '外部控制：完成', 'act.failed': '外部控制：失败（{code}）', 'act.cancelled': '外部控制：已取消（{code}）', 'err.disconnected': '控制连接已断开或控制权已变化',
     'toast.lease_preempted': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式',
     'toast.lease_expired': '⚠️ 连接中断，控制权已释放；若机械臂带力矩，armd 将执行看门狗停靠或保持锁存，请检查现场后点击「重新获取控制权」',
     'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；需要控制时请长按「使能」或在提示中确认获取后再次操作', 'toast.lease_busy': '{who} 正在持有控制权，本页面为观察模式：请等对方释放，或点击「接管控制权」', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
@@ -3997,7 +3997,7 @@ const I18N = {
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
     'err.rejected': 'Command rejected', 'err.rejected_fix': 'Request rejected: {why}. Check control status and try again', 'err.telemetry_stale': 'Telemetry is stale; wait for fresh telemetry and try again', 'err.nolease': 'This page has no control lease (read-only): hold Enable or take control first, then retry', 'err.cmdtimeout': 'Device did not confirm the command in time, check the actual state',
-    'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target outside the safe workspace (floor/boundary), rejected', 'act.running': 'External control: moving', 'act.done': 'External control: done', 'act.failed': 'External control: failed ({code})', 'act.cancelled': 'External control: cancelled ({code})', 'err.disconnected': 'Control connection lost or lease changed',
+    'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target or path outside the safe workspace (boundary/reach/floor), rejected; if already outside, press Park', 'act.running': 'External control: moving', 'act.done': 'External control: done', 'act.failed': 'External control: failed ({code})', 'act.cancelled': 'External control: cancelled ({code})', 'err.disconnected': 'Control connection lost or lease changed',
     'toast.lease_preempted': '⚠️ Control was taken over by another device, this page is now an observer',
     'toast.lease_expired': '⚠️ Connection dropped, so control was released. If torqued, armd runs its watchdog park or holds; check the arm and click "Take control" to resume',
     'toast.lease_released': 'This page released control', 'toast.lease_idle': 'Idle for {s} s, control released. Hold Enable or confirm "Take control?" and repeat when you need control', 'toast.lease_busy': '{who} holds control (observer mode): wait for it to release, or click "Take control"', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
@@ -4075,28 +4075,44 @@ Object.assign(I18N.zh, {
   'ex.speed.btn': '速度 {p}% ▾',
   'ex.task.loads': '抓取时将自动加载：{m}',
   'ex.kind.segment': '分割', 'ex.kind.detect': '检测', 'ex.kind.obb': 'OBB', 'ex.kind.other': '模型',
-  'ws.box_edge': '{part}超出工作空间{edge} {dist}，请{dir}或按 Home',
-  'ws.box_edge_nocm': '{part}超出工作空间{edge}，请{dir}或按 Home',
-  'ws.part.gripper': '夹爪', 'ws.part.camera': '相机', 'ws.part.arm': '机械臂',
-  'ws.edge.box_max_x': '前方边界', 'ws.dir.box_max_x': '向后移动',
-  'ws.edge.box_min_x': '后方边界', 'ws.dir.box_min_x': '向前移动',
-  'ws.edge.box_max_y': '左侧边界', 'ws.dir.box_max_y': '向右移动',
-  'ws.edge.box_min_y': '右侧边界', 'ws.dir.box_min_y': '向左移动',
-  'ws.edge.box_max_z': '顶部边界', 'ws.dir.box_max_z': '向下移动',
-  'ws.edge.box_min_z': '底部边界', 'ws.dir.box_min_z': '向上移动',
+  'ws.box_edge': '{part}超出工作空间{edge} {dist}，请{dir}或{escape}', 'ws.box_edge_nocm': '{part}超出工作空间{edge}，请{dir}或{escape}',
+  'ws.box_edge_witness': '{part} ({gid}) 超出工作空间{edge} {dist}（{cid} {val} m，上限 {lim} m；原超出 {prev}，新超出 {depth}），请{dir}或{escape}',
+  'ws.box_edge_witness_deep': '{part} ({gid}) 超出工作空间{edge} {dist}（{cid} {val} m，上限 {lim} m；原超出 {prev}，新超出 {depth}，将加深 {delta}），请{dir}或{escape}',
+  'ws.escape.home': '按 Home', 'ws.escape.park': '按收纳（Park）', 'ws.part.gripper': '夹爪', 'ws.part.camera': '相机', 'ws.part.arm': '机械臂',
+  'ws.edge.box_max_x': '前方边界', 'ws.dir.box_max_x': '向后移动', 'ws.jog.box_max_x': '向后（-X）',
+  'ws.edge.box_min_x': '后方边界', 'ws.dir.box_min_x': '向前移动', 'ws.jog.box_min_x': '向前（+X）',
+  'ws.edge.box_max_y': '左侧边界', 'ws.dir.box_max_y': '向右移动', 'ws.jog.box_max_y': '向右（-Y）',
+  'ws.edge.box_min_y': '右侧边界', 'ws.dir.box_min_y': '向左移动', 'ws.jog.box_min_y': '向左（+Y）',
+  'ws.edge.box_max_z': '顶部边界', 'ws.dir.box_max_z': '向下移动', 'ws.jog.box_max_z': '向下（-Z）',
+  'ws.edge.box_min_z': '底部边界', 'ws.dir.box_min_z': '向上移动', 'ws.jog.box_min_z': '向上（+Z）',
+  'ws.jog.floor_z': '向上（+Z）', 'ws.jog.max_reach': '向基座方向', 'ws.jog.self_collision': '向远离自碰撞方向', 'ws.jog.inward': '向工作空间内侧',
+  'ws.sweep_budget': '回程路径无法完成校验（超出 {n} 次 FK 评估），请按收纳（Park）或{dir}小步点动{ctx}',
+  'ws.sweep_budget_ctx': '（{blk}，{gid}）',
+  'ws.sweep_budget_keepout': '禁入区「{name}」附近路径无法完成校验（超出 {n} 次 FK 评估），请小步点动或调整障碍物（{gid}）',
+  'ws.sweep_budget_keepout_park': '禁入区「{name}」附近路径无法完成校验（超出 {n} 次 FK 评估），请按收纳（Park）、向远离障碍物方向小步点动，或调整该障碍物（{gid}）',
+  'ws.max_reach': '{gid} 臂展 {val} m（上限 {lim} m，新超出 {depth}，原超出 {prev}）',
+  'ws.max_reach_deep': '{gid} 臂展 {val} m（上限 {lim} m，新超出 {depth}，原超出 {prev}；此移动会再加深 {delta}）',
 });
 Object.assign(I18N.en, {
   'ui.to_expert': 'Expert mode', 'ui.to_simple': 'Simple mode',
   'ui.to_expert.t': 'Switch to expert mode: joint jog, telemetry, calibration, recording and every grasp parameter', 'ui.to_simple.t': 'Back to simple mode: video, sticks and tap to grasp',
-  'ws.box_edge': '{part} is {dist} beyond the workspace {edge} ({cid}); {dir} or press Home',
-  'ws.box_edge_nocm': '{part} is beyond the workspace {edge} ({cid}); {dir} or press Home',
-  'ws.part.gripper': 'gripper', 'ws.part.camera': 'camera', 'ws.part.arm': 'arm',
-  'ws.edge.box_max_x': 'front edge', 'ws.dir.box_max_x': 'move back',
-  'ws.edge.box_min_x': 'back edge', 'ws.dir.box_min_x': 'move forward',
-  'ws.edge.box_max_y': 'left edge', 'ws.dir.box_max_y': 'move right',
-  'ws.edge.box_min_y': 'right edge', 'ws.dir.box_min_y': 'move left',
-  'ws.edge.box_max_z': 'top edge', 'ws.dir.box_max_z': 'move down',
-  'ws.edge.box_min_z': 'bottom edge', 'ws.dir.box_min_z': 'move up',
+  'ws.box_edge': '{part} is {dist} beyond the workspace {edge} ({cid}); {dir} or {escape}', 'ws.box_edge_nocm': '{part} is beyond the workspace {edge} ({cid}); {dir} or {escape}',
+  'ws.box_edge_witness': '{part} ({gid}) is {dist} beyond the workspace {edge} ({cid} {val} m, limit {lim} m; previous depth {prev}, new depth {depth}); {dir} or {escape}',
+  'ws.box_edge_witness_deep': '{part} ({gid}) is {dist} beyond the workspace {edge} ({cid} {val} m, limit {lim} m; previous depth {prev}, new depth {depth}; this move would go {delta} deeper); {dir} or {escape}',
+  'ws.escape.home': 'press Home', 'ws.escape.park': 'press Park', 'ws.part.gripper': 'gripper', 'ws.part.camera': 'camera', 'ws.part.arm': 'arm',
+  'ws.edge.box_max_x': 'front edge', 'ws.dir.box_max_x': 'move back', 'ws.jog.box_max_x': 'back (-X)',
+  'ws.edge.box_min_x': 'back edge', 'ws.dir.box_min_x': 'move forward', 'ws.jog.box_min_x': 'forward (+X)',
+  'ws.edge.box_max_y': 'left edge', 'ws.dir.box_max_y': 'move right', 'ws.jog.box_max_y': 'right (-Y)',
+  'ws.edge.box_min_y': 'right edge', 'ws.dir.box_min_y': 'move left', 'ws.jog.box_min_y': 'left (+Y)',
+  'ws.edge.box_max_z': 'top edge', 'ws.dir.box_max_z': 'move down', 'ws.jog.box_max_z': 'down (-Z)',
+  'ws.edge.box_min_z': 'bottom edge', 'ws.dir.box_min_z': 'move up', 'ws.jog.box_min_z': 'up (+Z)',
+  'ws.jog.floor_z': 'up (+Z)', 'ws.jog.max_reach': 'inward toward the base', 'ws.jog.self_collision': 'away from self-collision', 'ws.jog.inward': 'inward toward the workspace',
+  'ws.sweep_budget': 'return path could not be checked (needs more than {n} FK evaluations); press Park or make a short jog {dir}{ctx}',
+  'ws.sweep_budget_ctx': ' (near {blk} on {gid})',
+  'ws.sweep_budget_keepout': "path check near keep-out box '{name}' needs more than {n} FK evaluations; take a shorter jog or move the obstacle ({gid})",
+  'ws.sweep_budget_keepout_park': "path check near keep-out box '{name}' needs more than {n} FK evaluations; press Park, take a shorter jog away from the obstacle, or move the obstacle ({gid})",
+  'ws.max_reach': '{gid} reach {val} m (limit {lim} m, new depth {depth} over, previous depth {prev})',
+  'ws.max_reach_deep': '{gid} reach {val} m (limit {lim} m, new depth {depth} over, previous depth {prev}; this move would go {delta} deeper)',
   'sv.title': 'Recognition', 'sv.chip.n': 'Recognition · {n} objects', 'sv.chip.0': 'Recognition · no objects', 'sv.chip.wait': 'Recognition · on', 'sv.on.aria': 'Recognition on/off',
   'sv.meta.video': 'video {fps} fps · {ms} ms', 'sv.meta.det': 'recognition {fps} fps', 'sv.meta.off': 'recognition off',
   'sv.kind': 'Detection kind', 'sv.kind.detect': 'Detect (boxes)', 'sv.kind.segment': 'Segment (outlines)',
@@ -4995,16 +5011,44 @@ function syncEpoch(epoch) {
   S.epoch = epoch;
 }
 function formatWorkspaceViolation(o) {
-  if (!o || typeof o !== 'object') return '';
-  const cid = o.constraint_id;
-  if (!cid || !/^box_(?:min|max)_[xyz]$/.test(cid)) return '';
-  const gid = typeof o.geometry_id === 'string' ? o.geometry_id : '';
-  const partKey = gid === 'camera_mount' ? 'ws.part.camera' : gid.startsWith('capsule:') ? 'ws.part.arm' : 'ws.part.gripper';
+  if (!o || typeof o !== 'object' || !o.constraint_id) return '';
+  const cid = o.constraint_id, gid = (typeof o.geometry_id === 'string' && o.geometry_id) || 'end_origin';
   const raw = String(o.reason || o.message || '');
-  const m = /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
-  const args = { part: t(partKey), edge: t('ws.edge.' + cid), dir: t('ws.dir.' + cid), cid };
-  if (m) return t('ws.box_edge', { ...args, dist: m[1] + ' ' + m[2].toLowerCase() });
-  return t('ws.box_edge_nocm', args);
+  if (/^(?:invalid workspace check\b|.+sweep could not verify\b)/i.test(raw)) return '';
+  if (/^box_(?:min|max)_[xyz]$/.test(cid)) {
+    const partKey = gid === 'camera_mount' ? 'ws.part.camera' : gid.startsWith('capsule:') ? 'ws.part.arm' : 'ws.part.gripper';
+    const distM = /\bis\s+(\d+(?:\.\d+)?)\s*(cm|mm)\b/i.exec(raw) || /(\d+(?:\.\d+)?)\s*(cm|mm)/i.exec(raw);
+    const usePark = /\bpress Park\b/i.test(raw) || /would go .* deeper/i.test(raw);
+    const args = { part: t(partKey), gid, edge: t('ws.edge.' + cid), dir: t('ws.dir.' + cid), cid, escape: t(usePark ? 'ws.escape.park' : 'ws.escape.home') };
+    const wm = /box_(?:min|max)_[xyz]\s+(-?\d+(?:\.\d+)?)\s*m,\s*limit\s+(-?\d+(?:\.\d+)?)\s*m;\s*previous depth\s+(\d+(?:\.\d+)?\s*(?:m|mm)),\s*new depth\s+(\d+(?:\.\d+)?\s*(?:m|mm))(?:;\s*this move would go\s+(\d+(?:\.\d+)?\s*mm)\s+deeper)?/i.exec(raw);
+    if (distM && wm) {
+      const wArgs = { ...args, dist: distM[1] + ' ' + distM[2].toLowerCase(), val: wm[1], lim: wm[2], prev: wm[3], depth: wm[4] };
+      return wm[5] ? t('ws.box_edge_witness_deep', { ...wArgs, delta: wm[5] }) : t('ws.box_edge_witness', wArgs);
+    }
+    if (distM) return t('ws.box_edge', { ...args, dist: distM[1] + ' ' + distM[2].toLowerCase() });
+    return raw ? '' : t('ws.box_edge_nocm', args);
+  }
+  if (cid === 'sweep_budget') {
+    const koM = /^path check near keep-out box '(.+)' needs more than (\d+) FK evaluations;\s*(.+)$/i.exec(raw);
+    if (koM) {
+      return t(/\bpress Park\b/i.test(koM[3]) ? 'ws.sweep_budget_keepout_park' : 'ws.sweep_budget_keepout', { name: koM[1], n: koM[2], gid });
+    }
+    const unM = /^return path could not be checked \(needs more than (\d+) FK evaluations\);.*?(?:\(near (box_(?:min|max)_[xyz]|max_reach|floor_z|self_collision:.+?) on (.+)\))?$/i.exec(raw);
+    if (!unM) return '';
+    const n = unM[1], blk = unM[2] || '', blkGid = unM[3] || gid;
+    const jogKey = /^box_(?:min|max)_[xyz]$/.test(blk) ? 'ws.jog.' + blk : blk === 'max_reach' ? 'ws.jog.max_reach'
+      : blk === 'floor_z' ? 'ws.jog.floor_z' : blk.startsWith('self_collision:') ? 'ws.jog.self_collision' : 'ws.jog.inward';
+    const ctx = blk ? t('ws.sweep_budget_ctx', { blk, gid: blkGid }) : '';
+    return t('ws.sweep_budget', { n, dir: t(jogKey), ctx });
+  }
+  if (cid === 'max_reach') {
+    const rm = /reach\s+(\d+(?:\.\d+)?)\s*m\s*\(limit\s+(\d+(?:\.\d+)?)\s*m,\s*new depth\s+(\d+(?:\.\d+)?\s*(?:m|mm))\s+over,\s*previous depth\s+(\d+(?:\.\d+)?\s*(?:m|mm))(?:;\s*this move would go\s+(\d+(?:\.\d+)?\s*mm)\s+deeper)?\)/i.exec(raw);
+    if (rm) {
+      const rArgs = { gid, val: rm[1], lim: rm[2], depth: rm[3], prev: rm[4] };
+      return rm[5] ? t('ws.max_reach_deep', { ...rArgs, delta: rm[5] }) : t('ws.max_reach', rArgs);
+    }
+  }
+  return '';
 }
 function rpcError(response) {
   let message;
