@@ -33,24 +33,32 @@ async function startMockArmd() {
     env: { ...process.env, RUST_LOG: 'warn', ARMD_APP_CONFIG: 'off',
       ARMD_POSES: path.join(state, 'poses.json'), ARMD_SEQUENCES: path.join(state, 'sequences.json') },
   });
-  const deadline = Date.now() + 15000;
-  for (;;) {
-    if (child.exitCode !== null) throw new Error(`armd exited early (${child.exitCode})`);
-    try { if ((await fetch(`http://127.0.0.1:${port}/api/v1/observation`)).ok) break; } catch (_) {}
-    if (Date.now() > deadline) { child.kill('SIGKILL'); throw new Error('armd not ready'); }
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  // stop() ends the child and removes the temp state, also when the child already exited.
   const stop = () => new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+    const done = () => { fs.rmSync(state, { recursive: true, force: true }); resolve(); };
+    if (child.exitCode !== null || child.signalCode !== null) { done(); return; }
     const kt = setTimeout(() => child.kill('SIGKILL'), 3000);
-    child.once('exit', () => { clearTimeout(kt); fs.rmSync(state, { recursive: true, force: true }); resolve(); });
+    child.once('exit', () => { clearTimeout(kt); done(); });
     child.kill('SIGTERM');
   });
+  try {
+    const deadline = Date.now() + 15000;
+    for (;;) {
+      if (child.exitCode !== null) throw new Error(`armd exited early (${child.exitCode})`);
+      try { if ((await fetch(`http://127.0.0.1:${port}/api/v1/observation`)).ok) break; } catch (_) {}
+      if (Date.now() > deadline) throw new Error('armd not ready');
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } catch (e) {
+    await stop();
+    throw e;
+  }
   return { url: `http://127.0.0.1:${port}/`, stop };
 }
 
 (async () => {
   const armd = await startMockArmd();
+  let browser = null;
   try {
     const artifactDir = path.resolve(__dirname, 'artifacts');
     if (!fs.existsSync(artifactDir)) fs.mkdirSync(artifactDir, { recursive: true });
@@ -60,7 +68,7 @@ async function startMockArmd() {
       gitCommit = execSync('git rev-parse HEAD', { cwd: __dirname }).toString().trim();
     } catch (_) {}
 
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       executablePath: process.env.CHROME || undefined,
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
@@ -317,6 +325,7 @@ async function startMockArmd() {
     }
 
     await browser.close();
+    browser = null;
     log('=====================================================================');
     log(`SUMMARY STATS: Total Checked Dimensions = ${totalCheckedDimensions}`);
     log(`GLOBAL MAXIMUM MEASURED ERROR = ${globalMaxError.toFixed(6)}px`);
@@ -325,6 +334,7 @@ async function startMockArmd() {
 
     fs.writeFileSync(path.join(artifactDir, 'playwright_test.log'), logLines.join('\n') + '\n', 'utf8');
   } finally {
+    if (browser) await browser.close().catch(() => {});
     await armd.stop();
   }
 })().catch((e) => { console.error(e); process.exit(1); });
