@@ -1033,3 +1033,18 @@ pub enum DamiaoControlMode {
     /// Position-force (CTRL_MODE 4): every frame carries a motor current limit.
     PosForce,
 }
+
+/// Stop-gate policy for a mode-write transaction (`write_modes_send` / `write_modes_confirmed`).
+#[derive(Clone, Copy, Debug)]
+pub(in crate::driver::can_servo) enum ModeWritePolicy {
+    /// Torque-enable base-mode restore handshake: enforces strict pending + latched +
+    /// enable-stamp checks and tears down `torque_hs` on inhibition.
+    EnableRestore,
+    /// Forward mode switch (or non-base-restore rollback): refuses any transmit while a
+    /// stop or E-stop is pending, latched, or advances past the captured stamp.
+    Strict(StopStamp),
+    /// Base-mode rollback (every changing joint restoring `base_mode(i)`):
+    /// refused while a stop/E-stop is pending; allowed while latched ONLY with fresh
+    /// (`<= 100 ms`) measured feedback, rebuilding every hold at the fresh measured position.
+    BaseRollback { start_stamp: StopStamp, force_fresh_hold: bool },
+}
