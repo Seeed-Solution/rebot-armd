@@ -128,7 +128,23 @@ echo "      + cargo ${CARGO_ARGS[*]}"
 if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
-cargo "${CARGO_ARGS[@]}"
+# JSON messages on stdout (diagnostics still rendered on stderr): the armd build-script message of this
+# invocation names the OUT_DIR whose cockpit page is the one compiled into the packaged binary.
+CARGO_MESSAGES="${REPO_ROOT}/target/deb_cargo_messages.$$.json"
+cargo "${CARGO_ARGS[@]}" --message-format=json-render-diagnostics > "${CARGO_MESSAGES}"
+ARMD_OUT_DIRS="$(grep -F '"reason":"build-script-executed"' "${CARGO_MESSAGES}" \
+    | grep -F "\"package_id\":\"path+file://$(cd "${REPO_ROOT}" && pwd -P)#" \
+    | sed -n 's/.*"out_dir":"\([^"]*\)".*/\1/p' | sort -u || true)"
+rm -f "${CARGO_MESSAGES}"
+if [ "$(printf '%s\n' "${ARMD_OUT_DIRS}" | grep -c .)" -ne 1 ]; then
+    echo "Error: expected one armd build-script OUT_DIR from cargo, got: '${ARMD_OUT_DIRS}'" >&2
+    exit 1
+fi
+COCKPIT_PAGE="${ARMD_OUT_DIRS}/cockpit/index.html"
+if [ ! -f "${COCKPIT_PAGE}" ]; then
+    echo "Error: assembled cockpit page not found at ${COCKPIT_PAGE}" >&2
+    exit 1
+fi
 
 BIN_PATH="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/armd"
 if [ ! -f "${BIN_PATH}" ]; then
@@ -294,9 +310,8 @@ if [ -d "${REPO_ROOT}/assets/so101_meshes" ]; then
     cp -rf "${REPO_ROOT}/assets/so101_meshes/"* "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_meshes/"
 fi
 
-# Web UI: the same assembled cockpit page armd serves (shell + fragments, via .config/source_paths.tsv)
-COCKPIT_ASSEMBLER="$("${SCRIPT_DIR}/source_paths.sh" --repo cockpit_assembler)"
-sh "${COCKPIT_ASSEMBLER}" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
+# Web UI: the page build.rs assembled for the packaged binary (same bytes as its GET /)
+cp "${COCKPIT_PAGE}" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
 # Gallery manifest: its "version" is the package version (the console reports it as the
 # installed version), written here so the two cannot differ.
 MANIFEST="${STAGING_DIR}/usr/share/rebot-teleop/rebot-teleop.json"

@@ -4,7 +4,6 @@
 # When a source file moves or splits into a directory, update its row(s) here once.
 cockpit_html	src/api/index.html
 cockpit_fragments_dir	src/api/cockpit
-cockpit_assembler	src/api/cockpit/assembler/assemble.sh
 cockpit_assets_dir	src/api
 driver	src/driver.rs
 sim_driver	src/sim_driver.rs

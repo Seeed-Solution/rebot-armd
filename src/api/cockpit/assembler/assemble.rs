@@ -3,7 +3,8 @@
 //! The cockpit is one inline HTML page (`src/api/index.html`, the shell) whose CSS and scripts
 //! live in fragments under `src/api/cockpit/`. A splice point is a shell line that is exactly
 //! `<!-- @include cockpit/<path> -->`; the assembler replaces that line (and its newline) with
-//! the fragment's bytes. Rules (the Node and sh assemblers next to this file apply the same):
+//! the fragment's bytes. Rules (the Node assembler next to this file is a port with the same checks and error texts;
+//! both run tests/fixtures/cockpit_assembly/cases.json):
 //! - paths are relative to `src/api/`, start with `cockpit/`, use `[A-Za-z0-9_.-]` segments;
 //! - a fragment is non-empty UTF-8, ends with `\n` and contains no splice line (one level);
 //! - each fragment is included once, and every `.css` / `.js` / `.html` file under
