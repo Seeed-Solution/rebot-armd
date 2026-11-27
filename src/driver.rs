@@ -8,9 +8,7 @@ use crate::model::JointState;
 pub use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointRangeReading, MotorZeroSupport, RangeCheckStatus};
 use crate::protocol::damiao::{self, DamiaoLimits};
 pub use crate::protocol::damiao::DAMIAO_GRIPPER_POSFORCE_VEL_RAW;
-use crate::protocol::fashionstar::{self, FashionStarPacket};
 use crate::protocol::feetech;
-use crate::protocol::robstride::{self, RobStrideLimits};
 use crate::transport::{
     CanFrame, CanRxTime, CanTransport, Transport, TransportError,
     MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS,
@@ -6272,11 +6270,6 @@ impl<T: Transport> ShadowExt for FeetechArmDriver<T> {
         self.shadow_staging.drain_into(out)
     }
 }
-
-// =========================================================================
-// 2. FashionStar UartServo Arm Driver (Star Arm 102)
-// =========================================================================
-
 
 // =========================================================================
 // 3. Damiao Brushless Arm Driver (reBot Arm B601-DM)
@@ -27181,11 +27174,6 @@ mod pos_force_emitter {
         }
     }
 }
-
-// =========================================================================
-// 4. RobStride Actuator Arm Driver (reBot Arm B601-RS)
-// =========================================================================
-
 
 #[cfg(test)]
 mod tx_chokepoint_tests {
