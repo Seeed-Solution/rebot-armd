@@ -362,6 +362,8 @@ async function assertReachable(page, sel, label) {
 
 async function assertControlInputsState(page, expectedState, label) {
   assert(expectedState === 'unavailable' || expectedState === 'active', `${label}: invalid expectedState=${expectedState}`);
+  // The render loop (frame()) applies the control-input classes; let two frames pass under host load.
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
   const errors = await page.evaluate((exp) => {
     const errs = [];
     const wantActive = exp === 'active';
