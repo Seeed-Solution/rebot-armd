@@ -1872,7 +1872,9 @@ pub trait ArmDriver: Send {
         None
     }
 
-    /// Decode motor fault/status code into descriptive string
+    /// Decode motor fault/status code into descriptive string.
+    /// Implementation primitive (allocates): kept for the 3 legacy owner sites until S5;
+    /// RT paths call [`Self::decode_motor_error_static`].
     fn decode_motor_error(&self, code: u8) -> Option<String> {
         damiao_fault_name(code).map(str::to_string)
     }
@@ -1933,7 +1935,6 @@ pub trait ArmDriver: Send {
     /// [`BusRecoveryExt`] of this driver; `None` = the trait's default bodies ([`NoExt`]).
     fn bus_recovery_ext(&self) -> Option<&dyn BusRecoveryExt> { None }
     fn bus_recovery_ext_mut(&mut self) -> Option<&mut dyn BusRecoveryExt> { None }
-    #[cfg(not(target_arch = "wasm32"))]
     /// [`ShadowExt`] of this driver; `None` = the trait's default bodies ([`NoExt`]).
     #[cfg(not(target_arch = "wasm32"))]
     fn shadow_ext(&self) -> Option<&dyn ShadowExt> { None }
@@ -1947,6 +1948,11 @@ pub trait ArmDriver: Send {
 /// Allocating snapshots for non-RT owner paths, built on the `_into` methods. The `Vec`
 /// returning trait methods (`feedback_ages`, `motor_status`, ...) are implementation
 /// primitives of drivers and doubles; owners call these helpers or the `_into` forms.
+///
+/// S6 note (Fable M3): because these helpers read `*_into` rather than the `Vec` primitives,
+/// test doubles that override only `*_into` surface their `_into` data through these helpers
+/// (while pre-split legacy fault-clear freshness/resting-pose gates call `feedback_ages()`
+/// directly). Delete the `Vec` primitives once S6 regroups the doubles.
 impl dyn ArmDriver + '_ {
     pub fn feedback_ages_snapshot(&self) -> Vec<Option<Duration>> {
         let mut out = Vec::new();

@@ -11,9 +11,18 @@
 //! `BoundedTxExt`, `ModeSwitchExt`, `MitExt` and `BusRecoveryExt` carry no joint-space
 //! values: `ZeroOffsetDriver` passes them through without offsets. Do not add a method
 //! with joint angles to them.
+//!
+//! None of the `*Ext` traits has a `Send` or `Sync` supertrait: references derived from an
+//! `ArmDriver` borrow (`&dyn *Ext` / `&mut dyn *Ext`) stay tied to the borrowing thread.
 #![allow(clippy::too_many_arguments)]
 
-use super::*;
+use std::time::{Duration, Instant};
+
+use super::{
+    ArmDriver, ArmDriverError, CarryoverMotorClearOutcome, DriverRangeCheck, GripperPosForceInfo,
+    JointMode, JointTarget, ModeSwitchHoldTarget, MotorCurrentCap, PosForceEmitOutcome,
+    PosForceIntent, PosForceIntentStamp, PosForceTxStatus, TxBudget, DAMIAO_TX_FRAME_MAX_AGE,
+};
 
 /// Bounded TX / release budget accounting (Damiao). Carries no joint angles.
 pub trait BoundedTxExt {
@@ -801,6 +810,9 @@ macro_rules! ext_getters {
                 }
             }
         )*
+        // Getters live on `dyn ArmDriver` because all owners hold `dyn ArmDriver` (Fable M5).
+        // If a generic `D: ArmDriver` owner is ever introduced, expose these getters via a
+        // blanket extension trait rather than repeating `unwrap_or(&NoExt)` at call sites.
         impl dyn ArmDriver + '_ {
             $(
                 /// This driver's extension, or [`NoExt`] (the default bodies).
