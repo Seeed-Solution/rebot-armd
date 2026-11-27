@@ -2047,16 +2047,6 @@ impl PendingDisableShadowBatch {
 
 
 
-/// Transmit priority classes (lower value = higher priority):
-/// 1. Transition from motion to stop / hold / freeze for ANY joint (including J7).
-/// 2. Motion targets.
-/// 3. Re-sends of an unchanged hold / freeze.
-///
-/// (Class 4: J7 `0xCC` refresh and other reads — sent only when Classes 1–3 have no pending work
-/// and spare TX budget remains.)
-const TX_CLASS_STOP_TRANSITION: u8 = 1;
-const TX_CLASS_MOTION_TARGET: u8 = 2;
-const TX_CLASS_HOLD_RESEND: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct RestPoseBoundary {
