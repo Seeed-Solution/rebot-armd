@@ -12179,6 +12179,10 @@ mod panic_disable_tests {
             self.generic_begin_calls.fetch_add(1, Ordering::SeqCst);
             Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
         }
+        fn unconfirmed_disable_joints(&self) -> Vec<usize> { vec![2] }
+        crate::ext_accessors!(bus_recovery);
+    }
+    impl crate::driver::BusRecoveryExt for SelectiveMockDriver {
         fn panic_disable_step(
             &mut self,
             _first: bool,
@@ -12192,9 +12196,6 @@ mod panic_disable_tests {
                 Ok(v) => Ok(v.clone()),
                 Err(e) => Err(ArmDriverError::HardwareFault(e.to_string())),
             })
-        }
-        fn unconfirmed_disable_joints(&self) -> Vec<usize> {
-            vec![2]
         }
     }
 
@@ -12261,12 +12262,8 @@ mod panic_disable_tests {
         fn is_enabled(&self) -> bool { true }
         fn enable_state(&self) -> EnableState { EnableState::Unknown }
         fn is_feedback_valid(&self) -> bool { false }
-        fn read_joint_states(&mut self) -> Result<Vec<crate::model::JointState>, ArmDriverError> {
-            Ok(Vec::new())
-        }
-        fn write_joint_targets(&mut self, _: &[crate::driver::JointTarget]) -> Result<(), ArmDriverError> {
-            Ok(())
-        }
+        fn read_joint_states(&mut self) -> Result<Vec<crate::model::JointState>, ArmDriverError> { Ok(Vec::new()) }
+        fn write_joint_targets(&mut self, _: &[crate::driver::JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
         fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
         fn begin_torque_budgeted(
             &mut self,
@@ -12276,6 +12273,9 @@ mod panic_disable_tests {
             self.generic_begin_calls.fetch_add(1, Ordering::SeqCst);
             Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
         }
+        crate::ext_accessors!(bus_recovery);
+    }
+    impl crate::driver::BusRecoveryExt for ProbeThenGenericMockDriver {
         fn panic_disable_step(
             &mut self,
             _first: bool,

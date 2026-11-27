@@ -29,7 +29,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use armd::driver::{
+use armd::driver::{JointModeExt,
     ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, FashionStarArmDriver,
     FeetechArmDriver, JointTarget, TorqueOutcome, TorqueProgress,
 };
@@ -244,9 +244,7 @@ impl ArmDriver for ThreadAuditDriver {
         }
         true
     }
-    fn enable_state(&self) -> EnableState {
-        if self.enabled { EnableState::Enabled } else { EnableState::Disabled }
-    }
+    fn enable_state(&self) -> EnableState { if self.enabled { EnableState::Enabled } else { EnableState::Disabled } }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         dof == self.dof && Duration::from_millis(1) <= max_age
     }
@@ -274,14 +272,15 @@ impl ArmDriver for ThreadAuditDriver {
         out.resize(self.dof, 1);
     }
     fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); }
-    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { out.clear(); }
     fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { out.clear(); false }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool {
         out.clear();
         out.resize(self.dof, if self.enabled { 1 } else { 0 });
         true
     }
+    armd::ext_accessors!(joint_mode);
 }
+impl armd::driver::JointModeExt for ThreadAuditDriver { fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { out.clear(); } }
 
 /// Drop probe recording the `ThreadId` on which `Drop::drop` ran.
 struct DropProbe {

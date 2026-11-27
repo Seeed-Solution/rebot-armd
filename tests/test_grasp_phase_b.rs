@@ -260,67 +260,6 @@ impl ArmDriver for PhaseBDriver {
         out.clear();
         out.extend(std::iter::repeat_n(Some(ts), 7));
     }
-    fn motor_current_cap(&self) -> Option<MotorCurrentCap> {
-        let s = self.sim.lock().unwrap();
-        s.pos_force_active.then_some(MotorCurrentCap {
-            joint: 6,
-            mode: "pos_force",
-            current_raw: Some(2500),
-            active: true,
-            calibrated: true,
-            ceiling_torque_nm: Some(1.5),
-            torque_reference: None,
-            close_speed_rad_s: Some(2.0),
-            note: "phase_b_sim_pos_force",
-        })
-    }
-    fn set_external_pos_force_emitter(&mut self, enabled: bool) {
-        self.sim.lock().unwrap().external_pf = enabled;
-    }
-    fn pos_force_feedback_fresh(&self) -> bool {
-        !self.sim.lock().unwrap().inject_fault
-    }
-    fn pos_force_last_fresh_position(&self) -> Option<f32> {
-        Some(self.sim.lock().unwrap().pos[6])
-    }
-    fn emit_pos_force_j7(
-        &mut self,
-        intent: PosForceIntent,
-        current: PosForceIntentStamp,
-    ) -> Result<PosForceEmitOutcome, ArmDriverError> {
-        let mut s = self.sim.lock().unwrap();
-        if !s.pos_force_active {
-            return Ok(PosForceEmitOutcome::NotApplicable);
-        }
-        let stale = intent.stamp.is_stale_against(current);
-        let snap_pos = s.pos;
-        s.pf_intent_log.push((Instant::now(), intent.kind, stale, snap_pos));
-        if s.enabled && !s.inject_fault {
-            if let PosForceIntentKind::Target { position, velocity, .. } = intent.kind {
-                if !stale {
-                    let step = velocity.filter(|v| v.is_finite() && *v > 0.0).map(|v| v * 0.02);
-                    Self::apply_j7_target(&mut s, position, step);
-                }
-            } else {
-                // Hold / Stop keeps current measured J7 stationary (maintaining stall torque if holding).
-                s.vel[6] = 0.0;
-                let close_dir = if s.closed_rad >= s.open_rad { 1.0f32 } else { -1.0f32 };
-                let eff_obj = if s.dropped { None } else { s.object_j7 };
-                if let Some(obj_j7) = eff_obj {
-                    if (s.pos[6] - obj_j7).abs() < 0.05 {
-                        s.tau[6] = 1.5 * close_dir;
-                    }
-                } else {
-                    s.tau[6] = 0.0;
-                }
-            }
-        }
-        Ok(PosForceEmitOutcome::Sent {
-            joint: 6,
-            freeze: false,
-            pf_status: PosForceTxStatus::Fresh,
-        })
-    }
     fn enable_state(&self) -> EnableState {
         if self.sim.lock().unwrap().enabled {
             EnableState::Enabled
@@ -521,6 +460,64 @@ impl ArmDriver for PhaseBDriver {
     fn abort_enable(&mut self) {}
     fn torque_transition_pending(&self) -> bool {
         false
+    }
+    armd::ext_accessors!(pos_force);
+}
+impl armd::driver::PosForceExt for PhaseBDriver {
+    fn motor_current_cap(&self) -> Option<MotorCurrentCap> {
+        let s = self.sim.lock().unwrap();
+        s.pos_force_active.then_some(MotorCurrentCap {
+            joint: 6,
+            mode: "pos_force",
+            current_raw: Some(2500),
+            active: true,
+            calibrated: true,
+            ceiling_torque_nm: Some(1.5),
+            torque_reference: None,
+            close_speed_rad_s: Some(2.0),
+            note: "phase_b_sim_pos_force",
+        })
+    }
+    fn set_external_pos_force_emitter(&mut self, enabled: bool) { self.sim.lock().unwrap().external_pf = enabled; }
+    fn pos_force_feedback_fresh(&self) -> bool { !self.sim.lock().unwrap().inject_fault }
+    fn pos_force_last_fresh_position(&self) -> Option<f32> { Some(self.sim.lock().unwrap().pos[6]) }
+    fn emit_pos_force_j7(
+        &mut self,
+        intent: PosForceIntent,
+        current: PosForceIntentStamp,
+    ) -> Result<PosForceEmitOutcome, ArmDriverError> {
+        let mut s = self.sim.lock().unwrap();
+        if !s.pos_force_active {
+            return Ok(PosForceEmitOutcome::NotApplicable);
+        }
+        let stale = intent.stamp.is_stale_against(current);
+        let snap_pos = s.pos;
+        s.pf_intent_log.push((Instant::now(), intent.kind, stale, snap_pos));
+        if s.enabled && !s.inject_fault {
+            if let PosForceIntentKind::Target { position, velocity, .. } = intent.kind {
+                if !stale {
+                    let step = velocity.filter(|v| v.is_finite() && *v > 0.0).map(|v| v * 0.02);
+                    Self::apply_j7_target(&mut s, position, step);
+                }
+            } else {
+                // Hold / Stop keeps current measured J7 stationary (maintaining stall torque if holding).
+                s.vel[6] = 0.0;
+                let close_dir = if s.closed_rad >= s.open_rad { 1.0f32 } else { -1.0f32 };
+                let eff_obj = if s.dropped { None } else { s.object_j7 };
+                if let Some(obj_j7) = eff_obj {
+                    if (s.pos[6] - obj_j7).abs() < 0.05 {
+                        s.tau[6] = 1.5 * close_dir;
+                    }
+                } else {
+                    s.tau[6] = 0.0;
+                }
+            }
+        }
+        Ok(PosForceEmitOutcome::Sent {
+            joint: 6,
+            freeze: false,
+            pf_status: PosForceTxStatus::Fresh,
+        })
     }
 }
 

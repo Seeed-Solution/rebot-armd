@@ -170,7 +170,6 @@ impl ArmDriver for MockFbArm {
         for (i, t) in targets.iter().enumerate().take(7) { s.q[i] = t.position; }
         Ok(())
     }
-    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
         if self.state.lock().unwrap().hw_fault {
             Err(ArmDriverError::HardwareFault("latched hw fault".into()))
@@ -188,6 +187,10 @@ impl ArmDriver for MockFbArm {
         s.torqued = false;
         Ok(())
     }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for MockFbArm {
+    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
 }
 
 // =========================================================================

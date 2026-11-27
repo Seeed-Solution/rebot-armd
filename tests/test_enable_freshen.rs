@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use armd::auth::OperatorGrant;
-use armd::driver::{
+use armd::driver::{PosForceExt,
     gripper_drive_from_profile, ArmDriver, ArmDriverError, DamiaoArmDriver, EnableState,
 };
 use armd::protocol::damiao::{self, DamiaoLimits};

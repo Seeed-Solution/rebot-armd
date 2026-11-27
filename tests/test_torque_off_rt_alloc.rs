@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use armd::driver::{ArmDriver, DamiaoArmDriver, StoppedDisableGate};
+use armd::driver::{ArmDriver, DamiaoArmDriver, JointModeExt, ShadowExt, StoppedDisableGate};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{
     Authority, BootId, Broker, Capacities, ClientId, Outcome, Submit, TransitionOp,

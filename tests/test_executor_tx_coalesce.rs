@@ -16,7 +16,7 @@ use armd::diagnostics::tick::{
     reset_tx_metrics, take_tx_metrics, thread_usage, LockFreeTickStats, TickSample,
     TxFrameKindCounts, TxFrameKindTotals, UsageMark,
 };
-use armd::driver::{gripper_drive_from_profile, ArmDriver, DamiaoArmDriver};
+use armd::driver::{ArmDriver, BoundedTxExt, DamiaoArmDriver, gripper_drive_from_profile};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{BootId, Capacities, ClientId, DeliveryDecision, Outcome, Submit, TransitionOp};
 use armd::rt_core::ops::{CoreOps, ReleaseFixture, VirtualClock};

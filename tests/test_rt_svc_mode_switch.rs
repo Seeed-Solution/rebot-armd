@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use armd::auth::{OperatorGrant, OperatorRequirement};
 use armd::diagnostics::alloc::{snapshot_counts, time_this_thread};
-use armd::driver::{gripper_drive_from_profile, ArmDriver, DamiaoArmDriver, TxBudget};
+use armd::driver::{ArmDriver, DamiaoArmDriver, JointModeExt, ModeSwitchExt, TxBudget, gripper_drive_from_profile};
 use armd::model::ArmConfig;
 use armd::motor_mode::{
     AxisTarget, ControlMode, ModeProgress, ModeSwitch, ModeSwitchFailure, ModeSwitchIntent,

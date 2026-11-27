@@ -6,7 +6,7 @@ mod mit_support;
 
 use std::time::Duration;
 
-use armd::driver::{ArmDriver, DamiaoArmDriver, DamiaoControlMode, JointMode, JointTarget};
+use armd::driver::{JointModeExt, MitExt, ArmDriver, CommissioningExt, DamiaoArmDriver, DamiaoControlMode, JointMode, JointTarget};
 use armd::model::ArmConfig;
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::transport::{CanFrame, MockClock};

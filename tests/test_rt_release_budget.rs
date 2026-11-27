@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use armd::auth::OperatorRequirement;
-use armd::driver::{
+use armd::driver::{BoundedTxExt, JointModeExt, MitExt, PosForceExt,
     gripper_drive_from_profile, ArmDriver, DamiaoArmDriver, EnableState, TxBudget,
 };
 use armd::model::ArmConfig;

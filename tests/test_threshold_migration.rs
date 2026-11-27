@@ -131,8 +131,9 @@ impl ArmDriver for Shared {
     fn is_enabled(&self) -> bool { self.0.lock().unwrap().is_enabled() }
     fn motor_status(&self) -> Option<Vec<u8>> { self.0.lock().unwrap().motor_status() }
     fn set_torque_flag(&mut self, e: bool) { self.0.lock().unwrap().set_torque_flag(e) }
-    fn set_pending_rearm(&mut self, p: bool) { self.0.lock().unwrap().set_pending_rearm(p) }
+    armd::ext_accessors!(bus_recovery);
 }
+impl armd::driver::BusRecoveryExt for Shared { fn set_pending_rearm(&mut self, p: bool) { self.0.lock().unwrap().set_pending_rearm(p) } }
 
 struct Rig { sup: ArmSupervisor, drv: Arc<Mutex<DamiaoArmDriver<MockCanTransport>>> }
 

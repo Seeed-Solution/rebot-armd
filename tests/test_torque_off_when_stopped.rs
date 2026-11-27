@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use armd::driver::{ArmDriver, DamiaoArmDriver, EnableState};
+use armd::driver::{ArmDriver, DamiaoArmDriver, EnableState, JointModeExt, PosForceExt};
 use armd::model::{ArmConfig, DEFAULT_REST_POSE_TOLERANCE_RAD};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{
@@ -2901,12 +2901,6 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
         fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
             self.inner.fresh_measured_position_for(joint, max_age)
         }
-        fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-            self.inner.joint_hold_mode_verified(joint)
-        }
-        fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
-            self.inner.drop_pending_holds_outside_mask(hold_mask);
-        }
         fn write_measured_hold_masked(
             &mut self,
             hold_mask: u64,
@@ -3000,12 +2994,17 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
         fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
             self.inner.disable_torque(kind)
         }
-        fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
-            self.inner.set_stopped_disable_gate(gate);
+        fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) { self.inner.set_stopped_disable_gate(gate); }
+        fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.inner.set_abort_flag(flag); }
+        armd::ext_accessors!(tx, joint_mode);
+    }
+    impl armd::driver::BoundedTxExt for EnableFinishFailWrapper {
+        fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
+            self.inner.drop_pending_holds_outside_mask(hold_mask);
         }
-        fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
-            self.inner.set_abort_flag(flag);
-        }
+    }
+    impl armd::driver::JointModeExt for EnableFinishFailWrapper {
+        fn joint_hold_mode_verified(&self, joint: usize) -> bool { self.inner.joint_hold_mode_verified(joint) }
     }
 
     for fail_read_err in [true, false] {

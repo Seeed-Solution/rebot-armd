@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use armd::auth::{OperatorAuth, OperatorGrant, OperatorRequirement};
 use armd::calibration::{CalibrationDeps, CalibrationFile};
 use armd::diagnostics::alloc::AllocCounts;
-use armd::driver::{
+use armd::driver::{CommissioningExt, MitExt, ModeSwitchExt,
     gripper_drive_from_profile, ArmDriver, ArmDriverError, DamiaoArmDriver, DisableKind,
     DriverCapabilities, EnableState, JointMode, JointTarget, TxBudget,
 };
@@ -272,12 +272,6 @@ impl ArmDriver for SyncMitSimLikeDriver {
     fn supports_rt_executor(&self) -> Result<(), &'static str> {
         Ok(())
     }
-    fn supports_mit_mode_switch(&self) -> bool {
-        true
-    }
-    fn supports_nonblocking_mode_switch(&self) -> bool {
-        false
-    }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let mut out = Vec::with_capacity(7);
         self.read_joint_states_into(&mut out)?;
@@ -374,9 +368,6 @@ impl ArmDriver for SyncMitSimLikeDriver {
     fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
         out.clear();
     }
-    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
-        out.clear();
-    }
     fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
         out.clear();
         false
@@ -395,6 +386,12 @@ impl ArmDriver for SyncMitSimLikeDriver {
     fn has_hardware_fault(&self) -> bool {
         false
     }
+    armd::ext_accessors!(mode_switch, joint_mode);
+}
+impl armd::driver::ModeSwitchExt for SyncMitSimLikeDriver { fn supports_nonblocking_mode_switch(&self) -> bool { false } }
+impl armd::driver::JointModeExt for SyncMitSimLikeDriver {
+    fn supports_mit_mode_switch(&self) -> bool { true }
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { out.clear(); }
     fn set_joint_modes(
         &mut self,
         modes: &[JointMode],
@@ -5289,6 +5286,9 @@ async fn dual_owner_mit_recovery_authority_revocation_and_new_estop_abort() {
             fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> {
                 Ok(())
             }
+            armd::ext_accessors!(mit);
+        }
+        impl armd::driver::MitExt for LegacyOnlyMitRecoverDriver {
             fn mit_expiry_recover(&mut self) -> Result<(), String> {
                 self.legacy_called.store(true, Ordering::SeqCst);
                 Ok(())

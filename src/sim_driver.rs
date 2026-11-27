@@ -920,10 +920,6 @@ impl ArmDriver for SimArmDriver {
         out.clear();
     }
 
-    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
-        out.clear();
-    }
-
     fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
         out.clear();
         if self.load_only_feedback {
@@ -1286,50 +1282,20 @@ impl ArmDriver for SimArmDriver {
         self.tx_release_deadline = deadline;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
-        if self.load_only_feedback {
-            crate::torque::VendorKind::Feetech
-        } else {
-            crate::torque::VendorKind::Damiao
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn set_shadow_enabled(&mut self, enabled: bool) {
-        self.shadow_staging.set_enabled(enabled);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn drain_shadow_observations(
-        &mut self,
-        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
-    ) -> (usize, u64) {
-        self.shadow_staging.drain_into(out)
-    }
-
-    fn supports_mit_mode_switch(&self) -> bool { true }
-
-    /// The simulator switches a joint's control law with the next command, so the
-    /// switch is confirmed locally; `hold` is sent at once in the new modes.
-    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
-        if modes.len() != self.dof || hold.len() != self.dof {
-            return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: modes.len().min(hold.len()) });
-        }
-        self.estop_check()?;
-        let prev = self.modes.clone();
-        self.modes.copy_from_slice(modes);
-        if let Err(e) = self.write_joint_targets(hold) {
-            self.modes = prev;
-            return Err(e);
-        }
-        Ok(())
-    }
-
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::set_current("simulator", true, vec!["the new zero is an offset in armd's simulated encoder; it is lost when armd restarts".into()])
     }
+    fn commissioning_ext(&self) -> Option<&dyn crate::driver::CommissioningExt> { Some(self) }
+    fn commissioning_ext_mut(&mut self) -> Option<&mut dyn crate::driver::CommissioningExt> { Some(self) }
+    fn joint_mode_ext(&self) -> Option<&dyn crate::driver::JointModeExt> { Some(self) }
+    fn joint_mode_ext_mut(&mut self) -> Option<&mut dyn crate::driver::JointModeExt> { Some(self) }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_ext(&self) -> Option<&dyn crate::driver::ShadowExt> { Some(self) }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shadow_ext_mut(&mut self) -> Option<&mut dyn crate::driver::ShadowExt> { Some(self) }
+}
 
+impl crate::driver::CommissioningExt for SimArmDriver {
     fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> {
         if joint >= self.dof { return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: joint + 1 }); }
         if self.enable_requested || self.enable_state() != EnableState::Disabled {
@@ -1424,8 +1390,55 @@ impl ArmDriver for SimArmDriver {
     }
 }
 
+impl crate::driver::JointModeExt for SimArmDriver {
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
+        out.clear();
+    }
+
+    fn supports_mit_mode_switch(&self) -> bool { true }
+
+    /// The simulator switches a joint's control law with the next command, so the
+    /// switch is confirmed locally; `hold` is sent at once in the new modes.
+    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        if modes.len() != self.dof || hold.len() != self.dof {
+            return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: modes.len().min(hold.len()) });
+        }
+        self.estop_check()?;
+        let prev = self.modes.clone();
+        self.modes.copy_from_slice(modes);
+        if let Err(e) = self.write_joint_targets(hold) {
+            self.modes = prev;
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::driver::ShadowExt for SimArmDriver {
+    fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
+        if self.load_only_feedback {
+            crate::torque::VendorKind::Feetech
+        } else {
+            crate::torque::VendorKind::Damiao
+        }
+    }
+
+    fn set_shadow_enabled(&mut self, enabled: bool) {
+        self.shadow_staging.set_enabled(enabled);
+    }
+
+    fn drain_shadow_observations(
+        &mut self,
+        out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
+    ) -> (usize, u64) {
+        self.shadow_staging.drain_into(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::driver::{CommissioningExt, JointModeExt};
     use super::*;
 
     /// Fake simulator: a UDP socket the driver is connected to.

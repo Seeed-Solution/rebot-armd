@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
-use armd::driver::{
+use armd::driver::{BoundedTxExt, JointModeExt, MitExt, PosForceExt,
     is_estop_inhibited, ArmDriver, DamiaoArmDriver, JointTarget,
     TxBatchOutcome, TxBudget, DAMIAO_TX_FRAME_MAX_AGE, DAMIAO_TX_MAX_DURATION,
     DAMIAO_TX_MAX_FRAMES, DAMIAO_TX_RELEASE_PUBLISH_MARGIN,

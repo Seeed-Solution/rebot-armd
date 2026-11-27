@@ -3,7 +3,7 @@
 //! layout read on the B601-DM: `[id, 0, 0x33, rid, value LE]` on 0x10 + id.
 use std::time::{Duration, Instant};
 
-use armd::driver::{ArmDriver, DamiaoArmDriver, DamiaoControlMode, JointMode, JointTarget, RangeCheckStatus};
+use armd::driver::{JointModeExt, ArmDriver, DamiaoArmDriver, DamiaoControlMode, JointMode, JointTarget, RangeCheckStatus};
 use armd::model::{ArmConfig, DamiaoRange};
 use armd::protocol::damiao;
 use armd::transport::{CanFrame, MockCanTransport};

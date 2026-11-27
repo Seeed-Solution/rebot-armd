@@ -465,12 +465,6 @@ impl ArmDriver for PanicOnceDriver {
     fn abort_enable(&mut self) {
         self.inner.abort_enable();
     }
-    fn set_external_pos_force_emitter(&mut self, external: bool) {
-        self.inner.set_external_pos_force_emitter(external);
-    }
-    fn set_pending_pos_force_hold_hint(&mut self, active: bool) {
-        self.inner.set_pending_pos_force_hold_hint(active);
-    }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
         self.inner.set_tx_release_deadline(deadline);
     }
@@ -506,6 +500,13 @@ impl ArmDriver for PanicOnceDriver {
     fn clock_now(&self) -> Instant {
         self.inner.clock_now()
     }
+    armd::ext_accessors!(pos_force);
+}
+impl armd::driver::PosForceExt for PanicOnceDriver {
+    fn set_external_pos_force_emitter(&mut self, external: bool) {
+        self.inner.set_external_pos_force_emitter(external);
+    }
+    fn set_pending_pos_force_hold_hint(&mut self, active: bool) { self.inner.set_pending_pos_force_hold_hint(active); }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -598,8 +599,6 @@ async fn legacy_control_panic_enters_safe_hold_holds_measured_pose_and_exits_on_
             self.inner.poll_torque_budgeted(deadline, max_rx_frames)
         }
         fn abort_enable(&mut self) { self.inner.abort_enable(); }
-        fn set_external_pos_force_emitter(&mut self, external: bool) { self.inner.set_external_pos_force_emitter(external); }
-        fn set_pending_pos_force_hold_hint(&mut self, active: bool) { self.inner.set_pending_pos_force_hold_hint(active); }
         fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
         fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
         fn is_enabled(&self) -> bool { self.inner.is_enabled() }
@@ -612,6 +611,11 @@ async fn legacy_control_panic_enters_safe_hold_holds_measured_pose_and_exits_on_
             self.inner.fresh_joint_positions_into(joints, max_age, out)
         }
         fn clock_now(&self) -> Instant { self.inner.clock_now() }
+        armd::ext_accessors!(pos_force);
+    }
+    impl armd::driver::PosForceExt for SharedPanicDriver {
+        fn set_external_pos_force_emitter(&mut self, external: bool) { self.inner.set_external_pos_force_emitter(external); }
+        fn set_pending_pos_force_hold_hint(&mut self, active: bool) { self.inner.set_pending_pos_force_hold_hint(active); }
     }
     let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(SharedPanicDriver {
         inner: dm2,
@@ -1057,8 +1061,6 @@ impl ArmDriver for StallingReadDriver {
         self.inner.poll_torque_budgeted(deadline, max_rx_frames)
     }
     fn abort_enable(&mut self) { self.inner.abort_enable(); }
-    fn set_external_pos_force_emitter(&mut self, external: bool) { self.inner.set_external_pos_force_emitter(external); }
-    fn set_pending_pos_force_hold_hint(&mut self, active: bool) { self.inner.set_pending_pos_force_hold_hint(active); }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
     fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
@@ -1072,6 +1074,11 @@ impl ArmDriver for StallingReadDriver {
         self.inner.fresh_joint_positions_into(joints, max_age, out)
     }
     fn clock_now(&self) -> Instant { self.inner.clock_now() }
+    armd::ext_accessors!(pos_force);
+}
+impl armd::driver::PosForceExt for StallingReadDriver {
+    fn set_external_pos_force_emitter(&mut self, external: bool) { self.inner.set_external_pos_force_emitter(external); }
+    fn set_pending_pos_force_hold_hint(&mut self, active: bool) { self.inner.set_pending_pos_force_hold_hint(active); }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1620,9 +1627,6 @@ async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_d
         fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
             self.inner.fresh_measured_sample_for(joint, max_age)
         }
-        fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-            self.inner.joint_hold_mode_verified(joint)
-        }
         fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
         fn is_enabled(&self) -> bool { self.inner.is_enabled() }
         fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
@@ -1693,13 +1697,6 @@ async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_d
         ) -> Result<TorqueProgress, ArmDriverError> {
             self.inner.poll_torque_budgeted(deadline, max_rx_frames)
         }
-        fn panic_disable_step(
-            &mut self,
-            first: bool,
-            deadline: Instant,
-        ) -> Option<Result<Vec<usize>, ArmDriverError>> {
-            self.inner.panic_disable_step(first, deadline)
-        }
         fn unconfirmed_disable_joints(&self) -> Vec<usize> {
             self.inner.unconfirmed_disable_joints()
         }
@@ -1721,6 +1718,19 @@ async fn drv_f1_blocker1_process_exit_requires_causal_disarm_proof_and_retains_d
         fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
         fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
             self.inner.position_limits(joint)
+        }
+        armd::ext_accessors!(joint_mode, bus_recovery);
+    }
+    impl armd::driver::JointModeExt for DropWatchDamiao {
+        fn joint_hold_mode_verified(&self, joint: usize) -> bool { self.inner.joint_hold_mode_verified(joint) }
+    }
+    impl armd::driver::BusRecoveryExt for DropWatchDamiao {
+        fn panic_disable_step(
+            &mut self,
+            first: bool,
+            deadline: Instant,
+        ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+            self.inner.panic_disable_step(first, deadline)
         }
     }
 
@@ -1979,12 +1989,6 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
                 self.inner.fresh_measured_sample_for(joint, max_age)
             }
-            fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-                if joint == 3 && !self.j4_mode_verified.load(Ordering::Acquire) {
-                    return false;
-                }
-                self.inner.joint_hold_mode_verified(joint)
-            }
             fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
             fn is_enabled(&self) -> bool { self.inner.is_enabled() }
             fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
@@ -2055,13 +2059,6 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             ) -> Result<TorqueProgress, ArmDriverError> {
                 self.inner.poll_torque_budgeted(deadline, max_rx_frames)
             }
-            fn panic_disable_step(
-                &mut self,
-                first: bool,
-                deadline: Instant,
-            ) -> Option<Result<Vec<usize>, ArmDriverError>> {
-                self.inner.panic_disable_step(first, deadline)
-            }
             fn unconfirmed_disable_joints(&self) -> Vec<usize> {
                 self.inner.unconfirmed_disable_joints()
             }
@@ -2083,6 +2080,24 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
             fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
                 self.inner.position_limits(joint)
+            }
+            armd::ext_accessors!(joint_mode, bus_recovery);
+        }
+        impl armd::driver::JointModeExt for ModeToggleDriver {
+            fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+                if joint == 3 && !self.j4_mode_verified.load(Ordering::Acquire) {
+                    return false;
+                }
+                self.inner.joint_hold_mode_verified(joint)
+            }
+        }
+        impl armd::driver::BusRecoveryExt for ModeToggleDriver {
+            fn panic_disable_step(
+                &mut self,
+                first: bool,
+                deadline: Instant,
+            ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+                self.inner.panic_disable_step(first, deadline)
             }
         }
 
@@ -2171,9 +2186,6 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
                 self.inner.fresh_measured_sample_for(joint, max_age)
             }
-            fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-                self.inner.joint_hold_mode_verified(joint)
-            }
             fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
             fn is_enabled(&self) -> bool { self.inner.is_enabled() }
             fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
@@ -2244,13 +2256,6 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             ) -> Result<TorqueProgress, ArmDriverError> {
                 self.inner.poll_torque_budgeted(deadline, max_rx_frames)
             }
-            fn panic_disable_step(
-                &mut self,
-                first: bool,
-                deadline: Instant,
-            ) -> Option<Result<Vec<usize>, ArmDriverError>> {
-                self.inner.panic_disable_step(first, deadline)
-            }
             fn unconfirmed_disable_joints(&self) -> Vec<usize> {
                 self.inner.unconfirmed_disable_joints()
             }
@@ -2279,6 +2284,19 @@ async fn drv_f1_blocker2_energized_handback_rejects_stale_or_unverified_hold_cov
             fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
             fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
                 self.inner.position_limits(joint)
+            }
+            armd::ext_accessors!(joint_mode, bus_recovery);
+        }
+        impl armd::driver::JointModeExt for SlowRtModeExitDriver {
+            fn joint_hold_mode_verified(&self, joint: usize) -> bool { self.inner.joint_hold_mode_verified(joint) }
+        }
+        impl armd::driver::BusRecoveryExt for SlowRtModeExitDriver {
+            fn panic_disable_step(
+                &mut self,
+                first: bool,
+                deadline: Instant,
+            ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+                self.inner.panic_disable_step(first, deadline)
             }
         }
 
@@ -2366,9 +2384,6 @@ impl ArmDriver for DropWatchDamiaoDriver {
     fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
         self.inner.fresh_measured_sample_for(joint, max_age)
     }
-    fn joint_hold_mode_verified(&self, joint: usize) -> bool {
-        self.inner.joint_hold_mode_verified(joint)
-    }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn is_enabled(&self) -> bool { self.inner.is_enabled() }
     fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
@@ -2439,13 +2454,6 @@ impl ArmDriver for DropWatchDamiaoDriver {
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.inner.poll_torque_budgeted(deadline, max_rx_frames)
     }
-    fn panic_disable_step(
-        &mut self,
-        first: bool,
-        deadline: Instant,
-    ) -> Option<Result<Vec<usize>, ArmDriverError>> {
-        self.inner.panic_disable_step(first, deadline)
-    }
     fn unconfirmed_disable_joints(&self) -> Vec<usize> {
         self.inner.unconfirmed_disable_joints()
     }
@@ -2467,6 +2475,19 @@ impl ArmDriver for DropWatchDamiaoDriver {
     fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
         self.inner.position_limits(joint)
+    }
+    armd::ext_accessors!(joint_mode, bus_recovery);
+}
+impl armd::driver::JointModeExt for DropWatchDamiaoDriver {
+    fn joint_hold_mode_verified(&self, joint: usize) -> bool { self.inner.joint_hold_mode_verified(joint) }
+}
+impl armd::driver::BusRecoveryExt for DropWatchDamiaoDriver {
+    fn panic_disable_step(
+        &mut self,
+        first: bool,
+        deadline: Instant,
+    ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+        self.inner.panic_disable_step(first, deadline)
     }
 }
 

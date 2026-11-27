@@ -691,6 +691,9 @@ mod tests {
                 self.tx_consumed.fetch_add(2, Ordering::SeqCst);
                 Ok(())
             }
+            crate::ext_accessors!(tx, commissioning);
+        }
+        impl crate::driver::BoundedTxExt for StubBudgetDriver {
             fn sync_release_budget_limits(&mut self, rx_rem: u16, tx_rem: u16) {
                 self.last_synced_rx.store(rx_rem, Ordering::SeqCst);
                 self.last_synced_tx.store(tx_rem, Ordering::SeqCst);
@@ -701,18 +704,12 @@ mod tests {
                     self.tx_consumed.load(Ordering::SeqCst),
                 )
             }
-            fn tx_budget_max_frames(&self) -> Option<u16> {
-                Some(16)
-            }
-            fn supports_nonblocking_commissioning(&self) -> bool {
-                true
-            }
-            fn supports_nonblocking_motor_zero(&self) -> bool {
-                true
-            }
-            fn commissioning_motor_id(&self, joint: usize) -> Option<u16> {
-                Some((joint + 1) as u16)
-            }
+            fn tx_budget_max_frames(&self) -> Option<u16> { Some(16) }
+        }
+        impl crate::driver::CommissioningExt for StubBudgetDriver {
+            fn supports_nonblocking_commissioning(&self) -> bool { true }
+            fn supports_nonblocking_motor_zero(&self) -> bool { true }
+            fn commissioning_motor_id(&self, joint: usize) -> Option<u16> { Some((joint + 1) as u16) }
             fn commissioning_drain_rx_step(
                 &mut self,
                 max_frames: u16,

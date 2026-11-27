@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use armd::diagnostics::alloc::TimedAlloc;
-use armd::driver::{
+use armd::driver::{BusRecoveryExt, JointModeExt, MitExt,
     is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState,
     GripperPosForce, JointMode, JointTarget, TorqueOutcome, TorqueProgress,
 };
@@ -474,9 +474,7 @@ impl ArmDriver for DelayedWakeDriver {
             load_feedback: false,
         }
     }
-    fn enable_state(&self) -> EnableState {
-        if self.enabled { EnableState::Enabled } else { EnableState::Disabled }
-    }
+    fn enable_state(&self) -> EnableState { if self.enabled { EnableState::Enabled } else { EnableState::Disabled } }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> { Ok(self.states.clone()) }
     fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         out.clear();
@@ -548,8 +546,9 @@ impl ArmDriver for DelayedWakeDriver {
     fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { out.clear(); out.resize(self.dof, u8::from(self.enabled)); true }
     fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { out.clear(); false }
-    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { out.clear(); }
+    armd::ext_accessors!(joint_mode);
 }
+impl armd::driver::JointModeExt for DelayedWakeDriver { fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { out.clear(); } }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn position_lead_enable_completion_on_sub_release_wake_does_zero_allocs() {

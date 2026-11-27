@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use armd::api::{create_router_full, proxy::DetectorUpstream};
 use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
 use armd::diagnostics::DiagnosticsState;
-use armd::driver::{
+use armd::driver::{BoundedTxExt, BusRecoveryExt, CommissioningExt, JointModeExt, MitExt, PosForceExt,
     is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, GripperPosForce, JointMode,
     JointTarget, TxBatchOutcome, TxBudget,
 };
@@ -5052,7 +5052,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
                 1,
                 "emit_j7_tick_epilogue must have no callers outside tick_control_inner"
             );
-        } else if rel != "joint_zero.rs" {
+        } else if !["joint_zero.rs", "driver/ext.rs", "driver/bridge.rs"].contains(&rel.as_str()) {
             assert_eq!(
                 compact.matches("emit_pos_force_j7(").count(),
                 0,

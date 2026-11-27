@@ -23397,28 +23397,19 @@ mod observation_snapshot_tests {
             fn supports_rt_executor(&self) -> Result<(), &'static str> {
                 Ok(())
             }
-            fn is_feedback_valid(&self) -> bool {
-                true
-            }
-            fn is_enabled(&self) -> bool {
-                true
-            }
-            fn enable_state(&self) -> EnableState {
-                EnableState::Enabled
-            }
-            fn feedback_ages(&self) -> Vec<Option<Duration>> {
-                vec![Some(Duration::from_millis(1)); self.dof]
-            }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn is_enabled(&self) -> bool { true }
+            fn enable_state(&self) -> EnableState { EnableState::Enabled }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
             fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
                 out.clear();
                 out.resize(self.dof, Some(Duration::from_millis(1)));
             }
-            fn feedback_instants(&self) -> Vec<Option<Instant>> {
-                vec![Some(Instant::now()); self.dof]
-            }
-            fn feedback_seqs(&self) -> Vec<u64> {
-                vec![1; self.dof]
-            }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
+            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+            crate::ext_accessors!(pos_force);
+        }
+        impl crate::driver::PosForceExt for ObservableReleaseDriver {
             fn emit_pos_force_j7(
                 &mut self,
                 _intent: PosForceIntent,
@@ -23644,12 +23635,6 @@ mod observation_snapshot_tests {
             fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
                 Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
             }
-            fn set_output_lease_gen(&mut self, gen: u64) {
-                self.last_lease_gen.store(gen, Ordering::SeqCst);
-                if matches!(self.inject_at, InjectPoint::SetOutputLeaseGen) && gen != 0 {
-                    self.pending_disconnect_hold.fetch_add(1, Ordering::SeqCst);
-                }
-            }
             fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
                 self.writes.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -23673,6 +23658,15 @@ mod observation_snapshot_tests {
             fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
             fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
             fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+            crate::ext_accessors!(tx);
+        }
+        impl crate::driver::BoundedTxExt for DisconnectInjectDriver {
+            fn set_output_lease_gen(&mut self, gen: u64) {
+                self.last_lease_gen.store(gen, Ordering::SeqCst);
+                if matches!(self.inject_at, InjectPoint::SetOutputLeaseGen) && gen != 0 {
+                    self.pending_disconnect_hold.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
 
         let make_run = |phase: GravityCompPhase, lease_generation: Option<u64>| GravityCompRun {
@@ -23795,12 +23789,6 @@ mod observation_snapshot_tests {
                 fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
                     Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
                 }
-                fn set_output_lease_gen(&mut self, gen: u64) {
-                    self.last_lease_gen.store(gen, Ordering::SeqCst);
-                    if self.inject_in_setter && gen != 0 {
-                        self.estop_state.request_and_latch();
-                    }
-                }
                 fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
                     self.writes.fetch_add(1, Ordering::SeqCst);
                     Ok(())
@@ -23824,6 +23812,15 @@ mod observation_snapshot_tests {
                 fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
                 fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
                 fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+                crate::ext_accessors!(tx);
+            }
+            impl crate::driver::BoundedTxExt for EstopInjectDriver {
+                fn set_output_lease_gen(&mut self, gen: u64) {
+                    self.last_lease_gen.store(gen, Ordering::SeqCst);
+                    if self.inject_in_setter && gen != 0 {
+                        self.estop_state.request_and_latch();
+                    }
+                }
             }
 
             let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
@@ -23897,17 +23894,11 @@ mod observation_snapshot_tests {
             }
             fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
             fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
-            fn probe_tx_ready_budgeted(&mut self, _deadline: Instant) -> Result<bool, ArmDriverError> {
-                self.tx_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(true)
-            }
             fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
                 self.tx_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
             fn has_hardware_fault(&self) -> bool { self.hw_fault }
-            fn tx_probe_pending(&self) -> bool { false }
-            fn tx_probe_confirmed(&self) -> bool { !self.tx_probe_pending }
             fn is_feedback_valid(&self) -> bool { true }
             fn is_enabled(&self) -> bool { false }
             fn enable_state(&self) -> EnableState { EnableState::Disabled }
@@ -23918,6 +23909,15 @@ mod observation_snapshot_tests {
             }
             fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(self.clock.now()); self.dof] }
             fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+            crate::ext_accessors!(tx);
+        }
+        impl crate::driver::BoundedTxExt for ExpiryProbeDriver {
+            fn probe_tx_ready_budgeted(&mut self, _deadline: Instant) -> Result<bool, ArmDriverError> {
+                self.tx_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            }
+            fn tx_probe_pending(&self) -> bool { false }
+            fn tx_probe_confirmed(&self) -> bool { !self.tx_probe_pending }
         }
 
         // Test BOTH budgeted TX probe and budgeted hardware reset when owner clock reaches

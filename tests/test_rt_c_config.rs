@@ -420,14 +420,6 @@ impl ArmDriver for MinimalHwDriver {
         }
     }
 
-    fn supports_mit_mode_switch(&self) -> bool {
-        true
-    }
-
-    fn supports_nonblocking_mode_switch(&self) -> bool {
-        self.nonblocking_mode_switch
-    }
-
     fn supports_rt_executor(&self) -> Result<(), &'static str> {
         Ok(())
     }
@@ -503,7 +495,10 @@ impl ArmDriver for MinimalHwDriver {
     fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> {
         Ok(())
     }
+    armd::ext_accessors!(mode_switch, joint_mode);
 }
+impl armd::driver::ModeSwitchExt for MinimalHwDriver { fn supports_nonblocking_mode_switch(&self) -> bool { self.nonblocking_mode_switch } }
+impl armd::driver::JointModeExt for MinimalHwDriver { fn supports_mit_mode_switch(&self) -> bool { true } }
 
 // ============================================================================
 // 1. All 7 config domains + all 10 REST readers (lock-proof & zero-alloc)

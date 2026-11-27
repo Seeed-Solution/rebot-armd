@@ -3,7 +3,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use armd::driver::{ArmDriver, ArmDriverError, EnableState, JointMode, JointTarget};
+use armd::driver::{ArmDriver, ArmDriverError, EnableState, JointMode, JointModeExt, JointTarget};
 use armd::sim_driver::{parse_state, SimArmDriver, SimCommand, SimState, SimTarget};
 
 struct MockSim {

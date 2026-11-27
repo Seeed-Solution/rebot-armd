@@ -2224,9 +2224,7 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
                 })
                 .collect())
         }
-        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-            Ok(())
-        }
+        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
         fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
             self.torqued = enabled;
             if enabled {
@@ -2234,11 +2232,12 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
             }
             Ok(())
         }
+        armd::ext_accessors!(joint_mode);
+    }
+    impl armd::driver::JointModeExt for MitCapableDriver {
         fn supports_mit_mode_switch(&self) -> bool { true }
         fn set_joint_modes(&mut self, modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
-            for (i, &m) in modes.iter().enumerate().take(7) {
-                self.modes[i] = m;
-            }
+            for (i, &m) in modes.iter().enumerate().take(7) { self.modes[i] = m; }
             Ok(())
         }
     }

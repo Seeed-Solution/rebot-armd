@@ -1,7 +1,7 @@
 //! Per-joint Damiao mapping ranges. The B601-DM motors report (registers 21 / 22 / 23,
 //! read on hardware 2026-11-09) PMAX 12.5, VMAX 10, TMAX 28 on J1-J3 and PMAX 12.5,
 //! VMAX 30, TMAX 10 on J4-J7; the driver used to decode all of them with 12.5 / 30 / 18.
-use armd::driver::{ArmDriver, DamiaoArmDriver, JointMode, JointTarget};
+use armd::driver::{ArmDriver, DamiaoArmDriver, JointMode, JointModeExt, JointTarget};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::transport::{CanFrame, MockCanTransport};
 use armd::model::{ArmConfig, DamiaoRange};

@@ -28,7 +28,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use armd::api::create_router;
 use armd::auth::OperatorAuth;
-use armd::driver::{ArmDriver, DamiaoArmDriver};
+use armd::driver::{ArmDriver, BoundedTxExt, DamiaoArmDriver};
 use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks};
 use armd::supervisor::OWNER_EXECUTOR;

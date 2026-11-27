@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use armd::calibration::{self, CalibrationDeps};
-use armd::driver::{ArmDriver, ArmDriverError, JointMode, JointTarget};
+use armd::driver::{ArmDriver, ArmDriverError, JointMode, JointModeExt, JointTarget, JointZeroExt};
 use armd::joint_zero::ZeroOffsetDriver;
 use armd::kinematics as k;
 use armd::model::JointState;
@@ -38,6 +38,9 @@ impl ArmDriver for RecDriver {
         Ok(())
     }
     fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    armd::ext_accessors!(joint_mode);
+}
+impl armd::driver::JointModeExt for RecDriver {
     fn set_joint_modes(&mut self, _: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         self.0.lock().unwrap().held.push(hold.iter().map(|x| x.position).collect());
         Ok(())
