@@ -14,8 +14,10 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
 
-use armd::api::ws::refusal_log::{note_at, RefusalLog, REFUSAL_LOG_INTERVAL, REFUSAL_LOG_TARGET};
+use armd::api::ws::refusal_log::{RefusalLog, REFUSAL_LOG_INTERVAL, REFUSAL_LOG_TARGET};
 use armd::ArmConfig;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, Clone)]
 struct Line {
@@ -112,10 +114,12 @@ fn only_refusals_are_logged_and_request_id_must_be_numeric() {
 fn stopped_is_debug_everything_else_warn_and_connections_are_independent() {
     lines();
     let now = Instant::now();
-    for conn in ["connection:t-a", "connection:t-b"] {
-        note_at(conn, &reject("command_reject", "STOPPED", Some(1)), now);
-        note_at(conn, &reject("command_reject", "LEASE_LOST", Some(2)), now);
-        note_at(conn, &reject("command_reject", "LEASE_LOST", Some(3)), now + Duration::from_secs(1));
+    let mut log_a = RefusalLog::default();
+    let mut log_b = RefusalLog::default();
+    for (conn, log) in [("connection:t-a", &mut log_a), ("connection:t-b", &mut log_b)] {
+        log.note_at(conn, &reject("command_reject", "STOPPED", Some(1)), now);
+        log.note_at(conn, &reject("command_reject", "LEASE_LOST", Some(2)), now);
+        log.note_at(conn, &reject("command_reject", "LEASE_LOST", Some(3)), now + Duration::from_secs(1));
     }
     for conn in ["connection:t-a", "connection:t-b"] {
         let l = lines_for(conn);
@@ -126,14 +130,14 @@ fn stopped_is_debug_everything_else_warn_and_connections_are_independent() {
         assert_eq!(lost.level, Level::WARN);
         assert_eq!((lost.f("reply_type"), lost.f("status"), lost.f("request_id"), lost.f("suppressed")), ("command_reject", "409", "2", "0"));
     }
-    note_at("connection:t-a", &reject("command_reject", "LEASE_LOST", Some(9)), now + REFUSAL_LOG_INTERVAL);
+    log_a.note_at("connection:t-a", &reject("command_reject", "LEASE_LOST", Some(9)), now + REFUSAL_LOG_INTERVAL);
     let a = lines_for("connection:t-a");
     assert_eq!(a.last().unwrap().f("suppressed"), "1");
     assert_eq!(a.last().unwrap().f("request_id"), "9");
 }
 
 /// A refused command over a real socket: ordinary writer branch (home) and urgent branch (stop)
-/// both log, and the reply the client reads has exactly the fields it had before.
+/// both log, and the reply the client reads matches the exact expected JSON.
 #[tokio::test]
 async fn refused_commands_over_websocket_are_logged_on_the_ordinary_and_urgent_paths() {
     lines();
@@ -143,19 +147,43 @@ async fn refused_commands_over_websocket_are_logged_on_the_ordinary_and_urgent_p
     // a second client: the same code is logged again for it (state is per connection)
     let (mut ws2, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
     let urgent = common::ws_reply(&mut ws2, json!({"type":"command", "request_id":7002, "generation":0, "epoch_id":0, "path":"/api/v1/motion/stop", "body":{}}), &["command_reject", "command_ack"]).await;
-    assert_eq!(ordinary["type"], "command_reject", "{ordinary}");
-    assert_eq!(urgent["type"], "command_reject", "{urgent}");
-    for (reply, id) in [(&ordinary, 7001u64), (&urgent, 7002)] {
-        let mut keys: Vec<&str> = reply.as_object().unwrap().keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        for k in ["code", "error", "message", "request_id", "status", "type"] {
-            assert!(keys.contains(&k), "{k} missing in {reply}");
-        }
-        assert!(keys.iter().all(|k| ["code", "error", "message", "request_id", "status", "type", "epoch_id", "safety_state"].contains(k)), "no field added by the logger: {keys:?}");
-        assert_eq!(reply["request_id"], id);
-    }
+    assert_eq!(
+        ordinary,
+        json!({
+            "type": "command_reject",
+            "request_id": 7001,
+            "status": 409,
+            "code": "LEASE_LOST",
+            "error": "LEASE_LOST",
+            "message": "This connection does not own an active lease",
+            "epoch_id": 1,
+        })
+    );
+    assert_eq!(
+        urgent,
+        json!({
+            "type": "command_reject",
+            "request_id": 7002,
+            "status": 409,
+            "code": "LEASE_LOST",
+            "error": "LEASE_LOST",
+            "message": "This connection does not own an active lease",
+            "epoch_id": 1,
+        })
+    );
     let repeat = common::ws_reply(&mut ws, json!({"type":"command", "request_id":7003, "generation":0, "epoch_id":0, "path":"/api/v1/motion/home", "body":{}}), &["command_reject", "command_ack"]).await;
-    assert_eq!(repeat["code"], ordinary["code"]);
+    assert_eq!(
+        repeat,
+        json!({
+            "type": "command_reject",
+            "request_id": 7003,
+            "status": 409,
+            "code": "LEASE_LOST",
+            "error": "LEASE_LOST",
+            "message": "This connection does not own an active lease",
+            "epoch_id": 1,
+        })
+    );
     // the writer logs before it writes, so both lines exist once both replies were read
     let all = lines().lock().unwrap().clone();
     for (id, reply) in [("7001", &ordinary), ("7002", &urgent)] {
@@ -166,4 +194,93 @@ async fn refused_commands_over_websocket_are_logged_on_the_ordinary_and_urgent_p
     }
     assert!(!all.iter().any(|l| l.f("request_id") == "7003"), "a repeat of the code inside 5 s is suppressed: {all:?}");
     assert_ne!(all.iter().find(|l| l.f("request_id") == "7001").unwrap().f("connection"), all.iter().find(|l| l.f("request_id") == "7002").unwrap().f("connection"));
+}
+
+struct WriteHookGuard(String);
+impl Drop for WriteHookGuard {
+    fn drop(&mut self) {
+        armd::api::ws::set_test_ws_write_paused(&self.0, false);
+        armd::api::ws::set_test_ws_write_timeout(&self.0, None);
+    }
+}
+
+/// Force a rejected Stop through `flush_urgent_then_fatal_and_close` using the paused-writer
+/// fixture, and verify the refusal log line, refusal frame, fatal error frame, and Close order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_stop_through_fatal_drain_is_logged_before_fatal_and_close() {
+    lines();
+    let (addr, sup) = common::spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::default() }).await;
+    let (mut ws, gen) = common::controller(addr).await;
+    let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard = WriteHookGuard(conn_id.clone());
+    let ep = sup.get_observation().await.epoch_id;
+
+    armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+    ws.send(Message::Text(
+        json!({"type": "command", "request_id": 7900, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {}}).to_string().into(),
+    )).await.unwrap();
+    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    while armd::api::ws::test_ws_writer_blocked_count(&conn_id) < 1 && Instant::now() < wait_deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1, "writer must block on paused frame");
+
+    // Urgent Stop with stale generation -> command_reject queued on stop_out_rx while writer is blocked.
+    ws.send(Message::Text(
+        json!({"type": "command", "request_id": 7901, "generation": gen + 99, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}}).to_string().into(),
+    )).await.unwrap();
+    // Overflow ordinary outbound queue (64 capacity) to trigger FatalClose::outbound_queue_full().
+    for k in 0..100u64 {
+        ws.send(Message::Text(
+            json!({"type": "command", "request_id": 8000 + k, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {}}).to_string().into(),
+        )).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    armd::api::ws::set_test_ws_write_paused(&conn_id, false);
+    let mut stop_reject: Option<(usize, Value)> = None;
+    let mut fatal_idx: Option<usize> = None;
+    let mut close_idx: Option<usize> = None;
+    let mut idx = 0usize;
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                seen.push(format!("{idx}:Text({}:{})", v["type"], v["code"]));
+                if v["type"] == "command_reject" && v["request_id"] == 7901 && stop_reject.is_none() {
+                    stop_reject = Some((idx, v.clone()));
+                }
+                if v["type"] == "error" && v["code"] == "OUTBOUND_QUEUE_FULL" && fatal_idx.is_none() {
+                    fatal_idx = Some(idx);
+                }
+                idx += 1;
+            }
+            Ok(Some(Ok(Message::Close(cf)))) => {
+                seen.push(format!("{idx}:Close({cf:?})"));
+                close_idx = Some(idx);
+                break;
+            }
+            Ok(other) => {
+                seen.push(format!("{idx}:Other({other:?})"));
+                break;
+            }
+            Err(_) => {
+                seen.push("TIMEOUT".into());
+                break;
+            }
+        }
+    }
+    let (si, reject_val) = stop_reject.unwrap_or_else(|| panic!("rejected Stop must be delivered through fatal drain; seen={seen:?}"));
+    let fi = fatal_idx.unwrap_or_else(|| panic!("fatal OUTBOUND_QUEUE_FULL error frame must be delivered; seen={seen:?}"));
+    let ci = close_idx.unwrap_or_else(|| panic!("Close frame must follow fatal error frame; seen={seen:?}"));
+    assert!(si < fi && fi < ci, "expected stop_reject({si}) < fatal({fi}) < close({ci})");
+
+    let all = lines().lock().unwrap().clone();
+    let l = all.iter().find(|l| l.f("request_id") == "7901")
+        .unwrap_or_else(|| panic!("no refusal log line for drained Stop 7901: {all:?}"));
+    assert_eq!(l.f("reply_type"), "command_reject");
+    assert_eq!(l.f("code"), reject_val["code"].as_str().unwrap());
+    assert_eq!(l.f("status"), reject_val["status"].as_u64().unwrap().to_string());
 }

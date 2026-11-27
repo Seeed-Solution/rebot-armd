@@ -10,7 +10,6 @@
 //! [`REFUSAL_LOG_INTERVAL`] are counted, and the next line after the interval carries the count.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -86,43 +85,19 @@ impl RefusalLog {
             suppressed,
         })
     }
-}
-
-static REGISTRY: LazyLock<Mutex<HashMap<String, RefusalLog>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Drops the connection's state when its writer task ends.
-pub struct RefusalLogGuard(String);
-
-impl RefusalLogGuard {
-    pub fn new(connection: &str) -> Self {
-        RefusalLogGuard(connection.to_owned())
+    /// Logs `reply` for `connection` when it is a refusal and not suppressed.
+    pub fn note(&mut self, connection: &str, reply: &Value) {
+        self.note_at(connection, reply, Instant::now());
     }
-}
 
-impl Drop for RefusalLogGuard {
-    fn drop(&mut self) {
-        REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
-    }
-}
-
-/// Logs `reply` for `connection` when it is a refusal and not suppressed.
-pub fn note(connection: &str, reply: &Value) {
-    note_at(connection, reply, Instant::now());
-}
-
-#[doc(hidden)]
-pub fn note_at(connection: &str, reply: &Value, now: Instant) {
-    if reply.get("type").and_then(Value::as_str).is_none_or(|t| !t.ends_with("_reject")) {
-        return;
-    }
-    let line = REGISTRY
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(connection.to_owned())
-        .or_default()
-        .observe(now, reply);
-    if let Some(l) = line {
-        emit(connection, &l);
+    #[doc(hidden)]
+    pub fn note_at(&mut self, connection: &str, reply: &Value, now: Instant) {
+        if reply.get("type").and_then(Value::as_str).is_none_or(|t| !t.ends_with("_reject")) {
+            return;
+        }
+        if let Some(l) = self.observe(now, reply) {
+            emit(connection, &l);
+        }
     }
 }
 
