@@ -2,7 +2,9 @@
 """File-level source line limit ratchet for first-party code.
 
 Policy (Fable 5.2 review / arch-sprint-1.6.1):
-  - First-party source files: .rs, .js, .mjs, .css, .html (excluding vendor/third_party).
+  - First-party source files: .rs, .js, .mjs, .cjs, .css, .html, .py, .sh,
+    .c, .cc, .cpp, .h, .hpp, plus extensionless executable/shebang scripts under scripts/
+    (excluding vendor/third_party/generated directories).
   - 1501..=3000 physical lines: WARN (non-blocking).
   - >3000 physical lines: BLOCK unless covered by .config/source_limits_allowlist.json
     and not exceeding either the allowlist cap or the merge-base line count.
@@ -10,6 +12,7 @@ Policy (Fable 5.2 review / arch-sprint-1.6.1):
       * No new entries added.
       * No cap increases.
       * No stale entries (deleted files or files now <= 3000 lines).
+  - Fails closed if no merge-base comparison ref can be resolved (unless --no-base is passed).
 """
 
 from __future__ import annotations
@@ -24,7 +27,21 @@ from typing import Dict, List, Optional, Tuple
 
 WARN_LINES = 1500
 BLOCK_LINES = 3000
-SOURCE_EXTS = (".rs", ".js", ".mjs", ".css", ".html")
+SOURCE_EXTS = (
+    ".rs",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".css",
+    ".html",
+    ".py",
+    ".sh",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+)
 EXCLUDED_DIRS = frozenset(
     {
         "vendor",
@@ -55,11 +72,24 @@ def count_physical_lines(data: bytes) -> int:
     return len(data.splitlines())
 
 
-def is_first_party_source(rel_posix: str) -> bool:
-    if not rel_posix.endswith(SOURCE_EXTS):
+def is_excluded_path(rel_posix: str) -> bool:
+    return any(part in EXCLUDED_DIRS for part in Path(rel_posix).parts)
+
+
+def is_first_party_source(root: Path, rel_posix: str) -> bool:
+    if is_excluded_path(rel_posix):
         return False
-    parts = Path(rel_posix).parts
-    return not any(part in EXCLUDED_DIRS for part in parts)
+    if rel_posix.endswith(SOURCE_EXTS):
+        return True
+    p = Path(rel_posix)
+    if p.parts and p.parts[0] == "scripts" and "." not in p.name:
+        full = root / rel_posix
+        try:
+            with full.open("rb") as fp:
+                return fp.read(2) == b"#!"
+        except OSError:
+            return False
+    return False
 
 
 def list_candidate_files(root: Path) -> List[str]:
@@ -69,10 +99,12 @@ def list_candidate_files(root: Path) -> List[str]:
     out: List[str] = []
     for rel in sorted(raw_paths):
         rel_posix = rel.replace("\\", "/")
-        if rel_posix in seen or not is_first_party_source(rel_posix):
+        if rel_posix in seen:
             continue
         full = root / rel_posix
         if full.is_symlink() or not full.is_file():
+            continue
+        if not is_first_party_source(root, rel_posix):
             continue
         seen.add(rel_posix)
         out.append(rel_posix)
@@ -106,7 +138,7 @@ def parse_allowlist_bytes(raw: bytes, label: str) -> Tuple[int, int, Dict[str, i
     return warn, block, parsed
 
 
-def resolve_merge_base(root: Path, base_arg: Optional[str]) -> Optional[str]:
+def resolve_merge_base(root: Path, base_arg: Optional[str]) -> str:
     if base_arg is not None:
         proc = run_git(root, "merge-base", "HEAD", base_arg, check=False)
         if proc.returncode != 0:
@@ -129,7 +161,11 @@ def resolve_merge_base(root: Path, base_arg: Optional[str]) -> Optional[str]:
         proc = run_git(root, "merge-base", "HEAD", cand, check=False)
         if proc.returncode == 0:
             return proc.stdout.decode("utf-8").strip()
-    return None
+
+    raise RuntimeError(
+        "cannot resolve a merge-base comparison ref (checked GITHUB_BASE_REF, origin/main, main); "
+        "pass --base <ref> or explicitly opt out with --no-base"
+    )
 
 
 def write_allowlist(path: Path, entries: Dict[str, int]) -> None:
@@ -153,12 +189,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--base",
         default=None,
-        help="Git ref for merge-base comparison (default: GITHUB_BASE_REF or main if present)",
+        help="Git ref for merge-base comparison (default: GITHUB_BASE_REF, origin/main, or main)",
     )
     parser.add_argument(
         "--no-base",
         action="store_true",
-        help="Skip git merge-base ratchet check (still validates files against current allowlist)",
+        help="Explicitly skip git merge-base ratchet check (still validates files against current allowlist)",
     )
     parser.add_argument(
         "--update",
@@ -243,17 +279,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         except RuntimeError as exc:
             print(f"source_limits: ERROR: {exc}", file=sys.stderr)
             return 2
-        if merge_base is not None:
-            proc = run_git(root, "show", f"{merge_base}:{allowlist_rel}", check=False)
-            if proc.returncode == 0:
-                try:
-                    _, _, base_allow = parse_allowlist_bytes(proc.stdout, f"{merge_base}:{allowlist_rel}")
-                except ValueError as exc:
-                    print(f"source_limits: ERROR: {exc}", file=sys.stderr)
-                    return 2
+        proc = run_git(root, "show", f"{merge_base}:{allowlist_rel}", check=False)
+        if proc.returncode == 0:
+            try:
+                _, _, base_allow = parse_allowlist_bytes(proc.stdout, f"{merge_base}:{allowlist_rel}")
+            except ValueError as exc:
+                print(f"source_limits: ERROR: {exc}", file=sys.stderr)
+                return 2
 
     # 1. Ratchet checks on the allowlist itself.
     if base_allow is not None:
+        assert merge_base is not None
         for rel, cap in sorted(cur_allow.items()):
             if rel not in base_allow:
                 errors.append(
@@ -266,8 +302,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f"relative to merge-base {merge_base[:8]}"
                 )
     elif merge_base is not None:
-        # Bootstrap case: allowlist did not exist at merge-base yet.
-        # Still verify no newly created file or grown cap sneaks in above merge-base.
         for rel, cap in sorted(cur_allow.items()):
             base_n = git_file_lines(root, merge_base, rel)
             if base_n is None:

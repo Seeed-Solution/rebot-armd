@@ -80,8 +80,10 @@ jobs:
             python3 scripts/check_source_limits
           elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
             python3 scripts/check_source_limits --base "${{ github.event.before }}"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            python3 scripts/check_source_limits --base HEAD~1
           else
-            python3 scripts/check_source_limits --no-base
+            python3 scripts/check_source_limits --base HEAD
           fi
       - name: Tooling self-tests
         run: |

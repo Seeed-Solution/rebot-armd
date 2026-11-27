@@ -148,6 +148,24 @@ class CheckSourceLimitsTest(unittest.TestCase):
         res = self.check("--base", "main")
         self.assertEqual(res.returncode, 1)
 
+    def test_checks_cjs_py_and_extensionless_scripts(self) -> None:
+        (self.repo / "scripts").mkdir()
+        (self.repo / "scripts" / "huge.cjs").write_text(make_lines(3001), encoding="utf-8")
+        (self.repo / "scripts" / "huge.py").write_text(make_lines(3002), encoding="utf-8")
+        (self.repo / "scripts" / "tool_bin").write_text("#!/usr/bin/env python3\n" + make_lines(3001), encoding="utf-8")
+        res = self.check("--base", "main")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("OVER LIMIT: scripts/huge.cjs", res.stderr)
+        self.assertIn("OVER LIMIT: scripts/huge.py", res.stderr)
+        self.assertIn("OVER LIMIT: scripts/tool_bin", res.stderr)
+
+    def test_missing_default_base_fails_closed(self) -> None:
+        # Rename main away so neither origin/main nor main exists.
+        self.git("branch", "-m", "main", "other-base")
+        res = self.check()
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("cannot resolve a merge-base comparison ref", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
