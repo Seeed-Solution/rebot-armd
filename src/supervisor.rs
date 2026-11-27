@@ -5415,8 +5415,9 @@ impl SupervisorInner {
                     .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)
                 {
                     let f = eval.describe_failure_with_context(slot, clr, -clr, 0.0, phase, true);
+                    let cid = f.detail.constraint_id.as_deref().unwrap_or(f.limit.as_str());
                     let detail = f.detail.reason.as_deref().unwrap_or(f.limit.as_str());
-                    Some(format!("measured pose violates workspace: {detail}"))
+                    Some(format!("measured pose violates workspace ({cid}, point {}): {detail}", f.point))
                 } else {
                     None
                 }

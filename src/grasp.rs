@@ -2843,7 +2843,7 @@ pub fn table_violation(from: &Pose, to: &Pose, pts: &[Vec3], table_z: f64) -> Op
                     constraint_id: Some("table_z".into()),
                     geometry_id: Some(if point == 0 { "end_origin".into() } else { format!("end_point:{point}") }),
                     violation_phase: Some("plan".into()),
-                    reason: Some(format!("new intrusion below table clearance {bound:.3}m at z={z:.3}m")),
+                    reason: Some(format!("new intrusion below table clearance (table_z_m + 0.005 = {bound:.3} m) at z={z:.3} m")),
                 }),
             })
     })

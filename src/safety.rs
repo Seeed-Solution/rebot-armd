@@ -1094,8 +1094,8 @@ impl std::fmt::Display for WorkspaceSupportViolation {
         match self {
             Self::EvalFailed { limit, reason } =>
                 write!(f, "measured pose workspace evaluation failed ({limit}): {reason}"),
-            Self::Constraint { limit, point: _, cid, gid, depth, value, bound } => {
-                f.write_str("measured pose violates workspace: ")?;
+            Self::Constraint { limit, point, cid, gid, depth, value, bound } => {
+                write!(f, "measured pose violates workspace ({cid}, point {point}): ")?;
                 crate::chain::WorkspaceFailure::write_witness(f, crate::chain::WorkspaceWitness::Constraint {
                     cid: cid.as_str(), gid: gid.as_str(), limit: limit.as_str(),
                     value: *value, bound: *bound, prev_depth: 0.0, depth: *depth, start_outside: true, conservative_bound: false,

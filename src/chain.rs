@@ -1478,61 +1478,88 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
     }
 
-    /// Zero-allocation bounded refusal detail for ANY RT workspace refusal (box edges, floor,
-    /// reach, keep-out, self-collision, sweep budget, or invalid), preserving full 64-byte IDs.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pack_slot_refusal(&self, slot: usize, clr: f64, depth: f64) -> (u8, u8, u8, u8, [u8; 82], f64, f64) {
+        if slot >= self.self_collision_slot_start {
+            let pi = slot - self.self_collision_slot_start;
+            let (id_a, id_b) = self.ws.self_collision_pairs.get(pi).map_or(("?", "?"), |[a, b]| (a.as_str(), b.as_str()));
+            let (l1, l2, names) = WorkspaceRefusalRt::pack_names(id_a, id_b);
+            return (9, 255, l1, l2, names, self.self_collision_min_clearance + clr, self.self_collision_min_clearance);
+        }
+        if self.has_reach && slot >= self.num_geoms * self.slots_per_geom {
+            let bound = self.max_reach.unwrap_or(0.0);
+            let geom_kind = if slot == self.num_geoms * self.slots_per_geom { 0 } else { 253 };
+            return (7, geom_kind, 0, 0, [0u8; 82], bound - clr, bound);
+        }
+        let (gi, ci) = (slot / self.slots_per_geom, slot % self.slots_per_geom);
+        let (geom_kind, cap_id) = if gi == 0 { (0u8, "") }
+            else if gi < self.num_end_pts { (if self.has_cam && gi + 1 == self.num_end_pts { 254 } else { gi.min(252) as u8 }, "") }
+            else { (255u8, self.ws.link_capsules.get(gi - self.num_end_pts).map_or("?", |c| c.id.as_str())) };
+        let (tag, ko_name, value, bound) = match ci {
+            0 => (6u8, "", self.floor + clr, self.floor),
+            1 => (0, "", self.box_lo[0] + clr, self.box_lo[0]),
+            2 => (2, "", self.box_lo[1] + clr, self.box_lo[1]),
+            3 => (4, "", self.box_lo[2] + clr, self.box_lo[2]),
+            4 => (1, "", self.box_hi[0] - clr, self.box_hi[0]),
+            5 => (3, "", self.box_hi[1] - clr, self.box_hi[1]),
+            6 => (5, "", self.box_hi[2] - clr, self.box_hi[2]),
+            _ => (8, self.ws.keepout_boxes.get(ci - 7).map_or("?", |b| b.name.as_str()), depth, 0.0),
+        };
+        let (l1, l2, names) = WorkspaceRefusalRt::pack_names(cap_id, ko_name);
+        (tag, geom_kind, l1, l2, names, value, bound)
+    }
+
+    /// Zero-allocation compact (128-byte) refusal detail for ANY RT workspace refusal
+    /// (box edges, floor, reach, keep-out, self-collision, sweep budget, or invalid), preserving
+    /// full 64-byte capsule/keep-out IDs.
     #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub fn refusal_detail(&self, failure: &WorkspaceFailureRt) -> crate::rt_core::mailbox::RefusalDetail {
-        use crate::safety::BoundedText;
-        use core::fmt::Write as _;
         let payload = match failure.kind {
             WorkspaceFailureKindRt::Constraint { slot, clr, depth, min_d, start_outside, conservative_bound } => {
-                let (_, cid, limit, gid, _, value, bound) = self.slot_meta_bounded(slot, clr, depth);
+                let (constraint_tag, geom_kind, name1_len, name2_len, names, value, bound) =
+                    self.pack_slot_refusal(slot, clr, depth);
                 WorkspaceRefusalRt {
-                    kind: u8::from(conservative_bound),
-                    cid, gid, limit_or_reason: limit,
                     value_bits: value.to_bits(), bound_bits: bound.to_bits(),
                     prev_depth_bits: min_d.max(0.0).to_bits(), depth_bits: depth.max(0.0).to_bits(),
-                    max_budget: 0, start_outside,
+                    max_budget: 0, kind: u8::from(conservative_bound), constraint_tag, geom_kind,
+                    start_outside, name1_len, name2_len, names,
                 }
             }
             WorkspaceFailureKindRt::BudgetExceeded { max_budget, slot, start_outside } => {
-                let (cid, gid) = match slot {
-                    Some(s) => { let (_, c, _, g, _, _, _) = self.slot_meta_bounded(s, 0.0, 0.0); (c, g) }
-                    None => (BoundedText::empty(), BoundedText::new("end_origin")),
+                let (constraint_tag, geom_kind, name1_len, name2_len, names) = match slot {
+                    Some(s) => { let (t, g, l1, l2, n, _, _) = self.pack_slot_refusal(s, 0.0, 0.0); (t, g, l1, l2, n) }
+                    None => (255, 0, 0, 0, [0u8; 82]),
                 };
                 WorkspaceRefusalRt {
-                    kind: 2, cid, gid, limit_or_reason: BoundedText::empty(),
                     value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
-                    max_budget: max_budget.min(u32::MAX as usize) as u32, start_outside,
+                    max_budget: max_budget.min(u32::MAX as usize) as u32, kind: 2, constraint_tag, geom_kind,
+                    start_outside, name1_len, name2_len, names,
                 }
             }
-            WorkspaceFailureKindRt::Invalid(msg) => WorkspaceRefusalRt {
-                kind: 3, cid: BoundedText::new("invalid"), gid: BoundedText::new("end_origin"),
-                limit_or_reason: BoundedText::new(msg),
-                value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0, max_budget: 0, start_outside: false,
-            },
+            WorkspaceFailureKindRt::Invalid(msg) => {
+                let (name1_len, name2_len, names) = WorkspaceRefusalRt::pack_names(msg, "");
+                WorkspaceRefusalRt {
+                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
+                    max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 0,
+                    start_outside: false, name1_len, name2_len, names,
+                }
+            }
             WorkspaceFailureKindRt::UnknownCapsule(ci) => {
-                let (id, fr) = self.ws.link_capsules.get(ci).map_or(("?", "?"), |c| (c.id.as_str(), c.frame.as_str()));
-                let (mut gid, mut reason) = (BoundedText::empty(), BoundedText::empty());
-                let _ = write!(&mut gid, "capsule:{id}");
-                let _ = write!(&mut reason, "unknown frame '{fr}' for capsule '{id}'");
+                let id = self.ws.link_capsules.get(ci).map_or("?", |c| c.id.as_str());
+                let (name1_len, name2_len, names) = WorkspaceRefusalRt::pack_names(id, "unknown capsule frame");
                 WorkspaceRefusalRt {
-                    kind: 3, cid: BoundedText::new("invalid"), gid, limit_or_reason: reason,
-                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0, max_budget: 0, start_outside: false,
+                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
+                    max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 255,
+                    start_outside: false, name1_len, name2_len, names,
                 }
             }
-            WorkspaceFailureKindRt::InvalidSelfPair(pi) => {
-                let mut reason = BoundedText::empty();
-                if let Some([a, b]) = self.ws.self_collision_pairs.get(pi) {
-                    let _ = write!(&mut reason, "unknown or invalid self_collision pair ['{a}', '{b}']");
-                } else {
-                    reason.push_str("invalid self-collision pair");
-                }
+            WorkspaceFailureKindRt::InvalidSelfPair(_) => {
+                let (name1_len, name2_len, names) = WorkspaceRefusalRt::pack_names("invalid self-collision pair", "");
                 WorkspaceRefusalRt {
-                    kind: 3, cid: BoundedText::new("invalid"), gid: BoundedText::new("end_origin"),
-                    limit_or_reason: reason,
-                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0, max_budget: 0, start_outside: false,
+                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
+                    max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 0,
+                    start_outside: false, name1_len, name2_len, names,
                 }
             }
         };

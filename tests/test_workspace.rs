@@ -1919,20 +1919,18 @@ fn workspace_box_edge_messages_all_six_faces_and_geometries() {
 
     // RT mailbox preserves full 64-byte capsule IDs, non-box constraints (max_reach), and sub-mm precision.
     let long_id = "c".repeat(64);
+    let mut names = [0u8; 82];
+    names[..64].copy_from_slice(long_id.as_bytes());
     let r_box = armd::chain::WorkspaceRefusalRt {
-        kind: 0, cid: armd::safety::BoundedText::new("box_max_x"), gid: armd::safety::BoundedText::new(&format!("capsule:{long_id}")),
-        limit_or_reason: armd::safety::BoundedText::new("box_x_max"),
         value_bits: 0.60096_f64.to_bits(), bound_bits: 0.600_f64.to_bits(), prev_depth_bits: 0.0_f64.to_bits(), depth_bits: 0.00096_f64.to_bits(),
-        max_budget: 0, start_outside: false,
+        max_budget: 0, kind: 0, constraint_tag: 1, geom_kind: 255, start_outside: false, name1_len: 64, name2_len: 0, names,
     };
     let (cid, gid, reason) = armd::chain::decode_workspace_refusal(&r_box);
     assert_eq!((cid.as_str(), gid.as_str()), ("box_max_x", format!("capsule:{long_id}").as_str()));
     assert_eq!(reason, format!("arm (capsule:{long_id}) is 1.0 mm beyond the workspace front edge (box_max_x 0.6010 m, limit 0.6000 m; previous depth 0.000 m, new depth 1.0 mm); move back or press Home"));
     let r_reach = armd::chain::WorkspaceRefusalRt {
-        kind: 0, cid: armd::safety::BoundedText::new("max_reach"), gid: armd::safety::BoundedText::new("end_origin"),
-        limit_or_reason: armd::safety::BoundedText::new("reach"),
         value_bits: 0.685_f64.to_bits(), bound_bits: 0.520_f64.to_bits(), prev_depth_bits: 0.164_f64.to_bits(), depth_bits: 0.165_f64.to_bits(),
-        max_budget: 0, start_outside: true,
+        max_budget: 0, kind: 0, constraint_tag: 7, geom_kind: 0, start_outside: true, name1_len: 0, name2_len: 0, names: [0u8; 82],
     };
     let (rcid, rgid, rrsn) = armd::chain::decode_workspace_refusal(&r_reach);
     assert_eq!((rcid.as_str(), rgid.as_str()), ("max_reach", "end_origin"));

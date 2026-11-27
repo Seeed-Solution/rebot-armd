@@ -3,7 +3,6 @@
 
 use crate::chain::WorkspaceFailure;
 use crate::kinematics as k;
-use crate::safety::BoundedText;
 
 /// Single witness rendered by [`WorkspaceFailure::write_witness`].
 #[derive(Debug, Clone, Copy)]
@@ -20,21 +19,50 @@ pub enum WorkspaceWitness<'a> {
     Invalid { reason: &'a str },
 }
 
-/// Zero-allocation, `Copy` workspace refusal payload carried across the RT mailbox for EVERY
-/// constraint kind (full 64-byte capsule/keep-out IDs, no truncation) and rendered off-RT by
-/// [`WorkspaceFailure::write_witness`].
+/// Zero-allocation, compact (128-byte) `Copy` workspace refusal payload carried across the RT
+/// mailbox for EVERY constraint kind (preserving full 64-byte capsule/keep-out IDs) and rendered
+/// off-RT by [`WorkspaceFailure::write_witness`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceRefusalRt {
-    pub kind: u8, // 0=Constraint, 1=ConservativeBound, 2=SweepBudget, 3=Invalid
-    pub cid: BoundedText<160>,
-    pub gid: BoundedText<80>,
-    pub limit_or_reason: BoundedText<160>,
     pub value_bits: u64,
     pub bound_bits: u64,
     pub prev_depth_bits: u64,
     pub depth_bits: u64,
     pub max_budget: u32,
+    /// 0=Constraint, 1=ConservativeBound, 2=SweepBudget, 3=Invalid
+    pub kind: u8,
+    /// 0..=5=box_{min,max}_{x,y,z}, 6=floor_z, 7=max_reach, 8=keepout, 9=self_collision, 255=none
+    pub constraint_tag: u8,
+    /// 0=end_origin, 1..=252=end_point:N, 253=tcp_origin, 254=camera_mount, 255=capsule
+    pub geom_kind: u8,
     pub start_outside: bool,
+    pub name1_len: u8,
+    pub name2_len: u8,
+    /// Packed UTF-8 bytes: `name1` (`0..name1_len`, e.g. capsule id or invalid reason) followed by
+    /// `name2` (`name1_len..name1_len+name2_len`, e.g. keep-out name or 2nd self-collision capsule).
+    pub names: [u8; 82],
+}
+
+impl WorkspaceRefusalRt {
+    pub(crate) fn pack_names(n1: &str, n2: &str) -> (u8, u8, [u8; 82]) {
+        let mut buf = [0u8; 82];
+        let mut l1 = n1.len().min(buf.len());
+        while l1 > 0 && !n1.is_char_boundary(l1) { l1 -= 1; }
+        buf[..l1].copy_from_slice(&n1.as_bytes()[..l1]);
+        let rem = buf.len() - l1;
+        let mut l2 = n2.len().min(rem);
+        while l2 > 0 && !n2.is_char_boundary(l2) { l2 -= 1; }
+        buf[l1..l1 + l2].copy_from_slice(&n2.as_bytes()[..l2]);
+        (l1 as u8, l2 as u8, buf)
+    }
+
+    pub(crate) fn unpack_names(&self) -> (&str, &str) {
+        let l1 = usize::from(self.name1_len).min(self.names.len());
+        let l2 = usize::from(self.name2_len).min(self.names.len().saturating_sub(l1));
+        let n1 = core::str::from_utf8(&self.names[..l1]).unwrap_or("?");
+        let n2 = core::str::from_utf8(&self.names[l1..l1 + l2]).unwrap_or("?");
+        (n1, n2)
+    }
 }
 
 pub(crate) fn box_edge_info(cid: &str) -> Option<(&'static str, &'static str)> {
@@ -185,33 +213,50 @@ impl WorkspaceFailure {
 /// Decodes a zero-alloc [`WorkspaceRefusalRt`] mailbox payload off the RT thread into
 /// `(constraint_id, geometry_id, reason)` using [`WorkspaceFailure::write_witness`].
 pub fn decode_workspace_refusal(r: &WorkspaceRefusalRt) -> (String, String, String) {
+    let (n1, n2) = r.unpack_names();
+    let gid = match r.geom_kind {
+        0 => "end_origin".to_string(),
+        253 => "tcp_origin".to_string(),
+        254 => "camera_mount".to_string(),
+        255 => format!("capsule:{n1}"),
+        n => format!("end_point:{n}"),
+    };
+    let (cid, limit, keepout_name): (String, String, Option<&str>) = match r.constraint_tag {
+        0 => ("box_min_x".into(), "box_x_min".into(), None),
+        1 => ("box_max_x".into(), "box_x_max".into(), None),
+        2 => ("box_min_y".into(), "box_y_min".into(), None),
+        3 => ("box_max_y".into(), "box_y_max".into(), None),
+        4 => ("box_min_z".into(), "box_z_min".into(), None),
+        5 => ("box_max_z".into(), "box_z_max".into(), None),
+        6 => ("floor_z".into(), "floor".into(), None),
+        7 => ("max_reach".into(), "reach".into(), None),
+        8 => (format!("keepout:{n2}"), format!("keepout '{n2}'"), Some(n2)),
+        9 => (format!("self_collision:{n1}:{n2}"), format!("self_collision '{n1}' vs '{n2}'"), None),
+        _ => (String::new(), String::new(), None),
+    };
     let mut reason = String::new();
     match r.kind {
         0 | 1 => {
-            let cid = r.cid.as_str();
-            let gid = r.gid.as_str();
             WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::Constraint {
-                cid, gid, limit: r.limit_or_reason.as_str(),
+                cid: &cid, gid: &gid, limit: &limit,
                 value: f64::from_bits(r.value_bits), bound: f64::from_bits(r.bound_bits),
                 prev_depth: f64::from_bits(r.prev_depth_bits), depth: f64::from_bits(r.depth_bits),
                 start_outside: r.start_outside, conservative_bound: r.kind == 1,
             });
-            (cid.to_string(), gid.to_string(), reason)
+            (cid, gid, reason)
         }
         2 => {
-            let b_cid = (!r.cid.as_str().is_empty()).then_some(r.cid.as_str());
-            let gid = if r.gid.as_str().is_empty() { "end_origin" } else { r.gid.as_str() };
-            let ko = b_cid.and_then(|c| c.strip_prefix("keepout:"));
+            let b_cid = (!cid.is_empty()).then_some(cid.as_str());
             WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::SweepBudget {
-                max_budget: r.max_budget as usize, blocking_cid: b_cid, blocking_gid: b_cid.map(|_| gid),
-                keepout_name: ko, start_outside: r.start_outside,
+                max_budget: r.max_budget as usize, blocking_cid: b_cid, blocking_gid: b_cid.map(|_| gid.as_str()),
+                keepout_name, start_outside: r.start_outside,
             });
-            ("sweep_budget".into(), gid.into(), reason)
+            ("sweep_budget".into(), gid, reason)
         }
         _ => {
-            let gid = if r.gid.as_str().is_empty() { "end_origin" } else { r.gid.as_str() };
-            WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::Invalid { reason: r.limit_or_reason.as_str() });
-            ("invalid".into(), gid.into(), reason)
+            let msg = if r.geom_kind == 255 { n2 } else { n1 };
+            WorkspaceFailure::write_witness(&mut reason, WorkspaceWitness::Invalid { reason: msg });
+            ("invalid".into(), gid, reason)
         }
     }
 }
