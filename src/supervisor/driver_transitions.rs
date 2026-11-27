@@ -274,7 +274,7 @@ pub(crate) fn bounded_panic_disable_driver_until(
         };
         let drv_deadline = drv_now + step_budget;
         let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drv.panic_disable_step(first_step, drv_deadline)
+            drv.bus_recovery_mut().panic_disable_step(first_step, drv_deadline)
         }));
         match step_res {
             Err(_) => return PanicDisableOutcome::Failed("driver panicked during panic_disable_step".into()),
@@ -2146,7 +2146,7 @@ impl SupervisorInner {
                         }
                         // Frame 1 already dispatched (`torque_intent = Off`): complete remaining
                         // bounded disable repeats without re-sending repeat 1 or starving holds.
-                        if let Err(e) = drv.finish_dispatched_disable() {
+                        if let Err(e) = drv.bus_recovery_mut().finish_dispatched_disable() {
                             let refused = matches!(
                                 e,
                                 crate::driver::ArmDriverError::TorqueOffWouldDrop
@@ -2862,12 +2862,12 @@ impl SupervisorInner {
         let shadow_rt = &mut self.torque_shadow;
         let write_result = match self.driver.as_mut() {
             Some(d) => match d.try_with_mut(|drv| {
-                drv.set_mit_ownership_lost(mit_lost);
+                drv.mit_mut().set_mit_ownership_lost(mit_lost);
                 let dispatched_mask = drv.disable_dispatched_mask();
                 let effective_hold_mask = hold_mask & !dispatched_mask;
                 let effective_keep_mask = keep_queued_mask & !dispatched_mask;
                 drv.tx_mut().drop_pending_holds_outside_mask(effective_keep_mask);
-                drv.set_pending_pos_force_hold_hint(true);
+                drv.pos_force_mut().set_pending_pos_force_hold_hint(true);
                 let r = drv.write_measured_hold_masked(effective_hold_mask, &targets);
                 let now = drv.clock_now();
                 let max_age = drv.tx().tx_frame_max_age();
@@ -2876,7 +2876,7 @@ impl SupervisorInner {
                 let sent_any_fallback = drv.tx().last_hold_tx_sent_any();
                 let due_mask = drv.tx().last_hold_tx_due_mask();
                 let sent_mask = drv.tx().last_hold_tx_sent_mask();
-                let pf_status = drv.take_last_pos_force_tx_status();
+                let pf_status = drv.pos_force_mut().take_last_pos_force_tx_status();
                 let has_pending_holds = drv.tx().pending_tx_len_total() > 0;
                 #[cfg(not(target_arch = "wasm32"))]
                 shadow_rt.drain_from_driver(drv);
@@ -4110,7 +4110,7 @@ impl SupervisorInner {
             let d = self.driver.as_mut().expect("checked is_some");
             let run_start = |drv: &mut dyn crate::driver::ArmDriver| {
                 if *pending_bus_loss_notify {
-                    drv.notify_bus_loss();
+                    drv.bus_recovery_mut().notify_bus_loss();
                     *pending_bus_loss_notify = false;
                 }
                 let enable_fb = drv.capabilities().enable_feedback;
@@ -9100,7 +9100,7 @@ impl SupervisorInner {
                 ctx.feedback_fresh = self.feedback_numeric_valid
                     && drv.is_feedback_valid()
                     && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
-                ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                ctx.j7_feedback_fresh = drv.pos_force().pos_force_feedback_fresh();
                 ctx.tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
                 ctx.tx_probe_confirmed = drv.tx().tx_probe_confirmed();
                 ctx.tx_probe_sent = drv.tx().tx_probe_pending();
@@ -9300,7 +9300,7 @@ impl SupervisorInner {
             // Do NOT acknowledge the MIT fence trip or mutate supervisor state before the full
             // `clear_check` passes: `mit_fresh_status()` enforces the quiet period directly while
             // leaving `mit_fence_acked == false` so autonomous CAN refreshes remain inhibited.
-            let fresh = match self.driver.as_mut().and_then(|d| d.with_mut(|drv| drv.mit_fresh_status())) {
+            let fresh = match self.driver.as_mut().and_then(|d| d.with_mut(|drv| drv.mit_mut().mit_fresh_status())) {
                 Some(r) => r,
                 None => Err("no driver".into()),
             };
@@ -9327,7 +9327,7 @@ impl SupervisorInner {
                             && ages.len() == dof
                             && ages.iter().all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                             && Self::states_valid(&states, caps, dof, loads.as_deref());
-                        let j7_fb_fresh = drv.pos_force_feedback_fresh();
+                        let j7_fb_fresh = drv.pos_force().pos_force_feedback_fresh();
                         let threshold = max_temp - THERMAL_CLEAR_MARGIN_C;
                         let thermal_below = fb_fresh
                             && caps.temperature_feedback
@@ -9497,7 +9497,7 @@ impl SupervisorInner {
                 let disabling = drv.clear_fault_disables_joints();
                 let hw_fault = drv.check_hardware_status().is_err();
                 let fb_valid = drv.is_feedback_valid();
-                let j7_fb_fresh = drv.pos_force_feedback_fresh();
+                let j7_fb_fresh = drv.pos_force().pos_force_feedback_fresh();
                 let tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
                 let tx_probe_confirmed = drv.tx().tx_probe_confirmed();
                 let tx_probe_sent = drv.tx().tx_probe_pending();
@@ -9624,7 +9624,7 @@ impl SupervisorInner {
                             drv.tx().tx_probe_pending(),
                             drv.check_hardware_status().is_err(),
                             drv.is_feedback_valid(),
-                            drv.pos_force_feedback_fresh(),
+                            drv.pos_force().pos_force_feedback_fresh(),
                             drv.feedback_ages(),
                         ))
                     })
@@ -9685,7 +9685,7 @@ impl SupervisorInner {
                                     return ResetAttempt::StoppedTorqueOff(r);
                                 }
                             }
-                            ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                            ctx.j7_feedback_fresh = drv.pos_force().pos_force_feedback_fresh();
                             ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
                             ctx.pending_estop = owner.estop_request_unapplied();
                             if let Err(refusal) = owner.safety.clear_check(&ctx) {
@@ -9867,7 +9867,7 @@ impl SupervisorInner {
             }
             final_ctx.pending_estop = self.estop_request_unapplied();
             if self.safety.has_latched_fault_kind(FaultKind::J7FeedbackStale) {
-                final_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                final_ctx.j7_feedback_fresh = drv.pos_force().pos_force_feedback_fresh();
                 final_ctx.feedback_fresh = final_ctx.feedback_fresh && drv.is_feedback_valid();
             }
             if let Err(refusal) = self.safety.clear_check(&final_ctx) {
@@ -10036,9 +10036,9 @@ impl SupervisorInner {
             self.mit.recovery_confirmed = false;
             if let Some(ref mut d) = self.driver {
                 if self.rt_executor_owned {
-                    let _ = d.try_with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                    let _ = d.try_with_mut(|drv| drv.mit_mut().acknowledge_mit_fence_trip());
                 } else {
-                    let _ = d.with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                    let _ = d.with_mut(|drv| drv.mit_mut().acknowledge_mit_fence_trip());
                 }
             }
         }
@@ -10494,7 +10494,7 @@ impl SupervisorInner {
                     && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
                 let caps = drv.capabilities();
                 pre_ctx.feedback_fresh = ages_valid && drv.is_feedback_valid();
-                pre_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                pre_ctx.j7_feedback_fresh = drv.pos_force().pos_force_feedback_fresh();
                 pre_ctx.thermal_sensor_available = caps.temperature_feedback;
                 let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
                 let thermal_below = pre_ctx.feedback_fresh
@@ -10585,24 +10585,24 @@ impl SupervisorInner {
             let mut mit_tx_delta = 0u16;
             let rec_step_opt = self.with_driver_and_owner_ref(|owner, drv| {
                 if is_new_attempt {
-                    drv.mit_expiry_recover_reset();
+                    drv.mit_mut().mit_expiry_recover_reset();
                 }
                 if let Some(auth) = authority {
                     if let Err(auth_err) =
                         recheck_clear_fault_authority_readonly(owner, auth, now_fn())
                     {
-                        drv.mit_expiry_recover_reset();
+                        drv.mit_mut().mit_expiry_recover_reset();
                         return MitRecStep::Authority(auth_err);
                     }
                 }
                 if let Err(refusal) =
                     Self::check_stopped_torque_off_with_driver(&owner.config, &*drv)
                 {
-                    drv.mit_expiry_recover_reset();
+                    drv.mit_mut().mit_expiry_recover_reset();
                     return MitRecStep::TorqueOffWouldDrop(refusal);
                 }
                 if let Err((max_frames, required)) = drv.tx().check_watchdog_tx_budget_for_energized() {
-                    drv.mit_expiry_recover_reset();
+                    drv.mit_mut().mit_expiry_recover_reset();
                     return MitRecStep::WatchdogBudgetInsufficient {
                         max_frames: max_frames.min(u16::MAX as usize) as u16,
                         required: required.min(u16::MAX as usize) as u16,
@@ -10642,7 +10642,7 @@ impl SupervisorInner {
                     drv.tx_mut().sync_release_budget_limits(rx_rem, tx_rem);
                 }
                 drv.set_tx_release_deadline(Some(drv_deadline));
-                let r = drv.mit_expiry_recover_budgeted(
+                let r = drv.mit_mut().mit_expiry_recover_budgeted(
                     drv_deadline,
                     drv_started_at,
                     &mut pre_tx_gate,
@@ -10652,25 +10652,25 @@ impl SupervisorInner {
                 mit_rx_delta = after_budget.0.saturating_sub(before_budget.0);
                 mit_tx_delta = after_budget.1.saturating_sub(before_budget.1);
                 if let Some(auth_err) = auth_abort {
-                    drv.mit_expiry_recover_reset();
+                    drv.mit_mut().mit_expiry_recover_reset();
                     return MitRecStep::Authority(auth_err);
                 }
                 if estop_abort {
-                    drv.mit_expiry_recover_reset();
+                    drv.mit_mut().mit_expiry_recover_reset();
                     return MitRecStep::Refusal(R::EStopActive);
                 }
                 match r {
                     Ok(true) => {
-                        drv.mit_expiry_recover_reset();
+                        drv.mit_mut().mit_expiry_recover_reset();
                         MitRecStep::Done
                     }
                     Ok(false) => MitRecStep::Pending,
                     Err(crate::driver::ArmDriverError::DisableRequestExpired) => {
-                        drv.mit_expiry_recover_reset();
+                        drv.mit_mut().mit_expiry_recover_reset();
                         MitRecStep::Refusal(R::BudgetExpired)
                     }
                     Err(crate::driver::ArmDriverError::TorqueOffWouldDrop) => {
-                        drv.mit_expiry_recover_reset();
+                        drv.mit_mut().mit_expiry_recover_reset();
                         let ref_err = Self::check_stopped_torque_off_with_driver(
                             &owner.config,
                             &*drv,
@@ -10685,20 +10685,20 @@ impl SupervisorInner {
                         max_frames,
                         required,
                     }) => {
-                        drv.mit_expiry_recover_reset();
+                        drv.mit_mut().mit_expiry_recover_reset();
                         MitRecStep::WatchdogBudgetInsufficient {
                             max_frames: max_frames.min(u16::MAX as usize) as u16,
                             required: required.min(u16::MAX as usize) as u16,
                         }
                     }
                     Err(crate::driver::ArmDriverError::WatchdogContinuityMissed { joint }) => {
-                        drv.mit_expiry_recover_reset();
+                        drv.mit_mut().mit_expiry_recover_reset();
                         MitRecStep::WatchdogContinuityMissed {
                             joint: joint.min(u8::MAX as usize) as u8,
                         }
                     }
                     Err(e) if crate::driver::is_estop_inhibited(&e) => {
-                        drv.mit_expiry_recover_reset();
+                        drv.mit_mut().mit_expiry_recover_reset();
                         MitRecStep::Refusal(R::EStopActive)
                     }
                     Err(_) => MitRecStep::Pending,
@@ -10818,7 +10818,7 @@ impl SupervisorInner {
                         .all(|s| s.position.is_finite() && (!caps.temperature_feedback || s.temperature.is_finite()));
                 let fb_fresh = ages_valid && drv.is_feedback_valid() && (!cached_ok || states_finite);
                 post_ctx.feedback_fresh = fb_fresh;
-                post_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                post_ctx.j7_feedback_fresh = drv.pos_force().pos_force_feedback_fresh();
                 post_ctx.thermal_sensor_available = caps.temperature_feedback;
                 post_ctx.enable_state_known = true;
                 post_ctx.hardware_reset_required = drv.has_hardware_fault();
@@ -10914,7 +10914,7 @@ impl SupervisorInner {
                 self.mit.revoke_pending = false;
                 self.mit.recovery_confirmed = false;
                 if let Some(d) = self.driver.as_mut() {
-                    let _ = d.try_with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                    let _ = d.try_with_mut(|drv| drv.mit_mut().acknowledge_mit_fence_trip());
                 }
                 let _ = self.safety.clear_with_check(&post_ctx);
                 self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
@@ -10941,7 +10941,7 @@ impl SupervisorInner {
                     this.mit.revoke_pending = false;
                     this.mit.recovery_confirmed = false;
                     if let Some(d) = this.driver.as_mut() {
-                        let _ = d.try_with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                        let _ = d.try_with_mut(|drv| drv.mit_mut().acknowledge_mit_fence_trip());
                     }
                 },
             )?;
@@ -11013,7 +11013,7 @@ impl SupervisorInner {
             let ages_valid = scratch_ages.len() == self.config.dof
                 && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
             let fb_valid = drv.is_feedback_valid();
-            let j7_fb_fresh = drv.pos_force_feedback_fresh();
+            let j7_fb_fresh = drv.pos_force().pos_force_feedback_fresh();
             let tx_queue_drained = drv.tx().pending_tx_len_total() == 0;
             let tx_probe_confirmed = drv.tx().tx_probe_confirmed();
             let tx_probe_sent = drv.tx().tx_probe_pending();
@@ -11148,7 +11148,7 @@ impl SupervisorInner {
                         drv.tx().tx_probe_pending(),
                         drv.has_hardware_fault(),
                         drv.is_feedback_valid(),
-                        drv.pos_force_feedback_fresh(),
+                        drv.pos_force().pos_force_feedback_fresh(),
                         ages_ok,
                     ))
                 });
@@ -11232,7 +11232,7 @@ impl SupervisorInner {
                                     return BudgetedResetAttempt::StoppedTorqueOff(refusal);
                                 }
                             }
-                            ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                            ctx.j7_feedback_fresh = drv.pos_force().pos_force_feedback_fresh();
                             ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
                             ctx.pending_estop = owner.estop_request_unapplied();
                             if let Err(refusal) = owner.safety.clear_check(&ctx) {
@@ -11563,7 +11563,7 @@ impl SupervisorInner {
 
                 // 1. Drain any queued RX backlog FIRST so newer off-rest or enabled-motor frames
                 //    are never missed by the rest-pose or disarm interlocks.
-                if let Err(e) = drv.drain_rx_only_bounded(drv_deadline) {
+                if let Err(e) = drv.bus_recovery_mut().drain_rx_only_bounded(drv_deadline) {
                     if deadline.is_some() {
                         drv.set_tx_release_deadline(None);
                     }
@@ -11657,7 +11657,7 @@ impl SupervisorInner {
                     }
                     Ok(())
                 };
-                let outcome = drv.clear_carried_over_motor_errors(drv_deadline, &mut pre_tx_gate);
+                let outcome = drv.bus_recovery_mut().clear_carried_over_motor_errors(drv_deadline, &mut pre_tx_gate);
                 if deadline.is_some() {
                     drv.set_tx_release_deadline(None);
                 }

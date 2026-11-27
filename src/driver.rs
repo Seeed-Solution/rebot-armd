@@ -17,7 +17,6 @@ use crate::transport::{
 };
 
 pub mod ext;
-mod bridge;
 pub mod handshake;
 pub use handshake::{TorqueOutcome, TorqueProgress};
 pub use ext::{

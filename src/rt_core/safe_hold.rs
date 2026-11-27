@@ -694,7 +694,7 @@ impl SafeHoldBuffers {
             // Acknowledge any pending external E-stop/stop generations while keeping LATCH_BIT set
             // so `EstopGate::pending()` never suppresses SAFE-HOLD measured-position hold frames.
             self.acknowledge_stops_for_safe_hold();
-            drv.set_pending_pos_force_hold_hint(true);
+            drv.pos_force_mut().set_pending_pos_force_hold_hint(true);
             let hold_res = drv.write_measured_hold_masked(hold_mask, &self.hold_targets[..dof]);
             hold_tx_failed = hold_res.is_err();
             if let Ok(report) = hold_res {

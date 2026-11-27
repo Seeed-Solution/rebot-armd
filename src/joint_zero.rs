@@ -812,25 +812,25 @@ impl crate::driver::JointModeExt for ZeroOffsetDriver {
 }
 
 impl crate::driver::MitExt for ZeroOffsetDriver {
-    fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
-    fn set_mit_ownership_lost(&mut self, lost: bool) { self.inner.set_mit_ownership_lost(lost) }
+    fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.mit_mut().set_mit_deadline_fence(deadline, holdoff) }
+    fn set_mit_ownership_lost(&mut self, lost: bool) { self.inner.mit_mut().set_mit_ownership_lost(lost) }
     fn mit_fence_trip_bounded(
         &self,
     ) -> Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>> {
-        self.inner.mit_fence_trip_bounded()
+        self.inner.mit().mit_fence_trip_bounded()
     }
-    fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
+    fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_mut().mit_expiry_recover() }
     fn mit_expiry_recover_with_gate(
         &mut self,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<(), String> {
-        self.inner.mit_expiry_recover_with_gate(pre_tx_gate)
+        self.inner.mit_mut().mit_expiry_recover_with_gate(pre_tx_gate)
     }
-    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
-    fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
-    fn mit_feedback_after_recovery(&self, dof: usize) -> bool { self.inner.mit_feedback_after_recovery(dof) }
+    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_mut().mit_fresh_status() }
+    fn acknowledge_mit_fence_trip(&mut self) { self.inner.mit_mut().acknowledge_mit_fence_trip() }
+    fn mit_feedback_after_recovery(&self, dof: usize) -> bool { self.inner.mit().mit_feedback_after_recovery(dof) }
     fn mit_min_last_ctrl_tx(&self, mask: u64) -> Option<Instant> {
-        self.inner.mit_min_last_ctrl_tx(mask)
+        self.inner.mit().mit_min_last_ctrl_tx(mask)
     }
     fn mit_expiry_recover_budgeted(
         &mut self,
@@ -838,17 +838,17 @@ impl crate::driver::MitExt for ZeroOffsetDriver {
         started_at: Instant,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<bool, ArmDriverError> {
-        self.inner.mit_expiry_recover_budgeted(deadline, started_at, pre_tx_gate)
+        self.inner.mit_mut().mit_expiry_recover_budgeted(deadline, started_at, pre_tx_gate)
     }
     fn mit_expiry_recover_reset(&mut self) {
-        self.inner.mit_expiry_recover_reset();
+        self.inner.mit_mut().mit_expiry_recover_reset();
     }
 }
 
 impl crate::driver::PosForceExt for ZeroOffsetDriver {
-    fn reset_pos_force_boot_state(&mut self) { self.inner.reset_pos_force_boot_state(); }
+    fn reset_pos_force_boot_state(&mut self) { self.inner.pos_force_mut().reset_pos_force_boot_state(); }
     fn set_external_pos_force_emitter(&mut self, enabled: bool) {
-        self.inner.set_external_pos_force_emitter(enabled);
+        self.inner.pos_force_mut().set_external_pos_force_emitter(enabled);
     }
     fn validate_pos_force_intent_target(
         &self,
@@ -856,11 +856,11 @@ impl crate::driver::PosForceExt for ZeroOffsetDriver {
         velocity: Option<f32>,
         current_raw: Option<u16>,
     ) -> Result<(), ArmDriverError> {
-        let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
-        self.inner.validate_pos_force_intent_target(position + offset, velocity, current_raw)
+        let offset = self.inner.pos_force().gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+        self.inner.pos_force().validate_pos_force_intent_target(position + offset, velocity, current_raw)
     }
     fn set_pending_pos_force_hold_hint(&mut self, is_hold: bool) {
-        self.inner.set_pending_pos_force_hold_hint(is_hold);
+        self.inner.pos_force_mut().set_pending_pos_force_hold_hint(is_hold);
     }
     fn emit_pos_force_j7(
         &mut self,
@@ -869,7 +869,7 @@ impl crate::driver::PosForceExt for ZeroOffsetDriver {
     ) -> Result<crate::driver::PosForceEmitOutcome, ArmDriverError> {
         let mapped = match intent.kind {
             crate::driver::PosForceIntentKind::Target { position, velocity, current_raw } => {
-                let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+                let offset = self.inner.pos_force().gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
                 crate::driver::PosForceIntent {
                     kind: crate::driver::PosForceIntentKind::Target {
                         position: position + offset,
@@ -881,56 +881,56 @@ impl crate::driver::PosForceExt for ZeroOffsetDriver {
             }
             _ => intent,
         };
-        self.inner.emit_pos_force_j7(mapped, current)
+        self.inner.pos_force_mut().emit_pos_force_j7(mapped, current)
     }
     fn take_last_pos_force_tx_status(&mut self) -> crate::driver::PosForceTxStatus {
-        self.inner.take_last_pos_force_tx_status()
+        self.inner.pos_force_mut().take_last_pos_force_tx_status()
     }
-    fn pos_force_feedback_fresh(&self) -> bool { self.inner.pos_force_feedback_fresh() }
+    fn pos_force_feedback_fresh(&self) -> bool { self.inner.pos_force().pos_force_feedback_fresh() }
     fn pos_force_last_fresh_position(&self) -> Option<f32> {
-        let pos = self.inner.pos_force_last_fresh_position()?;
-        let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+        let pos = self.inner.pos_force().pos_force_last_fresh_position()?;
+        let offset = self.inner.pos_force().gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
         Some(pos - offset)
     }
-    fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }
-    fn gripper_pos_force_info(&self) -> Option<crate::driver::GripperPosForceInfo> { self.inner.gripper_pos_force_info() }
+    fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.pos_force().motor_current_cap() }
+    fn gripper_pos_force_info(&self) -> Option<crate::driver::GripperPosForceInfo> { self.inner.pos_force().gripper_pos_force_info() }
 }
 
 impl crate::driver::BusRecoveryExt for ZeroOffsetDriver {
     fn service_pending_refresh(&mut self) -> Result<(), ArmDriverError> {
-        self.inner.service_pending_refresh()
+        self.inner.bus_recovery_mut().service_pending_refresh()
     }
-    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.finish_dispatched_disable() }
-    fn notify_bus_loss(&mut self) { self.inner.notify_bus_loss() }
+    fn finish_dispatched_disable(&mut self) -> Result<(), ArmDriverError> { self.inner.bus_recovery_mut().finish_dispatched_disable() }
+    fn notify_bus_loss(&mut self) { self.inner.bus_recovery_mut().notify_bus_loss() }
     fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
-        self.inner.panic_disable_step(first, deadline)
+        self.inner.bus_recovery_mut().panic_disable_step(first, deadline)
     }
     fn drain_rx_only_bounded(&mut self, deadline: Option<Instant>) -> Result<(), ArmDriverError> {
-        self.inner.drain_rx_only_bounded(deadline)
+        self.inner.bus_recovery_mut().drain_rx_only_bounded(deadline)
     }
     fn clear_carried_over_motor_errors(
         &mut self,
         deadline: Option<Instant>,
         pre_tx_gate: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<crate::driver::CarryoverMotorClearOutcome, ArmDriverError> {
-        self.inner.clear_carried_over_motor_errors(deadline, pre_tx_gate)
+        self.inner.bus_recovery_mut().clear_carried_over_motor_errors(deadline, pre_tx_gate)
     }
-    fn set_pending_rearm(&mut self, pending: bool) { self.inner.set_pending_rearm(pending) }
+    fn set_pending_rearm(&mut self, pending: bool) { self.inner.bus_recovery_mut().set_pending_rearm(pending) }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::driver::ShadowExt for ZeroOffsetDriver {
     fn shadow_vendor_kind(&self) -> crate::torque::VendorKind {
-        self.inner.shadow_vendor_kind()
+        self.inner.shadow().shadow_vendor_kind()
     }
     fn set_shadow_enabled(&mut self, enabled: bool) {
-        self.inner.set_shadow_enabled(enabled);
+        self.inner.shadow_mut().set_shadow_enabled(enabled);
     }
     fn drain_shadow_observations(
         &mut self,
         out: &mut [Option<crate::torque::shadow::ShadowDriverObs>],
     ) -> (usize, u64) {
-        let (count, dropped) = self.inner.drain_shadow_observations(out);
+        let (count, dropped) = self.inner.shadow_mut().drain_shadow_observations(out);
         for slot in out.iter_mut().take(count) {
             if let Some(crate::torque::shadow::ShadowDriverObs::CausalSample {
                 channel,

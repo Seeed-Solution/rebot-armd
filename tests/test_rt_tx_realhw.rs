@@ -4179,7 +4179,7 @@ fn dual_owner_fresh_j7_rx_between_two_stale_outputs_resets_staleness_episode() {
             let _ = g.read_joint_states().unwrap();
             bus.with(|s| s.push_all_feedback());
             let _ = g.read_joint_states().unwrap();
-            assert!(g.pos_force_feedback_fresh(), "{owner:?}: sample #2 must be provably fresh at t=240 ms");
+            assert!(g.pos_force().pos_force_feedback_fresh(), "{owner:?}: sample #2 must be provably fresh at t=240 ms");
         }
         rig.bus.with(|s| s.motors[6].mute_feedback = true);
 
@@ -5050,7 +5050,7 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
                     .collect();
                 let mut drv = rig.inner_mut().driver.as_mut().unwrap().write().unwrap();
                 drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
-                drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+                drv.mit_mut().set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
             }
             rig.inner_mut().mit.owner = MitOwner::Active;
             rig.inner_mut().mit.joints = vec![3];
@@ -5801,7 +5801,7 @@ fn dual_owner_single_j7_emitter_covers_all_fenced_and_invalid_target_paths() {
                 .collect();
             let mut drv = rig.inner_mut().driver.as_mut().unwrap().write().unwrap();
             drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
-            drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+            drv.mit_mut().set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
         }
         rig.inner_mut().mit.owner = MitOwner::Active;
         rig.inner_mut().mit.joints = vec![3];
@@ -6592,7 +6592,7 @@ fn dual_owner_r8_d1_boot_fallback_no_output_until_fresh_and_stop_before_first_sa
                 .unwrap()
                 .write()
                 .unwrap()
-                .reset_pos_force_boot_state();
+                .pos_force_mut().reset_pos_force_boot_state();
 
             rig.bus.clear_log();
             for _ in 0..3 {
@@ -6652,7 +6652,7 @@ fn dual_owner_r8_d1_boot_fallback_no_output_until_fresh_and_stop_before_first_sa
                 .unwrap()
                 .write()
                 .unwrap()
-                .reset_pos_force_boot_state();
+                .pos_force_mut().reset_pos_force_boot_state();
 
             if is_estop {
                 rig.inner_mut().apply_stop_policy(armd::StopPolicy::EStopLatch);

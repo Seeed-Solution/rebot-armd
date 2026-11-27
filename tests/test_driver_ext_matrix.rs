@@ -93,3 +93,12 @@ fn getters_fall_back_to_the_default_bodies() {
     assert!(out.is_empty());
     assert!(ft.commissioning_mut().set_zero_position(0).is_err());
 }
+
+#[test]
+fn temporary_call_site_bridge_is_gone() {
+    // S4 PR 1a added src/driver/bridge.rs (old method names on dyn ArmDriver); PR 1d removed it.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!root.join("src/driver/bridge.rs").exists(), "src/driver/bridge.rs must not come back");
+    let driver = std::fs::read_to_string(root.join("src/driver.rs")).unwrap();
+    assert!(!driver.lines().any(|l| l.trim() == "mod bridge;"), "src/driver.rs must not declare mod bridge");
+}

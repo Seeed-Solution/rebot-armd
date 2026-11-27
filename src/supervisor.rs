@@ -5016,7 +5016,7 @@ impl SupervisorInner {
             .and_then(|g| {
                 self.driver
                     .as_ref()
-                    .and_then(|d| d.with_ref(|drv| drv.gripper_pos_force_info()).flatten())
+                    .and_then(|d| d.with_ref(|drv| drv.pos_force().gripper_pos_force_info()).flatten())
                     .filter(|info| info.joint == g)
             });
         self.driver_gripper_close_speed_limit = pf_info
@@ -7421,7 +7421,7 @@ impl SupervisorInner {
     /// and initialize owner torque intent to `On` (R10 hold-by-default).
     pub(crate) fn install_driver(&mut self, mut driver: Box<dyn ArmDriver>) {
         driver.set_estop_gate(self.estop_gate());
-        driver.set_external_pos_force_emitter(true);
+        driver.pos_force_mut().set_external_pos_force_emitter(true);
         driver.set_stopped_disable_gate(self.stopped_disable_gate());
         self.driver_clock = driver.driver_clock();
         self.last_valid_motor_rx = [None; crate::model::MAX_MOTION_DOF];
@@ -7432,7 +7432,7 @@ impl SupervisorInner {
         if let Some(pf) = self
             .config
             .gripper_index()
-            .and_then(|g| driver.gripper_pos_force_info().filter(|info| info.joint == g))
+            .and_then(|g| driver.pos_force().gripper_pos_force_info().filter(|info| info.joint == g))
         {
             self.driver_gripper_close_speed_limit =
                 (pf.close_speed_rad_s.is_finite() && pf.close_speed_rad_s > 0.0)
@@ -7475,7 +7475,7 @@ impl SupervisorInner {
         self.torque_intent = crate::supervisor::TorqueIntent::On;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            driver.set_shadow_enabled(self.torque_shadow.is_enabled());
+            driver.shadow_mut().set_shadow_enabled(self.torque_shadow.is_enabled());
             let boot_sync = crate::torque::shadow::LiveBootSync {
                 live_is_torqued: self.is_torqued,
                 live_stopped: self.safety.state().is_stopped(),
@@ -7487,7 +7487,7 @@ impl SupervisorInner {
             };
             self.torque_shadow.reinit_for_driver_synced(
                 &self.config,
-                driver.shadow_vendor_kind(),
+                driver.shadow().shadow_vendor_kind(),
                 driver.driver_clock(),
                 boot_sync,
             );
@@ -7764,7 +7764,7 @@ impl SupervisorInner {
         let Some(d) = self.driver.as_ref() else {
             return false;
         };
-        d.try_with_ref_recover(|drv| !drv.pos_force_feedback_fresh())
+        d.try_with_ref_recover(|drv| !drv.pos_force().pos_force_feedback_fresh())
             .unwrap_or_else(|| self.j7_stale_since.is_some())
     }
 
@@ -7776,7 +7776,7 @@ impl SupervisorInner {
         let raw = self
             .driver
             .as_ref()
-            .and_then(|d| d.try_with_ref_recover(|drv| drv.pos_force_last_fresh_position()).flatten())
+            .and_then(|d| d.try_with_ref_recover(|drv| drv.pos_force().pos_force_last_fresh_position()).flatten())
             .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
             .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
         Some(self.config.limits.get(g).map_or(raw, |l| raw.clamp(l.min_position, l.max_position)))
@@ -8122,7 +8122,7 @@ impl SupervisorInner {
         let j7_effective_hold_or_freeze = j7_is_hold
             || !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
             || intent.stamp.is_stale_against(current_stamp)
-            || !drv.pos_force_feedback_fresh();
+            || !drv.pos_force().pos_force_feedback_fresh();
         let action_cap = cutoff.and_then(|c| c.drv_action_cutoff);
         if j7_effective_hold_or_freeze {
             if let Some(c) = cutoff {
@@ -8146,7 +8146,7 @@ impl SupervisorInner {
         }
         let now = drv.clock_now();
         let max_age = drv.tx().tx_frame_max_age();
-        let emit_res = drv.emit_pos_force_j7(intent, current_stamp);
+        let emit_res = drv.pos_force_mut().emit_pos_force_j7(intent, current_stamp);
         if !j7_effective_hold_or_freeze
             && matches!(
                 emit_res,
@@ -8164,7 +8164,7 @@ impl SupervisorInner {
                     PosForceEmitOutcome::Deferred { pf_status, .. }
                     | PosForceEmitOutcome::SentHoldInsteadOfTarget { pf_status, .. },
                 ) => pf_status,
-                _ => drv.take_last_pos_force_tx_status(),
+                _ => drv.pos_force_mut().take_last_pos_force_tx_status(),
             };
             drv.tx_mut().discard_pending_tx();
             *allow_output_accepted = false;
@@ -8502,13 +8502,13 @@ impl SupervisorInner {
                 }
             }
             Err(e) => {
-                if let Some(c) = drv.gripper_pos_force_info() {
+                if let Some(c) = drv.pos_force().gripper_pos_force_info() {
                     hold_status_update = Some((c.joint, JointHoldStatus::UnheldTxFailed));
                 }
                 let pf_bit_hold = drv
-                    .gripper_pos_force_info()
+                    .pos_force().gripper_pos_force_info()
                     .map_or(0, |c| if c.joint.saturating_mul(2) < 64 { 1u64 << (c.joint * 2) } else { 0 });
-                let pf_status = drv.take_last_pos_force_tx_status();
+                let pf_status = drv.pos_force_mut().take_last_pos_force_tx_status();
                 match tick_output {
                     TickOutput::ActionDeadlineRefused { pf_status: dst_pf, .. } => {
                         *dst_pf = pf_status;
@@ -8615,7 +8615,7 @@ impl SupervisorInner {
         let hold_sent_any = is_hold && drv.tx().last_hold_tx_sent_any();
         let due_mask = if is_hold { drv.tx().last_hold_tx_due_mask() } else { 0 };
         let hold_sent_mask = if is_hold { drv.tx().last_hold_tx_sent_mask() } else { 0 };
-        let pf_status = drv.take_last_pos_force_tx_status();
+        let pf_status = drv.pos_force_mut().take_last_pos_force_tx_status();
         match write_res {
             Ok(TxBatchOutcome::Complete) => TickOutput::Complete {
                 is_hold,
@@ -8793,7 +8793,7 @@ impl SupervisorInner {
         let notified = self
             .driver
             .as_mut()
-            .and_then(|d| d.try_with_mut(|drv| drv.notify_bus_loss()).ok())
+            .and_then(|d| d.try_with_mut(|drv| drv.bus_recovery_mut().notify_bus_loss()).ok())
             .is_some();
         if !notified && self.driver.is_some() {
             self.pending_driver_bus_loss_notify = true;
@@ -9540,10 +9540,10 @@ impl SupervisorInner {
                     .copied()
                     .try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
                 let gate = if is_pf {
-                    let stale = !d.pos_force_feedback_fresh();
+                    let stale = !d.pos_force().pos_force_feedback_fresh();
                     let freeze_pos = self.config.gripper_index().and_then(|g| {
                         let raw = d
-                            .pos_force_last_fresh_position()
+                            .pos_force().pos_force_last_fresh_position()
                             .or_else(|| self.measured_positions.get(g).copied().filter(|p| p.is_finite()))
                             .or_else(|| self.commanded_positions.get(g).copied().filter(|p| p.is_finite()))?;
                         Some(
@@ -9682,7 +9682,7 @@ impl SupervisorInner {
                                     == driver_transitions::EnableLifecycle::FailedHold
                             {
                                 driver
-                                    .service_pending_refresh()
+                                    .bus_recovery_mut().service_pending_refresh()
                                     .map(|()| (frames, exhausted))
                             } else {
                                 Ok((frames, exhausted))
@@ -9912,7 +9912,7 @@ impl SupervisorInner {
                     }
                 }
                 if self.pending_driver_bus_loss_notify {
-                    driver.notify_bus_loss();
+                    driver.bus_recovery_mut().notify_bus_loss();
                     self.pending_driver_bus_loss_notify = false;
                 }
                 if self.is_torqued
@@ -9933,7 +9933,7 @@ impl SupervisorInner {
                 // R1/B2: Sync MIT ownership loss before capturing hold-mode verification so
                 // MIT-configured joints in verified `PosVel` fall back to position-mode holds
                 // while joints still in `Mit` mode enter L2's 200 ms readback -> fault bound.
-                driver.set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
+                driver.mit_mut().set_mit_ownership_lost(self.mit.owner == crate::mit::MitOwner::Lost);
                 // R1: Refresh the owner-held driver snapshot while already holding the driver
                 // so stopped-hold capture and MIT stopped-hold preparation never lock
                 // `self.driver` or allocate.
@@ -10769,7 +10769,7 @@ impl SupervisorInner {
                         && self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50))
                         && driver.is_feedback_valid();
                     let caps = driver.capabilities();
-                    let pf = driver.gripper_pos_force_info().filter(|info| info.joint == g_idx);
+                    let pf = driver.pos_force().gripper_pos_force_info().filter(|info| info.joint == g_idx);
                     (fresh, caps.torque_feedback, caps.load_feedback, pf)
                 } else {
                     (false, false, false, None)
@@ -13015,7 +13015,7 @@ impl SupervisorInner {
                     if let Some(cap) = release_cap {
                         drv.set_tx_release_deadline(Some(cap));
                     }
-                    drv.set_pending_pos_force_hold_hint(true);
+                    drv.pos_force_mut().set_pending_pos_force_hold_hint(true);
                     let mut unverified_mask = 0u64;
                     if hold_mask != 0 {
                         if let Ok(report) =
@@ -14362,7 +14362,7 @@ impl SupervisorInner {
                 if matches!(
                     purpose,
                     ModeSwitchPurpose::MitActivate { .. } | ModeSwitchPurpose::MitHandBack { .. }
-                ) && drv.mit_fence_trip_bounded().is_some()
+                ) && drv.mit().mit_fence_trip_bounded().is_some()
                 {
                     mit_fence_tripped = true;
                     drv_uncertain = drv.mode_switch().mode_write_uncertain_mask();
@@ -14422,13 +14422,13 @@ impl SupervisorInner {
                     purpose,
                     ModeSwitchPurpose::MitActivate { .. } | ModeSwitchPurpose::MitHandBack { .. }
                 ) {
-                    mit_fence_tripped = drv.mit_fence_trip_bounded().is_some();
+                    mit_fence_tripped = drv.mit().mit_fence_trip_bounded().is_some();
                     if let ModeSwitchPurpose::MitHandBack { mask, .. } = purpose {
                         if !mit_fence_tripped && !out.is_terminal() {
                             // Supply genuine oldest committed control-frame TX timestamp across
                             // the handback axes so `mit_supervise()` observes real committed holds
                             // rather than declaring ownership lost during a healthy multi-tick handback.
-                            handback_committed_tx = drv.mit_min_last_ctrl_tx(mask);
+                            handback_committed_tx = drv.mit().mit_min_last_ctrl_tx(mask);
                         }
                     }
                 }

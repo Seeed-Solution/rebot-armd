@@ -98,7 +98,7 @@ impl SupervisorInner {
                 .with_mut(|drv| {
                     #[cfg(not(target_arch = "wasm32"))]
                     shadow_rt.drain_from_driver(drv);
-                    drv.set_joint_zero_offsets(offsets);
+                    drv.joint_zero_mut().set_joint_zero_offsets(offsets);
                     (0..dof).any(|i| drv.position_limits(i).is_some())
                 })
                 .ok_or_else(|| "driver unavailable".to_string())?;

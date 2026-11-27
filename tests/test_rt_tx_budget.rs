@@ -5052,7 +5052,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
                 1,
                 "emit_j7_tick_epilogue must have no callers outside tick_control_inner"
             );
-        } else if !["joint_zero.rs", "driver/ext.rs", "driver/bridge.rs"].contains(&rel.as_str()) {
+        } else if !["joint_zero.rs", "driver/ext.rs"].contains(&rel.as_str()) {
             assert_eq!(
                 compact.matches("emit_pos_force_j7(").count(),
                 0,

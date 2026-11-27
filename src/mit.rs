@@ -1472,7 +1472,7 @@ impl crate::supervisor::SupervisorInner {
                 //   validate the caller's J7 target BEFORE writing arm frames: an invalid caller
                 //   J7 target (non-finite or unrepresentable sub-quantum speed) refuses arm motion
                 //   and degrades J7 intent to `Stop` so the epilogue still emits a hold/freeze.
-                if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
+                if let Some(cap) = drv.pos_force().gripper_pos_force_info().filter(|c| c.active) {
                     if is_hold {
                         computed_j7_intent = Some(PosForceIntent::stop(non_target_stamp));
                     } else if let Some(t) = targets.get_mut(cap.joint) {
@@ -1499,7 +1499,7 @@ impl crate::supervisor::SupervisorInner {
                                 }
                             }
                         }
-                        if let Err(err) = drv.validate_pos_force_intent_target(t.position, t.velocity, None) {
+                        if let Err(err) = drv.pos_force().validate_pos_force_intent_target(t.position, t.velocity, None) {
                             computed_j7_intent = Some(PosForceIntent::stop(non_target_stamp));
                             return crate::supervisor::SupervisorInner::tick_output_from_driver_write(
                                 drv,
@@ -1518,7 +1518,7 @@ impl crate::supervisor::SupervisorInner {
                         !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
                             || intent.stamp.is_stale_against(non_target_stamp)
                     });
-                drv.set_pending_pos_force_hold_hint(j7_hold_hint);
+                drv.pos_force_mut().set_pending_pos_force_hold_hint(j7_hold_hint);
                 // Single TX cutoff choke point at the driver boundary:
                 // - Safety/stopped holds restore the unclipped release cap so an action deadline
                 //   never blocks a safety hold.
@@ -1572,7 +1572,7 @@ impl crate::supervisor::SupervisorInner {
                     drv.tx_mut().discard_pending_tx();
                     return TickOutput::ActionDeadlineRefused {
                         drv_now: now,
-                        pf_status: drv.take_last_pos_force_tx_status(),
+                        pf_status: drv.pos_force_mut().take_last_pos_force_tx_status(),
                     };
                 }
                 crate::supervisor::SupervisorInner::tick_output_from_driver_write(drv, is_hold, write_res)
@@ -1729,7 +1729,7 @@ impl crate::supervisor::SupervisorInner {
         let tripped = self
             .driver
             .as_ref()
-            .and_then(|d| d.try_with_ref(|drv| drv.mit_fence_trip_bounded().is_some()).ok())
+            .and_then(|d| d.try_with_ref(|drv| drv.mit().mit_fence_trip_bounded().is_some()).ok())
             .unwrap_or(false);
         if tripped { crate::safety::FaultCode::BusLoss } else { crate::safety::FaultCode::HardwareFault }
     }
@@ -1740,7 +1740,7 @@ impl crate::supervisor::SupervisorInner {
             let tripped = self
                 .driver
                 .as_ref()
-                .and_then(|d| d.try_with_ref(|drv| drv.mit_fence_trip_bounded()).ok())
+                .and_then(|d| d.try_with_ref(|drv| drv.mit().mit_fence_trip_bounded()).ok())
                 .flatten();
             if let Some(t) = tripped {
                 if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::BusLoss) {
@@ -1767,7 +1767,7 @@ impl crate::supervisor::SupervisorInner {
             Some(d) => d
                 .try_with_ref(|drv| {
                     drv.feedback_ages_into(&mut ages);
-                    (drv.mit_fence_trip_bounded(), drv.clock_now())
+                    (drv.mit().mit_fence_trip_bounded(), drv.clock_now())
                 })
                 .unwrap_or_else(|_| (None, std::time::Instant::now())),
             None => (None, std::time::Instant::now()),
@@ -1883,12 +1883,12 @@ impl crate::supervisor::SupervisorInner {
                 d.with_mut(|drv| {
                     // armed before the first MIT-capable switch frame: a lost acknowledgement or a slow
                     // confirmation cannot outlast the deadline, and a rollback after a trip sends nothing
-                    drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
+                    drv.mit_mut().set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
                     let res = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
                     let uncertain = drv.joint_mode().joint_modes_uncertain();
                     if res.is_err() && !uncertain && drv.mit_fence_trip().is_none() {
                         // switched back and confirmed in position control: nothing to fence
-                        drv.set_mit_deadline_fence(None, Duration::ZERO);
+                        drv.mit_mut().set_mit_deadline_fence(None, Duration::ZERO);
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     shadow_rt.drain_from_driver(drv);
@@ -2080,7 +2080,7 @@ impl crate::supervisor::SupervisorInner {
         };
         if let Some(slot) = self.driver.as_mut() {
             let _ = slot.try_with_mut(|drv| {
-                drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
+                drv.mit_mut().set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
                 drv.joint_mode_mut().set_mode_switch_hold_targets(&holds);
                 drv.mode_switch_mut().set_mode_switch_active_mask(active_mask);
             });
@@ -2112,7 +2112,7 @@ impl crate::supervisor::SupervisorInner {
                 let fence_tripped = self
                     .driver
                     .as_ref()
-                    .and_then(|s| s.try_with_ref(|d| d.mit_fence_trip_bounded()).ok())
+                    .and_then(|s| s.try_with_ref(|d| d.mit().mit_fence_trip_bounded()).ok())
                     .flatten()
                     .is_some();
                 if fence_tripped {
@@ -2177,9 +2177,9 @@ impl crate::supervisor::SupervisorInner {
                 let mut fence_tripped = false;
                 if let Some(slot) = self.driver.as_mut() {
                     let _ = slot.try_with_mut(|drv| {
-                        fence_tripped = drv.mit_fence_trip_bounded().is_some();
+                        fence_tripped = drv.mit().mit_fence_trip_bounded().is_some();
                         if !uncertain && !fence_tripped {
-                            drv.set_mit_deadline_fence(None, Duration::ZERO);
+                            drv.mit_mut().set_mit_deadline_fence(None, Duration::ZERO);
                         }
                     });
                 }
@@ -2496,7 +2496,7 @@ impl crate::supervisor::SupervisorInner {
             crate::motor_mode::ModeProgress::Confirmed => {
                 if let Some(slot) = self.driver.as_mut() {
                     let _ = slot.try_with_mut(|drv| {
-                        drv.set_mit_deadline_fence(None, Duration::ZERO);
+                        drv.mit_mut().set_mit_deadline_fence(None, Duration::ZERO);
                     });
                 }
                 for j in 0..dof {
@@ -2645,7 +2645,7 @@ impl crate::supervisor::SupervisorInner {
             let Some(d) = self.driver.as_mut() else { return Err("no driver".into()) };
             d.with_mut(|drv| {
                 let res = drv.joint_mode_mut().set_joint_modes_confirmed(&modes, &hold);
-                if res.is_ok() { drv.set_mit_deadline_fence(None, Duration::ZERO); }
+                if res.is_ok() { drv.mit_mut().set_mit_deadline_fence(None, Duration::ZERO); }
                 #[cfg(not(target_arch = "wasm32"))]
                 shadow_rt.drain_from_driver(drv);
                 (res, drv.joint_mode().joint_modes_uncertain())
@@ -2792,7 +2792,7 @@ impl crate::supervisor::SupervisorInner {
         let (pre_recovery_seqs, res) = if self.driver.is_some() {
             let outcome = self.with_driver_and_owner_ref(|owner, drv| {
                 let mut local_ctx = pre_ctx;
-                local_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                local_ctx.j7_feedback_fresh = drv.pos_force().pos_force_feedback_fresh();
                 local_ctx.feedback_fresh = local_ctx.feedback_fresh && drv.is_feedback_valid();
                 local_ctx.pending_estop =
                     owner.estop_state.requested_count() != owner.applied_estop_count;
@@ -2829,7 +2829,7 @@ impl crate::supervisor::SupervisorInner {
                     Ok(())
                 };
                 let pre = drv.feedback_seqs();
-                let r = drv.mit_expiry_recover_with_gate(&mut pre_tx_gate);
+                let r = drv.mit_mut().mit_expiry_recover_with_gate(&mut pre_tx_gate);
                 if let Some(auth_err) = auth_abort {
                     return PreRecoveryOutcome::Authority(auth_err);
                 }
@@ -2937,7 +2937,7 @@ impl crate::supervisor::SupervisorInner {
                         .iter()
                         .zip(&pre_recovery_seqs)
                         .all(|(&post, &pre)| post > pre);
-                let rx_boundary_ok = drv.mit_feedback_after_recovery(dof);
+                let rx_boundary_ok = drv.mit().mit_feedback_after_recovery(dof);
                 let ages = drv.feedback_ages();
                 let loads = drv.joint_loads();
                 let caps = drv.capabilities();
@@ -2949,7 +2949,7 @@ impl crate::supervisor::SupervisorInner {
                         .iter()
                         .all(|a| a.is_some_and(|t| t <= crate::supervisor::THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                     && Self::states_valid(&states, caps, dof, loads.as_deref());
-                let j7_fresh = drv.pos_force_feedback_fresh();
+                let j7_fresh = drv.pos_force().pos_force_feedback_fresh();
                 let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
                 let hw_fault = drv.has_hardware_fault();
                 let enable_known = true;
@@ -3064,7 +3064,7 @@ impl crate::supervisor::SupervisorInner {
             self.mit.revoke_pending = false;
             self.mit.recovery_confirmed = false;
             if let Some(d) = self.driver.as_mut() {
-                let _ = d.with_mut(|drv| drv.acknowledge_mit_fence_trip());
+                let _ = d.with_mut(|drv| drv.mit_mut().acknowledge_mit_fence_trip());
             }
             let _ = self.safety.set_torque(false);
             let _ = self.safety.clear_with_check(&post_ctx);
@@ -3088,7 +3088,7 @@ impl crate::supervisor::SupervisorInner {
                         }
                     }
                     post_ctx.j7_feedback_fresh =
-                        post_ctx.j7_feedback_fresh && drv.pos_force_feedback_fresh();
+                        post_ctx.j7_feedback_fresh && drv.pos_force().pos_force_feedback_fresh();
                     post_ctx.feedback_fresh = post_ctx.feedback_fresh && drv.is_feedback_valid();
                     post_ctx.pending_estop =
                         self.estop_state.requested_count() != self.applied_estop_count;
@@ -3182,7 +3182,7 @@ impl crate::supervisor::SupervisorInner {
         self.mit.armed_ok = false;
         self.mit.revoke_pending = false;
         if let Some(d) = self.driver.as_mut() {
-            let _ = d.with_mut(|drv| drv.acknowledge_mit_fence_trip());
+            let _ = d.with_mut(|drv| drv.mit_mut().acknowledge_mit_fence_trip());
         }
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {

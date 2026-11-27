@@ -837,7 +837,7 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
         "contradictory energized ConfirmOnly reply MUST invalidate cached PosForce mode"
     );
     assert!(
-        !ex_drv.get_ref().gripper_pos_force_info().unwrap().active,
+        !ex_drv.get_ref().pos_force().gripper_pos_force_info().unwrap().active,
         "pos_force_verified must be cleared on contradiction"
     );
 
@@ -864,7 +864,7 @@ fn fakebus_causal_rejections_ranges_rollback_flush_fail_duplicates_and_confirm_o
             reason: ModeSwitchFailure::AmbiguousReply,
         }
     );
-    assert!(!ex_drv.get_ref().gripper_pos_force_info().unwrap().active);
+    assert!(!ex_drv.get_ref().pos_force().gripper_pos_force_info().unwrap().active);
 }
 
 // ---------------------------------------------------------------------------

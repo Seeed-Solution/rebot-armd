@@ -8345,7 +8345,7 @@ fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
         inner.apply_stop_policy(StopPolicy::EStopLatch);
         {
             let mut drv = inner.driver.as_mut().unwrap().write().unwrap();
-            drv.set_mit_deadline_fence(Some(Duration::from_millis(50)), Duration::ZERO);
+            drv.mit_mut().set_mit_deadline_fence(Some(Duration::from_millis(50)), Duration::ZERO);
         }
 
         clock.advance(Duration::from_millis(20));

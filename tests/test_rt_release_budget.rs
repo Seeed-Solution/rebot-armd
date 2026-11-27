@@ -2050,7 +2050,7 @@ fn j7_continuity_hold_fallback_does_not_count_as_accepted_motion_in_supervisor()
             .try_with_mut(|d| {
                 d.joint_mode_mut().set_joint_modes(&modes, &base_targets)
                     .expect("set MIT modes");
-                d.set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
+                d.mit_mut().set_mit_deadline_fence(Some(Duration::from_millis(80)), Duration::from_millis(300));
                 clock.advance(Duration::from_millis(10));
                 bus.with(|s| {
                     s.tx_log.clear();

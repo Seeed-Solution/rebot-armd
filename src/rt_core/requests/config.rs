@@ -223,7 +223,7 @@ impl PublishedConfig {
         let driver_motor_current_cap = inner
             .driver
             .as_ref()
-            .and_then(|d| d.with_ref(|drv| drv.motor_current_cap()).flatten())
+            .and_then(|d| d.with_ref(|drv| drv.pos_force().motor_current_cap()).flatten())
             .and_then(|cap| serde_json::to_value(cap).ok());
         let mut sequences = inner.sequences.clone();
         sequences.pins = inner.active_sequence_pins().cloned();
@@ -3540,7 +3540,7 @@ fn swap_config_candidate_in_place(
             if let Some(ref mut d) = core.driver {
                 let has_pos_limits = d
                     .with_mut(|drv| {
-                        drv.set_joint_zero_offsets(&core.joint_zero_offsets[..n]);
+                        drv.joint_zero_mut().set_joint_zero_offsets(&core.joint_zero_offsets[..n]);
                         (0..n).any(|i| drv.position_limits(i).is_some())
                     })
                     .unwrap_or(false);
