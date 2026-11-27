@@ -5304,6 +5304,9 @@ function connectWS() {
     }
     if (o.type === 'servo_reject') {
       syncEpoch(o.epoch_id);
+      // A jog frame that was already in flight when the stop (joystick release, Stop button)
+      // was applied is refused with STOPPED. That is the expected preemption, not an error.
+      if (o.code === 'STOPPED' || o.reason === 'stopped') return;
       if (o.code === 'WORKSPACE_VIOLATION') {
         const cid = o.constraint_id;
         const gid = o.geometry_id;
