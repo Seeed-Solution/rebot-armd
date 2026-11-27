@@ -385,6 +385,27 @@ pub(super) fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> 
     Pose::new(look_down(r_now), [target[0], target[1], setup.table_z_m + setup.approach_height_m])
 }
 
+/// Sole constructor of a top-down [`PlannedGrasp`] (`adaptive: None, jaw: Some`), shared by
+/// `strategy: "legacy"` and `strategy: "adaptive"` when [`crate::grasp_select::SelectedRoute::TopDown`]
+/// is selected so both dispatch identically through the legacy orchestrator.
+pub fn planned_top_down(
+    input: PlanInput,
+    request: GraspRequest,
+    tr: crate::grasp_select::admission::TopDownRoute,
+) -> PlannedGrasp {
+    PlannedGrasp {
+        input,
+        request,
+        target: tr.td.target,
+        approach_duration: tr.approach_duration,
+        camera_down: tr.td.camera_down,
+        transition_duration: tr.transition_duration,
+        mode: None,
+        adaptive: None,
+        jaw: Some(tr.jaw),
+    }
+}
+
 /// Outside the lock: estimate the target from the box-centre ray and plan the approach
 /// (legacy) or select & preflight the whole adaptive route (`strategy: "adaptive"`).
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
@@ -397,31 +418,38 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
             pa.close_speed_limit,
             pa.has_gravity_model,
         );
-        if let Some(route) = sel.route.filter(|_| sel.selection.outcome == crate::grasp_select::Outcome::Selected) {
-            let target = [route.target_centroid[0], route.target_centroid[1], route.plan.grasp.p[2]];
-            let approach_duration = route.budget.pregrasp_s;
-            return Ok(PlannedGrasp {
-                input,
-                request: *request,
-                target,
-                approach_duration,
-                camera_down: pa.snapshot.camera_down,
-                transition_duration: 0.0,
-                mode: None,
-                adaptive: Some(Box::new(PlannedAdaptive {
-                    route,
-                    start_positions: pa.start_positions,
-                    revisions: pa.revisions,
-                    expected_generation: None,
-                })),
-                jaw: None,
-            });
+        if sel.selection.outcome == crate::grasp_select::Outcome::Selected {
+            match sel.route {
+                Some(crate::grasp_select::SelectedRoute::TopDown(tr)) => {
+                    return Ok(planned_top_down(input, *request, tr));
+                }
+                Some(crate::grasp_select::SelectedRoute::Chord(route)) => {
+                    let target = [route.target_centroid[0], route.target_centroid[1], route.plan.grasp.p[2]];
+                    let approach_duration = route.budget.pregrasp_s;
+                    return Ok(PlannedGrasp {
+                        input,
+                        request: *request,
+                        target,
+                        approach_duration,
+                        camera_down: pa.snapshot.camera_down,
+                        transition_duration: 0.0,
+                        mode: None,
+                        adaptive: Some(Box::new(PlannedAdaptive {
+                            route,
+                            start_positions: pa.start_positions,
+                            revisions: pa.revisions,
+                            expected_generation: None,
+                        })),
+                        jaw: None,
+                    });
+                }
+                None => {}
+            }
         }
         let code = sel.selection.code.unwrap_or_else(|| "NO_CANDIDATE".into());
         let phase = sel.failing_phase.unwrap_or("selection");
         let base_msg = sel.selection.message.unwrap_or_else(|| "adaptive grasp infeasible".into());
-        // Checked hints only (e.g. verified payload capacity bound, or verified legacy top-down
-        // pass when adaptive safety checks such as lift torque or carried-object keepout refuse).
+        // Checked hints only (e.g. verified payload capacity bound).
         let checked_hint = sel.checked_hint;
         let message = match &checked_hint {
             Some(hint) => format!("[{phase}] {base_msg}; hint: {hint}"),
@@ -451,17 +479,7 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let shared = shared.ok_or_else(|| ArmError::from(MotionError::InvalidCommand("grasp admission state missing".into())))?;
     let mut work = crate::grasp_select::Work::default();
     let tr = crate::grasp_select::admission::plan_legacy_top_down(&shared.snapshot, None, &mut work).route?;
-    Ok(PlannedGrasp {
-        input,
-        request: *request,
-        target: tr.td.target,
-        approach_duration: tr.approach_duration,
-        camera_down: tr.td.camera_down,
-        transition_duration: tr.transition_duration,
-        mode: None,
-        adaptive: None,
-        jaw: Some(tr.jaw),
-    })
+    Ok(planned_top_down(input, *request, tr))
 }
 
 /// The top-down (legacy) grasp of a request, shared by the legacy plan, the adaptive
@@ -508,22 +526,37 @@ pub fn transition_estimate(from: &Pose, target: &Vec3, setup: &GraspSetup) -> f6
     1.1 * 1.875 * (length / setup.approach_speed_mps).max(theta / motion::DEFAULT_ANGULAR_RPS)
 }
 
-/// Rough total duration for the ack.
-pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
-    if let Some(pa) = &planned.adaptive {
-        return pa.route.budget.nominal_total_s;
-    }
-    let s = &planned.request.setup;
+/// Rough total duration of a legacy top-down grasp (shared by [`expected_duration`] and
+/// `SelectedRoute::TopDown` dry-run JSON).
+pub fn legacy_expected_duration(
+    s: &GraspSetup,
+    approach_duration: f64,
+    camera_down: bool,
+    transition_duration: f64,
+) -> f64 {
     let descend = (s.approach_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let lift = (s.lift_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let mut probe = if s.height_probe_m > 0.0 { 2.0 * s.height_probe_m * 1.875 / s.approach_speed_mps + 1.5 } else { 0.0 };
     // lateral: B/2 + B + B/2 of motion and two frame sets, on top of a possible up fallback
     if s.height_probe_m > 0.0 && s.height_probe_mode == HeightProbeMode::Lateral { probe += 2.0 * 1.875 * s.lateral_probe_m / s.approach_speed_mps + 1.5; }
-    let recentre = if s.recentre_height_m > 0.0 && !planned.camera_down { 3.0 } else { 0.0 };
+    let recentre = if s.recentre_height_m > 0.0 && !camera_down { 3.0 } else { 0.0 };
     let lift_check = s.post_lift_settle_ms as f64 / 1000.0;
-    let base = lift_check + 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
+    let base = lift_check + 6.5 + approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
     // camera-down: the transition move and its re-check frame
-    if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
+    if camera_down { base + transition_duration + 1.5 } else { base }
+}
+
+/// Rough total duration for the ack.
+pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
+    if let Some(pa) = &planned.adaptive {
+        return pa.route.budget.nominal_total_s;
+    }
+    legacy_expected_duration(
+        &planned.request.setup,
+        planned.approach_duration,
+        planned.camera_down,
+        planned.transition_duration,
+    )
 }
 
 /// Result of a grasp dry run.

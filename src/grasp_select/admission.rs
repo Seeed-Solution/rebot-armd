@@ -7,8 +7,6 @@
 //! Legacy admission, the adaptive `-top` candidate, and the nested `legacy` verdict in adaptive
 //! replies all come from that single call.
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Map, Value};
 
 use super::candidates::{self, Chord, DirClass, Hypothesis, Rejection, MIN_OPENING_RESERVE_M};
@@ -16,7 +14,7 @@ use super::feasibility::{self, Work};
 use super::geometry as g;
 use super::margin::ErrorMargin;
 use super::snapshot::{self, FootprintSource, Snapshot, Target};
-use super::{score, AdaptiveRoute, Candidate};
+use super::{score, Candidate};
 use crate::api::rest::ApiError;
 use crate::grasp::{
     table_violation, top_down_pose, transition_estimate, TopDown, TABLE_CLEARANCE_M,
@@ -27,10 +25,26 @@ use crate::supervisor::ArmError;
 
 /// Hypothesis index of the top-down candidate (ids `<snapshot>-top`).
 pub const TOP_DOWN_INDEX: usize = 99_999;
-/// Wall budget reserved for the top-down candidate, outside the request's search budget.
-pub const TOP_DOWN_BUDGET_MS: u64 = 1500;
 /// Floating-point slack of the jaw predicate (an exact-threshold width passes).
 const JAW_EPS_M: f64 = 1e-9;
+
+/// Advisory result when adaptive whole-route preflight of `-top` fails or runs out of optional
+/// search budget. Reported in `selection.top_advisory` only — never added to `rejected` or
+/// `best_refusal`, and never disqualifies `-top`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopAdvisory {
+    pub code: String,
+    pub phase: String,
+}
+
+impl TopAdvisory {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "code": self.code,
+            "phase": self.phase,
+        })
+    }
+}
 
 /// The jaw predicate: `width` along the closing axis is finite, at most `max_grasp_width_m`
 /// (when the cap is enabled), and `width + 2·hard_error + 2·MIN_OPENING_RESERVE_M <= open_width`.
@@ -228,9 +242,17 @@ pub struct TopDownRoute {
     pub grasp_r: Mat3,
     pub closing_axis: g::V2,
     pub jaw: JawAdmission,
-    /// Present only when a box-only request failed the upper-bound jaw check and was deferred for
-    /// legacy live measurement (adaptive refuses `-top` with this rejection instead of deferring).
-    pub box_refusal: Option<Rejection>,
+}
+
+impl TopDownRoute {
+    /// Legacy planning phases verified by [`plan_legacy_top_down`].
+    pub fn checked_phases(&self) -> Vec<&'static str> {
+        if self.td.camera_down {
+            vec!["acquisition", "transition", "insertion"]
+        } else {
+            vec!["acquisition", "insertion"]
+        }
+    }
 }
 
 /// Outcome of the single shared [`plan_legacy_top_down`] call.
@@ -343,9 +365,19 @@ fn legacy_refusal(s: &Snapshot, t: Option<&Target>, r: &Rejection, id: Option<St
     }
 }
 
+fn is_cancelled(s: &Snapshot) -> bool {
+    s.budget
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// The single shared builder and checker of the legacy vertical route (box-centre contact,
 /// `grasp_height_m`, `approach_height_m` pregrasp, camera-down / look-down approach, transition,
 /// nominal descent, table clearance, and shared jaw rule without `PAD_OVERLAP`).
+///
+/// Cooperative cancellation (`s.budget.cancel`) is checked between stages; there is no wall-time
+/// deadline on the builder itself (only the optional chord search carries a wall budget).
 ///
 /// Called by legacy `grasp::plan()`, by adaptive `select_adaptive_route()` for the `-top`
 /// candidate, and directly for the nested `legacy` verdict in adaptive dry-run replies.
@@ -354,24 +386,14 @@ pub fn plan_legacy_top_down(
     target_res: Option<Result<&Target, &str>>,
     work: &mut Work,
 ) -> TopDownOutcome {
-    plan_legacy_top_down_budget(s, target_res, work, &|| false)
-}
-
-/// [`plan_legacy_top_down`] checking `out_of_budget()` before every charged planning stage.
-pub fn plan_legacy_top_down_budget(
-    s: &Snapshot,
-    target_res: Option<Result<&Target, &str>>,
-    work: &mut Work,
-    out_of_budget: &dyn Fn() -> bool,
-) -> TopDownOutcome {
-    let budget_err = |acq: Result<[f64; 6], Rejection>| {
-        let r = Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded");
+    let cancel_err = |acq: Result<[f64; 6], Rejection>| {
+        let r = Rejection::new("budget", "BUDGET_EXHAUSTED", "grasp planning cancelled");
         let e = legacy_refusal(s, None, &r, Some(top_down_id(s)));
         TopDownOutcome { route: Err(e), acq, rejection: Some((r, true)) }
     };
-    if out_of_budget() {
-        let r = Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded");
-        return budget_err(Err(r));
+    if is_cancelled(s) {
+        let r = Rejection::new("budget", "BUDGET_EXHAUSTED", "grasp planning cancelled");
+        return cancel_err(Err(r));
     }
     let setup = &s.setup;
     let is_5dof = s.input.arm.arm_dof() == 5;
@@ -431,8 +453,8 @@ pub fn plan_legacy_top_down_budget(
         return TopDownOutcome { route: Err(e.into()), acq: Err(r.clone()), rejection: Some((r, true)) };
     }
     let q_acq = q6_of(&path.last());
-    if out_of_budget() {
-        return budget_err(Ok(q_acq));
+    if is_cancelled(s) {
+        return cancel_err(Ok(q_acq));
     }
     cur.q0 = q_acq;
     cur.goal_frame = GoalFrame::Tcp;
@@ -473,8 +495,8 @@ pub fn plan_legacy_top_down_budget(
     } else {
         (q_acq, 0.0)
     };
-    if out_of_budget() {
-        return budget_err(Ok(q_acq));
+    if is_cancelled(s) {
+        return cancel_err(Ok(q_acq));
     }
     let before = motion::ik_iterations();
     work.path_checks += 1;
@@ -496,8 +518,8 @@ pub fn plan_legacy_top_down_budget(
         }
     };
     let q_grasp = q6_of(&descend_path.last());
-    if out_of_budget() {
-        return budget_err(Ok(q_acq));
+    if is_cancelled(s) {
+        return cancel_err(Ok(q_acq));
     }
 
     // Target footprint and shared jaw rule on the exact box-centre contact along the actual
@@ -531,7 +553,6 @@ pub fn plan_legacy_top_down_budget(
         Err(m) if !has_footprint_evidence(s) => {
             let (grasp_r, closing_axis, q_tool, q_grasp) =
                 resolve_top_down_alignment(s, None, &td.grasp.r, q_tool, q_grasp);
-            let rej = Rejection::new("evidence", "NO_WIDTH_EVIDENCE", format!("evidence: {m}"));
             let jaw = make_deferred(fallback_margin(s), format!("box-only evidence: {m}"));
             return TopDownOutcome {
                 route: Ok(TopDownRoute {
@@ -544,7 +565,6 @@ pub fn plan_legacy_top_down_budget(
                     grasp_r,
                     closing_axis,
                     jaw,
-                    box_refusal: Some(rej),
                 }),
                 acq: Ok(q_acq),
                 rejection: None,
@@ -595,13 +615,12 @@ pub fn plan_legacy_top_down_budget(
                     grasp_r,
                     closing_axis,
                     jaw,
-                    box_refusal: None,
                 }),
                 acq: Ok(q_acq),
                 rejection: None,
             }
         }
-        (FootprintSource::Box, Err(rej)) => {
+        (FootprintSource::Box, Err(_)) => {
             let jaw = make_deferred(
                 t.margin.clone(),
                 "box-only evidence: the width is checked on the measured width at close range".into(),
@@ -617,7 +636,6 @@ pub fn plan_legacy_top_down_budget(
                     grasp_r,
                     closing_axis,
                     jaw,
-                    box_refusal: Some(rej),
                 }),
                 acq: Ok(q_acq),
                 rejection: None,
@@ -632,23 +650,27 @@ pub fn plan_legacy_top_down_budget(
     }
 }
 
-/// Build the `-top` adaptive candidate directly from the verified [`TopDownRoute`] (exact legacy
-/// contact point, height, pregrasp, and closing orientation; no `PAD_OVERLAP` check) and run
-/// Phase B whole-route preflight (`separation`, `lift`, carried-object keepout, payload torque,
-/// `withdrawal`, parent budget) within the reserved top-down deadline.
+/// Advisory Phase B whole-route preflight of the verified [`TopDownRoute`] inside the optional
+/// chord-search budget (`out_of_budget`): used solely to decide whether a higher-scoring chord
+/// may beat `-top` and to populate `selection.top_advisory`.
 ///
-/// Error payload: `(hypothesis, rejection, path_stage)`.
+/// Never disqualifies `-top` and never emits entries into `rejected` or `best_refusal`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn evaluate_top_down_from_legacy(
+pub(super) fn advisory_preflight_top_down(
     s: &Snapshot,
     t: &Target,
     tr: &TopDownRoute,
-    chord_index: usize,
     ctx: &Ctx,
     acq_ok: bool,
     work: &mut Work,
     out_of_budget: &dyn Fn() -> bool,
-) -> Result<(Chord, Candidate, AdaptiveRoute), Box<(Option<Hypothesis>, Rejection, bool)>> {
+) -> Result<Candidate, TopAdvisory> {
+    if out_of_budget() {
+        return Err(TopAdvisory {
+            code: "BUDGET_EXHAUSTED".into(),
+            phase: "advisory".into(),
+        });
+    }
     let contact_xy = [tr.td.target[0], tr.td.target[1]];
     let tangent = g::perp2(tr.closing_axis);
     let (lo, hi) = g::extent_along(&t.poly, t.centroid, tangent);
@@ -678,7 +700,7 @@ pub(super) fn evaluate_top_down_from_legacy(
     let insertion_m = (tr.td.tool.p[2] - gz).max(0.0);
     let hy = Hypothesis {
         index: TOP_DOWN_INDEX,
-        chord: chord_index,
+        chord: 0,
         class: DirClass::Vertical,
         tilt_deg: 0.0,
         deep: false,
@@ -693,17 +715,7 @@ pub(super) fn evaluate_top_down_from_legacy(
         table_clearance_m: gz + finger_low.min(env_low) - t.table_z,
         jaw_elevation_deg: 0.0,
     };
-    if let Some(rej) = &tr.box_refusal {
-        return Err(Box::new((Some(hy), rej.clone(), false)));
-    }
-    if out_of_budget() {
-        return Err(Box::new((
-            Some(hy),
-            Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded"),
-            true,
-        )));
-    }
-    let (checked, mut route) = super::preflight_candidate_from_start(
+    let (checked, _route) = super::preflight_candidate_from_start(
         s,
         t,
         &hy,
@@ -717,50 +729,37 @@ pub(super) fn evaluate_top_down_from_legacy(
         work,
         out_of_budget,
     )
-    .map_err(|r| Box::new((Some(hy.clone()), r, true)))?;
+    .map_err(|r| {
+        if r.phase == "budget" && r.code == "BUDGET_EXHAUSTED" {
+            TopAdvisory { code: "BUDGET_EXHAUSTED".into(), phase: "advisory".into() }
+        } else {
+            TopAdvisory { code: r.code, phase: r.phase.to_string() }
+        }
+    })?;
+    if checked.insufficient_evidence.is_some() {
+        return Err(TopAdvisory {
+            code: "INSUFFICIENT_EVIDENCE".into(),
+            phase: "lift".into(),
+        });
+    }
     let Some(rob) = score::robustness_budget(s, t, &hy, &checked, work, out_of_budget) else {
-        return Err(Box::new((
-            Some(hy),
-            Rejection::new("budget", "BUDGET_EXHAUSTED", "top-down reservation exceeded"),
-            true,
-        )));
+        return Err(TopAdvisory {
+            code: "BUDGET_EXHAUSTED".into(),
+            phase: "advisory".into(),
+        });
     };
     let scores = score::score(s, t, &chord, &hy, &checked, &rob);
     let vis = super::visible(s, t, &hy.pregrasp_pose());
     let id = top_down_id(s);
-    route.candidate_id = id.clone();
-    route.robustness = rob;
-    route.scores = scores;
-    route.visible_at_pregrasp = vis;
-    let cand = Candidate {
+    Ok(Candidate {
         id,
         hy,
-        chord: chord.clone(),
+        chord,
         checked,
         robustness: rob,
         scores,
         visible_at_pregrasp: vis,
-    };
-    Ok((chord, cand, route))
-}
-
-/// Top-down budget check closure helper (deadline + cooperative cancellation).
-pub(super) fn top_down_budget_fn<'a>(
-    s: &'a Snapshot,
-    deadline: Instant,
-) -> impl Fn() -> bool + 'a {
-    move || {
-        Instant::now() > deadline
-            || s.budget
-                .cancel
-                .as_ref()
-                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-    }
-}
-
-/// Top-down deadline from `start`.
-pub(super) fn top_down_deadline(start: Instant) -> Instant {
-    start + Duration::from_millis(TOP_DOWN_BUDGET_MS)
+    })
 }
 
 /// Whether the request carries footprint evidence beyond the box (contour, oriented box or a

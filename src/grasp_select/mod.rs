@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-pub use admission::BestRefusal;
+pub use admission::{BestRefusal, TopAdvisory};
 pub use snapshot::{capture, capture_from_env, Snapshot};
 use candidates::{Chord, DirClass, Hypothesis, Rejection};
 pub use feasibility::{
@@ -339,16 +339,24 @@ impl AdaptiveRoute {
     }
 }
 
+/// Executable route chosen by [`select_adaptive_route`]: either the shared legacy vertical route
+/// (`-top`, dispatched through the legacy orchestrator) or a checked adaptive chord route
+/// (dispatched through the Phase B adaptive orchestrator).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum SelectedRoute {
+    TopDown(admission::TopDownRoute),
+    Chord(AdaptiveRoute),
+}
+
 /// Result of Phase B actual-start selection + whole-route preflight ([`select_adaptive_route`]).
 #[derive(Debug, Clone)]
 pub struct AdaptiveSelection {
     pub selection: Selection,
-    pub route: Option<AdaptiveRoute>,
+    pub route: Option<SelectedRoute>,
     pub failing_phase: Option<&'static str>,
     /// Checked-alternative hint populated ONLY when an actually checked alternative exists
-    /// (e.g. an `InsufficientEvidence` candidate with a verified payload capacity bound, or a
-    /// verified legacy vertical grasp when adaptive safety checks such as lift torque or
-    /// carried-object keepout refuse).
+    /// (e.g. an `InsufficientEvidence` candidate with a verified payload capacity bound).
     pub checked_hint: Option<String>,
     /// Legacy vertical admission verdict from the same [`admission::plan_legacy_top_down`] call
     /// that built and checked the `-top` candidate.
@@ -360,20 +368,48 @@ impl AdaptiveSelection {
         self.selection.outcome == Outcome::Selected && self.route.is_some()
     }
 
-    /// Adaptive dry-run reply JSON (parity with Phase A fields plus authoritative Phase B
-    /// route summary, `failing_phase`, nested `legacy` verdict from the shared top-down check,
-    /// and checked-alternative `hint` only when verified).
+    /// Adaptive dry-run reply JSON (parity with Phase A fields plus authoritative route summary,
+    /// `failing_phase`, nested `legacy` verdict from the shared top-down check, optional
+    /// `top_advisory`, and checked-alternative `hint` only when verified).
     pub fn to_json(&self, s: &Snapshot) -> Value {
         let mut v = self.selection.to_json(s);
-        if let Some(route) = &self.route {
-            v["expected_duration_s"] = json!(route.budget.nominal_total_s);
-            v["pregrasp_mode"] = json!(route.pregrasp_mode.name());
-            v["checked_phases"] = json!(route.checked_phases);
-            if let Some(sc) = v.get_mut("selected_candidate").and_then(Value::as_object_mut) {
-                sc.insert("checked_phases".into(), json!(route.checked_phases));
-                sc.insert("pregrasp_mode".into(), json!(route.pregrasp_mode.name()));
-                sc.insert("expected_duration_s".into(), json!(route.budget.nominal_total_s));
+        match &self.route {
+            Some(SelectedRoute::Chord(route)) => {
+                v["expected_duration_s"] = json!(route.budget.nominal_total_s);
+                v["pregrasp_mode"] = json!(route.pregrasp_mode.name());
+                v["checked_phases"] = json!(route.checked_phases);
+                if let Some(sc) = v.get_mut("selected_candidate").and_then(Value::as_object_mut) {
+                    sc.insert("checked_phases".into(), json!(route.checked_phases));
+                    sc.insert("pregrasp_mode".into(), json!(route.pregrasp_mode.name()));
+                    sc.insert("expected_duration_s".into(), json!(route.budget.nominal_total_s));
+                }
             }
+            Some(SelectedRoute::TopDown(tr)) => {
+                let phases = tr.checked_phases();
+                let exp_dur = crate::grasp::legacy_expected_duration(
+                    &s.setup,
+                    tr.approach_duration,
+                    tr.td.camera_down,
+                    tr.transition_duration,
+                );
+                let jaw_json = tr.jaw.to_json();
+                v["expected_duration_s"] = json!(exp_dur);
+                v["pregrasp_mode"] = json!("legacy");
+                v["checked_phases"] = json!(phases);
+                v["selected_candidate"] = json!({
+                    "id": admission::top_down_id(s),
+                    "approach_class": "vertical",
+                    "tilt_deg": 0.0,
+                    "jaw": jaw_json,
+                    "checked_phases": phases,
+                    "pregrasp_mode": "legacy",
+                    "expected_duration_s": exp_dur,
+                });
+                v["margins"] = json!({
+                    "opening_reserve_m": tr.jaw.opening_reserve_m.is_finite().then_some(tr.jaw.opening_reserve_m),
+                });
+            }
+            None => {}
         }
         v["failing_phase"] = json!(self.failing_phase);
         if let Some(h) = self.checked_hint.clone() {
@@ -548,6 +584,9 @@ pub struct Selection {
     /// Without a winner: the structured reason, chosen before the alternatives are truncated
     /// (deepest phase, ties to the lowest candidate index).
     pub best_refusal: Option<admission::BestRefusal>,
+    /// Advisory failure/timeout of `-top`'s adaptive whole-route preflight (never disqualifies
+    /// `-top` and omitted from JSON when `None`).
+    pub top_advisory: Option<admission::TopAdvisory>,
 }
 
 impl Selection {
@@ -571,13 +610,41 @@ impl Selection {
     }
 }
 
-/// Order of the phases, for the deepest failure.
-const PHASE_ORDER: [&str; 13] = ["evidence", "geometry", "table", "pre_open", "insertion", "closure", "endpoint_ik", "acquisition", "transition", "separation", "lift", "withdrawal", "budget"];
-
+/// Phase depth for `best_refusal` ranking: cheap geometric/endpoint phases (0..=6) strictly
+/// precede path-preflight phases (7..=15), including path-stage `pre_open`, `insertion`, and
+/// `closure`.
 fn phase_rank(p: &str, path: bool) -> usize {
-    // an insertion failure of the path check is deeper than one of the cheap stage
-    let base = PHASE_ORDER.iter().position(|x| *x == p).unwrap_or(0);
-    if path && p == "insertion" { 8 } else { base }
+    if path {
+        match p {
+            "acquisition" => 7,
+            "transition" => 8,
+            "pre_open" => 9,
+            "insertion" => 10,
+            "closure" => 11,
+            "separation" => 12,
+            "lift" => 13,
+            "withdrawal" => 14,
+            "budget" => 15,
+            _ => 7,
+        }
+    } else {
+        match p {
+            "evidence" => 0,
+            "geometry" => 1,
+            "table" => 2,
+            "pre_open" => 3,
+            "insertion" => 4,
+            "closure" => 5,
+            "endpoint_ik" => 6,
+            "acquisition" => 7,
+            "transition" => 8,
+            "separation" => 12,
+            "lift" => 13,
+            "withdrawal" => 14,
+            "budget" => 15,
+            _ => 0,
+        }
+    }
 }
 
 struct Search<'a> {
@@ -635,7 +702,7 @@ impl Search<'_> {
         Selection {
             snapshot_id: self.s.id.clone(), outcome, code, message, ranked, rejected: self.rejected, rejections_by_phase: self.by_phase, rejections_by_code: self.by_code,
             evidence, stats: self.stats, elapsed_ms: self.total_start.elapsed().as_secs_f64() * 1000.0, budget_ms: self.s.budget.wall_ms, plan,
-            best_refusal: None,
+            best_refusal: None, top_advisory: None,
         }
     }
     fn exhausted(self, ranked_so_far: usize, evidence: Value) -> Selection {
@@ -746,29 +813,38 @@ fn canonical_seed(s: &Snapshot, t: &snapshot::Target) -> [f64; 6] {
     })
 }
 
-/// Budget exhaustion of the optional search: the verified top-down route when there is one
-/// (unless explicitly cancelled via `budget.cancel`), else no winner.
+/// Budget exhaustion of the optional search: returns `SelectedRoute::TopDown` whenever the
+/// legacy top-down route succeeded (unless explicitly cancelled via `budget.cancel`), else no
+/// winner.
 fn exhausted_or_top(
-    se: Search,
+    mut se: Search,
     n: usize,
     ev: Value,
-    top: &Option<(Candidate, AdaptiveRoute)>,
+    top_route: Option<admission::TopDownRoute>,
+    top_advisory: Option<admission::TopAdvisory>,
     legacy: admission::LegacyVerdict,
 ) -> AdaptiveSelection {
     if !se.cancelled() {
-        if let Some((c, route)) = top {
-            if c.checked.insufficient_evidence.is_none() {
-                let mut se = se;
-                se.stats.fully_checked = 1;
-                let sel = se.finish(Outcome::Selected, None, None, vec![c.clone()], ev);
-                return AdaptiveSelection { selection: sel, route: Some(route.clone()), failing_phase: None, checked_hint: None, legacy };
-            }
+        if let Some(tr) = top_route {
+            se.stats.fully_checked = 1;
+            let mut sel = se.finish(Outcome::Selected, None, None, Vec::new(), ev);
+            sel.top_advisory = top_advisory;
+            return AdaptiveSelection {
+                selection: sel,
+                route: Some(SelectedRoute::TopDown(tr)),
+                failing_phase: None,
+                checked_hint: None,
+                legacy,
+            };
         }
     }
-    let hint = (!se.cancelled() && legacy.reachable).then(|| {
-        "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
-    });
-    AdaptiveSelection { selection: se.exhausted(n, ev), route: None, failing_phase: Some("budget"), checked_hint: hint, legacy }
+    AdaptiveSelection {
+        selection: se.exhausted(n, ev),
+        route: None,
+        failing_phase: Some("budget"),
+        checked_hint: None,
+        legacy,
+    }
 }
 
 pub fn select_adaptive_route(
@@ -813,69 +889,94 @@ fn select_adaptive_route_inner(
         by_code: BTreeMap::new(),
     };
     let mut work = Work::default();
-    // Start the reserved top-down budget BEFORE any charged top-down / legacy work.
-    let top_deadline = admission::top_down_deadline(total_start);
-    let top_over = admission::top_down_budget_fn(s, top_deadline);
-    let t = match snapshot::target(s) {
+    if se.cancelled() {
+        let r = Rejection::new("budget", "BUDGET_EXHAUSTED", "grasp planning cancelled");
+        let legacy = admission::LegacyVerdict {
+            reachable: false,
+            code: Some(r.code.clone()),
+            message: Some(r.message.clone()),
+            admission: None,
+        };
+        return exhausted_or_top(se, 0, evidence_json(s, None), None, None, legacy);
+    }
+    // Build & check the legacy vertical route first (no 1.5 s wall deadline; cancellation only).
+    let target_res = snapshot::target(s);
+    let td_out = admission::plan_legacy_top_down(
+        s,
+        Some(target_res.as_ref().map_err(String::as_str)),
+        &mut work,
+    );
+    let acq_res = td_out.acq;
+    let acq_seed = acq_res.as_ref().ok().copied();
+    let (legacy, top_route) = match td_out.route {
+        Ok(tr) => (admission::LegacyVerdict::from_ok(&tr), Some(tr)),
+        Err(e) => (admission::LegacyVerdict::from_err(e), None),
+    };
+    if se.cancelled() {
+        se.stats.work = work;
+        return exhausted_or_top(se, 0, evidence_json(s, target_res.as_ref().ok()), None, None, legacy);
+    }
+    let t = match target_res {
         Ok(t) => t,
         Err(m) => {
-            let td_out = admission::plan_legacy_top_down_budget(s, Some(Err(&m)), &mut work, &top_over);
-            let legacy = match td_out.route {
-                Ok(tr) => admission::LegacyVerdict::from_ok(&tr),
-                Err(e) => admission::LegacyVerdict::from_err(e),
-            };
-            let hint = legacy.reachable.then(|| {
-                "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
-            });
-            *se.by_phase.entry("evidence").or_default() += 1;
             let ev = evidence_json(s, None);
-            let sel = se.finish(
-                Outcome::Infeasible,
-                Some("INVALID_COMMAND".into()),
-                Some(format!("evidence: {m}")),
-                Vec::new(),
-                ev,
-            );
+            se.stats.work = work;
+            if let Some(tr) = top_route {
+                se.stats.fully_checked = 1;
+                let sel = se.finish(Outcome::Selected, None, None, Vec::new(), ev);
+                return AdaptiveSelection {
+                    selection: sel,
+                    route: Some(SelectedRoute::TopDown(tr)),
+                    failing_phase: None,
+                    checked_hint: None,
+                    legacy,
+                };
+            }
+            if let Some((r, path_stage)) = td_out.rejection {
+                se.reject_bare(Some(admission::top_down_id(s)), admission::TOP_DOWN_INDEX, r, path_stage);
+            } else {
+                se.reject_bare(
+                    None,
+                    usize::MAX,
+                    Rejection::new("evidence", "INVALID_COMMAND", format!("evidence: {m}")),
+                    false,
+                );
+            }
+            let picked = se.pick_best_refusal();
+            let best = picked
+                .as_ref()
+                .map(|(cid, r)| admission::BestRefusal::from_rejection(cid.clone(), r));
+            let (phase, code, msg) = match picked {
+                Some((_, r)) => (r.phase, r.code, r.message),
+                None => ("evidence", "INVALID_COMMAND".into(), format!("evidence: {m}")),
+            };
+            let mut sel = se.finish(Outcome::Infeasible, Some(code), Some(msg), Vec::new(), ev);
+            sel.best_refusal = best;
             return AdaptiveSelection {
                 selection: sel,
                 route: None,
-                failing_phase: Some("evidence"),
-                checked_hint: hint,
+                failing_phase: Some(phase),
+                checked_hint: None,
                 legacy,
             };
         }
     };
     let ev = evidence_json(s, Some(&t));
-    let td_out = admission::plan_legacy_top_down_budget(s, Some(Ok(&t)), &mut work, &top_over);
-    let acq_res = td_out.acq;
-    let acq_seed = acq_res.as_ref().ok().copied();
+    // Optional-search budget starts here (covers -top advisory preflight and chord search);
+    // `total_start` stays untouched for total `elapsed_ms`.
+    se.start = Instant::now();
 
-    let (mut chords, chord_rej) = candidates::chords(&t, &s.tool);
-    let mut cheap = candidates::CheapStats::default();
     let ctx = admission::Ctx { policy: gripper_policy, limit: gripper_limit, close_speed_limit, has_gravity_model };
-    let (legacy, top) = match td_out.route {
-        Ok(tr) => {
-            let legacy = admission::LegacyVerdict::from_ok(&tr);
-            let top = match admission::evaluate_top_down_from_legacy(
-                s, &t, &tr, chords.len(), &ctx, acq_res.is_ok(), &mut work, &top_over,
-            ) {
-                Ok((chord, cand, route)) => {
-                    chords.push(chord);
-                    Some((cand, route))
-                }
-                Err(b) => {
-                    let (hy, r, path_stage) = *b;
-                    match hy {
-                        Some(hy) => se.reject(&hy, r, path_stage, path_stage),
-                        None => se.reject_bare(Some(admission::top_down_id(s)), admission::TOP_DOWN_INDEX, r, path_stage),
-                    }
-                    None
-                }
-            };
-            (legacy, top)
+    let (top_advisory_cand, top_advisory) = match &top_route {
+        Some(tr) if tr.jaw.deferred.is_none() => {
+            let over = || se.out_of_budget();
+            match admission::advisory_preflight_top_down(s, &t, tr, &ctx, acq_res.is_ok(), &mut work, &over) {
+                Ok(cand) => (Some(cand), None),
+                Err(adv) => (None, Some(adv)),
+            }
         }
-        Err(e) => {
-            let legacy = admission::LegacyVerdict::from_err(e);
+        Some(_) => (None, None),
+        None => {
             // When acquisition itself failed, keep `acq_res` for the wholly-unreachable path so
             // `rejections.acquisition` is counted once rather than twice.
             if acq_res.is_ok() {
@@ -883,16 +984,16 @@ fn select_adaptive_route_inner(
                     se.reject_bare(Some(admission::top_down_id(s)), admission::TOP_DOWN_INDEX, r, path_stage);
                 }
             }
-            (legacy, None)
+            (None, None)
         }
     };
-    if se.cancelled() {
+    if se.out_of_budget() {
         se.stats.work = work;
-        se.stats.lattice_tests = cheap.lattice_tests;
-        return exhausted_or_top(se, 0, ev, &top, legacy);
+        return exhausted_or_top(se, 0, ev, top_route, top_advisory, legacy);
     }
-    // Optional-search budget starts here; `total_start` stays untouched for total `elapsed_ms`.
-    se.start = Instant::now();
+
+    let (chords, chord_rej) = candidates::chords(&t, &s.tool);
+    let mut cheap = candidates::CheapStats::default();
     se.stats.chords = chords.len();
     for r in chord_rej {
         se.reject_bare(None, usize::MAX, r, false);
@@ -906,7 +1007,7 @@ fn select_adaptive_route_inner(
     if se.out_of_budget() {
         se.stats.work = work;
         se.stats.lattice_tests = cheap.lattice_tests;
-        return exhausted_or_top(se, 0, ev, &top, legacy);
+        return exhausted_or_top(se, 0, ev, top_route, top_advisory, legacy);
     }
 
     let canonical_seed = canonical_seed(s, &t);
@@ -916,7 +1017,7 @@ fn select_adaptive_route_inner(
         if se.out_of_budget() {
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
-            return exhausted_or_top(se, 0, ev, &top, legacy);
+            return exhausted_or_top(se, 0, ev, top_route, top_advisory, legacy);
         }
         let mut seeds = Vec::with_capacity(4);
         if let Some(q) = seed_cache.get(&(hy.class, hy.half_turn)) {
@@ -934,7 +1035,7 @@ fn select_adaptive_route_inner(
                 Err(feasibility::EndpointIkError::BudgetExhausted) => {
                     se.stats.work = work;
                     se.stats.lattice_tests = cheap.lattice_tests;
-                    return exhausted_or_top(se, 0, ev, &top, legacy);
+                    return exhausted_or_top(se, 0, ev, top_route, top_advisory, legacy);
                 }
                 Err(err) => {
                     se.reject(&hy, err.into_rejection("contact pose"), false, false);
@@ -954,7 +1055,7 @@ fn select_adaptive_route_inner(
                 Err(feasibility::EndpointIkError::BudgetExhausted) => {
                     se.stats.work = work;
                     se.stats.lattice_tests = cheap.lattice_tests;
-                    return exhausted_or_top(se, 0, ev, &top, legacy);
+                    return exhausted_or_top(se, 0, ev, top_route, top_advisory, legacy);
                 }
                 Err(err) => {
                     se.reject(&hy, err.into_rejection("pre-grasp pose"), false, false);
@@ -968,9 +1069,9 @@ fn select_adaptive_route_inner(
     }
     se.stats.ik_survivors = screened.len();
 
-    // If acquisition failed AND no candidate passed endpoint IK AND no verified top-down route
-    // exists, preserve the exact acquisition failure diagnostics.
-    if screened.is_empty() && top.is_none() {
+    // If acquisition failed AND no candidate passed endpoint IK AND legacy refused,
+    // preserve the exact acquisition failure diagnostics.
+    if screened.is_empty() && top_route.is_none() {
         if let Err(r) = acq_res {
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
@@ -1019,7 +1120,6 @@ fn select_adaptive_route_inner(
 
     let acq_ok = acq_res.is_ok();
     let mut entries: Vec<(Candidate, AdaptiveRoute)> = Vec::new();
-    entries.extend(top.iter().cloned());
 
     // Returns `true` when the optional-search budget or cancellation flag tripped.
     let evaluate = |se: &mut Search,
@@ -1080,14 +1180,14 @@ fn select_adaptive_route_inner(
             let n = entries.len();
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
-            return exhausted_or_top(se, n, ev, &top, legacy);
+            return exhausted_or_top(se, n, ev, top_route, top_advisory, legacy);
         }
         let (hy, _, q_pre_seed, _) = &screened[i];
         if evaluate(&mut se, hy, *q_pre_seed, &mut work, &mut entries) {
             let n = entries.len();
             se.stats.work = work;
             se.stats.lattice_tests = cheap.lattice_tests;
-            return exhausted_or_top(se, n, ev, &top, legacy);
+            return exhausted_or_top(se, n, ev, top_route, top_advisory, legacy);
         }
     }
 
@@ -1121,7 +1221,7 @@ fn select_adaptive_route_inner(
                 let n = entries.len();
                 se.stats.work = work;
                 se.stats.lattice_tests = cheap.lattice_tests;
-                return exhausted_or_top(se, n, ev, &top, legacy);
+                return exhausted_or_top(se, n, ev, top_route, top_advisory, legacy);
             }
             next += 1;
             se.stats.refined += 1;
@@ -1155,14 +1255,14 @@ fn select_adaptive_route_inner(
                                         let n = entries.len();
                                         se.stats.work = work;
                                         se.stats.lattice_tests = cheap.lattice_tests;
-                                        return exhausted_or_top(se, n, ev, &top, legacy);
+                                        return exhausted_or_top(se, n, ev, top_route, top_advisory, legacy);
                                     }
                                 }
                                 Err(feasibility::EndpointIkError::BudgetExhausted) => {
                                     let n = entries.len();
                                     se.stats.work = work;
                                     se.stats.lattice_tests = cheap.lattice_tests;
-                                    return exhausted_or_top(se, n, ev, &top, legacy);
+                                    return exhausted_or_top(se, n, ev, top_route, top_advisory, legacy);
                                 }
                                 Err(err) => se.reject(&hy, err.into_rejection("refined pre-grasp pose"), true, false),
                             }
@@ -1171,7 +1271,7 @@ fn select_adaptive_route_inner(
                             let n = entries.len();
                             se.stats.work = work;
                             se.stats.lattice_tests = cheap.lattice_tests;
-                            return exhausted_or_top(se, n, ev, &top, legacy);
+                            return exhausted_or_top(se, n, ev, top_route, top_advisory, legacy);
                         }
                         Err(err) => se.reject(&hy, err.into_rejection("refined contact pose"), true, false),
                     }
@@ -1186,13 +1286,28 @@ fn select_adaptive_route_inner(
 
     se.stats.work = work;
     se.stats.lattice_tests = cheap.lattice_tests;
-    se.stats.fully_checked = entries.len();
-    // Enforce absolute search budget right before publishing a route so the last evaluation
-    // cannot exceed `budget_ms` and still return `Outcome::Selected`.
+    se.stats.fully_checked = entries.len() + usize::from(top_route.is_some());
+    // Enforce absolute optional-search budget before publishing a chord winner.
     if se.out_of_budget() {
         let n = entries.len();
-        return exhausted_or_top(se, n, ev, &top, legacy);
+        return exhausted_or_top(se, n, ev, top_route, top_advisory, legacy);
     }
+    pick_adaptive_winner(se, entries, top_route, top_advisory_cand, top_advisory, ev, legacy)
+}
+
+/// Final ranking between `-top` and checked chord candidates: a checked chord wins over `-top`
+/// only if `-top`'s advisory preflight passed and the chord scores higher, or `-top` is deferred
+/// and the chord is checked; else `-top`. `best_refusal` is populated only when legacy refused
+/// and no chord passed.
+fn pick_adaptive_winner(
+    se: Search,
+    mut entries: Vec<(Candidate, AdaptiveRoute)>,
+    top_route: Option<admission::TopDownRoute>,
+    top_advisory_cand: Option<Candidate>,
+    top_advisory: Option<admission::TopAdvisory>,
+    ev: Value,
+    legacy: admission::LegacyVerdict,
+) -> AdaptiveSelection {
     entries.sort_by(|a, b| {
         let ia = a.0.checked.insufficient_evidence.is_some();
         let ib = b.0.checked.insufficient_evidence.is_some();
@@ -1200,6 +1315,42 @@ fn select_adaptive_route_inner(
             .then(b.0.scores.total.total_cmp(&a.0.scores.total))
             .then(a.0.hy.index.cmp(&b.0.hy.index))
     });
+    let best_chord_ok = entries.first().is_some_and(|(c, _)| c.checked.insufficient_evidence.is_none());
+    if let Some(tr) = top_route {
+        let chord_wins = if best_chord_ok {
+            let best_score = entries[0].0.scores.total;
+            tr.jaw.deferred.is_some()
+                || top_advisory_cand
+                    .as_ref()
+                    .is_some_and(|top_c| best_score > top_c.scores.total)
+        } else {
+            false
+        };
+        if chord_wins {
+            let route = entries[0].1.clone();
+            let ranked: Vec<Candidate> = entries.into_iter().map(|(c, _)| c).collect();
+            let mut sel = se.finish(Outcome::Selected, None, None, ranked, ev);
+            sel.top_advisory = top_advisory;
+            return AdaptiveSelection {
+                selection: sel,
+                route: Some(SelectedRoute::Chord(route)),
+                failing_phase: None,
+                checked_hint: None,
+                legacy,
+            };
+        }
+        let ranked: Vec<Candidate> = entries.into_iter().map(|(c, _)| c).collect();
+        let mut sel = se.finish(Outcome::Selected, None, None, ranked, ev);
+        sel.plan = None;
+        sel.top_advisory = top_advisory;
+        return AdaptiveSelection {
+            selection: sel,
+            route: Some(SelectedRoute::TopDown(tr)),
+            failing_phase: None,
+            checked_hint: None,
+            legacy,
+        };
+    }
     let ranked: Vec<Candidate> = entries.iter().map(|(c, _)| c.clone()).collect();
     match entries.first() {
         Some((c, route)) if c.checked.insufficient_evidence.is_none() => {
@@ -1207,7 +1358,7 @@ fn select_adaptive_route_inner(
             let sel = se.finish(Outcome::Selected, None, None, ranked, ev);
             AdaptiveSelection {
                 selection: sel,
-                route: Some(route),
+                route: Some(SelectedRoute::Chord(route)),
                 failing_phase: None,
                 checked_hint: None,
                 legacy,
@@ -1256,16 +1407,13 @@ fn select_adaptive_route_inner(
                     "no contact chord on the footprint".into(),
                 ),
             };
-            let hint = legacy.reachable.then(|| {
-                "legacy vertical grasp passed its checks on this target; retry with strategy \"legacy\" if acceptable".to_string()
-            });
             let mut sel = se.finish(Outcome::Infeasible, Some(code), Some(m), ranked, ev);
             sel.best_refusal = best;
             AdaptiveSelection {
                 selection: sel,
                 route: None,
                 failing_phase: Some(phase),
-                checked_hint: hint,
+                checked_hint: None,
                 legacy,
             }
         }
@@ -1965,7 +2113,7 @@ impl Selection {
         // alternatives: the best other candidate per class, then the shortlisted rejections
         let mut alts: Vec<Value> = Vec::new();
         let mut classes = Vec::new();
-        for c in self.ranked.iter().skip(usize::from(self.outcome == Outcome::Selected)) {
+        for c in self.ranked.iter().skip(usize::from(self.plan.is_some())) {
             if alts.len() >= MAX_ALTERNATIVES / 2 { break; }
             if classes.contains(&c.hy.class) { continue; }
             classes.push(c.hy.class);
@@ -1979,7 +2127,7 @@ impl Selection {
                 "phase": r.rejection.phase, "code": r.rejection.code, "message": r.rejection.message, "value": r.rejection.value, "bound": r.rejection.bound,
                 "geometry": r.rejection.geometry, "s": r.rejection.s}));
         }
-        json!({
+        let mut out = json!({
             "strategy": "adaptive",
             "outcome": self.outcome.name(),
             "snapshot_id": self.snapshot_id,
@@ -2001,6 +2149,10 @@ impl Selection {
                 "elapsed_ms": self.elapsed_ms, "budget_ms": self.budget_ms,
                 "quotas": {"shortlist": SHORTLIST, "reserved_radial_oblique": RESERVED_RADIAL_OBLIQUE, "max_per_class": MAX_PER_CLASS, "refine": REFINE},
             },
-        })
+        });
+        if let Some(adv) = &self.top_advisory {
+            out["top_advisory"] = adv.to_json();
+        }
+        out
     }
 }
