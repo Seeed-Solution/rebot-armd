@@ -2051,5 +2051,4 @@ impl PendingDisableShadowBatch {
 
 
 #[cfg(test)]
-mod tx_chokepoint_tests {
-}
+mod tx_chokepoint_tests;
