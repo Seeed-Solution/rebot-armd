@@ -1343,14 +1343,15 @@ impl SupervisorInner {
                 {
                     let eval = self.workspace_policy().and_then(|(ws, cam)| {
                         (!self.rt_executor_owned
-                            || bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false))
+                            || bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, ramp.keepout_only))
                         .then(|| {
-                            crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                            crate::chain::WorkspaceEvaluator::new_with_tcp_in_mode(
                                 &self.config.arm_model,
                                 ws,
                                 cam,
                                 self.config.tcp_offset,
                                 &mut bufs,
+                                ramp.keepout_only,
                             )
                         })
                     });

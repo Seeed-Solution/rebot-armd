@@ -2375,9 +2375,6 @@ impl crate::supervisor::SupervisorInner {
             let Some((ws, cam)) = self.workspace_policy() else {
                 return Ok(());
             };
-            if keepout_only && ws.keepout_boxes.is_empty() {
-                return Ok(());
-            }
             let mut eval = WorkspaceEvaluator::new_with_tcp_in_mode(
                 &self.config.arm_model,
                 ws,
@@ -2606,33 +2603,49 @@ impl crate::supervisor::SupervisorInner {
         let mut committed_ws_min_d = None;
         let mut committed_keepout_min_d = None;
         if let Some((ws, cam)) = self.workspace_policy() {
-            let keepout_ws = keepout_only.then(|| ws.keepout_only());
-            let ws_ref = keepout_ws.as_ref().unwrap_or(ws);
-            let skip_ws = keepout_only && ws_ref.keepout_boxes.is_empty();
-            if !skip_ws {
-                let eval = WorkspaceEvaluator::new_with_tcp(&self.config.arm_model, ws_ref, cam, self.config.tcp_offset);
-                let mut c_prev = eval.alloc_buf();
-                eval.eval_into(prev_q, &mut c_prev, "tracking_ramp_out")
+            let mut tmp_bufs = crate::chain::EvalBufs::default();
+            let eval = WorkspaceEvaluator::new_with_tcp_in_mode(
+                &self.config.arm_model, ws, cam, self.config.tcp_offset, &mut tmp_bufs, keepout_only,
+            );
+            let mut c_prev = eval.alloc_buf();
+            eval.eval_into(prev_q, &mut c_prev, "tracking_ramp_out")
+                .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
+            let cached_depths = if keepout_only {
+                &self.tracking.ws_keepout_min_depths
+            } else {
+                &self.tracking.ws_min_depths
+            };
+            let mut local_min_d = match cached_depths {
+                Some((rev, md))
+                    if *rev == self.workspace_revision
+                        && md.as_slice().len() == eval.total_slots =>
+                {
+                    md.clone()
+                }
+                _ => eval.init_min_depths(&c_prev),
+            };
+            if let Err((_, f)) = eval.sweep_linear_step(
+                prev_q,
+                &q_next,
+                &c_prev,
+                &mut local_min_d,
+                budget,
+                MAX_KEEPOUT_EVALS_PER_TICK,
+                "tracking_ramp_out",
+                "tracking_ramp_out",
+            ) {
+                return Err(TrackingReject::Workspace(SafetyError::from_workspace(f)));
+            }
+            if fresh_meas {
+                let mut c_meas = eval.alloc_buf();
+                eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_ramp_out")
                     .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
-                let cached_depths = if keepout_only {
-                    &self.tracking.ws_keepout_min_depths
-                } else {
-                    &self.tracking.ws_min_depths
-                };
-                let mut local_min_d = match cached_depths {
-                    Some((rev, md))
-                        if *rev == self.workspace_revision
-                            && md.as_slice().len() == eval.total_slots =>
-                    {
-                        md.clone()
-                    }
-                    _ => eval.init_min_depths(&c_prev),
-                };
+                let mut local_meas_min_d = eval.init_min_depths(&c_meas);
                 if let Err((_, f)) = eval.sweep_linear_step(
-                    prev_q,
+                    &self.measured_positions,
                     &q_next,
-                    &c_prev,
-                    &mut local_min_d,
+                    &c_meas,
+                    &mut local_meas_min_d,
                     budget,
                     MAX_KEEPOUT_EVALS_PER_TICK,
                     "tracking_ramp_out",
@@ -2640,29 +2653,11 @@ impl crate::supervisor::SupervisorInner {
                 ) {
                     return Err(TrackingReject::Workspace(SafetyError::from_workspace(f)));
                 }
-                if fresh_meas {
-                    let mut c_meas = eval.alloc_buf();
-                    eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_ramp_out")
-                        .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
-                    let mut local_meas_min_d = eval.init_min_depths(&c_meas);
-                    if let Err((_, f)) = eval.sweep_linear_step(
-                        &self.measured_positions,
-                        &q_next,
-                        &c_meas,
-                        &mut local_meas_min_d,
-                        budget,
-                        MAX_KEEPOUT_EVALS_PER_TICK,
-                        "tracking_ramp_out",
-                        "tracking_ramp_out",
-                    ) {
-                        return Err(TrackingReject::Workspace(SafetyError::from_workspace(f)));
-                    }
-                }
-                if keepout_only {
-                    committed_keepout_min_d = Some((self.workspace_revision, local_min_d));
-                } else {
-                    committed_ws_min_d = Some((self.workspace_revision, local_min_d));
-                }
+            }
+            if keepout_only {
+                committed_keepout_min_d = Some((self.workspace_revision, local_min_d));
+            } else {
+                committed_ws_min_d = Some((self.workspace_revision, local_min_d));
             }
         }
 
@@ -3209,23 +3204,6 @@ impl crate::supervisor::SupervisorInner {
         let Some((ws_full, cam)) = self.workspace_policy() else {
             return Ok(None);
         };
-        if keepout_only && ws_full.keepout_boxes.is_empty() {
-            if let Some((rev, md)) = prev_depths {
-                let src = md.as_slice();
-                if bufs.tracking_staged_ws.len() < src.len() {
-                    if self.rt_executor_owned {
-                        return Err(FallbackStepErr::WorkspaceStepViolation(crate::chain::WorkspaceFailureRt {
-                            kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
-                            phase: "tracking_fallback",
-                        }));
-                    }
-                    bufs.tracking_staged_ws.resize(src.len(), 0.0);
-                }
-                bufs.tracking_staged_ws[..src.len()].copy_from_slice(src);
-                return Ok(Some((*rev, src.len())));
-            }
-            return Ok(None);
-        }
         if !bufs.can_eval_rt(&self.config.arm_model, ws_full, cam, self.config.tcp_offset, keepout_only) {
             if self.rt_executor_owned {
                 return Err(FallbackStepErr::WorkspaceStepViolation(crate::chain::WorkspaceFailureRt {
@@ -3331,12 +3309,10 @@ impl crate::supervisor::SupervisorInner {
         use crate::chain::WorkspaceEvaluator;
         use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
         let Some((ws_full, cam)) = self.workspace_policy() else { return Ok(None) };
-        let keepout_ws = keepout_only.then(|| ws_full.keepout_only());
-        let ws = keepout_ws.as_ref().unwrap_or(ws_full);
-        if keepout_only && ws.keepout_boxes.is_empty() {
-            return Ok(prev_depths.cloned());
-        }
-        let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+        let mut tmp_bufs = crate::chain::EvalBufs::default();
+        let eval = WorkspaceEvaluator::new_with_tcp_in_mode(
+            &self.config.arm_model, ws_full, cam, self.config.tcp_offset, &mut tmp_bufs, keepout_only,
+        );
         let mut committed = None;
         if let Some(pq) = prev {
             let mut c_prev = eval.alloc_buf();

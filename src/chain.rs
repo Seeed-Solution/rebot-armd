@@ -1484,9 +1484,9 @@ impl<'a> WorkspaceEvaluator<'a> {
         Self::new_with_tcp_in_mode(model, ws, cam, tcp_offset, bufs, false)
     }
 
-    /// Zero-allocation equivalent of constructing on `ws.keepout_only()` when `keepout_only` is
-    /// true: disables `floor`, outer `box`, and `max_reach` in the evaluator without cloning
-    /// `WorkspacePolicy` or its `keepout_boxes` / `link_capsules` vectors.
+    /// Zero-allocation hard-slots-only mode when `keepout_only` is true (used by Park tracking
+    /// ramp-out/fallback): disables soft outer `box` and `max_reach` while keeping `floor_z`,
+    /// `keepout_boxes`, and `self_collision` hard slots active without cloning `WorkspacePolicy`.
     pub fn new_with_tcp_in_mode(
         model: &'a ArmModel,
         ws: &'a crate::model::WorkspacePolicy,
@@ -1574,7 +1574,7 @@ impl<'a> WorkspaceEvaluator<'a> {
             ws,
             cam,
             shoulder: model.shoulder_rz(),
-            floor: if keepout_only { f64::NEG_INFINITY } else { f64::from(ws.floor_z_m) },
+            floor: f64::from(ws.floor_z_m),
             box_lo: if keepout_only { [f64::NEG_INFINITY; 3] } else { ws.box_min_m.map(f64::from) },
             box_hi: if keepout_only { [f64::INFINITY; 3] } else { ws.box_max_m.map(f64::from) },
             max_reach,
