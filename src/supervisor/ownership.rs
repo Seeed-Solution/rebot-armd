@@ -3,6 +3,108 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Ownership mode of [`ArmSupervisor`], mirrored atomically for lock-free routing checks.
+pub const OWNER_LEGACY: u8 = 0;
+pub const OWNER_TRANSFERRING: u8 = 1;
+pub const OWNER_EXECUTOR: u8 = 2;
+pub const OWNER_FAILED: u8 = 3;
+
+pub(super) enum OwnerSlot {
+    Legacy,
+    Transferring,
+    Executor(crate::rt_core::executor::RtExecutorHandle),
+    Failed,
+}
+
+/// RAII rollback guard for the single `.await` inside [`ArmSupervisor::start_executor_with_hooks`].
+struct TransferGuard<'a> {
+    sup: &'a ArmSupervisor,
+    armed: bool,
+    saved_legacy_stop: Option<Arc<AtomicBool>>,
+}
+
+/// Immutable host/process boot identity exposed on `GET /api/v1/diagnostics/tick` so offline
+/// qualification analysis can detect kernel reboots and `panic = "abort"` daemon restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub boot_id: Option<String>,
+    pub process_start_unix_ns: Option<u64>,
+}
+
+/// Pure parser computing a process's Unix-epoch start timestamp (nanoseconds) from Linux
+/// `/proc/stat` (`btime` seconds) and `/proc/self/stat` (field 22 `starttime` in clock ticks),
+/// given `sysconf(_SC_CLK_TCK)`. Handles arbitrary `comm` names containing spaces or parentheses
+/// by splitting after the final `')'`. Returns `None` on parse failure, `clk_tck <= 0`, or
+/// arithmetic overflow (never emits a placeholder).
+pub fn parse_linux_process_start_unix_ns(
+    proc_stat: &str,
+    proc_self_stat: &str,
+    clk_tck: i64,
+) -> Option<u64> {
+    if clk_tck <= 0 {
+        return None;
+    }
+    let btime_secs: u64 = proc_stat.lines().find_map(|line| {
+        let mut toks = line.split_whitespace();
+        if toks.next()? == "btime" {
+            toks.next()?.parse::<u64>().ok()
+        } else {
+            None
+        }
+    })?;
+    let after_comm = proc_self_stat.rsplit_once(')')?.1;
+    // Fields after `)` begin at field 3 (`state`), so field 22 (`starttime`) is 0-based index 19.
+    let start_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+    let btime_ns = u128::from(btime_secs).checked_mul(1_000_000_000)?;
+    let offset_ns = u128::from(start_ticks)
+        .checked_mul(1_000_000_000)?
+        .checked_div(u128::try_from(clk_tck).ok()?)?;
+    let total_ns = btime_ns.checked_add(offset_ns)?;
+    u64::try_from(total_ns).ok()
+}
+
+fn read_process_identity() -> ProcessIdentity {
+    #[cfg(target_os = "linux")]
+    {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // SAFETY: `sysconf(_SC_CLK_TCK)` is a thread-safe POSIX query with no pointer arguments.
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as i64 };
+        let process_start_unix_ns = (|| {
+            let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+            let proc_self_stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+            parse_linux_process_start_unix_ns(&proc_stat, &proc_self_stat, clk_tck)
+        })();
+        ProcessIdentity {
+            boot_id,
+            process_start_unix_ns,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let process_start_unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
+            .filter(|&ns| ns > 0);
+        ProcessIdentity {
+            boot_id: None,
+            process_start_unix_ns,
+        }
+    }
+}
+
+static PROCESS_IDENTITY: std::sync::OnceLock<ProcessIdentity> = std::sync::OnceLock::new();
+
+/// Eagerly initializes and returns the process-wide immutable boot identity.
+/// Called at the top of `main()` and in `ArmSupervisor::new()`.
+pub fn init_process_identity() -> &'static ProcessIdentity {
+    PROCESS_IDENTITY.get_or_init(read_process_identity)
+}
+
+
 impl Drop for TransferGuard<'_> {
     fn drop(&mut self) {
         if self.armed {

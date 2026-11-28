@@ -3,6 +3,41 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// How often a reader that waits for the next sample looks again.
+pub(super) const OBS_POLL: Duration = Duration::from_millis(1);
+
+/// How long [`ArmSupervisor::observation`] waits for the read lock when no sample answers.
+pub const OBS_LOCK_WAIT: Duration = Duration::from_millis(500);
+
+/// 503 `OBSERVATION_UNAVAILABLE`: neither a fresh sample nor the read lock in time.
+pub(super) fn observation_unavailable() -> ArmError {
+    ArmError::Rejected { status: 503, code: "OBSERVATION_UNAVAILABLE".into(),
+        message: "No current observation: the control tick has not published and the supervisor lock stayed busy".into() }
+}
+
+pub(super) fn owner_transferred() -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "OWNER_TRANSFERRED".into(),
+        message: "ArmCore is owned by the synchronous RT executor; legacy lock path is disabled".into(),
+    }
+}
+
+pub(super) fn executor_unavailable() -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor ownership is transitioning or unavailable".into(),
+    }
+}
+
+/// A published sample, or the read guard when no sample answers (no control loop running).
+enum Fresh<'a> {
+    Sample(Arc<crate::rt_core::publish::Snapshot>),
+    Locked(crate::supervisor_lock::SupReadGuard<'a, SupervisorInner>),
+}
+
+
 impl SupervisorInner {
     pub(super) fn gravity_output_enabled(&self) -> bool {
         self.gravity_compensated

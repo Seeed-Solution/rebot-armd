@@ -3,6 +3,69 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Semantic purpose attached to the active PR0C `ModeSwitch` session on [`SupervisorInner`]
+/// (`Copy`, 0 heap alloc). Every terminal transition — normal completion, gate revocation,
+/// or external revocation — flows through a single RT completion handler.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ModeSwitchPurpose {
+    /// Direct PR0C `StartModeSwitch` caller (reference gripper confirm, standalone tests).
+    Standalone,
+    /// Hardware gravity-comp entry (`POS_VEL -> MIT` on J1–J6); payload lives in
+    /// `SupervisorInner::pending_gravity_enter`.
+    GravityCompEnter,
+    /// Stop-direction hardware gravity-comp exit (`MIT -> POS_VEL` on J1–J6).
+    GravityCompExit {
+        hold: [f32; 6],
+    },
+    /// MIT tracking activation (`POS_VEL -> MIT` on configured MIT joints).
+    MitActivate {
+        mask: u64,
+        hold_positions: [f32; crate::rt_core::mailbox::MAX_DOF],
+        ff: [f32; crate::rt_core::mailbox::MAX_DOF],
+    },
+    /// Stop-direction MIT tracking handback (`MIT -> POS_VEL` on active MIT joints).
+    MitHandBack {
+        reason: MitHandBackReason,
+        mask: u64,
+        hold_positions: [f32; crate::rt_core::mailbox::MAX_DOF],
+        ff: [f32; crate::rt_core::mailbox::MAX_DOF],
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MitHandBackReason {
+    Park,
+    AuthorizationRevoked,
+    GravityCompEntry,
+    Rearm,
+}
+
+/// Preallocated, zero-allocation inline holder for one PR0C `ModeSwitch` session inside
+/// [`SupervisorInner`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ModeSwitchRunner {
+    active_session: Option<crate::rt_core::session::SessionId>,
+    purpose: ModeSwitchPurpose,
+    machine: Option<crate::motor_mode::ModeSwitch>,
+    event_tx: Option<crate::rt_core::stream::StreamProducer<crate::motor_mode::ModeSwitchEvent>>,
+    retained_events: [Option<crate::motor_mode::ModeSwitchEvent>; 16],
+    retained_len: usize,
+    recent_terminals: [Option<crate::motor_mode::ModeSwitchSnapshot>; 4],
+    recent_terminal_cursor: usize,
+}
+
+/// Allocates a collision-free `ActionId` for a router-bound `ModeSwitch` session terminal
+/// (session-request namespace bit set, never equal to a broker `ActionId`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn next_mode_switch_terminal_action_id() -> crate::rt_core::broker::ActionId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    crate::rt_core::broker::ActionId(crate::rt_core::reply_router::SESSION_REQUEST_ID_BIT | n)
+}
+
+
 #[cfg(not(target_arch = "wasm32"))]
 impl ModeSwitchRunner {
     pub(crate) fn new() -> Self {

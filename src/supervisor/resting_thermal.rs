@@ -3,6 +3,19 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Zero-allocation tracker of continuous thermal cooldown dwell across consecutive fresh
+/// temperature samples. Dwell is the span between consecutive fresh cool samples; any unobserved
+/// gap longer than [`THERMAL_FEEDBACK_FRESHNESS_LIMIT`] between consecutive fresh samples restarts
+/// the dwell from the next fresh sample.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ThermalCooldown {
+    first_sample_at: Option<Instant>,
+    last_oldest_sample_at: Option<Instant>,
+    last_joint_samples: [Option<Instant>; crate::model::MAX_MOTION_DOF],
+    joint_count: usize,
+}
+
+
 impl ThermalCooldown {
     pub(crate) fn reset(&mut self) {
         self.first_sample_at = None;
