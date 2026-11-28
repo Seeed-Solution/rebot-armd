@@ -228,7 +228,7 @@ async fn legacy_published_config_releases_supervisor_lock_while_driver_mutex_is_
     let mut cfg = ArmConfig::rebot_dm();
     cfg.profile_id = Some("initial-profile".into());
     let sup = Arc::new(
-        ArmSupervisor::new(cfg).with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.45))),
+        ArmSupervisor::new(cfg).with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
     );
 
     // Warm the published cache, then force a generation miss.
@@ -304,8 +304,8 @@ async fn legacy_published_config_releases_supervisor_lock_while_driver_mutex_is_
         Some(420),
     );
     assert!(
-        (snap.effective_planned_close_speed - 0.45).abs() < 1e-3,
-        "expected quantized close speed ~0.45, got {}",
+        (snap.effective_planned_close_speed - 0.25).abs() < 1e-6,
+        "expected quantized close speed 0.25, got {}",
         snap.effective_planned_close_speed,
     );
 

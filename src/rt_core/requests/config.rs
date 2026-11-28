@@ -203,97 +203,7 @@ pub struct PublishedConfig {
 }
 
 impl PublishedConfig {
-    /// Captures a complete configuration snapshot from `inner` off the RT thread.
-    pub fn from_inner(inner: &SupervisorInner) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let driver_supports_nonblocking_mode_switch = inner
-            .driver
-            .as_ref()
-            .is_some_and(|d| d.with_ref(|drv| drv.mode_switch().supports_nonblocking_mode_switch()).unwrap_or(false));
-        #[cfg(target_arch = "wasm32")]
-        let driver_supports_nonblocking_mode_switch = false;
-        let driver_torque_feedback = inner
-            .driver
-            .as_ref()
-            .is_some_and(|d| d.with_ref(|drv| drv.capabilities().torque_feedback).unwrap_or(false));
-        let driver_temperature_feedback = inner
-            .driver
-            .as_ref()
-            .is_none_or(|d| d.with_ref(|drv| drv.capabilities().temperature_feedback).unwrap_or(false));
-        let driver_motor_current_cap = inner
-            .driver
-            .as_ref()
-            .and_then(|d| d.with_ref(|drv| drv.pos_force().motor_current_cap()).flatten())
-            .and_then(|cap| serde_json::to_value(cap).ok());
-        let mut sequences = inner.sequences.clone();
-        sequences.pins = inner.active_sequence_pins().cloned();
-        Self {
-            config: inner.config.clone(),
-            follower: inner.follower.clone(),
-            keepout: inner.keepout.clone(),
-            collision_enabled: inner.collision.enabled,
-            collision_sensitivity: inner.collision.sensitivity,
-            collision_runtime: inner.collision.runtime,
-            collision_path: inner.collision.path.clone(),
-            collision_revision: inner.collision.revision,
-            collision_active: inner.collision.hold.is_some(),
-            collision_torque_feedback: inner.collision.torque_feedback,
-            base_gripper_policy: inner.base_gripper_policy.clone(),
-            gripper_calib_path: inner.gripper_calib_path.clone(),
-            gripper_calib_offset: inner.gripper_calib_offset,
-            gripper_calib_jaw_opening: inner.gripper_calib_jaw_opening.clone(),
-            gripper_calib_invalid: inner.gripper_calib_invalid,
-            gripper_calib_stale: inner.gripper_calib_stale.clone(),
-            gripper_calib_revision: inner.gripper_calib_revision,
-            poses: inner.poses.clone(),
-            sequences,
-            episodes: inner.episodes.clone(),
-            max_episode_s: inner.max_episode_s,
-            grasp_setup_revision: inner.grasp_setup_revision,
-            tool_commissioning_path: inner.tool_commissioning_path.clone(),
-            tool_commissioning_confirmed_at: inner.tool_commissioning_confirmed_at.clone(),
-            tool_commissioning_revision: inner.tool_commissioning_revision,
-            calibration: inner.calibration.clone(),
-            calibration_revision: inner.calibration_revision,
-            calibration_busy: inner.calibration_busy,
-            calibration_txn_id: inner.calibration_txn_id,
-            calibration_quarantined: inner.calibration_quarantined,
-            calibration_load_error: inner.calibration_load_error.clone(),
-            profile_camera_mount: inner.profile_camera_mount.clone(),
-            profile_floor_z_m: inner.profile_floor_z_m,
-            floor_source: inner.floor_source,
-            workspace_revision: inner.workspace_revision,
-            joint_zero_offsets: inner.joint_zero_offsets.clone(),
-            zero_convention: inner.zero_convention,
-            operator_auth_enforced: inner.operator_auth_enforced,
-            has_driver: inner.driver.is_some(),
-            driver_supports_nonblocking_mode_switch,
-            driver_torque_feedback,
-            driver_temperature_feedback,
-            driver_supports_automatic_unload: inner.supports_automatic_unload(),
-            driver_motor_current_cap,
-            driver_motor_zero_support: inner.motor_zero_support(),
-            driver_config_error: inner.driver_config_error.clone(),
-            gravity_compensated: inner.gravity_compensated,
-            gravity_comp_supported: inner.gravity_comp_support().is_ok(),
-            torque_guard_thresholds: inner.torque_guard_thresholds(),
-            effective_planned_close_speed: inner.effective_planned_close_speed(),
-            policy_live_allowed: {
-                #[cfg(feature = "policy-runtime")]
-                {
-                    inner.policy_live_allowed()
-                }
-                #[cfg(not(feature = "policy-runtime"))]
-                {
-                    false
-                }
-            },
-            #[cfg(feature = "policy-runtime")]
-            policy_ledger_path: inner.policy_ledger_path.clone(),
-            fallback_measured_positions: inner.measured_positions.clone(),
-            cell: inner.cell.clone(),
-        }
-    }
+    // `from_inner` and capture/finalize helpers live in `crate::supervisor::config::published`.
 
     pub fn profile_keepout(&self) -> Vec<KeepoutBox> {
         self.keepout.profile.clone().unwrap_or_else(|| {
@@ -722,29 +632,72 @@ impl PublishedConfigHub {
     }
 
     pub fn publish(&self, next: PublishedConfig, legacy_lock_gen: u64) {
-        let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
-        g.config = Arc::new(next);
-        g.legacy_lock_gen = legacy_lock_gen;
-        self.available.store(true, Ordering::Release);
+        let next = Arc::new(next);
+        let displaced = {
+            let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
+            let old = std::mem::replace(&mut g.config, next);
+            g.legacy_lock_gen = legacy_lock_gen;
+            self.available.store(true, Ordering::Release);
+            old
+        };
+        drop(displaced);
     }
 
     /// Publishes a Legacy read snapshot only if `legacy_lock_gen` is strictly newer than the
     /// currently published generation, preventing a slower concurrent Legacy reader from
-    /// overwriting a newer snapshot after dropping its read guard.
+    /// overwriting a newer snapshot after dropping its read guard. Any displaced or rejected
+    /// payload is dropped strictly after releasing the hub write guard.
     pub fn publish_if_newer(&self, next: PublishedConfig, legacy_lock_gen: u64) -> Arc<PublishedConfig> {
-        let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
-        if legacy_lock_gen > g.legacy_lock_gen {
-            g.config = Arc::new(next);
-            g.legacy_lock_gen = legacy_lock_gen;
-        }
-        Arc::clone(&g.config)
+        let next = Arc::new(next);
+        let (result, displaced) = {
+            let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
+            if legacy_lock_gen > g.legacy_lock_gen {
+                let old = std::mem::replace(&mut g.config, next);
+                g.legacy_lock_gen = legacy_lock_gen;
+                (Arc::clone(&g.config), Some(old))
+            } else {
+                (Arc::clone(&g.config), Some(next))
+            }
+        };
+        drop(displaced);
+        result
+    }
+
+    /// Publishes a pre-built Legacy `Arc<PublishedConfig>` only if the hub is available,
+    /// `can_publish()` holds under the hub write guard (preventing a delayed Legacy finalizer
+    /// from publishing into the Executor's epoch or a failed/transferring owner), and
+    /// `legacy_lock_gen` is strictly newer than the currently published generation. Any
+    /// displaced or rejected `Arc` is dropped strictly after releasing the hub write guard.
+    pub fn publish_legacy_arc_if_newer(
+        &self,
+        next: Arc<PublishedConfig>,
+        legacy_lock_gen: u64,
+        can_publish: impl FnOnce() -> bool,
+    ) -> Option<Arc<PublishedConfig>> {
+        let (result, displaced) = {
+            let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
+            if !self.available.load(Ordering::Acquire) || !can_publish() {
+                (None, Some(next))
+            } else if legacy_lock_gen > g.legacy_lock_gen {
+                let old = std::mem::replace(&mut g.config, next);
+                g.legacy_lock_gen = legacy_lock_gen;
+                (Some(Arc::clone(&g.config)), Some(old))
+            } else {
+                (Some(Arc::clone(&g.config)), Some(next))
+            }
+        };
+        drop(displaced);
+        result
     }
 
     pub fn update(&self, mutate: impl FnOnce(&mut PublishedConfig)) {
-        let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
-        let mut next = (*g.config).clone();
-        mutate(&mut next);
-        g.config = Arc::new(next);
+        let displaced = {
+            let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
+            let mut next = (*g.config).clone();
+            mutate(&mut next);
+            std::mem::replace(&mut g.config, Arc::new(next))
+        };
+        drop(displaced);
     }
 
     /// Updates published gripper calibration state off-thread after `armd-persist`
