@@ -230,13 +230,30 @@ async fn wholly_unreachable_object_fails_at_acquisition() {
 
 #[tokio::test]
 async fn reachable_contact_with_an_impossible_lift() {
-    let sc = mounted_scene(0.30, 0.0, 0.26).await;
-    let poly = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
+    // At [0.30, 0.0], legacy top-down is reachable so adaptive falls back to -top with an
+    // advisory LIFT_TORQUE rather than refusing a route legacy admits (GU-R3 Addendum 1).
+    let sc_leg = mounted_scene(0.30, 0.0, 0.26).await;
+    let poly_leg = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
+    let mut body_leg = request(&sc_leg, &poly_leg, 0.035);
+    body_leg["evidence"]["payload_kg"] = json!(4.0);
+    let v_leg = dry(&sc_leg, &body_leg).await;
+    println!("0.30 heavy: {}", summary(&v_leg));
+    assert_eq!(v_leg["legacy"]["reachable"], true, "the legacy check does not look at the lift");
+    assert_eq!(v_leg["reachable"], true, "{v_leg:?}");
+    assert_eq!(v_leg["outcome"], "selected");
+    assert_eq!(v_leg["pregrasp_mode"], "legacy");
+    assert!(sel_of(&v_leg)["id"].as_str().unwrap().ends_with("-top"), "{}", sel_of(&v_leg));
+    assert_eq!(v_leg["top_advisory"]["code"], "LIFT_TORQUE", "{v_leg:?}");
+    assert_eq!(v_leg["top_advisory"]["phase"], "lift", "{v_leg:?}");
+
+    // At [0.42, 0.0], legacy refuses (IK_UNREACHABLE) so chord lift-torque checks decide.
+    let sc = mounted_scene(0.42, 0.0, 0.26).await;
+    let poly = banana([0.42, 0.0], 0.12, 30.0, 0.034, 90.0);
     let mut body = request(&sc, &poly, 0.035);
     body["evidence"]["payload_kg"] = json!(4.0);
     let v = dry(&sc, &body).await;
-    println!("{}", summary(&v));
-    assert_eq!(v["legacy"]["reachable"], true, "the legacy check does not look at the lift");
+    println!("0.42 heavy: {}", summary(&v));
+    assert_eq!(v["legacy"]["reachable"], false, "legacy refuses at 0.42 m");
     assert_eq!(v["reachable"], false);
     assert_eq!(v["outcome"], "infeasible");
     assert_eq!(v["code"], "LIFT_TORQUE", "{}", v["message"]);
@@ -369,16 +386,20 @@ async fn timing_and_work_counts() {
 }
 
 #[tokio::test]
-async fn budget_exhaustion_returns_no_winner() {
+async fn budget_exhaustion_returns_the_verified_top_down_route() {
+    // the top-down candidate is checked first with its own reserved budget: a 1 ms search
+    // budget runs out in the optional search and the verified top-down route is returned
     let sc = mounted_scene(0.30, 0.0, 0.26).await;
     let poly = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
     let mut body = request(&sc, &poly, 0.035);
     body["budget_ms"] = json!(1);
     let v = dry(&sc, &body).await;
-    assert_eq!(v["outcome"], "budget_exhausted", "{}", summary(&v));
-    assert_eq!(v["reachable"], false);
-    assert_eq!(v["code"], "BUDGET_EXHAUSTED");
-    assert!(sel(&v).is_null());
+    assert_eq!(v["outcome"], "selected", "{}", summary(&v));
+    assert_eq!(v["reachable"], true);
+    let c = sel_of(&v);
+    assert!(c["id"].as_str().unwrap().ends_with("-top"), "{c}");
+    assert_eq!(c["approach_class"], "vertical");
+    assert_eq!(v["search"]["fully_checked"], 1);
 }
 
 #[tokio::test]

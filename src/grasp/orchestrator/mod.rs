@@ -596,7 +596,21 @@ impl Orchestrator {
                     } else if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) {
                         (Some(format!("skipped:{reason}")), None)
                     } else if let Some(w) = measured_width_m {
-                        let target_w = (w + s.pre_open_margin_m) as f32;
+                        let base_target = w + s.pre_open_margin_m;
+                        let floor = planned.jaw.as_ref().map_or(0.0, |j| {
+                            let adm_min = j.fit().map_or(0.0, |f| f.min_opening_m);
+                            let scalar_min = if j.hard_error_m().is_finite() {
+                                w + 2.0 * j.hard_error_m() + 2.0 * crate::grasp_select::candidates::MIN_OPENING_RESERVE_M
+                            } else {
+                                0.0
+                            };
+                            adm_min.max(scalar_min)
+                        });
+                        let target_w = if floor.is_finite() && base_target < floor {
+                            (floor + 1e-6) as f32
+                        } else {
+                            base_target as f32
+                        };
                         let target_j7 = policy.j7_for(target_w);
                         let full_open_w = policy.opening_m(policy.open_rad);
                         let at_or_beyond_open = target_w >= full_open_w

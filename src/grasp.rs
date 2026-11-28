@@ -75,9 +75,9 @@ pub(crate) use perception::TRIGGER_WAIT_MS;
 use perception::{f, median, refusal_message};
 
 pub use planning::{
-    dry_run, dry_run_task, expected_duration, parse_grasp, plan, prepare, prepare_from_snapshot,
-    transition_estimate, DryRun, GraspRequest, PendingAdaptive, PendingGrasp, PlannedAdaptive,
-    PlannedGrasp,
+    dry_run, dry_run_task, expected_duration, legacy_expected_duration, parse_grasp, plan,
+    planned_top_down, prepare, prepare_from_snapshot, transition_estimate, top_down_pose, DryRun,
+    GraspRequest, PendingAdaptive, PendingGrasp, PlannedAdaptive, TopDown, PlannedGrasp,
 };
 use planning::{approach_pose, grasp_plane};
 

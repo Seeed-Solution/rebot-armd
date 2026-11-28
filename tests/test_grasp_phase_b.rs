@@ -1483,38 +1483,76 @@ async fn phase_b_swept_joint_pregrasp_fallback_locks_j7_both_owners() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn phase_b_keepout_carried_object_sat_and_checked_only_hints() {
     let (base_cfg, setup) = fast_mounted_config();
-    let q0 = solve_camera_down(&base_cfg, &setup, [0.30, 0.0, 0.26]);
-    let poly = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
     let cam = CamModel::assumed(&base_cfg.arm_model, &setup, &base_cfg.camera_mount);
-    let start_end = base_cfg.arm_model.fk(&q0);
-    let req = adaptive_request(&cam, &start_end, setup.table_z_m, &poly, 0.035);
+    let q0_leg = solve_camera_down(&base_cfg, &setup, [0.30, 0.0, 0.26]);
+    let poly_leg = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
+    let req_leg = adaptive_request(&cam, &base_cfg.arm_model.fk(&q0_leg), setup.table_z_m, &poly_leg, 0.035);
 
-    // 3a) Thin keep-out piercing the carried object's middle during SEPARATION (+0.03 m above table)
-    //     with all 8 object corners outside the thin rod!
+    // At [0.30, 0.0], `thin_sep_rod` only pierces the carried object during separation while
+    // legacy insertion clears it, so adaptive admits -top with advisory keep-out (GU-R3 Addendum 1).
     {
         let mut cfg = base_cfg.clone();
-        // Object spans roughly x in [0.27, 0.33], y in [-0.06, 0.06], z in [0.002, 0.037] -> during
-        // separation (+0.03 m), object passes through z = 0.055 at (0.30, 0.0) while all corners are
-        // well outside this thin 6 mm x 6 mm rod!
         cfg.workspace.as_mut().unwrap().keepout_boxes.push(KeepoutBox {
             name: "thin_sep_rod".into(),
             min_m: [0.297, -0.003, 0.050],
             max_m: [0.303, 0.003, 0.062],
         });
+        let rig = Rig::start(Owner::Legacy, cfg, setup.clone(), q0_leg, poly_leg.clone(), 0.035, Some(-1.5), false).await;
+        let mut dry_req = req_leg.clone();
+        dry_req["dry_run"] = json!(true);
+        let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
+        assert_eq!(dry["reachable"], json!(true), "thin_sep_rod at 0.30 m should select -top: {dry:?}");
+        assert!(dry["selected_candidate"]["id"].as_str().unwrap().ends_with("-top"), "{dry:?}");
+        assert_eq!(dry["pregrasp_mode"], json!("legacy"), "{dry:?}");
+        assert_eq!(dry["top_advisory"]["code"], json!("WORKSPACE_VIOLATION"), "{dry:?}");
+        assert_eq!(dry["top_advisory"]["phase"], json!("separation"), "{dry:?}");
+        let planned = rig.plan_adaptive(&req_leg).await.expect("live plan also selects -top");
+        assert!(planned.adaptive.is_none() && planned.jaw.is_some());
+        rig.shutdown();
+    }
+
+    // Move 3a/3b chord keep-out refusal checks to [0.42, 0.0] where legacy is IK_UNREACHABLE while
+    // oblique chords succeed without the thin keep-out rods.
+    let q0 = solve_camera_down(&base_cfg, &setup, [0.42, 0.0, 0.26]);
+    let poly = banana([0.42, 0.0], 0.12, 30.0, 0.034, 90.0);
+    let start_end = base_cfg.arm_model.fk(&q0);
+    let req = adaptive_request(&cam, &start_end, setup.table_z_m, &poly, 0.035);
+    {
+        let rig = Rig::start(Owner::Legacy, base_cfg.clone(), setup.clone(), q0, poly.clone(), 0.035, Some(-1.5), false).await;
+        let mut dry_req = req.clone();
+        dry_req["dry_run"] = json!(true);
+        let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
+        assert_eq!(dry["legacy"]["reachable"], json!(false), "legacy must refuse at 0.42 m: {dry:?}");
+        assert_eq!(dry["reachable"], json!(true), "baseline oblique chord must pass at 0.42 m without thin rods: {dry:?}");
+        rig.shutdown();
+    }
+
+    // 3a) Thin keep-out piercing the carried object's middle during SEPARATION (+0.03 m above table)
+    //     with all 8 object corners outside the thin rod!
+    {
+        let mut cfg = base_cfg.clone();
+        cfg.workspace.as_mut().unwrap().keepout_boxes.push(KeepoutBox {
+            name: "thin_sep_rod".into(),
+            min_m: [0.417, -0.003, 0.050],
+            max_m: [0.423, 0.003, 0.062],
+        });
         let rig = Rig::start(Owner::Legacy, cfg, setup.clone(), q0, poly.clone(), 0.035, Some(-1.5), false).await;
         let mut dry_req = req.clone();
         dry_req["dry_run"] = json!(true);
         let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
+        assert_eq!(dry["legacy"]["reachable"], json!(false), "legacy refuses at 0.42 m: {dry:?}");
         assert_eq!(dry["reachable"], json!(false), "thin rod piercing carried object during separation must be rejected: {dry:?}");
-        assert!(dry.get("failing_phase").and_then(Value::as_str).is_some(), "{dry:?}");
-        // Live plan must refuse with exact parity (failing_phase + code + checked-only hint).
+        assert_eq!(dry["code"], json!("WORKSPACE_VIOLATION"), "3a must refuse WORKSPACE_VIOLATION: {dry:?}");
+        assert_eq!(dry["failing_phase"], json!("separation"), "3a must fail in separation phase: {dry:?}");
+        assert_eq!(dry["best_refusal"]["code"], json!("WORKSPACE_VIOLATION"), "{dry:?}");
+        assert_eq!(dry["best_refusal"]["phase"], json!("separation"), "{dry:?}");
+        // Live plan must refuse with exact parity (failing_phase + code) and no legacy-pass hint.
         let err = rig.plan_adaptive(&req).await.err().expect("live plan must also refuse");
         match err {
             ArmError::Detailed { code, details, .. } => {
-                assert_eq!(Value::String(code), dry["code"]);
-                assert_eq!(details["failing_phase"], dry["failing_phase"]);
-                // Because legacy checked reachable in this scene, hint is present ONLY because legacy was checked!
-                assert_eq!(details.get("hint"), dry.get("hint"));
+                assert_eq!(code, "WORKSPACE_VIOLATION");
+                assert_eq!(details["failing_phase"], json!("separation"));
+                assert!(details.get("hint").is_none(), "no legacy-pass hint: {details:?}");
             }
             other => panic!("expected ArmError::Detailed, got {other:?}"),
         }
@@ -1526,15 +1564,27 @@ async fn phase_b_keepout_carried_object_sat_and_checked_only_hints() {
         let mut cfg = base_cfg.clone();
         cfg.workspace.as_mut().unwrap().keepout_boxes.push(KeepoutBox {
             name: "thin_lift_rod".into(),
-            min_m: [0.297, -0.003, 0.102],
-            max_m: [0.303, 0.003, 0.114],
+            min_m: [0.417, -0.003, 0.102],
+            max_m: [0.423, 0.003, 0.114],
         });
         let rig = Rig::start(Owner::Legacy, cfg, setup.clone(), q0, poly.clone(), 0.035, Some(-1.5), false).await;
         let mut dry_req = req.clone();
         dry_req["dry_run"] = json!(true);
         let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
+        assert_eq!(dry["legacy"]["reachable"], json!(false), "legacy refuses at 0.42 m: {dry:?}");
         assert_eq!(dry["reachable"], json!(false), "thin rod piercing carried object during lift must be rejected: {dry:?}");
-        assert!(rig.plan_adaptive(&req).await.is_err());
+        assert_eq!(dry["code"], json!("WORKSPACE_VIOLATION"), "3b must refuse WORKSPACE_VIOLATION: {dry:?}");
+        assert_eq!(dry["failing_phase"], json!("lift"), "3b must fail in lift phase: {dry:?}");
+        assert_eq!(dry["best_refusal"]["code"], json!("WORKSPACE_VIOLATION"), "{dry:?}");
+        assert_eq!(dry["best_refusal"]["phase"], json!("lift"), "{dry:?}");
+        let err = rig.plan_adaptive(&req).await.err().expect("live plan must also refuse");
+        match err {
+            ArmError::Detailed { code, details, .. } => {
+                assert_eq!(code, "WORKSPACE_VIOLATION");
+                assert_eq!(details["failing_phase"], json!("lift"));
+            }
+            other => panic!("expected ArmError::Detailed, got {other:?}"),
+        }
         rig.shutdown();
     }
 
@@ -1547,14 +1597,14 @@ async fn phase_b_keepout_carried_object_sat_and_checked_only_hints() {
             min_m: [0.20, -0.20, 0.01],
             max_m: [0.45, 0.20, 0.22],
         });
-        let rig = Rig::start(Owner::Legacy, cfg, setup.clone(), q0, poly.clone(), 0.035, Some(-1.5), false).await;
-        let mut dry_req = req.clone();
+        let rig = Rig::start(Owner::Legacy, cfg, setup.clone(), q0_leg, poly_leg.clone(), 0.035, Some(-1.5), false).await;
+        let mut dry_req = req_leg.clone();
         dry_req["dry_run"] = json!(true);
         let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
         assert_eq!(dry["reachable"], json!(false));
         assert_eq!(dry["legacy"]["reachable"], json!(false));
         assert!(dry.get("hint").is_none() || dry["hint"].is_null(), "must NOT emit unchecked hint: {dry:?}");
-        let err = rig.plan_adaptive(&req).await.err().expect("must refuse");
+        let err = rig.plan_adaptive(&req_leg).await.err().expect("must refuse");
         if let ArmError::Detailed { details, .. } = err {
             assert!(details.get("hint").is_none(), "live error must NOT emit unchecked hint: {details:?}");
         } else {
@@ -2819,4 +2869,46 @@ fn phase_b_sdk_doc_request_example_parses_cleanly() {
     assert_eq!(prefs.preferred_max_tilt_deg, Some(45.0));
     assert_eq!(prefs.hard_max_tilt_deg, Some(70.0));
     assert_eq!(grasp_select::snapshot::parse_budget(&body).unwrap(), 500);
+}
+
+// ============================================================================
+// Shared admission: the same jaw refusal (best_refusal) in dry run and live planning, both
+// strategies, both owners
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_admission_refusal_parity_both_strategies_both_owners() {
+    let (cfg, setup) = fast_mounted_config();
+    let q0 = solve_camera_down(&cfg, &setup, [0.30, 0.0, 0.26]);
+    let narrow = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let rig = Rig::start(owner, cfg.clone(), setup.clone(), q0, narrow.clone(), 0.035, Some(-1.5), false).await;
+        let mut probe = adaptive_request(&rig.cam, &rig.start_end, setup.table_z_m, &narrow, 0.035);
+        probe["dry_run"] = json!(true);
+        let p = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &probe).await.fields();
+        let open = p["evidence"]["jaw_open_width_m"].as_f64().unwrap();
+        let he = p["evidence"]["uncertainty"]["hard_error_m"].as_f64().unwrap();
+        // the rc7.3 case: reserve -3 mm per side against the +3 mm bound
+        let wide = banana([0.30, 0.0], 0.12, 30.0, open - 2.0 * he + 0.006, 90.0);
+        let req = adaptive_request(&rig.cam, &rig.start_end, setup.table_z_m, &wide, 0.035);
+        for strategy in ["adaptive", "legacy"] {
+            let mut live = req.clone();
+            live["strategy"] = json!(strategy);
+            let mut d = live.clone();
+            d["dry_run"] = json!(true);
+            let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &d).await.fields();
+            assert_eq!((dry["reachable"].clone(), dry["code"].clone()), (json!(false), json!("OPENING")), "{strategy}: {dry:?}");
+            match rig.plan_adaptive(&live).await.err().expect("live plan refuses") {
+                ArmError::Detailed { code, details, .. } => {
+                    assert_eq!(code, "OPENING", "{strategy}");
+                    for k in ["phase", "code", "value", "bound"] {
+                        assert_eq!(details["best_refusal"][k], dry["best_refusal"][k], "{strategy} {k}: {details} vs {dry:?}");
+                    }
+                    assert_eq!(details["best_refusal"]["bound"], json!(0.003));
+                }
+                other => panic!("{strategy}: expected a detailed refusal, got {other:?}"),
+            }
+        }
+        rig.shutdown();
+    }
 }

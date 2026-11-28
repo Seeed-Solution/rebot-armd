@@ -36,15 +36,53 @@ fn num(v: &Value, key: &str) -> Result<Option<f64>, String> {
 }
 
 /// `evidence`: `{contour?, obb_corners_norm?, angle_deg?, angle_conf?, height_m?: h | [lo, hi], payload_kg?}`.
-/// A malformed contour is not an error: it is reported and the next evidence is used.
+/// A malformed contour is not an error in adaptive mode: it is reported and the next evidence is used.
 pub fn parse_evidence(body: &Value) -> Result<Evidence, String> {
+    parse_evidence_mode(body, true)
+}
+
+/// Legacy evidence parser: validates `evidence` (when present) and all fields used for jaw
+/// admission (`contour`, `obb_corners_norm`, `angle_deg`, `angle_conf`), while keeping
+/// compatibility for unused adaptive-only sibling fields (`height_m`, `payload_kg`) so a
+/// malformed sibling never erases valid footprint evidence.
+pub fn parse_evidence_for_legacy(body: &Value) -> Result<Evidence, String> {
+    parse_evidence_mode(body, false)
+}
+
+fn parse_height_m(e: &Value) -> Result<Option<[f64; 2]>, String> {
+    match e.get("height_m") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) if a.len() == 2 => {
+            let (lo, hi) = (a[0].as_f64(), a[1].as_f64());
+            match (lo, hi) {
+                (Some(lo), Some(hi)) if lo > 0.0 && hi >= lo && hi <= 0.5 => Ok(Some([lo, hi])),
+                _ => Err("evidence.height_m must be h or [lo, hi] with 0 < lo <= hi <= 0.5 m".into()),
+            }
+        }
+        Some(v) => match v.as_f64() {
+            Some(h) if h > 0.0 && h <= 0.5 => Ok(Some([h, h])),
+            _ => Err("evidence.height_m must be h or [lo, hi] with 0 < lo <= hi <= 0.5 m".into()),
+        },
+    }
+}
+
+fn parse_payload_kg(e: &Value) -> Result<Option<f64>, String> {
+    let p = num(e, "payload_kg")?;
+    if p.is_some_and(|m| !(0.0..=5.0).contains(&m)) {
+        return Err("evidence.payload_kg must be in [0, 5] kg".into());
+    }
+    Ok(p)
+}
+
+fn parse_evidence_mode(body: &Value, strict_adaptive: bool) -> Result<Evidence, String> {
     let Some(e) = body.get("evidence").filter(|e| !e.is_null()) else { return Ok(Evidence::default()) };
     if !e.is_object() { return Err("evidence must be an object".into()); }
     let mut out = Evidence::default();
     if let Some(c) = e.get("contour").filter(|c| !c.is_null()) {
         match grasp::parse_contour(c, false, [1.0, 1.0]) {
             Ok(p) => out.contour_norm = Some(p),
-            Err(why) => out.contour_error = Some(why),
+            Err(why) if strict_adaptive => out.contour_error = Some(why),
+            Err(why) => return Err(format!("evidence.contour: {why}")),
         }
     }
     if let Some(o) = e.get("obb_corners_norm").filter(|o| !o.is_null()) {
@@ -62,22 +100,13 @@ pub fn parse_evidence(body: &Value) -> Result<Evidence, String> {
     }
     out.angle_deg = num(e, "angle_deg")?.map(|a| (a + 90.0).rem_euclid(180.0) - 90.0);
     out.angle_conf = num(e, "angle_conf")?.map(|c| c.clamp(0.0, 1.0));
-    out.height_m = match e.get("height_m") {
-        None | Some(Value::Null) => None,
-        Some(Value::Array(a)) if a.len() == 2 => {
-            let (lo, hi) = (a[0].as_f64(), a[1].as_f64());
-            match (lo, hi) {
-                (Some(lo), Some(hi)) if lo > 0.0 && hi >= lo && hi <= 0.5 => Some([lo, hi]),
-                _ => return Err("evidence.height_m must be h or [lo, hi] with 0 < lo <= hi <= 0.5 m".into()),
-            }
-        }
-        Some(v) => match v.as_f64() {
-            Some(h) if h > 0.0 && h <= 0.5 => Some([h, h]),
-            _ => return Err("evidence.height_m must be h or [lo, hi] with 0 < lo <= hi <= 0.5 m".into()),
-        },
-    };
-    out.payload_kg = num(e, "payload_kg")?;
-    if out.payload_kg.is_some_and(|m| !(0.0..=5.0).contains(&m)) { return Err("evidence.payload_kg must be in [0, 5] kg".into()); }
+    if strict_adaptive {
+        out.height_m = parse_height_m(e)?;
+        out.payload_kg = parse_payload_kg(e)?;
+    } else {
+        out.height_m = parse_height_m(e).ok().flatten();
+        out.payload_kg = parse_payload_kg(e).ok().flatten();
+    }
     Ok(out)
 }
 
@@ -152,16 +181,23 @@ pub struct ToolVolumes {
     pub palm_depth_m: f64,
     /// Jaw opening at the gripper policy's open position.
     pub open_width_m: f64,
-    /// Widest object the grasp accepts (`max_grasp_width_m`, clamped to the calibrated opening).
+    /// Widest object the grasp accepts (`max_grasp_width_m`, clamped to the calibrated opening;
+    /// 0.0 when the cap is disabled on an uncalibrated policy).
     pub max_grasp_width_m: f64,
+    /// Optional width cap enforced independently of the opening reserve (`None`: cap disabled).
+    pub max_grasp_width_cap: Option<f64>,
     pub source: &'static str,
 }
 
 impl ToolVolumes {
     pub fn b601dm_assumed(open_width_m: f64, max_grasp_width_m: f64) -> Self {
+        Self::b601dm_assumed_with_cap(open_width_m, max_grasp_width_m, (max_grasp_width_m > 0.0).then_some(max_grasp_width_m))
+    }
+
+    pub fn b601dm_assumed_with_cap(open_width_m: f64, max_grasp_width_m: f64, max_grasp_width_cap: Option<f64>) -> Self {
         Self {
             finger_length_m: 0.055, finger_thickness_m: 0.008, finger_width_m: 0.018, pad_length_m: 0.025,
-            palm_depth_m: 0.03, open_width_m, max_grasp_width_m, source: "assumed_b601dm",
+            palm_depth_m: 0.03, open_width_m, max_grasp_width_m, max_grasp_width_cap, source: "assumed_b601dm",
         }
     }
 }
@@ -199,6 +235,8 @@ pub struct Snapshot {
     pub torque_limits: Option<(Vec<f64>, &'static str)>,
     pub prefs: PosePreferences,
     pub budget: Budget,
+    /// Residuals of the calibration in effect (reported margin, [`super::margin`]).
+    pub calib: super::margin::CalibQuality,
 }
 
 /// Request fields of the adaptive strategy (besides the legacy grasp fields).
@@ -214,8 +252,20 @@ fn invalid(m: String) -> ArmError { MotionError::InvalidCommand(m).into() }
 /// Under the lock: bind the parsed request (`pending`) and the request's evidence to the
 /// supervisor state.
 pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) -> Result<Snapshot, ArmError> {
+    capture_mode(inner, pending, body, true)
+}
+
+/// [`capture`] with `strict` = the adaptive rules (6-DOF only, malformed `evidence`,
+/// `pose_preferences` or `budget_ms` refused). Legacy requests (`strict` false) capture on any
+/// arm and ignore those adaptive-only fields when malformed.
+pub fn capture_mode(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value, strict: bool) -> Result<Snapshot, ArmError> {
     let policy = inner.config.gripper_policy.clone()
         .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    let accept_ctx = super::margin::AcceptanceContext {
+        camera_mount: &inner.config.camera_mount,
+        joint_zero_offsets: &inner.joint_zero_offsets,
+        active_tool: &inner.config.active_tool,
+    };
     capture_from_parts(
         pending,
         body,
@@ -223,6 +273,9 @@ pub fn capture(inner: &SupervisorInner, pending: &PendingGrasp, body: &Value) ->
         inner.requires_real_jaw_curve(),
         inner.config.gravity_comp.as_ref(),
         inner.config.damiao_ranges.as_deref(),
+        inner.calibration.as_ref(),
+        &accept_ctx,
+        strict,
     )
 }
 
@@ -233,8 +286,23 @@ pub fn capture_from_env(
     pending: &PendingGrasp,
     body: &Value,
 ) -> Result<Snapshot, ArmError> {
+    capture_from_env_mode(env, pending, body, true)
+}
+
+/// [`capture_from_env`] with the `strict` rules of [`capture_mode`].
+pub fn capture_from_env_mode(
+    env: &crate::rt_core::requests::actions::ActionPrepEnv,
+    pending: &PendingGrasp,
+    body: &Value,
+    strict: bool,
+) -> Result<Snapshot, ArmError> {
     let policy = env.config.gripper_policy.clone()
         .ok_or_else(|| ArmError::from(MotionError::Unsupported("Grasp needs a gripper policy".into())))?;
+    let accept_ctx = super::margin::AcceptanceContext {
+        camera_mount: &env.config.camera_mount,
+        joint_zero_offsets: &env.joint_zero_offsets,
+        active_tool: &env.config.active_tool,
+    };
     capture_from_parts(
         pending,
         body,
@@ -242,9 +310,13 @@ pub fn capture_from_env(
         env.requires_real_jaw_curve,
         env.config.gravity_comp.as_ref(),
         env.config.damiao_ranges.as_deref(),
+        env.calibration.as_ref(),
+        &accept_ctx,
+        strict,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_from_parts(
     pending: &PendingGrasp,
     body: &Value,
@@ -252,13 +324,18 @@ fn capture_from_parts(
     requires_real_jaw_curve: bool,
     gravity_comp: Option<&crate::model::GravityCompPolicy>,
     damiao_ranges: Option<&[crate::model::DamiaoRange]>,
+    calibration: Option<&crate::calibration::CalibrationFile>,
+    accept_ctx: &super::margin::AcceptanceContext<'_>,
+    strict: bool,
 ) -> Result<Snapshot, ArmError> {
-    let evidence = parse_evidence(body).map_err(invalid)?;
-    let prefs = parse_preferences(body).map_err(invalid)?;
-    let wall_ms = parse_budget(body).map_err(invalid)?;
+    let (evidence, prefs, wall_ms) = if strict {
+        (parse_evidence(body).map_err(invalid)?, parse_preferences(body).map_err(invalid)?, parse_budget(body).map_err(invalid)?)
+    } else {
+        (parse_evidence_for_legacy(body).map_err(invalid)?, parse_preferences(body).unwrap_or_default(), parse_budget(body).unwrap_or(DEFAULT_BUDGET_MS))
+    };
     let request = &pending.request;
     let mut input = pending.input.clone();
-    if input.arm.arm_dof() != 6 {
+    if strict && input.arm.arm_dof() != 6 {
         return Err(MotionError::Unsupported("strategy \"adaptive\" needs a 6-DOF arm (the grasp orientation is fully constrained)".into()).into());
     }
     input.goal_frame = GoalFrame::Tcp;
@@ -267,12 +344,16 @@ fn capture_from_parts(
     let camera_down = grasp::camera_down_mode(&setup, &input.cam).map_err(invalid)?;
     let envelope = grasp::envelope_with_contact(input.ws.as_ref(), &input.cam, &cam.rec, pending.physical_contact_end_m);
     let open_width = f64::from(policy.opening_m(policy.open_rad));
-    let max_w = if policy.is_calibrated() {
+    let (max_w, max_w_cap) = if policy.is_calibrated() {
         let calib = open_width - setup.pre_open_margin_m;
-        if setup.max_grasp_width_m > 0.0 { setup.max_grasp_width_m.min(calib) } else { calib }
-    } else {
+        let w = if setup.max_grasp_width_m > 0.0 { setup.max_grasp_width_m.min(calib) } else { calib };
+        (w, Some(w))
+    } else if setup.max_grasp_width_m > 0.0 {
         let check = crate::model::check_grasp_width(policy, setup.max_grasp_width_m, requires_real_jaw_curve);
-        check.effective_max_m(setup.max_grasp_width_m)
+        let w = check.effective_max_m(setup.max_grasp_width_m);
+        (w, Some(w))
+    } else {
+        (0.0, None)
     };
     let torque_limits = gravity_comp
         .filter(|gc| gc.torque_limits_nm.len() >= 6)
@@ -282,8 +363,9 @@ fn capture_from_parts(
     let mut snap = Snapshot {
         id: String::new(), input, setup, cam, camera_down, label: request.label.clone(), box_norm: request.box_norm,
         frame_id: request.frame_id, evidence, open_rad: pending.open_rad, closed_rad: policy.closed_rad, envelope,
-        tool: ToolVolumes::b601dm_assumed(open_width, max_w), torque_limits, prefs,
+        tool: ToolVolumes::b601dm_assumed_with_cap(open_width, max_w, max_w_cap), torque_limits, prefs,
         budget: Budget { wall_ms, cancel: None },
+        calib: super::margin::quality_for(calibration, Some(accept_ctx)),
     };
     snap.id = snapshot_id(&snap);
     Ok(snap)
@@ -307,6 +389,7 @@ pub fn snapshot_id(s: &Snapshot) -> String {
         st.approach_speed_mps, st.descend_speed_mps, st.max_grasp_width_m,
         st.timeout_s, st.phase_timeout_s, st.settle_delay_s, st.lost_timeout_s,
         st.post_lift_settle_ms as f64, st.descend_contact_stop_nm.unwrap_or(-1.0),
+        f64::from(u8::from(st.align_j6)), st.align_min_angle_conf,
     ] { eat(v); }
     for p in &s.envelope { p.iter().for_each(|v| eat(*v)); }
     for v in [s.tool.open_width_m, s.tool.max_grasp_width_m, f64::from(s.open_rad), f64::from(s.closed_rad)] { eat(v); }
@@ -371,6 +454,8 @@ pub struct Target {
     pub contour_error_m: f64,
     /// Camera centre to target distance at capture (m).
     pub view_distance_m: f64,
+    /// The active (fallback) and the reported measured error budget.
+    pub margin: super::margin::ErrorMargin,
 }
 
 /// Fractional scale error of the image-to-base mapping (user report: 12 mm at 0.40 m).
@@ -389,7 +474,12 @@ pub const DEFAULT_HEIGHT_M: [f64; 2] = [0.02, 0.06];
 pub fn target(s: &Snapshot) -> Result<Target, String> {
     let st = &s.setup;
     let pose_end = s.input.arm.fk(&s.input.q0);
-    let (height, height_source) = match (s.evidence.height_m, st.height_priors.iter().find(|(k, _)| k.eq_ignore_ascii_case(&s.label))) {
+    let prior = st
+        .height_sources
+        .contains(&crate::grasp::HeightSource::Prior)
+        .then(|| st.height_priors.iter().find(|(k, _)| k.eq_ignore_ascii_case(&s.label)))
+        .flatten();
+    let (height, height_source) = match (s.evidence.height_m, prior) {
         (Some(h), _) => ([h[0], h[1]], "evidence"),
         (None, Some((_, h))) => ([0.8 * h, 1.2 * h], "height_prior"),
         _ => (DEFAULT_HEIGHT_M, "default"),
@@ -434,11 +524,13 @@ pub fn target(s: &Snapshot) -> Result<Target, String> {
     let scale_e = SCALE_ERROR * c[0].hypot(c[1]);
     let he_e = HAND_EYE_ERROR_DEG.to_radians().tan() * dist;
     let contour_e = CONTOUR_ERROR_PX * dist / s.cam.fx.min(s.cam.fy);
+    let cam_tan = (cam_o[0] - c[0]).hypot(cam_o[1] - c[1]) / (cam_o[2] - z_mid).abs().max(1e-3);
+    let margin = super::margin::margin(&s.calib, scale_e.max(he_e) + contour_e, contour_e, dist, cam_tan);
     Ok(Target {
         poly, poly_lo: lo, poly_hi: hi, source, fallback_reason: if source == FootprintSource::Contour { None } else { fallback }, table_z: table, height, height_source,
         centroid: c, axis, aspect, axis_ambiguous: source == FootprintSource::Box || aspect < 1.2,
         projection_spread_m: spread, hard_error_m: scale_e.max(he_e) + contour_e, scale_error_m: scale_e, hand_eye_error_m: he_e,
-        contour_error_m: contour_e, view_distance_m: dist,
+        contour_error_m: contour_e, view_distance_m: dist, margin,
     })
 }
 

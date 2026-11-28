@@ -2050,6 +2050,10 @@ pub(super) fn spawn_macro_check(
     let abort = worker_tasks.spawn_abortable(async move {
         let planned_res = async {
             let cancel_blk = cancel.clone();
+            let mut pending = pending;
+            if let PendingMacro::Grasp(g) = &mut pending {
+                g.set_cancel(cancel_blk.clone());
+            }
             let mut planned = tokio::task::spawn_blocking(move || {
                 maybe_pause_blocking_plan(&plan_conn);
                 if cancel_blk.load(Ordering::Acquire) {

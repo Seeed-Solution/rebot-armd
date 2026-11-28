@@ -11,7 +11,91 @@ use crate::grasp::{
     GRASP_PIPELINES, TABLE_CLEARANCE_M, TRIGGER_WAIT_MS,
 };
 
+/// Fresh-frame jaw-gate evidence cached from `fresh_match_adaptive` so `insert` can re-gate the
+/// exact insertion `grasp_goal` built from `snap_ins` against the same interval jaw predicate.
+struct AdaptiveJawEvidence {
+    poly: Vec<[f64; 2]>,
+    cut_evidence: &'static str,
+    cut_tol: f64,
+    open_w: f64,
+    cap: Option<f64>,
+}
+
 impl Orchestrator {
+    /// Evaluate the shared interval jaw predicate on `contact_pose` against cached fresh-frame
+    /// footprint evidence `ev` (used by both `fresh_match_adaptive` on `snap_rev` and `insert` on
+    /// `snap_ins` so wrist settle between the two snapshots can never bypass the jaw gate).
+    fn gate_adaptive_jaw_pose(
+        phase: &str,
+        label: &str,
+        route: &crate::grasp_select::AdaptiveRoute,
+        contact_pose: &Pose,
+        ev: &AdaptiveJawEvidence,
+    ) -> Result<(), Stop> {
+        let y = kinematics::column(&contact_pose.r, 1);
+        let cos_elev = y[0].hypot(y[1]).clamp(1e-6, 1.0);
+        let u = crate::grasp_select::geometry::unit2([y[0], y[1]]);
+        let p = [
+            route.contact_centre[0] + (contact_pose.p[0] - route.plan.grasp.p[0]),
+            route.contact_centre[1] + (contact_pose.p[1] - route.plan.grasp.p[1]),
+        ];
+        let Some((lo_h, hi_h)) =
+            crate::grasp_select::candidates::cut_interval_near(&ev.poly, p, u, Some(ev.cut_tol))
+        else {
+            return Err(fail(
+                "TARGET_DISPLACED",
+                format!("[{phase}] fresh footprint of '{label}' no longer covers the contact along the closing axis"),
+            ));
+        };
+        let cut = crate::grasp_select::admission::JawCut::new(
+            lo_h / cos_elev,
+            hi_h / cos_elev,
+            ev.cut_evidence,
+        );
+        if let Err(r) =
+            crate::grasp_select::admission::jaw_check(&cut, route.target_hard_error_m, ev.open_w, ev.cap)
+        {
+            return Err(fail(&r.code, format!("[{phase}] fresh evidence of '{label}': {}", r.message)));
+        }
+        Ok(())
+    }
+    /// Optional TOO_WIDE cap (m) enforced independently of the opening reserve: `None` when the
+    /// cap is disabled (`max_grasp_width_m <= 0`) on an uncalibrated policy.
+    async fn effective_max_grasp_width_cap(&self) -> Option<f64> {
+        let s = &self.setup;
+        if self.is_executor() {
+            let Some(env) = self.sup.hub().prep_env() else {
+                return (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m);
+            };
+            match env.config.gripper_policy.as_ref() {
+                Some(p) if p.is_calibrated() => {
+                    let calib_limit = f64::from(p.opening_m(p.open_rad)) - s.pre_open_margin_m;
+                    Some(if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit })
+                }
+                Some(p) if s.max_grasp_width_m > 0.0 => {
+                    let check = crate::model::check_grasp_width(p, s.max_grasp_width_m, env.requires_real_jaw_curve);
+                    Some(check.effective_max_m(s.max_grasp_width_m))
+                }
+                Some(_) => None,
+                None => (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m),
+            }
+        } else {
+            let inner = self.sup.inner().read().await;
+            match inner.config.gripper_policy.as_ref() {
+                Some(p) if p.is_calibrated() => {
+                    let calib_limit = f64::from(p.opening_m(p.open_rad)) - s.pre_open_margin_m;
+                    Some(if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit })
+                }
+                Some(_) if s.max_grasp_width_m > 0.0 => {
+                    Some(inner.grasp_width_check(s.max_grasp_width_m)
+                        .map_or(s.max_grasp_width_m, |c| c.effective_max_m(s.max_grasp_width_m)))
+                }
+                Some(_) => None,
+                None => (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m),
+            }
+        }
+    }
+
     pub(super) fn check_adaptive_revisions(
         phase: &str,
         env: &crate::rt_core::requests::actions::ActionPrepEnv,
@@ -146,11 +230,12 @@ impl Orchestrator {
         phase: &str,
         label: &str,
         route: &crate::grasp_select::AdaptiveRoute,
+        contact_pose: &Pose,
         expected_gen: &mut Option<u64>,
         pose_end: &Pose,
         since: Instant,
         after: &mut Option<u64>,
-    ) -> Result<Detection, Stop> {
+    ) -> Result<(Detection, AdaptiveJawEvidence), Stop> {
         let s = &self.setup;
         let z_mid = route.target_table_z + (route.target_height[0] + route.target_height[1]) / 4.0;
         let target_mid = [route.target_centroid[0], route.target_centroid[1], z_mid];
@@ -441,6 +526,71 @@ impl Orchestrator {
                 }
             }
 
+            // The shared interval jaw predicate on fresh evidence at the actual insertion contact
+            // pose and closing axis (consistent with the insertion goal at actual settled wrist
+            // orientation), with jaw-elevation tilt correction and actual insertion opening.
+            let cut_tol = route.opening_reserve_m.clamp(0.005, 0.015);
+            let (fresh_poly, cut_evidence): (Vec<[f64; 2]>, &'static str) = match &best.contour_norm {
+                Some(Ok(pts)) => {
+                    let world: Option<Vec<[f64; 2]>> = pts
+                        .iter()
+                        .map(|v| self.cam.plane_point(pose_end, self.cam.to_px(*v), z_mid).map(|q| [q[0], q[1]]))
+                        .collect();
+                    let Some(mut wpts) = world.filter(|w| w.len() >= 3) else {
+                        return Err(fail(
+                            "NO_WIDTH_EVIDENCE",
+                            format!("[{phase}] fresh contour of '{label}' could not be projected onto the target plane"),
+                        ));
+                    };
+                    crate::grasp_select::geometry::ensure_ccw(&mut wpts);
+                    (wpts, "contour")
+                }
+                Some(Err(why)) => {
+                    return Err(fail(
+                        "NO_WIDTH_EVIDENCE",
+                        format!("[{phase}] fresh contour of '{label}' malformed: {why}"),
+                    ));
+                }
+                None if route.has_contour_evidence => {
+                    return Err(fail(
+                        "NO_WIDTH_EVIDENCE",
+                        format!("[{phase}] fresh detection of '{label}' is missing its contour"),
+                    ));
+                }
+                None => {
+                    let b = best.box_norm;
+                    let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+                    let world: Option<Vec<[f64; 2]>> = corners
+                        .iter()
+                        .map(|v| self.cam.plane_point(pose_end, self.cam.to_px(*v), z_mid).map(|q| [q[0], q[1]]))
+                        .collect();
+                    let Some(mut wpts) = world.filter(|w| w.len() >= 3) else {
+                        return Err(fail(
+                            "NO_WIDTH_EVIDENCE",
+                            format!("[{phase}] fresh box of '{label}' could not be projected onto the target plane"),
+                        ));
+                    };
+                    crate::grasp_select::geometry::ensure_ccw(&mut wpts);
+                    (wpts, "box")
+                }
+            };
+            let cap = self.effective_max_grasp_width_cap().await;
+            let open_w = match (route.pre_open_fraction, self.gripper_policy().await) {
+                (Some(frac), Some(pol)) => {
+                    let j7 = pol.closed_rad + (frac as f32) * (pol.open_rad - pol.closed_rad);
+                    f64::from(pol.opening_m(j7))
+                }
+                _ => route.plan.jaw_opening_m,
+            };
+            let jaw_ev = AdaptiveJawEvidence {
+                poly: fresh_poly,
+                cut_evidence,
+                cut_tol,
+                open_w,
+                cap,
+            };
+            Self::gate_adaptive_jaw_pose(phase, label, route, contact_pose, &jaw_ev)?;
+
             // Orientation consistency when target long axis is non-ambiguous (tightened to 12 deg).
             if !route.target_axis_ambiguous {
                 let exp_axis = route.target_axis;
@@ -498,7 +648,7 @@ impl Orchestrator {
                 }
             }
 
-            return Ok(best.clone());
+            return Ok((best.clone(), jaw_ev));
         }
     }
 
@@ -675,16 +825,18 @@ impl Orchestrator {
             .plan_input_in(GoalFrame::Tcp)
             .map_err(crate::macro_action::arm_fail)?;
         let pose0_end = input0.arm.fk(&input0.q0);
-        self.fresh_match_adaptive(
-            "revalidate_start",
-            &planned.request.label,
-            route,
-            &mut expected_gen,
-            &pose0_end,
-            Instant::now(),
-            &mut after,
-        )
-        .await?;
+        let (_, mut jaw_ev) = self
+            .fresh_match_adaptive(
+                "revalidate_start",
+                &planned.request.label,
+                route,
+                &route.plan.grasp,
+                &mut expected_gen,
+                &pose0_end,
+                Instant::now(),
+                &mut after,
+            )
+            .await?;
         let confirmed_at = Instant::now();
 
         // ---- Stage 1: Pre-grasp (preserving jaw orientation & IK branch, J7 locked) + Pre-open ----
@@ -793,16 +945,30 @@ impl Orchestrator {
             z_mid,
             &actual_pre_tcp,
         ) {
-            self.fresh_match_adaptive(
-                "revalidate",
-                &planned.request.label,
-                route,
-                &mut expected_gen,
-                &actual_pre_end,
-                pre_open_done_at,
-                &mut after,
+            // Actual insertion contact pose matching the insertion goal below (settled wrist
+            // orientation `actual_pre_tcp.r` and translation along `insertion_dir`).
+            let rem_rev = kinematics::dot(
+                &kinematics::sub(&route.plan.grasp.p, &actual_pre_tcp.p),
+                &route.plan.insertion_dir,
             )
-            .await?;
+            .clamp(0.0, route.plan.insertion_m + 0.006);
+            let actual_contact_pose = Pose::new(
+                actual_pre_tcp.r,
+                kinematics::add(&actual_pre_tcp.p, &route.plan.insertion_dir.map(|x| x * rem_rev)),
+            );
+            let (_, rev_jaw_ev) = self
+                .fresh_match_adaptive(
+                    "revalidate",
+                    &planned.request.label,
+                    route,
+                    &actual_contact_pose,
+                    &mut expected_gen,
+                    &actual_pre_end,
+                    pre_open_done_at,
+                    &mut after,
+                )
+                .await?;
+            jaw_ev = rev_jaw_ev;
         } else {
             let max_obscured_s = (route.budget.pregrasp_s + route.budget.pre_open_s + 2.5).min(s.phase_timeout_s);
             if confirmed_at.elapsed().as_secs_f64() > max_obscured_s {
@@ -825,6 +991,21 @@ impl Orchestrator {
         // Fixed-orientation straight TCP translation strictly along `insertion_dir` from the
         // actual pregrasp pose (zero lateral drift or wrist rotation during insertion).
         let actual_ins_start = motion::end_to_tcp(&input_ins.arm.fk(&input_ins.q0), &self.tcp_offset);
+        let ins_pos_err = kinematics::norm(&kinematics::sub(&actual_ins_start.p, &route.plan.pregrasp.p));
+        let ins_rot_err = kinematics::angle_between(&actual_ins_start.r, &route.plan.pregrasp.r);
+        let ins_j_err = max_joint_diff(&input_ins.q0, &route.plan.q_pregrasp, input_ins.arm.arm_dof());
+        if ins_pos_err > 0.006
+            || ins_rot_err > 2.5f64.to_radians()
+            || ins_j_err > BRANCH_CONSISTENCY_TOL_RAD
+        {
+            return Err(fail(
+                "PLAN_STALE",
+                format!(
+                    "[insert] arm drifted from pregrasp pose/branch before insertion (pos {ins_pos_err:.4} m, rot {:.2} deg, joint {ins_j_err:.3} rad)",
+                    ins_rot_err.to_degrees()
+                ),
+            ));
+        }
         let rem_ins = kinematics::dot(
             &kinematics::sub(&route.plan.grasp.p, &actual_ins_start.p),
             &route.plan.insertion_dir,
@@ -834,6 +1015,9 @@ impl Orchestrator {
             actual_ins_start.r,
             kinematics::add(&actual_ins_start.p, &route.plan.insertion_dir.map(|x| x * rem_ins)),
         );
+        // Re-gate the exact insertion `grasp_goal` built from `snap_ins` so any wrist settle
+        // between `snap_rev` and `snap_ins` cannot bypass the interval jaw predicate.
+        Self::gate_adaptive_jaw_pose("insert", &planned.request.label, route, &grasp_goal, &jaw_ev)?;
         let q_grasp_ref = route.plan.q_grasp;
         let ins_speed = Speed { linear: route.insert_mps, angular: motion::DEFAULT_ANGULAR_RPS };
         let env_pts = self.envelope.clone();

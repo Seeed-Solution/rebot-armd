@@ -51,17 +51,20 @@ pub struct Work {
     pub path_samples: usize,
 }
 
-/// Error from [`endpoint_ik`]: either generic IK non-convergence or a named planning-limit refusal.
+/// Error from [`endpoint_ik`]: generic IK non-convergence, a named planning-limit refusal, or
+/// selection budget/cancellation expiry.
 #[derive(Debug, Clone)]
 pub enum EndpointIkError {
     Unreachable { ep: f64, er: f64 },
     PlanningLimit(MotionError),
+    BudgetExhausted,
 }
 
 impl EndpointIkError {
     pub fn into_rejection(self, label: &str) -> Rejection {
         match self {
             Self::PlanningLimit(e) => motion_rejection("endpoint_ik", &e),
+            Self::BudgetExhausted => Rejection::new("budget", "BUDGET_EXHAUSTED", format!("{label}: selection budget exceeded")),
             Self::Unreachable { ep, er } => Rejection::new(
                 "endpoint_ik",
                 "IK_UNREACHABLE",
@@ -74,6 +77,20 @@ impl EndpointIkError {
 
 /// IK of the TCP pose `goal` from each of `seeds` (first success wins): Err([`EndpointIkError`]).
 pub fn endpoint_ik(input: &PlanInput, goal: &Pose, seeds: &[[f64; 6]], work: &mut Work) -> Result<[f64; 6], EndpointIkError> {
+    endpoint_ik_budget(input, goal, seeds, work, &|| false)
+}
+
+/// [`endpoint_ik`] checking `out_of_budget()` before every seed and DLS round.
+pub fn endpoint_ik_budget(
+    input: &PlanInput,
+    goal: &Pose,
+    seeds: &[[f64; 6]],
+    work: &mut Work,
+    out_of_budget: &dyn Fn() -> bool,
+) -> Result<[f64; 6], EndpointIkError> {
+    if out_of_budget() {
+        return Err(EndpointIkError::BudgetExhausted);
+    }
     let arm_dof = input.arm.arm_dof();
     let arm_scope = crate::model::PlanningScope::first_n(arm_dof);
     if let Err(e) = motion::check_start_planning_limits_f64(&input.q0, &input.limits, arm_scope, Some(0.0)) {
@@ -83,10 +100,16 @@ pub fn endpoint_ik(input: &PlanInput, goal: &Pose, seeds: &[[f64; 6]], work: &mu
     let end = motion::tcp_to_end(goal, &input.tcp_offset);
     let mut best = (f64::INFINITY, f64::INFINITY);
     for seed in seeds {
+        if out_of_budget() {
+            return Err(EndpointIkError::BudgetExhausted);
+        }
         work.endpoint_solves += 1;
         let mut q: [f64; 6] = std::array::from_fn(|i| seed[i].clamp(lo[i], hi[i]));
         let mut prev = f64::INFINITY;
         for _ in 0..ENDPOINT_ROUNDS {
+            if out_of_budget() {
+                return Err(EndpointIkError::BudgetExhausted);
+            }
             let sol = input.arm.solve_dls_ex(&end, &q, &lo, &hi, PAR.w, false);
             work.ik_iterations += sol.iterations as u64;
             if sol.ep + sol.er < best.0 + best.1 { best = (sol.ep, sol.er); }
@@ -106,9 +129,15 @@ pub fn endpoint_ik(input: &PlanInput, goal: &Pose, seeds: &[[f64; 6]], work: &mu
     if has_custom {
         let (hard_lo, hard_hi) = motion::hard_ik_search_bounds(&input.limits, arm_dof);
         for seed in seeds {
+            if out_of_budget() {
+                return Err(EndpointIkError::BudgetExhausted);
+            }
             let mut q: [f64; 6] = std::array::from_fn(|i| seed[i].clamp(hard_lo[i], hard_hi[i]));
             let mut prev = f64::INFINITY;
             for _ in 0..ENDPOINT_ROUNDS {
+                if out_of_budget() {
+                    return Err(EndpointIkError::BudgetExhausted);
+                }
                 let sol = input.arm.solve_dls_ex(&end, &q, &hard_lo, &hard_hi, PAR.w, false);
                 work.ik_iterations += sol.iterations as u64;
                 q = sol.q;
@@ -216,17 +245,18 @@ pub struct Acquisition { pub q_end: [f64; 6], pub pose_end: Pose, pub path: Join
 pub fn acquisition(s: &Snapshot, work: &mut Work) -> Result<Acquisition, Rejection> {
     let setup = &s.setup;
     let pose_end = s.input.arm.fk(&s.input.q0);
-    let centre = s.cam.to_px(grasp::box_centre(&s.box_norm));
-    let target = s.cam.plane_point(&pose_end, centre, setup.table_z_m + setup.grasp_height_m)
-        .ok_or_else(|| Rejection::new("acquisition", "INVALID_COMMAND", "the box centre ray does not meet the table plane in front of the camera"))?;
-    let approach = |r: &kinematics::Mat3| Pose::new(grasp::look_down(r), [target[0], target[1], setup.table_z_m + setup.approach_height_m]);
-    let (goal, frame) = if s.camera_down {
-        let goal = grasp::camera_down_pose(&pose_end.r, &target, setup, &s.cam, &s.envelope);
-        let tool_end = motion::tcp_to_end(&approach(&goal.r), &s.input.tcp_offset);
-        if let Some(e) = grasp::table_violation(&goal, &tool_end, &s.envelope, setup.table_z_m) { return Err(motion_rejection("acquisition", &e)); }
-        (goal, GoalFrame::EndLink)
+    // the shared top-down construction of the legacy plan
+    let td = grasp::top_down_pose(&s.input, setup, &s.cam, &s.envelope, &s.box_norm).map_err(|e| {
+        let api = crate::api::rest::ApiError::from(e);
+        Rejection::new("acquisition", api.code.as_deref().unwrap_or(&api.error), api.message)
+    })?;
+    let target = td.target;
+    let (goal, frame) = if td.camera_down {
+        let tool_end = motion::tcp_to_end(&td.tool, &s.input.tcp_offset);
+        if let Some(e) = grasp::table_violation(&td.goal, &tool_end, &s.envelope, setup.table_z_m) { return Err(motion_rejection("acquisition", &e)); }
+        (td.goal, GoalFrame::EndLink)
     } else {
-        (approach(&pose_end.r), GoalFrame::Tcp)
+        (td.goal, GoalFrame::Tcp)
     };
     let goal_end = if frame == GoalFrame::EndLink { goal } else { motion::tcp_to_end(&goal, &s.input.tcp_offset) };
     if let Some(e) = grasp::table_violation(&pose_end, &goal_end, &s.envelope, setup.table_z_m) { return Err(motion_rejection("acquisition", &e)); }
