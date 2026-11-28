@@ -4568,10 +4568,18 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
 
     let assert_pos_force_single_emitter = |src_files: &[(String, String)]| {
         let (corpus, test_only) = source_scan::build_production_corpus(src_files);
-        assert!(
-            test_only.contains("driver/tx_chokepoint_tests.rs"),
-            "driver/tx_chokepoint_tests.rs must be included solely via #[cfg(test)] mod declarations"
-        );
+        for expected_test_only in [
+            "driver/tx_chokepoint_tests.rs",
+            "supervisor/observation_snapshot_tests.rs",
+            "supervisor/driver_transitions/panic_disable_tests.rs",
+            "supervisor/terminal_capture/tests.rs",
+            "supervisor/streams/target_tests.rs",
+        ] {
+            assert!(
+                test_only.contains(expected_test_only),
+                "{expected_test_only} must be included solely via #[cfg(test)] mod declarations"
+            );
+        }
 
         let mut total_driver_build_sites = 0usize;
         let mut total_owner_emit_j7_calls = 0usize;
@@ -4662,6 +4670,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
             } else {
                 assert_eq!(compact.matches("emit_pos_force_j7(").count(), 0, "production file src/{rel} must not call emit_pos_force_j7(");
                 assert_eq!(compact.matches("emit_and_merge_pos_force_j7(").count(), 0, "production file src/{rel} must not call emit_and_merge_pos_force_j7(");
+                assert_eq!(compact.matches("emit_j7_tick_epilogue(").count(), 0, "production file src/{rel} must not call emit_j7_tick_epilogue(");
             }
         }
 

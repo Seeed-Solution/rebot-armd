@@ -7,6 +7,9 @@
 //! - Live `alloc_timing=true` zero-alloc/zero-free RT stop/E-stop/apply_stop proof + positive control, refusal wake, park, panic-before-publish (Stop & E-stop)
 mod common;
 mod mit_support;
+#[path = "common/source_scan.rs"]
+#[allow(dead_code)]
+mod source_scan;
 
 #[global_allocator]
 static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
@@ -2408,30 +2411,96 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
     // Static audit: production supervisor motion-start modules (including grasp & place!) must
     // never re-sample `current_admission_stamp` or `capture_admission_stamp`, and every motion or
     // output start function must require `Admitted` by value in its signature.
+    // Uses shared `tests/common/source_scan.rs` lexical cleaner + `#[cfg(test)]`-aware corpus.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for rel in [
-        "src/supervisor/motion.rs",
-        "src/supervisor/actions.rs",
-        "src/supervisor/streams.rs",
-        "src/supervisor/driver_transitions.rs",
-        "src/gravity_comp.rs",
-        "src/poses.rs",
-        "src/backlash.rs",
-        "src/grasp.rs",
-        "src/place.rs",
-        "src/gripper_calib.rs",
-        "src/gripper_baseline.rs",
-    ] {
-        let src = std::fs::read_to_string(manifest_dir.join(rel)).unwrap();
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(&src);
+    let src_dir = manifest_dir.join("src");
+    let mut rs_paths = Vec::new();
+    source_scan::collect_rs_files(&src_dir, &mut rs_paths);
+    let src_files: Vec<(String, String)> = rs_paths
+        .iter()
+        .map(|p| {
+            let rel = p.strip_prefix(manifest_dir).unwrap().to_string_lossy().replace('\\', "/");
+            (rel, std::fs::read_to_string(p).unwrap())
+        })
+        .collect();
+
+    let assert_no_resampled_stamps = |files: &[(String, String)]| {
+        let (corpus, test_only) = source_scan::build_production_corpus(files);
+        for expected_test_only in [
+            "src/supervisor/driver_transitions/panic_disable_tests.rs",
+            "src/supervisor/streams/target_tests.rs",
+            "src/supervisor/observation_snapshot_tests.rs",
+            "src/supervisor/terminal_capture/tests.rs",
+        ] {
+            assert!(
+                test_only.contains(expected_test_only),
+                "{expected_test_only} must be included solely via #[cfg(test)] mod declarations"
+            );
+        }
+        let audited_exact = [
+            "src/supervisor/motion.rs",
+            "src/gravity_comp.rs",
+            "src/poses.rs",
+            "src/backlash.rs",
+            "src/grasp.rs",
+            "src/place.rs",
+            "src/gripper_calib.rs",
+            "src/gripper_baseline.rs",
+        ];
+        let audited_prefixes = [
+            "src/supervisor/actions/",
+            "src/supervisor/streams/",
+            "src/supervisor/driver_transitions/",
+        ];
+        let allowed_stamp_definers = [
+            "src/supervisor/state_init.rs",
+            "src/supervisor/ownership.rs",
+        ];
+        let mut audited_count = 0usize;
+        for (rel, prod) in &corpus {
+            let in_audited = audited_exact.contains(&rel.as_str())
+                || audited_prefixes.iter().any(|pfx| rel.starts_with(pfx));
+            if in_audited {
+                audited_count += 1;
+                assert!(
+                    !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
+                    "{rel} must never re-sample an admission stamp in production code"
+                );
+            }
+            if (rel == "src/supervisor.rs" || rel.starts_with("src/supervisor/"))
+                && !allowed_stamp_definers.contains(&rel.as_str())
+            {
+                assert!(
+                    !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
+                    "{rel} must never re-sample or define an admission stamp outside state_init/ownership"
+                );
+            }
+        }
         assert!(
-            !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
-            "{rel} must never re-sample an admission stamp in production code"
+            audited_count >= 25,
+            "expected >= 25 audited production files across split supervisor modules, got {audited_count}"
         );
-    }
+        corpus
+    };
+
+    let corpus = assert_no_resampled_stamps(&src_files);
+    let corpus_map: std::collections::BTreeMap<&str, &str> =
+        corpus.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    // Negative fixture: re-sampling `current_admission_stamp` in a split child file MUST fail.
+    let mut bad_resample = src_files.clone();
+    bad_resample.push((
+        "src/supervisor/actions/injected_resample.rs".into(),
+        "impl SupervisorInner { fn sneaky(&self) { let _ = self.current_admission_stamp(); } }".into(),
+    ));
+    assert!(
+        std::panic::catch_unwind(|| { let _ = assert_no_resampled_stamps(&bad_resample); }).is_err(),
+        "must reject current_admission_stamp re-sampling inside split src/supervisor/actions/**"
+    );
+
     let required_signatures = [
-        ("src/supervisor/driver_transitions.rs", "pub fn enable_torque("),
-        ("src/supervisor/driver_transitions.rs", "pub(crate) fn begin_enable_torque_transition("),
+        ("src/supervisor/driver_transitions/enable_prepare.rs", "pub fn enable_torque("),
+        ("src/supervisor/driver_transitions/torque_off_gate.rs", "pub(crate) fn begin_enable_torque_transition("),
         ("src/supervisor/motion.rs", "pub fn jog("),
         ("src/supervisor/motion.rs", "pub fn jog_action("),
         ("src/supervisor/motion.rs", "pub fn jog_action_with_speed_scale("),
@@ -2439,22 +2508,22 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
         ("src/supervisor/motion.rs", "pub fn install_path("),
         ("src/supervisor/motion.rs", "pub fn install_joint_goal("),
         ("src/supervisor/motion.rs", "pub fn start_path_motion_slice("),
-        ("src/supervisor/actions.rs", "pub fn unload_action("),
-        ("src/supervisor/actions.rs", "pub fn begin_macro("),
-        ("src/supervisor/actions.rs", "pub fn begin_sequence_action("),
-        ("src/supervisor/actions.rs", "pub fn begin_orchestrated_action("),
-        ("src/supervisor/actions.rs", "pub fn install_macro_path("),
-        ("src/supervisor/actions.rs", "pub fn start_macro_gripper("),
-        ("src/supervisor/actions.rs", "pub fn start_macro_gripper_learning("),
-        ("src/supervisor/actions.rs", "pub fn start_macro_gripper_learning_within("),
-        ("src/supervisor/actions.rs", "pub fn install_macro_quintic("),
-        ("src/supervisor/actions.rs", "pub fn start_gripper("),
-        ("src/supervisor/actions.rs", "pub fn start_gripper_with_baseline("),
-        ("src/supervisor/actions.rs", "pub fn start_gripper_zero_check("),
+        ("src/supervisor/actions/lifecycle.rs", "pub fn unload_action("),
+        ("src/supervisor/actions/macros.rs", "pub fn begin_macro("),
+        ("src/supervisor/actions/macros.rs", "pub fn begin_sequence_action("),
+        ("src/supervisor/actions/macros.rs", "pub fn begin_orchestrated_action("),
+        ("src/supervisor/actions/macros.rs", "pub fn install_macro_path("),
+        ("src/supervisor/actions/macros.rs", "pub fn start_macro_gripper("),
+        ("src/supervisor/actions/macros.rs", "pub fn start_macro_gripper_learning("),
+        ("src/supervisor/actions/macros.rs", "pub fn start_macro_gripper_learning_within("),
+        ("src/supervisor/actions/macros.rs", "pub fn install_macro_quintic("),
+        ("src/supervisor/actions/gripper_reconcile.rs", "pub fn start_gripper("),
+        ("src/supervisor/actions/gripper_reconcile.rs", "pub fn start_gripper_with_baseline("),
+        ("src/supervisor/actions/gripper_reconcile.rs", "pub fn start_gripper_zero_check("),
         ("src/gripper_calib.rs", "pub fn begin_calibration("),
-        ("src/supervisor/streams.rs", "pub fn servo("),
-        ("src/supervisor/streams.rs", "pub fn begin_policy_run("),
-        ("src/supervisor/streams.rs", "pub fn authorize_servo_stream("),
+        ("src/supervisor/streams/mod.rs", "pub fn servo("),
+        ("src/supervisor/streams/policy.rs", "pub fn begin_policy_run("),
+        ("src/supervisor/streams/targets.rs", "pub fn authorize_servo_stream("),
         ("src/gravity_comp.rs", "pub fn enter_gravity_comp("),
         ("src/poses.rs", "pub fn move_to_pose("),
         ("src/poses.rs", "pub fn start_action("),
@@ -2464,9 +2533,11 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
         ("src/replay.rs", "pub fn start_replay_motion("),
     ];
     for (rel, sig_prefix) in required_signatures {
-        let src = std::fs::read_to_string(manifest_dir.join(rel)).unwrap();
-        let idx = src.find(sig_prefix).unwrap_or_else(|| panic!("missing {sig_prefix} in {rel}"));
-        let sig_slice = &src[idx..src[idx..].find('{').map_or(src.len(), |o| idx + o)];
+        let prod = corpus_map
+            .get(rel)
+            .unwrap_or_else(|| panic!("missing production corpus entry for {rel}"));
+        let idx = prod.find(sig_prefix).unwrap_or_else(|| panic!("missing {sig_prefix} in {rel}"));
+        let sig_slice = &prod[idx..prod[idx..].find('{').map_or(prod.len(), |o| idx + o)];
         assert!(
             sig_slice.contains("Admitted"),
             "{rel}::{sig_prefix} lacks Admitted parameter: {sig_slice}"
