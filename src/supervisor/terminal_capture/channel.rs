@@ -3,6 +3,334 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Inline staged entry for one release before `capture_edge_terminals` runs:
+/// - `Deferred`: ordinary in-tick `finish_action` / `config.rs` transition whose `ActionStatus`
+///   remains in `last_action` (or `previous_action`), so `TerminalCaptureRecord::capture_from`
+///   runs inside `capture_edge_terminals` (timed in `phases_us.terminal` and covered by capture
+///   alloc/lock proofs).
+/// - `Captured`: inline record captured immediately when an in-tick superseding `begin_action_inner`
+///   is about to overwrite the old slot before `capture_edge_terminals`.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum StagedTerminal {
+    Deferred {
+        action_id: u64,
+        terminal_seq: u64,
+    },
+    Captured(TerminalCaptureRecord),
+}
+
+/// Fixed-capacity preallocated staging buffer for terminal transitions produced during one control
+/// release before `publish_at` flushes them into the SPSC ring (0 RT heap allocations; backing
+/// slice is allocated once at `SupervisorInner::new` to keep `SupervisorInner` small on the stack).
+pub(crate) struct StagedTerminalBuf {
+    slots: Box<[Option<StagedTerminal>]>,
+    len: usize,
+}
+
+/// Fixed-size deduplication tracker for terminal edges keyed by `(action_id, terminal_seq)`.
+/// Guarantees an already-captured action slot is never re-captured during dwell ticks or
+/// after moving from `last_action` to `previous_action`.
+#[derive(Debug, Default)]
+pub(crate) struct TerminalEdgeTracker {
+    /// Recent `(action_id, terminal_seq)` pairs that have emitted a terminal edge.
+    seen: [(u64, u64); 16],
+    head: usize,
+}
+
+/// Exclusive-access (`&mut self` only) producer wrapper around `rtrb::Producer<TerminalCaptureRecord>`
+/// so `SupervisorInner` remains `Sync` while `armd-control` pushes lock-free with zero allocations.
+pub(crate) struct TerminalCaptureTx {
+    producer: rtrb::Producer<TerminalCaptureRecord>,
+    channel: Arc<TerminalCaptureChannel>,
+}
+
+
+#[derive(Clone)]
+struct CachedRichEntry {
+    id: u64,
+    status: Option<ActionStatus>,
+    message: Option<String>,
+    durability_warning: Option<String>,
+}
+
+/// Shared off-thread consumer and lock-free atomic accounting for terminal capture.
+/// `rx` and `rich_action_cache` are NEVER locked on `armd-control`; lock order is strictly
+/// `channel.rx -> terminals.inner` (and `rich_action_cache` is a leaf mutex).
+pub(crate) struct TerminalCaptureChannel {
+    rx: Mutex<rtrb::Consumer<TerminalCaptureRecord>>,
+    /// Off-RT mirror of off-RT mutated `ActionStatus` payloads and >256-byte worker strings
+    /// (bounded to `TERMINAL_FIFO_CAPACITY`) so delayed dispatch past the 2 s window never drops
+    /// or truncates any field without touching `SupervisorLock`. Never accessed on `armd-control`.
+    rich_action_cache: Mutex<VecDeque<CachedRichEntry>>,
+    /// Monotonic high-water mark of action IDs emitted via synthetic (`obs_override`) terminals
+    /// across ALL drain consumers. Because action IDs are strictly monotonic and single-active-slot
+    /// (`begin_action` always terminates any earlier running action before assigning a higher ID),
+    /// any `running` snapshot with `action.id <= max_synthetic_action_id` is guaranteed stale
+    /// without ring eviction or mutex overhead.
+    max_synthetic_action_id: AtomicU64,
+    control_thread_lock_attempts: AtomicU64,
+    next_terminal_seq: AtomicU64,
+    captured: AtomicU64,
+    saturated: AtomicU64,
+    ever_saturated: AtomicBool,
+    inflight: AtomicUsize,
+    admission_cap: AtomicUsize,
+    test_push_cap: AtomicUsize,
+    drain_paused: AtomicBool,
+    /// Off-RT sequence repeat commit barrier: when non-zero, holds `action_id` of a sequence
+    /// whose RT-committed repeat episode is still finishing disk/catalog publication so terminal
+    /// delivery waits until `episodes` and `EpisodeStore` are finalized (never touched on RT).
+    sequence_commit_inflight: AtomicU64,
+    /// Condvar signaled when `sequence_commit_inflight` clears so normal shutdown drains and
+    /// delivers every originating WS terminal and observer broadcast with the committed episode ID
+    /// before broker/router finalization runs.
+    sequence_commit_wait: (Mutex<()>, std::sync::Condvar),
+}
+
+/// Off-RT RAII guard holding [`TerminalCaptureChannel::sequence_commit_inflight`] while an
+/// RT-committed sequence repeat episode finishes off-thread publication and rich-status mirroring.
+pub(crate) struct SequenceCommitGuard {
+    channel: Arc<TerminalCaptureChannel>,
+    hub: Arc<StateHub>,
+    action_id: u64,
+}
+
+fn match_action(cand: &ActionStatus, rec: &TerminalCaptureRecord) -> bool {
+    cand.id == rec.action_id
+        && !cand.is_running()
+        && cand.state == rec.state
+        && cand.code == rec.code
+}
+
+fn merge_sequence_rich_fields(dst: &mut ActionStatus, src: &ActionStatus) {
+    if dst.sequence_id.is_none() {
+        dst.sequence_id = src.sequence_id.clone();
+    }
+    if dst.repeats.is_none() {
+        dst.repeats = src.repeats;
+    }
+    if src.repeat_index.is_some() {
+        dst.repeat_index = src.repeat_index;
+    }
+    if src.step_index.is_some() {
+        dst.step_index = src.step_index;
+    }
+    if src.step_type.is_some() {
+        dst.step_type = src.step_type.clone();
+    }
+    if dst.is_running() {
+        if src.phase.is_some() {
+            dst.phase = src.phase;
+        }
+        if src.progress > dst.progress {
+            dst.progress = src.progress;
+        }
+    }
+    if dst.episodes.len() < src.episodes.len() {
+        dst.episodes = src.episodes.clone();
+    }
+    if !dst.is_running() && dst.state.as_str() != "done" && dst.failed_step.is_none() {
+        dst.failed_step = src.failed_step.or(src.step_index);
+    } else if dst.failed_step.is_none() && src.failed_step.is_some() {
+        dst.failed_step = src.failed_step;
+    }
+}
+
+fn resolve_full_action(
+    rec: &TerminalCaptureRecord,
+    live_slots: &[Option<&ActionStatus>],
+    latest_obs: Option<&ArmObservation>,
+    channel: &TerminalCaptureChannel,
+) -> Option<ActionStatus> {
+    let entry = channel.take_rich_entry(rec.action_id);
+    let mut base: Option<ActionStatus> = None;
+    for slot in live_slots.iter().flatten() {
+        if match_action(slot, rec) {
+            base = Some((*slot).clone());
+            break;
+        }
+    }
+    if base.is_none() {
+        if let Some(obs) = latest_obs {
+            for slot in [obs.previous_action.as_ref(), obs.action.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if match_action(slot, rec) {
+                    base = Some(slot.clone());
+                    break;
+                }
+            }
+        }
+    }
+    let mut out = match (base, entry) {
+        (Some(mut matched), sidecar) => {
+            // Re-apply captured terminal fields even when a live slot or later snapshot matched
+            // `(id, state, code)`, so subsequent in-place reconciliation (e.g., clearing a
+            // dir-sync durability warning) cannot alter the captured terminal payload depending
+            // on drain timing.
+            rec.apply_terminal_overlay(&mut matched);
+            if let Some(sc) = sidecar {
+                if let Some(cached) = sc.status.as_ref() {
+                    if matched.kind.as_str() == "sequence" {
+                        merge_sequence_rich_fields(&mut matched, cached);
+                    }
+                }
+                if rec.has_message {
+                    if let Some(full_msg) = sc.message {
+                        if rec.message.is_truncated() || full_msg.len() > rec.message.as_str().len() {
+                            matched.message = Some(full_msg);
+                        }
+                    }
+                }
+                if rec.has_durability_warning {
+                    if let Some(full_warn) = sc.durability_warning {
+                        if rec.durability_warning.is_truncated()
+                            || full_warn.len() > rec.durability_warning.as_str().len()
+                        {
+                            matched.durability_warning = Some(full_warn);
+                        }
+                    }
+                }
+            }
+            matched
+        }
+        (None, Some(sc)) => {
+            let mut out = match sc.status {
+                Some(mut cached) => {
+                    rec.apply_terminal_overlay(&mut cached);
+                    if cached.kind.as_str() == "sequence"
+                        && cached.state.as_str() != "done"
+                        && cached.failed_step.is_none()
+                    {
+                        cached.failed_step = cached.step_index;
+                    }
+                    cached
+                }
+                None => rec.build_action_status(),
+            };
+            if rec.has_message {
+                if let Some(full_msg) = sc.message {
+                    if rec.message.is_truncated() || full_msg.len() > rec.message.as_str().len() {
+                        out.message = Some(full_msg);
+                    }
+                }
+            }
+            if rec.has_durability_warning {
+                if let Some(full_warn) = sc.durability_warning {
+                    if rec.durability_warning.is_truncated()
+                        || full_warn.len() > rec.durability_warning.as_str().len()
+                    {
+                        out.durability_warning = Some(full_warn);
+                    }
+                }
+            }
+            out
+        }
+        (None, None) => return None,
+    };
+    if !rec.has_durability_warning {
+        out.durability_warning = None;
+    }
+    Some(out)
+}
+
+/// Single authoritative per-joint feedback age & freshness computation shared by
+/// `TerminalCaptureRecord::capture_from` (`feedback_age_ms` + `feedback_valid`) and
+/// `cached_hardware_feedback_fresh`. Never mutates `ArmCore::feedback().instants()`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_cached_feedback_state(
+    feedback_numeric_valid: bool,
+    last_poll_feedback_valid: bool,
+    has_driver: bool,
+    dof: usize,
+    instants: &[Option<Instant>],
+    cached_ages: &[Option<Duration>],
+    cached_feedback_at: Option<Instant>,
+    now: Instant,
+    max_age: Duration,
+) -> ([Option<u64>; CAPTURE_MAX_DOF], bool) {
+    let n = dof.min(CAPTURE_MAX_DOF);
+    let mut age_ms = [None; CAPTURE_MAX_DOF];
+    if !has_driver {
+        for slot in &mut age_ms[..n] {
+            *slot = Some(0);
+        }
+        return (age_ms, feedback_numeric_valid);
+    }
+
+    let complete_instants =
+        instants.len() >= n && n > 0 && instants[..n].iter().all(Option::is_some);
+    let elapsed_since_poll = cached_feedback_at.map(|t| now.saturating_duration_since(t));
+    let mut all_fresh = feedback_numeric_valid && last_poll_feedback_valid && n > 0;
+
+    for (i, slot) in age_ms.iter_mut().enumerate().take(n) {
+        let dur = if complete_instants {
+            instants[i].map(|rx| now.saturating_duration_since(rx))
+        } else {
+            let from_poll = cached_ages
+                .get(i)
+                .copied()
+                .flatten()
+                .zip(elapsed_since_poll)
+                .map(|(age, elapsed)| age.saturating_add(elapsed));
+            from_poll.or_else(|| {
+                instants
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|rx| now.saturating_duration_since(rx))
+            })
+        };
+        match dur {
+            Some(d) => {
+                *slot = Some(d.as_millis().min(u128::from(u64::MAX)) as u64);
+                if d > max_age {
+                    all_fresh = false;
+                }
+            }
+            None => {
+                *slot = None;
+                all_fresh = false;
+            }
+        }
+    }
+    (age_ms, all_fresh)
+}
+
+/// Pure, lock-free cached driver freshness check shared by terminal capture tests.
+/// Derives from [`compute_cached_feedback_state`] so `feedback_valid` and `feedback_age_ms`
+/// always agree on the exact same per-joint sample.
+#[cfg(test)]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_cached_feedback_fresh(
+    feedback_numeric_valid: bool,
+    last_poll_feedback_valid: bool,
+    has_driver: bool,
+    dof: usize,
+    instants: &[Option<Instant>],
+    cached_ages: &[Option<Duration>],
+    cached_feedback_at: Option<Instant>,
+    now: Instant,
+    max_age: Duration,
+) -> bool {
+    compute_cached_feedback_state(
+        feedback_numeric_valid,
+        last_poll_feedback_valid,
+        has_driver,
+        dof,
+        instants,
+        cached_ages,
+        cached_feedback_at,
+        now,
+        max_age,
+    )
+    .1
+}
+
+
 impl Default for StagedTerminalBuf {
     fn default() -> Self {
         let mut v = Vec::with_capacity(4);
