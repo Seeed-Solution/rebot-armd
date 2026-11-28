@@ -470,3 +470,127 @@ fn rt_tracking_lead_and_ramp_out_undersized_scratch_fail_closed_zero_alloc() {
         );
     }
 }
+
+/// R2 Item 6 (Minor): RT inline quintic refusal recording its structured witness into
+/// `workspace_violation` MUST perform (0, 0) heap allocations / deallocations.
+#[test]
+fn rt_inline_quintic_refusal_witness_zero_alloc() {
+    use armd::rt_core::requests::actions::{
+        install_move_joint, ActionSnapshot, JointInstallPayload, OwnerCheckCtx, PreparedActionKind,
+    };
+
+    let mut cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    cfg.collision = None;
+    cfg.power_budget = None;
+    let q_start: [f32; 7] = [0.0, -0.90, -1.15, 0.85, 0.0, 0.0, 0.0];
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    ws.keepout_boxes.clear();
+    let check_pts = ws.check_points_end_m.clone();
+    let start_max_x = {
+        let pose = armd::chain::ArmModel::REBOT_DEV_ARM.fk_f32(&q_start).unwrap();
+        check_pts.iter().map(|c| pose.transform_point(&c.map(f64::from))[0]).fold(pose.p[0], f64::max)
+    };
+    ws.box_max_m[0] = (start_max_x - 0.010) as f32;
+
+    let mut q_neutral = q_start;
+    q_neutral[6] += 0.05;
+    let mut inner = SupervisorInner::new(cfg.clone());
+    inner.lease_enabled = false;
+    inner.rt_executor_owned = true;
+    inner.safety.set_off_thread_reclaim(true);
+    {
+        let s = inner.current_admission_stamp();
+        inner.check_admission(s).and_then(|a| SupervisorInner::enable_torque(a)).unwrap();
+    }
+    inner.commanded_positions = q_start.to_vec();
+    inner.measured_positions = q_start.to_vec();
+    inner.target_positions = q_start.to_vec();
+    inner.prewarm_rt_buffers();
+
+    let s = inner.current_admission_stamp();
+    let snap = ActionSnapshot::from_inner(&inner, s, Instant::now() + Duration::from_secs(5));
+    let ctx = OwnerCheckCtx::for_legacy(&inner);
+    let mut start_arr = [0.0f32; 8];
+    let mut tgt_arr = [0.0f32; 8];
+    let mut vel_arr = [1.0f32; 8];
+    start_arr[..7].copy_from_slice(&q_start);
+    tgt_arr[..7].copy_from_slice(&q_neutral);
+    for (i, l) in cfg.limits.iter().enumerate() { vel_arr[i] = l.max_velocity; }
+
+    // Invoke via `CoreOps::commit_action` (the exact RT thread entrypoint that returns `CommitRefusal`,
+    // avoiding `install_move_joint`'s off-RT `ArmError` String formatting).
+    use armd::rt_core::broker::{plan_slots, ClientId, CommandKind, Descriptor, RequestId, Stamp};
+    use armd::rt_core::ops::{CommitCtx, CoreOps, PlanSlot, Primitive};
+    use armd::rt_core::requests::actions::{ActionCommand, StagedAction};
+    let mut slot = PlanSlot::default();
+    slot.primitive = Primitive::Action(StagedAction::Joint {
+        child: None,
+        kind: PreparedActionKind::MoveToJoint,
+        dof: 7,
+        start: start_arr,
+        v0: [0.0; 8],
+        target: tgt_arr,
+        duration_s: 0.4,
+        max_velocity: vel_arr,
+        power_scale: None,
+        settle: false,
+        approach_then: None,
+        checked_joints: None,
+    });
+    let (mut pw, pr) = plan_slots(1, PlanSlot::default);
+    let h = pw.stage(|dst| *dst = slot).unwrap();
+    let slot_ref = pr.pin(h).unwrap();
+    let now = Instant::now();
+    let cmd = ActionCommand::InstallPrepared {
+        kind: PreparedActionKind::MoveToJoint,
+        plan: h,
+        prepared_boot: snap.stamp.boot,
+        admission_request_id: snap.stamp.admission.request_id,
+        check_workspace_revision: true,
+        poses_revision: snap.stamp.poses_revision,
+        calibration_revision: snap.stamp.calibration_revision,
+        gripper_calib_revision: snap.stamp.gripper_calib_revision,
+        power_budget_revision: snap.stamp.power_budget_revision,
+    };
+    let d = Descriptor {
+        stamp: Stamp {
+            arm: inner.core.id(),
+            boot: snap.stamp.boot,
+            client: ClientId(0),
+            client_seq: 1,
+            request: RequestId(snap.stamp.admission.request_id),
+            authority: Authority {
+                lease_generation: 0,
+                epoch: snap.stamp.admission.estop_epoch,
+                stop_generation: snap.stamp.admission.stop_gen,
+                config_revision: snap.stamp.config_revision,
+                parent_generation: 0,
+            },
+            deadline: now + Duration::from_secs(5),
+        },
+        kind: CommandKind::Action(cmd),
+    };
+    let cctx = CommitCtx {
+        arm: inner.core.id(),
+        boot: ctx.boot,
+        now,
+        stop_generation: ctx.stop_generation,
+    };
+    let _ = (install_move_joint, JointInstallPayload::Rt {
+        kind: PreparedActionKind::MoveToJoint, dof: 7, start: start_arr, v0: [0.0; 8], target: tgt_arr,
+        duration_s: 0.4, max_velocity: vel_arr, power_scale: None, settle: false, approach_then: None, checked_joints: None,
+    });
+
+    let (res, a, fr) = counted(|| CoreOps::commit_action(&mut inner, &d, cmd, Some(slot_ref), &cctx));
+    let refusal = res.expect_err("RT commit_staged_action must refuse neutral move");
+    assert_eq!(refusal.code, "WORKSPACE_VIOLATION");
+    assert_eq!((a, fr), (0, 0), "RT inline quintic refusal witness must perform (0, 0) allocs/frees");
+    let detail = inner.workspace_violation.as_ref().expect("structured witness populated");
+    assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
+    assert_eq!(detail.violation_phase.as_deref(), Some("sweep"));
+    assert!(detail.reason.as_deref().unwrap_or("").contains("move makes no net return toward the workspace"));
+}

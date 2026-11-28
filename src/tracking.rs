@@ -435,6 +435,9 @@ fn fmt_ws_failure_rt(
             let lbl = if conservative_bound { "bound depth" } else { "new depth" };
             write!(f, "{prefix} (slot {slot}, previous depth {:.3} m, {lbl} {:.3} m)", min_d.max(0.0), depth)
         }
+        WorkspaceFailureKindRt::TerminalNoProgress { slot, depth, start_depth, .. } => {
+            write!(f, "{prefix} (slot {slot}, start depth {:.3} m, end depth {:.3} m; move makes no net return toward the workspace)", start_depth.max(0.0), depth)
+        }
     }
 }
 

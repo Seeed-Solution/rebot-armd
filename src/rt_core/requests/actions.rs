@@ -873,6 +873,18 @@ impl ActionRefusal {
     }
 }
 
+fn commit_refusal_to_arm_error(inner: &SupervisorInner, r: CommitRefusal) -> ArmError {
+    if r.code == "WORKSPACE_VIOLATION" {
+        if let Some(d) = inner.workspace_violation.clone() {
+            let limit = d.constraint_id.clone().unwrap_or_else(|| "workspace".into());
+            return ArmError::Safety(SafetyError::WorkspaceViolation {
+                limit, value: 0.0, bound: 0.0, point: 0, detail: Box::new(d),
+            });
+        }
+    }
+    ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))
+}
+
 pub(crate) fn check_cartesian_path_planning_rt(
     inner: &SupervisorInner,
     dof: usize,
@@ -3470,7 +3482,7 @@ pub fn install_move_cartesian(
         }
         CartesianInstallPayload::Slot { kind, dof, start, measured_start, slot, duration_s, power_scale, approach_then } => {
             install_move_cartesian_slot_rt(inner, stamp, ctx, kind, dof, &start, measured_start.as_ref(), slot, duration_s, power_scale, approach_then)
-                .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits)))
+                .map_err(|r| commit_refusal_to_arm_error(inner, r))
         }
     }
 }
@@ -3848,7 +3860,7 @@ pub fn install_move_joint(
             approach_then,
             checked_joints,
         )
-        .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))),
+        .map_err(|r| commit_refusal_to_arm_error(inner, r)),
     }
 }
 
@@ -4827,7 +4839,7 @@ pub fn install_macro_child(
     match payload {
         MacroChildPayload::Slot(slot) => {
             install_macro_child_slot_rt(inner, stamp, ctx, slot)
-                .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits)))
+                .map_err(|r| commit_refusal_to_arm_error(inner, r))
         }
         MacroChildPayload::LegacyCartesian {
             spec,

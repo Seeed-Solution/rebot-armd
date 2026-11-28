@@ -592,12 +592,15 @@ impl SupervisorInner {
     }
 
     /// Zero-allocation RT quintic sweep returning static error codes on both acceptance and
-    /// refusal; fails closed without allocating on oversized/undersized inputs on RT.
+    /// refusal; preserves the structured refusal witness (`constraint_id`, `geometry_id`,
+    /// `violation_phase`, `reason`) in the preallocated `self.workspace_violation` buffer and
+    /// fails closed without allocating on oversized/undersized inputs on RT.
     pub(crate) fn check_workspace_quintic_inline_rt(
         &mut self,
         traj: &MultiJointQuinticTrajectory,
         check_measured: bool,
     ) -> Result<(), &'static str> {
+        use crate::chain::{WorkspaceEvaluator, WorkspaceFailureKindRt, WorkspaceFailureRt};
         if self.workspace_policy().is_none() {
             return Ok(());
         }
@@ -605,35 +608,59 @@ impl SupervisorInner {
             || self.config.arm_model.arm_dof() > crate::chain::MAX_CHAIN_JOINTS
         {
             if self.rt_executor_owned {
+                let f = WorkspaceFailureRt { kind: WorkspaceFailureKindRt::Invalid("dof exceeds inline sweep capacity"), phase: "sweep" };
+                let mut detail = self.workspace_violation.take().or_else(|| self.workspace_violation_spare.take())
+                    .unwrap_or_else(crate::kinematics::WorkspaceViolationDetail::preallocated_rt);
+                WorkspaceEvaluator::write_failure_detail_without_eval_rt(&f, &mut detail);
+                self.workspace_violation = Some(detail);
                 return Err("WORKSPACE_VIOLATION");
             }
             let meas = check_measured.then_some(self.measured_positions.as_slice());
-            let samples = self.workspace_samples_from_measured(traj, meas).map_err(|_| "WORKSPACE_VIOLATION")?;
-            return self
-                .check_workspace_path_from_measured(&self.commanded_positions, meas, samples.iter().map(Vec::as_slice))
-                .map_err(|_| "WORKSPACE_VIOLATION");
+            let checked = self.workspace_samples_from_measured(traj, meas).and_then(|samples| {
+                self.check_workspace_path_from_measured(&self.commanded_positions, meas, samples.iter().map(Vec::as_slice))
+            });
+            return checked.map_err(|e| {
+                if let SafetyError::WorkspaceViolation { detail, .. } = e { self.workspace_violation = Some(*detail); }
+                "WORKSPACE_VIOLATION"
+            });
         }
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let mut detail_slot = self.workspace_violation.take().or_else(|| self.workspace_violation_spare.take());
         let result = (|| {
             let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
             if !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false) {
                 if self.rt_executor_owned {
+                    let f = WorkspaceFailureRt { kind: WorkspaceFailureKindRt::Invalid("workspace scratch undersized"), phase: "sweep" };
+                    let d = detail_slot.get_or_insert_with(crate::kinematics::WorkspaceViolationDetail::preallocated_rt);
+                    WorkspaceEvaluator::write_failure_detail_without_eval_rt(&f, d);
                     return Err("WORKSPACE_VIOLATION");
                 }
                 bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
             }
-            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            let eval = WorkspaceEvaluator::new_with_tcp_in(
                 &self.config.arm_model, ws, cam, self.config.tcp_offset, &mut bufs,
             )
             .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
             let meas = check_measured.then_some(self.measured_positions.as_slice());
-            let checked = eval
-                .check_quintic_inline_rt(meas, traj, MAX_KEEPOUT_EVALS_PER_PLAN, "sweep", &mut bufs)
-                .map_err(|_| "WORKSPACE_VIOLATION");
+            let checked = match eval.check_quintic_inline_rt(meas, traj, MAX_KEEPOUT_EVALS_PER_PLAN, "sweep", &mut bufs) {
+                Ok(()) => Ok(()),
+                Err(f) => {
+                    let d = detail_slot.get_or_insert_with(crate::kinematics::WorkspaceViolationDetail::preallocated_rt);
+                    eval.write_failure_detail_rt(&f, d);
+                    Err("WORKSPACE_VIOLATION")
+                }
+            };
             eval.recycle(&mut bufs);
             checked
         })();
         self.ws_eval_bufs = bufs;
+        match (result, detail_slot) {
+            (Ok(()), Some(spare)) => {
+                if self.workspace_violation_spare.is_none() { self.workspace_violation_spare = Some(spare); }
+            }
+            (Err(_), Some(detail)) => { self.workspace_violation = Some(detail); }
+            _ => {}
+        }
         result
     }
 

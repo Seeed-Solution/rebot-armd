@@ -598,3 +598,132 @@ fn terminal_rule_rejects_sub_eps_deepening_even_when_another_slot_improves() {
         .expect_err("RT check_terminal_progress_rt must reject 0.09 mm deepening");
     assert_eq!(rt_err.phase, "sweep");
 }
+
+/// R2 Item 6 (Minor): RT inline quintic refusal (`check_workspace_quintic_inline_rt` /
+/// `install_move_joint`) must preserve the full structured witness (`constraint_id`,
+/// `geometry_id`, `violation_phase`, `reason`) in the preallocated `workspace_violation`
+/// buffer — including the exact no-net-return terminal text matching the allocating path.
+#[test]
+fn rt_inline_quintic_refusal_preserves_structured_witness_including_no_progress() {
+    use armd::rt_core::requests::actions::{
+        install_move_joint, ActionSnapshot, JointInstallPayload, OwnerCheckCtx,
+        PreparedActionKind,
+    };
+    use armd::rt_core::requests::motion::{prepare_motion, MotionPlanSnapshot, MotionRequest};
+
+    // Start 10 mm outside box_max_x.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.lease_timeout_ms = 60_000;
+    let q_start: [f32; 7] = [0.0, -0.90, -1.15, 0.85, 0.0, 0.0, 0.0];
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    ws.keepout_boxes.clear();
+    let check_pts = ws.check_points_end_m.clone();
+    let max_x_at = |q: &[f32]| -> f64 {
+        let pose = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts.iter().map(|c| pose.transform_point(&c.map(f64::from))[0]).fold(pose.p[0], f64::max)
+    };
+    let start_max_x = max_x_at(&q_start);
+    ws.box_max_m[0] = (start_max_x - 0.010) as f32;
+
+    // 1. Direct formatter parity on TerminalNoProgress (RT vs allocating check_terminal_progress).
+    let eval = WorkspaceEvaluator::new_with_tcp(&cfg.arm_model, cfg.workspace.as_ref().unwrap(), &cfg.camera_mount, cfg.tcp_offset);
+    let mut c0 = eval.alloc_buf();
+    eval.eval_into(&q_start, &mut c0, "sweep").unwrap();
+    let sd = eval.init_min_depths(&c0);
+    let alloc_np = eval.check_terminal_progress(sd.as_slice(), c0.as_slice(), "sweep").unwrap_err();
+    let rt_np = eval.check_terminal_progress_rt(sd.as_slice(), c0.as_slice(), "sweep").unwrap_err();
+    let mut rt_detail = armd::kinematics::WorkspaceViolationDetail {
+        constraint_id: Some(String::with_capacity(160)),
+        geometry_id: Some(String::with_capacity(128)),
+        violation_phase: Some(String::with_capacity(64)),
+        reason: Some(String::with_capacity(384)),
+    };
+    eval.write_failure_detail_rt(&rt_np, &mut rt_detail);
+    assert_eq!(rt_detail.constraint_id, alloc_np.detail.constraint_id);
+    assert_eq!(rt_detail.geometry_id, alloc_np.detail.geometry_id);
+    assert_eq!(rt_detail.violation_phase, alloc_np.detail.violation_phase);
+    assert_eq!(rt_detail.reason, alloc_np.detail.reason);
+    assert!(
+        rt_detail.reason.as_deref().unwrap_or("").contains("move makes no net return toward the workspace"),
+        "RT no-progress reason must identify no net return, got {:?}",
+        rt_detail.reason
+    );
+
+    // 2. Live RT install (`JointInstallPayload::Rt`) where live measured pose is at q_start:
+    //    (a) tiny J1 nudge deepens an off-axis end_point by 0.1 mm -> structured deepening witness;
+    //    (b) arm-invariant target (`q_stay[6] += 0.05`) makes zero net return -> structured
+    //        TerminalNoProgress witness ("move makes no net return toward the workspace").
+    //    Both must be preserved in `inner.workspace_violation` AND the returned `ArmError`.
+    let mut q_deeper = q_start;
+    q_deeper[0] += 0.0005;
+    let mut q_no_progress = q_start;
+    q_no_progress[6] += 0.05;
+    let mut inner = armd::SupervisorInner::new(cfg.clone());
+    inner.lease_enabled = false;
+    inner.rt_executor_owned = true;
+    let s0 = inner.current_admission_stamp();
+    inner.check_admission(s0).and_then(|a| armd::SupervisorInner::enable_torque(a)).unwrap();
+    inner.commanded_positions = q_start.to_vec();
+    inner.measured_positions = q_start.to_vec();
+    inner.target_positions = q_start.to_vec();
+    inner.prewarm_rt_buffers();
+    let _ = (prepare_motion, MotionPlanSnapshot::from_supervisor(&inner), MotionRequest::home(None));
+
+    let mut start_arr = [0.0f32; 8];
+    let mut vel_arr = [1.0f32; 8];
+    start_arr[..7].copy_from_slice(&q_start);
+    for (i, l) in cfg.limits.iter().enumerate() { vel_arr[i] = l.max_velocity; }
+
+    for (label, q_tgt, expected_substr) in [
+        ("deepened", q_deeper, "this move would go"),
+        ("no_progress", q_no_progress, "move makes no net return toward the workspace"),
+    ] {
+        let s1 = inner.current_admission_stamp();
+        let snap = ActionSnapshot::from_inner(&inner, s1, std::time::Instant::now() + Duration::from_secs(5));
+        let ctx = OwnerCheckCtx::for_legacy(&inner);
+        let mut tgt_arr = [0.0f32; 8];
+        tgt_arr[..7].copy_from_slice(&q_tgt);
+        let err = install_move_joint(
+            &mut inner,
+            &snap.stamp,
+            &ctx,
+            JointInstallPayload::Rt {
+                kind: PreparedActionKind::MoveToJoint,
+                dof: 7,
+                start: start_arr,
+                v0: [0.0; 8],
+                target: tgt_arr,
+                duration_s: 0.4,
+                max_velocity: vel_arr,
+                power_scale: None,
+                settle: false,
+                approach_then: None,
+                checked_joints: None,
+            },
+        )
+        .unwrap_err();
+        let detail = inner
+            .workspace_violation
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: RT inline refusal must record structured workspace_violation witness"));
+        assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"), "{label}: {detail:?}");
+        assert!(detail.geometry_id.as_deref().is_some_and(|g| !g.is_empty()), "{label}: {detail:?}");
+        assert_eq!(detail.violation_phase.as_deref(), Some("sweep"), "{label}: {detail:?}");
+        assert!(
+            detail.reason.as_deref().unwrap_or("").contains(expected_substr),
+            "{label}: expected '{expected_substr}' in witness, got {detail:?}"
+        );
+        match err {
+            armd::ArmError::Safety(armd::safety::SafetyError::WorkspaceViolation { detail: err_detail, .. }) => {
+                assert_eq!(err_detail.constraint_id, detail.constraint_id, "{label}");
+                assert_eq!(err_detail.geometry_id, detail.geometry_id, "{label}");
+                assert_eq!(err_detail.violation_phase, detail.violation_phase, "{label}");
+                assert_eq!(err_detail.reason, detail.reason, "{label}");
+            }
+            other => panic!("{label}: expected SafetyError::WorkspaceViolation with structured detail, got {other:?}"),
+        }
+    }
+}

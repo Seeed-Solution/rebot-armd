@@ -1242,6 +1242,7 @@ pub enum WorkspaceFailureKindRt {
     InvalidSelfPair(usize),
     BudgetExceeded { max_budget: usize, slot: Option<usize>, start_outside: bool },
     Constraint { slot: usize, clr: f64, depth: f64, min_d: f64, start_outside: bool, conservative_bound: bool },
+    TerminalNoProgress { slot: usize, clr: f64, depth: f64, start_depth: f64 },
 }
 
 /// Zero-allocation refusal returned by RT workspace evaluation/sweep helpers.
@@ -1259,7 +1260,8 @@ impl WorkspaceFailureRt {
             | WorkspaceFailureKindRt::UnknownCapsule(_)
             | WorkspaceFailureKindRt::InvalidSelfPair(_) => "invalid",
             WorkspaceFailureKindRt::BudgetExceeded { .. } => "sweep_budget",
-            WorkspaceFailureKindRt::Constraint { .. } => "workspace_violation",
+            WorkspaceFailureKindRt::Constraint { .. }
+            | WorkspaceFailureKindRt::TerminalNoProgress { .. } => "workspace_violation",
         }
     }
 }
@@ -1679,9 +1681,12 @@ impl<'a> WorkspaceEvaluator<'a> {
     pub fn check_terminal_progress_rt(&self, start_depths: &[f64], end_clr: &[f64], phase: &'static str) -> Result<(), WorkspaceFailureRt> {
         match k::check_terminal_workspace_progress(&start_depths[..self.total_slots], &end_clr[..self.total_slots]) {
             Ok(()) => Ok(()),
-            Err(k::TerminalWorkspaceReject::Deepened { slot, depth, start_depth })
-            | Err(k::TerminalWorkspaceReject::NoProgress { slot, depth, start_depth }) => Err(WorkspaceFailureRt {
+            Err(k::TerminalWorkspaceReject::Deepened { slot, depth, start_depth }) => Err(WorkspaceFailureRt {
                 kind: WorkspaceFailureKindRt::Constraint { slot, clr: end_clr[slot], depth, min_d: start_depth, start_outside: true, conservative_bound: false },
+                phase,
+            }),
+            Err(k::TerminalWorkspaceReject::NoProgress { slot, depth, start_depth }) => Err(WorkspaceFailureRt {
+                kind: WorkspaceFailureKindRt::TerminalNoProgress { slot, clr: end_clr[slot], depth, start_depth },
                 phase,
             }),
         }
@@ -1726,50 +1731,32 @@ impl<'a> WorkspaceEvaluator<'a> {
     pub fn refusal_detail(&self, failure: &WorkspaceFailureRt) -> crate::rt_core::mailbox::RefusalDetail {
         let payload = match failure.kind {
             WorkspaceFailureKindRt::Constraint { slot, clr, depth, min_d, start_outside, conservative_bound } => {
-                let (constraint_tag, geom_kind, name1_len, name2_len, names, value, bound) =
-                    self.pack_slot_refusal(slot, clr, depth);
-                WorkspaceRefusalRt {
-                    value_bits: value.to_bits(), bound_bits: bound.to_bits(),
-                    prev_depth_bits: min_d.max(0.0).to_bits(), depth_bits: depth.max(0.0).to_bits(),
-                    max_budget: 0, kind: u8::from(conservative_bound), constraint_tag, geom_kind,
-                    start_outside, name1_len, name2_len, names,
-                }
+                let (constraint_tag, geom_kind, name1_len, name2_len, names, value, bound) = self.pack_slot_refusal(slot, clr, depth);
+                WorkspaceRefusalRt { value_bits: value.to_bits(), bound_bits: bound.to_bits(), prev_depth_bits: min_d.max(0.0).to_bits(), depth_bits: depth.max(0.0).to_bits(), max_budget: 0, kind: u8::from(conservative_bound), constraint_tag, geom_kind, start_outside, name1_len, name2_len, names }
+            }
+            WorkspaceFailureKindRt::TerminalNoProgress { slot, clr, depth, start_depth } => {
+                let (constraint_tag, geom_kind, name1_len, name2_len, names, value, bound) = self.pack_slot_refusal(slot, clr, depth);
+                WorkspaceRefusalRt { value_bits: value.to_bits(), bound_bits: bound.to_bits(), prev_depth_bits: start_depth.max(0.0).to_bits(), depth_bits: depth.max(0.0).to_bits(), max_budget: 0, kind: 0, constraint_tag, geom_kind, start_outside: true, name1_len, name2_len, names }
             }
             WorkspaceFailureKindRt::BudgetExceeded { max_budget, slot, start_outside } => {
                 let (constraint_tag, geom_kind, name1_len, name2_len, names) = match slot {
                     Some(s) => { let (t, g, l1, l2, n, _, _) = self.pack_slot_refusal(s, 0.0, 0.0); (t, g, l1, l2, n) }
                     None => (255, 0, 0, 0, [0u8; 82]),
                 };
-                WorkspaceRefusalRt {
-                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
-                    max_budget: max_budget.min(u32::MAX as usize) as u32, kind: 2, constraint_tag, geom_kind,
-                    start_outside, name1_len, name2_len, names,
-                }
+                WorkspaceRefusalRt { value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0, max_budget: max_budget.min(u32::MAX as usize) as u32, kind: 2, constraint_tag, geom_kind, start_outside, name1_len, name2_len, names }
             }
             WorkspaceFailureKindRt::Invalid(msg) => {
                 let (name1_len, name2_len, names) = WorkspaceRefusalRt::pack_names(msg, "");
-                WorkspaceRefusalRt {
-                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
-                    max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 0,
-                    start_outside: false, name1_len, name2_len, names,
-                }
+                WorkspaceRefusalRt { value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0, max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 0, start_outside: false, name1_len, name2_len, names }
             }
             WorkspaceFailureKindRt::UnknownCapsule(ci) => {
                 let id = self.ws.link_capsules.get(ci).map_or("?", |c| c.id.as_str());
                 let (name1_len, name2_len, names) = WorkspaceRefusalRt::pack_names(id, "unknown capsule frame");
-                WorkspaceRefusalRt {
-                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
-                    max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 255,
-                    start_outside: false, name1_len, name2_len, names,
-                }
+                WorkspaceRefusalRt { value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0, max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 255, start_outside: false, name1_len, name2_len, names }
             }
             WorkspaceFailureKindRt::InvalidSelfPair(_) => {
                 let (name1_len, name2_len, names) = WorkspaceRefusalRt::pack_names("invalid self-collision pair", "");
-                WorkspaceRefusalRt {
-                    value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0,
-                    max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 0,
-                    start_outside: false, name1_len, name2_len, names,
-                }
+                WorkspaceRefusalRt { value_bits: 0, bound_bits: 0, prev_depth_bits: 0, depth_bits: 0, max_budget: 0, kind: 3, constraint_tag: 255, geom_kind: 0, start_outside: false, name1_len, name2_len, names }
             }
         };
         crate::rt_core::mailbox::RefusalDetail::Workspace(payload)
@@ -2239,6 +2226,13 @@ impl<'a> WorkspaceEvaluator<'a> {
                     cid: cid.as_str(), gid: gid.as_str(), limit: limit.as_str(), value, bound, prev_depth: min_d, depth, start_outside, conservative_bound,
                 });
             }
+            WorkspaceFailureKindRt::TerminalNoProgress { slot, clr, depth, start_depth } => {
+                let (_, cid, limit, gid, _, value, bound) = self.slot_meta_bounded(slot, clr, depth);
+                let _ = write!(
+                    w, "{} ({}) remains {:.3} m beyond {} ({} {:.3} m, limit {:.3} m; start depth {:.3} m, end depth {:.3} m; move makes no net return toward the workspace)",
+                    workspace_geometry_part(gid.as_str()), gid.as_str(), depth, limit.as_str(), cid.as_str(), value, bound, start_depth, depth,
+                );
+            }
         }
     }
 
@@ -2263,7 +2257,8 @@ impl<'a> WorkspaceEvaluator<'a> {
                 write_opt_str_rt(&mut dst.constraint_id, |w| { let _ = w.write_str("sweep_budget"); });
                 write_opt_str_rt(&mut dst.geometry_id, |w| { let _ = w.write_str(gid); });
             }
-            WorkspaceFailureKindRt::Constraint { slot, clr, depth, .. } => {
+            WorkspaceFailureKindRt::Constraint { slot, clr, depth, .. }
+            | WorkspaceFailureKindRt::TerminalNoProgress { slot, clr, depth, .. } => {
                 let (_, cid, _, gid, _, _, _) = self.slot_meta_bounded(slot, clr, depth);
                 write_opt_str_rt(&mut dst.constraint_id, |w| { let _ = w.write_str(cid.as_str()); });
                 write_opt_str_rt(&mut dst.geometry_id, |w| { let _ = w.write_str(gid.as_str()); });
