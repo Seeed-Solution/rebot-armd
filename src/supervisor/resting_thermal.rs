@@ -9,10 +9,10 @@ use super::*;
 /// the dwell from the next fresh sample.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ThermalCooldown {
-    first_sample_at: Option<Instant>,
-    last_oldest_sample_at: Option<Instant>,
-    last_joint_samples: [Option<Instant>; crate::model::MAX_MOTION_DOF],
-    joint_count: usize,
+    pub(super) first_sample_at: Option<Instant>,
+    pub(super) last_oldest_sample_at: Option<Instant>,
+    pub(super) last_joint_samples: [Option<Instant>; crate::model::MAX_MOTION_DOF],
+    pub(super) joint_count: usize,
 }
 
 

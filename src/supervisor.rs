@@ -97,6 +97,18 @@ pub(crate) use types::{
     TickOutput,
 };
 use types::{sync_action_obs, UNLOAD_SETTLE_REPORT_AFTER_S};
+pub use mode_switch::MitHandBackReason;
+pub(crate) use mode_switch::{
+    next_mode_switch_terminal_action_id, ModeSwitchPurpose, ModeSwitchRunner,
+};
+pub use observation::OBS_LOCK_WAIT;
+use observation::{executor_unavailable, observation_unavailable, owner_transferred, OBS_POLL};
+pub use ownership::{
+    init_process_identity, parse_linux_process_start_unix_ns, ProcessIdentity, OWNER_EXECUTOR,
+    OWNER_FAILED, OWNER_LEGACY, OWNER_TRANSFERRING,
+};
+use ownership::OwnerSlot;
+pub(crate) use resting_thermal::ThermalCooldown;
 
 pub struct SupervisorInner {
     pub config: ArmConfig,

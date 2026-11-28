@@ -46,14 +46,14 @@ pub enum MitHandBackReason {
 /// [`SupervisorInner`].
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ModeSwitchRunner {
-    active_session: Option<crate::rt_core::session::SessionId>,
-    purpose: ModeSwitchPurpose,
-    machine: Option<crate::motor_mode::ModeSwitch>,
-    event_tx: Option<crate::rt_core::stream::StreamProducer<crate::motor_mode::ModeSwitchEvent>>,
-    retained_events: [Option<crate::motor_mode::ModeSwitchEvent>; 16],
-    retained_len: usize,
-    recent_terminals: [Option<crate::motor_mode::ModeSwitchSnapshot>; 4],
-    recent_terminal_cursor: usize,
+    pub(super) active_session: Option<crate::rt_core::session::SessionId>,
+    pub(super) purpose: ModeSwitchPurpose,
+    pub(super) machine: Option<crate::motor_mode::ModeSwitch>,
+    pub(super) event_tx: Option<crate::rt_core::stream::StreamProducer<crate::motor_mode::ModeSwitchEvent>>,
+    pub(super) retained_events: [Option<crate::motor_mode::ModeSwitchEvent>; 16],
+    pub(super) retained_len: usize,
+    pub(super) recent_terminals: [Option<crate::motor_mode::ModeSwitchSnapshot>; 4],
+    pub(super) recent_terminal_cursor: usize,
 }
 
 /// Allocates a collision-free `ActionId` for a router-bound `ModeSwitch` session terminal
