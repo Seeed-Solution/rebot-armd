@@ -847,9 +847,6 @@ pub(crate) struct TerminalCaptureTx {
     channel: Arc<TerminalCaptureChannel>,
 }
 
-// SAFETY: `TerminalCaptureTx` exposes no `&self` access to `self.producer`; all push operations
-// require `&mut self`, enforcing single-producer exclusive access (identical to `PolicyTerminalTx`).
-unsafe 
 
 #[derive(Clone)]
 struct CachedRichEntry {

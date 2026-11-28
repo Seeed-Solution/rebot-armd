@@ -621,3 +621,7 @@ impl TerminalCaptureChannel {
         terminals.activate_subscriber_cutoff(sub_id, || self.latest_terminal_seq());
     }
 }
+
+// SAFETY: `TerminalCaptureTx` exposes no `&self` access to `self.producer`; all push operations
+// require `&mut self`, enforcing single-producer exclusive access (identical to `PolicyTerminalTx`).
+unsafe impl Sync for TerminalCaptureTx {}
