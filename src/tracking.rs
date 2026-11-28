@@ -2012,31 +2012,28 @@ impl crate::supervisor::SupervisorInner {
 
         // 5. Evaluate candidates reusing caller's `bufs` (`self.ws_eval_bufs`, 0 heap allocs on RT).
         let mut ws_eval = if let Some((ws, cam)) = self.workspace_policy() {
-            let mut eval = WorkspaceEvaluator::new_with_tcp_in(
-                &self.config.arm_model,
-                ws,
-                cam,
-                self.config.tcp_offset,
-                bufs,
+            if !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false) {
+                if self.rt_executor_owned {
+                    return Err(TrackingRejectRt::Workspace(crate::chain::WorkspaceFailureRt {
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase: "tracking_lead",
+                    }));
+                }
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+            }
+            let eval = WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model, ws, cam, self.config.tcp_offset, bufs,
             );
             let n = eval.total_slots;
-            if bufs.scratch_c0.len() < n
-                || bufs.scratch_c1.len() < n
-                || bufs.scratch_cm.len() < n
-                || bufs.scratch_cand_min_d.len() < n
-                || bufs.tracking_staged_ws.len() < n
-                || bufs.geom_bounds.len() < eval.num_geoms
-                || bufs.sweep_slab.len() < 2 * n
-            {
-                eval.recycle(bufs);
-                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
-                eval = WorkspaceEvaluator::new_with_tcp_in(
-                    &self.config.arm_model,
-                    ws,
-                    cam,
-                    self.config.tcp_offset,
-                    bufs,
-                );
+            if bufs.tracking_staged_ws.len() < n {
+                if self.rt_executor_owned {
+                    eval.recycle(bufs);
+                    return Err(TrackingRejectRt::Workspace(crate::chain::WorkspaceFailureRt {
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase: "tracking_lead",
+                    }));
+                }
+                bufs.tracking_staged_ws.resize(n, 0.0);
             }
             if let Err(f) = eval.eval_into_slice_rt(prev_q, &mut bufs.scratch_c0, &mut bufs.world_caps, "tracking_lead") {
                 eval.recycle(bufs);
@@ -2375,33 +2372,28 @@ impl crate::supervisor::SupervisorInner {
             let Some((ws, cam)) = self.workspace_policy() else {
                 return Ok(());
             };
-            let mut eval = WorkspaceEvaluator::new_with_tcp_in_mode(
-                &self.config.arm_model,
-                ws,
-                cam,
-                self.config.tcp_offset,
-                &mut bufs,
-                keepout_only,
+            if !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, keepout_only) {
+                if self.rt_executor_owned {
+                    return Err(TrackingRejectRt::Workspace(crate::chain::WorkspaceFailureRt {
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase: "tracking_ramp_out",
+                    }));
+                }
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+            }
+            let eval = WorkspaceEvaluator::new_with_tcp_in_mode(
+                &self.config.arm_model, ws, cam, self.config.tcp_offset, &mut bufs, keepout_only,
             );
             let n = eval.total_slots;
-            if bufs.scratch_c0.len() < n
-                || bufs.scratch_c1.len() < n
-                || bufs.scratch_cm.len() < n
-                || bufs.scratch_cand_min_d.len() < n
-                || bufs.tracking_staged_ws.len() < n
-                || bufs.geom_bounds.len() < eval.num_geoms
-                || bufs.sweep_slab.len() < 2 * n
-            {
-                eval.recycle(&mut bufs);
-                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
-                eval = WorkspaceEvaluator::new_with_tcp_in_mode(
-                    &self.config.arm_model,
-                    ws,
-                    cam,
-                    self.config.tcp_offset,
-                    &mut bufs,
-                    keepout_only,
-                );
+            if bufs.tracking_staged_ws.len() < n {
+                if self.rt_executor_owned {
+                    eval.recycle(&mut bufs);
+                    return Err(TrackingRejectRt::Workspace(crate::chain::WorkspaceFailureRt {
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase: "tracking_ramp_out",
+                    }));
+                }
+                bufs.tracking_staged_ws.resize(n, 0.0);
             }
             let inner_res = (|| {
                 eval.eval_into_slice_rt(prev_q, &mut bufs.scratch_c0, &mut bufs.world_caps, "tracking_ramp_out")

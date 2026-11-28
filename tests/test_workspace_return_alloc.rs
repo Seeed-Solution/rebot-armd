@@ -301,3 +301,172 @@ fn rt_oversized_workspace_and_undersized_scratch_fail_closed_zero_alloc() {
         "RT step fail-closed on undersized scratch must not allocate or free"
     );
 }
+
+struct NoAllocTrackingDriver {
+    q: [f32; 7],
+    enabled: bool,
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl armd::driver::ArmDriver for NoAllocTrackingDriver {
+    fn supports_rt_executor(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+    fn capabilities(&self) -> armd::driver::DriverCapabilities {
+        armd::driver::DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: true,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        }
+    }
+    fn enable_state(&self) -> armd::driver::EnableState {
+        if self.enabled { armd::driver::EnableState::Enabled } else { armd::driver::EnableState::Disabled }
+    }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.enabled }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        for _ in 0..7 { out.push(Some(Duration::ZERO)); }
+    }
+    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool {
+        dof == 7
+    }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        out.clear();
+        for _ in 0..7 { out.push(Some(0)); }
+    }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        let now = Instant::now();
+        out.clear();
+        for _ in 0..7 { out.push(Some(now)); }
+    }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        for _ in 0..7 { out.push(1); }
+    }
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        for _ in 0..7 { out.push(None); }
+    }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        let now = Instant::now();
+        out.clear();
+        for _ in 0..7 { out.push(Some(now)); }
+    }
+    fn fresh_joint_positions_into(&self, joints: &[usize], _max_age: Duration, out: &mut [f32]) -> bool {
+        if out.len() < joints.len() { return false; }
+        for (dst, &j) in out.iter_mut().zip(joints) {
+            let Some(&v) = self.q.get(j) else { return false };
+            *dst = v;
+        }
+        true
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+        Ok(self.q.iter().map(|&position| armd::model::JointState { position, velocity: 0.0, torque: 0.0, temperature: 30.0 }).collect())
+    }
+    fn read_joint_states_into(&mut self, out: &mut Vec<armd::model::JointState>) -> Result<(), armd::driver::ArmDriverError> {
+        out.clear();
+        for &position in &self.q {
+            out.push(armd::model::JointState { position, velocity: 0.0, torque: 0.0, temperature: 30.0 });
+        }
+        Ok(())
+    }
+    fn write_joint_targets(&mut self, _targets: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn set_torque(&mut self, enable: bool) -> Result<(), armd::driver::ArmDriverError> {
+        self.enabled = enable;
+        Ok(())
+    }
+}
+
+/// R2 Item 4 (Major): Both `compute_position_lead_output_inline` (`tracking_owned`) AND
+/// `compute_lead_ramp_out_inline` (`ramp_out_handover`) MUST check `can_eval_rt` before building
+/// `WorkspaceEvaluator` and fail closed with (0, 0) heap allocs/frees on undersized scratch.
+#[test]
+fn rt_tracking_lead_and_ramp_out_undersized_scratch_fail_closed_zero_alloc() {
+    use armd::safety::SafetyState;
+    use armd::tracking::{JointTrackingConfig, TrackingStrategy};
+    use std::sync::atomic::AtomicUsize;
+
+    for is_ramp_out in [false, true] {
+        let label = if is_ramp_out { "ramp_out" } else { "tracking_lead" };
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.collision = None;
+        cfg.power_budget = None;
+        cfg.torque_guard = None;
+        let mut jt = JointTrackingConfig::rebot_dm();
+        jt.enabled = true;
+        for j in &mut jt.joints { j.strategy = TrackingStrategy::Position; }
+        jt.joints[0].strategy = TrackingStrategy::PositionLead;
+        jt.joints[0].lag_s = 0.68;
+        jt.joints[0].max_lead_rad = 0.03;
+        cfg.joint_tracking = Some(jt);
+
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let drv = NoAllocTrackingDriver { q: INSPECT, enabled: true, writes: writes.clone() };
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.safety.set_off_thread_reclaim(true);
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.prewarm_rt_buffers();
+        {
+            let s = inner.current_admission_stamp();
+            inner.check_admission(s).and_then(|a| SupervisorInner::enable_torque(a)).unwrap();
+        }
+        // Warm up steady-state RT buffers (driver read vecs, fallback spares) on normal ticks.
+        let mut obs = ArmObservation::blank_rt();
+        inner.tick_control(0.02);
+        inner.fill_observation(0.02, &mut obs);
+        let (_, warm_a, warm_f) = counted(|| inner.tick_control(0.02));
+        assert_eq!((warm_a, warm_f), (0, 0), "{label}: warmup steady tick must be (0, 0)");
+
+        // Set up either active tracking lead (trajectory moving J1) or Park ramp-out with residual lead.
+        if is_ramp_out {
+            let mut q_prev = INSPECT;
+            q_prev[0] += 0.015;
+            inner.tracking.record_issued(q_prev.to_vec(), vec![0.0; 7]);
+            inner.pending_normal_unload = true;
+        } else {
+            let mut q_goal = INSPECT;
+            q_goal[0] += 0.15;
+            let traj = armd::TrajectoryPlanner::plan(&INSPECT, &[0.0; 7], &q_goal, &[0.0; 7], Some(1.0), &inner.config.limits).unwrap();
+            inner.tracking.record_issued(INSPECT.to_vec(), vec![0.0; 7]);
+            let _ = inner.safety.mark_motion_started();
+            inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        }
+
+        // Grow workspace past prewarmed scratch capacity WITHOUT calling prepare_workspace_eval_bufs().
+        let ws = inner.config.workspace.as_mut().unwrap();
+        for i in 0..8 {
+            ws.keepout_boxes.push(KeepoutBox {
+                name: format!("rt_trk_extra_{i}"),
+                min_m: [1.0, 1.0, 1.0],
+                max_m: [1.1, 1.1, 1.1],
+            });
+        }
+
+        let (_, tick_a, tick_f) = counted(|| inner.tick_control(0.02));
+        assert!(
+            matches!(inner.safety.state(), SafetyState::Fault(_)),
+            "{label}: undersized RT scratch must fail closed into Fault, got {:?}",
+            inner.safety.state()
+        );
+        assert_eq!(
+            (tick_a, tick_f),
+            (0, 0),
+            "{label}: undersized RT scratch fail-closed tick_control must perform (0, 0) allocs/frees"
+        );
+    }
+}
