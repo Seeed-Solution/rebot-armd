@@ -28,6 +28,10 @@ mod actions;
 pub(crate) mod terminal_capture;
 mod torque_off;
 mod workspace;
+mod admission;
+mod state_init;
+mod terminal_plumbing;
+mod types;
 
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
