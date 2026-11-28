@@ -594,3 +594,76 @@ fn rt_inline_quintic_refusal_witness_zero_alloc() {
     assert_eq!(detail.violation_phase.as_deref(), Some("sweep"));
     assert!(detail.reason.as_deref().unwrap_or("").contains("move makes no net return toward the workspace"));
 }
+
+/// R3 Item 1 (Blocker): install-time live measured terminal re-check MUST perform (0, 0) heap
+/// allocations / deallocations on RT on BOTH acceptance (within 20 mrad jitter) and refusal
+/// (inward drift makes endpoint deeper than live start -> WORKSPACE_VIOLATION with witness).
+#[test]
+fn rt_measured_start_terminal_recheck_zero_alloc() {
+    use armd::rt_core::requests::motion::{
+        install_jog, prepare_motion, MotionInstallError, MotionPlanSnapshot, MotionRequest,
+    };
+
+    let mut cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    cfg.collision = None;
+    cfg.power_budget = None;
+    let q_start: [f32; 7] = [0.0, -0.90, -1.15, 0.85, 0.0, 0.0, 0.0];
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    ws.keepout_boxes.clear();
+    let check_pts = ws.check_points_end_m.clone();
+    let max_x_at = |q: &[f32]| -> f64 {
+        let pose = armd::chain::ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts.iter().map(|c| pose.transform_point(&c.map(f64::from))[0]).fold(pose.p[0], f64::max)
+    };
+    let start_max_x = max_x_at(&q_start);
+    ws.box_max_m[0] = (start_max_x - 0.010) as f32;
+    let mut q_probe = q_start;
+    q_probe[1] += 0.01;
+    let inward_sign = if max_x_at(&q_probe) < start_max_x { 1.0f32 } else { -1.0f32 };
+    let dx_per_rad = (start_max_x - { let mut q = q_start; q[1] += 0.01 * inward_sign; max_x_at(&q) }) / 0.01;
+    let mut q_jog_2mm = q_start;
+    q_jog_2mm[1] += (0.0015 / dx_per_rad) as f32 * inward_sign;
+    let mut q_meas_jitter = q_start;
+    q_meas_jitter[0] += 0.002;
+    let mut q_meas_inward = q_start;
+    q_meas_inward[1] += (0.0030 / dx_per_rad) as f32 * inward_sign;
+
+    let mut inner = SupervisorInner::new(cfg.clone());
+    inner.lease_enabled = false;
+    inner.rt_executor_owned = true;
+    inner.safety.set_off_thread_reclaim(true);
+    {
+        let s = inner.current_admission_stamp();
+        inner.check_admission(s).and_then(|a| SupervisorInner::enable_torque(a)).unwrap();
+    }
+    inner.commanded_positions = q_start.to_vec();
+    inner.measured_positions = q_start.to_vec();
+    inner.target_positions = q_start.to_vec();
+    inner.prewarm_rt_buffers();
+
+    let snap = MotionPlanSnapshot::from_supervisor(&inner);
+    let plan = prepare_motion(&snap, &MotionRequest::jog(q_jog_2mm.to_vec(), Some(0.5), None))
+        .expect("prepare jog");
+
+    // 1. Inward drift (<= 20 mrad) makes endpoint deeper than live start -> WORKSPACE_VIOLATION, (0, 0) allocs/frees.
+    inner.measured_positions.copy_from_slice(&q_meas_inward);
+    let s1 = inner.current_admission_stamp();
+    let (res_refuse, a1, fr1) = counted(|| install_jog(&mut inner, s1, &plan.slot, None, None, false));
+    assert_eq!(res_refuse.unwrap_err(), MotionInstallError::WorkspaceViolation);
+    assert_eq!((a1, fr1), (0, 0), "RT measured-start terminal refusal must perform (0, 0) allocs/frees");
+    assert_eq!(
+        inner.workspace_violation.as_ref().and_then(|d| d.constraint_id.as_deref()),
+        Some("box_max_x")
+    );
+
+    // 2. ±2 mrad jitter leaving terminal rule valid -> ADMITTED, (0, 0) allocs/frees.
+    inner.measured_positions.copy_from_slice(&q_meas_jitter);
+    let s2 = inner.current_admission_stamp();
+    let (res_admit, a2, fr2) = counted(|| install_jog(&mut inner, s2, &plan.slot, None, None, false));
+    assert!(res_admit.is_ok(), "±2 mrad jitter must admit: {res_admit:?}");
+    assert_eq!((a2, fr2), (0, 0), "RT measured-start terminal admission must perform (0, 0) allocs/frees");
+}

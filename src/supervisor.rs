@@ -63,7 +63,7 @@ pub(crate) use driver_transitions::{
 pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
 pub use workspace::{
     check_path_with, check_path_with_tcp_tol, keepout_sweep_with, keepout_sweep_with_tcp_tol,
-    prepare_quintic, JointGoalSnapshot, PreparedQuintic,
+    prepare_quintic, JointGoalSnapshot, MeasuredStartFenceErr, PreparedQuintic, MEASURED_START_DRIFT_TOL_RAD,
 };
 pub(crate) use workspace::joint_goal_target_from;
 pub use admission::{

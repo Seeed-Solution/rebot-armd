@@ -21,8 +21,8 @@ use crate::rt_core::publish::Snapshot;
 use crate::rt_core::scratch::copy_into;
 use crate::safety::{SafetyError, SafetyState};
 use crate::supervisor::{
-    AdmissionStamp, ArmError, ParkContinuation, ParkContinuationPhase, ParkRearmStart,
-    SupervisorInner, MAX_KEEPOUT_EVALS_PER_PLAN,
+    AdmissionStamp, ArmError, MeasuredStartFenceErr, ParkContinuation, ParkContinuationPhase,
+    ParkRearmStart, SupervisorInner, MAX_KEEPOUT_EVALS_PER_PLAN, MEASURED_START_DRIFT_TOL_RAD,
 };
 use crate::torque_guard::TorqueHold;
 use crate::trajectory::{
@@ -342,7 +342,7 @@ pub enum MotionInstallError {
     UnsupportedUnload, ConfigBusy, MotionBusy, CollisionHold, HandoverSettling,
     EStopActive, FaultActive, NotArmed, WrongTarget, DeadlineExpired,
     EpochMismatch, LeaseLost, Stopped, StampReused, TerminalsBusy,
-    FeedbackStale, J7FeedbackStale, StartDrifted, PlanStale, SoftLimitExceeded, ContinuationMismatch, EnableFailed,
+    FeedbackStale, J7FeedbackStale, StartDrifted, PlanStale, WorkspaceViolation, SoftLimitExceeded, ContinuationMismatch, EnableFailed,
 }
 
 impl MotionInstallError {
@@ -368,6 +368,7 @@ impl MotionInstallError {
             Self::FeedbackStale => "FEEDBACK_STALE",
             Self::J7FeedbackStale => "J7_FEEDBACK_STALE",
             Self::StartDrifted | Self::PlanStale | Self::ContinuationMismatch => "PLAN_STALE",
+            Self::WorkspaceViolation => "WORKSPACE_VIOLATION",
             Self::SoftLimitExceeded => "JOINT_LIMIT",
             Self::EnableFailed => "ENABLE_FAILED",
         }
@@ -404,6 +405,11 @@ impl MotionInstallError {
                 message: "Gripper (J7) position-force feedback is stale (> 100 ms); new gripper targets are refused until fresh feedback returns",
             },
             Self::StartDrifted | Self::PlanStale | Self::ContinuationMismatch => MotionError::PlanStale("arm state or motion configuration changed while planning".into()).into(),
+            Self::WorkspaceViolation => {
+                let d = inner.workspace_violation.clone().unwrap_or_default();
+                let limit = d.constraint_id.clone().unwrap_or_else(|| "workspace".into());
+                SafetyError::WorkspaceViolation { limit, value: 0.0, bound: 0.0, point: 0, detail: Box::new(d) }.into()
+            }
             Self::SoftLimitExceeded => MotionError::InvalidCommand("target position exceeds joint soft limits".into()).into(),
             Self::EnableFailed => SafetyError::ClearFaultRejected("Park rearm enable failed".into()).into(),
         }
@@ -806,7 +812,7 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
             || (0..arm_dof).any(|i| {
                 !inner.measured_positions[i].is_finite()
                     || !slot.measured_start[i].is_finite()
-                    || (inner.measured_positions[i] - slot.measured_start[i]).abs() > EXACT_START_TOL
+                    || (inner.measured_positions[i] - slot.measured_start[i]).abs() > MEASURED_START_DRIFT_TOL_RAD
             })
         {
             return Err(MotionInstallError::PlanStale);
@@ -869,6 +875,20 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
     Ok(notes)
 }
 
+fn verify_motion_measured_terminal(inner: &mut SupervisorInner, slot: &PreparedMotionSlot) -> Result<(), MotionInstallError> {
+    if !slot.checked_workspace {
+        return Ok(());
+    }
+    let dof = usize::from(slot.dof);
+    let phase = if slot.kind == MotionKind::Park { "park" } else { "plan" };
+    inner
+        .check_measured_start_terminal_rt(&slot.measured_start[..dof], &slot.target[..dof], phase)
+        .map_err(|e| match e {
+            MeasuredStartFenceErr::PlanStale => MotionInstallError::PlanStale,
+            MeasuredStartFenceErr::WorkspaceViolation => MotionInstallError::WorkspaceViolation,
+        })
+}
+
 fn commit_quintic_slot(
     inner: &mut SupervisorInner,
     stamp: AdmissionStamp,
@@ -885,6 +905,7 @@ fn commit_quintic_slot(
     verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
     verify_motion_authority(inner, slot.kind, slot.speed_scale_opt(), &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let (torque_clamped, power_clamped) = verify_motion_freshness(inner, slot)?;
+    verify_motion_measured_terminal(inner, slot)?;
     inner.preflight_admission(stamp).map_err(map_admission_err)?;
     inner.check_terminal_fifo_for_new_action().map_err(map_admission_err)?;
     let mut eff_pos = [0.0f32; MAX_DOF];
@@ -971,6 +992,7 @@ pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot:
         }
     } else if !inner.mit_active() {
         let _ = verify_motion_freshness(inner, slot)?;
+        verify_motion_measured_terminal(inner, slot)?;
     } else if slot.workspace_revision != inner.workspace_revision || slot.motion_config_revision != inner.motion_config_revision {
         return Err(MotionInstallError::PlanStale);
     }
@@ -1052,6 +1074,7 @@ pub fn install_park_continuation_at(inner: &mut SupervisorInner, action_id: u64,
     }
     if require_fresh_feedback && !inner.commit_feedback_valid() { return Err(MotionInstallError::FeedbackStale); }
     let _ = verify_motion_freshness(inner, slot)?;
+    verify_motion_measured_terminal(inner, slot)?;
     inner.park_continuation = None;
     install_park_trajectory(inner, ParkActionMode::Existing(action_id), slot, heap_traj)
 }
@@ -1102,6 +1125,7 @@ pub fn install_watchdog_park(
         return Err(MotionInstallError::UnsupportedUnload);
     }
     let _ = verify_motion_freshness(inner, slot)?;
+    verify_motion_measured_terminal(inner, slot)?;
     #[cfg(not(target_arch = "wasm32"))]
     if inner.sessions.blocks_ordinary_output(None) {
         // Safety watchdog park preempts any ordinary non-safety session cleanly.

@@ -1064,16 +1064,24 @@ pub fn check_start_fresh(commanded: &[f32], prepared_start: &[f32]) -> Result<()
     Ok(())
 }
 
-/// Fences the certified `measured_positions` baseline at install when a workspace policy is active.
-pub fn check_measured_fresh(inner: &SupervisorInner, measured_start: &[f32]) -> Result<(), ActionRefusal> {
-    if inner.workspace_policy().is_none() { return Ok(()); }
-    let arm_dof = inner.config.arm_dof().min(measured_start.len());
-    if inner.measured_positions.len() != measured_start.len()
-        || (0..arm_dof).any(|i| !inner.measured_positions[i].is_finite() || !measured_start[i].is_finite() || (inner.measured_positions[i] - measured_start[i]).abs() > 1e-6)
-    {
-        return Err(ActionRefusal::new("PLAN_STALE"));
-    }
-    Ok(())
+/// Fences the certified `measured_positions` baseline at install when a workspace policy is active:
+/// returns `PLAN_STALE` if any arm joint drifted beyond [`crate::supervisor::MEASURED_START_DRIFT_TOL_RAD`]
+/// (20 mrad), otherwise re-evaluates the terminal workspace rule against the live measured start and
+/// the plan's `endpoint` (bounded zero-alloc FK) returning `WORKSPACE_VIOLATION` on refusal.
+pub fn check_measured_fresh(
+    inner: &mut SupervisorInner,
+    measured_start: &[f32],
+    endpoint: &[f32],
+    phase: &'static str,
+) -> Result<(), ActionRefusal> {
+    inner
+        .check_measured_start_terminal_rt(measured_start, endpoint, phase)
+        .map_err(|e| match e {
+            crate::supervisor::MeasuredStartFenceErr::PlanStale => ActionRefusal::new("PLAN_STALE"),
+            crate::supervisor::MeasuredStartFenceErr::WorkspaceViolation => {
+                ActionRefusal::new("WORKSPACE_VIOLATION")
+            }
+        })
 }
 
 /// **Single entry point for single-use A1 admission consumption**: syncs `stop_generation`
@@ -3468,7 +3476,14 @@ pub fn install_move_cartesian(
     match payload {
         CartesianInstallPayload::Legacy(prep) => {
             check_start_fresh(&inner.commanded_positions, &prep.start).map_err(|r| r.into_arm_error(inner))?;
-            check_measured_fresh(inner, &prep.measured_start).map_err(|r| r.into_arm_error(inner))?;
+            let end_q = prep
+                .resolved
+                .path
+                .q
+                .last()
+                .ok_or_else(|| ActionRefusal::new("PLAN_STALE").into_arm_error(inner))?;
+            check_measured_fresh(inner, &prep.measured_start, end_q, "plan")
+                .map_err(|r| commit_refusal_to_arm_error(inner, CommitRefusal::code(r.code)))?;
             check_cartesian_path_planning_legacy(inner, &inner.commanded_positions, &prep.resolved.path)?;
             if let Some(leg) = prep.resolved.approach_leg.as_ref() {
                 motion::check_quintic_planning_limits(&leg.seg, &inner.config.limits, crate::model::PlanningScope::arm_only(&inner.config))?;
@@ -3562,18 +3577,19 @@ fn install_move_cartesian_slot_rt(
     let mut post_q = [0.0f32; MAX_DOF];
     let (post_dof, _) = inner.post_quiesce_commanded_positions(&mut post_q);
     check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
-    if let Some(m) = measured_start {
-        check_measured_fresh(inner, &m[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
-    }
     inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+    let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
+    let mut last_buf = [0.0f32; MAX_DOF];
+    last_buf[..dof].copy_from_slice(last_slice);
+    if let Some(m) = measured_start {
+        check_measured_fresh(inner, &m[..dof], &last_buf[..dof], "plan")
+            .map_err(|r| CommitRefusal::code(r.code))?;
+    }
     check_cartesian_path_planning_rt(inner, dof, &post_q[..post_dof], slot.path.samples())?;
     if inner.gravity_comp.is_some() {
         return Err(CommitRefusal::code("MOTION_BUSY"));
     }
     inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
-    let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
-    let mut last_buf = [0.0f32; MAX_DOF];
-    last_buf[..dof].copy_from_slice(last_slice);
     let arm_scope = Some(crate::model::PlanningScope::arm_only(&inner.config));
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
@@ -5324,10 +5340,14 @@ fn install_macro_child_slot_rt(
             lock_j7_hold,
             ..
         } => {
-            if has_measured_start {
-                check_measured_fresh(inner, &measured_start[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
-            }
             inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+            let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
+            let mut last_buf = [0.0f32; MAX_DOF];
+            last_buf[..dof].copy_from_slice(last_slice);
+            if has_measured_start {
+                check_measured_fresh(inner, &measured_start[..dof], &last_buf[..dof], "plan")
+                    .map_err(|r| CommitRefusal::code(r.code))?;
+            }
             check_cartesian_path_planning_rt(inner, dof, &inner.commanded_positions, slot.path.samples())?;
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
             if lock_j7_hold {
@@ -5353,9 +5373,6 @@ fn install_macro_child_slot_rt(
                     }
                 }
             }
-            let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
-            let mut last_buf = [0.0f32; MAX_DOF];
-            last_buf[..dof].copy_from_slice(last_slice);
             let arm_scope = Some(crate::model::PlanningScope::arm_only(&inner.config));
             let then_traj = match approach_then {
                 Some(leg) => Some(validate_approach_leg_rt(

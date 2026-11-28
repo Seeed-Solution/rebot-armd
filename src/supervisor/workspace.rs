@@ -3,6 +3,32 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Maximum per-joint drift (rad) between the certified off-thread planning snapshot's
+/// `measured_positions` and the live `measured_positions` at install time before returning
+/// `PLAN_STALE`.
+///
+/// Observed encoder noise floors on supported hardware:
+/// - B601-DM (Damiao CAN): ~0.3 mrad (~1 encoder count)
+/// - SO-ARM101 (Feetech STS3215, 4096 CPR): ~1.5 mrad (~1 encoder count)
+///
+/// Within `MEASURED_START_DRIFT_TOL_RAD` (20 mrad), install-time certification re-runs the
+/// terminal workspace rule against the live measured pose and the plan's endpoint using bounded
+/// zero-alloc FK so ordinary stationary encoder jitter is admitted while any inward drift that
+/// leaves the endpoint deeper than the live start is refused (`WORKSPACE_VIOLATION`).
+pub const MEASURED_START_DRIFT_TOL_RAD: f32 = 0.020;
+
+/// Outcome of install-time measured-start drift and terminal-progress verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasuredStartFenceErr {
+    /// Live measured feedback drifted more than [`MEASURED_START_DRIFT_TOL_RAD`] (or was
+    /// non-finite / wrong DOF) since off-thread preparation; caller must replan.
+    PlanStale,
+    /// Drift stayed within [`MEASURED_START_DRIFT_TOL_RAD`], but the plan's endpoint no longer
+    /// satisfies the terminal workspace rule against the live measured pose (or RT scratch was
+    /// undersized); the structured witness is stored in `SupervisorInner::workspace_violation`.
+    WorkspaceViolation,
+}
+
 /// [`SupervisorInner::keepout_sweep`] with an explicit arm model (planning outside the lock).
 pub fn keepout_sweep_with(
     model: &crate::chain::ArmModel,
@@ -659,6 +685,105 @@ impl SupervisorInner {
                 if self.workspace_violation_spare.is_none() { self.workspace_violation_spare = Some(spare); }
             }
             (Err(_), Some(detail)) => { self.workspace_violation = Some(detail); }
+            _ => {}
+        }
+        result
+    }
+
+    /// Zero-allocation install-time fence for prepared motion/Cartesian plans against live
+    /// `measured_positions`:
+    /// 1. Rejects `PlanStale` if any arm joint drifted by more than
+    ///    [`MEASURED_START_DRIFT_TOL_RAD`] (20 mrad) or is non-finite.
+    /// 2. Otherwise re-evaluates the terminal workspace rule against the live measured start and
+    ///    the plan's `endpoint` using preallocated `ws_eval_bufs` (2 bounded endpoint FKs, 0 RT
+    ///    heap allocs/frees), admitting when it holds and recording the structured witness in
+    ///    `self.workspace_violation` on refusal.
+    pub(crate) fn check_measured_start_terminal_rt(
+        &mut self,
+        certified_measured: &[f32],
+        endpoint: &[f32],
+        phase: &'static str,
+    ) -> Result<(), MeasuredStartFenceErr> {
+        use crate::chain::{WorkspaceEvaluator, WorkspaceFailureKindRt, WorkspaceFailureRt};
+        if self.workspace_policy().is_none() {
+            return Ok(());
+        }
+        let dof = certified_measured.len();
+        let arm_dof = self.config.arm_dof().min(dof);
+        if self.measured_positions.len() != dof
+            || endpoint.len() != dof
+            || (0..arm_dof).any(|i| {
+                !self.measured_positions[i].is_finite()
+                    || !certified_measured[i].is_finite()
+                    || !endpoint[i].is_finite()
+                    || (self.measured_positions[i] - certified_measured[i]).abs()
+                        > MEASURED_START_DRIFT_TOL_RAD
+            })
+        {
+            return Err(MeasuredStartFenceErr::PlanStale);
+        }
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let mut detail_slot = self
+            .workspace_violation
+            .take()
+            .or_else(|| self.workspace_violation_spare.take());
+        let result = (|| {
+            let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+            if !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false) {
+                if self.rt_executor_owned {
+                    let f = WorkspaceFailureRt {
+                        kind: WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase,
+                    };
+                    let d = detail_slot.get_or_insert_with(
+                        crate::kinematics::WorkspaceViolationDetail::preallocated_rt,
+                    );
+                    WorkspaceEvaluator::write_failure_detail_without_eval_rt(&f, d);
+                    return Err(MeasuredStartFenceErr::WorkspaceViolation);
+                }
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+            }
+            let eval = WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            );
+            let checked = (|| {
+                eval.eval_into_slice_rt(
+                    &self.measured_positions,
+                    &mut bufs.scratch_c0,
+                    &mut bufs.world_caps,
+                    phase,
+                )?;
+                eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
+                eval.eval_into_slice_rt(endpoint, &mut bufs.scratch_c1, &mut bufs.world_caps, phase)?;
+                eval.check_terminal_progress_rt(&bufs.scratch_min_d, &bufs.scratch_c1, phase)
+            })();
+            let out = match checked {
+                Ok(()) => Ok(()),
+                Err(f) => {
+                    let d = detail_slot.get_or_insert_with(
+                        crate::kinematics::WorkspaceViolationDetail::preallocated_rt,
+                    );
+                    eval.write_failure_detail_rt(&f, d);
+                    Err(MeasuredStartFenceErr::WorkspaceViolation)
+                }
+            };
+            eval.recycle(&mut bufs);
+            out
+        })();
+        self.ws_eval_bufs = bufs;
+        match (result, detail_slot) {
+            (Ok(()), Some(spare)) | (Err(MeasuredStartFenceErr::PlanStale), Some(spare)) => {
+                if self.workspace_violation_spare.is_none() {
+                    self.workspace_violation_spare = Some(spare);
+                }
+            }
+            (Err(MeasuredStartFenceErr::WorkspaceViolation), Some(detail)) => {
+                self.workspace_violation = Some(detail);
+            }
             _ => {}
         }
         result

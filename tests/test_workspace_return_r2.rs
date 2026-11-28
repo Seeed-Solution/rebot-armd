@@ -46,8 +46,14 @@ impl ArmDriver for FixedPoseDriver {
             temperature_feedback: true,
             torque_feedforward: false,
             enable_feedback: true,
-            load_feedback: false,
+            load_feedback: true,
         }
+    }
+    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
+        let n = self.q.lock().unwrap().len();
+        out.clear();
+        out.resize(n, 0.0);
+        true
     }
     fn enable_state(&self) -> EnableState {
         *self.enabled.lock().unwrap()
@@ -261,13 +267,22 @@ fn prepared_plans_fence_measured_drift_before_install() {
         q[1] += 0.01 * inward_sign;
         max_x_at(&q)
     }) / 0.01;
-    // Target moves 2 mm inward from q_start (valid from q_start, but 3 mm DEEPER than q_meas_inward!)
+    // Target moves 1.5 mm inward from q_start (valid from q_start, but 1.5 mm DEEPER than q_meas_inward!)
     let mut q_jog_2mm = q_start;
-    q_jog_2mm[1] += (0.002 / dx_per_rad) as f32 * inward_sign;
-    // Feedback drifts 5 mm inward between prepare and install while commanded stays at q_start.
+    q_jog_2mm[1] += (0.0015 / dx_per_rad) as f32 * inward_sign;
+    // Feedback drifts 3.0 mm inward (within 20 mrad) while commanded stays at q_start, making
+    // `q_jog_2mm` and `-1.5 mm X` endpoints DEEPER than live measured -> refused (WORKSPACE_VIOLATION).
     let mut q_meas_inward = q_start;
-    q_meas_inward[1] += (0.005 / dx_per_rad) as f32 * inward_sign;
-    assert!(max_x_at(&q_meas_inward) < max_x_at(&q_jog_2mm) - 0.002);
+    q_meas_inward[1] += (0.0030 / dx_per_rad) as f32 * inward_sign;
+    assert!(
+        (q_meas_inward[1] - q_start[1]).abs() < armd::supervisor::MEASURED_START_DRIFT_TOL_RAD,
+        "3 mm inward drift must stay within 20 mrad tolerance: {}",
+        (q_meas_inward[1] - q_start[1]).abs()
+    );
+    assert!(max_x_at(&q_meas_inward) < max_x_at(&q_jog_2mm) - 0.001);
+    // Feedback drifts > 20 mrad (25 mrad) -> PLAN_STALE even when endpoint is inside workspace.
+    let mut q_meas_big_drift = q_start;
+    q_meas_big_drift[1] += 0.025 * inward_sign;
 
     let make_armed = || {
         let mut inner = armd::SupervisorInner::new(cfg.clone());
@@ -280,7 +295,8 @@ fn prepared_plans_fence_measured_drift_before_install() {
         inner
     };
 
-    // 1. RT Jog: prepared at q_start (2 mm inward), feedback drifts 5 mm inward -> PLAN_STALE!
+    // 1. RT Jog: prepared at q_start (2 mm inward), feedback drifts 5 mm inward (<= 20 mrad,
+    //    endpoint now deeper than live start) -> WORKSPACE_VIOLATION! Drift > 20 mrad -> PLAN_STALE!
     {
         let mut inner = make_armed();
         let snap = MotionPlanSnapshot::from_supervisor(&inner);
@@ -288,84 +304,372 @@ fn prepared_plans_fence_measured_drift_before_install() {
             .expect("jog prepares cleanly before drift");
         inner.measured_positions = q_meas_inward.to_vec();
         let s = inner.current_admission_stamp();
-        let err = install_jog(&mut inner, s, &plan.slot, plan.heap_traj, None, false)
-            .expect_err("install_jog must reject after measured_positions drifted inward");
-        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on jog, got {err:?}");
+        let err = install_jog(&mut inner, s, &plan.slot, plan.heap_traj.clone(), None, false)
+            .expect_err("install_jog must reject when inward drift makes endpoint deeper than live start");
+        assert_eq!(err, MotionInstallError::WorkspaceViolation, "expected WorkspaceViolation on jog, got {err:?}");
+        assert_eq!(inner.workspace_violation.as_ref().and_then(|d| d.constraint_id.as_deref()), Some("box_max_x"));
+
+        inner.measured_positions = q_meas_big_drift.to_vec();
+        let s2 = inner.current_admission_stamp();
+        let err2 = install_jog(&mut inner, s2, &plan.slot, plan.heap_traj, None, false)
+            .expect_err("install_jog must return PlanStale when drift > 20 mrad");
+        assert_eq!(err2, MotionInstallError::PlanStale, "expected PlanStale on >20 mrad jog drift, got {err2:?}");
     }
 
-    // 2. RT Home: prepared at q_start, feedback drifts inward -> PLAN_STALE!
+    // 2. RT Home: <= 20 mrad inward drift where Home endpoint is inside -> ADMITTED; > 20 mrad -> PLAN_STALE!
     {
         let mut inner = make_armed();
         let snap = MotionPlanSnapshot::from_supervisor(&inner);
         let plan = prepare_motion(&snap, &MotionRequest::home(None))
             .expect("home prepares cleanly before drift");
-        inner.measured_positions = q_meas_inward.to_vec();
+        inner.measured_positions = q_meas_big_drift.to_vec();
         let s = inner.current_admission_stamp();
-        let err = install_home(&mut inner, s, &plan.slot, plan.heap_traj, None, false)
-            .expect_err("install_home must reject after measured_positions drifted inward");
-        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on home, got {err:?}");
+        let err = install_home(&mut inner, s, &plan.slot, plan.heap_traj.clone(), None, false)
+            .expect_err("install_home must reject when measured_positions drifted > 20 mrad");
+        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on >20 mrad home drift, got {err:?}");
+
+        inner.measured_positions = q_meas_inward.to_vec();
+        let s2 = inner.current_admission_stamp();
+        install_home(&mut inner, s2, &plan.slot, plan.heap_traj, None, false)
+            .expect("install_home must admit <= 20 mrad drift when terminal rule still holds");
     }
 
-    // 3. RT Park: prepared at q_start, feedback drifts inward -> PLAN_STALE!
+    // 3. RT Park: <= 20 mrad inward drift where Park rest endpoint is inside -> ADMITTED; > 20 mrad -> PLAN_STALE!
     {
         let mut inner = make_armed();
         let snap = MotionPlanSnapshot::from_supervisor(&inner);
         let plan = prepare_motion(&snap, &MotionRequest::park())
             .expect("park prepares cleanly before drift");
-        inner.measured_positions = q_meas_inward.to_vec();
+        inner.measured_positions = q_meas_big_drift.to_vec();
         let s = inner.current_admission_stamp();
-        let err = install_park(&mut inner, s, &plan.slot, plan.heap_traj, None, false)
-            .expect_err("install_park must reject after measured_positions drifted inward");
-        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on park, got {err:?}");
+        let err = install_park(&mut inner, s, &plan.slot, plan.heap_traj.clone(), None, false)
+            .expect_err("install_park must reject when measured_positions drifted > 20 mrad");
+        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on >20 mrad park drift, got {err:?}");
+
+        inner.measured_positions = q_meas_inward.to_vec();
+        let s2 = inner.current_admission_stamp();
+        install_park(&mut inner, s2, &plan.slot, plan.heap_traj, None, false)
+            .expect("install_park must admit <= 20 mrad drift when terminal rule still holds");
     }
 
-    // 4 & 5. Both linear Cartesian installers (Legacy AND RT Slot): -2 mm X prepared at q_start,
-    //        feedback drifts 5 mm inward before install -> PLAN_STALE!
+    // 4 & 5. Both linear Cartesian installers (Legacy AND RT Slot): -2 mm X prepared at q_start:
+    //        (a) 5 mm inward drift (<= 20 mrad, endpoint deeper than live start) -> WORKSPACE_VIOLATION!
+    //        (b) 25 mrad drift (> 20 mrad) -> PLAN_STALE!
     for use_slot in [false, true] {
-        let mut inner = make_armed();
-        let s = inner.current_admission_stamp();
-        let snap = ActionSnapshot::from_inner(&inner, s, std::time::Instant::now() + Duration::from_secs(5));
-        let body = json!({"frame": "base", "d": [-0.002, 0.0, 0.0], "path": "linear"});
-        let prep = match prepare_move_relative(&snap, &body)
-            .expect("linear move_relative prepares cleanly before drift")
-        {
-            PreparedMoveAction::Cartesian(c) => c,
-            _ => panic!("expected Cartesian"),
-        };
-        inner.measured_positions = q_meas_inward.to_vec();
-        let ctx = OwnerCheckCtx::for_legacy(&inner);
-        let stamp: ActionStamp = prep.stamp;
-        let (mut pw, pr) = plan_slots(1, PlanSlot::default);
-        let payload = if use_slot {
-            let slot = prep.to_plan_slot(None).expect("to_plan_slot");
-            let Primitive::Action(StagedAction::Cartesian {
-                kind, dof, start, measured_start, has_measured_start, duration_s, power_scale, approach_then, ..
-            }) = slot.primitive
-            else {
-                panic!("expected StagedAction::Cartesian");
+        for (big_drift, expect_stale) in [(false, false), (true, true)] {
+            let mut inner = make_armed();
+            let s = inner.current_admission_stamp();
+            let snap = ActionSnapshot::from_inner(&inner, s, std::time::Instant::now() + Duration::from_secs(5));
+            let body = json!({"frame": "base", "d": [-0.0015, 0.0, 0.0], "path": "linear"});
+            let prep = match prepare_move_relative(&snap, &body)
+                .expect("linear move_relative prepares cleanly before drift")
+            {
+                PreparedMoveAction::Cartesian(c) => c,
+                _ => panic!("expected Cartesian"),
             };
-            let h = pw.stage(|dst| *dst = slot).expect("publish plan slot");
-            let slot_ref = pr.pin(h).expect("pin plan slot");
-            CartesianInstallPayload::Slot {
-                kind,
-                dof: usize::from(dof),
-                start,
-                measured_start: has_measured_start.then_some(measured_start),
-                slot: slot_ref,
-                duration_s,
-                power_scale,
-                approach_then,
+            inner.measured_positions = if big_drift { q_meas_big_drift.to_vec() } else { q_meas_inward.to_vec() };
+            let ctx = OwnerCheckCtx::for_legacy(&inner);
+            let stamp: ActionStamp = prep.stamp;
+            let (mut pw, pr) = plan_slots(1, PlanSlot::default);
+            let payload = if use_slot {
+                let slot = prep.to_plan_slot(None).expect("to_plan_slot");
+                let Primitive::Action(StagedAction::Cartesian {
+                    kind, dof, start, measured_start, has_measured_start, duration_s, power_scale, approach_then, ..
+                }) = slot.primitive
+                else {
+                    panic!("expected StagedAction::Cartesian");
+                };
+                let h = pw.stage(|dst| *dst = slot).expect("publish plan slot");
+                let slot_ref = pr.pin(h).expect("pin plan slot");
+                CartesianInstallPayload::Slot {
+                    kind,
+                    dof: usize::from(dof),
+                    start,
+                    measured_start: has_measured_start.then_some(measured_start),
+                    slot: slot_ref,
+                    duration_s,
+                    power_scale,
+                    approach_then,
+                }
+            } else {
+                CartesianInstallPayload::Legacy(Box::new(prep))
+            };
+            let err = install_move_cartesian(&mut inner, &stamp, &ctx, payload)
+                .expect_err("Cartesian installer must reject invalid drift");
+            if expect_stale {
+                assert!(
+                    matches!(err, armd::ArmError::Motion(armd::motion::MotionError::PlanStale(_))),
+                    "use_slot={use_slot}: expected PlanStale on >20 mrad drift, got {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, armd::ArmError::Safety(armd::safety::SafetyError::WorkspaceViolation { .. })),
+                    "use_slot={use_slot}: expected WorkspaceViolation on inward drift deeper than live start, got {err:?}"
+                );
+                assert_eq!(
+                    inner.workspace_violation.as_ref().and_then(|d| d.constraint_id.as_deref()),
+                    Some("box_max_x")
+                );
             }
-        } else {
-            CartesianInstallPayload::Legacy(Box::new(prep))
-        };
-        let err = install_move_cartesian(&mut inner, &stamp, &ctx, payload)
-            .expect_err("Cartesian installer must reject after measured_positions drifted inward");
-        assert!(
-            matches!(err, armd::ArmError::Motion(armd::motion::MotionError::PlanStale(_))),
-            "use_slot={use_slot}: expected PlanStale, got {err:?}"
-        );
+        }
     }
+}
+
+/// Driver that tracks commanded targets while superimposing deterministic ±jitter (e.g., ±1
+/// encoder count or ±2 mrad) on consecutive `read_joint_states` calls so off-thread snapshot
+/// measured positions and install-time live measured positions always differ by encoder jitter.
+#[derive(Clone)]
+struct JitterFeedbackDriver {
+    q: Arc<Mutex<Vec<f32>>>,
+    enabled: Arc<Mutex<EnableState>>,
+    jitter_rad: f32,
+    arm_dof: usize,
+    tick: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl JitterFeedbackDriver {
+    fn new(q0: &[f32], arm_dof: usize, jitter_rad: f32) -> Self {
+        Self {
+            q: Arc::new(Mutex::new(q0.to_vec())),
+            enabled: Arc::new(Mutex::new(EnableState::Disabled)),
+            jitter_rad,
+            arm_dof,
+            tick: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+    fn fill_jittered_states(&self, out: &mut Vec<JointState>) {
+        let q = self.q.lock().unwrap();
+        let n = self.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sign = if n % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        out.clear();
+        for (i, &pos) in q.iter().enumerate() {
+            let jitter = if i < self.arm_dof { sign * self.jitter_rad } else { 0.0 };
+            out.push(JointState { position: pos + jitter, velocity: 0.0, torque: 0.0, temperature: 30.0 });
+        }
+    }
+}
+
+impl ArmDriver for JitterFeedbackDriver {
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: true,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: true,
+        }
+    }
+    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
+        let n = self.q.lock().unwrap().len();
+        out.clear();
+        out.resize(n, 0.0);
+        true
+    }
+    fn enable_state(&self) -> EnableState { *self.enabled.lock().unwrap() }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { *self.enabled.lock().unwrap() == EnableState::Enabled }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); self.q.lock().unwrap().len()] }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        let n = self.q.lock().unwrap().len();
+        out.clear();
+        for _ in 0..n { out.push(Some(Duration::ZERO)); }
+    }
+    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool {
+        dof == self.q.lock().unwrap().len()
+    }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) {
+        let now = std::time::Instant::now();
+        let n = self.q.lock().unwrap().len();
+        out.clear();
+        for _ in 0..n { out.push(Some(now)); }
+    }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) {
+        let now = std::time::Instant::now();
+        let n = self.q.lock().unwrap().len();
+        out.clear();
+        for _ in 0..n { out.push(Some(now)); }
+    }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        let n = self.q.lock().unwrap().len();
+        out.clear();
+        for _ in 0..n { out.push(Some(0)); }
+    }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+        let seq = self.tick.load(std::sync::atomic::Ordering::Relaxed) as u64 + 1;
+        let n = self.q.lock().unwrap().len();
+        out.clear();
+        for _ in 0..n { out.push(seq); }
+    }
+    fn fresh_joint_positions_into(&self, joints: &[usize], _max_age: Duration, out: &mut [f32]) -> bool {
+        let q = self.q.lock().unwrap();
+        if out.len() < joints.len() { return false; }
+        for (dst, &j) in out.iter_mut().zip(joints) {
+            let Some(&v) = q.get(j) else { return false };
+            *dst = v;
+        }
+        true
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let mut out = Vec::new();
+        self.fill_jittered_states(&mut out);
+        Ok(out)
+    }
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        self.fill_jittered_states(out);
+        Ok(())
+    }
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        self.fill_jittered_states(out);
+        Some(())
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let mut q = self.q.lock().unwrap();
+        for (dst, t) in q.iter_mut().zip(targets) {
+            *dst = t.position;
+        }
+        Ok(())
+    }
+    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+        *self.enabled.lock().unwrap() = if enable { EnableState::Enabled } else { EnableState::Disabled };
+        Ok(())
+    }
+}
+
+/// Shared R3 Item 1 harness: verifies ±1 encoder count and ±2 mrad live jitter are admitted on
+/// Jog, Home, optional linear `move_to`, and Park across both Legacy and RT Executor owners.
+async fn assert_encoder_jitter_admitted_both_owners(
+    arm_name: &str,
+    cfg_base: ArmConfig,
+    jitter_levels: [f32; 2],
+    test_linear: bool,
+) {
+    use serde_json::json;
+    let rest = cfg_base.resting_positions().to_vec();
+    let arm_dof = cfg_base.arm_dof();
+    for jitter in jitter_levels {
+        for use_executor in [false, true] {
+            let label = format!("{arm_name}/jitter={jitter:.4}/{}", if use_executor { "executor" } else { "legacy" });
+            let drv = JitterFeedbackDriver::new(&rest, arm_dof, jitter);
+            let sup = Arc::new(ArmSupervisor::new(cfg_base.clone()).with_driver(Box::new(drv)));
+            {
+                let mut inner = sup.inner().write().await;
+                inner.commanded_positions = rest.clone();
+                inner.measured_positions = rest.clone();
+                inner.target_positions = rest.clone();
+            }
+            let exec = if use_executor {
+                Some(sup.start_executor(ExecutorConfig::for_tests(Duration::from_millis(20))).await.unwrap())
+            } else {
+                None
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn({
+                let s = sup.clone();
+                async move { axum::serve(listener, armd::create_router(s, armd::OperatorAuth::disabled())).await.unwrap(); }
+            });
+            let tick = (!use_executor).then(|| {
+                let t = sup.clone();
+                tokio::spawn(async move {
+                    let mut iv = tokio::time::interval(Duration::from_millis(20));
+                    loop { iv.tick().await; t.tick(0.02).await; }
+                })
+            });
+
+            let (mut ws, gen) = common::controller(addr).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let ep = sup.get_observation().await.epoch_id;
+            let en = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+            assert_eq!(en["type"], "command_ack", "{label}: enable: {en}");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+
+            let wait_idle = |sup: Arc<ArmSupervisor>, tag: String| async move {
+                let dl = tokio::time::Instant::now() + Duration::from_secs(15);
+                loop {
+                    let o = sup.get_observation().await;
+                    assert!(
+                        matches!(o.safety_state, SafetyState::Armed | SafetyState::Moving | SafetyState::Idle),
+                        "{tag}: unexpected fault state {:?}", o.safety_state
+                    );
+                    if o.action.as_ref().is_none_or(|a| !a.is_running()) && o.safety_state != SafetyState::Moving {
+                        break;
+                    }
+                    assert!(tokio::time::Instant::now() < dl, "{tag}: timeout waiting idle; state={:?} action={:?}", o.safety_state, o.action);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+
+            // 1. Jog +0.10 rad on J1 from rest under live jitter -> ADMITTED
+            let mut q_jog = rest.clone();
+            q_jog[0] += 0.10;
+            let ep = sup.get_observation().await.epoch_id;
+            let ack_j = common::rpc(&mut ws, gen, ep, "/api/v1/motion/jog", json!({"target_positions": q_jog, "duration_secs": 0.25})).await;
+            assert_eq!(ack_j["type"], "command_ack", "{label}: jog under jitter must be admitted: {ack_j}");
+            wait_idle(sup.clone(), format!("{label}/jog")).await;
+
+            // 2. Home under live jitter -> ADMITTED
+            let ep = sup.get_observation().await.epoch_id;
+            let ack_h = common::rpc(&mut ws, gen, ep, "/api/v1/motion/home", json!({})).await;
+            assert_eq!(ack_h["type"], "command_ack", "{label}: home under jitter must be admitted: {ack_h}");
+            wait_idle(sup.clone(), format!("{label}/home")).await;
+
+            // 3. Linear move_to under live jitter (B601-DM from home pose) -> ADMITTED
+            if test_linear {
+                let cur_q = sup.get_observation().await.commanded_positions;
+                let p_cur = cfg_base.arm_model.fk_f32(&cur_q).unwrap().p;
+                let ep = sup.get_observation().await.epoch_id;
+                let ack_m = common::rpc(
+                    &mut ws, gen, ep, "/api/v1/action/move_to",
+                    json!({"position": [p_cur[0] + 0.015, p_cur[1], p_cur[2]], "orientation": null, "path": "linear"}),
+                ).await;
+                assert_eq!(ack_m["type"], "command_ack", "{label}: linear move_to under jitter must be admitted: {ack_m}");
+                wait_idle(sup.clone(), format!("{label}/linear_move_to")).await;
+            }
+
+            // 4. Park under live jitter -> ADMITTED
+            let ep = sup.get_observation().await.epoch_id;
+            let ack_p = common::preset(&mut ws, gen, ep, "park", None).await;
+            assert_eq!(ack_p["type"], "preset_ack", "{label}: park under jitter must be admitted: {ack_p}");
+            wait_idle(sup.clone(), format!("{label}/park")).await;
+
+            drop(ws);
+            if let Some(t) = tick { t.abort(); }
+            srv.abort();
+            if let Some(h) = exec { h.stop_and_join(); }
+        }
+    }
+}
+
+/// R3 Item 1 (Blocker): B601-DM ±1 encoder count (~0.3 mrad) and ±2 mrad stationary encoder jitter
+/// must NOT trigger `PLAN_STALE` on Park, Home, Jog, or linear `move_to` from rest (both owners).
+#[tokio::test]
+async fn encoder_jitter_admitted_b601dm_both_owners() {
+    let mut cfg: ArmConfig = serde_json::from_reader(
+        std::fs::File::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kits/recamera-b601dm/profile/rebot-b601dm.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.lease_timeout_ms = 60_000;
+    assert_encoder_jitter_admitted_both_owners("b601dm", cfg, [0.0003f32, 0.002f32], true).await;
+}
+
+/// R3 Item 1 (Blocker): SO-ARM101 ±1 encoder count (~1.5 mrad) and ±2 mrad stationary encoder
+/// jitter must NOT trigger `PLAN_STALE` on Park, Home, or Jog from rest (both owners).
+#[tokio::test]
+async fn encoder_jitter_admitted_so101_both_owners() {
+    let mut cfg: ArmConfig = serde_json::from_str(include_str!("../profiles/so_arm101.json")).unwrap();
+    cfg.init_arm_model_in_memory(Some(include_str!("../assets/so101_new_calib.urdf"))).unwrap();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.lease_timeout_ms = 60_000;
+    assert_encoder_jitter_admitted_both_owners("so101", cfg, [0.0015f32, 0.002f32], false).await;
 }
 
 /// R2 Item 3 (Major): Standalone gripper, zero-check, and macro gripper commits must NOT
