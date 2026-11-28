@@ -1514,11 +1514,21 @@ async fn phase_b_keepout_carried_object_sat_and_checked_only_hints() {
         rig.shutdown();
     }
 
-    // Move 3a/3b chord keep-out refusal checks to [0.42, 0.0] where legacy is IK_UNREACHABLE.
+    // Move 3a/3b chord keep-out refusal checks to [0.42, 0.0] where legacy is IK_UNREACHABLE while
+    // oblique chords succeed without the thin keep-out rods.
     let q0 = solve_camera_down(&base_cfg, &setup, [0.42, 0.0, 0.26]);
     let poly = banana([0.42, 0.0], 0.12, 30.0, 0.034, 90.0);
     let start_end = base_cfg.arm_model.fk(&q0);
     let req = adaptive_request(&cam, &start_end, setup.table_z_m, &poly, 0.035);
+    {
+        let rig = Rig::start(Owner::Legacy, base_cfg.clone(), setup.clone(), q0, poly.clone(), 0.035, Some(-1.5), false).await;
+        let mut dry_req = req.clone();
+        dry_req["dry_run"] = json!(true);
+        let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
+        assert_eq!(dry["legacy"]["reachable"], json!(false), "legacy must refuse at 0.42 m: {dry:?}");
+        assert_eq!(dry["reachable"], json!(true), "baseline oblique chord must pass at 0.42 m without thin rods: {dry:?}");
+        rig.shutdown();
+    }
 
     // 3a) Thin keep-out piercing the carried object's middle during SEPARATION (+0.03 m above table)
     //     with all 8 object corners outside the thin rod!
@@ -1535,13 +1545,16 @@ async fn phase_b_keepout_carried_object_sat_and_checked_only_hints() {
         let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
         assert_eq!(dry["legacy"]["reachable"], json!(false), "legacy refuses at 0.42 m: {dry:?}");
         assert_eq!(dry["reachable"], json!(false), "thin rod piercing carried object during separation must be rejected: {dry:?}");
-        assert!(dry.get("failing_phase").and_then(Value::as_str).is_some(), "{dry:?}");
+        assert_eq!(dry["code"], json!("WORKSPACE_VIOLATION"), "3a must refuse WORKSPACE_VIOLATION: {dry:?}");
+        assert_eq!(dry["failing_phase"], json!("separation"), "3a must fail in separation phase: {dry:?}");
+        assert_eq!(dry["best_refusal"]["code"], json!("WORKSPACE_VIOLATION"), "{dry:?}");
+        assert_eq!(dry["best_refusal"]["phase"], json!("separation"), "{dry:?}");
         // Live plan must refuse with exact parity (failing_phase + code) and no legacy-pass hint.
         let err = rig.plan_adaptive(&req).await.err().expect("live plan must also refuse");
         match err {
             ArmError::Detailed { code, details, .. } => {
-                assert_eq!(Value::String(code), dry["code"]);
-                assert_eq!(details["failing_phase"], dry["failing_phase"]);
+                assert_eq!(code, "WORKSPACE_VIOLATION");
+                assert_eq!(details["failing_phase"], json!("separation"));
                 assert!(details.get("hint").is_none(), "no legacy-pass hint: {details:?}");
             }
             other => panic!("expected ArmError::Detailed, got {other:?}"),
@@ -1563,7 +1576,18 @@ async fn phase_b_keepout_carried_object_sat_and_checked_only_hints() {
         let dry = grasp::dry_run_task(&rig.sup, rig.vision.as_ref(), &dry_req).await.fields();
         assert_eq!(dry["legacy"]["reachable"], json!(false), "legacy refuses at 0.42 m: {dry:?}");
         assert_eq!(dry["reachable"], json!(false), "thin rod piercing carried object during lift must be rejected: {dry:?}");
-        assert!(rig.plan_adaptive(&req).await.is_err());
+        assert_eq!(dry["code"], json!("WORKSPACE_VIOLATION"), "3b must refuse WORKSPACE_VIOLATION: {dry:?}");
+        assert_eq!(dry["failing_phase"], json!("lift"), "3b must fail in lift phase: {dry:?}");
+        assert_eq!(dry["best_refusal"]["code"], json!("WORKSPACE_VIOLATION"), "{dry:?}");
+        assert_eq!(dry["best_refusal"]["phase"], json!("lift"), "{dry:?}");
+        let err = rig.plan_adaptive(&req).await.err().expect("live plan must also refuse");
+        match err {
+            ArmError::Detailed { code, details, .. } => {
+                assert_eq!(code, "WORKSPACE_VIOLATION");
+                assert_eq!(details["failing_phase"], json!("lift"));
+            }
+            other => panic!("expected ArmError::Detailed, got {other:?}"),
+        }
         rig.shutdown();
     }
 

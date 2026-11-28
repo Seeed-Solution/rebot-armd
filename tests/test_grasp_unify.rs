@@ -252,7 +252,7 @@ async fn wide_banana_is_refused_by_both_strategies_with_the_measured_reserve() {
     let br = &leg["best_refusal"];
     // Interval jaw_check catches the curved banana's box-centre offset (~6.15 mm) on top of the
     // width excess (~3 mm), giving a stricter negative reserve (~-9.3 mm < -3 mm).
-    assert!(f(&br["value"]) < -0.003 && f(&br["bound"]) == 0.003, "{br}");
+    assert!((f(&br["value"]) - (-0.0093)).abs() < 0.0005 && f(&br["bound"]) == 0.003, "{br}");
     assert_eq!(leg["error_margin"]["error_margin_source"], "fallback");
     let ad = dry(&sc, &body).await;
     println!("adaptive {}", summary(&ad));
