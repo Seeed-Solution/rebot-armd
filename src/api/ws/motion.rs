@@ -900,12 +900,23 @@ async fn submit_prepared_motion_executor_ws(
                 drop(ack_guard);
                 return ExecutorMotionSubmitOutcome::StartDrifted;
             }
-            Ok(Ok(Ok(Reply::Refused { code, .. }))) => {
+            Ok(Ok(Ok(Reply::Refused { request, code, .. }))) => {
                 drop(ack_guard);
                 let ep = cur_epoch();
+                let ws_detail = (code == "WORKSPACE_VIOLATION")
+                    .then(|| {
+                        handle
+                            .broker()
+                            .lock()
+                            .ok()
+                            .and_then(|mut b| b.take_workspace_witness(request))
+                            .map(crate::rt_core::broker::WorkspaceViolationRtWitness::into_detail)
+                    })
+                    .flatten();
                 return ExecutorMotionSubmitOutcome::Reject {
                     epoch: ep,
-                    error: ActionRefusal::new(code).into_arm_error_with_epoch(ep),
+                    error: ActionRefusal::new(code)
+                        .into_arm_error_with_workspace(ep, None, None, ws_detail),
                 };
             }
             Ok(Ok(Ok(Reply::Terminal { .. } | Reply::Lease { .. }))) => {

@@ -27,7 +27,8 @@ function clearFault(opts) {
 function formatParkWorkspaceBlocked(d) {
   const geom = (d && typeof d.geometry_id === 'string' && d.geometry_id)
     || (d && typeof d.constraint_id === 'string' && d.constraint_id)
-    || t('ws.edge.unknown');
+    || '';
+  if (!geom) return t('toast.ws_blocked_generic');
   const cid = (d && typeof d.constraint_id === 'string' && d.constraint_id && d.constraint_id !== geom)
     ? d.constraint_id : '';
   return cid ? t('toast.park_ws_blocked_cid', { geom, cid }) : t('toast.park_ws_blocked', { geom });
@@ -64,15 +65,14 @@ async function controlledUnload() {
     if (S.obs && !S.obs.is_torqued) {
       toast(t('toast.parked'), 'ok');
     } else if (act?.kind === 'park' && act?.state === 'failed' && act?.code === 'WORKSPACE_VIOLATION') {
-      const witness = act.geometry_id ? act : (S.obs?.workspace_violation || act);
-      toast(formatParkWorkspaceBlocked(witness), 'err', 'WORKSPACE_VIOLATION');
+      toast(formatParkWorkspaceBlocked(act), 'err', 'WORKSPACE_VIOLATION');
     } else {
       toast(t('toast.unload_unconfirmed'), 'err');
     }
   } catch (e) {
     if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return;
     if (e && e.code === 'WORKSPACE_VIOLATION') {
-      toast(formatParkWorkspaceBlocked(e.reply || S.obs?.workspace_violation || e), 'err', 'WORKSPACE_VIOLATION');
+      toast(formatParkWorkspaceBlocked(e.reply || e), 'err', 'WORKSPACE_VIOLATION');
     } else {
       toast(t('toast.stow_failed') + (e.message || t('toast.stow_unconfirmed')), 'err', e.code);
     }

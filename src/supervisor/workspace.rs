@@ -798,7 +798,9 @@ impl SupervisorInner {
     ///
     /// Leaves `self.tracking` intact for the caller's `apply_tracking_fallback_step_inline` to
     /// emit the hold frame at the last certified target (`last_issued`) and preserve park escape
-    /// depths.
+    /// depths. Known limitation: when Park is refused while moving and every bounded braking
+    /// candidate violates the workspace, the shared fallback (`src/tracking.rs:3077-3150`) still
+    /// latches `ServoNoBrake`.
     pub(super) fn enter_park_workspace_hold_rt(&mut self, f: crate::chain::WorkspaceFailureRt) {
         use crate::chain::{WorkspaceEvaluator, WorkspaceFailureRt};
         let f_park = WorkspaceFailureRt { kind: f.kind, phase: "park" };

@@ -36,7 +36,7 @@
 //! A refused admission ([`AdmitError`]) has no side effect on the RT side: nothing is
 //! queued, no plan slot stays taken, active motion is untouched.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -300,6 +300,85 @@ pub enum Outcome {
     Stopped,
     /// Cancelled for another cause (`LEASE_LOST`, `ESTOP`, `COLLISION_HOLD`, ...).
     Cancelled(&'static str),
+}
+
+/// Fixed-size zero-allocation RT workspace-violation witness bound to a single [`RequestId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceViolationRtWitness {
+    pub constraint_id: crate::safety::BoundedText<160>,
+    pub geometry_id: crate::safety::BoundedText<128>,
+    pub violation_phase: crate::safety::BoundedText<64>,
+    pub reason: crate::safety::BoundedText<384>,
+}
+
+impl WorkspaceViolationRtWitness {
+    /// Captures a non-empty witness from a [`crate::kinematics::WorkspaceViolationDetail`] with
+    /// zero heap allocations. Returns `None` when all fields are empty.
+    pub fn from_detail(d: &crate::kinematics::WorkspaceViolationDetail) -> Option<Self> {
+        let w = Self {
+            constraint_id: d
+                .constraint_id
+                .as_deref()
+                .map_or_else(Default::default, crate::safety::BoundedText::new),
+            geometry_id: d
+                .geometry_id
+                .as_deref()
+                .map_or_else(Default::default, crate::safety::BoundedText::new),
+            violation_phase: d
+                .violation_phase
+                .as_deref()
+                .map_or_else(Default::default, crate::safety::BoundedText::new),
+            reason: d
+                .reason
+                .as_deref()
+                .map_or_else(Default::default, crate::safety::BoundedText::new),
+        };
+        if w.constraint_id.is_empty()
+            && w.geometry_id.is_empty()
+            && w.violation_phase.is_empty()
+            && w.reason.is_empty()
+        {
+            None
+        } else {
+            Some(w)
+        }
+    }
+
+    /// Converts this fixed-size witness into an owned [`crate::kinematics::WorkspaceViolationDetail`]
+    /// on the non-RT broker/WS side.
+    pub fn into_detail(self) -> crate::kinematics::WorkspaceViolationDetail {
+        let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        crate::kinematics::WorkspaceViolationDetail {
+            constraint_id: opt(self.constraint_id.as_str()),
+            geometry_id: opt(self.geometry_id.as_str()),
+            violation_phase: opt(self.violation_phase.as_str()),
+            reason: opt(self.reason.as_str()),
+        }
+    }
+
+    /// Copies all 4 fields into a preallocated RT `WorkspaceViolationDetail` without allocating
+    /// or freeing heap memory.
+    pub(crate) fn write_into_detail_rt(&self, dst: &mut crate::kinematics::WorkspaceViolationDetail) {
+        fn copy_capped(dst: &mut Option<String>, s: &str) {
+            if let Some(d) = dst.as_mut() {
+                d.clear();
+                let cap = d.capacity();
+                if s.len() <= cap {
+                    d.push_str(s);
+                } else {
+                    let mut end = cap;
+                    while end > 0 && !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    d.push_str(&s[..end]);
+                }
+            }
+        }
+        copy_capped(&mut dst.constraint_id, self.constraint_id.as_str());
+        copy_capped(&mut dst.geometry_id, self.geometry_id.as_str());
+        copy_capped(&mut dst.violation_phase, self.violation_phase.as_str());
+        copy_capped(&mut dst.reason, self.reason.as_str());
+    }
 }
 
 /// RT -> broker.
@@ -700,6 +779,8 @@ pub struct Broker<P> {
     next_request: u64,
     commands: rtrb::Producer<Descriptor>,
     replies: rtrb::Consumer<Reply>,
+    ws_witnesses_rx: rtrb::Consumer<(RequestId, WorkspaceViolationRtWitness)>,
+    ws_witnesses_by_req: VecDeque<(RequestId, WorkspaceViolationRtWitness)>,
     stashed_reply: Option<Reply>,
     plans: PlanWriter<P>,
     reply_capacity: usize,
@@ -722,6 +803,7 @@ pub struct RtIntake<P> {
     boot: BootId,
     commands: rtrb::Consumer<Descriptor>,
     replies: rtrb::Producer<Reply>,
+    ws_witnesses: rtrb::Producer<(RequestId, WorkspaceViolationRtWitness)>,
     plans: PlanReader<P>,
     commit_seq: u64,
     /// The current release (0: none started).
@@ -772,6 +854,8 @@ pub struct Acked {
 pub fn channel<P: Send>(arm: ArmId, boot: BootId, caps: Capacities, make: impl FnMut() -> P) -> (Broker<P>, RtIntake<P>) {
     let (ctx, crx) = rtrb::RingBuffer::new(caps.commands);
     let (rtx, rrx) = rtrb::RingBuffer::new(caps.replies);
+    let ws_cap = caps.replies.max(1);
+    let (wtx, wrx) = rtrb::RingBuffer::new(ws_cap);
     let (pw, pr) = plan_slots(caps.plans, make);
     (
         Broker {
@@ -780,6 +864,8 @@ pub fn channel<P: Send>(arm: ArmId, boot: BootId, caps: Capacities, make: impl F
             next_request: 0,
             commands: ctx,
             replies: rrx,
+            ws_witnesses_rx: wrx,
+            ws_witnesses_by_req: VecDeque::with_capacity(ws_cap * 2),
             stashed_reply: None,
             plans: pw,
             reply_capacity: caps.replies,
@@ -790,7 +876,7 @@ pub fn channel<P: Send>(arm: ArmId, boot: BootId, caps: Capacities, make: impl F
             closed_bitset: Arc::new(super::requests::actions::ClosedBitset::new()),
             stats: BrokerStats::default(),
         },
-        RtIntake { arm, boot, commands: crx, replies: rtx, plans: pr, commit_seq: 0, release: 0, taken_in: 0, installed: 0, reply_overflow: 0 },
+        RtIntake { arm, boot, commands: crx, replies: rtx, ws_witnesses: wtx, plans: pr, commit_seq: 0, release: 0, taken_in: 0, installed: 0, reply_overflow: 0 },
     )
 }
 
@@ -979,10 +1065,37 @@ impl<P> Broker<P> {
     pub fn discard_stopped_after_rt_exit(&mut self) {
         self.stashed_reply = None;
         while self.replies.pop().is_ok() {}
+        while self.ws_witnesses_rx.pop().is_ok() {}
+        self.ws_witnesses_by_req.clear();
         self.pending.clear();
         self.disconnected.clear();
         self.reserved = 0;
         self.plans.reclaim();
+    }
+
+    fn drain_workspace_witnesses(&mut self) {
+        let cap = self.reply_capacity.max(1) * 2;
+        while let Ok(entry) = self.ws_witnesses_rx.pop() {
+            if self.ws_witnesses_by_req.len() >= cap {
+                self.ws_witnesses_by_req.pop_front();
+            }
+            self.ws_witnesses_by_req.push_back(entry);
+        }
+    }
+
+    fn drop_workspace_witness(&mut self, request: RequestId) {
+        if let Some(pos) = self.ws_witnesses_by_req.iter().position(|(r, _)| *r == request) {
+            self.ws_witnesses_by_req.remove(pos);
+        }
+    }
+
+    /// Consumes the request-bound workspace-violation witness recorded for `request` when the RT
+    /// owner refused it at Step 3, or `None` if that request produced no witness (never returns
+    /// another request's witness).
+    pub fn take_workspace_witness(&mut self, request: RequestId) -> Option<WorkspaceViolationRtWitness> {
+        self.drain_workspace_witnesses();
+        let pos = self.ws_witnesses_by_req.iter().position(|(r, _)| *r == request)?;
+        self.ws_witnesses_by_req.remove(pos).map(|(_, w)| w)
     }
 
     /// Drains the RT's replies in exact global FIFO order with bounded backpressure: when
@@ -990,6 +1103,7 @@ impl<P> Broker<P> {
     /// with its reservation intact and polling stops until the caller retries. Returns the
     /// number of replies processed (delivered or abandoned).
     pub fn try_poll(&mut self, mut deliver: impl FnMut(ClientId, Reply) -> DeliveryDecision) -> usize {
+        self.drain_workspace_witnesses();
         let mut n = 0;
         loop {
             let reply = match self.stashed_reply.take() {
@@ -999,6 +1113,7 @@ impl<P> Broker<P> {
                     Err(_) => break,
                 },
             };
+            self.drain_workspace_witnesses();
             let request = reply.request();
             let Some((client, expected, p_ack, p_terminal)) = self.pending.get(&request).map(|p| {
                 let expected = match reply {
@@ -1009,11 +1124,17 @@ impl<P> Broker<P> {
             }) else {
                 n += 1;
                 self.stats.unexpected += 1;
+                if matches!(reply, Reply::Refused { .. }) {
+                    self.drop_workspace_witness(request);
+                }
                 continue;
             };
             if !expected {
                 n += 1;
                 self.stats.unexpected += 1;
+                if matches!(reply, Reply::Refused { .. }) {
+                    self.drop_workspace_witness(request);
+                }
                 // Early terminal before ACK: recover both broker and router credits cleanly by
                 // removing the broken pending entry and notifying the router with PROTOCOL_ERROR.
                 if matches!(reply, Reply::Terminal { .. }) && p_ack {
@@ -1079,7 +1200,12 @@ impl<P> Broker<P> {
                 !p.ack && !p.terminal
             };
             if done { self.pending.remove(&request); }
-            if decision == DeliveryDecision::Abandoned { self.stats.abandoned += 1; }
+            if decision == DeliveryDecision::Abandoned {
+                self.stats.abandoned += 1;
+                if matches!(reply, Reply::Refused { .. }) {
+                    self.drop_workspace_witness(request);
+                }
+            }
             if done && self.disconnected.contains(&client) && !self.pending.values().any(|p| p.client == client) {
                 self.disconnected.remove(&client);
             }
@@ -1255,13 +1381,27 @@ impl<P> Taken<'_, P> {
 
     /// Refuses the command with an optional fixed-size per-request RT diagnostic detail.
     pub fn refuse_deferred_with(
+        self,
+        code: &'static str,
+        detail: Option<crate::motion::PlanningLimitViolationRt>,
+    ) -> Reply {
+        self.refuse_deferred_with_ws(code, detail, None)
+    }
+
+    /// Like [`Self::refuse_deferred_with`], also binding an optional fixed-size workspace-violation
+    /// witness strictly to this request's [`RequestId`] on the RT side (zero heap allocations).
+    pub fn refuse_deferred_with_ws(
         mut self,
         code: &'static str,
         detail: Option<crate::motion::PlanningLimitViolationRt>,
+        ws_witness: Option<WorkspaceViolationRtWitness>,
     ) -> Reply {
         self.answered = true;
         if let Some(plan) = self.d.kind.plan() {
             self.intake.plans.retire(plan);
+        }
+        if let Some(w) = ws_witness {
+            let _ = self.intake.ws_witnesses.push((self.d.stamp.request, w));
         }
         Reply::Refused {
             request: self.d.stamp.request,

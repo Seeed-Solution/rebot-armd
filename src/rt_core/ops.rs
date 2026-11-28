@@ -1105,6 +1105,12 @@ pub trait CoreOps {
     ) -> Result<Committed, CommitRefusal> {
         Err(CommitRefusal::code("UNSUPPORTED"))
     }
+    fn prepare_workspace_witness_capture(&mut self) -> Option<super::broker::WorkspaceViolationRtWitness> { None }
+    fn finish_workspace_witness_capture(
+        &mut self,
+        _prev: Option<super::broker::WorkspaceViolationRtWitness>,
+        _code: Option<&'static str>,
+    ) -> Option<super::broker::WorkspaceViolationRtWitness> { None }
     /// Commits one policy lifecycle broker command (`ReserveLoad`, `BeginPolicy`, `EndPolicy`).
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
     fn commit_policy(
@@ -2268,14 +2274,27 @@ impl CoreOps for SupervisorInner {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn commit_action(
-        &mut self,
-        d: &Descriptor,
-        cmd: super::requests::actions::ActionCommand,
-        slot: Option<PlanSlotRef<PlanSlot>>,
-        ctx: &CommitCtx,
-    ) -> Result<Committed, CommitRefusal> {
+    fn commit_action(&mut self, d: &Descriptor, cmd: super::requests::actions::ActionCommand, slot: Option<PlanSlotRef<PlanSlot>>, ctx: &CommitCtx) -> Result<Committed, CommitRefusal> {
         super::requests::actions::commit_action(self, d, cmd, slot, ctx)
+    }
+    fn prepare_workspace_witness_capture(&mut self) -> Option<super::broker::WorkspaceViolationRtWitness> {
+        let prev = self.workspace_violation.as_ref().and_then(super::broker::WorkspaceViolationRtWitness::from_detail);
+        self.clear_workspace_violation_rt();
+        prev
+    }
+    fn finish_workspace_witness_capture(&mut self, prev: Option<super::broker::WorkspaceViolationRtWitness>, code: Option<&'static str>) -> Option<super::broker::WorkspaceViolationRtWitness> {
+        let fresh = (code == Some("WORKSPACE_VIOLATION"))
+            .then(|| self.workspace_violation.as_ref().and_then(super::broker::WorkspaceViolationRtWitness::from_detail))
+            .flatten();
+        if fresh.is_none() && code.is_some() && self.workspace_violation.is_none() {
+            if let Some(p) = prev {
+                if let Some(mut d) = self.workspace_violation_spare.take() {
+                    p.write_into_detail_rt(&mut d);
+                    self.workspace_violation = Some(d);
+                }
+            }
+        }
+        fresh
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
@@ -2997,6 +3016,14 @@ impl ReleaseEngine {
                     } else {
                         None
                     };
+                    let captures_ws = matches!(
+                        d.kind,
+                        CommandKind::Install { .. }
+                            | CommandKind::InstallHome { .. }
+                            | CommandKind::InstallPark { .. }
+                            | CommandKind::ContinuePark { .. }
+                    ) || is_action_cmd;
+                    let ws_prev = if captures_ws { core.prepare_workspace_witness_capture() } else { None };
                     let result: Result<Committed, CommitRefusal> = match d.kind {
                         CommandKind::Install { .. } => {
                             #[cfg(not(target_arch = "wasm32"))]
@@ -3021,40 +3048,22 @@ impl ReleaseEngine {
                                 }
                             }
                         }
-                        CommandKind::InstallHome { .. } => match t.plan().and_then(|s| s.motion) {
-                            Some(m) => core.commit_home(&d, &m, &ctx).map_err(CommitRefusal::code),
-                            None => Err(CommitRefusal::code("PLAN_RETIRED")),
-                        },
-                        CommandKind::InstallPark { .. } => match t.plan().and_then(|s| s.motion) {
-                            Some(m) => core.commit_park(&d, &m, &ctx).map_err(CommitRefusal::code),
-                            None => Err(CommitRefusal::code("PLAN_RETIRED")),
-                        },
-                        CommandKind::ContinuePark { .. } => match t.plan().and_then(|s| s.motion) {
-                            Some(m) => core.commit_park_continuation(&d, &m, &ctx).map_err(CommitRefusal::code),
-                            None => Err(CommitRefusal::code("PLAN_RETIRED")),
-                        },
+                        CommandKind::InstallHome { .. } => t.plan().and_then(|s| s.motion)
+                            .map_or(Err(CommitRefusal::code("PLAN_RETIRED")), |m| core.commit_home(&d, &m, &ctx).map_err(CommitRefusal::code)),
+                        CommandKind::InstallPark { .. } => t.plan().and_then(|s| s.motion)
+                            .map_or(Err(CommitRefusal::code("PLAN_RETIRED")), |m| core.commit_park(&d, &m, &ctx).map_err(CommitRefusal::code)),
+                        CommandKind::ContinuePark { .. } => t.plan().and_then(|s| s.motion)
+                            .map_or(Err(CommitRefusal::code("PLAN_RETIRED")), |m| core.commit_park_continuation(&d, &m, &ctx).map_err(CommitRefusal::code)),
                         CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx).map_err(CommitRefusal::code),
-                        CommandKind::Transition(op) => {
-                            core.commit_transition_with_budget(
-                                &d,
-                                op,
-                                &ctx,
-                                &mut ledger,
-                                &mut now_fn,
-                            )
-                            .map_err(CommitRefusal::code)
-                        }
+                        CommandKind::Transition(op) => core
+                            .commit_transition_with_budget(&d, op, &ctx, &mut ledger, &mut now_fn)
+                            .map_err(CommitRefusal::code),
                         #[cfg(not(target_arch = "wasm32"))]
                         CommandKind::Action(cmd) => {
                             let slot_res = if cmd.plan().is_some() {
                                 t.plan_ref().map(Some).ok_or(CommitRefusal::code("PLAN_RETIRED"))
-                            } else {
-                                Ok(None)
-                            };
-                            match slot_res {
-                                Ok(slot_ref) => core.commit_action(&d, cmd, slot_ref, &ctx),
-                                Err(err) => Err(err),
-                            }
+                            } else { Ok(None) };
+                            slot_res.and_then(|slot_ref| core.commit_action(&d, cmd, slot_ref, &ctx))
                         }
                         #[cfg(all(not(target_arch = "wasm32"), feature = "policy-runtime"))]
                         CommandKind::Policy(cmd) => {
@@ -3064,32 +3073,25 @@ impl ReleaseEngine {
                         }
                         CommandKind::Lease(_) => unreachable!(),
                     };
+                    let ws_witness = if captures_ws {
+                        core.finish_workspace_witness_capture(ws_prev, result.as_ref().err().map(|r| r.code))
+                    } else { None };
                     report.command = Some((d.stamp.request, match result {
                         Ok(c) => {
                             let install = d.kind.is_install();
                             let supersedes = starts_top_action && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
                             if supersedes {
                                 t.ack_deferred(c).map(|(acked, ack_reply)| {
-                                    let old_slot = self.active.take().expect("checked active.is_some()");
-                                    let (old_installed, old_child_plan) = old_slot.into_parts();
+                                    let (old_installed, old_child_plan) = self.active.take().expect("checked active.is_some()").into_parts();
                                     retire_after_take = old_child_plan;
                                     let (old_outcome, old_children) = prior_ended
                                         .unwrap_or_else(|| (Outcome::Superseded, core.action_children(old_installed.action())));
                                     superseded_and_ack = Some((old_installed, old_outcome, old_children, ack_reply));
                                     if let Some(i) = acked.installed {
                                         #[cfg(not(target_arch = "wasm32"))]
-                                        {
-                                            self.active = Some(if is_begin_macro {
-                                                ActiveSlot::Macro { parent: i, child_plan: None }
-                                            } else {
-                                                ActiveSlot::Standalone(i)
-                                            });
-                                        }
+                                        { self.active = Some(if is_begin_macro { ActiveSlot::Macro { parent: i, child_plan: None } } else { ActiveSlot::Standalone(i) }); }
                                         #[cfg(target_arch = "wasm32")]
-                                        {
-                                            let _ = is_begin_macro;
-                                            self.active = Some(ActiveSlot::Standalone(i));
-                                        }
+                                        { let _ = is_begin_macro; self.active = Some(ActiveSlot::Standalone(i)); }
                                     }
                                     acked.commit_seq
                                 })
@@ -3099,33 +3101,19 @@ impl ReleaseEngine {
                                     if is_child_cmd {
                                         #[cfg(not(target_arch = "wasm32"))]
                                         if let Some(new_cp) = d.kind.plan() {
-                                            if let Some(ActiveSlot::Macro { child_plan, .. }) = self.active.as_mut() {
-                                                retire_after_take = child_plan.replace(new_cp);
-                                            } else {
-                                                retire_after_take = Some(new_cp);
-                                            }
+                                            retire_after_take = if let Some(ActiveSlot::Macro { child_plan, .. }) = self.active.as_mut() { child_plan.replace(new_cp) } else { Some(new_cp) };
                                         }
                                     } else if let Some(i) = acked.installed {
                                         #[cfg(not(target_arch = "wasm32"))]
-                                        {
-                                            self.active = Some(if is_begin_macro {
-                                                ActiveSlot::Macro { parent: i, child_plan: None }
-                                            } else {
-                                                ActiveSlot::Standalone(i)
-                                            });
-                                        }
+                                        { self.active = Some(if is_begin_macro { ActiveSlot::Macro { parent: i, child_plan: None } } else { ActiveSlot::Standalone(i) }); }
                                         #[cfg(target_arch = "wasm32")]
-                                        {
-                                            self.active = Some(ActiveSlot::Standalone(i));
-                                        }
+                                        { self.active = Some(ActiveSlot::Standalone(i)); }
                                     }
                                     acked.commit_seq
                                 })
                             } else if install {
                                 t.ack(c).map(|acked| {
-                                    if let Some(i) = acked.installed {
-                                        self.active = Some(ActiveSlot::Standalone(i));
-                                    }
+                                    if let Some(i) = acked.installed { self.active = Some(ActiveSlot::Standalone(i)); }
                                     acked.commit_seq
                                 })
                             } else {
@@ -3140,7 +3128,7 @@ impl ReleaseEngine {
                             }
                         }
                         Err(refusal) => {
-                            deferred_step3_reply = Some(t.refuse_deferred_with(refusal.code, refusal.detail));
+                            deferred_step3_reply = Some(t.refuse_deferred_with_ws(refusal.code, refusal.detail, ws_witness));
                             Err(refusal.code)
                         }
                     }));

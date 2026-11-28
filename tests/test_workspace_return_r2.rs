@@ -248,13 +248,29 @@ async fn park_ramp_out_deepening_floor_with_no_keepout_boxes_refused_both_owners
         if let Some(h) = exec { h.stop_and_join(); }
     }
 
-    // 2. Cockpit i18n & safety.js message check (en + zh): names blocking geometry and gives recovery step.
+    // 2. Cockpit i18n & safety.js message check (en + zh): names blocking geometry when witness is
+    //    present and falls back to generic guidance when witness is absent (never S.obs fallback).
     let en_js = include_str!("../src/api/cockpit/i18n/en.js");
     let zh_js = include_str!("../src/api/cockpit/i18n/zh.js");
     let safety_js = include_str!("../src/api/cockpit/panels/motion/safety.js");
     assert!(en_js.contains("jog away from {geom}, then Park again"), "en.js must include Park workspace guidance");
+    assert!(
+        en_js.contains("toast.ws_blocked_generic")
+            && en_js.contains("The move would go further outside the workspace; jog back toward the workspace, then try again"),
+        "en.js must include generic workspace fallback guidance"
+    );
     assert!(zh_js.contains("toast.park_ws_blocked") && zh_js.contains("{geom}"), "zh.js must include Park workspace guidance");
-    assert!(safety_js.contains("formatParkWorkspaceBlocked") && safety_js.contains("WORKSPACE_VIOLATION"), "safety.js must render Park workspace guidance");
+    assert!(
+        zh_js.contains("toast.ws_blocked_generic") && zh_js.contains("进一步超出工作空间"),
+        "zh.js must include generic workspace fallback guidance"
+    );
+    assert!(
+        safety_js.contains("formatParkWorkspaceBlocked")
+            && safety_js.contains("WORKSPACE_VIOLATION")
+            && safety_js.contains("toast.ws_blocked_generic")
+            && !safety_js.contains("S.obs?.workspace_violation"),
+        "safety.js must render geometry-specific or generic fallback without reading S.obs?.workspace_violation"
+    );
 
     // 3. Unit check: `WorkspaceEvaluator::new_with_tcp_in_mode(..., keepout_only = true)`
     //    must keep both `floor_z` AND `self_collision` hard slots active even when `keepout_boxes` is empty.
@@ -1302,4 +1318,510 @@ async fn executor_ws_command_reply_carries_inline_workspace_witness() {
     drop(ws);
     srv.abort();
     exec.stop_and_join();
+}
+
+/// R4 (Codex R3 Major 1): Request-bound workspace-violation witness correctness.
+///
+/// 1. Same-release Step 3 refusal + Step 4 target overwrite/clear: Request 1 refused at Step 3
+///    with `box_max_x` keeps its own witness even when Step 4 of the SAME release replaces or
+///    clears `inner.workspace_violation`.
+/// 2. Two interleaved requests (Request 1 refused with `box_max_x`, Request 2 refused with
+///    `floor_z` or succeeding and clearing `obs.workspace_violation`, plus Request 3 refused with
+///    a bare `WORKSPACE_VIOLATION` without writing a witness): each request gets ONLY its own
+///    witness (or `None`), NEVER another request's witness.
+/// 3. Live Executor WebSocket Motion (`/api/v1/motion/jog`) refusal at `src/api/ws/motion.rs`
+///    carries its request-bound witness (`constraint_id`, `geometry_id`, `violation_phase`,
+///    `reason`) end-to-end.
+#[tokio::test]
+async fn interleaved_requests_and_motion_replies_bind_workspace_witness_per_request() {
+    use armd::rt_core::broker::{
+        Authority, BootId, Capacities, ClientId, Reply, Submit,
+    };
+    use armd::rt_core::ids::ArmId;
+    use armd::rt_core::mailbox::{StreamId, TargetAuthority, TargetFrame, MAX_DOF};
+    use armd::rt_core::ops::{
+        CommitCtx, CoreOps, PlanSlot, Primitive, ReleaseFixture, StubCore,
+    };
+    use armd::rt_core::requests::motion::{
+        self as req_motion, MotionPlanSnapshot, MotionRequest, PlanAuthority,
+    };
+    use armd::SupervisorInner;
+    use serde_json::json;
+    use std::time::Instant;
+
+    let q_start = INSPECT;
+    let p_start = ArmModel::REBOT_DEV_ARM.fk_f32(&q_start).unwrap().p;
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.torque_guard = None;
+    cfg.joint_tracking = None;
+    cfg.lease_timeout_ms = 60_000;
+    let ws_cfg = cfg.workspace.as_mut().unwrap();
+    ws_cfg.keepout_boxes.clear();
+    ws_cfg.link_capsules.clear();
+    ws_cfg.self_collision_enabled = false;
+    ws_cfg.self_collision_pairs.clear();
+    ws_cfg.check_points_end_m = vec![[0.0, 0.0, 0.0]];
+    ws_cfg.max_reach_m = Some(5.0);
+    ws_cfg.floor_z_m = (p_start[2] - 0.50) as f32;
+    ws_cfg.box_min_m = [-2.0, -2.0, -2.0];
+    // Start outside box_max_x by 5 mm.
+    ws_cfg.box_max_m = [(p_start[0] - 0.005) as f32, 2.0, 2.0];
+
+    // Find a small jog moving further +X (deepens box_max_x) and a small jog moving -X (retreats).
+    let find_step = |want_dx_pos: bool| -> [f32; 7] {
+        for j in 0..6 {
+            for sign in [-1.0f32, 1.0f32] {
+                let mut q = q_start;
+                q[j] += sign * 0.012;
+                let p = ArmModel::REBOT_DEV_ARM.fk_f32(&q).unwrap().p;
+                let dx = p[0] - p_start[0];
+                if (want_dx_pos && dx > 0.002) || (!want_dx_pos && dx < -0.002) {
+                    return q;
+                }
+            }
+        }
+        panic!("could not find joint step with dx sign {want_dx_pos}");
+    };
+    let q_deeper_x = find_step(true);
+    let q_retreat_x = find_step(false);
+
+    // Find a pose that moves downward in Z (for floor_z refusal on Request 2).
+    let q_down_z = {
+        let mut chosen = q_start;
+        for j in 0..6 {
+            for sign in [-1.0f32, 1.0f32] {
+                let mut q = q_start;
+                q[j] += sign * 0.015;
+                let p = ArmModel::REBOT_DEV_ARM.fk_f32(&q).unwrap().p;
+                if p[2] < p_start[2] - 0.002 {
+                    chosen = q;
+                    break;
+                }
+            }
+        }
+        chosen
+    };
+    let p_down_z = ArmModel::REBOT_DEV_ARM.fk_f32(&q_down_z).unwrap().p;
+    assert!(p_down_z[2] < p_start[2] - 0.002, "q_down_z must move downward");
+
+    // -------------------------------------------------------------------------
+    // Part 1 & 2: Deterministic ReleaseFixture + Broker interleaving
+    // -------------------------------------------------------------------------
+    {
+        let mut inner = SupervisorInner::new(cfg.clone());
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.register_live_connection(1).unwrap();
+        inner.register_live_connection(2).unwrap();
+        let s0 = inner.current_admission_stamp();
+        inner.check_admission(s0).and_then(|a| SupervisorInner::enable_torque(a)).unwrap();
+        inner.commanded_positions = q_start.to_vec();
+        inner.measured_positions = q_start.to_vec();
+        inner.target_positions = q_start.to_vec();
+
+        let boot = BootId(77);
+        let (mut fx, mut broker, mut tw, _stop) =
+            ReleaseFixture::new(inner, boot, Capacities { commands: 8, plans: 8, replies: 16 });
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        let deadline = fx.now().max(Instant::now()) + Duration::from_secs(600);
+
+        // Helper to prepare a retreat jog on a permissive snapshot and then shift `target` so
+        // Step 3's `check_measured_start_terminal_rt` refuses it with `WORKSPACE_VIOLATION`.
+        let make_refused_slot = |fx_ref: &ReleaseFixture<SupervisorInner>, target: &[f32]| {
+            let mut snap = MotionPlanSnapshot::from_supervisor(&fx_ref.core);
+            let cfg_mut = Arc::make_mut(&mut snap.config);
+            cfg_mut.workspace = None;
+            cfg_mut.config.workspace = None;
+            snap.commanded_positions = q_start.to_vec();
+            snap.measured_positions = q_start.to_vec();
+            snap.authority = PlanAuthority {
+                boot: fx_ref.boot(),
+                epoch: auth.epoch,
+                lease_generation: auth.lease_generation,
+                stop_generation: auth.stop_generation,
+                deadline,
+            };
+            let mut slot = req_motion::prepare_motion(
+                &snap,
+                &MotionRequest::jog(target.to_vec(), Some(0.4), None),
+            )
+            .expect("prepare_motion")
+            .slot;
+            slot.checked_workspace = true;
+            slot.workspace_revision = fx_ref.core.workspace_revision;
+            slot
+        };
+
+        // Configure BOTH `box_max_x` (5 mm outside) AND `floor_z` (1 mm below q_start) so:
+        // - Release 1 Step 3: Request 1 (`q_deeper_x`) is refused with `box_max_x`.
+        // - Release 1 Step 4 (SAME release!): servo target `q_down_z` is refused with `floor_z`,
+        //   immediately overwriting `fx.core.workspace_violation` BEFORE Step 6 publication!
+        fx.core.config.workspace.as_mut().unwrap().floor_z_m = (p_start[2] - 0.001) as f32;
+
+        // Submit Request 1: deepens box_max_x -> refused at Step 3 with `box_max_x`.
+        let slot1 = make_refused_slot(&fx, &q_deeper_x);
+        let r1 = broker
+            .submit(
+                ClientId(1),
+                1,
+                auth,
+                deadline,
+                Submit::Install(&move |dst: &mut PlanSlot| req_motion::stage_jog(dst, &slot1)),
+            )
+            .unwrap();
+
+        // Authorize a servo stream and push a Step 4 servo target in the SAME release that hits
+        // `floor_z` and OVERWRITES `fx.core.workspace_violation` right after Step 3 refused r1!
+        fx.core.core.authorize_stream(TargetAuthority {
+            stream: Some(StreamId(1)),
+            max_input_age: Some(Duration::from_secs(10)),
+            ..TargetAuthority::default()
+        });
+        let mut q_target = [0.0f32; MAX_DOF];
+        q_target[..7].copy_from_slice(&q_down_z);
+        tw.submit(TargetFrame {
+            arm: ArmId::LOCAL,
+            boot,
+            stream: StreamId(1),
+            seq: 1,
+            authority: auth,
+            policy_generation: 0,
+            input_at: fx.now(),
+            vision_at: None,
+            vision_frame_id: None,
+            deadline,
+            dof: 7,
+            q: q_target,
+            replaceable: true,
+        });
+
+        let rep1 = fx.step();
+        assert_eq!(rep1.command, Some((r1, Err("WORKSPACE_VIOLATION"))), "{rep1:?}");
+        assert_eq!(rep1.target, Some((1, Err("WORKSPACE_VIOLATION"))), "Step 4 downward target must be refused: {rep1:?}");
+
+        // Prove Step 4 of the SAME release cleared/overwrote `fx.core.workspace_violation` (it no
+        // longer holds Request 1's `box_max_x` witness!), yet Request 1's request-bound witness
+        // STILL holds `box_max_x`!
+        assert_ne!(
+            fx.core.workspace_violation.as_ref().and_then(|d| d.constraint_id.as_deref()),
+            Some("box_max_x"),
+            "Step 4 target must clear/overwrite workspace_violation in the same release"
+        );
+
+        // Release 2: restore low floor_z and submit Request 2 (valid retreat jog) that SUCCEEDS
+        // and CLEARS `fx.core.workspace_violation` to None BEFORE we poll Request 1!
+        fx.core.config.workspace.as_mut().unwrap().floor_z_m = (p_start[2] - 0.50) as f32;
+        let slot_clear = make_refused_slot(&fx, &q_retreat_x);
+        let r_clear = broker
+            .submit(
+                ClientId(2),
+                1,
+                auth,
+                deadline,
+                Submit::Install(&move |dst: &mut PlanSlot| req_motion::stage_jog(dst, &slot_clear)),
+            )
+            .unwrap();
+        let rep_clear = fx.step();
+        assert!(matches!(rep_clear.command, Some((req, Ok(_))) if req == r_clear), "retreat jog must succeed: {rep_clear:?}");
+        assert!(
+            fx.core.workspace_violation.is_none(),
+            "Request 2 succeeding must clear workspace_violation to None"
+        );
+
+        // Release 3: reset to q_start, switch workspace to floor_z and submit Request 3 BEFORE polling!
+        let ws_mut = fx.core.config.workspace.as_mut().unwrap();
+        ws_mut.floor_z_m = (p_start[2] + 0.004) as f32;
+        ws_mut.box_max_m = [2.0, 2.0, 2.0];
+        fx.core.active_trajectory = None;
+        fx.core.measured_positions = q_start.to_vec();
+        fx.core.commanded_positions = q_start.to_vec();
+        fx.core.target_positions = q_start.to_vec();
+        let slot2 = make_refused_slot(&fx, &q_down_z);
+        let r2 = broker
+            .submit(
+                ClientId(2),
+                2,
+                auth,
+                deadline,
+                Submit::Install(&move |dst: &mut PlanSlot| req_motion::stage_jog(dst, &slot2)),
+            )
+            .unwrap();
+        let rep2 = fx.step();
+        assert_eq!(rep2.command, Some((r2, Err("WORKSPACE_VIOLATION"))), "{rep2:?}");
+
+        // Confirm `fx.core.workspace_violation` is now `floor_z` (Request 2's witness).
+        assert_eq!(
+            fx.core.workspace_violation.as_ref().and_then(|d| d.constraint_id.as_deref()),
+            Some("floor_z"),
+            "observation diagnostic must now hold Request 2's floor_z witness"
+        );
+
+        // Poll BOTH replies now and verify each request receives ONLY its own bound witness.
+        let mut replies = Vec::new();
+        broker.poll(|c, r| {
+            replies.push((c, r));
+            true
+        });
+        assert!(
+            replies.iter().any(|(_, r)| matches!(r, Reply::Refused { request, code: "WORKSPACE_VIOLATION", .. } if *request == r1)),
+            "expected Request 1 WORKSPACE_VIOLATION refusal: {replies:?}"
+        );
+        assert!(
+            replies.iter().any(|(_, r)| matches!(r, Reply::Refused { request, code: "WORKSPACE_VIOLATION", .. } if *request == r2)),
+            "expected Request 2 WORKSPACE_VIOLATION refusal: {replies:?}"
+        );
+
+        let w_r1 = broker
+            .take_workspace_witness(r1)
+            .expect("Request 1 must still have its own bound witness after Step 4 clear + Request 2 overwrite");
+        assert_eq!(
+            w_r1.constraint_id.as_str(),
+            "box_max_x",
+            "Request 1 must carry box_max_x, NEVER Request 2's floor_z: {w_r1:?}"
+        );
+        let w_r2 = broker
+            .take_workspace_witness(r2)
+            .expect("Request 2 must have its own bound floor_z witness");
+        assert_eq!(w_r2.constraint_id.as_str(), "floor_z", "Request 2 witness: {w_r2:?}");
+        // Consumed once -> second lookup returns None.
+        assert!(broker.take_workspace_witness(r1).is_none());
+
+        // Request 3: a CoreOps returning bare `WORKSPACE_VIOLATION` without writing a witness
+        // must yield `None` (code-only), NEVER Request 2's leftover observation witness.
+        struct BareWsRefuseCore(StubCore);
+        impl CoreOps for BareWsRefuseCore {
+            fn authority(&self, ctx: &CommitCtx) -> Authority { self.0.authority(ctx) }
+            fn planning_snapshot(&self, ctx: &CommitCtx) -> armd::rt_core::ops::PlanningSnapshot {
+                self.0.planning_snapshot(ctx)
+            }
+            fn commit_primitive(
+                &mut self,
+                _d: &armd::rt_core::broker::Descriptor,
+                _primitive: &Primitive,
+                _ctx: &CommitCtx,
+            ) -> Result<armd::rt_core::ops::Committed, &'static str> {
+                Err("WORKSPACE_VIOLATION")
+            }
+            fn commit_immediate(
+                &mut self,
+                d: &armd::rt_core::broker::Descriptor,
+                op: armd::rt_core::broker::ImmediateOp,
+                ctx: &CommitCtx,
+            ) -> Result<armd::rt_core::ops::Committed, &'static str> {
+                self.0.commit_immediate(d, op, ctx)
+            }
+            fn commit_transition(
+                &mut self,
+                d: &armd::rt_core::broker::Descriptor,
+                op: armd::rt_core::broker::TransitionOp,
+                ctx: &CommitCtx,
+            ) -> Result<armd::rt_core::ops::Committed, &'static str> {
+                self.0.commit_transition(d, op, ctx)
+            }
+            fn consume_target(
+                &mut self,
+                f: &TargetFrame,
+                ctx: &CommitCtx,
+            ) -> Result<(), armd::rt_core::mailbox::Refusal> {
+                self.0.consume_target(f, ctx)
+            }
+            fn apply_stop(&mut self) { self.0.apply_stop() }
+            fn poll_hardware(&mut self, budget: &armd::rt_core::ops::ServiceBudget) -> armd::rt_core::ops::HardwarePoll {
+                self.0.poll_hardware(budget)
+            }
+            fn advance(&mut self, dt_s: f64, generation: u64) { self.0.advance(dt_s, generation) }
+            fn action_outcome(&self, id: armd::rt_core::broker::ActionId) -> Option<armd::rt_core::broker::Outcome> {
+                self.0.action_outcome(id)
+            }
+        }
+        let (mut fx_bare, mut broker_bare, _tw_b, _stop_b) = ReleaseFixture::new(
+            BareWsRefuseCore(StubCore::default()),
+            BootId(78),
+            Capacities { commands: 4, plans: 4, replies: 8 },
+        );
+        let r3 = broker_bare
+            .submit(
+                ClientId(3),
+                1,
+                Authority::default(),
+                deadline,
+                Submit::Install(&|dst: &mut PlanSlot| {
+                    dst.set(Primitive::JointQuintic {
+                        dof: 7,
+                        start: [0.0; MAX_DOF],
+                        q: [0.0; MAX_DOF],
+                        duration_s: 0.4,
+                    });
+                }),
+            )
+            .unwrap();
+        let rep3 = fx_bare.step();
+        assert_eq!(rep3.command, Some((r3, Err("WORKSPACE_VIOLATION"))), "{rep3:?}");
+        let mut bare_replies = Vec::new();
+        broker_bare.poll(|c, r| {
+            bare_replies.push((c, r));
+            true
+        });
+        assert!(
+            bare_replies.iter().any(|(_, r)| matches!(r, Reply::Refused { request, code: "WORKSPACE_VIOLATION", .. } if *request == r3)),
+            "expected Request 3 WORKSPACE_VIOLATION refusal: {bare_replies:?}"
+        );
+        assert!(
+            broker_bare.take_workspace_witness(r3).is_none(),
+            "refusal without a witness must stay code-only (None), never borrow another request's witness"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 3: Live Executor WebSocket Motion (`/api/v1/motion/jog`) refusal
+    //         carries its request-bound witness via `src/api/ws/motion.rs`
+    // -------------------------------------------------------------------------
+    {
+        struct PinnedDriver(JitterFeedbackDriver);
+        impl ArmDriver for PinnedDriver {
+            fn supports_rt_executor(&self) -> Result<(), &'static str> { self.0.supports_rt_executor() }
+            fn capabilities(&self) -> DriverCapabilities { self.0.capabilities() }
+            fn enable_state(&self) -> EnableState { self.0.enable_state() }
+            fn is_feedback_valid(&self) -> bool { self.0.is_feedback_valid() }
+            fn is_enabled(&self) -> bool { self.0.is_enabled() }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { self.0.feedback_ages() }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.0.feedback_ages_into(out); }
+            fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.0.feedback_all_within(dof, max_age) }
+            fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.0.feedback_instants_into(out); }
+            fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.0.feedback_receive_instants_into(out); }
+            fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.0.feedback_age_ms_into(out); }
+            fn feedback_seqs_into(&self, out: &mut Vec<u64>) { self.0.feedback_seqs_into(out); }
+            fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { self.0.joint_loads_into(out) }
+            fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+                self.0.fresh_joint_positions_into(joints, max_age, out)
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> { self.0.read_joint_states() }
+            fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> { self.0.read_joint_states_into(out) }
+            fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> { self.0.read_cached_joint_states_into(out) }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> { self.0.set_torque(enable) }
+        }
+
+        // Shift live measured pose further inward (-X) by ~4 mm (still < 20 mrad joint drift) so
+        // a jog prepared at q_start to q_retreat_x (moving -2.5 mm X) is now deeper than the live
+        // measured pose at RT commit and fails with WORKSPACE_VIOLATION (`box_max_x`, `plan`).
+        let mut q_live_inward = q_start;
+        for j in 0..6 {
+            let dq = q_retreat_x[j] - q_start[j];
+            if dq.abs() > 1e-6 {
+                q_live_inward[j] = q_start[j] + dq * 1.5;
+            }
+        }
+        assert!(
+            (0..6).all(|i| (q_live_inward[i] - q_start[i]).abs() < armd::supervisor::MEASURED_START_DRIFT_TOL_RAD),
+            "inward drift must stay within 20 mrad so RT runs workspace re-check rather than PLAN_STALE"
+        );
+        // Verify off-thread prepare_motion succeeds from q_start -> q_retreat_x.
+        {
+            let mut tmp = SupervisorInner::new(cfg.clone());
+            tmp.lease_enabled = false;
+            let s0 = tmp.current_admission_stamp();
+            tmp.check_admission(s0).and_then(|a| SupervisorInner::enable_torque(a)).unwrap();
+            tmp.commanded_positions = q_start.to_vec();
+            tmp.measured_positions = q_start.to_vec();
+            tmp.target_positions = q_start.to_vec();
+            let mut snap = MotionPlanSnapshot::from_supervisor(&tmp);
+            snap.authority = PlanAuthority {
+                boot: BootId(1),
+                epoch: tmp.safety.epoch_id(),
+                lease_generation: 0,
+                stop_generation: 0,
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            req_motion::prepare_motion(&snap, &MotionRequest::jog(q_retreat_x.to_vec(), Some(0.4), None))
+                .expect("off-thread prepare_motion for retreat must succeed");
+        }
+
+        let drv = JitterFeedbackDriver::new(&q_start, cfg.arm_dof(), 0.0);
+        let drv_q = drv.q.clone();
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(PinnedDriver(drv))));
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = q_start.to_vec();
+            inner.measured_positions = q_start.to_vec();
+            inner.target_positions = q_start.to_vec();
+        }
+        let exec = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(20)))
+            .await
+            .expect("start_executor");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn({
+            let s = sup.clone();
+            async move { axum::serve(listener, armd::create_router(s, armd::OperatorAuth::disabled())).await.unwrap(); }
+        });
+
+        let (mut ws, gen) = common::controller(addr).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let ep = sup.get_observation().await.epoch_id;
+        let en = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(en["type"], "command_ack", "enable: {en}");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let conn_id = "connection:1".to_string();
+        struct PauseGuard(String);
+        impl Drop for PauseGuard {
+            fn drop(&mut self) {
+                armd::api::ws::set_test_ws_blocking_plan_paused(&self.0, false);
+            }
+        }
+        let ep = sup.get_observation().await.epoch_id;
+        armd::api::ws::set_test_ws_blocking_plan_paused(&conn_id, true);
+        let _guard = PauseGuard(conn_id.clone());
+        let drv_q_bg = drv_q.clone();
+        let conn_bg = conn_id.clone();
+        let unpause_task = tokio::spawn(async move {
+            let dl = tokio::time::Instant::now() + Duration::from_secs(3);
+            while armd::api::ws::test_ws_blocking_plan_blocked_count(&conn_bg) < 1 {
+                assert!(tokio::time::Instant::now() < dl, "motion blocking planner never paused for {conn_bg}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            *drv_q_bg.lock().unwrap() = q_live_inward.to_vec();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            armd::api::ws::set_test_ws_blocking_plan_paused(&conn_bg, false);
+        });
+
+        let reply = common::rpc(
+            &mut ws,
+            gen,
+            ep,
+            "/api/v1/motion/jog",
+            json!({"target_positions": q_retreat_x, "duration_secs": 0.4}),
+        )
+        .await;
+        unpause_task.await.unwrap();
+
+        assert_eq!(reply["type"], "command_reject", "motion jog must be refused: {reply}");
+        assert_eq!(reply["code"], "WORKSPACE_VIOLATION", "motion jog code: {reply}");
+        assert_eq!(
+            reply["constraint_id"], "box_max_x",
+            "Executor WS motion reply must carry its own constraint_id witness: {reply}"
+        );
+        assert!(
+            reply["geometry_id"].as_str().is_some_and(|g| !g.is_empty()),
+            "Executor WS motion reply must carry geometry_id: {reply}"
+        );
+        assert_eq!(
+            reply["violation_phase"], "plan",
+            "Executor WS motion reply must carry violation_phase=plan: {reply}"
+        );
+        assert!(
+            reply["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("this move would go")),
+            "Executor WS motion reply must carry witness reason: {reply}"
+        );
+
+        drop(ws);
+        srv.abort();
+        exec.stop_and_join();
+    }
 }

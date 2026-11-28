@@ -741,14 +741,22 @@ async fn submit_prepared_executor_ws(
                 drop(ack_guard);
                 return Err(ArmError::Internal("InstallPrepared ACK omitted ActionId".into()));
             }
-            Ok(Ok(Ok(Reply::Refused { code, detail, .. }))) => {
+            Ok(Ok(Ok(Reply::Refused { request, code, detail }))) => {
                 drop(ack_guard);
-                let latest = sup.hub().latest();
-                let cur_epoch = latest
+                let cur_epoch = sup
+                    .hub()
+                    .latest()
                     .as_ref()
                     .map_or(auth.epoch, |s| s.rt.owner.authority.epoch);
                 let ws_detail = (code == "WORKSPACE_VIOLATION")
-                    .then(|| latest.as_ref().and_then(|s| s.obs.workspace_violation.clone()))
+                    .then(|| {
+                        handle
+                            .broker()
+                            .lock()
+                            .ok()
+                            .and_then(|mut b| b.take_workspace_witness(request))
+                            .map(crate::rt_core::broker::WorkspaceViolationRtWitness::into_detail)
+                    })
                     .flatten();
                 let lims = sup.hub().prep_env().map(|e| e.config.limits.clone());
                 return Err(ActionRefusal::new(code)
