@@ -10095,60 +10095,6 @@ impl SupervisorInner {
         Ok(state)
     }
 
-    pub(super) fn measured_workspace_violation_bounded(
-        &self,
-        bufs: &mut crate::chain::EvalBufs,
-    ) -> Option<crate::safety::WorkspaceSupportViolation> {
-        self.workspace_violation_for_positions_bounded(&self.measured_positions, bufs)
-    }
-
-    pub(super) fn workspace_violation_for_positions_bounded(
-        &self,
-        positions: &[f32],
-        bufs: &mut crate::chain::EvalBufs,
-    ) -> Option<crate::safety::WorkspaceSupportViolation> {
-        use crate::safety::{BoundedText, WorkspaceSupportViolation};
-        let (ws, cam) = self.workspace_policy()?;
-        if self.config.arm_model.frames_f32(positions).is_none() {
-            return Some(WorkspaceSupportViolation::EvalFailed {
-                limit: BoundedText::new("invalid"),
-                reason: BoundedText::new("non-finite or incomplete joint positions"),
-            });
-        }
-        if ws.self_collision_enabled && !ws.link_capsules.is_empty() && !ws.self_collision_pairs.is_empty()
-            && (!ws.self_collision_min_clearance_m.is_finite() || ws.self_collision_min_clearance_m < 0.0)
-        {
-            return Some(WorkspaceSupportViolation::EvalFailed {
-                limit: BoundedText::new("invalid"),
-                reason: BoundedText::new("invalid self_collision_min_clearance_m"),
-            });
-        }
-        if let Some(cap) = ws.link_capsules.iter().find(|c| self.config.arm_model.resolve_frame(&c.frame).is_none()) {
-            let mut reason = BoundedText::<128>::empty();
-            let _ = core::fmt::write(&mut reason, format_args!("unknown frame '{}' for capsule '{}'", cap.frame, cap.id));
-            return Some(WorkspaceSupportViolation::EvalFailed {
-                limit: BoundedText::new("invalid"),
-                reason,
-            });
-        }
-        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-            &self.config.arm_model, ws, cam, self.config.tcp_offset, bufs,
-        );
-        let mut buf = eval.alloc_buf_in(bufs);
-        let violation = match eval.eval_into_in(positions, &mut buf, &mut bufs.world_caps, "clear_fault") {
-            Err(f) => Some(WorkspaceSupportViolation::EvalFailed {
-                limit: BoundedText::new(&f.limit),
-                reason: BoundedText::new(f.detail.reason.as_deref().unwrap_or("invalid joint positions")),
-            }),
-            Ok(()) => buf.as_slice().iter().enumerate()
-                .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)
-                .map(|(slot, &clr)| describe_workspace_slot_bounded(&eval, ws, cam, self.config.tcp_offset, slot, clr)),
-        };
-        crate::chain::WorkspaceEvaluator::recycle_buf(buf, bufs);
-        eval.recycle(bufs);
-        violation
-    }
-
     /// Allocation-free bounded equivalent of [`Self::resting_pose_support_violation_with_driver`].
     pub(crate) fn resting_pose_support_violation_bounded(
         &self,
@@ -12068,76 +12014,6 @@ impl SupervisorInner {
 
 fn clear_fault_driver_error(e: &crate::driver::ArmDriverError) -> crate::safety::ClearFaultDriverError {
     e.to_clear_fault_error()
-}
-
-fn describe_workspace_slot_bounded(
-    eval: &crate::chain::WorkspaceEvaluator<'_>,
-    ws: &crate::model::WorkspacePolicy,
-    cam: &crate::model::CameraMount,
-    tcp_offset: [f64; 3],
-    slot: usize,
-    clr: f64,
-) -> crate::safety::WorkspaceSupportViolation {
-    use crate::kinematics as k;
-    use crate::safety::{BoundedText, WorkspaceSupportViolation as W};
-    use core::fmt::Write as _;
-
-    let depth = -clr;
-    if slot >= eval.self_collision_slot_start {
-        let pi = slot - eval.self_collision_slot_start;
-        let (id_a, id_b) = ws.self_collision_pairs.get(pi).map_or(("?", "?"), |[a, b]| (a.as_str(), b.as_str()));
-        let (mut cid, mut gid, mut limit) = (BoundedText::empty(), BoundedText::empty(), BoundedText::empty());
-        let _ = write!(&mut cid, "self_collision:{id_a}:{id_b}");
-        let _ = write!(&mut gid, "capsule:{id_a}");
-        let _ = write!(&mut limit, "self_collision '{id_a}' vs '{id_b}'");
-        let ia = ws.link_capsules.iter().position(|c| c.id == id_a);
-        let ib = ws.link_capsules.iter().position(|c| c.id == id_b);
-        let point = match (ia, ib) { (Some(a), Some(b)) if a != b => eval.num_end_pts + a, _ => 0 };
-        let bound = f64::from(ws.self_collision_min_clearance_m);
-        return W::Constraint { limit, point, cid, gid, depth, value: bound + clr, bound };
-    }
-    if eval.has_reach && slot >= eval.num_geoms * eval.slots_per_geom {
-        let reach_idx = slot - eval.num_geoms * eval.slots_per_geom;
-        let bound = f64::from(ws.max_reach_m.unwrap_or(0.0));
-        let (point, gid) = if reach_idx == 0 {
-            (0, BoundedText::new("end_origin"))
-        } else {
-            let tcp_f32 = tcp_offset.map(|v| v as f32);
-            let pt = ws.check_points_end_m.iter()
-                .position(|c| (c[0] - tcp_f32[0]).abs() <= 1e-6 && (c[1] - tcp_f32[1]).abs() <= 1e-6 && (c[2] - tcp_f32[2]).abs() <= 1e-6)
-                .map_or(0, |i| i + 1);
-            (pt, BoundedText::new("tcp_origin"))
-        };
-        return W::Constraint { limit: BoundedText::new("reach"), point, cid: BoundedText::new("max_reach"), gid, depth, value: bound - clr, bound };
-    }
-    let (gi, ci) = (slot / eval.slots_per_geom, slot % eval.slots_per_geom);
-    let mut gid = BoundedText::empty();
-    if gi == 0 {
-        gid.push_str("end_origin");
-    } else if gi < eval.num_end_pts {
-        if cam.offset_m.is_some() && gi + 1 == eval.num_end_pts { gid.push_str("camera_mount"); }
-        else { let _ = write!(&mut gid, "end_point:{gi}"); }
-    } else {
-        let _ = write!(&mut gid, "capsule:{}", ws.link_capsules[gi - eval.num_end_pts].id);
-    }
-    let (mut limit, mut cid) = (BoundedText::empty(), BoundedText::empty());
-    let (value, bound) = if ci == 0 {
-        limit.push_str("floor"); cid.push_str("floor_z");
-        let b = f64::from(ws.floor_z_m); (b + clr, b)
-    } else if ci <= 3 {
-        let ax = ci - 1;
-        limit.push_str(k::BOX_LIMITS[ax][0]); cid.push_str(k::BOX_CONSTRAINT_IDS[ax][0]);
-        let b = f64::from(ws.box_min_m[ax]); (b + clr, b)
-    } else if ci <= 6 {
-        let ax = ci - 4;
-        limit.push_str(k::BOX_LIMITS[ax][1]); cid.push_str(k::BOX_CONSTRAINT_IDS[ax][1]);
-        let b = f64::from(ws.box_max_m[ax]); (b - clr, b)
-    } else {
-        let name = ws.keepout_boxes.get(ci - 7).map_or("?", |b| b.name.as_str());
-        let _ = write!(&mut limit, "keepout '{name}'"); let _ = write!(&mut cid, "keepout:{name}");
-        (depth, 0.0)
-    };
-    W::Constraint { limit, point: gi, cid, gid, depth, value, bound }
 }
 
 #[cfg(test)]

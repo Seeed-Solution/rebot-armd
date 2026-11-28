@@ -1304,41 +1304,6 @@ impl SupervisorInner {
         Some((out, dof))
     }
 
-    /// Zero-allocation workspace sweep check of a joint-space quintic trajectory using
-    /// reused evaluator buffers (`ws_eval_bufs`) and stack-only adaptive subdivision.
-    /// Falls back to [`Self::workspace_samples`] + [`Self::check_workspace_path`] only when
-    /// `dof > INLINE_POLYS` or `arm_dof > MAX_CHAIN_JOINTS`.
-    pub(crate) fn check_workspace_quintic_inline(&mut self, traj: &MultiJointQuinticTrajectory) -> Result<(), SafetyError> {
-        if self.workspace_policy().is_none() {
-            return Ok(());
-        }
-        if traj.polynomials.len() > crate::trajectory::INLINE_POLYS
-            || self.config.arm_model.arm_dof() > crate::chain::MAX_CHAIN_JOINTS
-        {
-            let samples = self.workspace_samples(traj)?;
-            return self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice));
-        }
-        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
-        let result = (|| {
-            let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-                &self.config.arm_model,
-                ws,
-                cam,
-                self.config.tcp_offset,
-                &mut bufs,
-            )
-            .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
-            let checked = eval
-                .check_quintic_inline(traj, MAX_KEEPOUT_EVALS_PER_PLAN, "sweep")
-                .map_err(SafetyError::from_workspace);
-            eval.recycle(&mut bufs);
-            checked
-        })();
-        self.ws_eval_bufs = bufs;
-        result
-    }
-
     pub fn jog(admitted: Admitted<'_>, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>) -> Result<u64, ArmError> {
         Self::jog_action(admitted, target_positions, duration_secs, epoch_id, "joint_move").map(|(epoch, _, _)| epoch)
     }
