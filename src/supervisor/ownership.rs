@@ -5,15 +5,188 @@ use super::*;
 
 // scaffold-impl-0
 impl Drop for TransferGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            {
+                let mut slot = self.sup.owner.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*slot, OwnerSlot::Transferring) {
+                    *slot = OwnerSlot::Legacy;
+                    self.sup.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+                }
+            }
+            {
+                let mut w = self.sup.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*w, WriterEndpoint::Transferring) {
+                    *w = WriterEndpoint::Legacy {
+                        control_stop: self.saved_legacy_stop.take(),
+                        safe_hold: Arc::clone(&self.sup.legacy_safe_hold),
+                    };
+                }
+            }
+            self.sup.try_drain_pending_disconnects_legacy();
+        }
+    }
 }
 
 // scaffold-impl-1
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for SupervisorInner {
+    fn drop(&mut self) {
+        // Last-resort safety barrier (Blocker 3): even if a caller held a cloned
+        // `Arc<SupervisorLock<SupervisorInner>>` across `ArmSupervisor::drop` so `try_write()`
+        // could not extract the driver into SAFE-HOLD, NEVER drop an energized/unconfirmed driver
+        // when the final `Arc` releases.
+        if !self.detached
+            && !self.shutdown_committed
+            && self.driver.is_some()
+            && !crate::rt_core::executor::core_is_confirmed_disarmed(self)
+        {
+            if let Some(slot) = self.driver.take() {
+                tracing::error!(
+                    "SupervisorInner::drop reached with energized/unconfirmed driver still attached; leaking driver slot rather than dropping energized hardware"
+                );
+                std::mem::forget(slot);
+            }
+        }
+    }
 }
 
 // scaffold-impl-2
 impl Drop for ArmSupervisor {
+    fn drop(&mut self) {
+        // DRV-F1 B2: NEVER destroy an energized or unconfirmed Legacy driver on Drop — even after
+        // an unconfirmed/timed-out Legacy `ProcessExit` (`process_exit_requested == true`).
+        // If this Legacy shell still holds a non-disarmed driver, extract it and hand it to a
+        // detached SAFE-HOLD writer thread; if spawning fails, retain sole ownership and run
+        // SAFE-HOLD inline (NEVER dropping an energized driver inside a failed spawn closure).
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut extracted_for_drop: Option<(
+            Box<dyn crate::driver::ArmDriver>,
+            crate::rt_core::safe_hold::SafeHoldBuffers,
+            crate::torque::shadow::ShadowRuntime,
+        )> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.owner_mode.load(Ordering::Acquire) == OWNER_LEGACY {
+            if let Ok(mut guard) = self.inner.try_write() {
+                if !guard.detached
+                    && !guard.shutdown_committed
+                    && !crate::rt_core::executor::core_is_confirmed_disarmed(&guard)
+                {
+                    let period = Duration::from_secs_f64(
+                        1.0 / f64::from(guard.config.control_frequency_hz.max(1)),
+                    );
+                    let mut safe_hold_bufs =
+                        crate::rt_core::safe_hold::SafeHoldBuffers::from_config(&guard.config, period);
+                    safe_hold_bufs.attach_stop_mirrors(
+                        Arc::clone(&self.estop_state),
+                        Arc::clone(&guard.estop_applied),
+                        guard.stop_requests.clone(),
+                    );
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        guard.on_safe_hold_enter("SAFE_HOLD");
+                        safe_hold_bufs.seed_on_entry(&guard);
+                    }));
+                    let extracted = guard
+                        .driver
+                        .take()
+                        .map(crate::supervisor_lock::DriverSlot::into_driver_recover_for_safe_hold);
+                    let extracted_shadow = {
+                        let disabled =
+                            crate::torque::shadow::ShadowRuntime::disabled(&guard.config);
+                        std::mem::replace(&mut guard.torque_shadow, disabled)
+                    };
+                    if let Some(drv) = extracted {
+                        guard.detached = true;
+                        {
+                            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                            *slot = OwnerSlot::Failed;
+                            self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                        }
+                        {
+                            let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                            *w = WriterEndpoint::DetachedSafeHold {
+                                safe_hold: Arc::clone(&self.legacy_safe_hold),
+                                control_stop: Arc::new(AtomicBool::new(true)),
+                            };
+                        }
+                        extracted_for_drop = Some((drv, safe_hold_bufs, extracted_shadow));
+                    }
+                }
+            }
+        }
+        self.hub.close();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((drv, safe_hold_bufs, extracted_shadow)) = extracted_for_drop {
+            let sh_ctrl = Arc::clone(&self.legacy_safe_hold);
+            // Store the energized driver in a shared slot BEFORE calling `Builder::spawn` so a
+            // spawn error NEVER drops the closure's captured driver.
+            let handoff = Arc::new(std::sync::Mutex::new(Some((
+                drv,
+                safe_hold_bufs,
+                extracted_shadow,
+            ))));
+            let handoff_thread = Arc::clone(&handoff);
+            let sh_thread = Arc::clone(&sh_ctrl);
+            let spawn_res = if self.fail_drop_safe_hold_spawn.load(Ordering::Acquire) {
+                Err(std::io::Error::other(
+                    "injected SAFE-HOLD retention thread spawn failure",
+                ))
+            } else {
+                std::thread::Builder::new()
+                    .name("armd-safe-hold-drop".into())
+                    .spawn(move || {
+                        let Some((mut drv, mut safe_hold_bufs, mut extracted_shadow)) =
+                            handoff_thread.lock().unwrap_or_else(|e| e.into_inner()).take()
+                        else {
+                            return;
+                        };
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = safe_hold_bufs.run_loop_with_shadow(
+                                drv.as_mut(),
+                                &sh_thread,
+                                crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized,
+                                Instant::now,
+                                std::thread::sleep,
+                                Some(&mut extracted_shadow),
+                            );
+                        }));
+                        if res.is_err() {
+                            // Never drop an energized driver on unexpected unwind.
+                            std::mem::forget(drv);
+                        } else {
+                            drop(drv);
+                        }
+                    })
+            };
+            if let Err(e) = spawn_res {
+                tracing::error!(
+                    "Failed to spawn SAFE-HOLD retention thread on ArmSupervisor::drop ({e}); retaining driver in inline SAFE-HOLD"
+                );
+                if let Some((mut drv, mut safe_hold_bufs, mut extracted_shadow)) =
+                    handoff.lock().unwrap_or_else(|e| e.into_inner()).take()
+                {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = safe_hold_bufs.run_loop_with_shadow(
+                            drv.as_mut(),
+                            &sh_ctrl,
+                            crate::rt_core::safe_hold::SafeHoldReason::TeardownWhileEnergized,
+                            Instant::now,
+                            std::thread::sleep,
+                            Some(&mut extracted_shadow),
+                        );
+                    }));
+                    if res.is_err() {
+                        std::mem::forget(drv);
+                    } else {
+                        drop(drv);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.torque_shadow
+            .stop_and_flush_bounded(Duration::from_millis(50));
+    }
 }
 
 // scaffold-extra-0

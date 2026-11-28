@@ -5,11 +5,110 @@ use super::*;
 
 // scaffold-impl-0
 impl ThermalCooldown {
+    pub(crate) fn reset(&mut self) {
+        self.first_sample_at = None;
+        self.last_oldest_sample_at = None;
+        self.last_joint_samples.fill(None);
+        self.joint_count = 0;
+    }
+
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        match (self.first_sample_at, self.last_oldest_sample_at) {
+            (Some(first), Some(last)) => last
+                .saturating_duration_since(first)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn record_fresh_cool_samples(&mut self, samples: &[Instant]) {
+        let (Some(oldest), Some(newest)) = (samples.iter().copied().min(), samples.iter().copied().max()) else {
+            self.reset();
+            return;
+        };
+        let track_joints = samples.len() <= crate::model::MAX_MOTION_DOF;
+        match (self.first_sample_at, self.last_oldest_sample_at) {
+            (Some(first), Some(prev_oldest)) => {
+                let oldest_gapped =
+                    oldest.saturating_duration_since(prev_oldest) > THERMAL_FEEDBACK_FRESHNESS_LIMIT;
+                let joint_gapped = track_joints
+                    && self.joint_count == samples.len()
+                    && samples.iter().enumerate().any(|(i, &t)| {
+                        self.last_joint_samples[i].is_none_or(|prev| {
+                            t.saturating_duration_since(prev) > THERMAL_FEEDBACK_FRESHNESS_LIMIT
+                        })
+                    });
+                let gapped = oldest_gapped || joint_gapped;
+                if gapped {
+                    // Continuity across all joints is only proven from the newest sample on: a joint
+                    // that resumed late must not credit dwell from an older joint's timestamp.
+                    self.first_sample_at = Some(newest);
+                    self.last_oldest_sample_at = Some(oldest);
+                } else {
+                    self.first_sample_at = Some(first);
+                    self.last_oldest_sample_at = Some(prev_oldest.max(oldest));
+                }
+                if track_joints {
+                    if gapped || self.joint_count != samples.len() {
+                        self.last_joint_samples.fill(None);
+                        for (slot, &t) in self.last_joint_samples.iter_mut().zip(samples.iter()) {
+                            *slot = Some(t);
+                        }
+                    } else {
+                        for (slot, &t) in self.last_joint_samples.iter_mut().zip(samples.iter()) {
+                            *slot = Some(slot.map_or(t, |prev| prev.max(t)));
+                        }
+                    }
+                    self.joint_count = samples.len();
+                } else {
+                    self.last_joint_samples.fill(None);
+                    self.joint_count = 0;
+                }
+            }
+            _ => {
+                self.first_sample_at = Some(oldest);
+                self.last_oldest_sample_at = Some(oldest);
+                self.last_joint_samples.fill(None);
+                if track_joints {
+                    for (slot, &t) in self.last_joint_samples.iter_mut().zip(samples.iter()) {
+                        *slot = Some(t);
+                    }
+                    self.joint_count = samples.len();
+                } else {
+                    self.joint_count = 0;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record_fresh_cool_at(&mut self, sample_at: Instant) {
+        self.record_fresh_cool_samples(std::slice::from_ref(&sample_at));
+    }
 }
 
 // scaffold-impl-1
 #[cfg(test)]
 mod thermal_cooldown_tests {
+    use super::{ThermalCooldown, THERMAL_FEEDBACK_FRESHNESS_LIMIT};
+    use std::time::{Duration, Instant};
+
+    /// A joint that resumes after a stale gap restarts the dwell from the newest sample: dwell is
+    /// never credited from an older joint's timestamp (2026-11-24 review: J1 resumes at 300 ms,
+    /// J2's last sample was at 240 ms, both sample at 330 ms -> dwell 30 ms, not 90 ms).
+    #[test]
+    fn staggered_gap_restarts_dwell_from_newest_sample() {
+        let t0 = Instant::now();
+        let ms = |v: u64| t0 + Duration::from_millis(v);
+        let mut c = ThermalCooldown::default();
+        c.record_fresh_cool_samples(&[ms(0), ms(0)]);
+        c.record_fresh_cool_samples(&[ms(40), ms(240)]);
+        assert!(Duration::from_millis(300 - 40) > THERMAL_FEEDBACK_FRESHNESS_LIMIT);
+        c.record_fresh_cool_samples(&[ms(300), ms(240)]); // J1 gap 260 ms > 250 ms
+        assert_eq!(c.elapsed_ms(), 0);
+        c.record_fresh_cool_samples(&[ms(330), ms(330)]);
+        assert_eq!(c.elapsed_ms(), 30);
+    }
 }
 
 // scaffold-extra-0
