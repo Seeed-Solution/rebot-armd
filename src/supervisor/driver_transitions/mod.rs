@@ -6,6 +6,20 @@
 #[allow(unused_imports)]
 use super::*;
 
+mod limits_feedback;
+mod disable_request;
+mod measured_hold;
+mod enable_prepare;
+mod enable_poll;
+mod torque_off_gate;
+mod legacy_torque;
+mod park_disable;
+mod service_transition;
+mod clear_fault_legacy;
+mod clear_fault_support;
+mod clear_fault_executor;
+mod panic_disable;
+
 /// Interval between service polls in bounded panic-disable teardown.
 pub const PANIC_DISABLE_SERVICE: Duration = Duration::from_millis(2);
 /// Upper wall-clock bound for last-chance hardware disable attempts on panic or forced teardown.
