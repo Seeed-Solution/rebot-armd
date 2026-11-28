@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 impl ThermalCooldown {
     pub(crate) fn reset(&mut self) {
         self.first_sample_at = None;
@@ -87,7 +86,6 @@ impl ThermalCooldown {
     }
 }
 
-// scaffold-impl-1
 #[cfg(test)]
 mod thermal_cooldown_tests {
     use super::{ThermalCooldown, THERMAL_FEEDBACK_FRESHNESS_LIMIT};
@@ -111,7 +109,6 @@ mod thermal_cooldown_tests {
     }
 }
 
-// scaffold-extra-0
 impl SupervisorInner {
     pub fn is_at_safe_resting_pose(&self) -> bool {
         self.resting_pose_violation().is_none()

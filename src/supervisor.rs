@@ -900,18 +900,7 @@ pub(crate) struct ThermalCooldown {
     joint_count: usize,
 }
 
-impl ThermalCooldown {
-}
-
-#[cfg(test)]
-mod thermal_cooldown_tests {
-}
-
 impl SupervisorInner {
-
-
-
-
 
     /// Captures a single consistent `(stale, freeze_pos)` snapshot for J7 `PosForce` gating.
     /// Reuses Step 2's cached [`Self::rt_j7_pf_gate`] during an RT release (zero driver lock
@@ -6699,14 +6688,6 @@ pub(crate) struct ModeSwitchRunner {
     recent_terminal_cursor: usize,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl ModeSwitchRunner {
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl SupervisorInner {
-}
-
 /// Allocates a collision-free `ActionId` for a router-bound `ModeSwitch` session terminal
 /// (session-request namespace bit set, never equal to a broker `ActionId`).
 #[cfg(not(target_arch = "wasm32"))]
@@ -7076,20 +7057,10 @@ struct TransferGuard<'a> {
     saved_legacy_stop: Option<Arc<AtomicBool>>,
 }
 
-impl Drop for TransferGuard<'_> {
-}
-
 /// A published sample, or the read guard when no sample answers (no control loop running).
 enum Fresh<'a> {
     Sample(Arc<crate::rt_core::publish::Snapshot>),
     Locked(crate::supervisor_lock::SupReadGuard<'a, SupervisorInner>),
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for SupervisorInner {
-}
-
-impl Drop for ArmSupervisor {
 }
 
 /// Immutable host/process boot identity exposed on `GET /api/v1/diagnostics/tick` so offline
@@ -7174,9 +7145,6 @@ pub fn init_process_identity() -> &'static ProcessIdentity {
 }
 
 impl ArmSupervisor {
-
-
-
 
     /// Owner-aware storage of a `measure_multiview` measurement payload for action `id`.
     /// On `OWNER_EXECUTOR`, stores in `self.hub` (never touching `SupervisorLock` or `armd-control`)
@@ -7442,10 +7410,6 @@ impl ArmSupervisor {
         }
     }
 
-
-
-
-
     /// Current monotonic stop generation across both `Legacy` and `Executor` owners (lock-free).
     pub fn current_stop_gen(&self) -> u64 {
         let legacy = self.stop_gen.load(Ordering::Acquire);
@@ -7542,9 +7506,6 @@ impl ArmSupervisor {
     ) -> Arc<crate::torque::shadow::ShadowOverflowAtomics> {
         self.torque_shadow.overflow_atomics().clone()
     }
-
-
-
 
     /// Claims one off-thread WS connection slot (`<= MAX_LIVE_CONNECTIONS`) and allocates a
     /// strictly monotonic connection ID without touching the RT executor. Rejected upgrades
@@ -10261,9 +10222,6 @@ impl ArmSupervisor {
         let inner = self.inner.read().await;
         inner.active_trajectory.is_some()
     }
-
-
-
 
     /// Exposes the lock-free tick ring for deterministic paused-reader contention tests.
     #[doc(hidden)]

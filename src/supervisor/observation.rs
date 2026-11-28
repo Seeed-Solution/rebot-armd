@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     pub(super) fn gravity_output_enabled(&self) -> bool {
         self.gravity_compensated
@@ -572,7 +571,6 @@ impl SupervisorInner {
     }
 }
 
-// scaffold-extra-1
 impl ArmSupervisor {
     #[doc(hidden)]
     pub fn inner(&self) -> &Arc<SupervisorLock<SupervisorInner>> {

@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 #[cfg(not(target_arch = "wasm32"))]
 impl ModeSwitchRunner {
     pub(crate) fn new() -> Self {
@@ -136,7 +135,6 @@ impl ModeSwitchRunner {
     }
 }
 
-// scaffold-impl-1
 #[cfg(not(target_arch = "wasm32"))]
 impl SupervisorInner {
     /// Attaches a preallocated off-RT [`crate::rt_core::stream`] consumer for `ModeSwitchEvent`s.
@@ -953,7 +951,6 @@ impl SupervisorInner {
     }
 }
 
-// scaffold-extra-0
 impl ArmSupervisor {
     // ---- PR0C: Dual-owner ModeSwitch session orchestrator (PR0A/PR0B shared layer) ----
 

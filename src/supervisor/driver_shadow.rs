@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Zero-allocation monotonic bump of [`Self::motion_generation`] on motion lifecycle changes.
     #[inline]

@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-extra-0
 impl ArmSupervisor {
     /// Shared Legacy `armd-control` loop body with tiered panic recovery (FU-PANIC / DRV-F1):
     /// - Enters [`crate::panic_coord::ControlPanicScope`] so the process panic hook routes

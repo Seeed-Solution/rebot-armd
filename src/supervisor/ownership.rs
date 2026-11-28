@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 impl Drop for TransferGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -28,7 +27,6 @@ impl Drop for TransferGuard<'_> {
     }
 }
 
-// scaffold-impl-1
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for SupervisorInner {
     fn drop(&mut self) {
@@ -51,7 +49,6 @@ impl Drop for SupervisorInner {
     }
 }
 
-// scaffold-impl-2
 impl Drop for ArmSupervisor {
     fn drop(&mut self) {
         // DRV-F1 B2: NEVER destroy an energized or unconfirmed Legacy driver on Drop — even after
@@ -189,7 +186,6 @@ impl Drop for ArmSupervisor {
     }
 }
 
-// scaffold-extra-0
 impl ArmSupervisor {
     #[inline(never)]
     pub fn new(config: ArmConfig) -> Self {

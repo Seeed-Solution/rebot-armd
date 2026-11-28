@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Returns `true` when no background disable requires a periodic 250 ms retry (either no
     /// background disable is pending, a broker torque transition owns it, or the RT executor is
