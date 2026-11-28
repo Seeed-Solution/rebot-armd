@@ -5,6 +5,141 @@ use super::*;
 
 // scaffold-impl-0
 impl WsConnectionSlotPool {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::with_capacity(
+                MAX_LIVE_CONNECTIONS,
+            )),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn try_claim(&self) -> Result<crate::rt_core::requests::lease::ConnectionHandle, ArmError> {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= MAX_LIVE_CONNECTIONS {
+            return Err(ArmError::Rejected {
+                status: 503,
+                code: "TOO_MANY_CONNECTIONS".into(),
+                message: "Maximum live WebSocket connections reached".into(),
+            });
+        }
+        let id = NEXT_WS_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let handle = crate::rt_core::requests::lease::ConnectionHandle::from_ws_id(id)
+            .expect("monotonic WS conn_id >= 1");
+        g.insert(
+            id,
+            WsSlotEntry {
+                phase: WsSlotPhase::Admitted,
+                opening: false,
+                #[cfg(not(target_arch = "wasm32"))]
+                reply_sink: None,
+            },
+        );
+        Ok(handle)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_reply_sink(
+        &self,
+        conn_id: u64,
+        sink: Arc<crate::rt_core::reply_router::ConnectionReplySink>,
+    ) -> bool {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = g.get_mut(&conn_id) else {
+            return false;
+        };
+        if entry.phase == WsSlotPhase::Closing {
+            return false;
+        }
+        entry.reply_sink = Some(sink);
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reply_sink(
+        &self,
+        conn_id: u64,
+    ) -> Option<Arc<crate::rt_core::reply_router::ConnectionReplySink>> {
+        let g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = g.get(&conn_id)?;
+        if entry.phase == WsSlotPhase::Closing {
+            return None;
+        }
+        entry.reply_sink.clone()
+    }
+
+    /// Joins transferred `live_ids` against non-closing `WsSlotEntry` reply sinks for atomic
+    /// executor handover seeding (omits unregistered claimed slots and already-closing slots).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sinks_for_live_ids(
+        &self,
+        live_ids: &[u64],
+    ) -> Vec<(u64, Arc<crate::rt_core::reply_router::ConnectionReplySink>)> {
+        let g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(live_ids.len());
+        for &id in live_ids {
+            if let Some(entry) = g.get(&id) {
+                if entry.phase != WsSlotPhase::Closing {
+                    if let Some(sink) = entry.reply_sink.as_ref() {
+                        out.push((id, Arc::clone(sink)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn begin_open(&self, conn_id: u64) -> bool {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = g.get_mut(&conn_id) else {
+            return false;
+        };
+        if entry.phase != WsSlotPhase::Admitted || entry.opening {
+            return false;
+        }
+        entry.opening = true;
+        true
+    }
+
+    fn finish_open(&self, conn_id: u64, succeeded: bool) {
+        {
+            let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = g.get_mut(&conn_id) {
+                entry.opening = false;
+                if succeeded && entry.phase == WsSlotPhase::Admitted {
+                    entry.phase = WsSlotPhase::Open;
+                }
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn mark_closing(&self, conn_id: u64) -> Option<bool> {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = g.get_mut(&conn_id)?;
+        entry.phase = WsSlotPhase::Closing;
+        Some(entry.opening)
+    }
+
+    fn is_opening(&self, conn_id: u64) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&conn_id)
+            .is_some_and(|e| e.opening)
+    }
+
+    fn remove(&self, conn_id: u64) {
+        {
+            let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            g.remove(&conn_id);
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
 }
 
 // scaffold-extra-0
