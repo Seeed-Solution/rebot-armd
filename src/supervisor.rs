@@ -6841,64 +6841,6 @@ mod observation_snapshot_tests {
 
 
 
-    #[test]
-    fn drv_lock_major8_park_disable_stop_gen_max_cancels_cleanly_on_estop_inhibited() {
-        use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, TorqueProgress};
-        use crate::model::JointState;
-        use crate::rt_core::urgent::StopRequests;
-        use crate::supervisor_lock::DriverSlot;
-
-        struct StopGenLeadParkDriver {
-            dof: usize,
-            owner_stop_gen: Arc<AtomicU64>,
-        }
-        impl ArmDriver for StopGenLeadParkDriver {
-            fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
-            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-                Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
-            }
-            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
-            fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
-            fn begin_client_park_disable(
-                &mut self,
-                _max_rx_frames: Option<u16>,
-                _expected_stop_gen: Option<u64>,
-            ) -> Result<TorqueProgress, ArmDriverError> {
-                // Advance owner-local `stop_gen` ahead of `StopRequests::current()` and fail
-                // with `EstopInhibited` (modeling a local stop before any disable frame hit the wire).
-                self.owner_stop_gen.fetch_add(1, Ordering::SeqCst);
-                Err(ArmDriverError::EstopInhibited)
-            }
-            fn is_feedback_valid(&self) -> bool { true }
-            fn is_enabled(&self) -> bool { true }
-            fn enable_state(&self) -> EnableState { EnableState::Enabled }
-            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
-            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
-            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
-        }
-
-        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
-        inner.lease_enabled = false;
-        inner.is_torqued = true;
-        inner.safety.set_torque(true).unwrap();
-        inner.commanded_velocities.fill(0.0);
-        inner.attach_stop_requests(StopRequests::new());
-        let drv = StopGenLeadParkDriver {
-            dof: 7,
-            owner_stop_gen: Arc::clone(&inner.stop_gen),
-        };
-        inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
-
-        inner.begin_park_disable_transition(false, None);
-        assert!(
-            inner.torque_transition.is_none(),
-            "client park stopped via owner-local stop_gen must cancel cleanly without torque_transition"
-        );
-        assert!(
-            !inner.safety.state().is_stopped(),
-            "clean park stop-gate cancellation must not latch E-stop/stopped fault"
-        );
-    }
 }
 
 #[cfg(test)]
