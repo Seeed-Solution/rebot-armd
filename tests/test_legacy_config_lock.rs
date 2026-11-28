@@ -1,9 +1,5 @@
-//! Lock-hold and freshness tests for Legacy `ArmSupervisor::published_config()`.
-//!
-//! Verifies that `published_config()` never holds `SupervisorLock::read()` across
-//! a contended legacy `DriverLock` mutex or snapshot finalization, preserves
-//! poisoned-driver fallbacks, and never overwrites a newer snapshot or publishes
-//! into the executor's epoch.
+//! Lock-hold, bounded-retry, handoff-race, and freshness tests for Legacy
+//! `ArmSupervisor::published_config()` and `ArmSupervisor::set_operator_auth_enforced()`.
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -16,16 +12,21 @@ use armd::driver::{
 use armd::model::{ArmConfig, JointState, MotorZeroSupport};
 use armd::rt_core::executor::ExecutorConfig;
 use armd::rt_core::requests::config::PublishedConfig;
+use armd::sequences::RunPins;
 use armd::supervisor::{ArmError, ArmSupervisor, OWNER_EXECUTOR, OWNER_LEGACY};
 use armd::supervisor_lock::HoldKind;
 
-/// Minimal mock driver implementing capability helpers exercised by `PublishedConfig`.
+/// Minimal configurable mock driver implementing capability helpers exercised by `PublishedConfig`.
 struct ConfigLockTestDriver {
     positions: Vec<f32>,
     rx_at: Vec<Option<Instant>>,
     seqs: Vec<u64>,
     motor_current_raw: u16,
     close_speed_rad_s: f32,
+    torque_feedback: bool,
+    temperature_feedback: bool,
+    nonblocking_mode_switch: bool,
+    mit_mode_switch: bool,
 }
 
 impl ConfigLockTestDriver {
@@ -37,6 +38,10 @@ impl ConfigLockTestDriver {
             seqs: vec![1; dof],
             motor_current_raw,
             close_speed_rad_s,
+            torque_feedback: true,
+            temperature_feedback: true,
+            nonblocking_mode_switch: true,
+            mit_mode_switch: true,
         }
     }
 }
@@ -45,8 +50,8 @@ impl ArmDriver for ConfigLockTestDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities {
             velocity_feedback: true,
-            torque_feedback: true,
-            temperature_feedback: true,
+            torque_feedback: self.torque_feedback,
+            temperature_feedback: self.temperature_feedback,
             enable_feedback: true,
             ..DriverCapabilities::default()
         }
@@ -129,13 +134,13 @@ impl ArmDriver for ConfigLockTestDriver {
 
 impl ModeSwitchExt for ConfigLockTestDriver {
     fn supports_nonblocking_mode_switch(&self) -> bool {
-        true
+        self.nonblocking_mode_switch
     }
 }
 
 impl JointModeExt for ConfigLockTestDriver {
     fn supports_mit_mode_switch(&self) -> bool {
-        true
+        self.mit_mode_switch
     }
 }
 
@@ -164,12 +169,14 @@ impl PosForceExt for ConfigLockTestDriver {
     }
 }
 
-/// Holds the legacy `DriverLock` mutex on a dedicated OS thread without holding `SupervisorLock`,
-/// and guarantees release + thread join on drop (even on test panic) while keeping `_sup` alive.
+/// Holds the legacy `DriverLock` mutex on a dedicated OS thread without holding `SupervisorLock`.
+///
+/// The helper thread owns its own `Arc<ArmSupervisor>` declared strictly before locking the
+/// driver mutex, so LIFO drop order guarantees the mutex guard is always released before the
+/// backing `SupervisorInner` allocation can be dropped — even on panic, timeout, or guard leak.
 struct ContendedDriverGuard {
     release_tx: Option<mpsc::SyncSender<()>>,
     holder: Option<std::thread::JoinHandle<()>>,
-    _sup: Arc<ArmSupervisor>,
 }
 
 impl ContendedDriverGuard {
@@ -184,16 +191,21 @@ impl ContendedDriverGuard {
                 .expect("legacy driver lock");
             (lock.raw_mutex() as *const std::sync::Mutex<Box<dyn ArmDriver>>) as usize
         };
+        let sup_owned = Arc::clone(sup);
         let (locked_tx, locked_rx) = mpsc::sync_channel::<()>(1);
         let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
         let holder = std::thread::spawn(move || {
-            // SAFETY: `_sup` keeps `SupervisorInner` and its legacy `DriverSlot` alive and
-            // unmoved for the lifetime of this guard, and `Drop` joins this thread before
-            // dropping `_sup`. Tests using this guard never replace or detach `inner.driver`.
+            // Keep the `Arc<ArmSupervisor>` owned by this thread for its entire lifetime so
+            // `_guard` is always dropped strictly before `_sup_keep_alive`. Tests using this
+            // guard never replace or detach `inner.driver`.
+            let _sup_keep_alive = sup_owned;
+            // SAFETY: `_sup_keep_alive` keeps `SupervisorInner` and its legacy `DriverSlot`
+            // alive and pinned inside `Arc<SupervisorLock<SupervisorInner>>` until after `_guard`
+            // drops when this thread exits.
             let mutex = unsafe { &*(addr as *const std::sync::Mutex<Box<dyn ArmDriver>>) };
             let _guard = mutex.lock().expect("driver mutex not poisoned");
             let _ = locked_tx.send(());
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            let _ = release_rx.recv();
         });
         locked_rx
             .recv_timeout(Duration::from_secs(2))
@@ -201,7 +213,6 @@ impl ContendedDriverGuard {
         Self {
             release_tx: Some(release_tx),
             holder: Some(holder),
-            _sup: Arc::clone(sup),
         }
     }
 
@@ -248,17 +259,33 @@ async fn legacy_published_config_releases_supervisor_lock_while_driver_mutex_is_
     // Record every individual SupervisorLock guard hold across the contended refresh.
     sup.inner().set_hold_history_enabled(true);
 
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (busy_tx, mut busy_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
     let reader = tokio::spawn({
         let sup = Arc::clone(&sup);
-        async move { sup.published_config().await }
+        async move {
+            sup.published_config_with_driver_busy_hooks(
+                move || {
+                    let _ = entered_tx.send(());
+                },
+                move || {
+                    let _ = busy_tx.send(());
+                },
+            )
+            .await
+        }
     });
 
-    // Give the reader task time to enter `published_config()`, miss the generation cache,
-    // and attempt driver capability capture against the contended driver mutex.
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Deterministic handshake (zero sleeps): wait until the reader has entered
+    // `SupervisorLock::read()` and attempted the driver borrow.
+    tokio::time::timeout(Duration::from_millis(200), entered_rx.recv())
+        .await
+        .expect("reader must attempt driver borrow")
+        .expect("entered channel open");
 
     // Bounded handshake: a concurrent supervisor writer MUST acquire `SupervisorLock::write()`
-    // while the driver mutex is still held. On base, `published_config()` blocks inside
+    // while the driver mutex is still held. On base (4ea286c0), `published_config()` blocks inside
     // `DriverLock::lock()` while holding `SupervisorLock::read()`, starving this writer.
     let writer_acquired = tokio::time::timeout(Duration::from_millis(200), sup.inner().write())
         .await
@@ -270,12 +297,17 @@ async fn legacy_published_config_releases_supervisor_lock_while_driver_mutex_is_
         inner.operator_auth_enforced = true;
     }
 
-    // Keep the mutex held briefly longer so the reader cannot finish before release, then release.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Confirm the non-blocking WouldBlock path actually fired and the reader is still retrying
+    // after the writer released its guard (zero sleeps).
+    tokio::time::timeout(Duration::from_millis(200), busy_rx.recv())
+        .await
+        .expect("reader must signal WouldBlock retry after dropping SupervisorLock::read()")
+        .expect("busy channel open");
     assert!(
         !reader.is_finished(),
         "reader must wait for driver mutex release rather than returning fabricated capabilities"
     );
+
     contended.release();
 
     let snap = tokio::time::timeout(Duration::from_secs(2), reader)
@@ -311,7 +343,7 @@ async fn legacy_published_config_releases_supervisor_lock_while_driver_mutex_is_
         snap.effective_planned_close_speed,
     );
 
-    // Per-guard hold recording: no unpreempted SupervisorLock read hold may span the contention window.
+    // Per-guard hold recording: no unpreempted SupervisorLock read hold may span contention.
     let read_holds: Vec<_> = holds.iter().filter(|h| h.kind == HoldKind::Read).collect();
     assert!(
         !read_holds.is_empty(),
@@ -338,43 +370,448 @@ async fn legacy_published_config_releases_supervisor_lock_while_driver_mutex_is_
     }
 }
 
-fn assert_published_config_fields_match(actual: &PublishedConfig, expected: &PublishedConfig) {
-    assert_eq!(actual.workspace_revision, expected.workspace_revision);
-    assert_eq!(actual.config.profile_id, expected.config.profile_id);
-    assert_eq!(actual.operator_auth_enforced, expected.operator_auth_enforced);
-    assert_eq!(actual.has_driver, expected.has_driver);
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_rest_config_fails_closed_within_50ms_budget_and_recovers_after_release() {
     assert_eq!(
-        actual.driver_supports_nonblocking_mode_switch,
-        expected.driver_supports_nonblocking_mode_switch
+        ArmSupervisor::LEGACY_DRIVER_BUSY_RETRY_BUDGET,
+        Duration::from_millis(50)
     );
-    assert_eq!(actual.driver_torque_feedback, expected.driver_torque_feedback);
-    assert_eq!(
-        actual.driver_temperature_feedback,
-        expected.driver_temperature_feedback
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.profile_id = Some("rest-budget-profile".into());
+    let sup = Arc::new(
+        ArmSupervisor::new(cfg).with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
     );
-    assert_eq!(
-        actual.driver_supports_automatic_unload,
-        expected.driver_supports_automatic_unload
+
+    let router = armd::create_router(Arc::clone(&sup), armd::OperatorAuth::disabled());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let server_jh = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/safety/describe");
+
+    // Force a cache miss so the REST config handler must capture from SupervisorInner + driver.
+    {
+        let mut inner = sup.inner().write().await;
+        inner.workspace_revision = 77;
+    }
+
+    // Hold the mock driver mutex outside SupervisorLock for 200 ms on a helper thread.
+    let contended = ContendedDriverGuard::acquire(&sup).await;
+    let hold_started = Instant::now();
+    let release_after_200ms = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        contended.release();
+    });
+
+    let t0 = Instant::now();
+    let resp = client.get(&url).send().await.expect("GET safety/describe");
+    let elapsed = t0.elapsed();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("error json body");
+
+    println!(
+        "[legacy_config_lock_rest_budget] status={} code={:?} elapsed_ms={}",
+        status.as_u16(),
+        body.get("code"),
+        elapsed.as_millis(),
     );
-    assert_eq!(
-        actual.driver_motor_current_cap,
-        expected.driver_motor_current_cap
-    );
-    assert_eq!(
-        actual.driver_motor_zero_support,
-        expected.driver_motor_zero_support
-    );
-    assert_eq!(actual.gravity_compensated, expected.gravity_compensated);
-    assert_eq!(actual.gravity_comp_supported, expected.gravity_comp_supported);
-    assert_eq!(actual.torque_guard_thresholds, expected.torque_guard_thresholds);
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "CONFIG_UNAVAILABLE");
     assert!(
-        (actual.effective_planned_close_speed - expected.effective_planned_close_speed).abs()
-            < 1e-9,
-        "effective_planned_close_speed mismatch: actual={} expected={}",
-        actual.effective_planned_close_speed,
-        expected.effective_planned_close_speed,
+        elapsed >= Duration::from_millis(45),
+        "REST config should retry for the bounded ~50 ms window (got {elapsed:?})"
     );
-    assert_eq!(actual.policy_live_allowed, expected.policy_live_allowed);
+    assert!(
+        elapsed < Duration::from_millis(120),
+        "REST config must fail closed near 50 ms budget well before 200 ms hold (got {elapsed:?})"
+    );
+    assert!(
+        hold_started.elapsed() < Duration::from_millis(190),
+        "driver mutex must still be held when 503 CONFIG_UNAVAILABLE is returned"
+    );
+
+    // Wait for the 200 ms driver hold to release, then verify REST config succeeds cleanly.
+    release_after_200ms.await.expect("release task completed");
+    let ok_resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("GET safety/describe after release");
+    assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
+    let ok_body: serde_json::Value = ok_resp.json().await.expect("ok json body");
+    assert_eq!(ok_body["hardware"]["gripper_current_cap"]["current_raw"], 420);
+    assert_eq!(ok_body["hardware"]["gripper_current_cap"]["mode"], "pos_force");
+
+    server_jh.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_auth_setter_racing_newer_publish_cannot_overwrite() {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.profile_id = Some("auth-race-legacy".into());
+    let sup = Arc::new(
+        ArmSupervisor::new(cfg).with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
+    );
+
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<u64>();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut dropped_tx = Some(dropped_tx);
+    let mut resume_rx = Some(resume_rx);
+
+    let setter = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move {
+            sup.set_operator_auth_enforced_with_after_drop_hook(true, |gen| {
+                let tx = dropped_tx.take();
+                let rx = resume_rx.take();
+                async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(gen);
+                    }
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    let setter_gen = tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+        .await
+        .expect("auth setter dropped SupervisorLock::write()")
+        .expect("dropped_tx open");
+
+    let newer_gen = {
+        let mut inner = sup.inner().write().await;
+        inner.operator_auth_enforced = false;
+        inner.workspace_revision = 88;
+        inner.config.profile_id = Some("newer-after-setter".into());
+        sup.inner().generation()
+    };
+    assert!(newer_gen > setter_gen);
+    let newer = sup.published_config().await.expect("newer publish");
+    assert_eq!(newer.workspace_revision, 88);
+    assert!(!newer.operator_auth_enforced);
+
+    resume_tx.send(()).expect("resume setter");
+    tokio::time::timeout(Duration::from_secs(2), setter)
+        .await
+        .expect("setter completed")
+        .expect("setter did not panic");
+
+    let (hub_after, hub_gen) = sup.published_config_hub().latest_with_gen();
+    assert_eq!(hub_gen, newer_gen);
+    assert_eq!(hub_after.workspace_revision, 88);
+    assert!(!hub_after.operator_auth_enforced);
+    assert_eq!(
+        hub_after.config.profile_id.as_deref(),
+        Some("newer-after-setter")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_auth_setter_racing_handoff_and_owner_failed_cannot_overwrite_or_enable() {
+    // Part 1: Auth setter racing handoff to Executor must not overwrite or set available=true.
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig::rebot_dm())
+            .with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
+    );
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<u64>();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut dropped_tx = Some(dropped_tx);
+    let mut resume_rx = Some(resume_rx);
+
+    let setter = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move {
+            sup.set_operator_auth_enforced_with_after_drop_hook(true, |gen| {
+                let tx = dropped_tx.take();
+                let rx = resume_rx.take();
+                async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(gen);
+                    }
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+        .await
+        .expect("auth setter dropped write guard")
+        .expect("dropped_tx open");
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .expect("start_executor handoff");
+    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+    sup.published_config_hub().update(|cfg| {
+        cfg.workspace_revision = 99;
+        cfg.config.profile_id = Some("executor-after-setter".into());
+    });
+    sup.published_config_hub().set_available(false);
+
+    resume_tx.send(()).expect("resume setter after handoff");
+    tokio::time::timeout(Duration::from_secs(2), setter)
+        .await
+        .expect("setter completed")
+        .expect("setter did not panic");
+
+    assert!(
+        sup.published_config_hub().latest().is_none(),
+        "delayed legacy auth setter must never set available=true in OWNER_EXECUTOR"
+    );
+    sup.published_config_hub().set_available(true);
+    let hub_after = sup.published_config_hub().latest().expect("executor hub");
+    assert_eq!(hub_after.workspace_revision, 99);
+    assert_eq!(
+        hub_after.config.profile_id.as_deref(),
+        Some("executor-after-setter")
+    );
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .expect("executor joined cleanly");
+
+    // Part 2: Auth setter racing OWNER_FAILED must never re-enable available=true.
+    let sup_fail = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<u64>();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut dropped_tx = Some(dropped_tx);
+    let mut resume_rx = Some(resume_rx);
+
+    let setter_fail = tokio::spawn({
+        let sup = Arc::clone(&sup_fail);
+        async move {
+            sup.set_operator_auth_enforced_with_after_drop_hook(true, |gen| {
+                let tx = dropped_tx.take();
+                let rx = resume_rx.take();
+                async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(gen);
+                    }
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+        .await
+        .expect("auth setter dropped write guard")
+        .expect("dropped_tx open");
+    sup_fail
+        .force_owner_failed_for_mock_test()
+        .await
+        .expect("force OWNER_FAILED");
+    assert!(sup_fail.published_config_hub().latest().is_none());
+
+    resume_tx.send(()).expect("resume setter");
+    tokio::time::timeout(Duration::from_secs(2), setter_fail)
+        .await
+        .expect("setter completed")
+        .expect("setter did not panic");
+    assert!(
+        sup_fail.published_config_hub().latest().is_none(),
+        "delayed legacy auth setter must not re-enable hub after OWNER_FAILED"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_cache_hit_during_handoff_routes_through_executor_pin_filter() {
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig::rebot_dm())
+            .with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
+    );
+    let _ = sup.published_config().await.expect("warm cache");
+
+    let (before_tx, before_rx) = tokio::sync::oneshot::channel::<()>();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut before_tx = Some(before_tx);
+    let mut resume_rx = Some(resume_rx);
+
+    let reader = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move {
+            sup.published_config_with_cache_check_hooks(
+                move || {
+                    let tx = before_tx.take();
+                    let rx = resume_rx.take();
+                    async move {
+                        if let Some(tx) = tx {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = rx {
+                            let _ = rx.await;
+                        }
+                    }
+                },
+                || std::future::ready(()),
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), before_rx)
+        .await
+        .expect("reader paused before cache check")
+        .expect("before_tx open");
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .expect("start_executor handoff");
+    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+    sup.published_config_hub().update(|cfg| {
+        cfg.workspace_revision = 123;
+        cfg.sequences.pins = Some(RunPins {
+            sequence_id: "seq-1".into(),
+            action_id: 999,
+            pose_ids: vec!["p1".into()],
+            episode_ids: vec![],
+        });
+    });
+
+    resume_tx.send(()).expect("resume reader");
+    let snap = tokio::time::timeout(Duration::from_secs(2), reader)
+        .await
+        .expect("reader completed")
+        .expect("reader did not panic")
+        .expect("took executor path");
+
+    assert_eq!(snap.workspace_revision, 123);
+    assert!(
+        snap.sequences.pins.is_none(),
+        "cache-hit during handoff must route through executor pin filter, not return raw hub entry"
+    );
+
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .expect("executor joined");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_cache_hit_during_exited_executor_or_owner_failed_fails_closed() {
+    // Part 1: Handoff + executor exit occurs right after reading a matching Legacy cache entry.
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let _ = sup.published_config().await.expect("warm cache");
+
+    let (after_tx, after_rx) = tokio::sync::oneshot::channel::<()>();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut after_tx = Some(after_tx);
+    let mut resume_rx = Some(resume_rx);
+
+    let reader = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move {
+            sup.published_config_with_cache_check_hooks(
+                || std::future::ready(()),
+                move || {
+                    let tx = after_tx.take();
+                    let rx = resume_rx.take();
+                    async move {
+                        if let Some(tx) = tx {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = rx {
+                            let _ = rx.await;
+                        }
+                    }
+                },
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), after_rx)
+        .await
+        .expect("reader hit cache and paused before owner re-check")
+        .expect("after_tx open");
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .expect("start_executor handoff");
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .expect("executor stopped and joined");
+    assert!(
+        sup.executor_handle().is_some_and(|h| h.is_exited()),
+        "executor handle must be exited before resuming reader"
+    );
+
+    resume_tx.send(()).expect("resume reader");
+    let res = tokio::time::timeout(Duration::from_secs(2), reader)
+        .await
+        .expect("reader completed")
+        .expect("reader did not panic");
+    assert!(matches!(
+        res,
+        Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "CONFIG_UNAVAILABLE"
+    ));
+
+    // Part 2: OWNER_FAILED occurs right after reading a matching Legacy cache entry.
+    let sup_fail = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let _ = sup_fail.published_config().await.expect("warm cache");
+
+    let (after_tx, after_rx) = tokio::sync::oneshot::channel::<()>();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut after_tx = Some(after_tx);
+    let mut resume_rx = Some(resume_rx);
+
+    let reader_fail = tokio::spawn({
+        let sup = Arc::clone(&sup_fail);
+        async move {
+            sup.published_config_with_cache_check_hooks(
+                || std::future::ready(()),
+                move || {
+                    let tx = after_tx.take();
+                    let rx = resume_rx.take();
+                    async move {
+                        if let Some(tx) = tx {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = rx {
+                            let _ = rx.await;
+                        }
+                    }
+                },
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), after_rx)
+        .await
+        .expect("reader paused after cache read")
+        .expect("after_tx open");
+    sup_fail
+        .force_owner_failed_for_mock_test()
+        .await
+        .expect("force OWNER_FAILED");
+
+    resume_tx.send(()).expect("resume reader");
+    let res_fail = tokio::time::timeout(Duration::from_secs(2), reader_fail)
+        .await
+        .expect("reader completed")
+        .expect("reader did not panic");
+    assert!(matches!(
+        res_fail,
+        Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "CONFIG_UNAVAILABLE"
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -417,14 +854,12 @@ async fn legacy_older_paused_capture_cannot_overwrite_newer_snapshot() {
         }
     });
 
-    // Wait until older_reader has completed capture and dropped SupervisorLock::read().
     let captured_gen = tokio::time::timeout(Duration::from_secs(2), captured_rx)
         .await
         .expect("older reader reached after_capture hook")
         .expect("captured_tx not dropped");
     assert_eq!(captured_gen, gen_old);
 
-    // Advance state under a write guard and publish the newer snapshot while older_reader is paused.
     let gen_new = {
         let mut inner = sup.inner().write().await;
         inner.workspace_revision = 20;
@@ -441,7 +876,6 @@ async fn legacy_older_paused_capture_cannot_overwrite_newer_snapshot() {
     assert_eq!(hub_gen_before, gen_new);
     assert_eq!(hub_before.workspace_revision, 20);
 
-    // Release older_reader to finalize and attempt publication of its stale rev-10 capture.
     resume_tx.send(()).expect("resume older reader");
     let older_returned = tokio::time::timeout(Duration::from_secs(2), older_reader)
         .await
@@ -449,7 +883,6 @@ async fn legacy_older_paused_capture_cannot_overwrite_newer_snapshot() {
         .expect("older reader did not panic")
         .expect("older reader returned Ok");
 
-    // Hub and caller must both preserve the newer rev-20 snapshot.
     let (hub_after, hub_gen_after) = sup.published_config_hub().latest_with_gen();
     assert_eq!(hub_gen_after, gen_new);
     assert_eq!(hub_after.workspace_revision, 20);
@@ -459,7 +892,6 @@ async fn legacy_older_paused_capture_cannot_overwrite_newer_snapshot() {
     assert_eq!(older_returned.config.profile_id.as_deref(), Some("rev-20"));
     assert!(older_returned.operator_auth_enforced);
 
-    // Subsequent cache-hit read still returns rev-20.
     let final_snap = sup.published_config().await.expect("final read");
     assert_eq!(final_snap.workspace_revision, 20);
     assert_eq!(final_snap.config.profile_id.as_deref(), Some("rev-20"));
@@ -473,7 +905,6 @@ async fn legacy_delayed_finalizer_cannot_publish_into_executor_epoch() {
         ArmSupervisor::new(cfg).with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
     );
 
-    // Force a legacy cache miss at rev-11.
     let legacy_gen = {
         let mut inner = sup.inner().write().await;
         inner.workspace_revision = 11;
@@ -511,21 +942,17 @@ async fn legacy_delayed_finalizer_cannot_publish_into_executor_epoch() {
         .expect("captured_tx not dropped");
     assert_eq!(captured_gen, legacy_gen);
 
-    // Transfer ownership to the RT executor while delayed_legacy is paused after capture.
     let handle = sup
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
         .await
         .expect("start_executor handoff");
     assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
 
-    // Advance the executor's published config (note: `update` keeps `legacy_lock_gen` unchanged).
     sup.published_config_hub().update(|cfg| {
         cfg.workspace_revision = 99;
         cfg.config.profile_id = Some("executor-epoch".into());
     });
 
-    // Even a hypothetical Legacy publish with `u64::MAX` generation must be rejected once
-    // ownership is no longer `OWNER_LEGACY`.
     let mut forged_legacy = (*sup.published_config_hub().latest().expect("executor latest")).clone();
     forged_legacy.workspace_revision = 777;
     forged_legacy.config.profile_id = Some("forged-legacy".into());
@@ -539,8 +966,6 @@ async fn legacy_delayed_finalizer_cannot_publish_into_executor_epoch() {
         "publish_legacy_arc_if_newer must refuse publication outside OWNER_LEGACY"
     );
 
-    // Release the delayed legacy finalizer and verify it neither replaces the executor's
-    // PublishedConfigHub entry nor returns stale legacy data.
     resume_tx.send(()).expect("resume delayed legacy reader");
     let returned = tokio::time::timeout(Duration::from_secs(2), delayed_legacy)
         .await
@@ -633,12 +1058,15 @@ async fn legacy_delayed_finalizer_fails_closed_after_owner_failed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_published_config_preserves_poisoned_driver_fallbacks() {
+    let mut cfg = ArmConfig::rebot_dm();
+    if let Some(gp) = cfg.gripper_policy.as_mut() {
+        gp.close_speed_rad_s = Some(0.187);
+    }
     let sup = Arc::new(
-        ArmSupervisor::new(ArmConfig::rebot_dm())
-            .with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
+        ArmSupervisor::new(cfg).with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
     );
 
-    // Poison the legacy driver mutex on a separate thread without leaving SupervisorLock held.
+    // Poison the legacy driver mutex on a separate thread that owns an `Arc<ArmSupervisor>`.
     let addr = {
         let inner = sup.inner().read().await;
         let lock = inner
@@ -649,18 +1077,24 @@ async fn legacy_published_config_preserves_poisoned_driver_fallbacks() {
             .expect("legacy driver lock");
         (lock.raw_mutex() as *const std::sync::Mutex<Box<dyn ArmDriver>>) as usize
     };
+    let sup_owned = Arc::clone(&sup);
     let poison_jh = std::thread::spawn(move || {
-        // SAFETY: `sup` stays alive and unmoved until `poison_jh.join()` completes below.
+        let _sup_keep_alive = sup_owned;
+        // SAFETY: `_sup_keep_alive` keeps `SupervisorInner` and its legacy `DriverSlot` alive
+        // until after `_guard` unwinds.
         let mutex = unsafe { &*(addr as *const std::sync::Mutex<Box<dyn ArmDriver>>) };
         let _guard = mutex.lock().expect("acquire mutex before poison");
         panic!("intentional poison for fallback test");
     });
-    assert!(poison_jh.join().is_err(), "helper thread must panic to poison mutex");
+    assert!(
+        poison_jh.join().is_err(),
+        "helper thread must panic to poison mutex"
+    );
 
-    // Force a cache miss so published_config() takes the nonblocking capture path.
     {
         let mut inner = sup.inner().write().await;
         inner.workspace_revision = 55;
+        inner.gravity_compensated = true;
     }
 
     let snap = tokio::time::timeout(Duration::from_secs(1), sup.published_config())
@@ -680,27 +1114,31 @@ async fn legacy_published_config_preserves_poisoned_driver_fallbacks() {
         Some("driver unavailable")
     );
     assert!(!snap.gravity_comp_supported);
-
-    // Verify exact field-by-field parity with `PublishedConfig::from_inner`.
-    let expected = {
-        let inner = sup.inner().read().await;
-        PublishedConfig::from_inner(&inner)
-    };
-    assert_published_config_fields_match(&snap, &expected);
+    // Poisoned driver cannot report pos_force cap, so close speed stays unquantized at policy 0.187.
+    assert!(
+        (snap.effective_planned_close_speed - f64::from(0.187_f32)).abs() < 1e-6,
+        "poisoned driver must fall back to unquantized policy close speed 0.187, got {}",
+        snap.effective_planned_close_speed,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_published_config_matches_from_inner_for_live_driver_and_mock() {
-    // Live driver parity.
-    let sup_hw = Arc::new(
-        ArmSupervisor::new(ArmConfig::rebot_dm())
-            .with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.25))),
-    );
-    {
-        let mut inner = sup_hw.inner().write().await;
-        inner.workspace_revision = 3;
-        inner.operator_auth_enforced = true;
+async fn legacy_published_config_independent_capability_and_quantization_expectations() {
+    // 1. Live driver: pos_force cap below policy (0.223 < 0.30) quantizes downward to 0.22 rad/s,
+    //    and gravity_comp_supported tracks independent profile/dynamics/driver requirements.
+    let mut cfg_hw = ArmConfig::rebot_dm();
+    cfg_hw.dynamics_qualified = true;
+    if let Some(gp) = cfg_hw.gripper_policy.as_mut() {
+        gp.close_speed_rad_s = Some(0.30);
     }
+    let expected_tq_thresholds = cfg_hw
+        .torque_guard
+        .map(|p| p.thresholds(&cfg_hw))
+        .unwrap_or_default();
+    let sup_hw = Arc::new(
+        ArmSupervisor::new(cfg_hw).with_driver(Box::new(ConfigLockTestDriver::new(7, 420, 0.223))),
+    );
+
     // Regression guard: `published_config()`'s async state machine must stay small so deep
     // tokio worker stacks (e.g. hardware motor_zero / calibration handlers) never overflow.
     {
@@ -712,30 +1150,149 @@ async fn legacy_published_config_matches_from_inner_for_live_driver_and_mock() {
         );
     }
 
+    {
+        let mut inner = sup_hw.inner().write().await;
+        inner.workspace_revision = 3;
+        inner.operator_auth_enforced = true;
+        inner.gravity_compensated = true;
+    }
     let hw_snap = sup_hw.published_config().await.expect("hw published_config");
-    let hw_expected = {
-        let inner = sup_hw.inner().read().await;
-        PublishedConfig::from_inner(&inner)
-    };
-    assert_published_config_fields_match(&hw_snap, &hw_expected);
+    assert_eq!(hw_snap.workspace_revision, 3);
+    assert!(hw_snap.operator_auth_enforced);
+    assert!(hw_snap.has_driver);
+    assert!(hw_snap.driver_supports_nonblocking_mode_switch);
+    assert!(hw_snap.driver_torque_feedback);
+    assert!(hw_snap.driver_temperature_feedback);
+    assert_eq!(hw_snap.torque_guard_thresholds, expected_tq_thresholds);
+    assert_eq!(
+        hw_snap.driver_motor_zero_support,
+        MotorZeroSupport::set_current("motor_flash", false, vec![])
+    );
+    let cap_json = hw_snap
+        .driver_motor_current_cap
+        .as_ref()
+        .expect("motor_current_cap serialized");
+    assert_eq!(cap_json["joint"], 6);
+    assert_eq!(cap_json["mode"], "pos_force");
+    assert_eq!(cap_json["current_raw"], 420);
+    assert_eq!(cap_json["active"], true);
+    assert_eq!(cap_json["calibrated"], false);
+    assert_eq!(cap_json["torque_reference"], "bench");
+    assert_eq!(cap_json["note"], "test motor current cap");
+    // Independent expectation: floor(0.223 * 100) / 100 = 0.22.
+    assert!(
+        (hw_snap.effective_planned_close_speed - 0.22).abs() < 1e-9,
+        "expected floor(0.223*100)/100 = 0.22, got {}",
+        hw_snap.effective_planned_close_speed,
+    );
+    // Independent expectation: 7-DOF rebot_dm with gravity_comp + gravity_model +
+    // gravity_compensated=true + dynamics_qualified=true + MIT + vel/torque/enable feedback => true.
+    let profile_gc_ready = hw_snap.config.gravity_comp.is_some()
+        && hw_snap.config.six_plus_gripper()
+        && hw_snap.config.gravity_model.is_some();
+    assert!(profile_gc_ready, "rebot_dm must provide gravity_comp + gravity_model");
+    assert!(hw_snap.gravity_comp_supported);
 
-    // Driverless mock follower parity (temperature_feedback == true, automatic_unload == true).
-    let sup_mock = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    // 2. Flip policy close speed to 0.187 (below driver cap 0.223) -> still quantized to 0.18
+    //    because pos_force is active; and flip gravity_compensated=false -> gravity_comp_supported=false.
+    {
+        let mut inner = sup_hw.inner().write().await;
+        if let Some(gp) = inner.config.gripper_policy.as_mut() {
+            gp.close_speed_rad_s = Some(0.187);
+        }
+        inner.gravity_compensated = false;
+    }
+    let hw_snap2 = sup_hw.published_config().await.expect("hw snap 2");
+    assert!(
+        (hw_snap2.effective_planned_close_speed - 0.18).abs() < 1e-9,
+        "expected floor(0.187*100)/100 = 0.18 under active pos_force, got {}",
+        hw_snap2.effective_planned_close_speed,
+    );
+    assert!(!hw_snap2.gravity_comp_supported);
+
+    // 3. Flip dynamics_qualified=false with gravity_compensated=true -> gravity_comp_supported=false.
+    {
+        let mut inner = sup_hw.inner().write().await;
+        inner.gravity_compensated = true;
+        inner.config.dynamics_qualified = false;
+    }
+    let hw_snap3 = sup_hw.published_config().await.expect("hw snap 3");
+    assert!(!hw_snap3.gravity_comp_supported);
+
+    // 4. Driver lacking MIT mode switch -> gravity_comp_supported=false even when qualified.
+    let mut no_mit_drv = ConfigLockTestDriver::new(7, 420, 0.40);
+    no_mit_drv.mit_mode_switch = false;
+    let mut cfg_no_mit = ArmConfig::rebot_dm();
+    cfg_no_mit.dynamics_qualified = true;
+    let sup_no_mit = Arc::new(ArmSupervisor::new(cfg_no_mit).with_driver(Box::new(no_mit_drv)));
+    {
+        let mut inner = sup_no_mit.inner().write().await;
+        inner.gravity_compensated = true;
+    }
+    let snap_no_mit = sup_no_mit.published_config().await.expect("no_mit snap");
+    assert!(!snap_no_mit.gravity_comp_supported);
+
+    // 5. Driver lacking torque feedback -> gravity_comp_supported=false and driver_torque_feedback=false.
+    let mut no_tq_drv = ConfigLockTestDriver::new(7, 420, 0.40);
+    no_tq_drv.torque_feedback = false;
+    let mut cfg_no_tq = ArmConfig::rebot_dm();
+    cfg_no_tq.dynamics_qualified = true;
+    let sup_no_tq = Arc::new(ArmSupervisor::new(cfg_no_tq).with_driver(Box::new(no_tq_drv)));
+    {
+        let mut inner = sup_no_tq.inner().write().await;
+        inner.gravity_compensated = true;
+    }
+    let snap_no_tq = sup_no_tq.published_config().await.expect("no_tq snap");
+    assert!(!snap_no_tq.driver_torque_feedback);
+    assert!(!snap_no_tq.gravity_comp_supported);
+
+    // 6. Driverless mock follower: temperature_feedback=true, automatic_unload=true,
+    //    close speed unquantized (0.187), gravity_comp_supported=true when qualified & compensated.
+    let mut cfg_mock = ArmConfig::rebot_dm();
+    cfg_mock.dynamics_qualified = true;
+    if let Some(gp) = cfg_mock.gripper_policy.as_mut() {
+        gp.close_speed_rad_s = Some(0.187);
+    }
+    let sup_mock = Arc::new(ArmSupervisor::new(cfg_mock));
     {
         let mut inner = sup_mock.inner().write().await;
         inner.workspace_revision = 4;
+        inner.gravity_compensated = true;
     }
     let mock_snap = sup_mock
         .published_config()
         .await
         .expect("mock published_config");
     assert!(!mock_snap.has_driver);
+    assert!(!mock_snap.driver_supports_nonblocking_mode_switch);
+    assert!(!mock_snap.driver_torque_feedback);
     assert!(mock_snap.driver_temperature_feedback);
     assert!(mock_snap.driver_supports_automatic_unload);
+    assert!(mock_snap.driver_motor_current_cap.is_none());
     assert!(mock_snap.driver_motor_zero_support.supported);
-    let mock_expected = {
+    assert_eq!(
+        mock_snap.driver_motor_zero_support.persist.as_deref(),
+        Some("process")
+    );
+    assert!(mock_snap.gravity_comp_supported);
+    assert!(
+        (mock_snap.effective_planned_close_speed - f64::from(0.187_f32)).abs() < 1e-6,
+        "driverless mock must keep unquantized policy close speed 0.187, got {}",
+        mock_snap.effective_planned_close_speed,
+    );
+
+    // Cross-check PublishedConfig::from_inner agrees with published_config() on mock too.
+    let mock_from_inner = {
         let inner = sup_mock.inner().read().await;
         PublishedConfig::from_inner(&inner)
     };
-    assert_published_config_fields_match(&mock_snap, &mock_expected);
+    assert_eq!(
+        mock_snap.gravity_comp_supported,
+        mock_from_inner.gravity_comp_supported
+    );
+    assert!(
+        (mock_snap.effective_planned_close_speed - mock_from_inner.effective_planned_close_speed)
+            .abs()
+            < 1e-9
+    );
 }
