@@ -900,4 +900,36 @@ impl ArmSupervisor {
             },
         }
     }
+
+    /// Registers an already-claimed off-thread WS slot with the active owner (legacy or RT executor).
+    /// Returns `Err(DISCONNECTED)` without touching the owner if teardown already marked the slot closing.
+    pub async fn register_ws_connection_for_slot(&self, conn_id: u64) -> Result<(), ArmError> {
+        if !self.ws_slots.begin_open(conn_id) {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "DISCONNECTED".into(),
+                message: "Connection slot is already closing".into(),
+            });
+        }
+        struct OpenGuard<'a> {
+            pool: &'a WsConnectionSlotPool,
+            conn_id: u64,
+            succeeded: bool,
+        }
+        impl Drop for OpenGuard<'_> {
+            fn drop(&mut self) {
+                self.pool.finish_open(self.conn_id, self.succeeded);
+            }
+        }
+        let mut guard = OpenGuard {
+            pool: &self.ws_slots,
+            conn_id,
+            succeeded: false,
+        };
+        let res = self.register_ws_connection(conn_id).await;
+        if res.is_ok() {
+            guard.succeeded = true;
+        }
+        res
+    }
 }
