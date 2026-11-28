@@ -570,12 +570,12 @@ pub(crate) struct PendingRxPoll {
 /// Complete validated gripper calibration snapshot ready for infallible commit after disk rename.
 #[derive(Debug, Clone)]
 pub struct GripperCalibrationCandidate {
-    config: ArmConfig,
-    base_gripper_policy: Option<crate::model::GripperPolicy>,
-    gripper_calib_offset: Option<f32>,
-    gripper_calib_jaw_opening: Option<crate::model::JawOpening>,
-    gripper_calib_invalid: bool,
-    driver_config_error: Option<String>,
+    pub(super) config: ArmConfig,
+    pub(super) base_gripper_policy: Option<crate::model::GripperPolicy>,
+    pub(super) gripper_calib_offset: Option<f32>,
+    pub(super) gripper_calib_jaw_opening: Option<crate::model::JawOpening>,
+    pub(super) gripper_calib_invalid: bool,
+    pub(super) driver_config_error: Option<String>,
 }
 
 /// Pre-captured heap context for `gripper_zero_check(store_offset=true)` persistence,

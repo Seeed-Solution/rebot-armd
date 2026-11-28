@@ -55,6 +55,41 @@ pub use workspace::{
     prepare_quintic, JointGoalSnapshot, PreparedQuintic,
 };
 pub(crate) use workspace::joint_goal_target_from;
+pub use admission::{
+    next_admission_request_id, AdmissionStamp, Admitted, ArmError, MotionStartKind,
+    MotionStartOp, PreemptError, MAX_LIVE_CONNECTIONS,
+};
+pub(crate) use admission::{
+    AdmittedProof, ClosedConnections, ConsumedStamps, LiveConnections, LiveDisconnectFenceView,
+};
+#[cfg(test)]
+use admission::{BROKER_REQUEST_ID_BIT, RT_INTERNAL_REQUEST_ID_BIT};
+pub use terminal_plumbing::{TerminalSubscription, TERMINAL_FIFO_CAPACITY};
+pub(crate) use terminal_plumbing::TerminalBroadcaster;
+pub use types::{
+    ActiveLease, GripperBaselineCmd, GripperCalibrationCandidate, GripperCalibrationRun,
+    GripperStreamContact, HeldObject, ParkContinuation, ParkContinuationPhase, ParkRelease,
+    PendingZeroCheckPersist, TickPublished, UnloadSettle, UnloadSettleSample, WatchdogPark,
+    WatchdogParkPending, ZeroCheckParams, ZeroCheckPersistContext, ZeroCheckStreamEvent,
+    BUS_LOSS_TIMEOUT, CONTROL_DEADLINE, GRIPPER_BASELINE_PENDING_MAX, GRIPPER_END_LEAD_RAD,
+    GRIPPER_FORCE_CAP_TICKS, GRIPPER_FORCE_RELEASE_MARGIN_RAD,
+    GRIPPER_STALL_BASELINE_RAISE_MAX_NM, GRIPPER_STALL_LATCH_NM, GRIPPER_STALL_MIN_LEAD_RAD,
+    GRIPPER_STALL_PROGRESS_EPS, GRIPPER_STALL_RELEASE_NM, GRIPPER_STALL_WINDOW_MAX_S,
+    GRIPPER_STREAM_CAP_HOLD_FRACTION, GRIPPER_STREAM_CAP_RAMP_RAD_S,
+    GRIPPER_STREAM_CONTACT_LOST_RAD, GRIPPER_STREAM_TARGET_RAISE_MAX_NM,
+    JOINT_LIMIT_CLEAR_MARGIN_RAD, MAX_KEEPOUT_EVALS_PER_PLAN, MAX_KEEPOUT_EVALS_PER_TICK,
+    MOTION_LIMIT_CLEAR_S, PARK_RELEASE_OPEN_RAD, PARK_RELEASE_SPEED, POWER_LOSS_SYNC_WINDOW_MS,
+    PREEMPT_COOLDOWN, SERVO_BLOCKED_PROGRESS_RAD, THERMAL_CLEAR_MARGIN_C,
+    THERMAL_FEEDBACK_FRESHNESS_LIMIT, UNLOAD_SETTLE_HOLD, UNLOAD_STILL_POSITION_SPAN_RAD,
+    UNLOAD_STILL_RECENT, UNLOAD_STILL_VELOCITY_PEAK_FACTOR, WATCHDOG_PARK_MARGIN,
+    WATCHDOG_PARK_SETTLE_GRACE, WATCHDOG_PARK_TIMEOUT,
+};
+pub(crate) use types::{
+    translate_driver_cutoff_conservative, DeferredActionDone, DeferredCompletionTarget,
+    DriverTxCapOutcome, EffectiveTxCutoff, J7PosForceGate, PendingRxPoll, RtRestingCheck,
+    TickOutput,
+};
+use types::{sync_action_obs, UNLOAD_SETTLE_REPORT_AFTER_S};
 
 pub struct SupervisorInner {
     pub config: ArmConfig,

@@ -155,9 +155,9 @@ pub struct AdmissionStamp {
 /// ```
 #[must_use = "Admitted token must be consumed by a motion/output start"]
 pub struct Admitted<'g> {
-    inner: &'g mut SupervisorInner,
-    stamp: AdmissionStamp,
-    _not_send_sync: std::marker::PhantomData<*mut ()>,
+    pub(super) inner: &'g mut SupervisorInner,
+    pub(super) stamp: AdmissionStamp,
+    pub(super) _not_send_sync: std::marker::PhantomData<*mut ()>,
 }
 
 /// Crate-private, non-`Copy`, non-`Clone` witness proving a live [`Admitted`] token was
@@ -270,8 +270,8 @@ pub const MAX_LIVE_CONNECTIONS: usize = 64;
 /// Fixed-capacity, zero-allocation live WS connection registry (`>= 1`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LiveConnections {
-    ids: [u64; MAX_LIVE_CONNECTIONS],
-    len: usize,
+    pub(super) ids: [u64; MAX_LIVE_CONNECTIONS],
+    pub(super) len: usize,
 }
 
 /// Preallocated capacity for [`ClosedConnections`] intervals: with at most `MAX_LIVE_CONNECTIONS`
