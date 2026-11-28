@@ -3179,18 +3179,7 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
     ];
     let assert_disable_protective = |src_files: &[(String, String)]| {
         let (corpus, test_only) = source_scan::build_production_corpus(src_files);
-        for expected_test_only in [
-            "src/driver/tx_chokepoint_tests.rs",
-            "src/supervisor/observation_snapshot_tests.rs",
-            "src/supervisor/driver_transitions/panic_disable_tests.rs",
-            "src/supervisor/terminal_capture/tests.rs",
-            "src/supervisor/streams/target_tests.rs",
-        ] {
-            assert!(
-                test_only.contains(expected_test_only),
-                "{expected_test_only} must be included solely via #[cfg(test)] mod declarations"
-            );
-        }
+        assert!(source_scan::assert_split_test_only_files(&test_only, "src/") >= 5);
         for (rel, full) in src_files {
             if test_only.contains(rel) {
                 continue;

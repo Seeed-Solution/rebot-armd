@@ -663,3 +663,117 @@ pub fn extract_impl_blocks_for_type(prod: &str, type_name: &str) -> (String, Str
     remainder.push_str(&prod[cursor..]);
     (extracted, remainder)
 }
+
+/// Expected `#[cfg(test)]`-only split files under `src/driver/**` and `src/supervisor/**`.
+pub const SPLIT_TEST_ONLY_FILES: &[&str] = &[
+    "driver/tx_chokepoint_tests.rs",
+    "supervisor/observation_snapshot_tests.rs",
+    "supervisor/driver_transitions/panic_disable_tests.rs",
+    "supervisor/terminal_capture/tests.rs",
+    "supervisor/streams/target_tests.rs",
+];
+
+/// Assert every expected split test-only module file (with optional `prefix`, e.g. `""` or `"src/"`)
+/// is classified as test-only by [`build_production_corpus`].
+pub fn assert_split_test_only_files(test_only: &BTreeSet<String>, prefix: &str) -> usize {
+    for rel in SPLIT_TEST_ONLY_FILES {
+        let full = format!("{prefix}{rel}");
+        assert!(
+            test_only.contains(&full),
+            "{full} must be included solely via #[cfg(test)] mod declarations"
+        );
+    }
+    SPLIT_TEST_ONLY_FILES.len()
+}
+
+/// Audit production supervisor motion-start modules using the shared lexical cleaner +
+/// `#[cfg(test)]`-aware corpus: verify no production file re-samples `current_admission_stamp`
+/// or `capture_admission_stamp`, verify a negative fixture is rejected, and verify every
+/// `(rel, sig_prefix)` in `required_signatures` requires `Admitted` by value.
+/// Returns `(audited_file_count, checked_sig_count, test_only_checked)`.
+pub fn audit_supervisor_admission_stamps(
+    manifest_dir: &Path,
+    required_signatures: &[(&str, &str)],
+) -> (usize, usize, usize) {
+    let src_dir = manifest_dir.join("src");
+    let mut rs_paths = Vec::new();
+    collect_rs_files(&src_dir, &mut rs_paths);
+    let src_files: Vec<(String, String)> = rs_paths
+        .iter()
+        .map(|p| {
+            let rel = p.strip_prefix(manifest_dir).unwrap().to_string_lossy().replace('\\', "/");
+            (rel, std::fs::read_to_string(p).unwrap())
+        })
+        .collect();
+
+    let run_audit = |files: &[(String, String)]| {
+        let (corpus, test_only) = build_production_corpus(files);
+        let test_only_n = assert_split_test_only_files(&test_only, "src/");
+        let audited_exact = [
+            "src/supervisor/motion.rs",
+            "src/gravity_comp.rs",
+            "src/poses.rs",
+            "src/backlash.rs",
+            "src/grasp.rs",
+            "src/place.rs",
+            "src/gripper_calib.rs",
+            "src/gripper_baseline.rs",
+        ];
+        let audited_prefixes = [
+            "src/supervisor/actions/",
+            "src/supervisor/streams/",
+            "src/supervisor/driver_transitions/",
+        ];
+        let allowed_stamp_definers = [
+            "src/supervisor/state_init.rs",
+            "src/supervisor/ownership.rs",
+        ];
+        let mut audited_count = 0usize;
+        for (rel, prod) in &corpus {
+            let in_audited = audited_exact.contains(&rel.as_str())
+                || audited_prefixes.iter().any(|pfx| rel.starts_with(pfx));
+            if in_audited {
+                audited_count += 1;
+                assert!(
+                    !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
+                    "{rel} must never re-sample an admission stamp in production code"
+                );
+            }
+            if (rel == "src/supervisor.rs" || rel.starts_with("src/supervisor/"))
+                && !allowed_stamp_definers.contains(&rel.as_str())
+            {
+                assert!(
+                    !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
+                    "{rel} must never re-sample or define an admission stamp outside state_init/ownership"
+                );
+            }
+        }
+        (corpus, audited_count, test_only_n)
+    };
+
+    let (corpus, audited_count, test_only_n) = run_audit(&src_files);
+    let mut bad = src_files;
+    bad.push((
+        "src/supervisor/actions/injected_resample.rs".into(),
+        "impl SupervisorInner { fn sneaky(&self) { let _ = self.current_admission_stamp(); } }".into(),
+    ));
+    assert!(
+        std::panic::catch_unwind(|| { let _ = run_audit(&bad); }).is_err(),
+        "must reject current_admission_stamp re-sampling inside split src/supervisor/actions/**"
+    );
+
+    let corpus_map: BTreeMap<&str, &str> =
+        corpus.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    for &(rel, sig_prefix) in required_signatures {
+        let prod = corpus_map
+            .get(rel)
+            .unwrap_or_else(|| panic!("missing production corpus entry for {rel}"));
+        let idx = prod.find(sig_prefix).unwrap_or_else(|| panic!("missing {sig_prefix} in {rel}"));
+        let sig_slice = &prod[idx..prod[idx..].find('{').map_or(prod.len(), |o| idx + o)];
+        assert!(
+            sig_slice.contains("Admitted"),
+            "{rel}::{sig_prefix} lacks Admitted parameter: {sig_slice}"
+        );
+    }
+    (audited_count, required_signatures.len(), test_only_n)
+}

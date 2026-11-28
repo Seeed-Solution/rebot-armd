@@ -31,7 +31,7 @@
     "tests/test_joint_tracking.rs": 5023,
     "tests/test_mit_gripper_posforce.rs": 5324,
     "tests/test_policy_runtime.rs": 7373,
-    "tests/test_rt_a1_stop.rs": 4230,
+    "tests/test_rt_a1_stop.rs": 4207,
     "tests/test_rt_adapter4_gravity_mit.rs": 8757,
     "tests/test_rt_b3_alloc.rs": 4490,
     "tests/test_rt_c_config.rs": 5834,
@@ -43,11 +43,11 @@
     "tests/test_rt_p_actions.rs": 5325,
     "tests/test_rt_timing_diagnostics.rs": 4444,
     "tests/test_rt_tx_alloc.rs": 3121,
-    "tests/test_rt_tx_budget.rs": 6021,
+    "tests/test_rt_tx_budget.rs": 6019,
     "tests/test_rt_tx_realhw.rs": 7203,
     "tests/test_rt_whole_release_alloc.rs": 4435,
     "tests/test_stage2_feetech.rs": 4108,
-    "tests/test_torque_off_when_stopped.rs": 11341,
+    "tests/test_torque_off_when_stopped.rs": 11338,
     "tests/test_torque_reducer.rs": 3255,
     "tests/test_torque_shadow.rs": 3726
   }
