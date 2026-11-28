@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::driver::DriverCapabilities;
-use crate::kinematics::{WORKSPACE_EPS, WORKSPACE_PARK_ESCAPE_EPS};
+use crate::kinematics::WORKSPACE_EPS;
 use crate::model::{ArmConfig, JointLimit, WorkspacePolicy, MAX_MOTION_DOF};
 use crate::motion::{ActiveTrajectory, MotionError};
 use crate::power::{PowerBudget, PowerHold};
@@ -21,8 +21,8 @@ use crate::rt_core::publish::Snapshot;
 use crate::rt_core::scratch::copy_into;
 use crate::safety::{SafetyError, SafetyState};
 use crate::supervisor::{
-    check_path_with_tcp_tol, keepout_sweep_with_tcp_tol, AdmissionStamp, ArmError,
-    ParkContinuation, ParkContinuationPhase, ParkRearmStart, SupervisorInner, MAX_KEEPOUT_EVALS_PER_PLAN,
+    AdmissionStamp, ArmError, MeasuredStartFenceErr, ParkContinuation, ParkContinuationPhase,
+    ParkRearmStart, SupervisorInner, MAX_KEEPOUT_EVALS_PER_PLAN, MEASURED_START_DRIFT_TOL_RAD,
 };
 use crate::torque_guard::TorqueHold;
 use crate::trajectory::{
@@ -294,6 +294,7 @@ pub struct PreparedMotionSlot {
     pub kind: MotionKind,
     pub dof: u8,
     pub start: [f32; MAX_MOTION_DOF],
+    pub measured_start: [f32; MAX_MOTION_DOF],
     pub v0: [f32; MAX_MOTION_DOF],
     pub requested_target: [f32; MAX_MOTION_DOF],
     pub target: [f32; MAX_MOTION_DOF],
@@ -341,7 +342,7 @@ pub enum MotionInstallError {
     UnsupportedUnload, ConfigBusy, MotionBusy, CollisionHold, HandoverSettling,
     EStopActive, FaultActive, NotArmed, WrongTarget, DeadlineExpired,
     EpochMismatch, LeaseLost, Stopped, StampReused, TerminalsBusy,
-    FeedbackStale, J7FeedbackStale, StartDrifted, PlanStale, SoftLimitExceeded, ContinuationMismatch, EnableFailed,
+    FeedbackStale, J7FeedbackStale, StartDrifted, PlanStale, WorkspaceViolation, SoftLimitExceeded, ContinuationMismatch, EnableFailed,
 }
 
 impl MotionInstallError {
@@ -367,6 +368,7 @@ impl MotionInstallError {
             Self::FeedbackStale => "FEEDBACK_STALE",
             Self::J7FeedbackStale => "J7_FEEDBACK_STALE",
             Self::StartDrifted | Self::PlanStale | Self::ContinuationMismatch => "PLAN_STALE",
+            Self::WorkspaceViolation => "WORKSPACE_VIOLATION",
             Self::SoftLimitExceeded => "JOINT_LIMIT",
             Self::EnableFailed => "ENABLE_FAILED",
         }
@@ -403,6 +405,11 @@ impl MotionInstallError {
                 message: "Gripper (J7) position-force feedback is stale (> 100 ms); new gripper targets are refused until fresh feedback returns",
             },
             Self::StartDrifted | Self::PlanStale | Self::ContinuationMismatch => MotionError::PlanStale("arm state or motion configuration changed while planning".into()).into(),
+            Self::WorkspaceViolation => {
+                let d = inner.workspace_violation.clone().unwrap_or_default();
+                let limit = d.constraint_id.clone().unwrap_or_else(|| "workspace".into());
+                SafetyError::WorkspaceViolation { limit, value: 0.0, bound: 0.0, point: 0, detail: Box::new(d) }.into()
+            }
             Self::SoftLimitExceeded => MotionError::InvalidCommand("target position exceeds joint soft limits".into()).into(),
             Self::EnableFailed => SafetyError::ClearFaultRejected("Park rearm enable failed".into()).into(),
         }
@@ -489,10 +496,14 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         });
     }
     if req.kind == MotionKind::Park && (snap.holding_after_clear || snap.mit_active) {
+        let mut m_arr = [0.0f32; MAX_MOTION_DOF];
+        if snap.measured_positions.len() == dof {
+            m_arr[..dof].copy_from_slice(&snap.measured_positions);
+        }
         return Ok(PreparedMotionPlan {
             slot: PreparedMotionSlot {
                 kind: MotionKind::Park, dof: dof as u8,
-                start: [0.0; MAX_MOTION_DOF], v0: [0.0; MAX_MOTION_DOF], requested_target: [0.0; MAX_MOTION_DOF], target: [0.0; MAX_MOTION_DOF], vel_caps: [0.0; MAX_MOTION_DOF],
+                start: [0.0; MAX_MOTION_DOF], measured_start: m_arr, v0: [0.0; MAX_MOTION_DOF], requested_target: [0.0; MAX_MOTION_DOF], target: [0.0; MAX_MOTION_DOF], vel_caps: [0.0; MAX_MOTION_DOF],
                 has_speed_scale: false, speed_scale: 1.0, polynomials: [zero_poly(); INLINE_POLYS],
                 duration: PARK_DURATION_S, power_scale: None, power_budget_hash: cfg.power_budget_hash,
                 static_restricted: snap.static_restricted,
@@ -570,17 +581,24 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
                 ).into());
             }
         }
-        let eps = if is_park { WORKSPACE_PARK_ESCAPE_EPS } else { WORKSPACE_EPS };
         let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
         let at = |t: f64| traj.sample(t).positions;
         let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
         let map_ws = |e: SafetyError| ArmError::Safety(if is_park { e.with_workspace_phase("park") } else { e });
-        let samples = keepout_sweep_with_tcp_tol(&arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, eps, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN).map_err(map_ws)?;
-        check_path_with_tcp_tol(&arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, eps, &start, samples.iter().map(Vec::as_slice)).map_err(map_ws)?;
+        let meas = Some(snap.measured_positions.as_slice());
+        let samples = SupervisorInner::keepout_sweep_with_tcp_measured(
+            &arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, WORKSPACE_EPS,
+            meas, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN,
+        ).map_err(map_ws)?;
+        SupervisorInner::check_path_with_tcp_measured(
+            &arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, WORKSPACE_EPS,
+            meas, &start, samples.iter().map(Vec::as_slice),
+        ).map_err(map_ws)?;
     }
 
-    let (mut s_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) = (
+    let (mut s_arr, mut m_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) = (
         [0.0f32; MAX_MOTION_DOF],
+        [f32::NAN; MAX_MOTION_DOF],
         [0.0f32; MAX_MOTION_DOF],
         [0.0f32; MAX_MOTION_DOF],
         [0.0f32; MAX_MOTION_DOF],
@@ -594,13 +612,16 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         )).into());
     }
     s_arr[..dof].copy_from_slice(&start);
+    if snap.measured_positions.len() == dof {
+        m_arr[..dof].copy_from_slice(&snap.measured_positions);
+    }
     v_arr[..dof].copy_from_slice(&snap.commanded_velocities);
     r_arr[..dof].copy_from_slice(&requested_unfiltered);
     t_arr[..dof].copy_from_slice(&target);
     for i in 0..dof { vc_arr[i] = limits[i].max_velocity; p_arr[i] = traj.polynomials[i]; }
     Ok(PreparedMotionPlan {
         slot: PreparedMotionSlot {
-            kind: req.kind, dof: dof as u8, start: s_arr, v0: v_arr, requested_target: r_arr, target: t_arr, vel_caps: vc_arr,
+            kind: req.kind, dof: dof as u8, start: s_arr, measured_start: m_arr, v0: v_arr, requested_target: r_arr, target: t_arr, vel_caps: vc_arr,
             has_speed_scale: req.speed_scale.is_some(), speed_scale: req.speed_scale.unwrap_or(1.0),
             polynomials: p_arr, duration: traj.duration, power_scale,
             power_budget_hash: cfg.power_budget_hash, static_restricted: snap.static_restricted, tcp_offset: arm_cfg.tcp_offset,
@@ -785,6 +806,18 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
         || slot.power_budget_hash != power_budget_fingerprint(inner.power_budget())
         || (inner.power.is_static_restricted() && !slot.static_restricted)
     { return Err(MotionInstallError::PlanStale); }
+    if slot.checked_workspace {
+        let arm_dof = inner.config.arm_dof().min(dof);
+        if inner.measured_positions.len() != dof
+            || (0..arm_dof).any(|i| {
+                !inner.measured_positions[i].is_finite()
+                    || !slot.measured_start[i].is_finite()
+                    || (inner.measured_positions[i] - slot.measured_start[i]).abs() > MEASURED_START_DRIFT_TOL_RAD
+            })
+        {
+            return Err(MotionInstallError::PlanStale);
+        }
+    }
     let Some((limits, lim_n)) = inner.planning_limits_inline(slot.speed_scale_opt()) else { return Err(MotionInstallError::InvalidCommand); };
     if lim_n != dof || (0..dof).any(|i| (limits[i].max_velocity - slot.vel_caps[i]).abs() > EXACT_START_TOL) {
         return Err(MotionInstallError::PlanStale);
@@ -842,6 +875,20 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
     Ok(notes)
 }
 
+fn verify_motion_measured_terminal(inner: &mut SupervisorInner, slot: &PreparedMotionSlot) -> Result<(), MotionInstallError> {
+    if !slot.checked_workspace {
+        return Ok(());
+    }
+    let dof = usize::from(slot.dof);
+    let phase = if slot.kind == MotionKind::Park { "park" } else { "plan" };
+    inner
+        .check_measured_start_terminal_rt(&slot.measured_start[..dof], &slot.target[..dof], phase)
+        .map_err(|e| match e {
+            MeasuredStartFenceErr::PlanStale => MotionInstallError::PlanStale,
+            MeasuredStartFenceErr::WorkspaceViolation => MotionInstallError::WorkspaceViolation,
+        })
+}
+
 fn commit_quintic_slot(
     inner: &mut SupervisorInner,
     stamp: AdmissionStamp,
@@ -858,6 +905,7 @@ fn commit_quintic_slot(
     verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
     verify_motion_authority(inner, slot.kind, slot.speed_scale_opt(), &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let (torque_clamped, power_clamped) = verify_motion_freshness(inner, slot)?;
+    verify_motion_measured_terminal(inner, slot)?;
     inner.preflight_admission(stamp).map_err(map_admission_err)?;
     inner.check_terminal_fifo_for_new_action().map_err(map_admission_err)?;
     let mut eff_pos = [0.0f32; MAX_DOF];
@@ -887,7 +935,7 @@ fn commit_quintic_slot(
     this.last_heartbeat = Instant::now();
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.retire_servo_ws_min_depths();
+    this.force_clear_servo_ws_min_depths_rt();
     copy_into(&mut this.target_positions, target);
     this.safety.mark_motion_started().map_err(map_admission_err)?;
     let id = this.begin_action_rt(action_kind);
@@ -944,6 +992,7 @@ pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot:
         }
     } else if !inner.mit_active() {
         let _ = verify_motion_freshness(inner, slot)?;
+        verify_motion_measured_terminal(inner, slot)?;
     } else if slot.workspace_revision != inner.workspace_revision || slot.motion_config_revision != inner.motion_config_revision {
         return Err(MotionInstallError::PlanStale);
     }
@@ -1025,6 +1074,7 @@ pub fn install_park_continuation_at(inner: &mut SupervisorInner, action_id: u64,
     }
     if require_fresh_feedback && !inner.commit_feedback_valid() { return Err(MotionInstallError::FeedbackStale); }
     let _ = verify_motion_freshness(inner, slot)?;
+    verify_motion_measured_terminal(inner, slot)?;
     inner.park_continuation = None;
     install_park_trajectory(inner, ParkActionMode::Existing(action_id), slot, heap_traj)
 }
@@ -1075,6 +1125,7 @@ pub fn install_watchdog_park(
         return Err(MotionInstallError::UnsupportedUnload);
     }
     let _ = verify_motion_freshness(inner, slot)?;
+    verify_motion_measured_terminal(inner, slot)?;
     #[cfg(not(target_arch = "wasm32"))]
     if inner.sessions.blocks_ordinary_output(None) {
         // Safety watchdog park preempts any ordinary non-safety session cleanly.
@@ -1126,7 +1177,7 @@ fn install_park_trajectory(this: &mut SupervisorInner, mode: ParkActionMode, slo
     let dof = usize::from(slot.dof);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.retire_servo_ws_min_depths();
+    this.force_clear_servo_ws_min_depths_rt();
     this.servo_stream_active = false;
     let _ = this.safety.set_torque_rt(true);
     let _ = this.safety.mark_motion_started();

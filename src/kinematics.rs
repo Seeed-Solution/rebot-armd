@@ -716,11 +716,13 @@ pub struct Violation {
 
 /// Tolerance used by the workspace rule (m).
 pub const WORKSPACE_EPS: f64 = 1e-4;
-/// Jitter tolerance for monotonic escape of already-violated constraints during `park` (m).
+/// Legacy park escape constant (m). Hard slots (floor, keep-out boxes, self-collision) never
+/// receive deepening allowance beyond [`WORKSPACE_EPS`]; soft slots (outer workspace faces and
+/// reach) use [`WORKSPACE_ESCAPE_TOL_M`].
 pub const WORKSPACE_PARK_ESCAPE_EPS: f64 = 1e-3;
-/// Escape tolerance (m) for already-violated outer workspace box boundaries (`box_min/max x/y/z`).
-/// Allows small incidental deepening (e.g. lateral/upward jogs on a stretched arm) without
-/// loosening new-intrusion checks, the floor (`floor_z`), or keep-out boxes.
+/// Temporary deepening allowance (m) for already-violated soft workspace slots (outer workspace
+/// box faces `box_min/max x/y/z` and `max_reach` for end-origin and TCP). Never loosens new
+/// intrusions, floor (`floor_z`), keep-out boxes, or self-collision.
 pub const WORKSPACE_ESCAPE_TOL_M: f64 = 0.005;
 
 pub const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "box_y_max"], ["box_z_min", "box_z_max"]];
@@ -1043,6 +1045,60 @@ pub fn advance_min_depths(clearances: &[f64], min_depths: &mut [f64]) {
             *min_d = depth;
         }
     }
+}
+
+/// Failure witness from [`check_terminal_workspace_progress`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TerminalWorkspaceReject {
+    /// A slot ended deeper than its command-start depth (beyond [`WORKSPACE_EPS`]) or non-finite.
+    Deepened { slot: usize, depth: f64, start_depth: f64 },
+    /// No initially-intruding slot improved by more than [`WORKSPACE_EPS`].
+    NoProgress { slot: usize, depth: f64, start_depth: f64 },
+}
+
+/// Terminal return rule for a discrete motion whose start has any intruding slot
+/// (`start_depths.iter().any(|&d| d.is_finite() && d > WORKSPACE_EPS)`):
+/// - Every initially-intruding slot must finish at or shallower than its start depth (`ed <= sd`).
+/// - Every initially-clear slot (`sd <= WORKSPACE_EPS`) must remain clear (`ed <= WORKSPACE_EPS`).
+/// - At least one initially-intruding slot must improve strictly by more than [`WORKSPACE_EPS`].
+pub fn check_terminal_workspace_progress(
+    start_depths: &[f64],
+    end_clearances: &[f64],
+) -> Result<(), TerminalWorkspaceReject> {
+    let mut start_outside = false;
+    let mut any_improved = false;
+    let mut deepest: Option<(usize, f64, f64)> = None;
+    for (slot, (&sd, &clr)) in start_depths.iter().zip(end_clearances).enumerate() {
+        if clr.is_nan() || !sd.is_finite() {
+            return Err(TerminalWorkspaceReject::Deepened { slot, depth: f64::NAN, start_depth: sd });
+        }
+        let ed = (-clr).max(0.0);
+        if !ed.is_finite() {
+            return Err(TerminalWorkspaceReject::Deepened { slot, depth: f64::INFINITY, start_depth: sd });
+        }
+        if sd <= WORKSPACE_EPS {
+            if ed > WORKSPACE_EPS {
+                return Err(TerminalWorkspaceReject::Deepened { slot, depth: ed, start_depth: sd });
+            }
+        } else {
+            start_outside = true;
+            if ed > sd {
+                return Err(TerminalWorkspaceReject::Deepened { slot, depth: ed, start_depth: sd });
+            }
+            if sd - ed > WORKSPACE_EPS {
+                any_improved = true;
+            }
+            if deepest.is_none_or(|(_, best_ed, _)| ed > best_ed) {
+                deepest = Some((slot, ed, sd));
+            }
+        }
+    }
+    if start_outside && !any_improved {
+        if let Some((slot, depth, start_depth)) = deepest {
+            return Err(TerminalWorkspaceReject::NoProgress { slot, depth, start_depth });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -608,7 +608,7 @@ impl SupervisorInner {
                                 return;
                             }
                         }
-                        let samples = match self.workspace_samples_with_tol(&traj, crate::kinematics::WORKSPACE_PARK_ESCAPE_EPS) {
+                        let samples = match self.workspace_samples_from_measured(&traj, Some(&self.measured_positions)) {
                             Ok(s) => s,
                             Err(e) => {
                                 let e = e.with_workspace_phase("park");
@@ -620,7 +620,7 @@ impl SupervisorInner {
                                 return;
                             }
                         };
-                        if let Err(e) = self.check_workspace_path_with_tol(&clamped_start, samples.iter().map(Vec::as_slice), crate::kinematics::WORKSPACE_PARK_ESCAPE_EPS) {
+                        if let Err(e) = self.check_workspace_path_from_measured(&clamped_start, Some(&self.measured_positions), samples.iter().map(Vec::as_slice)) {
                             let e = e.with_workspace_phase("park");
                             tracing::warn!("Park path violates workspace ({e}); maintaining safe hold");
                             self.park_rejection = Some(e);
@@ -1451,6 +1451,8 @@ impl SupervisorInner {
         let reuse = prepared.filter(|p| {
             duration_secs.is_none()
                 && p.start == self.commanded_positions
+                && p.measured.len() == self.measured_positions.len()
+                && p.measured.iter().zip(&self.measured_positions).all(|(a, b)| (a - b).abs() < 1e-4)
                 && p.v0 == self.commanded_velocities
                 && p.target == target_positions
                 && p.limits.as_slice() == limits
@@ -1489,8 +1491,8 @@ impl SupervisorInner {
             if let Some(scope) = planning_scope {
                 crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, scope)?;
             }
-            let samples = self.workspace_samples(&traj)?;
-            self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+            let samples = self.workspace_samples_from_measured(&traj, Some(&self.measured_positions))?;
+            self.check_workspace_path_from_measured(&self.commanded_positions, Some(&self.measured_positions), samples.iter().map(Vec::as_slice))?;
             (traj, power_scale)
         };
         if let Some(scope) = planning_scope {
@@ -1504,7 +1506,7 @@ impl SupervisorInner {
             self.gripper_hold_vel_ceiling = None;
         }
         self.release_servo_target();
-        self.clear_servo_ws_min_depths_rt();
+        self.force_clear_servo_ws_min_depths_rt();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &target_positions);
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
@@ -1793,6 +1795,7 @@ impl SupervisorInner {
     pub fn joint_goal_snapshot(&self, speed_scale: f64) -> JointGoalSnapshot {
         JointGoalSnapshot {
             start: self.commanded_positions.clone(),
+            measured: self.measured_positions.clone(),
             v0: self.commanded_velocities.clone(),
             limits: self.joint_goal_limits(speed_scale),
             arm_dof: self.config.arm_dof(),
@@ -1820,8 +1823,8 @@ impl SupervisorInner {
         if crate::motion::check_quintic_planning_limits(&traj, &self.config.limits, scope).is_err() {
             return false;
         }
-        match self.workspace_samples(&traj) {
-            Ok(samples) => self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice)).is_ok(),
+        match self.workspace_samples_from_measured(&traj, Some(&self.measured_positions)) {
+            Ok(samples) => self.check_workspace_path_from_measured(&self.commanded_positions, Some(&self.measured_positions), samples.iter().map(Vec::as_slice)).is_ok(),
             Err(_) => false,
         }
     }

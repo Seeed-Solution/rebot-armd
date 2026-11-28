@@ -774,6 +774,12 @@ pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: 
 /// keeps its yaw at atan2(y, x) of every sample. A path passing within
 /// [`OUTWARD_MIN_RADIUS_M`] of the base z axis is `INVALID_COMMAND`.
 pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: PathOpts) -> Result<JointPath, MotionError> {
+    plan_cartesian_opts_from_measured(input, None, goal, speed, opts)
+}
+
+/// [`plan_cartesian_opts`] evaluating workspace recovery from `measured` when it differs from
+/// `input.q0` (checking `measured -> start` transition and terminal progress against `measured`).
+pub fn plan_cartesian_opts_from_measured(input: &PlanInput, measured: Option<&[f32]>, goal: Pose, speed: Speed, opts: PathOpts) -> Result<JointPath, MotionError> {
     let yaw_free = opts.yaw_free;
     let arm_dof = input.arm.arm_dof();
     if input.limits.len() < arm_dof + 1 {
@@ -831,20 +837,30 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
     let start_q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { input.q0[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
     check_start_planning_limits_f32(&start_q32, &input.limits, arm_scope, Some(0.0))?;
     let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new_with_tcp(&input.arm, ws, &input.cam, input.tcp_offset));
+    let map_ws_err = |s: f64, f: crate::chain::WorkspaceFailure| MotionError::WorkspaceViolation {
+        s, point: f.point, limit: f.limit, value: f.value, bound: f.bound, detail: f.detail,
+    };
     let mut ws_state = match &ws_eval {
         Some(ev) => {
-            let mut c0 = ev.alloc_buf();
-            ev.eval_into(&start_q32, &mut c0, "plan").map_err(|f| MotionError::WorkspaceViolation {
-                s: 0.0,
-                point: f.point,
-                limit: f.limit,
-                value: f.value,
-                bound: f.bound,
-                detail: f.detail,
-            })?;
-            let min_d = ev.init_min_depths(&c0);
-            let start_outside = crate::chain::WorkspaceEvaluator::any_outside(min_d.as_slice());
-            Some((c0, min_d, MAX_CARTESIAN_SWEEP_EVALS, start_outside))
+            let mut rem = MAX_CARTESIAN_SWEEP_EVALS;
+            let (c0, start_depths, min_d, start_outside) =
+                if let Some(m) = crate::chain::WorkspaceEvaluator::valid_distinct_measured(measured, &start_q32[..input.limits.len().min(7)]) {
+                    let mut cm = ev.alloc_buf();
+                    ev.eval_into(m, &mut cm, "plan").map_err(|f| map_ws_err(0.0, f))?;
+                    let sd = ev.init_min_depths(&cm);
+                    let mut md = sd.clone();
+                    let so = crate::chain::WorkspaceEvaluator::any_outside(sd.as_slice());
+                    let c0 = ev.sweep_linear_step_with_start_outside(m, &start_q32[..m.len()], &cm, &mut md, &mut rem, MAX_CARTESIAN_SWEEP_EVALS, "plan", "sweep", so)
+                        .map_err(|(_, f)| map_ws_err(0.0, f))?;
+                    (c0, sd, md, so)
+                } else {
+                    let mut c0 = ev.alloc_buf();
+                    ev.eval_into(&start_q32, &mut c0, "plan").map_err(|f| map_ws_err(0.0, f))?;
+                    let sd = ev.init_min_depths(&c0);
+                    let so = crate::chain::WorkspaceEvaluator::any_outside(sd.as_slice());
+                    (c0, sd.clone(), sd, so)
+                };
+            Some((c0, start_depths, min_d, rem, start_outside))
         }
         None => None,
     };
@@ -892,36 +908,19 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
         check_planning_limits_f32(&q32, &input.limits, arm_scope, Some(s))?;
-        if let (Some(ev), Some((c_prev, min_d, rem, start_outside))) = (&ws_eval, &mut ws_state) {
-            match ev.sweep_linear_step_with_start_outside(
-                &prev_q32,
-                &q32,
-                c_prev,
-                min_d,
-                rem,
-                MAX_CARTESIAN_SWEEP_EVALS,
-                "plan",
-                "sweep",
-                *start_outside,
-            ) {
+        if let (Some(ev), Some((c_prev, _, min_d, rem, start_outside))) = (&ws_eval, &mut ws_state) {
+            match ev.sweep_linear_step_with_start_outside(&prev_q32, &q32, c_prev, min_d, rem, MAX_CARTESIAN_SWEEP_EVALS, "plan", "sweep", *start_outside) {
                 Ok(c_next) => *c_prev = c_next,
-                Err((t_seg, f)) => {
-                    let s_fail = ((k - 1) as f64 + t_seg) / n as f64;
-                    return Err(MotionError::WorkspaceViolation {
-                        s: s_fail,
-                        point: f.point,
-                        limit: f.limit,
-                        value: f.value,
-                        bound: f.bound,
-                        detail: f.detail,
-                    });
-                }
+                Err((t_seg, f)) => return Err(map_ws_err(((k - 1) as f64 + t_seg) / n as f64, f)),
             }
         }
         q_samples.push(q32);
         s_samples.push(s);
         prev = sol.q;
         prev_q32 = q32;
+    }
+    if let (Some(ev), Some((c_end, start_depths, _, _, _))) = (&ws_eval, &ws_state) {
+        ev.check_terminal_progress(start_depths.as_slice(), c_end.as_slice(), "plan").map_err(|f| map_ws_err(1.0, f))?;
     }
 
     // Single quintic s(t): peak s' = 1.875 / T, peak s'' = 5.7735 / T².

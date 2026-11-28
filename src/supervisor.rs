@@ -63,7 +63,7 @@ pub(crate) use driver_transitions::{
 pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
 pub use workspace::{
     check_path_with, check_path_with_tcp_tol, keepout_sweep_with, keepout_sweep_with_tcp_tol,
-    prepare_quintic, JointGoalSnapshot, PreparedQuintic,
+    prepare_quintic, JointGoalSnapshot, MeasuredStartFenceErr, PreparedQuintic, MEASURED_START_DRIFT_TOL_RAD,
 };
 pub(crate) use workspace::joint_goal_target_from;
 pub use admission::{
@@ -5916,27 +5916,21 @@ impl SupervisorInner {
                                 crate::tracking::TrackingRejectRt::Workspace(f) if was_streaming => {
                                     self.enter_servo_keepout_hold_rt(f);
                                 }
+                                crate::tracking::TrackingRejectRt::Workspace(f)
+                                    if self.pending_normal_unload && self.watchdog_park.is_none() =>
+                                {
+                                    self.enter_park_workspace_hold_rt(f);
+                                }
                                 crate::tracking::TrackingRejectRt::Workspace(f) => {
                                     if !self.safety.deferred_logging() {
-                                        tracing::warn!(
-                                            "Joint tracking output violated workspace ({} at {}): terminating motion",
-                                            f.code(),
-                                            f.phase
-                                        );
+                                        tracing::warn!("Joint tracking output violated workspace ({} at {}): terminating motion", f.code(), f.phase);
                                     }
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
                                     self.safety.latch(
                                         crate::safety::FaultKind::Other,
                                         crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
-                                            let _ = core::fmt::write(
-                                                buf,
-                                                format_args!(
-                                                    "Joint tracking output rejected: {} ({})",
-                                                    f.code(),
-                                                    f.phase
-                                                ),
-                                            );
+                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {} ({})", f.code(), f.phase));
                                         }),
                                     );
                                 }

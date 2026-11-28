@@ -24,6 +24,15 @@ function clearFault(opts) {
 
 /* Controlled stow: return to safe resting pose, wait until the arm settles,
    and safely cut power/torque. Never cuts torque while the arm is still moving. */
+function formatParkWorkspaceBlocked(d) {
+  const geom = (d && typeof d.geometry_id === 'string' && d.geometry_id)
+    || (d && typeof d.constraint_id === 'string' && d.constraint_id)
+    || '';
+  if (!geom) return t('toast.ws_blocked_generic');
+  const cid = (d && typeof d.constraint_id === 'string' && d.constraint_id && d.constraint_id !== geom)
+    ? d.constraint_id : '';
+  return cid ? t('toast.park_ws_blocked_cid', { geom, cid }) : t('toast.park_ws_blocked', { geom });
+}
 let unloading = false;
 async function controlledUnload() {
   if (unloading) return;
@@ -38,6 +47,7 @@ async function controlledUnload() {
       await new Promise((r) => setTimeout(r, 100));
       if (!S.obs || isStopped()) return;
       const o = S.obs;
+      if (o.action?.kind === 'park' && o.action?.state === 'failed') break;
       const parkActive = !!o.disable_pending || (o.action?.kind === 'park' && o.action?.state === 'running');
       if (!o.is_torqued && !parkActive && o.enable_state !== 'Enabled'
         && o.action?.state !== 'running' && S.state !== 'Moving') break;
@@ -51,14 +61,21 @@ async function controlledUnload() {
         stableSince = 0;
       }
     }
+    const act = S.obs?.action;
     if (S.obs && !S.obs.is_torqued) {
       toast(t('toast.parked'), 'ok');
+    } else if (act?.kind === 'park' && act?.state === 'failed' && act?.code === 'WORKSPACE_VIOLATION') {
+      toast(formatParkWorkspaceBlocked(act), 'err', 'WORKSPACE_VIOLATION');
     } else {
       toast(t('toast.unload_unconfirmed'), 'err');
     }
   } catch (e) {
     if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return;
-    toast(t('toast.stow_failed') + (e.message || t('toast.stow_unconfirmed')), 'err', e.code);
+    if (e && e.code === 'WORKSPACE_VIOLATION') {
+      toast(formatParkWorkspaceBlocked(e.reply || e), 'err', 'WORKSPACE_VIOLATION');
+    } else {
+      toast(t('toast.stow_failed') + (e.message || t('toast.stow_unconfirmed')), 'err', e.code);
+    }
   } finally {
     unloading = false;
     if (typeof toolsRenderRelease === 'function' && !$('sset').hidden) toolsRenderRelease();

@@ -279,6 +279,8 @@ pub enum StagedAction {
         kind: PreparedActionKind,
         dof: u8,
         start: [f32; MAX_DOF],
+        measured_start: [f32; MAX_DOF],
+        has_measured_start: bool,
         duration_s: f64,
         power_scale: Option<f64>,
         approach_then: Option<StagedQuinticLeg>,
@@ -854,21 +856,31 @@ impl ActionRefusal {
     }
 
     /// Translate an RT refusal code and optional per-request planning-limit diagnostic carried
-    /// directly in [`Reply::Refused`] into an [`ArmError`]. Falls back to indexed joint naming
-    /// (`joint_1`, ...) when `limits` is unavailable so the joint and bounds are never lost.
-    pub fn into_arm_error_with_detail(
-        self,
-        expected_epoch: u64,
-        detail: Option<motion::PlanningLimitViolationRt>,
-        limits: Option<&[JointLimit]>,
+    /// directly in [`Reply::Refused`] into an [`ArmError`].
+    pub fn into_arm_error_with_detail(self, expected_epoch: u64, detail: Option<motion::PlanningLimitViolationRt>, limits: Option<&[JointLimit]>) -> ArmError {
+        self.into_arm_error_with_workspace(expected_epoch, detail, limits, None)
+    }
+
+    /// Like [`Self::into_arm_error_with_detail`], preserving `ws_detail` on `WORKSPACE_VIOLATION`.
+    pub fn into_arm_error_with_workspace(
+        self, expected_epoch: u64, detail: Option<motion::PlanningLimitViolationRt>,
+        limits: Option<&[JointLimit]>, ws_detail: Option<crate::kinematics::WorkspaceViolationDetail>,
     ) -> ArmError {
-        if self.code == "IK_UNREACHABLE" {
-            if let Some(v) = detail {
-                return ArmError::Motion(v.into_motion_error(limits.unwrap_or(&[]), None));
+        if self.code == "WORKSPACE_VIOLATION" {
+            if let Some(d) = ws_detail {
+                let limit = d.constraint_id.clone().unwrap_or_else(|| "workspace".into());
+                return ArmError::Safety(SafetyError::WorkspaceViolation { limit, value: 0.0, bound: 0.0, point: 0, detail: Box::new(d) });
             }
+        }
+        if self.code == "IK_UNREACHABLE" {
+            if let Some(v) = detail { return ArmError::Motion(v.into_motion_error(limits.unwrap_or(&[]), None)); }
         }
         self.into_arm_error_with_epoch(expected_epoch)
     }
+}
+
+fn commit_refusal_to_arm_error(inner: &SupervisorInner, r: CommitRefusal) -> ArmError {
+    ActionRefusal::new(r.code).into_arm_error_with_workspace(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits), inner.workspace_violation.clone())
 }
 
 pub(crate) fn check_cartesian_path_planning_rt(
@@ -1043,14 +1055,31 @@ fn check_action_authority_ex(
 /// gripper against [`START_TOLERANCE`]), shared by BOTH Legacy and RT Executor owners.
 pub fn check_start_fresh(commanded: &[f32], prepared_start: &[f32]) -> Result<(), ActionRefusal> {
     if prepared_start.len() != commanded.len()
-        || prepared_start
-            .iter()
-            .zip(commanded)
-            .any(|(s, c)| !s.is_finite() || !c.is_finite() || (s - c).abs() >= START_TOLERANCE)
+        || prepared_start.iter().zip(commanded).any(|(s, c)| !s.is_finite() || !c.is_finite() || (s - c).abs() >= START_TOLERANCE)
     {
         return Err(ActionRefusal::new("PLAN_STALE"));
     }
     Ok(())
+}
+
+/// Fences the certified `measured_positions` baseline at install when a workspace policy is active:
+/// returns `PLAN_STALE` if any arm joint drifted beyond [`crate::supervisor::MEASURED_START_DRIFT_TOL_RAD`]
+/// (20 mrad), otherwise re-evaluates the terminal workspace rule against the live measured start and
+/// the plan's `endpoint` (bounded zero-alloc FK) returning `WORKSPACE_VIOLATION` on refusal.
+pub fn check_measured_fresh(
+    inner: &mut SupervisorInner,
+    measured_start: &[f32],
+    endpoint: &[f32],
+    phase: &'static str,
+) -> Result<(), ActionRefusal> {
+    inner
+        .check_measured_start_terminal_rt(measured_start, endpoint, phase)
+        .map_err(|e| match e {
+            crate::supervisor::MeasuredStartFenceErr::PlanStale => ActionRefusal::new("PLAN_STALE"),
+            crate::supervisor::MeasuredStartFenceErr::WorkspaceViolation => {
+                ActionRefusal::new("WORKSPACE_VIOLATION")
+            }
+        })
 }
 
 /// **Single entry point for single-use A1 admission consumption**: syncs `stop_generation`
@@ -1610,6 +1639,7 @@ impl ActionSnapshot {
     pub fn joint_goal_snapshot(&self, speed_scale: f64) -> JointGoalSnapshot {
         JointGoalSnapshot {
             start: self.commanded_positions.clone(),
+            measured: self.measured_positions.clone(),
             v0: self.commanded_velocities.clone(),
             limits: self.env.planning_limits(Some(speed_scale)),
             arm_dof: self.env.config.arm_dof(),
@@ -1700,6 +1730,7 @@ pub struct PreparedCartesianAction {
     pub kind: PreparedActionKind,
     pub stamp: ActionStamp,
     pub start: Vec<f32>,
+    pub measured_start: Vec<f32>,
     pub input: PlanInput,
     pub resolved: ResolvedCartesianLegs,
     pub tag: Option<String>,
@@ -1807,7 +1838,7 @@ fn validate_approach_segment_off_lock(
             .map_err(|e| format!("segment: {}", e.code()))?;
     }
     let seg_samples = if let Some(ws) = ws {
-        workspace_samples_and_check_off_lock(&traj, start, ws, cam, arm, tcp_offset)
+        workspace_samples_and_check_off_lock(&traj, start, None, ws, cam, arm, tcp_offset)
             .map_err(|e| format!("segment: {}", arm_err_code_str(e)))?
     } else {
         (0..=20)
@@ -1950,17 +1981,14 @@ impl PreparedCartesianAction {
         for (q, &s) in path.q.iter().zip(&path.s) {
             slot.path.push(&q[..path.dof], s)?;
         }
-        let mut start = [0.0f32; MAX_DOF];
+        let (mut start, mut measured_start) = ([0.0f32; MAX_DOF], [f32::NAN; MAX_DOF]);
         start[..self.start.len()].copy_from_slice(&self.start);
+        let has_measured_start = self.measured_start.len() == path.dof;
+        if has_measured_start { measured_start[..path.dof].copy_from_slice(&self.measured_start); }
         slot.primitive = Primitive::Action(StagedAction::Cartesian {
-            child,
-            kind: self.kind,
-            dof: path.dof as u8,
-            start,
-            duration_s: path.duration,
-            power_scale: self.input.power.as_ref().map(|_| path.power_scale),
-            approach_then,
-            lock_j7_hold: false,
+            child, kind: self.kind, dof: path.dof as u8, start, measured_start, has_measured_start,
+            duration_s: path.duration, power_scale: self.input.power.as_ref().map(|_| path.power_scale),
+            approach_then, lock_j7_hold: false,
         });
         slot.static_restricted = self.input.static_restricted;
         Ok(slot)
@@ -2830,9 +2858,10 @@ fn joint_goal_feasible_off_lock(snap: &ActionSnapshot, q: &[f64; 6]) -> bool {
         return false;
     }
     if let Some(ws) = snap.env.workspace_policy.as_ref() {
-        check_quintic_workspace_off_lock(
+        check_quintic_workspace_from_measured_off_lock(
             &traj,
             &snap.commanded_positions,
+            Some(&snap.measured_positions),
             ws,
             &snap.env.config.camera_mount,
             &snap.env.config.arm_model,
@@ -2938,7 +2967,7 @@ fn prepare_move_common(
             } else {
                 Err(None)
             };
-            let direct = match motion::plan_cartesian_opts(&input, goal, speed, opts) {
+            let direct = match motion::plan_cartesian_opts_from_measured(&input, Some(&snap.measured_positions), goal, speed, opts) {
                 Ok(d) => d,
                 Err(e) => {
                     let hint = matches!(&e, MotionError::IkBranchFlip { .. })
@@ -2974,6 +3003,7 @@ fn prepare_move_common(
                 },
                 stamp,
                 start: snap.commanded_positions.clone(),
+                measured_start: snap.measured_positions.clone(),
                 input,
                 resolved,
                 tag,
@@ -3076,14 +3106,9 @@ pub fn prepare_child_cartesian_slot_with_options(
     let mut start_arr = [0.0f32; MAX_DOF];
     start_arr[..start.len()].copy_from_slice(start);
     slot.primitive = Primitive::Action(StagedAction::Cartesian {
-        child: Some(child),
-        kind: PreparedActionKind::MoveToLinear,
-        dof: path.dof as u8,
-        start: start_arr,
-        duration_s: path.duration,
-        power_scale,
-        approach_then,
-        lock_j7_hold,
+        child: Some(child), kind: PreparedActionKind::MoveToLinear, dof: path.dof as u8,
+        start: start_arr, measured_start: [0.0; MAX_DOF], has_measured_start: false,
+        duration_s: path.duration, power_scale, approach_then, lock_j7_hold,
     });
     Ok(slot)
 }
@@ -3239,6 +3264,7 @@ pub(crate) fn fit_quintic_power_off_lock(
 fn workspace_samples_and_check_off_lock(
     traj: &crate::trajectory::MultiJointQuinticTrajectory,
     start: &[f32],
+    measured: Option<&[f32]>,
     ws: &WorkspacePolicy,
     cam: &crate::model::CameraMount,
     arm: &crate::chain::ArmModel,
@@ -3248,26 +3274,10 @@ fn workspace_samples_and_check_off_lock(
     let at = |t: f64| traj.sample(t).positions;
     let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
     let eps = crate::kinematics::WORKSPACE_EPS;
-    let samples = crate::supervisor::keepout_sweep_with_tcp_tol(
-        arm,
-        ws,
-        cam,
-        tcp_offset,
-        eps,
-        &at,
-        &travel,
-        &knots,
-        crate::supervisor::MAX_KEEPOUT_EVALS_PER_PLAN,
+    let samples = SupervisorInner::keepout_sweep_with_tcp_measured(
+        arm, ws, cam, tcp_offset, eps, measured, &at, &travel, &knots, crate::supervisor::MAX_KEEPOUT_EVALS_PER_PLAN,
     )?;
-    crate::supervisor::check_path_with_tcp_tol(
-        arm,
-        ws,
-        cam,
-        tcp_offset,
-        eps,
-        start,
-        samples.iter().map(Vec::as_slice),
-    )?;
+    SupervisorInner::check_path_with_tcp_measured(arm, ws, cam, tcp_offset, eps, measured, start, samples.iter().map(Vec::as_slice))?;
     Ok(samples)
 }
 
@@ -3279,7 +3289,19 @@ pub(crate) fn check_quintic_workspace_off_lock(
     arm: &crate::chain::ArmModel,
     tcp_offset: [f64; 3],
 ) -> Result<(), ArmError> {
-    workspace_samples_and_check_off_lock(traj, start, ws, cam, arm, tcp_offset).map(|_| ())
+    workspace_samples_and_check_off_lock(traj, start, None, ws, cam, arm, tcp_offset).map(|_| ())
+}
+
+pub(crate) fn check_quintic_workspace_from_measured_off_lock(
+    traj: &crate::trajectory::MultiJointQuinticTrajectory,
+    start: &[f32],
+    measured: Option<&[f32]>,
+    ws: &WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    arm: &crate::chain::ArmModel,
+    tcp_offset: [f64; 3],
+) -> Result<(), ArmError> {
+    workspace_samples_and_check_off_lock(traj, start, measured, ws, cam, arm, tcp_offset).map(|_| ())
 }
 
 pub(crate) fn build_prepared_quintic_off_lock(
@@ -3330,17 +3352,11 @@ pub(crate) fn build_prepared_quintic_off_lock(
         motion::check_quintic_planning_limits(&traj, &cfg.limits, sc)?;
     }
     if let Some(ws) = snap.env.workspace_policy.as_ref() {
-        check_quintic_workspace_off_lock(
-            &traj,
-            &snap.commanded_positions,
-            ws,
-            &cfg.camera_mount,
-            &cfg.arm_model,
-            cfg.tcp_offset,
-        )?;
+        check_quintic_workspace_from_measured_off_lock(&traj, &snap.commanded_positions, Some(&snap.measured_positions), ws, &cfg.camera_mount, &cfg.arm_model, cfg.tcp_offset)?;
     }
     Ok(PreparedQuintic {
         start: snap.commanded_positions.clone(),
+        measured: snap.measured_positions.clone(),
         v0: snap.commanded_velocities.clone(),
         target: target.to_vec(),
         limits: limits.to_vec(),
@@ -3457,54 +3473,30 @@ pub fn install_move_cartesian(
         .map_err(|r| r.into_arm_error(inner))?;
     match payload {
         CartesianInstallPayload::Legacy(prep) => {
-            check_start_fresh(&inner.commanded_positions, &prep.start)
-                .map_err(|r| r.into_arm_error(inner))?;
+            check_start_fresh(&inner.commanded_positions, &prep.start).map_err(|r| r.into_arm_error(inner))?;
+            let end_q = prep
+                .resolved
+                .path
+                .q
+                .last()
+                .ok_or_else(|| ActionRefusal::new("PLAN_STALE").into_arm_error(inner))?;
+            check_measured_fresh(inner, &prep.measured_start, end_q, "plan")
+                .map_err(|r| commit_refusal_to_arm_error(inner, CommitRefusal::code(r.code)))?;
             check_cartesian_path_planning_legacy(inner, &inner.commanded_positions, &prep.resolved.path)?;
             if let Some(leg) = prep.resolved.approach_leg.as_ref() {
-                motion::check_quintic_planning_limits(
-                    &leg.seg,
-                    &inner.config.limits,
-                    crate::model::PlanningScope::arm_only(&inner.config),
-                )?;
+                motion::check_quintic_planning_limits(&leg.seg, &inner.config.limits, crate::model::PlanningScope::arm_only(&inner.config))?;
             }
             let epoch = inner.safety.epoch_id();
-            let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
-                .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
-            let approach_seg = prep
-                .resolved
-                .approach_leg
-                .map(|l| (l.seg, l.target, l.power_scale));
+            let admitted = consume_action_admission(inner, stamp, ctx.stop_generation).map_err(|r| r.into_arm_error_with_epoch(epoch))?;
+            let approach_seg = prep.resolved.approach_leg.map(|l| (l.seg, l.target, l.power_scale));
             SupervisorInner::install_resolved_path(
-                admitted,
-                &prep.input,
-                prep.resolved.path,
-                approach_seg,
-                prep.resolved.outcome.as_ref(),
-                prep.kind.action_kind_str(),
-                prep.tag,
+                admitted, &prep.input, prep.resolved.path, approach_seg, prep.resolved.outcome.as_ref(), prep.kind.action_kind_str(), prep.tag,
             )
         }
-        CartesianInstallPayload::Slot {
-            kind,
-            dof,
-            start,
-            slot,
-            duration_s,
-            power_scale,
-            approach_then,
-        } => install_move_cartesian_slot_rt(
-            inner,
-            stamp,
-            ctx,
-            kind,
-            dof,
-            &start,
-            slot,
-            duration_s,
-            power_scale,
-            approach_then,
-        )
-        .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))),
+        CartesianInstallPayload::Slot { kind, dof, start, measured_start, slot, duration_s, power_scale, approach_then } => {
+            install_move_cartesian_slot_rt(inner, stamp, ctx, kind, dof, &start, measured_start.as_ref(), slot, duration_s, power_scale, approach_then)
+                .map_err(|r| commit_refusal_to_arm_error(inner, r))
+        }
     }
 }
 
@@ -3515,6 +3507,7 @@ pub enum CartesianInstallPayload {
         kind: PreparedActionKind,
         dof: usize,
         start: [f32; MAX_DOF],
+        measured_start: Option<[f32; MAX_DOF]>,
         slot: PlanSlotRef<PlanSlot>,
         duration_s: f64,
         power_scale: Option<f64>,
@@ -3556,9 +3549,7 @@ fn validate_approach_leg_rt(
     if let Some(sc) = scope {
         motion::check_quintic_planning_limits_rt(&seg, &inner.config.limits, sc)?;
     }
-    inner
-        .check_workspace_quintic_inline(&seg)
-        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
+    inner.check_workspace_quintic_inline_rt(&seg, false).map_err(CommitRefusal::code)?;
     // O(1) endpoint fence (full curve was certified off-thread; shared tick also checks every step).
     inner
         .check_static_load_endpoint_inline(&leg_start[..dof], &leg.target[..dof])
@@ -3574,26 +3565,29 @@ fn install_move_cartesian_slot_rt(
     kind: PreparedActionKind,
     dof: usize,
     start: &[f32; MAX_DOF],
+    measured_start: Option<&[f32; MAX_DOF]>,
     slot: PlanSlotRef<PlanSlot>,
     duration_s: f64,
     power_scale: Option<f64>,
     approach_then: Option<StagedQuinticLeg>,
 ) -> Result<InstalledAction, CommitRefusal> {
-    if dof == 0 || dof > MAX_DOF {
-        return Err(CommitRefusal::code("INVALID_COMMAND"));
-    }
+    if dof == 0 || dof > MAX_DOF { return Err(CommitRefusal::code("INVALID_COMMAND")); }
     let mut post_q = [0.0f32; MAX_DOF];
     let (post_dof, _) = inner.post_quiesce_commanded_positions(&mut post_q);
     check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
     inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+    let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
+    let mut last_buf = [0.0f32; MAX_DOF];
+    last_buf[..dof].copy_from_slice(last_slice);
+    if let Some(m) = measured_start {
+        check_measured_fresh(inner, &m[..dof], &last_buf[..dof], "plan")
+            .map_err(|r| CommitRefusal::code(r.code))?;
+    }
     check_cartesian_path_planning_rt(inner, dof, &post_q[..post_dof], slot.path.samples())?;
     if inner.gravity_comp.is_some() {
         return Err(CommitRefusal::code("MOTION_BUSY"));
     }
     inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
-    let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
-    let mut last_buf = [0.0f32; MAX_DOF];
-    last_buf[..dof].copy_from_slice(last_slice);
     let arm_scope = Some(crate::model::PlanningScope::arm_only(&inner.config));
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
@@ -3711,6 +3705,8 @@ pub fn install_move_joint(
             let target_clamped = leg1_target != prep.prepared_quintic.target;
             let (prepared_for_install, exact_for_install) = if let Some(scope) = prep.checked_joints {
                 let reuse_ok = prep.prepared_quintic.start == inner.commanded_positions
+                    && prep.prepared_quintic.measured.len() == inner.measured_positions.len()
+                    && prep.prepared_quintic.measured.iter().zip(&inner.measured_positions).all(|(a, b)| (a - b).abs() < 1e-4)
                     && prep.prepared_quintic.v0 == inner.commanded_velocities
                     && !target_clamped
                     && prep.prepared_quintic.limits.as_slice() == prep.limits.as_slice()
@@ -3732,8 +3728,8 @@ pub fn install_move_joint(
                         prep.prepared_quintic.traj.duration,
                     )?;
                     motion::check_quintic_planning_limits(&rebuilt, &inner.config.limits, scope)?;
-                    let samples = inner.workspace_samples(&rebuilt)?;
-                    inner.check_workspace_path(&inner.commanded_positions, samples.iter().map(Vec::as_slice))?;
+                    let samples = inner.workspace_samples_from_measured(&rebuilt, Some(&inner.measured_positions))?;
+                    inner.check_workspace_path_from_measured(&inner.commanded_positions, Some(&inner.measured_positions), samples.iter().map(Vec::as_slice))?;
                     (None, Some((rebuilt, prep.prepared_quintic.power_scale)))
                 };
                 if let Some(leg) = prep.approach_leg.as_mut() {
@@ -3878,7 +3874,7 @@ pub fn install_move_joint(
             approach_then,
             checked_joints,
         )
-        .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))),
+        .map_err(|r| commit_refusal_to_arm_error(inner, r)),
     }
 }
 
@@ -3994,9 +3990,7 @@ fn install_move_joint_rt(
     if let Some(sc) = scope {
         motion::check_quintic_planning_limits_rt(&traj, &inner.config.limits, sc)?;
     }
-    inner
-        .check_workspace_quintic_inline(&traj)
-        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
+    inner.check_workspace_quintic_inline_rt(&traj, true).map_err(CommitRefusal::code)?;
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
             inner,
@@ -4034,7 +4028,7 @@ fn install_move_joint_rt(
     }
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.clear_servo_ws_min_depths_rt();
+    this.force_clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &tgt[..dof]);
     this.safety
         .mark_motion_started()
@@ -4859,7 +4853,7 @@ pub fn install_macro_child(
     match payload {
         MacroChildPayload::Slot(slot) => {
             install_macro_child_slot_rt(inner, stamp, ctx, slot)
-                .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits)))
+                .map_err(|r| commit_refusal_to_arm_error(inner, r))
         }
         MacroChildPayload::LegacyCartesian {
             spec,
@@ -5052,8 +5046,8 @@ pub fn install_macro_child(
                         )?
                     };
                     motion::check_quintic_planning_limits(&rebuilt, &inner.config.limits, scope)?;
-                    let samples = inner.workspace_samples(&rebuilt)?;
-                    inner.check_workspace_path(&inner.commanded_positions, samples.iter().map(Vec::as_slice))?;
+                    let samples = inner.workspace_samples_from_measured(&rebuilt, Some(&inner.measured_positions))?;
+                    inner.check_workspace_path_from_measured(&inner.commanded_positions, Some(&inner.measured_positions), samples.iter().map(Vec::as_slice))?;
                     target = filtered_target;
                     (None, Some((rebuilt, pscale)))
                 }
@@ -5336,6 +5330,8 @@ fn install_macro_child_slot_rt(
 
     match staged {
         StagedAction::Cartesian {
+            measured_start,
+            has_measured_start,
             duration_s,
             power_scale,
             approach_then,
@@ -5343,6 +5339,13 @@ fn install_macro_child_slot_rt(
             ..
         } => {
             inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+            let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
+            let mut last_buf = [0.0f32; MAX_DOF];
+            last_buf[..dof].copy_from_slice(last_slice);
+            if has_measured_start {
+                check_measured_fresh(inner, &measured_start[..dof], &last_buf[..dof], "plan")
+                    .map_err(|r| CommitRefusal::code(r.code))?;
+            }
             check_cartesian_path_planning_rt(inner, dof, &inner.commanded_positions, slot.path.samples())?;
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
             if lock_j7_hold {
@@ -5368,9 +5371,6 @@ fn install_macro_child_slot_rt(
                     }
                 }
             }
-            let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
-            let mut last_buf = [0.0f32; MAX_DOF];
-            last_buf[..dof].copy_from_slice(last_slice);
             let arm_scope = Some(crate::model::PlanningScope::arm_only(&inner.config));
             let then_traj = match approach_then {
                 Some(leg) => Some(validate_approach_leg_rt(
@@ -5518,9 +5518,7 @@ fn install_macro_child_slot_rt(
             if let Some(sc) = scope {
                 motion::check_quintic_planning_limits_rt(&traj, &inner.config.limits, sc)?;
             }
-            inner
-                .check_workspace_quintic_inline(&traj)
-                .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
+            inner.check_workspace_quintic_inline_rt(&traj, true).map_err(CommitRefusal::code)?;
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,
@@ -5896,23 +5894,10 @@ pub fn commit_action(
             }
             let (id, _) = match staged {
                 StagedAction::Cartesian {
-                    dof,
-                    start,
-                    duration_s,
-                    power_scale,
-                    approach_then,
-                    ..
+                    dof, start, measured_start, has_measured_start, duration_s, power_scale, approach_then, ..
                 } => install_move_cartesian_slot_rt(
-                    inner,
-                    &stamp,
-                    &owner_ctx,
-                    kind,
-                    usize::from(dof),
-                    &start,
-                    slot,
-                    duration_s,
-                    power_scale,
-                    approach_then,
+                    inner, &stamp, &owner_ctx, kind, usize::from(dof), &start,
+                    has_measured_start.then_some(&measured_start), slot, duration_s, power_scale, approach_then,
                 )?,
                 StagedAction::Joint {
                     dof,

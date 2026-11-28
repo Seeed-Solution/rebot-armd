@@ -2432,23 +2432,21 @@ async fn executor_watchdog_continuity_exit_failed_and_tracking_rejection_zero_al
         cfg.joint_tracking = Some(jt);
         // Set tight J1 upper limit just past RAISED_POSE[0] so lead overshoots it.
         cfg.limits[0].max_position = RAISED_POSE[0] + 0.025;
+        // Fixture property: RAISED_POSE places link3 ~8 mm below default floor_z=0.0; widen floor like :2832/:5561.
+        let ws_cfg = cfg.workspace.as_mut().expect("rebot_dm has workspace");
+        let ev0 = armd::chain::WorkspaceEvaluator::new_with_tcp(&cfg.arm_model, ws_cfg, &cfg.camera_mount, cfg.tcp_offset);
+        let mut c0 = ev0.alloc_buf();
+        ev0.eval_into(&RAISED_POSE, &mut c0, "fixture").unwrap();
+        let l3_d = c0.as_slice().iter().enumerate().find_map(|(s, &c)| {
+            let f = ev0.describe_failure(s, c, (-c).max(0.0), 0.0, "fixture");
+            (f.detail.geometry_id.as_deref() == Some("capsule:link3") && f.detail.constraint_id.as_deref() == Some("floor_z")).then_some((-c).max(0.0))
+        }).expect("link3 floor_z slot");
+        assert!((l3_d - 0.008).abs() < 0.001, "RAISED_POSE default-floor link3 intrusion ~8 mm: {l3_d}");
+        ws_cfg.floor_z_m = -1.0;
 
-        let rig = LiveRig::start(
-            OwnerKind::Executor,
-            cfg,
-            RAISED_POSE,
-            OperatorAuth::disabled(),
-            None,
-            true,
-        )
-        .await;
+        let rig = LiveRig::start(OwnerKind::Executor, cfg, RAISED_POSE, OperatorAuth::disabled(), None, true).await;
         let mut ws = ws_connect(&rig.ws_url).await;
-        let granted = ws_send_wait_types(
-            &mut ws,
-            json!({"type": "acquire_lease", "client_id": "trk-rej-alloc", "seq": 1}),
-            &["lease_granted"],
-        )
-        .await;
+        let granted = ws_send_wait_types(&mut ws, json!({"type": "acquire_lease", "client_id": "trk-rej-alloc", "seq": 1}), &["lease_granted"]).await;
         let gen = granted["generation"].as_u64().unwrap();
         let epoch = rig.sup.get_observation().await.epoch_id;
 
@@ -2928,40 +2926,15 @@ async fn executor_tracking_keepout_and_large_workspace_zero_alloc() {
     cfg_fb.joint_tracking = Some(jt_fb);
     cfg_fb.limits[0].max_position = RAISED_POSE[0] + 0.025;
     let ws_fb = cfg_fb.workspace.as_mut().expect("rebot_dm has workspace");
+    ws_fb.floor_z_m = -1.0;
     ws_fb.check_points_end_m = (0..30).map(|i| [0.0001 * i as f32, 0.0, 0.0]).collect();
-    ws_fb.keepout_boxes = vec![KeepoutBox {
-        name: "far_obstacle_fb".into(),
-        min_m: [0.80, 0.80, 0.80],
-        max_m: [0.95, 0.95, 0.95],
-    }];
-    let eval_fb = armd::chain::WorkspaceEvaluator::new_with_tcp(
-        &cfg_fb.arm_model,
-        ws_fb,
-        &cfg_fb.camera_mount,
-        cfg_fb.tcp_offset,
-    );
-    assert!(
-        eval_fb.total_slots > armd::kinematics::MAX_STACK_WORKSPACE_SLOTS,
-        "fallback workspace must exceed 256 slots, got {}",
-        eval_fb.total_slots
-    );
+    ws_fb.keepout_boxes = vec![KeepoutBox { name: "far_obstacle_fb".into(), min_m: [0.80, 0.80, 0.80], max_m: [0.95, 0.95, 0.95] }];
+    let eval_fb = armd::chain::WorkspaceEvaluator::new_with_tcp(&cfg_fb.arm_model, ws_fb, &cfg_fb.camera_mount, cfg_fb.tcp_offset);
+    assert!(eval_fb.total_slots > armd::kinematics::MAX_STACK_WORKSPACE_SLOTS, "fallback workspace must exceed 256 slots, got {}", eval_fb.total_slots);
 
-    let rig_fb = LiveRig::start(
-        OwnerKind::Executor,
-        cfg_fb,
-        RAISED_POSE,
-        OperatorAuth::disabled(),
-        None,
-        true,
-    )
-    .await;
+    let rig_fb = LiveRig::start(OwnerKind::Executor, cfg_fb, RAISED_POSE, OperatorAuth::disabled(), None, true).await;
     let mut ws_fb_sock = ws_connect(&rig_fb.ws_url).await;
-    let granted_fb = ws_send_wait_types(
-        &mut ws_fb_sock,
-        json!({"type": "acquire_lease", "client_id": "trk-large-fb", "seq": 1}),
-        &["lease_granted"],
-    )
-    .await;
+    let granted_fb = ws_send_wait_types(&mut ws_fb_sock, json!({"type": "acquire_lease", "client_id": "trk-large-fb", "seq": 1}), &["lease_granted"]).await;
     let gen_fb = granted_fb["generation"].as_u64().unwrap();
     let ep_fb = rig_fb.sup.get_observation().await.epoch_id;
     let mut target_fb = RAISED_POSE.to_vec();
