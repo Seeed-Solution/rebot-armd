@@ -47,6 +47,12 @@ fi
 live_sh="$(env -u ARMD_COCKPIT_HTML "${REPO_ROOT}/scripts/source_paths.sh" cockpit_html)"
 [ -f "${live_sh}" ] || { echo "FAIL live cockpit_html missing: ${live_sh}" >&2; exit 1; }
 
+# 2b. Shell recursive directory expansion parity for split modules (`supervisor`).
+sup_sh="$("${REPO_ROOT}/scripts/source_paths.sh" --repo supervisor)"
+echo "${sup_sh}" | grep -qx "${REPO_ROOT}/src/supervisor.rs" || { echo "FAIL supervisor missing src/supervisor.rs" >&2; exit 1; }
+echo "${sup_sh}" | grep -qx "${REPO_ROOT}/src/supervisor/workspace.rs" || { echo "FAIL supervisor missing src/supervisor/workspace.rs" >&2; exit 1; }
+echo "${sup_sh}" | grep -qx "${REPO_ROOT}/src/supervisor/driver_transitions/mod.rs" || { echo "FAIL supervisor missing nested driver_transitions/mod.rs" >&2; exit 1; }
+
 (
     cd "${T}"
     env -u ARMD_COCKPIT_HTML node -e '
