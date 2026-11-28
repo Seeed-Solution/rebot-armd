@@ -32,6 +32,13 @@ mod admission;
 mod state_init;
 mod terminal_plumbing;
 mod types;
+mod driver_shadow;
+mod legacy_loop;
+mod mode_switch;
+mod observation;
+mod ownership;
+mod resting_thermal;
+mod shutdown_park;
 
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
