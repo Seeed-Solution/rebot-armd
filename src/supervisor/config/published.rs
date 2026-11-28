@@ -14,7 +14,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use super::super::*;
@@ -31,6 +31,83 @@ use crate::supervisor_lock::{DriverSlot, DriverTryError};
 
 const BUSY_YIELD_RETRIES: u32 = 4;
 const BUSY_RETRY_SLEEP: Duration = Duration::from_millis(1);
+
+/// Maximum total wall-clock duration Legacy `ArmSupervisor::published_config()` will wait retrying
+/// a contended `DriverLock` (`WouldBlock`) before failing closed with `503 CONFIG_UNAVAILABLE`.
+pub(crate) const LEGACY_DRIVER_BUSY_RETRY_BUDGET: Duration = Duration::from_millis(50);
+
+/// Internal test-only hooks for deterministic synchronization inside `published_config()` without
+/// sleeps. Production `published_config()` uses a zero-sized no-op impl that monomorphizes away.
+trait PublishedConfigHooks {
+    fn on_before_cache_check(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+    fn on_after_cache_read(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+    fn on_before_driver_borrow(&mut self) {}
+    fn on_driver_busy(&mut self) {}
+    fn after_capture(&mut self, _gen: u64) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
+struct NoopPublishedConfigHooks;
+impl PublishedConfigHooks for NoopPublishedConfigHooks {}
+
+struct AfterCaptureOnlyHook<F> {
+    after_capture: F,
+}
+
+impl<F, Fut> PublishedConfigHooks for AfterCaptureOnlyHook<F>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = ()> + Send,
+{
+    fn after_capture(&mut self, gen: u64) -> impl Future<Output = ()> + Send {
+        (self.after_capture)(gen)
+    }
+}
+
+struct DriverBusyClosureHooks<F1, F2> {
+    on_before_driver_borrow: F1,
+    on_driver_busy: F2,
+}
+
+impl<F1, F2> PublishedConfigHooks for DriverBusyClosureHooks<F1, F2>
+where
+    F1: FnMut(),
+    F2: FnMut(),
+{
+    fn on_before_driver_borrow(&mut self) {
+        (self.on_before_driver_borrow)();
+    }
+
+    fn on_driver_busy(&mut self) {
+        (self.on_driver_busy)();
+    }
+}
+
+struct CacheCheckClosureHooks<F1, F2> {
+    on_before_cache_check: F1,
+    on_after_cache_read: F2,
+}
+
+impl<F1, Fut1, F2, Fut2> PublishedConfigHooks for CacheCheckClosureHooks<F1, F2>
+where
+    F1: FnMut() -> Fut1,
+    Fut1: Future<Output = ()> + Send,
+    F2: FnMut() -> Fut2,
+    Fut2: Future<Output = ()> + Send,
+{
+    fn on_before_cache_check(&mut self) -> impl Future<Output = ()> + Send {
+        (self.on_before_cache_check)()
+    }
+
+    fn on_after_cache_read(&mut self) -> impl Future<Output = ()> + Send {
+        (self.on_after_cache_read)()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DriverBusy;
@@ -137,6 +214,45 @@ struct PublishedConfigCapture {
     policy_ledger_path: Option<PathBuf>,
     fallback_measured_positions: Vec<f32>,
     cell: Option<Arc<crate::cell::CellContext>>,
+}
+
+fn resolve_driver_fields(
+    driver_caps: CapturedDriverCaps,
+) -> (bool, bool, bool, Option<serde_json::Value>, MotorZeroSupport) {
+    match driver_caps {
+        CapturedDriverCaps::None => (
+            false,
+            false,
+            true,
+            None,
+            MotorZeroSupport::set_current(
+                "process",
+                true,
+                vec!["mock follower: the readings of the zeroed joints become 0 (the simulated arm has no encoder offset)".into()],
+            ),
+        ),
+        CapturedDriverCaps::Poisoned => (
+            false,
+            false,
+            false,
+            None,
+            MotorZeroSupport::unsupported("driver unavailable"),
+        ),
+        CapturedDriverCaps::Live {
+            supports_nonblocking_mode_switch,
+            torque_feedback,
+            temperature_feedback,
+            motor_current_cap,
+            motor_zero_support,
+            ..
+        } => (
+            supports_nonblocking_mode_switch,
+            torque_feedback,
+            temperature_feedback,
+            motor_current_cap.and_then(|cap| serde_json::to_value(cap).ok()),
+            motor_zero_support,
+        ),
+    }
 }
 
 impl PublishedConfigCapture {
@@ -324,40 +440,7 @@ impl PublishedConfigCapture {
             driver_temperature_feedback,
             driver_motor_current_cap,
             driver_motor_zero_support,
-        ) = match this.driver_caps {
-            CapturedDriverCaps::None => (
-                false,
-                false,
-                true,
-                None,
-                MotorZeroSupport::set_current(
-                    "process",
-                    true,
-                    vec!["mock follower: the readings of the zeroed joints become 0 (the simulated arm has no encoder offset)".into()],
-                ),
-            ),
-            CapturedDriverCaps::Poisoned => (
-                false,
-                false,
-                false,
-                None,
-                MotorZeroSupport::unsupported("driver unavailable"),
-            ),
-            CapturedDriverCaps::Live {
-                supports_nonblocking_mode_switch,
-                torque_feedback,
-                temperature_feedback,
-                motor_current_cap,
-                motor_zero_support,
-                ..
-            } => (
-                supports_nonblocking_mode_switch,
-                torque_feedback,
-                temperature_feedback,
-                motor_current_cap.and_then(|cap| serde_json::to_value(cap).ok()),
-                motor_zero_support,
-            ),
-        };
+        ) = resolve_driver_fields(this.driver_caps);
         PublishedConfig {
             config: this.config,
             follower: this.follower,
@@ -430,9 +513,20 @@ impl PublishedConfig {
     pub fn from_inner(inner: &SupervisorInner) -> Self {
         PublishedConfigCapture::blocking_from_inner(inner).finalize()
     }
+
+    /// Captures and wraps a complete configuration snapshot in `Arc<PublishedConfig>` inside a
+    /// non-inlined synchronous frame so callers in async functions do not inflate future size.
+    #[inline(never)]
+    pub(crate) fn from_inner_arc(inner: &SupervisorInner) -> Arc<Self> {
+        PublishedConfigCapture::blocking_from_inner(inner).finalize_arc()
+    }
 }
 
 impl ArmSupervisor {
+    /// Maximum total wall-clock duration Legacy `published_config()` retries a contended
+    /// `DriverLock` (`WouldBlock`) before failing closed with `503 CONFIG_UNAVAILABLE`.
+    pub const LEGACY_DRIVER_BUSY_RETRY_BUDGET: Duration = LEGACY_DRIVER_BUSY_RETRY_BUDGET;
+
     pub fn config_write_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.config_write_mutex)
     }
@@ -476,9 +570,10 @@ impl ArmSupervisor {
 
     /// Returns the latest published configuration snapshot without touching `SupervisorLock`
     /// in `OWNER_EXECUTOR` mode. Fails closed with `503 CONFIG_UNAVAILABLE` if ownership is
-    /// transitioning or failed.
+    /// transitioning or failed, or if a contended legacy driver mutex does not clear within
+    /// [`LEGACY_DRIVER_BUSY_RETRY_BUDGET`] (50 ms).
     pub async fn published_config(&self) -> Result<Arc<PublishedConfig>, ArmError> {
-        self.published_config_with_after_capture_hook(|_| std::future::ready(()))
+        self.published_config_with_hooks(NoopPublishedConfigHooks)
             .await
     }
 
@@ -488,23 +583,87 @@ impl ArmSupervisor {
     #[doc(hidden)]
     pub async fn published_config_with_after_capture_hook<F, Fut>(
         &self,
-        mut after_capture: F,
+        after_capture: F,
     ) -> Result<Arc<PublishedConfig>, ArmError>
     where
         F: FnMut(u64) -> Fut,
-        Fut: Future<Output = ()>,
+        Fut: Future<Output = ()> + Send,
     {
+        self.published_config_with_hooks(AfterCaptureOnlyHook { after_capture })
+            .await
+    }
+
+    /// Test-accessible entry point executing `published_config()` with deterministic callbacks
+    /// invoked right before borrowing the legacy driver and right after releasing
+    /// `SupervisorLock::read()` on `DriverLock::try_lock` `WouldBlock`.
+    #[doc(hidden)]
+    pub async fn published_config_with_driver_busy_hooks<F1, F2>(
+        &self,
+        on_before_driver_borrow: F1,
+        on_driver_busy: F2,
+    ) -> Result<Arc<PublishedConfig>, ArmError>
+    where
+        F1: FnMut(),
+        F2: FnMut(),
+    {
+        self.published_config_with_hooks(DriverBusyClosureHooks {
+            on_before_driver_borrow,
+            on_driver_busy,
+        })
+        .await
+    }
+
+    /// Test-accessible entry point executing `published_config()` with deterministic async hooks
+    /// around the Legacy cache-hit fast path (`on_before_cache_check` and `on_after_cache_read`).
+    #[doc(hidden)]
+    pub async fn published_config_with_cache_check_hooks<F1, Fut1, F2, Fut2>(
+        &self,
+        on_before_cache_check: F1,
+        on_after_cache_read: F2,
+    ) -> Result<Arc<PublishedConfig>, ArmError>
+    where
+        F1: FnMut() -> Fut1,
+        Fut1: Future<Output = ()> + Send,
+        F2: FnMut() -> Fut2,
+        Fut2: Future<Output = ()> + Send,
+    {
+        self.published_config_with_hooks(CacheCheckClosureHooks {
+            on_before_cache_check,
+            on_after_cache_read,
+        })
+        .await
+    }
+
+    async fn published_config_with_hooks<H: PublishedConfigHooks>(
+        &self,
+        mut hooks: H,
+    ) -> Result<Arc<PublishedConfig>, ArmError> {
         let mut busy_retries: u32 = 0;
+        let mut busy_deadline: Option<Instant> = None;
         loop {
             match self.owner_mode() {
                 OWNER_EXECUTOR => return self.executor_published_config(),
                 OWNER_LEGACY => {}
                 _ => return Err(config_unavailable()),
             }
+            let exec_base_before = self.executor_base_gen.load(Ordering::Acquire);
+            hooks.on_before_cache_check().await;
             let current_gen = self.inner.generation();
-            let (cached, cached_gen) = self.published_config.latest_with_gen();
-            if cached_gen == current_gen {
-                return Ok(cached);
+            if let Some((cached, cached_gen)) = self.published_config.latest_with_gen_if_available()
+            {
+                if cached_gen == current_gen {
+                    hooks.on_after_cache_read().await;
+                    let owner_after = self.owner_mode();
+                    let exec_base_after = self.executor_base_gen.load(Ordering::Acquire);
+                    if owner_after == OWNER_LEGACY && exec_base_after == exec_base_before {
+                        return Ok(cached);
+                    }
+                    return match owner_after {
+                        OWNER_EXECUTOR => self.executor_published_config(),
+                        OWNER_LEGACY => continue,
+                        _ => Err(config_unavailable()),
+                    };
+                }
             }
             let capture_res = {
                 let inner = self.inner.read().await;
@@ -516,21 +675,33 @@ impl ArmSupervisor {
                     return Err(config_unavailable());
                 }
                 let gen = self.inner.generation();
+                hooks.on_before_driver_borrow();
                 PublishedConfigCapture::try_from_inner(&inner).map(|capture| (capture, gen))
             };
             let (capture, gen) = match capture_res {
                 Ok(pair) => pair,
                 Err(DriverBusy) => {
+                    hooks.on_driver_busy();
+                    let deadline = *busy_deadline
+                        .get_or_insert_with(|| Instant::now() + LEGACY_DRIVER_BUSY_RETRY_BUDGET);
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(config_unavailable());
+                    }
                     busy_retries = busy_retries.saturating_add(1);
                     if busy_retries <= BUSY_YIELD_RETRIES {
                         tokio::task::yield_now().await;
                     } else {
-                        tokio::time::sleep(BUSY_RETRY_SLEEP).await;
+                        let remaining = deadline.saturating_duration_since(now);
+                        if remaining.is_zero() {
+                            return Err(config_unavailable());
+                        }
+                        tokio::time::sleep(BUSY_RETRY_SLEEP.min(remaining)).await;
                     }
                     continue;
                 }
             };
-            after_capture(gen).await;
+            hooks.after_capture(gen).await;
             let snap = capture.finalize_arc();
             match self
                 .published_config

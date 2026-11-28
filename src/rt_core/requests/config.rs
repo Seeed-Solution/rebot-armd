@@ -627,6 +627,19 @@ impl PublishedConfigHub {
         (Arc::clone(&g.config), g.legacy_lock_gen)
     }
 
+    /// Returns `(config, legacy_lock_gen)` only when the hub is available, preventing
+    /// a Legacy cache-hit fast path from returning a snapshot after `set_available(false)`.
+    pub fn latest_with_gen_if_available(&self) -> Option<(Arc<PublishedConfig>, u64)> {
+        if !self.available.load(Ordering::Acquire) {
+            return None;
+        }
+        let g = self.slot.read().unwrap_or_else(|e| e.into_inner());
+        if !self.available.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((Arc::clone(&g.config), g.legacy_lock_gen))
+    }
+
     pub fn set_available(&self, available: bool) {
         self.available.store(available, Ordering::Release);
     }
