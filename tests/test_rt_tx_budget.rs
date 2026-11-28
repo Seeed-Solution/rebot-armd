@@ -11,6 +11,10 @@
 //! - Per-frame wall/CPU timing exposed through `GET /api/v1/diagnostics/tick`
 //! - Fail-closed legacy supervisor bridge on a backpressured final release batch
 
+#[path = "common/source_scan.rs"]
+#[allow(dead_code)]
+mod source_scan;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3429,133 +3433,12 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
     }
 }
 
-/// Strip Rust `//` line comments, nested `/* ... */` block comments, string/raw-string contents,
-/// and character literal contents while keeping all code tokens and braces intact.
-fn strip_rust_comments_and_literals(src: &str) -> String {
-    let bytes = src.as_bytes();
-    let len = bytes.len();
-    let mut out = String::with_capacity(len);
-    let mut i = 0usize;
-    while i < len {
-        // Line comment: // ... \n
-        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            i += 2;
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            if i < len {
-                out.push('\n');
-                i += 1;
-            }
-            continue;
-        }
-        // Nested block comment: /* ... */
-        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            let mut depth = 1usize;
-            i += 2;
-            while i < len && depth > 0 {
-                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            out.push(' ');
-            continue;
-        }
-        // Raw string literal: r"...", r#"..."#, br#"..."#
-        let raw_prefix = if bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'r') {
-            Some(i + 2)
-        } else if bytes[i] == b'r'
-            && !i
-                .checked_sub(1)
-                .is_some_and(|p| bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_')
-        {
-            Some(i + 1)
-        } else {
-            None
-        };
-        if let Some(mut j) = raw_prefix {
-            let mut hashes = 0usize;
-            while j < len && bytes[j] == b'#' {
-                hashes += 1;
-                j += 1;
-            }
-            if j < len && bytes[j] == b'"' {
-                j += 1;
-                while j < len {
-                    if bytes[j] == b'"'
-                        && j + hashes < len
-                        && bytes[j + 1..j + 1 + hashes].iter().all(|&b| b == b'#')
-                    {
-                        j += 1 + hashes;
-                        break;
-                    }
-                    j += 1;
-                }
-                out.push_str("\"\"");
-                i = j;
-                continue;
-            }
-        }
-        // Regular string literal: "..." (or b"...")
-        if bytes[i] == b'"' {
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == b'"' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            out.push_str("\"\"");
-            continue;
-        }
-        // Char literal (distinguished from lifetime `'a`): `'...'`
-        if bytes[i] == b'\'' {
-            if bytes.get(i + 1) == Some(&b'\\') {
-                i += 2;
-                while i < len {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'\'' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str("''");
-                continue;
-            }
-            let mut chars = src[i + 1..].char_indices();
-            if let (Some((_, _ch)), Some((end_idx, '\''))) = (chars.next(), chars.next()) {
-                out.push_str("''");
-                i = i + 1 + end_idx + 1;
-                continue;
-            }
-        }
-        let ch = src[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-/// Partition `dm_section` into `(outside_send_compact, send_body_compact)` after stripping
-/// comments/literals and removing all ASCII whitespace so multi-line calls such as
-/// `self.can\n    .transmit(&frame)` or `CanTransport::\n    transmit(...)` are always caught.
+/// Partition `dm_section` into `(outside_send_compact, send_body_compact)` after blanking
+/// comments/literals via the shared lexical cleaner and removing all ASCII whitespace so
+/// multi-line calls such as `self.can\n    .transmit(&frame)` or `CanTransport::\n    transmit(...)`
+/// are always caught.
 fn partition_damiao_send_body_compact(dm_section: &str) -> (String, String) {
-    let clean = strip_rust_comments_and_literals(dm_section);
+    let clean = source_scan::blank_rust_comments_and_literals(dm_section);
     let send_matches: Vec<usize> = clean.match_indices("fn send(").map(|(idx, _)| idx).collect();
     assert_eq!(
         send_matches.len(),
@@ -3590,150 +3473,33 @@ fn partition_damiao_send_body_compact(dm_section: &str) -> (String, String) {
     (compact(&outside), compact(send_body))
 }
 
-fn normalize_src_rel(base: &str, rel: &str) -> String {
-    let mut parts: Vec<&str> = if base.is_empty() { Vec::new() } else { base.split('/').collect() };
-    for seg in rel.split('/') { match seg { "" | "." => {} ".." => { parts.pop(); } s => parts.push(s) } }
-    parts.join("/")
-}
-
-/// Strip `//` and `/* ... */` comments while preserving string literals (for `#[path = "..."]`).
-fn strip_rust_comments_keep_strings(src: &str) -> String {
-    let (bytes, len) = (src.as_bytes(), src.len());
-    let (mut out, mut i) = (String::with_capacity(len), 0);
-    while i < len {
-        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            while i < len && bytes[i] != b'\n' { i += 1; }
-            continue;
-        }
-        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            i += 2; let mut d = 1usize;
-            while i < len && d > 0 {
-                if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' { d += 1; i += 2; }
-                else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' { d -= 1; i += 2; }
-                else { if bytes[i] == b'\n' { out.push('\n'); } i += 1; }
-            }
-            continue;
-        }
-        if bytes[i] == b'"' {
-            out.push('"'); i += 1;
-            while i < len {
-                let c = bytes[i]; out.push(c as char); i += 1;
-                if c == b'\\' && i < len { out.push(bytes[i] as char); i += 1; }
-                else if c == b'"' { break; }
-            }
-            continue;
-        }
-        let ch = src[i..].chars().next().unwrap();
-        out.push(ch); i += ch.len_utf8();
-    }
-    out
-}
-
-/// Build the production corpus from all `src/**/*.rs` files. A file counts as test-only iff at
-/// least one `mod` declaration (including `#[path = "..."]`) resolves to it AND EVERY declaration
-/// resolving to it carries `#[cfg(test)]` (or lives inside a `#[cfg(test)]` block / test-only file).
-fn build_production_corpus(files: &[(String, String)]) -> (Vec<(String, String)>, std::collections::BTreeSet<String>) {
-    use std::collections::{BTreeMap, BTreeSet};
-    let file_set: BTreeSet<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
-    let mut incoming: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
-    for (file_rel, raw) in files {
-        let stripped = strip_rust_comments_keep_strings(raw);
-        let parent = file_rel.rsplit_once('/').map_or("", |(p, _)| p);
-        let stem = file_rel.rsplit_once('/').map_or(file_rel.as_str(), |(_, f)| f).strip_suffix(".rs").unwrap_or("");
-        let is_dir_mod = matches!(file_rel.as_str(), "lib.rs" | "main.rs") || file_rel.ends_with("/mod.rs") || file_rel.starts_with("bin/");
-        let sub_dir = if is_dir_mod { parent.to_string() } else if parent.is_empty() { stem.to_string() } else { format!("{parent}/{stem}") };
-        let (mut attr_cfg_test, mut attr_path, mut cfg_block_depth) = (false, None::<String>, 0usize);
-        for line in stripped.lines() {
-            let t = line.trim();
-            if t.is_empty() { continue; }
-            if cfg_block_depth > 0 {
-                cfg_block_depth = (cfg_block_depth + t.chars().filter(|&c| c == '{').count()).saturating_sub(t.chars().filter(|&c| c == '}').count());
-            }
-            if t.starts_with("#[") {
-                let comp: String = t.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                if comp.contains("cfg(test)") { attr_cfg_test = true; }
-                if let Some(p) = comp.find("path=\"").and_then(|i| comp[i + 6..].split_once('"')).map(|(v, _)| v.to_string()) { attr_path = Some(p); }
-                if !t.contains("mod ") { continue; }
-            }
-            let after_attr = t.rsplit(']').next().unwrap_or(t).trim();
-            let after_vis = after_attr.strip_prefix("pub(").and_then(|r| r.split_once(')')).map_or(after_attr.strip_prefix("pub ").unwrap_or(after_attr), |(_, r)| r).trim();
-            if let Some(name) = after_vis.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')).map(str::trim) {
-                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                    let gated = attr_cfg_test || cfg_block_depth > 0;
-                    let mut cands = if let Some(p) = &attr_path { vec![normalize_src_rel(parent, p), normalize_src_rel(&sub_dir, p)] }
-                        else { vec![normalize_src_rel(&sub_dir, &format!("{name}.rs")), normalize_src_rel(&sub_dir, &format!("{name}/mod.rs"))] };
-                    cands.sort(); cands.dedup();
-                    for cand in cands { if file_set.contains(cand.as_str()) { incoming.entry(cand).or_default().push((file_rel.clone(), gated)); } }
-                }
-                attr_cfg_test = false; attr_path = None; continue;
-            }
-            if attr_cfg_test && cfg_block_depth == 0 {
-                let (o, c) = (t.chars().filter(|&ch| ch == '{').count(), t.chars().filter(|&ch| ch == '}').count());
-                if o > c { cfg_block_depth = o - c; }
-            }
-            attr_cfg_test = false; attr_path = None;
-        }
-    }
-    let mut test_only = BTreeSet::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (rel, _) in files {
-            if !test_only.contains(rel) && incoming.get(rel).is_some_and(|d| !d.is_empty() && d.iter().all(|(s, g)| *g || test_only.contains(s))) {
-                test_only.insert(rel.clone()); changed = true;
-            }
-        }
-    }
-    let corpus = files.iter().filter(|(r, _)| !test_only.contains(r)).map(|(r, raw)| (r.clone(), strip_cfg_test_items(&strip_rust_comments_and_literals(raw)))).collect();
-    (corpus, test_only)
-}
-
-/// Extract all `impl ... <type_name>` blocks from comment/literal/`#[cfg(test)]`-stripped `prod`.
-fn extract_impl_blocks_for_type(prod: &str, type_name: &str) -> (String, String) {
-    let (bytes, len) = (prod.as_bytes(), prod.len());
-    let (mut extracted, mut remainder, mut cursor, mut i) = (String::new(), String::with_capacity(len), 0usize, 0usize);
-    while i + 4 <= len {
-        let is_impl = &bytes[i..i + 4] == b"impl"
-            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
-            && (i + 4 < len && (bytes[i + 4].is_ascii_whitespace() || bytes[i + 4] == b'<'));
-        if is_impl {
-            let (mut j, mut brace) = (i + 4, None);
-            while j < len { if bytes[j] == b';' { break; } else if bytes[j] == b'{' { brace = Some(j); break; } j += 1; }
-            if let Some(bopen) = brace {
-                let hdr = &prod[i..bopen];
-                let target = hdr.rsplit_once(" for ").map_or(hdr, |(_, rhs)| rhs);
-                let targets_type = target.match_indices(type_name).any(|(pos, _)| {
-                    (pos == 0 || !(target.as_bytes()[pos - 1].is_ascii_alphanumeric() || target.as_bytes()[pos - 1] == b'_'))
-                        && (pos + type_name.len() == target.len() || !(target.as_bytes()[pos + type_name.len()].is_ascii_alphanumeric() || target.as_bytes()[pos + type_name.len()] == b'_'))
-                });
-                if targets_type {
-                    let (mut depth, mut bend) = (0usize, None);
-                    for (rel, ch) in prod[bopen..].char_indices() {
-                        if ch == '{' { depth += 1; } else if ch == '}' { depth -= 1; if depth == 0 { bend = Some(bopen + rel); break; } }
-                    }
-                    if let Some(end) = bend {
-                        remainder.push_str(&prod[cursor..i]); extracted.push_str(&prod[i..=end]); extracted.push('\n');
-                        cursor = end + 1; i = cursor; continue;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    remainder.push_str(&prod[cursor..]);
-    (extracted, remainder)
-}
-
+/// Source-level TX chokepoint scanner for `DamiaoArmDriver`.
+///
+/// Threat model: guards against accidental regressions in ordinary code, not adversarial source;
+/// no new parser dependency.
 #[test]
 fn damiao_has_single_can_transmit_chokepoint_in_driver_rs() {
+    // Self-check: verify the whitespace/comment normalizer catches multi-line `.transmit(` and
+    // UFCS `::transmit(` splits while ignoring comments and string literals.
     let synthetic_split = r#"
         impl Foo {
             // self.can.transmit(&commented_out);
             /* self.can
                 .transmit(&block_commented); */
-            fn send(&mut self) { let _s = "self.can.transmit(&in_string)"; self.can.transmit(&frame); }
-            fn sneaky_dot(&mut self) { self.can.transmit(&bad); }
-            fn sneaky_ufcs(&mut self) { CanTransport::transmit(&mut self.can, &bad); }
+            fn send(&mut self) {
+                let _s = "self.can.transmit(&in_string)";
+                self.can
+                    .transmit(&frame);
+            }
+            fn sneaky_dot(&mut self) {
+                self
+                    .can
+                    .transmit(&bad);
+            }
+            fn sneaky_ufcs(&mut self) {
+                CanTransport::
+                    transmit(&mut self.can, &bad);
+            }
         }
     "#;
     let (syn_out, syn_in) = partition_damiao_send_body_compact(synthetic_split);
@@ -3741,13 +3507,40 @@ fn damiao_has_single_can_transmit_chokepoint_in_driver_rs() {
     assert_eq!(syn_out.matches(".transmit(").count(), 1, "must catch multi-line .transmit(: {syn_out}");
     assert_eq!(syn_out.matches("::transmit(").count(), 1, "must catch multi-line ::transmit(: {syn_out}");
 
-    fn assert_damiao_single_chokepoint(files: &[(String, String)], expect_test_only_tx_tests: bool) {
-        let (corpus, test_only) = build_production_corpus(files);
-        if expect_test_only_tx_tests {
-            assert!(test_only.contains("driver/tx_chokepoint_tests.rs"), "driver/tx_chokepoint_tests.rs must be included solely via #[cfg(test)] mod declarations");
-        }
+    fn assert_damiao_single_chokepoint(files: &[(String, String)]) {
+        const NON_DAMIAO_TRANSMIT_IMPL_TYPES: &[&str] = &[
+            "RobStrideArmDriver",
+            "FashionStarArmDriver",
+            "FeetechArmDriver",
+            "SimArmDriver",
+            "SocketCanTransport",
+            "SlcanTransport",
+            "MockCanTransport",
+        ];
+        let (corpus, test_only) = source_scan::build_production_corpus(files);
+        assert!(
+            test_only.contains("driver/tx_chokepoint_tests.rs"),
+            "driver/tx_chokepoint_tests.rs must be included solely via #[cfg(test)] mod declarations"
+        );
         let mut dm_section = String::new();
-        for (_rel, prod) in &corpus { dm_section.push_str(&extract_impl_blocks_for_type(prod, "DamiaoArmDriver").0); }
+        for (rel, prod) in &corpus {
+            let (dm_impls, mut rem) = source_scan::extract_impl_blocks_for_type(prod, "DamiaoArmDriver");
+            dm_section.push_str(&dm_impls);
+            for non_dm_ty in NON_DAMIAO_TRANSMIT_IMPL_TYPES {
+                rem = source_scan::extract_impl_blocks_for_type(&rem, non_dm_ty).1;
+            }
+            let rem_compact: String = rem.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            assert_eq!(
+                rem_compact.matches(".transmit(").count(),
+                0,
+                "production file src/{rel} has `.transmit(` outside DamiaoArmDriver::send and allowed non-Damiao driver/transport impls"
+            );
+            assert_eq!(
+                rem_compact.matches("::transmit(").count(),
+                0,
+                "production file src/{rel} has UFCS `::transmit(` outside DamiaoArmDriver::send and allowed non-Damiao driver/transport impls"
+            );
+        }
         assert!(!dm_section.is_empty(), "expected DamiaoArmDriver impl blocks in production corpus");
         let (outside_compact, send_compact) = partition_damiao_send_body_compact(&dm_section);
 
@@ -3767,21 +3560,40 @@ fn damiao_has_single_can_transmit_chokepoint_in_driver_rs() {
 
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut paths = Vec::new();
-    collect_rs_files(&src_root, &mut paths);
-    let files: Vec<(String, String)> = paths.iter().map(|p| (p.strip_prefix(&src_root).unwrap().to_string_lossy().replace('\\', "/"), std::fs::read_to_string(p).unwrap())).collect();
-    assert_damiao_single_chokepoint(&files, true);
+    source_scan::collect_rs_files(&src_root, &mut paths);
+    let files: Vec<(String, String)> = paths
+        .iter()
+        .map(|p| (p.strip_prefix(&src_root).unwrap().to_string_lossy().replace('\\', "/"), std::fs::read_to_string(p).unwrap()))
+        .collect();
+    assert_damiao_single_chokepoint(&files);
 
-    let mut bad_ungated = files.clone();
-    bad_ungated.push(("driver/leak_mod.rs".into(), "#[path = \"tx_chokepoint_tests.rs\"] mod leak;".into()));
-    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_ungated, true)).is_err(), "must reject ungated #[path] include of tx_chokepoint_tests.rs");
+    // Negative fixtures:
+    // 1. Split-line ungated `#[path = "..."]` + `mod ...;`
+    let mut bad_split_path = files.clone();
+    bad_split_path.push(("driver/leak_mod.rs".into(), "#[\n  path =\n    \"tx_chokepoint_tests.rs\"\n]\nmod\n  leak\n;".into()));
+    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_split_path)).is_err(), "must reject split-line ungated #[path] include");
+    // 2. `#[cfg_attr(any(), cfg(test))]` gate counts as production (not test-only)
+    let mut bad_cfg_attr = files.clone();
+    bad_cfg_attr.push(("driver/leak_cfg_attr.rs".into(), "#[cfg_attr(any(), cfg(test))]\n#[path = \"tx_chokepoint_tests.rs\"]\nmod leak;".into()));
+    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_cfg_attr)).is_err(), "must treat #[cfg_attr(any(), cfg(test))] as production");
+    // 3. `/* { */` inside a `#[cfg(test)] mod` must NOT hide following production code
+    let mut bad_comment_brace = files.clone();
+    bad_comment_brace.push(("driver/can_servo/brace_hide.rs".into(), "#[cfg(test)]\nmod t {\n    /* { */\n}\nfn sneaky(c: &mut impl CanTransport, f: &CanFrame) { let _ = c.transmit(f); }".into()));
+    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_comment_brace)).is_err(), "/* {{ */ inside #[cfg(test)] mod must not hide following production transmit");
+    // 4. `DamiaoArmDriver` impl hidden in `robstride/`
     let mut bad_rs = files.clone();
     if let Some((_, s)) = bad_rs.iter_mut().find(|(r, _)| r == "driver/can_servo/robstride/legacy.rs") {
         s.push_str("\nimpl<C: CanTransport> DamiaoArmDriver<C> { fn sneaky(&mut self, f: &CanFrame) { let _ = self.can.transmit(f); } }\n");
     }
-    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_rs, true)).is_err(), "must catch DamiaoArmDriver impl hidden in robstride/");
+    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_rs)).is_err(), "must catch DamiaoArmDriver impl hidden in robstride/");
+    // 5. Free fn calling transmit in `src/driver/can_servo/**`
+    let mut bad_free_fn = files.clone();
+    bad_free_fn.push(("driver/can_servo/free_tx.rs".into(), "fn sneaky_free(c: &mut impl CanTransport, f: &CanFrame) { let _ = c.transmit(f); }".into()));
+    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_free_fn)).is_err(), "must catch free fn transmit in src/driver/can_servo/**");
+    // 6. UFCS `::transmit(` in `DamiaoArmDriver` impl
     let mut bad_ufcs = files;
     bad_ufcs.push(("driver/bus_servo/injected_dm.rs".into(), "impl<C: CanTransport> DamiaoArmDriver<C> { fn sneaky(&mut self, f: &CanFrame) { let _ = CanTransport::transmit(&mut self.can, f); } }".into()));
-    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_ufcs, true)).is_err(), "must catch UFCS ::transmit( in DamiaoArmDriver impl");
+    assert!(std::panic::catch_unwind(|| assert_damiao_single_chokepoint(&bad_ufcs)).is_err(), "must catch UFCS ::transmit( in DamiaoArmDriver impl");
 }
 
 #[test]
@@ -4573,115 +4385,6 @@ fn slow_cadence_unconfirmed_joint_rotates_both_posvel_and_mit_hold_slots() {
     }
 }
 
-/// Remove every `#[cfg(test)]` item (module, function, or `mod foo;` declaration) from a
-/// comment/literal-stripped Rust source string so static production-code proofs never trip on
-/// unit tests while preserving all non-test production tokens.
-fn strip_cfg_test_items(clean: &str) -> String {
-    let bytes = clean.as_bytes();
-    let len = bytes.len();
-    let mut out = String::with_capacity(len);
-    let mut i = 0usize;
-    while i < len {
-        if bytes[i] == b'#' {
-            // Match `#[cfg(test)]` allowing arbitrary whitespace inside the attribute.
-            let mut j = i + 1;
-            while j < len && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if j < len && bytes[j] == b'[' {
-                let mut depth = 0usize;
-                let attr_start = j;
-                while j < len {
-                    match bytes[j] {
-                        b'[' => depth += 1,
-                        b']' => {
-                            depth -= 1;
-                            j += 1;
-                            if depth == 0 {
-                                break;
-                            }
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                let attr_compact: String = clean[attr_start..j]
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                if attr_compact == "[cfg(test)]" {
-                    // Skip any chained outer attributes (`#[path = "..."]`, `#[allow(...)]`, ...),
-                    // then skip either the item's balanced `{ ... }` block or terminating `;`.
-                    loop {
-                        while j < len && bytes[j].is_ascii_whitespace() {
-                            j += 1;
-                        }
-                        if j < len && bytes[j] == b'#' {
-                            j += 1;
-                            while j < len && bytes[j].is_ascii_whitespace() {
-                                j += 1;
-                            }
-                            if j < len && bytes[j] == b'[' {
-                                let mut ad = 0usize;
-                                while j < len {
-                                    match bytes[j] {
-                                        b'[' => ad += 1,
-                                        b']' => {
-                                            ad -= 1;
-                                            j += 1;
-                                            if ad == 0 {
-                                                break;
-                                            }
-                                            continue;
-                                        }
-                                        _ => {}
-                                    }
-                                    j += 1;
-                                }
-                                continue;
-                            }
-                        }
-                        break;
-                    }
-                    while j < len {
-                        if bytes[j] == b';' {
-                            j += 1;
-                            break;
-                        }
-                        if bytes[j] == b'{' {
-                            let mut bd = 0usize;
-                            while j < len {
-                                match bytes[j] {
-                                    b'{' => bd += 1,
-                                    b'}' => {
-                                        bd -= 1;
-                                        j += 1;
-                                        if bd == 0 {
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    _ => {}
-                                }
-                                j += 1;
-                            }
-                            break;
-                        }
-                        j += 1;
-                    }
-                    i = j;
-                    continue;
-                }
-            }
-        }
-        let ch = clean[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
 /// Partition `clean` (already comment/literal/test-stripped) around the unique function definition
 /// matching `fn_prefix` (e.g. `"fn emit_pos_force_frame("`) into `(outside_compact, body_compact)`.
 fn partition_unique_fn_compact(clean: &str, fn_prefix: &str) -> (String, String) {
@@ -4717,21 +4420,6 @@ fn partition_unique_fn_compact(clean: &str, fn_prefix: &str) -> (String, String)
     let outside = format!("{}{}", &clean[..fn_start], &clean[body_end + 1..]);
     let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
     (compact(&outside), compact(body))
-}
-
-fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
-        .map(|e| e.expect("dir entry").path())
-        .collect();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            collect_rs_files(&path, out);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
 }
 
 /// True iff `compact_lower` (whitespace-stripped, lowercased production source) contains a hex
@@ -4805,6 +4493,10 @@ fn partition_allowlisted_fns_compact<'a>(
     (compact(&outside), bodies)
 }
 
+/// Source-level single-emitter scanner for Damiao J7 `PosForce` (`0x307`) frames.
+///
+/// Threat model: guards against accidental regressions in ordinary code, not adversarial source;
+/// no new parser dependency.
 #[test]
 fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
     // Self-check: verify multi-line splits, raw 0x307 / 0x300 / CanFrame literals, and unlisted
@@ -4837,7 +4529,9 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
             fn t() { let _ = (0x307, CanFrame { id: 0x300 }, build_pos_force_frame(0x300, 7, 0.0, 0, 0)); }
         }
     "#;
-    let syn_prod = strip_cfg_test_items(&strip_rust_comments_and_literals(synthetic));
+    let syn_prod = source_scan::strip_cfg_test_items_cleaned(
+        &source_scan::blank_rust_comments_and_literals(synthetic),
+    );
     let (syn_out, syn_in) = partition_unique_fn_compact(&syn_prod, "fn emit_pos_force_frame(");
     assert_eq!(syn_in.matches("build_pos_force_frame(").count(), 1);
     assert_eq!(
@@ -4865,7 +4559,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
 
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut paths = Vec::new();
-    collect_rs_files(&src_root, &mut paths);
+    source_scan::collect_rs_files(&src_root, &mut paths);
     assert!(!paths.is_empty(), "expected Rust source files under src/");
     let files: Vec<(String, String)> = paths.iter().map(|p| {
         let rel = p.strip_prefix(&src_root).expect("relative under src/").to_string_lossy().replace('\\', "/");
@@ -4873,7 +4567,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
     }).collect();
 
     let assert_pos_force_single_emitter = |src_files: &[(String, String)]| {
-        let (corpus, test_only) = build_production_corpus(src_files);
+        let (corpus, test_only) = source_scan::build_production_corpus(src_files);
         assert!(
             test_only.contains("driver/tx_chokepoint_tests.rs"),
             "driver/tx_chokepoint_tests.rs must be included solely via #[cfg(test)] mod declarations"
@@ -4933,14 +4627,12 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
             if rel == "driver.rs" || rel.starts_with("driver/") {
                 all_driver_prod.push_str(prod);
                 all_driver_prod.push('\n');
-                let (dm_impls, rem) = extract_impl_blocks_for_type(prod, "DamiaoArmDriver");
+                // No file-remainder exemption for `gripper_j7.rs`: everything outside `impl ... DamiaoArmDriver`
+                // flows into `outside_damiao_driver_prod`, while `fn build_wire_frame(` is exempted strictly by
+                // its single fn body below.
+                let (dm_impls, rem) = source_scan::extract_impl_blocks_for_type(prod, "DamiaoArmDriver");
                 damiao_prod.push_str(&dm_impls);
-                if rel == "driver/can_servo/gripper_j7.rs" {
-                    // `trait DamiaoTxKind` and `mod pos_force_emitter` are part of the Damiao emitter unit.
-                    damiao_prod.push_str(&rem);
-                } else {
-                    outside_damiao_driver_prod.push_str(&rem);
-                }
+                outside_damiao_driver_prod.push_str(&rem);
                 if !DRIVER_EMIT_J7_FILES.contains(&rel.as_str()) {
                     assert_eq!(compact.matches("emit_pos_force_j7(").count(), 0, "production file src/{rel} must not call emit_pos_force_j7(");
                     assert_eq!(compact.matches("emit_and_merge_pos_force_j7(").count(), 0, "production file src/{rel} must not call emit_and_merge_pos_force_j7(");
@@ -5016,8 +4708,12 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
             assert_eq!(body.matches(api).count(), 1, "allow-listed {fn_name} expected exactly 1 {api} call");
         }
 
-        let outside_dm_compact: String = outside_damiao_driver_prod.chars().filter(|c| !c.is_ascii_whitespace()).collect::<String>()
-            .replacen("pub(crate)usegripper_j7::pos_force_emitter::PosForceSendToken;", "", 1);
+        let outside_dm_compact: String = outside_damiao_driver_prod
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect::<String>()
+            .replacen("pub(crate)usegripper_j7::pos_force_emitter::PosForceSendToken;", "", 1)
+            .replacen("fnpos_force_token(&self)->Option<&pos_force_emitter::PosForceSendToken>{None}", "", 1);
         assert_eq!(outside_dm_compact.matches("pos_force_emitter::").count(), 0, "src/driver/** must have ZERO pos_force_emitter:: calls outside DamiaoArmDriver");
 
         const EMIT_TICK_ALLOWLIST: &[(&str, &str)] = &[
@@ -5038,10 +4734,16 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
 
     assert_pos_force_single_emitter(&files);
 
-    // Negative fixtures for every previously skipped / split case:
-    let mut bad_ungated = files.clone();
-    bad_ungated.push(("driver/leak_mod.rs".into(), "#[path = \"tx_chokepoint_tests.rs\"] mod leak;".into()));
-    assert!(std::panic::catch_unwind(|| assert_pos_force_single_emitter(&bad_ungated)).is_err(), "must reject ungated #[path] include of tx_chokepoint_tests.rs");
+    // Negative fixtures:
+    let mut bad_split_path = files.clone();
+    bad_split_path.push(("driver/leak_mod.rs".into(), "#[\n  path =\n    \"tx_chokepoint_tests.rs\"\n]\nmod\n  leak\n;".into()));
+    assert!(std::panic::catch_unwind(|| assert_pos_force_single_emitter(&bad_split_path)).is_err(), "must reject split-line ungated #[path] include");
+    let mut bad_cfg_attr = files.clone();
+    bad_cfg_attr.push(("driver/leak_cfg_attr.rs".into(), "#[cfg_attr(any(), cfg(test))]\n#[path = \"tx_chokepoint_tests.rs\"]\nmod leak;".into()));
+    assert!(std::panic::catch_unwind(|| assert_pos_force_single_emitter(&bad_cfg_attr)).is_err(), "must treat #[cfg_attr(any(), cfg(test))] as production");
+    let mut bad_comment_brace = files.clone();
+    bad_comment_brace.push(("driver/can_servo/brace_hide.rs".into(), "#[cfg(test)]\nmod t {\n    /* { */\n}\nfn sneaky() -> u16 { 0x307 }".into()));
+    assert!(std::panic::catch_unwind(|| assert_pos_force_single_emitter(&bad_comment_brace)).is_err(), "/* {{ */ inside #[cfg(test)] mod must not hide following production 0x307");
     let mut bad_table_0x307 = files.clone();
     if let Some((_, s)) = bad_table_0x307.iter_mut().find(|(r, _)| r == "driver/can_servo/damiao/table.rs") {
         s.push_str("\npub fn sneaky() -> CanFrame { CanFrame::new_standard(0x307, &[0; 8]).unwrap() }\n");
@@ -5050,6 +4752,11 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
     let mut bad_sibling_emit = files.clone();
     bad_sibling_emit.push(("driver/can_servo/new_sibling.rs".into(), "fn sneaky(d: &mut dyn PosForceExt) { let _ = d.emit_pos_force_j7(intent, stamp); }".into()));
     assert!(std::panic::catch_unwind(|| assert_pos_force_single_emitter(&bad_sibling_emit)).is_err(), "must reject emit_pos_force_j7 caller in a new driver sibling module");
+    let mut bad_gripper_ref = files.clone();
+    if let Some((_, s)) = bad_gripper_ref.iter_mut().find(|(r, _)| r == "driver/can_servo/gripper_j7.rs") {
+        s.push_str("\nfn sneaky_extra_emitter_ref() { let _ = pos_force_emitter::authorize_kind; }\n");
+    }
+    assert!(std::panic::catch_unwind(|| assert_pos_force_single_emitter(&bad_gripper_ref)).is_err(), "must reject extra pos_force_emitter:: reference in gripper_j7.rs outside the emitter");
     let mut bad_build = files.clone();
     bad_build.push(("driver/can_servo/injected_pf.rs".into(), "fn sneaky(t: &PosForceSendToken) { let _ = damiao::build_pos_force_frame(t, 1, 7, 0.0, 0, 1); }".into()));
     assert!(std::panic::catch_unwind(|| assert_pos_force_single_emitter(&bad_build)).is_err(), "must reject build_pos_force_frame( in src/driver/**");
