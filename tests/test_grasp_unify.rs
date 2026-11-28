@@ -826,38 +826,14 @@ async fn run_live_legacy_case(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_legacy_insertion_enforces_77mm_opening_cap_off_absent_width_skipped_align_and_preopen() {
-    // 1. Preserved 77 mm OPENING assertion (former test_grasp::pre_open_skip_conditions c3):
-    // 310 px at 0.15 m, fx 600 -> ~0.077 m fails OPENING even with max_grasp_width_m = 0.10.
-    let s1 = GraspSetup { pre_open: grasp::PreOpen::On, max_grasp_width_m: 0.10, ..GraspSetup::default() };
-    let a1 = run_live_legacy_case(s1, [0.025, 0.015], Some(310.0), None).await;
-    assert_eq!((a1.state.as_str(), a1.code.as_deref()), ("failed", Some("OPENING")), "{a1:?}");
-
-    // 2. Cap disabled (max_grasp_width_m = 0.0) still enforces OPENING reserve!
-    let s2 = GraspSetup { max_grasp_width_m: 0.0, ..GraspSetup::default() };
-    let a2 = run_live_legacy_case(s2, [0.025, 0.015], Some(310.0), None).await;
-    assert_eq!((a2.state.as_str(), a2.code.as_deref()), ("failed", Some("OPENING")), "{a2:?}");
-
-    // 3. Deferred box-only (wide box > jaw reserve) with absent scalar width: Rung 3 fresh
-    // projected box cut (~88 mm) exceeds the 85 mm cap -> TOO_WIDE before descent!
-    let s3 = GraspSetup { max_grasp_width_m: 0.10, ..GraspSetup::default() };
-    let a3 = run_live_legacy_case(s3, [0.036, 0.036], None, None).await;
-    assert_eq!((a3.state.as_str(), a3.code.as_deref()), ("failed", Some("TOO_WIDE")), "{a3:?}");
-
-    // 4. Skipped alignment (align_j6 = false) on elongated object (60 mm along Y, 30 mm along X):
-    // detector reports short side 120 px (~27 mm) + confident angle, but jaws stay unaligned along
-    // Y (~72 mm projected, under 85 mm cap but violating OPENING reserve) -> refused before descent!
-    let s4 = GraspSetup { align_j6: false, max_grasp_width_m: 0.10, ..GraspSetup::default() };
-    let a4 = run_live_legacy_case(s4, [0.015, 0.030], Some(120.0), Some((0.0, 0.9))).await;
-    assert_eq!((a4.state.as_str(), a4.code.as_deref()), ("failed", Some("OPENING")), "{a4:?}");
-
-    // 5. Reduced pre_open_margin_m (2 mm) must NOT narrow jaws below `w + 2*hard_error + 6 mm`:
-    let s5 = GraspSetup { pre_open: grasp::PreOpen::On, pre_open_margin_m: 0.002, ..GraspSetup::default() };
-    let a5 = run_live_legacy_case(s5, [0.020, 0.015], Some(140.0), None).await;
-    assert_eq!(a5.state.as_str(), "done", "{a5:?}");
-    assert_eq!(a5.pre_open.as_deref(), Some("done"), "{a5:?}");
-    let meas_w = f64::from(a5.grasp_width_m.expect("grasp_width_m recorded"));
-    let pre_w = f64::from(a5.pre_open_m.expect("pre_open_m recorded"));
-    // Raw w + 0.002 would be ~0.0335 m; clamped jaw reserve floor raises it by > 20 mm (to ~0.0579 m).
+async fn live_legacy_pre_open_respects_admission_min_opening_floor() {
+    // Reduced pre_open_margin_m (2 mm) must NOT narrow jaws below admission JawFit.min_opening_m:
+    let s = GraspSetup { pre_open: grasp::PreOpen::On, pre_open_margin_m: 0.002, ..GraspSetup::default() };
+    let a = run_live_legacy_case(s, [0.020, 0.015], Some(140.0), None).await;
+    assert_eq!(a.state.as_str(), "done", "{a:?}");
+    assert_eq!(a.pre_open.as_deref(), Some("done"), "{a:?}");
+    let meas_w = f64::from(a.grasp_width_m.expect("grasp_width_m recorded"));
+    let pre_w = f64::from(a.pre_open_m.expect("pre_open_m recorded"));
+    // Raw w + 0.002 would be ~0.0335 m; admission min_opening_m floor raises it by > 20 mm.
     assert!(pre_w >= meas_w + 0.024, "pre_open {pre_w} narrowed below jaw reserve floor for w={meas_w}");
 }

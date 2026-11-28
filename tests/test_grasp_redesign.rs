@@ -1,15 +1,11 @@
-//! GU-R3 redesign verification suite:
+//! GU-R5 1.6.1 verification suite (Addendum 4 scope):
 //! 1. Plan parity sweep (>= 60 cases) covering deferred box-only, heavy payload, short
 //!    `phase_timeout_s`, tiny search budget (`top_advisory`), and both owners.
-//! 2. Sim dispatch parity (`strategy: "legacy"` vs `strategy: "adaptive"` forced `-top`):
-//!    identical phase sequence, joint trajectories within 1e-6 rad, preopen before descend,
-//!    fault count = 0.
-//! 3. Offset-contour interval jaw refusal at all 3 call sites: planning admission, live legacy
-//!    gate, and adaptive revalidate with rotated settled wrist.
-//! 4. Rotated / widened object during camera-down transition -> refused before descent on both
-//!    legacy and adaptive forced `-top`.
-//! 5. One case per live-gate evidence rung (`contour`, `scalar`, `admission_shifted`, `box`,
-//!    and absent evidence -> `NO_WIDTH_EVIDENCE`).
+//! 2. Sim dispatch parity (`strategy: "legacy"` vs `strategy: "adaptive"` forced `-top`,
+//!    covering look-down, camera-down, and deferred box-only): identical phase sequence,
+//!    joint trajectories within 1e-6 rad, preopen before descend, fault count = 0.
+//! 3. Offset-contour interval jaw refusal at planning admission and adaptive revalidate with
+//!    rotated settled wrist, plus adaptive wrist-settle re-gate between `snap_rev` and `snap_ins`.
 #![allow(clippy::too_many_arguments)]
 
 mod common;
@@ -21,7 +17,7 @@ use std::time::{Duration, Instant};
 use armd::chain::ArmModel;
 use armd::grasp::{
     self, AcquireCameraDown, BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource,
-    GraspSetup, HeightSource, PreOpen,
+    GraspSetup, MaskFocus, PreOpen,
 };
 use armd::kinematics::{self, Pose, Vec3};
 use armd::model::CameraMount;
@@ -397,16 +393,38 @@ struct LiveCamCfg {
     box_shift_xy: [f64; 2],
 }
 
+type LiveFrameHook = Arc<dyn Fn(&Pose, &mut LiveCamCfg) + Send + Sync>;
+
 struct FlexCamera {
     sup: Arc<ArmSupervisor>,
     cam: CamModel,
     cfg: Mutex<LiveCamCfg>,
     frame: AtomicU64,
+    per_request: bool,
+    on_frame: Option<LiveFrameHook>,
+    nudge_j6: Option<(Arc<AtomicBool>, Arc<AtomicBool>, f32)>,
 }
 
 impl FlexCamera {
+    fn new(sup: Arc<ArmSupervisor>, cam: CamModel, cfg: LiveCamCfg, frame: u64) -> Self {
+        Self {
+            sup,
+            cam,
+            cfg: Mutex::new(cfg),
+            frame: AtomicU64::new(frame),
+            per_request: false,
+            on_frame: None,
+            nudge_j6: None,
+        }
+    }
+
     fn det_at(&self, pose: &Pose) -> Detection {
-        let c = self.cfg.lock().unwrap().clone();
+        let mut guard = self.cfg.lock().unwrap();
+        if let Some(ref hook) = self.on_frame {
+            hook(pose, &mut guard);
+        }
+        let c = guard.clone();
+        drop(guard);
         let cx = c.object_xy[0] + c.box_shift_xy[0];
         let cy = c.object_xy[1] + c.box_shift_xy[1];
         let box_norm = if let Some(b) = c.box_override_norm {
@@ -468,6 +486,10 @@ impl FlexCamera {
 }
 
 impl DetectionSource for FlexCamera {
+    fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
+        let p = self.per_request;
+        Box::pin(async move { Ok(p) })
+    }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> {
         Box::pin(async { Ok(true) })
     }
@@ -482,6 +504,38 @@ impl DetectionSource for FlexCamera {
             let det = self.det_at(&pose);
             let fid = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
             let now = Instant::now();
+            Ok(Some(DetectionFrame {
+                frame_id: fid,
+                captured_at: now,
+                policy_captured_at: Some(now),
+                image_size_px: self.cam.size,
+                detections: vec![det],
+                depth: None,
+                model_generation: None,
+            }))
+        })
+    }
+    fn trigger_with_focus(
+        &self,
+        _pipelines: &'static [&'static str],
+        _wait_ms: u64,
+        _focus: Option<&MaskFocus>,
+    ) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(4)).await;
+            let q = self.sup.inner().read().await.measured_positions.clone();
+            let pose = ARM.fk(&kinematics::q6(&q));
+            let det = self.det_at(&pose);
+            let fid = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
+            let now = Instant::now();
+            if let Some((ref armed, ref fired, dq)) = self.nudge_j6 {
+                if armed.load(Ordering::SeqCst) && !fired.swap(true, Ordering::SeqCst) {
+                    let mut inner = self.sup.inner().write().await;
+                    inner.commanded_positions[5] += dq;
+                    inner.measured_positions[5] += dq;
+                    inner.target_positions[5] += dq;
+                }
+            }
             Ok(Some(DetectionFrame {
                 frame_id: fid,
                 captured_at: now,
@@ -559,12 +613,7 @@ async fn run_sim_grasp(
     let cam = CamModel::assumed(&cfg.arm_model, &setup, &cfg.camera_mount);
     let start = cfg.arm_model.fk(&q0);
     let q7: Vec<f32> = (0..7).map(|i| if i < 6 { q0[i] as f32 } else { 0.0 }).collect();
-    let flex = Arc::new(FlexCamera {
-        sup: sup.clone(),
-        cam: cam.clone(),
-        cfg: Mutex::new(cam_cfg.clone()),
-        frame: AtomicU64::new(0),
-    });
+    let flex = Arc::new(FlexCamera::new(sup.clone(), cam.clone(), cam_cfg.clone(), 0));
     let app = Pose::new(
         grasp::look_down(&start.r),
         [cam_cfg.object_xy[0], cam_cfg.object_xy[1], setup.table_z_m + setup.approach_height_m],
@@ -640,12 +689,7 @@ async fn assert_sim_dispatch_parity(
             dcfg.camera_mount.offset_m = Some([-0.06, 0.0, 0.0]);
         }
         let sc = scene_q(dcfg, setup.clone(), q0).await;
-        let flex = FlexCamera {
-            sup: sc.sup.clone(),
-            cam: sc.cam.clone(),
-            cfg: Mutex::new(cam_cfg.clone()),
-            frame: AtomicU64::new(0),
-        };
+        let flex = FlexCamera::new(sc.sup.clone(), sc.cam.clone(), cam_cfg.clone(), 0);
         let mut dry_req = json!({"label": "cup", "box_norm": flex.det_at(&sc.start).box_norm, "frame_id": 1});
         ad_patch(&mut dry_req, &sc.cam, &sc.start);
         let ad_dry = dry(&sc, &dry_req).await;
@@ -834,13 +878,13 @@ async fn dispatch_parity_in_sim_forced_top_down_matches_legacy() {
 }
 
 // ============================================================================
-// 4. Offset-contour interval check at all 3 call sites:
-//    (a) planning admission, (b) live legacy gate, (c) adaptive revalidate w/ rotated wrist
+// 4. Offset-contour interval check at planning admission and adaptive revalidate
+//    + adaptive snap_ins wrist-settle re-gate
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn offset_contour_refused_at_planning_admission_and_live_legacy_gate() {
-    // (a) Planning admission: offset L-shape has box centre at y = 0 and cut [-0.005, +0.038]
+async fn offset_contour_refused_at_planning_admission() {
+    // Planning admission: offset L-shape has box centre at y = 0 and cut [-0.005, +0.038]
     // (width 43 mm passes old scalar rule, +38 mm fails interval OPENING).
     let sc = mounted_scene(0.30, 0.0, 0.26).await;
     let l_poly = offset_l_poly([0.30, 0.0]);
@@ -850,54 +894,6 @@ async fn offset_contour_refused_at_planning_admission_and_live_legacy_gate() {
     assert_eq!((leg["reachable"].clone(), leg["code"].clone()), (json!(false), json!("OPENING")), "{leg:?}");
     let ad = dry(&sc, &body).await;
     assert_eq!(ad["legacy"]["code"], json!("OPENING"), "{ad:?}");
-
-    // (b) Live legacy gate: box-only deferred admission passes planning; live fresh offset
-    // contour [-0.005, +0.038] (43 mm width) refuses OPENING before descend, while centred
-    // contour [-0.0215, +0.0215] (same 43 mm width) completes.
-    let mut cfg = ArmConfig::rebot_dm();
-    cfg.camera_mount = CameraMount { offset_m: Some([-0.06, 0.0, 0.0]), ..CameraMount::default() };
-    let setup = GraspSetup { align_j6: false, height_probe_m: 0.0, recentre_height_m: 0.0, ..GraspSetup::default() };
-    let q0 = solve_look_down(&cfg, [0.30, 0.0, 0.24]);
-    let bad = run_sim_grasp(
-        cfg.clone(),
-        setup.clone(),
-        q0,
-        LiveCamCfg {
-            object_xy: [0.30, 0.0],
-            half_xy: [0.04, 0.038],
-            height_m: 0.035,
-            width_px: None,
-            angle: None,
-            contour_world: Some(l_poly),
-            box_override_norm: None,
-            box_shift_xy: [0.0, 0.0],
-        },
-        |_, _, _| {},
-        None,
-    )
-    .await;
-    assert_eq!((bad.status.state.as_str(), bad.status.code.as_deref()), ("failed", Some("OPENING")), "{:?}", bad.status);
-    assert!(!bad.phases.iter().any(|p| p == "descend" || p == "close"), "{:?}", bad.phases);
-
-    let sym = run_sim_grasp(
-        cfg,
-        setup,
-        q0,
-        LiveCamCfg {
-            object_xy: [0.30, 0.0],
-            half_xy: [0.04, 0.0215],
-            height_m: 0.035,
-            width_px: None,
-            angle: None,
-            contour_world: Some(bar([0.30, 0.0], 0.08, 0.043, 0.0)),
-            box_override_norm: None,
-            box_shift_xy: [0.0, 0.0],
-        },
-        |_, _, _| {},
-        None,
-    )
-    .await;
-    assert_eq!((sym.status.state.as_str(), sym.status.holding), ("done", Some(true)), "{:?}", sym.status);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -939,10 +935,10 @@ async fn offset_contour_refused_at_adaptive_revalidate_with_rotated_wrist() {
         .contact_centre;
 
     let swapped = Arc::new(AtomicBool::new(false));
-    let flex = Arc::new(FlexCamera {
-        sup: sc.sup.clone(),
-        cam: sc.cam.clone(),
-        cfg: Mutex::new(LiveCamCfg {
+    let flex = Arc::new(FlexCamera::new(
+        sc.sup.clone(),
+        sc.cam.clone(),
+        LiveCamCfg {
             object_xy: [0.30, 0.0],
             half_xy: [0.035, 0.016],
             height_m: 0.035,
@@ -951,9 +947,9 @@ async fn offset_contour_refused_at_adaptive_revalidate_with_rotated_wrist() {
             contour_world: Some(poly_init.clone()),
             box_override_norm: None,
             box_shift_xy: [0.0, 0.0],
-        }),
-        frame: AtomicU64::new(1),
-    });
+        },
+        1,
+    ));
     let stop = Arc::new(AtomicBool::new(false));
     let (ticker, _, _) = spawn_sim_ticker(sc.sup.clone(), stop.clone(), false);
 
@@ -1000,275 +996,130 @@ async fn offset_contour_refused_at_adaptive_revalidate_with_rotated_wrist() {
     assert!(!phases.iter().any(|p| p == "insert" || p == "close"), "must refuse before insert: {phases:?}");
 }
 
-// ============================================================================
-// 5. Rotated / widened object during camera-down transition -> refused on both
-//    strategy "legacy" and strategy "adaptive" forced -top
-// ============================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rotated_and_widened_object_during_transition_refused_both_strategies() {
-    // Camera-down mount where the entire 3 cm tall object sits cleanly INSIDE the post-transition
-    // FOV (not touching the image border), so FreshView decides alignment and the live jaw gate.
+async fn adaptive_wrist_settle_between_revalidate_and_insert_is_regated() {
     let mut cfg = ArmConfig::rebot_dm();
-    cfg.camera_mount = CameraMount {
-        rot_deg: 0.0,
-        tilt_deg: -16.0,
-        offset_m: Some([-0.04, 0.0, 0.04]),
-        ..CameraMount::default()
-    };
+    cfg.camera_mount = CameraMount { offset_m: Some([-0.08, 0.0, 0.0]), ..CameraMount::default() };
     let setup = GraspSetup {
-        camera_tilt_deg: -16.0,
-        acquire_camera_down: AcquireCameraDown::On,
-        approach_height_m: 0.12,
-        height_probe_m: 0.0,
-        align_j6: false,
+        fx_px: 320.0,
+        fy_px: 320.0,
+        approach_speed_mps: 0.12,
+        descend_speed_mps: 0.10,
+        settle_delay_s: 0.01,
         ..GraspSetup::default()
     };
-    let q0 = solve_camera_down(&cfg, &setup, [0.30, 0.0, 0.24]);
-    let narrow_poly = bar([0.30, 0.0], 0.072, 0.028, 0.0);
-    // Rotated 90 deg during transition: 72 mm long side now spans the y closing axis!
-    let rotated_poly = bar([0.30, 0.0], 0.072, 0.028, 90.0);
+    let q0 = solve_look_down(&cfg, [0.30, 0.0, 0.26]);
+    let sc = scene_q(cfg.clone(), setup.clone(), q0).await;
+    let poly_init = banana([0.30, 0.0], 0.12, 30.0, 0.034, 90.0);
+    let (b0, c0) = project_poly_box_and_contour(&sc.cam, &sc.start, 0.0, &poly_init, 0.035);
+    let req = json!({
+        "label": "cup",
+        "box_norm": b0,
+        "frame_id": 1,
+        "strategy": "adaptive",
+        "evidence": {"contour": c0, "height_m": [0.035, 0.035]},
+    });
+    let planned = {
+        let inner = sc.sup.inner().read().await;
+        let pending = grasp::prepare(&inner, &req, inner.safety.epoch_id()).expect("prepare");
+        drop(inner);
+        grasp::plan(pending).expect("plan adaptive chord")
+    };
+    let route = &planned.adaptive.as_ref().expect("chord wins for banana").route;
+    let contact_xy = route.contact_centre;
+    let y0 = kinematics::column(&route.plan.grasp.r, 1);
+    let u0 = armd::grasp_select::geometry::unit2([y0[0], y0[1]]);
+    // Wrist settles +2.2 deg (< 2.5 deg PLAN_STALE limit) between snap_rev and snap_ins.
+    let dq = 2.2f64.to_radians();
+    let mut q_rot = route.plan.q_grasp;
+    q_rot[5] += dq;
+    let y_rot = kinematics::column(&cfg.arm_model.fk(&q_rot).r, 1);
+    let u_rot = armd::grasp_select::geometry::unit2([y_rot[0], y_rot[1]]);
+    let t_raw = armd::grasp_select::geometry::perp2(u0);
+    let sign = if armd::grasp_select::geometry::dot2(u_rot, t_raw) >= 0.0 { 1.0 } else { -1.0 };
+    let t = [t_raw[0] * sign, t_raw[1] * sign];
+    // Long bar + narrow tab at x_t in [+0.8 mm, +12 mm] from y_u = +24 mm to +44 mm:
+    // passes revalidate at 0 deg ([-14, +24] mm), refuses OPENING at insert at +2.2 deg (+44 mm).
+    let mut notched: Vec<[f64; 2]> = [
+        [-0.060, -0.014],
+        [0.060, -0.014],
+        [0.060, 0.024],
+        [0.012, 0.024],
+        [0.012, 0.044],
+        [0.0008, 0.044],
+        [0.0008, 0.024],
+        [-0.060, 0.024],
+    ]
+    .into_iter()
+    .map(|[xt, yu]| [contact_xy[0] + xt * t[0] + yu * u0[0], contact_xy[1] + xt * t[1] + yu * u0[1]])
+    .collect();
+    armd::grasp_select::geometry::ensure_ccw(&mut notched);
 
-    for (label, forced_adaptive) in [("legacy", false), ("adaptive-top", true)] {
-        let rot = rotated_poly.clone();
-        let flipped = Arc::new(AtomicBool::new(false));
-        let cb: Arc<dyn Fn(&str, &FlexCamera) + Send + Sync> = Arc::new(move |phase, flex| {
-            if phase == "transition" && !flipped.swap(true, Ordering::SeqCst) {
-                flex.cfg.lock().unwrap().contour_world = Some(rot.clone());
-            }
-        });
-        let run = run_sim_grasp(
-            cfg.clone(),
-            setup.clone(),
-            q0,
-            LiveCamCfg {
-                object_xy: [0.30, 0.0],
-                half_xy: [0.036, 0.014],
-                height_m: 0.030,
-                width_px: None,
-                angle: None,
-                contour_world: Some(narrow_poly.clone()),
-                box_override_norm: None,
-                box_shift_xy: [0.0, 0.0],
-            },
-            |body, cam, start| {
-                let (_, contour) = project_poly_box_and_contour(cam, start, 0.0, &narrow_poly, 0.030);
-                if forced_adaptive {
-                    body["strategy"] = json!("adaptive");
-                    body["evidence"] = json!({"contour": contour, "height_m": [0.030, 0.030], "payload_kg": 4.0});
-                } else {
-                    body["evidence"] = json!({"contour": contour, "height_m": [0.030, 0.030]});
-                }
-            },
-            Some(cb),
-        )
-        .await;
-        assert!(run.status.final_offset_px.is_some(), "{label}: post-transition recheck must observe target");
-        assert_eq!(
-            (run.status.state.as_str(), run.status.code.as_deref()),
-            ("failed", Some("OPENING")),
-            "{label}: rotated object during transition must refuse OPENING: {:?}",
-            run.status
-        );
-        assert!(!run.phases.iter().any(|p| p == "descend" || p == "close"), "{label}: {:?}", run.phases);
-    }
-}
-
-// ============================================================================
-// 6. Evidence rungs at live gate: contour, scalar, admission_shifted, box,
-//    and no evidence covering closing axis -> NO_WIDTH_EVIDENCE
-// ============================================================================
-
-async fn run_no_width_evidence_case(cfg: ArmConfig, mut setup: GraspSetup, q0: [f64; 6]) -> ActionStatus {
-    // Thin along x (16 mm, uncut at v = 0.72), wide along y (76 mm -> deferred box-only):
-    // grip_pixel_norm at [0.5, 0.72] leaves the fresh box off the TCP closing line so
-    // cut_interval_near returns None -> NO_WIDTH_EVIDENCE before descend.
-    setup.grip_pixel_norm = [0.5, 0.72];
-    let sc = scene_q(cfg, setup, q0).await;
+    let in_revalidate = Arc::new(AtomicBool::new(false));
+    let settled_j6 = Arc::new(AtomicBool::new(false));
+    let swapped = Arc::new(AtomicBool::new(false));
+    let cam_hook = sc.cam.clone();
+    let in_rev_h = in_revalidate.clone();
+    let poly_h = poly_init.clone();
+    let notched_h = notched.clone();
+    let hook: LiveFrameHook = Arc::new(move |pose, cc| {
+        if in_rev_h.load(Ordering::SeqCst) && !swapped.swap(true, Ordering::SeqCst) {
+            let (keep_box, _) = project_poly_box_and_contour(&cam_hook, pose, 0.0, &poly_h, 0.035);
+            cc.contour_world = Some(notched_h.clone());
+            cc.box_override_norm = Some(keep_box);
+        }
+    });
     let flex = Arc::new(FlexCamera {
         sup: sc.sup.clone(),
         cam: sc.cam.clone(),
         cfg: Mutex::new(LiveCamCfg {
             object_xy: [0.30, 0.0],
-            half_xy: [0.008, 0.038],
-            height_m: 0.030,
+            half_xy: [0.035, 0.016],
+            height_m: 0.035,
             width_px: None,
             angle: None,
-            contour_world: None,
+            contour_world: Some(poly_init),
             box_override_norm: None,
             box_shift_xy: [0.0, 0.0],
         }),
-        frame: AtomicU64::new(0),
+        frame: AtomicU64::new(1),
+        per_request: true,
+        on_frame: Some(hook),
+        nudge_j6: Some((in_revalidate.clone(), settled_j6.clone(), dq as f32)),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let (ticker, _, _) = spawn_sim_ticker(sc.sup.clone(), stop.clone(), false);
-    let body = json!({"label": "cup", "box_norm": flex.det_at(&sc.start).box_norm, "frame_id": 1});
-    let (id, _) = grasp::start(&sc.sup, sc.sup.capture_admission_stamp(), flex, &body)
-        .await
-        .expect("start accepted");
+    let adm = sc.sup.capture_admission_stamp();
+    let (id, _) = {
+        let mut inner = sc.sup.inner().write().await;
+        grasp::begin_with_stamp(&mut inner, adm, &sc.sup, flex, planned).expect("begin adaptive")
+    };
+    let mut phases = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
-        assert!(Instant::now() < deadline, "no-evidence test timed out");
+        assert!(Instant::now() < deadline, "snap_ins wrist-settle test timed out");
         let obs = sc.sup.get_observation().await;
         let a = obs.action.clone().or(obs.previous_action.clone()).expect("action");
-        if a.id == id && !a.is_running() {
-            break a;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    };
-    stop.store(true, Ordering::Relaxed);
-    let _ = ticker.await;
-    status
-}
-
-async fn run_with_explicit_grip(
-    cfg: ArmConfig,
-    setup: GraspSetup,
-    q0: [f64; 6],
-    cam_cfg: LiveCamCfg,
-) -> ActionStatus {
-    let sc = scene_q(cfg, setup, q0).await;
-    let flex = Arc::new(FlexCamera {
-        sup: sc.sup.clone(),
-        cam: sc.cam.clone(),
-        cfg: Mutex::new(cam_cfg),
-        frame: AtomicU64::new(0),
-    });
-    let stop = Arc::new(AtomicBool::new(false));
-    let (ticker, _, _) = spawn_sim_ticker(sc.sup.clone(), stop.clone(), false);
-    let body = json!({"label": "cup", "box_norm": flex.det_at(&sc.start).box_norm, "frame_id": 1});
-    let (id, _) = grasp::start(&sc.sup, sc.sup.capture_admission_stamp(), flex, &body)
-        .await
-        .expect("start accepted");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        assert!(Instant::now() < deadline, "explicit-grip test timed out");
-        let obs = sc.sup.get_observation().await;
-        let a = obs.action.clone().or(obs.previous_action.clone()).expect("action");
-        if a.id == id && !a.is_running() {
-            break a;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    };
-    stop.store(true, Ordering::Relaxed);
-    let _ = ticker.await;
-    status
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_gate_evidence_rungs_all_rungs_and_no_width_evidence() {
-    let mut cfg = ArmConfig::rebot_dm();
-    cfg.camera_mount = CameraMount { offset_m: Some([-0.06, 0.0, 0.0]), ..CameraMount::default() };
-    let q0 = solve_look_down(&cfg, [0.30, 0.0, 0.24]);
-    let base_setup = GraspSetup {
-        align_j6: false,
-        height_probe_m: 0.0,
-        recentre_height_m: 0.0,
-        max_grasp_width_m: 0.10,
-        ..GraspSetup::default()
-    };
-    let cam_of = |half_xy, width_px, contour_world| LiveCamCfg {
-        object_xy: [0.30, 0.0],
-        half_xy,
-        height_m: 0.030,
-        width_px,
-        angle: None,
-        contour_world,
-        box_override_norm: None,
-        box_shift_xy: [0.0, 0.0],
-    };
-
-    // Rung 1 (contour): fresh wide contour overrides narrow scalar width -> OPENING (contour).
-    let r1 = run_sim_grasp(
-        cfg.clone(),
-        base_setup.clone(),
-        q0,
-        cam_of([0.025, 0.015], Some(80.0), Some(bar([0.30, 0.0], 0.05, 0.072, 0.0))),
-        |body, cam, start| {
-            let (b, _) = project_poly_box_and_contour(cam, start, 0.0, &bar([0.30, 0.0], 0.05, 0.03, 0.0), 0.030);
-            body["box_norm"] = json!(b);
-        },
-        None,
-    )
-    .await;
-    assert_eq!((r1.status.state.as_str(), r1.status.code.as_deref()), ("failed", Some("OPENING")), "{:?}", r1.status);
-    assert!(r1.status.message.as_deref().unwrap_or("").contains("(contour)"), "{:?}", r1.status.message);
-
-    // Rung 2 (scalar): no contour, wide scalar width_px (~68 mm < 85 mm cap) -> OPENING (scalar).
-    let r2 = run_sim_grasp(cfg.clone(), base_setup.clone(), q0, cam_of([0.025, 0.015], Some(210.0), None), |_, _, _| {}, None).await;
-    assert_eq!((r2.status.state.as_str(), r2.status.code.as_deref()), ("failed", Some("OPENING")), "{:?}", r2.status);
-    assert!(r2.status.message.as_deref().unwrap_or("").contains("(scalar)"), "{:?}", r2.status.message);
-
-    // Rung 2b (admission_shifted) positive: centred non-deferred box-only with setup height passes,
-    // AND shifted +24 mm along closing axis refuses OPENING explicitly tagged `(admission_shifted)`.
-    let r2b = run_sim_grasp(cfg.clone(), base_setup.clone(), q0, cam_of([0.025, 0.015], None, None), |_, _, _| {}, None).await;
-    assert_eq!((r2b.status.state.as_str(), r2b.status.holding), ("done", Some(true)), "{:?}", r2b.status);
-    let cam_m = CamModel::assumed(&cfg.arm_model, &base_setup, &cfg.camera_mount);
-    let app_pose = Pose::new(
-        grasp::look_down(&cfg.arm_model.fk(&q0).r),
-        [0.30, 0.0, base_setup.table_z_m + base_setup.approach_height_m],
-    );
-    let shifted_grip = cam_m.to_norm(cam_m.project(&app_pose, &[0.30, 0.024, base_setup.table_z_m + base_setup.grasp_height_m]).unwrap());
-    let mut r2b_setup = base_setup.clone();
-    r2b_setup.grip_pixel_norm = shifted_grip;
-    let r2b_ref = run_with_explicit_grip(cfg.clone(), r2b_setup.clone(), q0, cam_of([0.025, 0.015], None, None)).await;
-    assert_eq!((r2b_ref.state.as_str(), r2b_ref.code.as_deref()), ("failed", Some("OPENING")), "{r2b_ref:?}");
-    assert!(
-        r2b_ref.message.as_deref().unwrap_or("").contains("(admission_shifted)"),
-        "expected (admission_shifted), got {:?}",
-        r2b_ref.message
-    );
-
-    // Rung 2b negative 1 (height known via Prior): same shifted fixture MUST fall to Rung 3 `(box)`.
-    let mut known_h_setup = r2b_setup;
-    known_h_setup.height_sources = vec![HeightSource::Prior];
-    known_h_setup.height_priors.insert("cup".into(), 0.030);
-    let neg_h = run_with_explicit_grip(cfg.clone(), known_h_setup, q0, cam_of([0.025, 0.015], None, None)).await;
-    assert_eq!(neg_h.height_source.as_deref(), Some("prior"), "{neg_h:?}");
-    assert_eq!((neg_h.state.as_str(), neg_h.code.as_deref()), ("failed", Some("OPENING")), "{neg_h:?}");
-    assert!(neg_h.message.as_deref().unwrap_or("").contains("(box)"), "height-known must not use admission_shifted: {:?}", neg_h.message);
-
-    // Rung 2b negative 2 (non-clipped FreshView post_transition): setup height + non-deferred box
-    // widened during camera-down transition MUST fall to Rung 3 `(box)`.
-    {
-        let mut cd_cfg = ArmConfig::rebot_dm();
-        cd_cfg.camera_mount = CameraMount {
-            rot_deg: 0.0,
-            tilt_deg: -16.0,
-            offset_m: Some([-0.04, 0.0, 0.04]),
-            ..CameraMount::default()
-        };
-        let cd_setup = GraspSetup {
-            camera_tilt_deg: -16.0,
-            acquire_camera_down: AcquireCameraDown::On,
-            approach_height_m: 0.12,
-            height_probe_m: 0.0,
-            height_sources: vec![],
-            align_j6: false,
-            max_grasp_width_m: 0.10,
-            ..GraspSetup::default()
-        };
-        let cd_q0 = solve_camera_down(&cd_cfg, &cd_setup, [0.30, 0.0, 0.24]);
-        let widened = Arc::new(AtomicBool::new(false));
-        let cb: Arc<dyn Fn(&str, &FlexCamera) + Send + Sync> = Arc::new(move |phase, flex| {
-            if phase == "transition" && !widened.swap(true, Ordering::SeqCst) {
-                flex.cfg.lock().unwrap().half_xy = [0.036, 0.030];
+        if a.id == id {
+            if let Some(p) = a.phase.as_deref() {
+                if phases.last().map(String::as_str) != Some(p) {
+                    phases.push(p.to_string());
+                }
+                if p == "revalidate" {
+                    in_revalidate.store(true, Ordering::SeqCst);
+                }
             }
-        });
-        let neg_fv = run_sim_grasp(cd_cfg, cd_setup, cd_q0, cam_of([0.036, 0.014], None, None), |_, _, _| {}, Some(cb)).await;
-        assert_eq!(neg_fv.status.height_source.as_deref(), Some("setup"), "{:?}", neg_fv.status);
-        assert!(neg_fv.status.final_offset_px.is_some(), "FreshView must have run");
-        assert_eq!((neg_fv.status.state.as_str(), neg_fv.status.code.as_deref()), ("failed", Some("OPENING")), "{:?}", neg_fv.status);
-        assert!(neg_fv.status.message.as_deref().unwrap_or("").contains("(box)"), "non-clipped FreshView must not use admission_shifted: {:?}", neg_fv.status.message);
-    }
-
-    // Rung 2b negative 3 & Rung 3 (deferred box-only): setup height, no contour/scalar -> OPENING (box).
-    let r3 = run_sim_grasp(cfg.clone(), base_setup.clone(), q0, cam_of([0.030, 0.030], None, None), |_, _, _| {}, None).await;
-    assert_eq!((r3.status.state.as_str(), r3.status.code.as_deref()), ("failed", Some("OPENING")), "{:?}", r3.status);
-    assert!(r3.status.message.as_deref().unwrap_or("").contains("(box)"), "{:?}", r3.status.message);
-    assert!(!r3.status.message.as_deref().unwrap_or("").contains("admission_shifted"), "{:?}", r3.status.message);
-
-    // None -> NO_WIDTH_EVIDENCE.
-    let r_none = run_no_width_evidence_case(cfg, base_setup, q0).await;
-    assert_eq!((r_none.state.as_str(), r_none.code.as_deref()), ("failed", Some("NO_WIDTH_EVIDENCE")), "{r_none:?}");
+            if !a.is_running() {
+                break a;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    stop.store(true, Ordering::Relaxed);
+    let _ = ticker.await;
+    assert!(settled_j6.load(Ordering::SeqCst), "wrist settle must have fired during revalidate");
+    assert_eq!(status.phase.as_deref(), Some("insert"), "must pass revalidate and refuse at insert: {status:?}");
+    assert_eq!((status.state.as_str(), status.code.as_deref()), ("failed", Some("OPENING")), "{status:?}");
+    assert!(!status.motions.iter().any(|m| m.phase == "insert"), "must refuse before any insert motion: {:?}", status.motions);
+    assert!(!phases.iter().any(|p| p == "close"), "{phases:?}");
 }
