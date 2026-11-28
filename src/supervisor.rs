@@ -99,9 +99,6 @@ pub struct AdmissionStamp {
     pub request_id: u64,
 }
 
-impl AdmissionStamp {
-}
-
 /// Opaque, single-use admission proof token created ONLY by [`SupervisorInner::check_admission`]
 /// under the owner lock and borrowing the owner lock guard for `'g`.
 ///
@@ -216,19 +213,10 @@ pub struct Admitted<'g> {
     _not_send_sync: std::marker::PhantomData<*mut ()>,
 }
 
-impl std::fmt::Debug for Admitted<'_> {
-}
-
 /// Crate-private, non-`Copy`, non-`Clone` witness proving a live [`Admitted`] token was
 /// verified and consumed inside `armd`. Only [`Admitted::consume`] can construct it.
 pub(crate) struct AdmittedProof {
     stamp: AdmissionStamp,
-}
-
-impl AdmittedProof {
-}
-
-impl<'g> Admitted<'g> {
 }
 
 /// Complete catalog of motion/output start entry points gated by [`AdmissionStamp`].
@@ -260,9 +248,6 @@ pub enum MotionStartKind {
     GripperCalibrate,
     GripperZeroCheck,
     TorqueEnable,
-}
-
-impl MotionStartKind {
 }
 
 /// Single sealed execution contract for [`SupervisorInner::start_motion`]: an operation can only
@@ -322,12 +307,6 @@ pub enum ArmError {
     /// Config write expected_revision does not match the current revision.
     #[error("Policy revision mismatch: expected {expected}, current {current}")]
     PolicyRevisionMismatch { expected: u64, current: u64 },
-}
-
-impl ArmError {
-}
-
-impl From<crate::recording::StoreError> for ArmError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -490,9 +469,6 @@ pub struct UnloadSettleSample {
     pub velocities: [f32; crate::model::MAX_MOTION_DOF],
 }
 
-impl UnloadSettleSample {
-}
-
 /// Settle phase of a NormalUnload after its trajectory finished.
 #[derive(Debug, Clone, Default)]
 pub struct UnloadSettle {
@@ -507,9 +483,6 @@ pub struct UnloadSettle {
     pub samples: std::collections::VecDeque<UnloadSettleSample>,
     /// `pending_s` of the last blocker report.
     pub last_report_s: Option<f64>,
-}
-
-impl UnloadSettle {
 }
 
 /// Servo streaming: a lead-capped joint whose measured position moves less than this
@@ -699,9 +672,6 @@ pub(crate) enum TickOutput {
         sent_mask: u64,
         pf_status: crate::driver::PosForceTxStatus,
     },
-}
-
-impl TickOutput {
 }
 
 /// What [`SupervisorInner::tick_publish`] hands back.
@@ -1848,9 +1818,6 @@ pub struct ZeroCheckPersistContext {
     pub sat_msg_buf: String,
 }
 
-impl ZeroCheckPersistContext {
-}
-
 /// Parameters of a running gripper zero check action.
 #[derive(Clone)]
 pub struct ZeroCheckParams {
@@ -1916,12 +1883,6 @@ pub(crate) struct LiveConnections {
     len: usize,
 }
 
-impl Default for LiveConnections {
-}
-
-impl LiveConnections {
-}
-
 /// Preallocated capacity for [`ClosedConnections`] intervals: with at most `MAX_LIVE_CONNECTIONS`
 /// concurrent open connections, pigeonhole compaction guarantees `intervals.len() <= MAX_LIVE_CONNECTIONS + 1`
 /// forever without heap growth on RT.
@@ -1934,12 +1895,6 @@ const CLOSED_CONNECTIONS_PREALLOC: usize = MAX_LIVE_CONNECTIONS + 4;
 pub(crate) struct ClosedConnections {
     watermark: u64,
     intervals: Vec<(u64, u64)>,
-}
-
-impl Default for ClosedConnections {
-}
-
-impl ClosedConnections {
 }
 
 /// Borrowed snapshot of owner-side live disconnect fence & E-stop state checked immediately before
@@ -1957,9 +1912,6 @@ pub(crate) struct LiveDisconnectFenceView<'a> {
     shared_closed_bitset: &'a crate::rt_core::requests::actions::ClosedBitset,
 }
 
-impl<'a> LiveDisconnectFenceView<'a> {
-}
-
 /// Preallocated capacity for [`ConsumedStamps`] disjoint intervals above `watermark`.
 const CONSUMED_STAMPS_INTERVAL_CAP: usize = 256;
 
@@ -1973,12 +1925,7 @@ pub(crate) struct ConsumedStamps {
     intervals: Vec<(u64, u64)>,
 }
 
-impl ConsumedStamps {
-}
-
 impl SupervisorInner {
-
-
 
     fn gravity_output_enabled(&self) -> bool {
         self.gravity_compensated
@@ -11924,20 +11871,11 @@ pub(crate) struct TerminalBroadcaster {
     inner: std::sync::Mutex<TerminalBroadcasterInner>,
 }
 
-impl Default for TerminalBroadcaster {
-}
-
-impl TerminalBroadcaster {
-}
-
 /// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
 #[doc(hidden)]
 pub struct TerminalSubscription {
     broadcaster: Arc<TerminalBroadcaster>,
     id: u64,
-}
-
-impl Drop for TerminalSubscription {
 }
 
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
@@ -14528,7 +14466,6 @@ impl ArmSupervisor {
             .update(|cfg| cfg.operator_auth_enforced = enforced);
     }
 
-
     /// Snapshot of shadow `TorqueController` diagnostics (lock-free / off-RT; never touches RT owner).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn torque_shadow_diagnostics(&self) -> crate::torque::shadow::TorqueShadowDiagnostics {
@@ -14592,7 +14529,6 @@ impl ArmSupervisor {
     ) -> Arc<crate::torque::shadow::ShadowOverflowAtomics> {
         self.torque_shadow.overflow_atomics().clone()
     }
-
 
     #[doc(hidden)]
     pub fn inner(&self) -> &Arc<SupervisorLock<SupervisorInner>> {

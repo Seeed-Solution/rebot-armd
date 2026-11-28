@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 impl UnloadSettleSample {
     pub fn from_slices(t: f64, q: &[f32], v: &[f32]) -> Self {
         let dof = q.len().min(v.len()).min(crate::model::MAX_MOTION_DOF);
@@ -15,7 +14,6 @@ impl UnloadSettleSample {
     }
 }
 
-// scaffold-impl-1
 impl UnloadSettle {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
@@ -25,7 +23,6 @@ impl UnloadSettle {
     }
 }
 
-// scaffold-impl-2
 impl TickOutput {
     /// True when the active J7 position-force gripper was stale (> 100 ms) during this pass
     /// (receiving a freeze frame instead of any new target); prevents J7-dependent action
@@ -43,7 +40,6 @@ impl TickOutput {
     }
 }
 
-// scaffold-impl-3
 impl ZeroCheckPersistContext {
     /// Captures all heap-backed calibration persistence inputs off the RT completion path.
     pub fn from_inner(

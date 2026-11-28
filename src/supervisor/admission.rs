@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 impl AdmissionStamp {
     /// Derives a fresh single-use child [`AdmissionStamp`] for a macro sub-motion while
     /// preserving the parent's admission-captured `stop_gen`, `estop_epoch`, `lease_gen`, and
@@ -66,14 +65,12 @@ impl AdmissionStamp {
     }
 }
 
-// scaffold-impl-1
 impl std::fmt::Debug for Admitted<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Admitted").field("stamp", &self.stamp).finish()
     }
 }
 
-// scaffold-impl-2
 impl AdmittedProof {
     #[inline]
     pub(crate) fn stamp(&self) -> AdmissionStamp {
@@ -81,7 +78,6 @@ impl AdmittedProof {
     }
 }
 
-// scaffold-impl-3
 impl<'g> Admitted<'g> {
     /// The validated stamp captured at request admission.
     #[inline]
@@ -114,7 +110,6 @@ impl<'g> Admitted<'g> {
     }
 }
 
-// scaffold-impl-4
 impl MotionStartKind {
     pub const ALL: &'static [MotionStartKind] = &[
         Self::Jog,
@@ -146,7 +141,6 @@ impl MotionStartKind {
     ];
 }
 
-// scaffold-impl-5
 impl ArmError {
     pub fn detailed(status: u16, code: &str, message: impl Into<String>, details: serde_json::Value) -> Self {
         Self::Detailed { status, code: code.into(), message: message.into(), details: Box::new(details) }
@@ -162,7 +156,6 @@ impl ArmError {
     }
 }
 
-// scaffold-impl-6
 impl From<crate::recording::StoreError> for ArmError {
     fn from(e: crate::recording::StoreError) -> Self {
         let (status, code) = e.status_code();
@@ -170,14 +163,12 @@ impl From<crate::recording::StoreError> for ArmError {
     }
 }
 
-// scaffold-impl-7
 impl Default for LiveConnections {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// scaffold-impl-8
 impl LiveConnections {
     pub(crate) const fn new() -> Self {
         Self {
@@ -240,14 +231,12 @@ impl LiveConnections {
     }
 }
 
-// scaffold-impl-9
 impl Default for ClosedConnections {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// scaffold-impl-10
 impl ClosedConnections {
     pub(crate) fn new() -> Self {
         Self {
@@ -347,7 +336,6 @@ impl ClosedConnections {
     }
 }
 
-// scaffold-impl-11
 impl<'a> LiveDisconnectFenceView<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -397,7 +385,6 @@ impl<'a> LiveDisconnectFenceView<'a> {
     }
 }
 
-// scaffold-impl-12
 impl ConsumedStamps {
     pub(crate) fn new() -> Self {
         Self {
@@ -480,7 +467,6 @@ impl ConsumedStamps {
     }
 }
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Advance the stop generation under the owner lock whenever a Stop applies.
     pub fn advance_stop_generation(&mut self) -> u64 {

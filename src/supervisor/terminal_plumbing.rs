@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 impl Default for TerminalBroadcaster {
     fn default() -> Self {
         Self {
@@ -22,7 +21,6 @@ impl Default for TerminalBroadcaster {
     }
 }
 
-// scaffold-impl-1
 impl TerminalBroadcaster {
     fn recompute_atomics(&self, g: &TerminalBroadcasterInner) {
         self.subscriber_count.store(g.sinks.len(), Ordering::Release);
@@ -337,14 +335,12 @@ impl TerminalBroadcaster {
     }
 }
 
-// scaffold-impl-2
 impl Drop for TerminalSubscription {
     fn drop(&mut self) {
         self.broadcaster.unsubscribe(self.id);
     }
 }
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Ensures every subscribed connection's bounded terminal FIFO (plus staged and in-flight
     /// SPSC captures) has room for any action superseded by this start plus the new action's
@@ -871,7 +867,6 @@ impl SupervisorInner {
     }
 }
 
-// scaffold-extra-1
 impl ArmSupervisor {
     /// Every tick's observation, forwarded by the dispatcher thread (started here when it
     /// does not run yet; an error when it cannot start); a lagging receiver skips
