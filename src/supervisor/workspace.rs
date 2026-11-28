@@ -312,11 +312,13 @@ impl SupervisorInner {
     /// the same `workspace_revision` so settled/idle stream frames cannot ratchet deeper.
     pub(crate) fn clear_servo_ws_min_depths_rt(&mut self) {
         if let Some((rev, ref buf)) = self.servo_ws_min_depths {
+            let arm_motion = self.active_trajectory.as_ref().is_some_and(|t| {
+                !matches!(t.reference, crate::motion::Reference::Gripper(_))
+            });
             if rev == self.workspace_revision
                 && self.is_torqued
                 && self.safety.state().is_operational()
-                && self.active_trajectory.is_none()
-                && self.macro_run.is_none()
+                && !arm_motion
                 && crate::chain::WorkspaceEvaluator::any_outside(buf.as_slice())
             {
                 return;

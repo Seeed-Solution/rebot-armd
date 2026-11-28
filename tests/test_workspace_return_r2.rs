@@ -367,3 +367,181 @@ fn prepared_plans_fence_measured_drift_before_install() {
         );
     }
 }
+
+/// R2 Item 3 (Major): Standalone gripper, zero-check, and macro gripper commits must NOT
+/// reset arm stream minima (`servo_ws_min_depths`) while the arm is outside the workspace.
+/// Scenario: 3 mm outward servo step -> gripper action -> 3 mm outward servo step -> 2nd step refused.
+#[tokio::test]
+async fn gripper_zero_check_and_macro_gripper_do_not_reset_arm_stream_minima() {
+    use armd::macro_action::{ChildSpec, ChildTicket};
+    use armd::rt_core::broker::{plan_slots, ActionId};
+    use armd::rt_core::ops::{PlanSlot, Primitive};
+    use armd::rt_core::requests::actions::{
+        install_begin_macro, install_macro_child, ActionSnapshot, BeginMacroSpec,
+        GripperCommandKind, MacroChildPayload, MacroKind, OwnerCheckCtx, StagedAction,
+    };
+    use serde_json::json;
+
+    // Arm stretched 10 mm beyond box_max_x.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.lease_timeout_ms = 60_000;
+    let q_start: [f32; 7] = [0.0, -0.90, -1.15, 0.85, 0.0, 0.0, 0.0];
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    ws.keepout_boxes.clear();
+    let check_pts = ws.check_points_end_m.clone();
+    let max_x_at = |q: &[f32]| -> f64 {
+        let pose = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts.iter().map(|c| pose.transform_point(&c.map(f64::from))[0]).fold(pose.p[0], f64::max)
+    };
+    let start_max_x = max_x_at(&q_start);
+    ws.box_max_m[0] = (start_max_x - 0.010) as f32;
+
+    let mut q_probe = q_start;
+    q_probe[1] += 0.01;
+    let fwd_sign = if max_x_at(&q_probe) > start_max_x { 1.0f32 } else { -1.0f32 };
+    let dx_per_rad = ({
+        let mut q = q_start;
+        q[1] += 0.01 * fwd_sign;
+        max_x_at(&q)
+    } - start_max_x) / 0.01;
+    let mut q_step1 = q_start;
+    q_step1[1] += (0.003 / dx_per_rad) as f32 * fwd_sign;
+    let mut q_step2 = q_start;
+    q_step2[1] += (0.0062 / dx_per_rad) as f32 * fwd_sign;
+
+    // 1. E2E both owners: +3 mm servo -> standalone gripper action -> +3.2 mm servo -> REFUSED;
+    //    AND +3 mm servo -> gripper_zero_check -> +3.2 mm servo -> REFUSED!
+    for (action_path, action_body) in [
+        ("/api/v1/action/gripper", json!({"command": "move", "fraction": 0.1, "speed": 2.0})),
+        ("/api/v1/action/gripper_zero_check", json!({"store_offset": false, "threshold_rad": 0.2})),
+    ] {
+        for use_executor in [false, true] {
+            let label = format!("{action_path}/{}", if use_executor { "executor" } else { "legacy" });
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            {
+                let mut inner = sup.inner().write().await;
+                inner.commanded_positions = q_start.to_vec();
+                inner.measured_positions = q_start.to_vec();
+                inner.target_positions = q_start.to_vec();
+            }
+            let exec = if use_executor {
+                Some(sup.start_executor(ExecutorConfig::for_tests(Duration::from_millis(20))).await.unwrap())
+            } else {
+                None
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn({
+                let s = sup.clone();
+                async move { axum::serve(listener, armd::create_router(s, armd::OperatorAuth::disabled())).await.unwrap(); }
+            });
+            let tick = (!use_executor).then(|| {
+                let t = sup.clone();
+                tokio::spawn(async move {
+                    let mut iv = tokio::time::interval(Duration::from_millis(20));
+                    loop { iv.tick().await; t.tick(0.02).await; }
+                })
+            });
+            let (mut ws_sock, gen) = common::controller(addr).await;
+            let ep = sup.get_observation().await.epoch_id;
+            assert_eq!(common::rpc(&mut ws_sock, gen, ep, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+            let ep = sup.get_observation().await.epoch_id;
+
+            // Step 1: +3 mm outward servo frame -> accepted and reaches q_step1.
+            common::servo(&mut ws_sock, gen, ep, &q_step1).await;
+            assert!(common::servo_reject_within(&mut ws_sock, 250).await.is_none(), "{label}: +3mm frame must pass");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let obs1 = sup.get_observation().await;
+            assert!(
+                (obs1.commanded_positions[1] - q_step1[1]).abs() < 1e-4,
+                "{label}: frame 1 must reach q_step1 (got {}, expected {})",
+                obs1.commanded_positions[1], q_step1[1]
+            );
+
+            // Intervening gripper or gripper_zero_check action while arm is outside.
+            let grip_ack = common::rpc(&mut ws_sock, gen, ep, action_path, action_body.clone()).await;
+            assert_eq!(grip_ack["type"], "command_ack", "{label}: action ack: {grip_ack}");
+            let dl = tokio::time::Instant::now() + Duration::from_secs(6);
+            loop {
+                let obs = sup.get_observation().await;
+                if !obs.action.as_ref().is_some_and(|a| a.state == "running" || a.state == "pending") {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < dl, "{label}: action timed out");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+
+            // Step 2: +3.2 mm further outward (+6.2 mm cumulative from initial baseline) -> MUST BE REFUSED!
+            let mut q_step2_cur_g = q_step2;
+            q_step2_cur_g[6] = sup.get_observation().await.commanded_positions[6];
+            common::servo(&mut ws_sock, gen, ep, &q_step2_cur_g).await;
+            let rej = common::servo_reject_within(&mut ws_sock, 600)
+                .await
+                .unwrap_or_else(|| panic!("{label}: +3mm after {action_path} must be refused (no ratcheting)"));
+            assert_eq!(rej["code"], "WORKSPACE_VIOLATION", "{label}: {rej}");
+            assert_eq!(rej["constraint_id"], "box_max_x", "{label}: {rej}");
+
+            drop(ws_sock);
+            if let Some(t) = tick { t.abort(); }
+            srv.abort();
+            if let Some(h) = exec { h.stop_and_join(); }
+        }
+    }
+
+    // 2. Direct macro gripper child commit: `servo_ws_min_depths` seeded outside must survive unchanged.
+    {
+        let mut inner = armd::SupervisorInner::new(cfg.clone());
+        inner.lease_enabled = false;
+        let s = inner.current_admission_stamp();
+        inner.check_admission(s).and_then(|a| armd::SupervisorInner::enable_torque(a)).unwrap();
+        inner.commanded_positions = q_step1.to_vec();
+        inner.measured_positions = q_step1.to_vec();
+        inner.target_positions = q_step1.to_vec();
+        let eval = WorkspaceEvaluator::new_with_tcp(&inner.config.arm_model, inner.config.workspace.as_ref().unwrap(), &inner.config.camera_mount, inner.config.tcp_offset);
+        let mut c0 = eval.alloc_buf();
+        eval.eval_into(&q_start, &mut c0, "seed").unwrap();
+        let baseline = eval.init_min_depths(&c0);
+        inner.servo_ws_min_depths = Some((inner.workspace_revision, baseline.clone()));
+
+        let s_m = inner.current_admission_stamp();
+        let ctx = OwnerCheckCtx::for_legacy(&inner);
+        let spec = BeginMacroSpec::new(MacroKind::Grasp, ctx.boot);
+        let snap_m = ActionSnapshot::from_inner(&inner, s_m, std::time::Instant::now() + Duration::from_secs(5));
+        let parent_id = install_begin_macro(&mut inner, &snap_m.stamp, &ctx, &spec, None, None).expect("install_begin_macro");
+        let mut start_arr = [0.0f32; 8];
+        start_arr[..7].copy_from_slice(&q_step1);
+        let child = ChildSpec {
+            ticket: ChildTicket { parent: ActionId(parent_id), child_seq: 1 },
+            timeout_s: 5.0,
+            timeout_code: "GRIPPER_TIMEOUT",
+            contact: None,
+        };
+        let mut slot = PlanSlot::default();
+        slot.primitive = Primitive::Action(StagedAction::Gripper {
+            child: Some(child),
+            dof: 7,
+            start: start_arr,
+            command: GripperCommandKind::Open,
+            fraction: None,
+            grasp: false,
+            speed: 1.0,
+            timeout_s: None,
+            max_budget_s: None,
+            extend_pos_force_close_timeout: false,
+            speed_scale: None,
+        });
+        let (mut pw, pr) = plan_slots(1, PlanSlot::default);
+        let h = pw.stage(|dst| *dst = slot).unwrap();
+        let slot_ref = pr.pin(h).unwrap();
+        let s_c = inner.current_admission_stamp();
+        let mut child_stamp = ActionSnapshot::from_inner(&inner, s_c, std::time::Instant::now() + Duration::from_secs(5)).stamp;
+        child_stamp.parent_generation = parent_id;
+        let _ = install_macro_child(&mut inner, &child_stamp, &ctx, true, MacroChildPayload::Slot(slot_ref))
+            .expect("install macro gripper child");
+        let after = inner.servo_ws_min_depths.as_ref().expect("macro gripper child must preserve outside arm stream minima");
+        assert_eq!(after.1.as_slice(), baseline.as_slice());
+    }
+}

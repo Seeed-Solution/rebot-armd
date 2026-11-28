@@ -4205,7 +4205,7 @@ fn install_gripper_rt(
     this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.force_clear_servo_ws_min_depths_rt();
+    this.clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
     if gripper_idx < this.target_positions.len() {
         this.target_positions[gripper_idx] = target_g;
@@ -4383,7 +4383,7 @@ fn install_gripper_zero_check_rt(
     this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.force_clear_servo_ws_min_depths_rt();
+    this.clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
     if gripper_idx < this.target_positions.len() {
         this.target_positions[gripper_idx] = target_g;
@@ -5641,7 +5641,7 @@ fn install_macro_child_slot_rt(
             this.gripper_hold_vel_ceiling = Some(wire_vel);
             this.release_servo_target();
             this.servo_settled_ticks.fill(0);
-            this.force_clear_servo_ws_min_depths_rt();
+            this.clear_servo_ws_min_depths_rt();
             crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
             if gripper_idx < this.target_positions.len() {
                 this.target_positions[gripper_idx] = target_g;
