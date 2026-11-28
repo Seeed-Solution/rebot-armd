@@ -1465,7 +1465,6 @@ mod panic_disable_tests {
             Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
         }
         fn unconfirmed_disable_joints(&self) -> Vec<usize> { vec![2] }
-        crate::ext_accessors!(bus_recovery);
     }
     impl crate::driver::BusRecoveryExt for SelectiveMockDriver {
         fn panic_disable_step(
@@ -1558,7 +1557,6 @@ mod panic_disable_tests {
             self.generic_begin_calls.fetch_add(1, Ordering::SeqCst);
             Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
         }
-        crate::ext_accessors!(bus_recovery);
     }
     impl crate::driver::BusRecoveryExt for ProbeThenGenericMockDriver {
         fn panic_disable_step(

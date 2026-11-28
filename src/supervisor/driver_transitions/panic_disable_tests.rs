@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 // scaffold-impl-0
 impl ArmDriver for SelectiveMockDriver {
+    crate::ext_accessors!(bus_recovery);
 }
 
 // scaffold-impl-1
@@ -19,6 +20,7 @@ impl ArmDriver for GenericMockDriver {
 
 // scaffold-impl-3
 impl ArmDriver for ProbeThenGenericMockDriver {
+    crate::ext_accessors!(bus_recovery);
 }
 
 // scaffold-impl-4
