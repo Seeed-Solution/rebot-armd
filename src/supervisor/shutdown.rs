@@ -3,6 +3,21 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Lock-free ticket returned synchronously by [`ArmSupervisor::begin_e_stop_checked`] after
+/// latching `e_stop_latched` and advancing `requested_estop_count` via atomics (zero mutexes,
+/// zero waiter scans).
+pub(crate) struct CheckedEstopTicket {
+    req: u64,
+    mode: u8,
+}
+
+#[derive(Clone)]
+pub(super) enum LegacyPanicDisableStep {
+    Outcome(PanicDisableOutcome),
+    Detached,
+}
+
+
 impl ArmSupervisor {
     pub async fn shutdown_ready(&self) -> bool {
         match self.owner_mode() {

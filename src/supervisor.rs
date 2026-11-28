@@ -6639,14 +6639,6 @@ impl SupervisorInner {
     }
 }
 
-/// Lock-free ticket returned synchronously by [`ArmSupervisor::begin_e_stop_checked`] after
-/// latching `e_stop_latched` and advancing `requested_estop_count` via atomics (zero mutexes,
-/// zero waiter scans).
-pub(crate) struct CheckedEstopTicket {
-    req: u64,
-    mode: u8,
-}
-
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
@@ -6765,52 +6757,6 @@ pub struct ArmSupervisor {
     /// fail so inline ownership retention is deterministically verified.
     #[cfg(not(target_arch = "wasm32"))]
     fail_drop_safe_hold_spawn: AtomicBool,
-}
-
-#[derive(Clone)]
-enum LegacyPanicDisableStep {
-    Outcome(PanicDisableOutcome),
-    Detached,
-}
-
-/// Authoritative endpoint for the single active hardware bus writer across startup, handback,
-/// detached SAFE-HOLD, and daemon process exit (B4).
-#[derive(Clone)]
-pub enum WriterEndpoint {
-    Legacy {
-        control_stop: Option<Arc<AtomicBool>>,
-        safe_hold: Arc<crate::rt_core::safe_hold::SafeHoldControl>,
-    },
-    /// Ownership transfer is in progress (e.g. `start_executor` extracting `SupervisorInner`
-    /// into `armd-control`); `ProcessExit` must wait for the authoritative endpoint rather than
-    /// selecting `Legacy` or reading the detached shell.
-    Transferring,
-    Executor(crate::rt_core::executor::RtExecutorHandle),
-    DetachedSafeHold {
-        safe_hold: Arc<crate::rt_core::safe_hold::SafeHoldControl>,
-        control_stop: Arc<AtomicBool>,
-    },
-}
-
-static NEXT_WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WsSlotPhase {
-    Admitted,
-    Open,
-    Closing,
-}
-
-struct WsSlotEntry {
-    phase: WsSlotPhase,
-    opening: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    reply_sink: Option<Arc<crate::rt_core::reply_router::ConnectionReplySink>>,
-}
-
-struct WsConnectionSlotPool {
-    entries: std::sync::Mutex<std::collections::HashMap<u64, WsSlotEntry>>,
-    notify: tokio::sync::Notify,
 }
 
 #[cfg(test)]
