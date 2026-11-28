@@ -21,7 +21,6 @@
     "src/rt_core/requests/config.rs": 8088,
     "src/safety.rs": 3036,
     "src/supervisor.rs": 6769,
-    "src/supervisor/driver_transitions.rs": 12733,
     "src/torque/reducer.rs": 3788,
     "src/torque/shadow.rs": 5032,
     "src/tracking.rs": 3530,

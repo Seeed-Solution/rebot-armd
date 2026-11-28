@@ -1415,11 +1415,4 @@ fn clear_fault_driver_error(e: &crate::driver::ArmDriverError) -> crate::safety:
 }
 
 #[cfg(test)]
-mod panic_disable_tests {
-    use super::*;
-    use crate::driver::{ArmDriverError, TorqueOutcome, TorqueProgress};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
-
-
-}
+mod panic_disable_tests;
