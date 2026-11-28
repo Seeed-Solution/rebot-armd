@@ -686,10 +686,47 @@ pub fn assert_split_test_only_files(test_only: &BTreeSet<String>, prefix: &str) 
     SPLIT_TEST_ONLY_FILES.len()
 }
 
+/// Remove the single function definition matching `sig_prefix` (from `sig_prefix` through its
+/// matching closing `}`) from lexically cleaned production text `prod`, panicking if `sig_prefix`
+/// does not appear or appears more than once.
+fn strip_unique_fn_by_signature(prod: &str, sig_prefix: &str, rel: &str) -> String {
+    let mut matches = prod.match_indices(sig_prefix);
+    let Some((start, _)) = matches.next() else {
+        panic!("missing expected definition `{sig_prefix}` in {rel}");
+    };
+    assert!(
+        matches.next().is_none(),
+        "duplicate definition `{sig_prefix}` in {rel}"
+    );
+    let bopen = prod[start..]
+        .find('{')
+        .map(|rel_idx| start + rel_idx)
+        .unwrap_or_else(|| panic!("missing `{{` for `{sig_prefix}` in {rel}"));
+    let mut depth = 0usize;
+    let mut bend = None;
+    for (rel_idx, ch) in prod[bopen..].char_indices() {
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth -= 1;
+            if depth == 0 {
+                bend = Some(bopen + rel_idx);
+                break;
+            }
+        }
+    }
+    let end = bend.unwrap_or_else(|| panic!("unbalanced braces for `{sig_prefix}` in {rel}"));
+    let mut out = String::with_capacity(prod.len() - (end + 1 - start));
+    out.push_str(&prod[..start]);
+    out.push_str(&prod[end + 1..]);
+    out
+}
+
 /// Audit production supervisor motion-start modules using the shared lexical cleaner +
 /// `#[cfg(test)]`-aware corpus: verify no production file re-samples `current_admission_stamp`
-/// or `capture_admission_stamp`, verify a negative fixture is rejected, and verify every
-/// `(rel, sig_prefix)` in `required_signatures` requires `Admitted` by value.
+/// or `capture_admission_stamp` (narrowing the two definition sites to their exact signatures),
+/// verify negative fixtures are rejected, and verify every `(rel, sig_prefix)` in
+/// `required_signatures` requires `Admitted` by value.
 /// Returns `(audited_file_count, checked_sig_count, test_only_checked)`.
 pub fn audit_supervisor_admission_stamps(
     manifest_dir: &Path,
@@ -724,10 +761,6 @@ pub fn audit_supervisor_admission_stamps(
             "src/supervisor/streams/",
             "src/supervisor/driver_transitions/",
         ];
-        let allowed_stamp_definers = [
-            "src/supervisor/state_init.rs",
-            "src/supervisor/ownership.rs",
-        ];
         let mut audited_count = 0usize;
         for (rel, prod) in &corpus {
             let in_audited = audited_exact.contains(&rel.as_str())
@@ -739,12 +772,24 @@ pub fn audit_supervisor_admission_stamps(
                     "{rel} must never re-sample an admission stamp in production code"
                 );
             }
-            if (rel == "src/supervisor.rs" || rel.starts_with("src/supervisor/"))
-                && !allowed_stamp_definers.contains(&rel.as_str())
-            {
+            if rel == "src/supervisor.rs" || rel.starts_with("src/supervisor/") {
+                let remainder = match rel.as_str() {
+                    "src/supervisor/state_init.rs" => strip_unique_fn_by_signature(
+                        prod,
+                        "pub fn current_admission_stamp(&self) -> AdmissionStamp",
+                        rel,
+                    ),
+                    "src/supervisor/ownership.rs" => strip_unique_fn_by_signature(
+                        prod,
+                        "pub fn capture_admission_stamp(&self) -> AdmissionStamp",
+                        rel,
+                    ),
+                    _ => prod.clone(),
+                };
                 assert!(
-                    !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
-                    "{rel} must never re-sample or define an admission stamp outside state_init/ownership"
+                    !remainder.contains("current_admission_stamp")
+                        && !remainder.contains("capture_admission_stamp"),
+                    "{rel} must never re-sample or define an admission stamp outside its single definition signature"
                 );
             }
         }
@@ -752,14 +797,35 @@ pub fn audit_supervisor_admission_stamps(
     };
 
     let (corpus, audited_count, test_only_n) = run_audit(&src_files);
-    let mut bad = src_files;
-    bad.push((
+    // Negative fixture 1: re-sampling inside split `src/supervisor/actions/**`
+    let mut bad_actions = src_files.clone();
+    bad_actions.push((
         "src/supervisor/actions/injected_resample.rs".into(),
         "impl SupervisorInner { fn sneaky(&self) { let _ = self.current_admission_stamp(); } }".into(),
     ));
     assert!(
-        std::panic::catch_unwind(|| { let _ = run_audit(&bad); }).is_err(),
+        std::panic::catch_unwind(|| { let _ = run_audit(&bad_actions); }).is_err(),
         "must reject current_admission_stamp re-sampling inside split src/supervisor/actions/**"
+    );
+
+    // Negative fixture 2: re-sampling inside `src/supervisor/state_init.rs` outside its single definition
+    let mut bad_state_init = src_files.clone();
+    if let Some((_, content)) = bad_state_init.iter_mut().find(|(r, _)| r == "src/supervisor/state_init.rs") {
+        content.push_str("\nimpl SupervisorInner { fn sneaky_resample(&self) { let _ = self.current_admission_stamp(); } }\n");
+    }
+    assert!(
+        std::panic::catch_unwind(|| { let _ = run_audit(&bad_state_init); }).is_err(),
+        "must reject current_admission_stamp re-sampling inside src/supervisor/state_init.rs"
+    );
+
+    // Negative fixture 3: re-sampling inside `src/supervisor/ownership.rs` outside its single definition
+    let mut bad_ownership = src_files;
+    if let Some((_, content)) = bad_ownership.iter_mut().find(|(r, _)| r == "src/supervisor/ownership.rs") {
+        content.push_str("\nimpl ArmSupervisor { fn sneaky_capture(&self) { let _ = self.capture_admission_stamp(); } }\n");
+    }
+    assert!(
+        std::panic::catch_unwind(|| { let _ = run_audit(&bad_ownership); }).is_err(),
+        "must reject capture_admission_stamp re-sampling inside src/supervisor/ownership.rs"
     );
 
     let corpus_map: BTreeMap<&str, &str> =
