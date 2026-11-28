@@ -6,6 +6,8 @@
 #[allow(unused_imports)]
 use super::*;
 
+mod policy;
+
 #[inline]
 fn buf_len_ok(v: &[f64], n: usize) -> bool {
     v.len() >= n
@@ -3524,5 +3526,4 @@ pub mod targets {
 }
 
 #[cfg(test)]
-#[path = "streams_target_tests.rs"]
 mod target_tests;
