@@ -663,3 +663,183 @@ pub fn extract_impl_blocks_for_type(prod: &str, type_name: &str) -> (String, Str
     remainder.push_str(&prod[cursor..]);
     (extracted, remainder)
 }
+
+/// Expected `#[cfg(test)]`-only split files under `src/driver/**` and `src/supervisor/**`.
+pub const SPLIT_TEST_ONLY_FILES: &[&str] = &[
+    "driver/tx_chokepoint_tests.rs",
+    "supervisor/observation_snapshot_tests.rs",
+    "supervisor/driver_transitions/panic_disable_tests.rs",
+    "supervisor/terminal_capture/tests.rs",
+    "supervisor/streams/target_tests.rs",
+];
+
+/// Assert every expected split test-only module file (with optional `prefix`, e.g. `""` or `"src/"`)
+/// is classified as test-only by [`build_production_corpus`].
+pub fn assert_split_test_only_files(test_only: &BTreeSet<String>, prefix: &str) -> usize {
+    for rel in SPLIT_TEST_ONLY_FILES {
+        let full = format!("{prefix}{rel}");
+        assert!(
+            test_only.contains(&full),
+            "{full} must be included solely via #[cfg(test)] mod declarations"
+        );
+    }
+    SPLIT_TEST_ONLY_FILES.len()
+}
+
+/// Remove the single function definition matching `sig_prefix` (from `sig_prefix` through its
+/// matching closing `}`) from lexically cleaned production text `prod`, panicking if `sig_prefix`
+/// does not appear or appears more than once.
+fn strip_unique_fn_by_signature(prod: &str, sig_prefix: &str, rel: &str) -> String {
+    let mut matches = prod.match_indices(sig_prefix);
+    let Some((start, _)) = matches.next() else {
+        panic!("missing expected definition `{sig_prefix}` in {rel}");
+    };
+    assert!(
+        matches.next().is_none(),
+        "duplicate definition `{sig_prefix}` in {rel}"
+    );
+    let bopen = prod[start..]
+        .find('{')
+        .map(|rel_idx| start + rel_idx)
+        .unwrap_or_else(|| panic!("missing `{{` for `{sig_prefix}` in {rel}"));
+    let mut depth = 0usize;
+    let mut bend = None;
+    for (rel_idx, ch) in prod[bopen..].char_indices() {
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth -= 1;
+            if depth == 0 {
+                bend = Some(bopen + rel_idx);
+                break;
+            }
+        }
+    }
+    let end = bend.unwrap_or_else(|| panic!("unbalanced braces for `{sig_prefix}` in {rel}"));
+    let mut out = String::with_capacity(prod.len() - (end + 1 - start));
+    out.push_str(&prod[..start]);
+    out.push_str(&prod[end + 1..]);
+    out
+}
+
+/// Audit production supervisor motion-start modules using the shared lexical cleaner +
+/// `#[cfg(test)]`-aware corpus: verify no production file re-samples `current_admission_stamp`
+/// or `capture_admission_stamp` (narrowing the two definition sites to their exact signatures),
+/// verify negative fixtures are rejected, and verify every `(rel, sig_prefix)` in
+/// `required_signatures` requires `Admitted` by value.
+/// Returns `(audited_file_count, checked_sig_count, test_only_checked)`.
+pub fn audit_supervisor_admission_stamps(
+    manifest_dir: &Path,
+    required_signatures: &[(&str, &str)],
+) -> (usize, usize, usize) {
+    let src_dir = manifest_dir.join("src");
+    let mut rs_paths = Vec::new();
+    collect_rs_files(&src_dir, &mut rs_paths);
+    let src_files: Vec<(String, String)> = rs_paths
+        .iter()
+        .map(|p| {
+            let rel = p.strip_prefix(manifest_dir).unwrap().to_string_lossy().replace('\\', "/");
+            (rel, std::fs::read_to_string(p).unwrap())
+        })
+        .collect();
+
+    let run_audit = |files: &[(String, String)]| {
+        let (corpus, test_only) = build_production_corpus(files);
+        let test_only_n = assert_split_test_only_files(&test_only, "src/");
+        let audited_exact = [
+            "src/supervisor/motion.rs",
+            "src/gravity_comp.rs",
+            "src/poses.rs",
+            "src/backlash.rs",
+            "src/grasp.rs",
+            "src/place.rs",
+            "src/gripper_calib.rs",
+            "src/gripper_baseline.rs",
+        ];
+        let audited_prefixes = [
+            "src/supervisor/actions/",
+            "src/supervisor/streams/",
+            "src/supervisor/driver_transitions/",
+        ];
+        let mut audited_count = 0usize;
+        for (rel, prod) in &corpus {
+            let in_audited = audited_exact.contains(&rel.as_str())
+                || audited_prefixes.iter().any(|pfx| rel.starts_with(pfx));
+            if in_audited {
+                audited_count += 1;
+                assert!(
+                    !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
+                    "{rel} must never re-sample an admission stamp in production code"
+                );
+            }
+            if rel == "src/supervisor.rs" || rel.starts_with("src/supervisor/") {
+                let remainder = match rel.as_str() {
+                    "src/supervisor/state_init.rs" => strip_unique_fn_by_signature(
+                        prod,
+                        "pub fn current_admission_stamp(&self) -> AdmissionStamp",
+                        rel,
+                    ),
+                    "src/supervisor/ownership.rs" => strip_unique_fn_by_signature(
+                        prod,
+                        "pub fn capture_admission_stamp(&self) -> AdmissionStamp",
+                        rel,
+                    ),
+                    _ => prod.clone(),
+                };
+                assert!(
+                    !remainder.contains("current_admission_stamp")
+                        && !remainder.contains("capture_admission_stamp"),
+                    "{rel} must never re-sample or define an admission stamp outside its single definition signature"
+                );
+            }
+        }
+        (corpus, audited_count, test_only_n)
+    };
+
+    let (corpus, audited_count, test_only_n) = run_audit(&src_files);
+    // Negative fixture 1: re-sampling inside split `src/supervisor/actions/**`
+    let mut bad_actions = src_files.clone();
+    bad_actions.push((
+        "src/supervisor/actions/injected_resample.rs".into(),
+        "impl SupervisorInner { fn sneaky(&self) { let _ = self.current_admission_stamp(); } }".into(),
+    ));
+    assert!(
+        std::panic::catch_unwind(|| { let _ = run_audit(&bad_actions); }).is_err(),
+        "must reject current_admission_stamp re-sampling inside split src/supervisor/actions/**"
+    );
+
+    // Negative fixture 2: re-sampling inside `src/supervisor/state_init.rs` outside its single definition
+    let mut bad_state_init = src_files.clone();
+    if let Some((_, content)) = bad_state_init.iter_mut().find(|(r, _)| r == "src/supervisor/state_init.rs") {
+        content.push_str("\nimpl SupervisorInner { fn sneaky_resample(&self) { let _ = self.current_admission_stamp(); } }\n");
+    }
+    assert!(
+        std::panic::catch_unwind(|| { let _ = run_audit(&bad_state_init); }).is_err(),
+        "must reject current_admission_stamp re-sampling inside src/supervisor/state_init.rs"
+    );
+
+    // Negative fixture 3: re-sampling inside `src/supervisor/ownership.rs` outside its single definition
+    let mut bad_ownership = src_files;
+    if let Some((_, content)) = bad_ownership.iter_mut().find(|(r, _)| r == "src/supervisor/ownership.rs") {
+        content.push_str("\nimpl ArmSupervisor { fn sneaky_capture(&self) { let _ = self.capture_admission_stamp(); } }\n");
+    }
+    assert!(
+        std::panic::catch_unwind(|| { let _ = run_audit(&bad_ownership); }).is_err(),
+        "must reject capture_admission_stamp re-sampling inside src/supervisor/ownership.rs"
+    );
+
+    let corpus_map: BTreeMap<&str, &str> =
+        corpus.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    for &(rel, sig_prefix) in required_signatures {
+        let prod = corpus_map
+            .get(rel)
+            .unwrap_or_else(|| panic!("missing production corpus entry for {rel}"));
+        let idx = prod.find(sig_prefix).unwrap_or_else(|| panic!("missing {sig_prefix} in {rel}"));
+        let sig_slice = &prod[idx..prod[idx..].find('{').map_or(prod.len(), |o| idx + o)];
+        assert!(
+            sig_slice.contains("Admitted"),
+            "{rel}::{sig_prefix} lacks Admitted parameter: {sig_slice}"
+        );
+    }
+    (audited_count, required_signatures.len(), test_only_n)
+}

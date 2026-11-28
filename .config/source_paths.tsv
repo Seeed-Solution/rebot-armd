@@ -9,10 +9,11 @@ driver	src/driver.rs
 sim_driver	src/sim_driver.rs
 damiao_protocol	src/protocol/damiao.rs
 supervisor	src/supervisor.rs
+supervisor	src/supervisor
 supervisor_motion	src/supervisor/motion.rs
-supervisor_actions	src/supervisor/actions.rs
-supervisor_streams	src/supervisor/streams.rs
-driver_transitions	src/supervisor/driver_transitions.rs
+supervisor_actions	src/supervisor/actions
+supervisor_streams	src/supervisor/streams
+driver_transitions	src/supervisor/driver_transitions
 executor	src/rt_core/executor.rs
 safe_hold	src/rt_core/safe_hold.rs
 grasp	src/grasp.rs

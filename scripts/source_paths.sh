@@ -48,7 +48,7 @@ if [ ! -f "${REGISTRY}" ]; then
     exit 1
 fi
 
-REL="$(awk -F'\t' -v k="${KEY}" -v reg="${REGISTRY}" '
+RELS="$(awk -F'\t' -v k="${KEY}" -v reg="${REGISTRY}" '
 {
     sub(/\r$/, "", $0)
     if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
@@ -63,19 +63,38 @@ REL="$(awk -F'\t' -v k="${KEY}" -v reg="${REGISTRY}" '
         printf("Error: invalid repo-relative path \"%s\" on row %d in %s\n", val, NR, reg) > "/dev/stderr"
         exit 2
     }
-    if (key == k && !found) {
-        found = 1
-        out = val
+    if (key == k) {
+        print val
     }
-}
-END {
-    if (found) print out
 }
 ' "${REGISTRY}")"
 
-if [ -z "${REL}" ]; then
+if [ -z "${RELS}" ]; then
     echo "Error: unknown source_paths key '${KEY}' in ${REGISTRY}" >&2
     exit 1
 fi
 
-printf '%s/%s\n' "${REPO_ROOT}" "${REL}"
+EXPANDED=""
+while IFS= read -r rel; do
+    [ -z "${rel}" ] && continue
+    full="${REPO_ROOT}/${rel}"
+    if [ -d "${full}" ]; then
+        found_dir_files="$(find "${full}" -type f -name '*.rs')"
+        if [ -n "${found_dir_files}" ]; then
+            EXPANDED="${EXPANDED}${found_dir_files}"$'\n'
+        fi
+    elif [ -e "${full}" ]; then
+        EXPANDED="${EXPANDED}${full}"$'\n'
+    else
+        echo "Error: source_paths entry '${rel}' for key '${KEY}' does not exist at ${full}" >&2
+        exit 1
+    fi
+done <<< "${RELS}"
+
+OUT="$(printf '%s' "${EXPANDED}" | LC_ALL=C sort -u)"
+if [ -z "${OUT}" ]; then
+    echo "Error: source_paths key '${KEY}' resolved to 0 files under ${REPO_ROOT}" >&2
+    exit 1
+fi
+
+printf '%s\n' "${OUT}"

@@ -3179,10 +3179,7 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
     ];
     let assert_disable_protective = |src_files: &[(String, String)]| {
         let (corpus, test_only) = source_scan::build_production_corpus(src_files);
-        assert!(
-            test_only.contains("src/driver/tx_chokepoint_tests.rs"),
-            "src/driver/tx_chokepoint_tests.rs must be included solely via #[cfg(test)] mod declarations"
-        );
+        assert!(source_scan::assert_split_test_only_files(&test_only, "src/") >= 5);
         for (rel, full) in src_files {
             if test_only.contains(rel) {
                 continue;
@@ -3246,10 +3243,10 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
         let mut expected: Vec<(String, &'static str)> = vec![
             ("src/driver/can_servo/engine/recovery.rs".to_string(), "ProcessExit"),
             ("src/rt_core/safe_hold.rs".to_string(), "Thermal"),
-            ("src/supervisor.rs".to_string(), "ProcessExit"),
-            ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),
-            ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),
+            ("src/supervisor/driver_transitions/mod.rs".to_string(), "ProcessExit"),
+            ("src/supervisor/driver_transitions/panic_disable.rs".to_string(), "ProcessExit"),
             ("src/supervisor/motion.rs".to_string(), "Thermal"),
+            ("src/supervisor/shutdown_park.rs".to_string(), "ProcessExit"),
         ];
         expected.sort();
         assert_eq!(
