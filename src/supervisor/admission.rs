@@ -3,6 +3,320 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Global monotonic allocator for single-use [`AdmissionStamp::request_id`] values.
+pub(super) static NEXT_ADMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// High bit reserving an isolated single-use namespace for RT broker `RequestId` values so
+/// per-broker monotonic IDs never collide with global [`next_admission_request_id`] IDs.
+pub(super) const BROKER_REQUEST_ID_BIT: u64 = 1u64 << 63;
+
+/// High bit reserving an isolated single-use namespace for RT-internal latest-target and
+/// servo-stream authorization stamps so they never collide with caller or `LeaseInstallCtx` IDs.
+pub(super) const RT_INTERNAL_REQUEST_ID_BIT: u64 = 1u64 << 62;
+
+/// Allocates a fresh non-zero, single-use admission request ID (lock-free, zero-alloc).
+#[inline]
+pub fn next_admission_request_id() -> u64 {
+    let id = NEXT_ADMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        id != 0 && (id & (BROKER_REQUEST_ID_BIT | RT_INTERNAL_REQUEST_ID_BIT)) == 0,
+        "admission request_id overflow"
+    );
+    id
+}
+
+/// Generation snapshot captured ONCE at request admission (lock-free in the WS reader
+/// before queuing, or at REST/caller entry) and required by every supervisor/owner function
+/// that starts motion or output.
+///
+/// Although `AdmissionStamp` is [`Copy`] so callers can carry it across off-lock planning,
+/// each stamp carries a unique non-zero [`request_id`](Self::request_id) consumed once by
+/// [`SupervisorInner::check_admission`] under the owner lock; any second use is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionStamp {
+    pub stop_gen: u64,
+    pub estop_epoch: u64,
+    pub lease_gen: u64,
+    /// Monotonic WS connection ID (`>= 1`) captured at WS admission, or `0` for non-WS callers.
+    /// Checked against the owner-lock closed-connection set so a stale stamp from a closed
+    /// connection is always refused.
+    pub connection_id: u64,
+    /// Globally unique non-zero request ID consumed once by [`SupervisorInner::check_admission`].
+    /// A zero or already-consumed `request_id` is refused fail-closed.
+    pub request_id: u64,
+}
+
+/// Opaque, single-use admission proof token created ONLY by [`SupervisorInner::check_admission`]
+/// under the owner lock and borrowing the owner lock guard for `'g`.
+///
+/// It cannot be constructed externally, cloned, copied, sent across threads/`.await` points,
+/// stored past the guard lifetime `'g`, or held after dropping the owner lock guard, and every
+/// function that starts motion or output consumes it by value:
+///
+/// ```compile_fail
+/// use armd::{AdmissionStamp, Admitted};
+/// let _forged = Admitted(AdmissionStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0, connection_id: 0, request_id: 1 });
+/// ```
+///
+/// ```compile_fail
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<armd::Admitted<'_>>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<armd::Admitted<'_>>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<armd::Admitted<'_>>();
+/// ```
+///
+/// Holding [`Admitted`] after dropping the owner lock guard does not compile:
+///
+/// ```compile_fail,E0505
+/// use armd::{ArmSupervisor, SupervisorInner};
+/// async fn cannot_drop_guard_while_holding_admitted(sup: &ArmSupervisor) {
+///     let stamp = sup.capture_admission_stamp();
+///     let mut guard = sup.inner().write().await;
+///     let admitted = guard.check_admission(stamp).unwrap();
+///     drop(guard);
+///     let _ = SupervisorInner::enable_torque(admitted);
+/// }
+/// ```
+///
+/// ```compile_fail,E0597
+/// use armd::{ArmSupervisor, SupervisorInner};
+/// async fn cannot_return_admitted_past_guard_scope(sup: &ArmSupervisor) {
+///     let stamp = sup.capture_admission_stamp();
+///     let admitted = {
+///         let mut guard = sup.inner().write().await;
+///         guard.check_admission(stamp).unwrap()
+///     };
+///     let _ = SupervisorInner::enable_torque(admitted);
+/// }
+/// ```
+///
+/// Mutating the owner state while holding [`Admitted`] or storing it in `'static` does not compile:
+///
+/// ```compile_fail,E0499
+/// use armd::{ArmConfig, SupervisorInner};
+/// let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+/// let stamp = inner.current_admission_stamp();
+/// let admitted = inner.check_admission(stamp).unwrap();
+/// let _ = inner.authorized_stop();
+/// let _ = SupervisorInner::enable_torque(admitted);
+/// ```
+///
+/// ```compile_fail
+/// fn assert_static<T: 'static>() {}
+/// fn reject_static<'a>() { assert_static::<armd::Admitted<'a>>(); }
+/// ```
+///
+/// Calling a motion or output start without an [`Admitted`] token does not compile:
+///
+/// ```compile_fail,E0061
+/// use armd::SupervisorInner;
+/// let _ = SupervisorInner::jog(vec![0.0; 7], None, None);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use armd::SupervisorInner;
+/// let _ = SupervisorInner::enable_torque();
+/// ```
+///
+/// ```compile_fail,E0061
+/// use armd::motion::{GripperCommand, GripperRequest};
+/// use armd::SupervisorInner;
+/// let req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None };
+/// let _ = SupervisorInner::start_gripper_with_baseline(req, 1, armd::supervisor::GripperBaselineCmd::None);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use armd::motion::{GripperCommand, GripperRequest, LearnMode};
+/// use armd::SupervisorInner;
+/// let req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None };
+/// let _ = SupervisorInner::start_macro_gripper_learning(1, req, LearnMode::Calibration);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use std::sync::Arc;
+/// use armd::{ArmConfig, ArmSupervisor};
+/// let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+/// let _ = armd::gripper_calib::begin_calibration(&sup, 1, None);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use std::sync::Arc;
+/// use armd::{ArmConfig, ArmSupervisor};
+/// let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+/// let _ = armd::gripper_calib::start_calibration(&sup);
+/// ```
+#[must_use = "Admitted token must be consumed by a motion/output start"]
+pub struct Admitted<'g> {
+    inner: &'g mut SupervisorInner,
+    stamp: AdmissionStamp,
+    _not_send_sync: std::marker::PhantomData<*mut ()>,
+}
+
+/// Crate-private, non-`Copy`, non-`Clone` witness proving a live [`Admitted`] token was
+/// verified and consumed inside `armd`. Only [`Admitted::consume`] can construct it.
+pub(crate) struct AdmittedProof {
+    stamp: AdmissionStamp,
+}
+
+/// Complete catalog of motion/output start entry points gated by [`AdmissionStamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MotionStartKind {
+    Jog,
+    Home,
+    Park,
+    Preset,
+    MoveTo,
+    MoveRelative,
+    MoveToPose,
+    Place,
+    Grasp,
+    Replay,
+    Sequence,
+    CalibHover,
+    MeasureMultiview,
+    MacroStart,
+    MacroChildPath,
+    MacroChildQuintic,
+    MacroChildGripper,
+    MacroChildReplay,
+    Servo,
+    PolicyShadow,
+    PolicyLive,
+    GravityComp,
+    Gripper,
+    GripperCalibrate,
+    GripperZeroCheck,
+    TorqueEnable,
+}
+
+/// Single sealed execution contract for [`SupervisorInner::start_motion`]: an operation can only
+/// run when handed a single-use [`Admitted`] token produced by [`SupervisorInner::check_admission`]
+/// under the owner lock.
+///
+/// ```compile_fail,E0061
+/// use armd::SupervisorInner;
+/// // Calling start_motion without an Admitted token fails to compile:
+/// let _ = SupervisorInner::start_motion(());
+/// ```
+pub trait MotionStartOp {
+    type Output;
+    fn kind(&self) -> MotionStartKind;
+    fn execute(self, admitted: Admitted<'_>) -> Result<Self::Output, ArmError>;
+}
+
+#[derive(Debug, Error)]
+pub enum ArmError {
+    #[error("Safety error: {0}")]
+    Safety(#[from] SafetyError),
+
+    #[error("Trajectory error: {0}")]
+    Trajectory(#[from] TrajectoryError),
+
+    #[error("Recording error: {0}")]
+    Recording(#[from] RecordingError),
+
+    #[error("Unsupported operation: {0}")]
+    Unsupported(String),
+
+    #[error("Motion error: {0}")]
+    Motion(#[from] MotionError),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
+
+    /// Request refused with a specific code (gravity compensation mode changes).
+    #[error("{code}: {message}")]
+    Rejected { status: u16, code: String, message: String },
+
+    /// Zero-allocation static refusal for RT paths (`armd-control` never allocates `String`).
+    #[error("{code}: {message}")]
+    RejectedStatic { status: u16, code: &'static str, message: &'static str },
+
+    /// [`Rejected`](Self::Rejected) with extra reply fields (`owner`, `sequences`, `step`, `reason`).
+    #[error("{code}: {message}")]
+    Detailed { status: u16, code: String, message: String, details: Box<serde_json::Value> },
+
+    /// Workspace rejection preserving structured violation detail (e.g. replay).
+    #[error("WORKSPACE_VIOLATION: {message}")]
+    WorkspaceRejected {
+        message: String,
+        detail: Box<crate::kinematics::WorkspaceViolationDetail>,
+    },
+
+    /// Config write expected_revision does not match the current revision.
+    #[error("Policy revision mismatch: expected {expected}, current {current}")]
+    PolicyRevisionMismatch { expected: u64, current: u64 },
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
+pub enum PreemptError {
+    #[error("Preemption cooldown active: {0}ms remaining")]
+    Cooldown(u64),
+    #[error("OWNER_TRANSFERRED: control ownership transferred to RT executor; shell lease calls are refused")]
+    OwnerTransferred,
+}
+
+/// Maximum concurrent live WS connections tracked by the owner (fail-closed when full).
+pub const MAX_LIVE_CONNECTIONS: usize = 64;
+
+/// Fixed-capacity, zero-allocation live WS connection registry (`>= 1`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveConnections {
+    ids: [u64; MAX_LIVE_CONNECTIONS],
+    len: usize,
+}
+
+/// Preallocated capacity for [`ClosedConnections`] intervals: with at most `MAX_LIVE_CONNECTIONS`
+/// concurrent open connections, pigeonhole compaction guarantees `intervals.len() <= MAX_LIVE_CONNECTIONS + 1`
+/// forever without heap growth on RT.
+const CLOSED_CONNECTIONS_PREALLOC: usize = MAX_LIVE_CONNECTIONS + 4;
+
+/// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`) above a
+/// monotonic `watermark` (`<= watermark` is always closed). Bounded by `MAX_LIVE_CONNECTIONS + 1`
+/// via live-aware pigeonhole compaction with zero RT allocation and O(log K) lookup.
+#[derive(Debug)]
+pub(crate) struct ClosedConnections {
+    watermark: u64,
+    intervals: Vec<(u64, u64)>,
+}
+
+/// Borrowed snapshot of owner-side live disconnect fence & E-stop state checked immediately before
+/// transmitting gravity-comp targets (shared by periodic and immediate write paths).
+#[derive(Clone, Copy)]
+pub(crate) struct LiveDisconnectFenceView<'a> {
+    e_stop_latched: &'a crate::rt_core::urgent::EstopLatchView,
+    pending_disconnect_hold: &'a AtomicU64,
+    atomic_fenced_lease_gen: &'a AtomicU64,
+    fenced_lease_generation: u64,
+    active_lease_conn_id: u64,
+    active_lease_gen: Option<u64>,
+    closed_connections: &'a ClosedConnections,
+    rt_closed_connections: Option<&'a crate::rt_core::requests::actions::ClosedBitset>,
+    shared_closed_bitset: &'a crate::rt_core::requests::actions::ClosedBitset,
+}
+
+/// Preallocated capacity for [`ConsumedStamps`] disjoint intervals above `watermark`.
+const CONSUMED_STAMPS_INTERVAL_CAP: usize = 256;
+
+/// Bounded, zero-allocation-in-steady-state set of consumed single-use admission request IDs
+/// (`>= 1`), stored as a monotonic `watermark` (every `id <= watermark` is treated as consumed,
+/// fail-closed) plus up to [`CONSUMED_STAMPS_INTERVAL_CAP`] sorted coalesced inclusive
+/// intervals `(lo, hi)` above `watermark`.
+#[derive(Debug)]
+pub(crate) struct ConsumedStamps {
+    watermark: u64,
+    intervals: Vec<(u64, u64)>,
+}
+
+
 impl AdmissionStamp {
     /// Derives a fresh single-use child [`AdmissionStamp`] for a macro sub-motion while
     /// preserving the parent's admission-captured `stop_gen`, `estop_epoch`, `lease_gen`, and

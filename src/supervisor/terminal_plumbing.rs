@@ -3,6 +3,243 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Default bounded capacity of each connection's finished-action terminal FIFO.
+pub const TERMINAL_FIFO_CAPACITY: usize = 64;
+
+type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct QueuedTerminal {
+    pub(crate) action: ActionStatus,
+    pub(crate) obs_override: Option<ArmObservation>,
+    pub(crate) required_publish_seq: Option<u64>,
+}
+
+struct ConnectionTerminalQueue {
+    sub_id: u64,
+    min_terminal_seq: u64,
+    fifo: std::collections::VecDeque<QueuedTerminal>,
+    seen: std::collections::VecDeque<u64>,
+    sink: TerminalSinkFn,
+}
+
+struct TerminalBroadcasterInner {
+    next_id: u64,
+    capacity: usize,
+    sinks: Vec<ConnectionTerminalQueue>,
+    /// Bounded cache of recently finished `QueuedTerminal` records (carrying `obs_override` and
+    /// `required_publish_seq` from the single authoritative `TerminalCaptureChannel`) so
+    /// per-connection WS broker reply sinks enforce the same publish barrier and retrieve the
+    /// exact enriched `ActionStatus` for their bound `ActionId`.
+    recent_finished: std::collections::VecDeque<QueuedTerminal>,
+}
+
+/// Lossless off-RT per-connection bounded FIFO of finished actions: every terminal action
+/// (`!is_running()`) is appended in exact `terminal_seq` order to each subscribed connection's
+/// bounded FIFO, from which `armd-dispatch` drains every terminal in order onto that connection's
+/// lossless ordinary control queue. Never drops a terminal; if full, new action starts are refused
+/// with [`SafetyError::TerminalsBusy`] until drained. Never locks on `armd-control`.
+pub(crate) struct TerminalBroadcaster {
+    subscriber_count: AtomicUsize,
+    pending_total: AtomicUsize,
+    max_fifo_len: AtomicUsize,
+    capacity_atomic: AtomicUsize,
+    dispatch_paused: AtomicBool,
+    inner: std::sync::Mutex<TerminalBroadcasterInner>,
+}
+
+/// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
+#[doc(hidden)]
+pub struct TerminalSubscription {
+    broadcaster: Arc<TerminalBroadcaster>,
+    id: u64,
+}
+
+/// The dispatcher thread: forwards each new sample to the telemetry receivers (one clone
+/// per sample, off the control thread), drains the recording ring, and drains RT executor
+/// diagnostics / E-stop acks / maintenance replies / orphaned persistence replies until
+/// the supervisor is dropped.
+fn dispatch_loop(
+    hub: &crate::rt_core::publish::StateHub,
+    tx: &broadcast::Sender<ArmObservation>,
+    terminals: &Arc<TerminalBroadcaster>,
+    terminal_capture: &terminal_capture::TerminalCaptureChannel,
+    sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
+    tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    template_obs: &ArmObservation,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        // a normal-priority thread even when started from a real-time one
+        // SAFETY: sched_param is plain old data (musl has extra fields); the call only
+        // touches the calling thread.
+        unsafe {
+            let mut param: libc::sched_param = std::mem::zeroed();
+            param.sched_priority = 0;
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param);
+        }
+    }
+    let mut last = 0u64;
+    let mut last_diag = 0u64;
+    let mut last_action_diag = 0u64;
+    let mut latest_snap: Option<Arc<crate::rt_core::publish::Snapshot>> = None;
+    let mut pending_telemetry: Option<ArmObservation> = None;
+    while !hub.is_closed() {
+        let active_sinks = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(s) = active_sinks.as_ref() {
+            s.drain_pre_broker(tick_stats);
+        }
+        if let Some(ring) = hub.record_ring() { ring.drain(); }
+        if hub.published_seq() != last {
+            if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                last = s.meta.seq;
+                last_diag = last_diag.max(s.policy_diag_seq);
+                last_action_diag = last_action_diag.max(s.action_diag_seq);
+                pending_telemetry = Some(s.obs.clone());
+                latest_snap = Some(s);
+            }
+        } else if hub.policy_diag_seq() != last_diag || hub.action_diag_seq() != last_action_diag {
+            if let Some(s) = hub.latest() {
+                if s.meta.seq > last {
+                    last = s.meta.seq;
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
+                } else if s.policy_diag_seq > last_diag || s.action_diag_seq > last_action_diag {
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
+                    // Diagnostic-only overlay update (Shadow steps / timing stats / grasp diag
+                    // stream patch): forward telemetry without re-enqueuing action terminals.
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
+                }
+            }
+        }
+        // Single authoritative terminal ingestion path: drain ready SPSC capture records into
+        // `TerminalBroadcaster` in strict `terminal_seq` order, binding publish-barrier eligibility
+        // strictly to `latest_snap.meta.seq`.
+        let _ = terminal_capture.drain_into(
+            terminals,
+            hub,
+            latest_snap.as_deref(),
+            &[],
+            template_obs,
+            true,
+        );
+        // If a new publication landed concurrently while draining, refresh `latest_snap` once so a
+        // waiting `publish_seq`-gated capture consumes against the matching snapshot immediately.
+        if hub.published_seq() != last {
+            if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                last = s.meta.seq;
+                last_diag = last_diag.max(s.policy_diag_seq);
+                last_action_diag = last_action_diag.max(s.action_diag_seq);
+                pending_telemetry = Some(s.obs.clone());
+                latest_snap = Some(s);
+                let _ = terminal_capture.drain_into(
+                    terminals,
+                    hub,
+                    latest_snap.as_deref(),
+                    &[],
+                    template_obs,
+                    true,
+                );
+            }
+        }
+        // Stage 2 off-RT sinks: runs strictly AFTER `terminal_capture.drain_into` populated
+        // `TerminalBroadcaster` (respecting the `publish_seq` barrier), preserving Step 7 causal
+        // ordering (`broker_dispatcher` BEFORE `conn_lifecycle_client`).
+        if let Some(s) = active_sinks.as_ref() {
+            s.drain_post_terminal(true);
+        }
+        // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
+        // BEFORE forwarding telemetry so a newer telemetry snapshot can never overtake earlier
+        // terminals on the wire.
+        if terminals.has_pending() {
+            let (base, base_seq) = match latest_snap.as_ref() {
+                Some(s) => (&s.obs, s.meta.seq),
+                None => (pending_telemetry.as_ref().unwrap_or(template_obs), 0),
+            };
+            if terminals.drain_all(base, base_seq) {
+                // At least one terminal is gated on `required_publish_seq > base_seq` (e.g., an
+                // off-tick Legacy drain moved a terminal into the broadcaster while `latest_snap`
+                // was still at N). Refresh `latest_snap` once so it pairs with the matching snapshot.
+                if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                    last = s.meta.seq;
+                    last_diag = last_diag.max(s.policy_diag_seq);
+                    last_action_diag = last_action_diag.max(s.action_diag_seq);
+                    pending_telemetry = Some(s.obs.clone());
+                    latest_snap = Some(s);
+                    let _ = terminal_capture.drain_into(
+                        terminals,
+                        hub,
+                        latest_snap.as_deref(),
+                        &[],
+                        template_obs,
+                        true,
+                    );
+                    if let Some(s) = active_sinks.as_ref() {
+                        s.drain_post_terminal(true);
+                    }
+                    if let Some(s_ref) = latest_snap.as_ref() {
+                        let _ = terminals.drain_all(&s_ref.obs, s_ref.meta.seq);
+                    }
+                }
+            }
+        }
+        // Telemetry forwarding gate: read `terminal_capture.inflight()` (Acquire) FIRST, then
+        // `terminals.pending_total()` (Acquire) SECOND — the exact inverse of `drain_into`'s
+        // write order (`pending_total` Release -> `inflight` Release) so `(0, 0)` cannot be
+        // observed while a terminal is moving into the FIFO. Keep `pending_telemetry` across
+        // iterations so a gated snapshot is still forwarded once terminals clear without requiring
+        // another publication, while suppressing any stale `running` observation for an action
+        // already delivered via a synthetic post-publish terminal (across all consumers and
+        // diagnostic-only refreshes).
+        if terminal_capture.inflight() == 0 && terminals.pending_total() == 0 {
+            if let Some(mut obs) = pending_telemetry.take() {
+                if let Some(a) = obs.action.as_mut() {
+                    terminal_capture.apply_sequence_overlay_off_rt(a);
+                }
+                if let Some(a) = obs.previous_action.as_mut() {
+                    terminal_capture.apply_sequence_overlay_off_rt(a);
+                }
+                let stale_running = obs
+                    .action
+                    .as_ref()
+                    .is_some_and(|a| a.is_running() && terminal_capture.was_synthetically_terminated(a.id));
+                if !stale_running && tx.receiver_count() > 0 {
+                    let _ = tx.send(obs);
+                }
+            }
+        }
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+    // Final drain on supervisor close so no retired/diagnostic/reply/terminal items are stranded,
+    // and emit any final safety overflow summary. Drain `terminal_capture` BEFORE
+    // `flush_and_report_shutdown` so final broker reply routing sees every captured entry.
+    if let Some(ring) = hub.record_ring() { ring.drain(); }
+    let _ = terminal_capture
+        .wait_for_sequence_commit_idle_until(Instant::now() + Duration::from_secs(5));
+    let final_snap = hub.latest().or(latest_snap);
+    terminal_capture.drain_into(
+        terminals,
+        hub,
+        final_snap.as_deref(),
+        &[],
+        template_obs,
+        false,
+    );
+    let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(s) = s {
+        s.flush_and_report_shutdown(tick_stats);
+    }
+    if terminals.has_pending() {
+        let final_seq = final_snap.as_ref().map_or(0, |s| s.meta.seq);
+        let _ = terminals.drain_all(final_snap.as_ref().map_or(template_obs, |s| &s.obs), final_seq);
+    }
+}
+
+
 impl Default for TerminalBroadcaster {
     fn default() -> Self {
         Self {
