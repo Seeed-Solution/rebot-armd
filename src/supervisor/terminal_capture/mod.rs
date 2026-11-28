@@ -28,6 +28,8 @@ use crate::safety::{BoundedFaultReason, BoundedText, FaultInfo, FaultReason, Saf
 
 use super::{SupervisorInner, TerminalBroadcaster, TERMINAL_FIFO_CAPACITY};
 
+mod channel;
+
 /// Physical SPSC ring capacity (2x `TERMINAL_FIFO_CAPACITY` for in-flight headroom).
 pub const TERMINAL_CAPTURE_RING_CAPACITY: usize = TERMINAL_FIFO_CAPACITY * 2;
 /// Logical admission reservation ceiling matching `TERMINAL_FIFO_CAPACITY`.
