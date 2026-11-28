@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::driver::DriverCapabilities;
-use crate::kinematics::{WORKSPACE_EPS, WORKSPACE_PARK_ESCAPE_EPS};
+use crate::kinematics::WORKSPACE_EPS;
 use crate::model::{ArmConfig, JointLimit, WorkspacePolicy, MAX_MOTION_DOF};
 use crate::motion::{ActiveTrajectory, MotionError};
 use crate::power::{PowerBudget, PowerHold};
@@ -21,8 +21,8 @@ use crate::rt_core::publish::Snapshot;
 use crate::rt_core::scratch::copy_into;
 use crate::safety::{SafetyError, SafetyState};
 use crate::supervisor::{
-    check_path_with_tcp_tol, keepout_sweep_with_tcp_tol, AdmissionStamp, ArmError,
-    ParkContinuation, ParkContinuationPhase, ParkRearmStart, SupervisorInner, MAX_KEEPOUT_EVALS_PER_PLAN,
+    AdmissionStamp, ArmError, ParkContinuation, ParkContinuationPhase, ParkRearmStart,
+    SupervisorInner, MAX_KEEPOUT_EVALS_PER_PLAN,
 };
 use crate::torque_guard::TorqueHold;
 use crate::trajectory::{
@@ -570,13 +570,19 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
                 ).into());
             }
         }
-        let eps = if is_park { WORKSPACE_PARK_ESCAPE_EPS } else { WORKSPACE_EPS };
         let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
         let at = |t: f64| traj.sample(t).positions;
         let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
         let map_ws = |e: SafetyError| ArmError::Safety(if is_park { e.with_workspace_phase("park") } else { e });
-        let samples = keepout_sweep_with_tcp_tol(&arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, eps, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN).map_err(map_ws)?;
-        check_path_with_tcp_tol(&arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, eps, &start, samples.iter().map(Vec::as_slice)).map_err(map_ws)?;
+        let meas = Some(snap.measured_positions.as_slice());
+        let samples = SupervisorInner::keepout_sweep_with_tcp_measured(
+            &arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, WORKSPACE_EPS,
+            meas, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN,
+        ).map_err(map_ws)?;
+        SupervisorInner::check_path_with_tcp_measured(
+            &arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, WORKSPACE_EPS,
+            meas, &start, samples.iter().map(Vec::as_slice),
+        ).map_err(map_ws)?;
     }
 
     let (mut s_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) = (
@@ -887,7 +893,7 @@ fn commit_quintic_slot(
     this.last_heartbeat = Instant::now();
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.retire_servo_ws_min_depths();
+    this.force_clear_servo_ws_min_depths_rt();
     copy_into(&mut this.target_positions, target);
     this.safety.mark_motion_started().map_err(map_admission_err)?;
     let id = this.begin_action_rt(action_kind);
@@ -1126,7 +1132,7 @@ fn install_park_trajectory(this: &mut SupervisorInner, mode: ParkActionMode, slo
     let dof = usize::from(slot.dof);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.retire_servo_ws_min_depths();
+    this.force_clear_servo_ws_min_depths_rt();
     this.servo_stream_active = false;
     let _ = this.safety.set_torque_rt(true);
     let _ = this.safety.mark_motion_started();

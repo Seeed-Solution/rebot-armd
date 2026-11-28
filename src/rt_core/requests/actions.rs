@@ -1610,6 +1610,7 @@ impl ActionSnapshot {
     pub fn joint_goal_snapshot(&self, speed_scale: f64) -> JointGoalSnapshot {
         JointGoalSnapshot {
             start: self.commanded_positions.clone(),
+            measured: self.measured_positions.clone(),
             v0: self.commanded_velocities.clone(),
             limits: self.env.planning_limits(Some(speed_scale)),
             arm_dof: self.env.config.arm_dof(),
@@ -1807,7 +1808,7 @@ fn validate_approach_segment_off_lock(
             .map_err(|e| format!("segment: {}", e.code()))?;
     }
     let seg_samples = if let Some(ws) = ws {
-        workspace_samples_and_check_off_lock(&traj, start, ws, cam, arm, tcp_offset)
+        workspace_samples_and_check_off_lock(&traj, start, None, ws, cam, arm, tcp_offset)
             .map_err(|e| format!("segment: {}", arm_err_code_str(e)))?
     } else {
         (0..=20)
@@ -2830,9 +2831,10 @@ fn joint_goal_feasible_off_lock(snap: &ActionSnapshot, q: &[f64; 6]) -> bool {
         return false;
     }
     if let Some(ws) = snap.env.workspace_policy.as_ref() {
-        check_quintic_workspace_off_lock(
+        check_quintic_workspace_from_measured_off_lock(
             &traj,
             &snap.commanded_positions,
+            Some(&snap.measured_positions),
             ws,
             &snap.env.config.camera_mount,
             &snap.env.config.arm_model,
@@ -2938,7 +2940,7 @@ fn prepare_move_common(
             } else {
                 Err(None)
             };
-            let direct = match motion::plan_cartesian_opts(&input, goal, speed, opts) {
+            let direct = match motion::plan_cartesian_opts_from_measured(&input, Some(&snap.measured_positions), goal, speed, opts) {
                 Ok(d) => d,
                 Err(e) => {
                     let hint = matches!(&e, MotionError::IkBranchFlip { .. })
@@ -3239,6 +3241,7 @@ pub(crate) fn fit_quintic_power_off_lock(
 fn workspace_samples_and_check_off_lock(
     traj: &crate::trajectory::MultiJointQuinticTrajectory,
     start: &[f32],
+    measured: Option<&[f32]>,
     ws: &WorkspacePolicy,
     cam: &crate::model::CameraMount,
     arm: &crate::chain::ArmModel,
@@ -3248,26 +3251,10 @@ fn workspace_samples_and_check_off_lock(
     let at = |t: f64| traj.sample(t).positions;
     let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
     let eps = crate::kinematics::WORKSPACE_EPS;
-    let samples = crate::supervisor::keepout_sweep_with_tcp_tol(
-        arm,
-        ws,
-        cam,
-        tcp_offset,
-        eps,
-        &at,
-        &travel,
-        &knots,
-        crate::supervisor::MAX_KEEPOUT_EVALS_PER_PLAN,
+    let samples = SupervisorInner::keepout_sweep_with_tcp_measured(
+        arm, ws, cam, tcp_offset, eps, measured, &at, &travel, &knots, crate::supervisor::MAX_KEEPOUT_EVALS_PER_PLAN,
     )?;
-    crate::supervisor::check_path_with_tcp_tol(
-        arm,
-        ws,
-        cam,
-        tcp_offset,
-        eps,
-        start,
-        samples.iter().map(Vec::as_slice),
-    )?;
+    SupervisorInner::check_path_with_tcp_measured(arm, ws, cam, tcp_offset, eps, measured, start, samples.iter().map(Vec::as_slice))?;
     Ok(samples)
 }
 
@@ -3279,7 +3266,19 @@ pub(crate) fn check_quintic_workspace_off_lock(
     arm: &crate::chain::ArmModel,
     tcp_offset: [f64; 3],
 ) -> Result<(), ArmError> {
-    workspace_samples_and_check_off_lock(traj, start, ws, cam, arm, tcp_offset).map(|_| ())
+    workspace_samples_and_check_off_lock(traj, start, None, ws, cam, arm, tcp_offset).map(|_| ())
+}
+
+pub(crate) fn check_quintic_workspace_from_measured_off_lock(
+    traj: &crate::trajectory::MultiJointQuinticTrajectory,
+    start: &[f32],
+    measured: Option<&[f32]>,
+    ws: &WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    arm: &crate::chain::ArmModel,
+    tcp_offset: [f64; 3],
+) -> Result<(), ArmError> {
+    workspace_samples_and_check_off_lock(traj, start, measured, ws, cam, arm, tcp_offset).map(|_| ())
 }
 
 pub(crate) fn build_prepared_quintic_off_lock(
@@ -3330,17 +3329,11 @@ pub(crate) fn build_prepared_quintic_off_lock(
         motion::check_quintic_planning_limits(&traj, &cfg.limits, sc)?;
     }
     if let Some(ws) = snap.env.workspace_policy.as_ref() {
-        check_quintic_workspace_off_lock(
-            &traj,
-            &snap.commanded_positions,
-            ws,
-            &cfg.camera_mount,
-            &cfg.arm_model,
-            cfg.tcp_offset,
-        )?;
+        check_quintic_workspace_from_measured_off_lock(&traj, &snap.commanded_positions, Some(&snap.measured_positions), ws, &cfg.camera_mount, &cfg.arm_model, cfg.tcp_offset)?;
     }
     Ok(PreparedQuintic {
         start: snap.commanded_positions.clone(),
+        measured: snap.measured_positions.clone(),
         v0: snap.commanded_velocities.clone(),
         target: target.to_vec(),
         limits: limits.to_vec(),
@@ -3556,9 +3549,7 @@ fn validate_approach_leg_rt(
     if let Some(sc) = scope {
         motion::check_quintic_planning_limits_rt(&seg, &inner.config.limits, sc)?;
     }
-    inner
-        .check_workspace_quintic_inline(&seg)
-        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
+    inner.check_workspace_quintic_inline_rt(&seg, false).map_err(CommitRefusal::code)?;
     // O(1) endpoint fence (full curve was certified off-thread; shared tick also checks every step).
     inner
         .check_static_load_endpoint_inline(&leg_start[..dof], &leg.target[..dof])
@@ -3711,6 +3702,8 @@ pub fn install_move_joint(
             let target_clamped = leg1_target != prep.prepared_quintic.target;
             let (prepared_for_install, exact_for_install) = if let Some(scope) = prep.checked_joints {
                 let reuse_ok = prep.prepared_quintic.start == inner.commanded_positions
+                    && prep.prepared_quintic.measured.len() == inner.measured_positions.len()
+                    && prep.prepared_quintic.measured.iter().zip(&inner.measured_positions).all(|(a, b)| (a - b).abs() < 1e-4)
                     && prep.prepared_quintic.v0 == inner.commanded_velocities
                     && !target_clamped
                     && prep.prepared_quintic.limits.as_slice() == prep.limits.as_slice()
@@ -3732,8 +3725,8 @@ pub fn install_move_joint(
                         prep.prepared_quintic.traj.duration,
                     )?;
                     motion::check_quintic_planning_limits(&rebuilt, &inner.config.limits, scope)?;
-                    let samples = inner.workspace_samples(&rebuilt)?;
-                    inner.check_workspace_path(&inner.commanded_positions, samples.iter().map(Vec::as_slice))?;
+                    let samples = inner.workspace_samples_from_measured(&rebuilt, Some(&inner.measured_positions))?;
+                    inner.check_workspace_path_from_measured(&inner.commanded_positions, Some(&inner.measured_positions), samples.iter().map(Vec::as_slice))?;
                     (None, Some((rebuilt, prep.prepared_quintic.power_scale)))
                 };
                 if let Some(leg) = prep.approach_leg.as_mut() {
@@ -3994,9 +3987,7 @@ fn install_move_joint_rt(
     if let Some(sc) = scope {
         motion::check_quintic_planning_limits_rt(&traj, &inner.config.limits, sc)?;
     }
-    inner
-        .check_workspace_quintic_inline(&traj)
-        .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
+    inner.check_workspace_quintic_inline_rt(&traj, true).map_err(CommitRefusal::code)?;
     let then_traj = match approach_then {
         Some(leg) => Some(validate_approach_leg_rt(
             inner,
@@ -4034,7 +4025,7 @@ fn install_move_joint_rt(
     }
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.clear_servo_ws_min_depths_rt();
+    this.force_clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &tgt[..dof]);
     this.safety
         .mark_motion_started()
@@ -4237,7 +4228,7 @@ fn install_gripper_rt(
     this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.clear_servo_ws_min_depths_rt();
+    this.force_clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
     if gripper_idx < this.target_positions.len() {
         this.target_positions[gripper_idx] = target_g;
@@ -4415,7 +4406,7 @@ fn install_gripper_zero_check_rt(
     this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
-    this.clear_servo_ws_min_depths_rt();
+    this.force_clear_servo_ws_min_depths_rt();
     crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
     if gripper_idx < this.target_positions.len() {
         this.target_positions[gripper_idx] = target_g;
@@ -5052,8 +5043,8 @@ pub fn install_macro_child(
                         )?
                     };
                     motion::check_quintic_planning_limits(&rebuilt, &inner.config.limits, scope)?;
-                    let samples = inner.workspace_samples(&rebuilt)?;
-                    inner.check_workspace_path(&inner.commanded_positions, samples.iter().map(Vec::as_slice))?;
+                    let samples = inner.workspace_samples_from_measured(&rebuilt, Some(&inner.measured_positions))?;
+                    inner.check_workspace_path_from_measured(&inner.commanded_positions, Some(&inner.measured_positions), samples.iter().map(Vec::as_slice))?;
                     target = filtered_target;
                     (None, Some((rebuilt, pscale)))
                 }
@@ -5518,9 +5509,7 @@ fn install_macro_child_slot_rt(
             if let Some(sc) = scope {
                 motion::check_quintic_planning_limits_rt(&traj, &inner.config.limits, sc)?;
             }
-            inner
-                .check_workspace_quintic_inline(&traj)
-                .map_err(|e| CommitRefusal::code(static_code(ArmError::Safety(e))))?;
+            inner.check_workspace_quintic_inline_rt(&traj, true).map_err(CommitRefusal::code)?;
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,
@@ -5670,7 +5659,7 @@ fn install_macro_child_slot_rt(
             this.gripper_hold_vel_ceiling = Some(wire_vel);
             this.release_servo_target();
             this.servo_settled_ticks.fill(0);
-            this.clear_servo_ws_min_depths_rt();
+            this.force_clear_servo_ws_min_depths_rt();
             crate::rt_core::scratch::copy_into(&mut this.target_positions, &this.commanded_positions);
             if gripper_idx < this.target_positions.len() {
                 this.target_positions[gripper_idx] = target_g;

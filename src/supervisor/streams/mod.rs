@@ -224,15 +224,21 @@ impl SupervisorInner {
                 .or_else(|| self.workspace_violation_spare.take())
                 .unwrap_or_else(crate::kinematics::WorkspaceViolationDetail::preallocated_rt);
             if let Some((ws, cam)) = self.workspace_policy() {
-                let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-                    &self.config.arm_model,
-                    ws,
-                    cam,
-                    self.config.tcp_offset,
-                    &mut bufs,
-                );
-                eval.write_failure_detail_rt(&f, &mut detail);
-                eval.recycle(&mut bufs);
+                if !self.rt_executor_owned
+                    || bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false)
+                {
+                    let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                        &self.config.arm_model,
+                        ws,
+                        cam,
+                        self.config.tcp_offset,
+                        &mut bufs,
+                    );
+                    eval.write_failure_detail_rt(&f, &mut detail);
+                    eval.recycle(&mut bufs);
+                } else {
+                    crate::chain::WorkspaceEvaluator::write_failure_detail_without_eval_rt(&f, &mut detail);
+                }
             }
             self.ws_eval_bufs = bufs;
             self.workspace_violation = Some(detail);
@@ -319,58 +325,83 @@ impl SupervisorInner {
             let Some((ws, cam)) = self.workspace_policy() else {
                 return Ok(false);
             };
-            let mut eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            if !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false) {
+                if self.rt_executor_owned {
+                    return Err(crate::chain::WorkspaceFailureRt {
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        phase,
+                    });
+                }
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+            }
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
                 &self.config.arm_model,
                 ws,
                 cam,
                 self.config.tcp_offset,
                 &mut bufs,
             );
-            let mut n = eval.total_slots;
-            if !buf_len_ok(&bufs.scratch_c0, n)
-                || !buf_len_ok(&bufs.scratch_c1, n)
-                || !buf_len_ok(&bufs.scratch_cm, n)
-                || !buf_len_ok(&bufs.scratch_cand_min_d, n)
-                || !buf_len_ok(&bufs.geom_bounds, eval.num_geoms)
-                || bufs.sweep_slab.len() < 2 * n
-            {
-                // Fallback only if a non-RT caller/test mutated `config.workspace` directly
-                // without calling `prepare_workspace_eval_bufs()`; on `armd-control`, every
-                // workspace load and config commit pre-sizes `ws_eval_bufs` off-thread.
-                eval.recycle(&mut bufs);
-                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
-                eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-                    &self.config.arm_model,
-                    ws,
-                    cam,
-                    self.config.tcp_offset,
-                    &mut bufs,
-                );
-                n = eval.total_slots;
-            }
+            let n = eval.total_slots;
             let checked = (|| {
-                eval.eval_into_slice_rt(
-                    &self.commanded_positions,
-                    &mut bufs.scratch_c0,
-                    &mut bufs.world_caps,
-                    phase,
-                )?;
-                if buf_len_ok(&bufs.scratch_cand_min_d, n) {
-                    match &self.servo_ws_min_depths {
-                        Some((rev, min_d))
-                            if *rev == self.workspace_revision && min_d.as_slice().len() == n =>
-                        {
-                            bufs.scratch_cand_min_d[..n].copy_from_slice(min_d.as_slice());
-                        }
-                        _ => eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_cand_min_d),
-                    }
-                } else {
+                if self.rt_executor_owned
+                    && n > crate::kinematics::MAX_STACK_WORKSPACE_SLOTS
+                    && !self.servo_ws_min_depths.as_ref().is_some_and(|(_, b)| b.as_slice().len() == n)
+                    && !bufs.min_depths_spare.as_ref().is_some_and(|s| s.as_slice().len() == n)
+                {
                     return Err(crate::chain::WorkspaceFailureRt {
-                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                        kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace min_depths spare undersized"),
                         phase,
                     });
                 }
                 let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+                match &self.servo_ws_min_depths {
+                    Some((rev, min_d))
+                        if *rev == self.workspace_revision && min_d.as_slice().len() == n =>
+                    {
+                        bufs.scratch_cand_min_d[..n].copy_from_slice(min_d.as_slice());
+                        eval.eval_into_slice_rt(
+                            &self.commanded_positions,
+                            &mut bufs.scratch_c0,
+                            &mut bufs.world_caps,
+                            phase,
+                        )?;
+                    }
+                    _ => {
+                        if let Some(m) = crate::chain::WorkspaceEvaluator::valid_distinct_measured(
+                            Some(&self.measured_positions),
+                            &self.commanded_positions,
+                        ) {
+                            eval.eval_into_slice_rt(m, &mut bufs.scratch_c0, &mut bufs.world_caps, phase)?;
+                            eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_cand_min_d);
+                            eval.sweep_linear_step_rt(
+                                m,
+                                &self.commanded_positions,
+                                &bufs.scratch_c0,
+                                &mut bufs.scratch_cand_min_d,
+                                &mut budget,
+                                MAX_KEEPOUT_EVALS_PER_TICK,
+                                phase,
+                                phase,
+                                &mut bufs.scratch_c1,
+                                &mut bufs.scratch_cm,
+                                &mut bufs.sweep_slab,
+                                &mut bufs.sweep_stack,
+                                &mut bufs.sweep_free,
+                                &mut bufs.geom_bounds,
+                                &mut bufs.world_caps,
+                            )?;
+                            bufs.scratch_c0[..n].copy_from_slice(&bufs.scratch_c1[..n]);
+                        } else {
+                            eval.eval_into_slice_rt(
+                                &self.commanded_positions,
+                                &mut bufs.scratch_c0,
+                                &mut bufs.world_caps,
+                                phase,
+                            )?;
+                            eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_cand_min_d);
+                        }
+                    }
+                }
                 eval.sweep_linear_step_rt(
                     &self.commanded_positions,
                     next,
@@ -443,8 +474,8 @@ impl SupervisorInner {
         self.ws_eval_bufs = bufs;
     }
 
-    /// `check_workspace_path(commanded, [target])` with the evaluator's reused vectors (no
-    /// allocation): the servo / policy target check.
+    /// Servo / policy target workspace check reusing evaluator vectors and preserving running
+    /// per-slot minima (`self.servo_ws_min_depths`) across frames to prevent ratcheting.
     pub(super) fn servo_target_workspace(&mut self, target: &[f32]) -> Result<(), SafetyError> {
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let result = (|| {
@@ -452,9 +483,32 @@ impl SupervisorInner {
             let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(&self.config.arm_model, ws, cam, self.config.tcp_offset, &mut bufs)
                 .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
             let checked = (|| {
-                let mut c0 = eval.alloc_buf();
-                eval.eval_into(&self.commanded_positions, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
-                let mut min_depths = eval.init_min_depths(&c0);
+                let n = eval.total_slots;
+                let mut min_depths = match &self.servo_ws_min_depths {
+                    Some((rev, saved)) if *rev == self.workspace_revision && saved.as_slice().len() == n => {
+                        let mut md = saved.clone();
+                        let mut c0 = eval.alloc_buf();
+                        eval.eval_into(&self.commanded_positions, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
+                        crate::kinematics::advance_min_depths(c0.as_slice(), md.as_mut_slice());
+                        md
+                    }
+                    _ => {
+                        let mut c0 = eval.alloc_buf();
+                        if let Some(m) = crate::chain::WorkspaceEvaluator::valid_distinct_measured(
+                            Some(&self.measured_positions),
+                            &self.commanded_positions,
+                        ) {
+                            eval.eval_into(m, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
+                            let mut md = eval.init_min_depths(&c0);
+                            eval.eval_into(&self.commanded_positions, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
+                            eval.check_and_advance(&c0, &mut md, "plan").map_err(SafetyError::from_workspace)?;
+                            md
+                        } else {
+                            eval.eval_into(&self.commanded_positions, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
+                            eval.init_min_depths(&c0)
+                        }
+                    }
+                };
                 let mut clr = eval.alloc_buf();
                 eval.eval_into(target, &mut clr, "plan").map_err(SafetyError::from_workspace)?;
                 eval.check_and_advance(&clr, &mut min_depths, "plan").map_err(SafetyError::from_workspace)
@@ -467,15 +521,20 @@ impl SupervisorInner {
     }
 
     /// Zero-allocation RT variant of [`Self::servo_target_workspace`]: uses pre-sized clearance
-    /// scratch slices from `self.ws_eval_bufs` (zero heap allocations for any legal workspace
-    /// size, including 32 end points + multiple keep-out boxes, and never builds allocating
-    /// [`crate::chain::WorkspaceFailure`] strings on refusal).
+    /// scratch slices from `self.ws_eval_bufs`, preserves `self.servo_ws_min_depths` across
+    /// frames, and fails closed without allocating on undersized/oversized inputs on RT.
     pub(super) fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), crate::rt_core::mailbox::Refusal> {
         use crate::rt_core::mailbox::Refusal;
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let result = (|| {
             let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-            let mut eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            if !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false) {
+                if self.rt_executor_owned {
+                    return Err(Refusal::code("WORKSPACE_VIOLATION"));
+                }
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+            }
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
                 &self.config.arm_model,
                 ws,
                 cam,
@@ -483,23 +542,7 @@ impl SupervisorInner {
                 &mut bufs,
             )
             .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
-            let mut n = eval.total_slots;
-            if !buf_len_ok(&bufs.scratch_c0, n)
-                || !buf_len_ok(&bufs.scratch_c1, n)
-                || !buf_len_ok(&bufs.scratch_min_d, n)
-            {
-                eval.recycle(&mut bufs);
-                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
-                eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-                    &self.config.arm_model,
-                    ws,
-                    cam,
-                    self.config.tcp_offset,
-                    &mut bufs,
-                )
-                .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
-                n = eval.total_slots;
-            }
+            let n = eval.total_slots;
             let checked = if !eval.capsules_valid()
                 || !buf_len_ok(&bufs.scratch_c0, n)
                 || !buf_len_ok(&bufs.scratch_c1, n)
@@ -507,24 +550,60 @@ impl SupervisorInner {
             {
                 Err(Refusal::code("WORKSPACE_VIOLATION"))
             } else {
-                match eval
-                    .eval_into_slice_rt(
-                        &self.commanded_positions,
-                        &mut bufs.scratch_c0,
-                        &mut bufs.world_caps,
-                        "plan",
+                let res = (|| {
+                    match &self.servo_ws_min_depths {
+                        Some((rev, saved))
+                            if *rev == self.workspace_revision && saved.as_slice().len() == n =>
+                        {
+                            bufs.scratch_min_d[..n].copy_from_slice(saved.as_slice());
+                            eval.eval_into_slice_rt(
+                                &self.commanded_positions,
+                                &mut bufs.scratch_c0,
+                                &mut bufs.world_caps,
+                                "plan",
+                            )?;
+                            crate::kinematics::advance_min_depths(
+                                &bufs.scratch_c0[..n],
+                                &mut bufs.scratch_min_d[..n],
+                            );
+                        }
+                        _ => {
+                            if let Some(m) = crate::chain::WorkspaceEvaluator::valid_distinct_measured(
+                                Some(&self.measured_positions),
+                                &self.commanded_positions,
+                            ) {
+                                eval.eval_into_slice_rt(m, &mut bufs.scratch_c0, &mut bufs.world_caps, "plan")?;
+                                eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
+                                eval.eval_into_slice_rt(
+                                    &self.commanded_positions,
+                                    &mut bufs.scratch_c0,
+                                    &mut bufs.world_caps,
+                                    "plan",
+                                )?;
+                                eval.check_and_advance_slice_rt(
+                                    &bufs.scratch_c0,
+                                    &mut bufs.scratch_min_d,
+                                    "servo_target",
+                                )?;
+                            } else {
+                                eval.eval_into_slice_rt(
+                                    &self.commanded_positions,
+                                    &mut bufs.scratch_c0,
+                                    &mut bufs.world_caps,
+                                    "plan",
+                                )?;
+                                eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
+                            }
+                        }
+                    }
+                    eval.eval_into_slice_rt(target, &mut bufs.scratch_c1, &mut bufs.world_caps, "plan")?;
+                    eval.check_and_advance_slice_rt(
+                        &bufs.scratch_c1,
+                        &mut bufs.scratch_min_d,
+                        "servo_target",
                     )
-                    .and_then(|()| {
-                        eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_min_d);
-                        eval.eval_into_slice_rt(target, &mut bufs.scratch_c1, &mut bufs.world_caps, "plan")
-                    })
-                    .and_then(|()| {
-                        eval.check_and_advance_slice_rt(
-                            &bufs.scratch_c1,
-                            &mut bufs.scratch_min_d,
-                            "servo_target",
-                        )
-                    }) {
+                })();
+                match res {
                     Ok(()) => Ok(()),
                     Err(f) => Err(Refusal {
                         code: "WORKSPACE_VIOLATION",
@@ -551,14 +630,38 @@ impl SupervisorInner {
             bufs,
         );
         let checked = (|| {
-            let mut c0 = eval.alloc_buf();
-            eval.eval_into(&self.commanded_positions, &mut c0, phase)
-                .map_err(SafetyError::from_workspace)?;
-            let mut cand_min_d = match &self.servo_ws_min_depths {
-                Some((rev, min_d)) if *rev == self.workspace_revision => min_d.clone(),
-                _ => eval.init_min_depths(&c0),
-            };
             let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+            let (c0, mut cand_min_d) = match &self.servo_ws_min_depths {
+                Some((rev, min_d)) if *rev == self.workspace_revision => {
+                    let mut c0 = eval.alloc_buf();
+                    eval.eval_into(&self.commanded_positions, &mut c0, phase)
+                        .map_err(SafetyError::from_workspace)?;
+                    (c0, min_d.clone())
+                }
+                _ => {
+                    if let Some(m) = crate::chain::WorkspaceEvaluator::valid_distinct_measured(
+                        Some(&self.measured_positions),
+                        &self.commanded_positions,
+                    ) {
+                        let mut cm = eval.alloc_buf();
+                        eval.eval_into(m, &mut cm, phase).map_err(SafetyError::from_workspace)?;
+                        let mut md = eval.init_min_depths(&cm);
+                        let c0 = eval
+                            .sweep_linear_step(
+                                m, &self.commanded_positions, &cm, &mut md,
+                                &mut budget, MAX_KEEPOUT_EVALS_PER_TICK, phase, phase,
+                            )
+                            .map_err(|(_, f)| SafetyError::from_workspace(f))?;
+                        (c0, md)
+                    } else {
+                        let mut c0 = eval.alloc_buf();
+                        eval.eval_into(&self.commanded_positions, &mut c0, phase)
+                            .map_err(SafetyError::from_workspace)?;
+                        let md = eval.init_min_depths(&c0);
+                        (c0, md)
+                    }
+                }
+            };
             eval.sweep_linear_step(
                 &self.commanded_positions,
                 next,
@@ -1238,14 +1341,18 @@ impl SupervisorInner {
                 let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
                 let mut formatted = crate::safety::BoundedText::<384>::empty();
                 {
-                    let eval = self.workspace_policy().map(|(ws, cam)| {
-                        crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-                            &self.config.arm_model,
-                            ws,
-                            cam,
-                            self.config.tcp_offset,
-                            &mut bufs,
-                        )
+                    let eval = self.workspace_policy().and_then(|(ws, cam)| {
+                        (!self.rt_executor_owned
+                            || bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false))
+                        .then(|| {
+                            crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                                &self.config.arm_model,
+                                ws,
+                                cam,
+                                self.config.tcp_offset,
+                                &mut bufs,
+                            )
+                        })
                     });
                     why.write_with_evaluator(&mut formatted, eval.as_ref());
                     if let Some(ev) = eval {

@@ -3213,6 +3213,12 @@ impl crate::supervisor::SupervisorInner {
             if let Some((rev, md)) = prev_depths {
                 let src = md.as_slice();
                 if bufs.tracking_staged_ws.len() < src.len() {
+                    if self.rt_executor_owned {
+                        return Err(FallbackStepErr::WorkspaceStepViolation(crate::chain::WorkspaceFailureRt {
+                            kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                            phase: "tracking_fallback",
+                        }));
+                    }
                     bufs.tracking_staged_ws.resize(src.len(), 0.0);
                 }
                 bufs.tracking_staged_ws[..src.len()].copy_from_slice(src);
@@ -3220,33 +3226,26 @@ impl crate::supervisor::SupervisorInner {
             }
             return Ok(None);
         }
-        let mut eval = WorkspaceEvaluator::new_with_tcp_in_mode(
-            &self.config.arm_model,
-            ws_full,
-            cam,
-            self.config.tcp_offset,
-            bufs,
-            keepout_only,
-        );
-        let n = eval.total_slots;
-        if bufs.scratch_c0.len() < n
-            || bufs.scratch_c1.len() < n
-            || bufs.scratch_cm.len() < n
-            || bufs.scratch_cand_min_d.len() < n
-            || bufs.tracking_staged_ws.len() < n
-            || bufs.geom_bounds.len() < eval.num_geoms
-            || bufs.sweep_slab.len() < 2 * n
-        {
-            eval.recycle(bufs);
+        if !bufs.can_eval_rt(&self.config.arm_model, ws_full, cam, self.config.tcp_offset, keepout_only) {
+            if self.rt_executor_owned {
+                return Err(FallbackStepErr::WorkspaceStepViolation(crate::chain::WorkspaceFailureRt {
+                    kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                    phase: "tracking_fallback",
+                }));
+            }
             bufs.prepare_for(&self.config.arm_model, ws_full, cam, self.config.tcp_offset);
-            eval = WorkspaceEvaluator::new_with_tcp_in_mode(
-                &self.config.arm_model,
-                ws_full,
-                cam,
-                self.config.tcp_offset,
-                bufs,
-                keepout_only,
-            );
+        }
+        let eval = WorkspaceEvaluator::new_with_tcp_in_mode(&self.config.arm_model, ws_full, cam, self.config.tcp_offset, bufs, keepout_only);
+        let n = eval.total_slots;
+        if bufs.tracking_staged_ws.len() < n {
+            if self.rt_executor_owned {
+                eval.recycle(bufs);
+                return Err(FallbackStepErr::WorkspaceStepViolation(crate::chain::WorkspaceFailureRt {
+                    kind: crate::chain::WorkspaceFailureKindRt::Invalid("workspace scratch undersized"),
+                    phase: "tracking_fallback",
+                }));
+            }
+            bufs.tracking_staged_ws.resize(n, 0.0);
         }
         let res = (|| {
             let mut committed = None;
@@ -3260,50 +3259,22 @@ impl crate::supervisor::SupervisorInner {
                     _ => eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_cand_min_d),
                 }
                 eval.sweep_linear_step_rt(
-                    pq,
-                    q,
-                    &bufs.scratch_c0,
-                    &mut bufs.scratch_cand_min_d,
-                    budget,
-                    MAX_KEEPOUT_EVALS_PER_TICK,
-                    "tracking_fallback",
-                    "tracking_fallback",
-                    &mut bufs.scratch_c1,
-                    &mut bufs.scratch_cm,
-                    &mut bufs.sweep_slab,
-                    &mut bufs.sweep_stack,
-                    &mut bufs.sweep_free,
-                    &mut bufs.geom_bounds,
-                    &mut bufs.world_caps,
-                )
-                .map_err(FallbackStepErr::WorkspaceStepViolation)?;
+                    pq, q, &bufs.scratch_c0, &mut bufs.scratch_cand_min_d, budget, MAX_KEEPOUT_EVALS_PER_TICK,
+                    "tracking_fallback", "tracking_fallback", &mut bufs.scratch_c1, &mut bufs.scratch_cm,
+                    &mut bufs.sweep_slab, &mut bufs.sweep_stack, &mut bufs.sweep_free, &mut bufs.geom_bounds, &mut bufs.world_caps,
+                ).map_err(FallbackStepErr::WorkspaceStepViolation)?;
                 bufs.tracking_staged_ws[..n].copy_from_slice(&bufs.scratch_cand_min_d[..n]);
                 committed = Some((self.workspace_revision, n));
             }
-            if !fresh_meas {
-                return Ok(committed);
-            }
+            if !fresh_meas { return Ok(committed); }
             eval.eval_into_slice_rt(&self.measured_positions, &mut bufs.scratch_c0, &mut bufs.world_caps, "tracking_fallback")
                 .map_err(FallbackStepErr::WorkspaceMeasuredViolation)?;
             eval.init_min_depths_slice(&bufs.scratch_c0, &mut bufs.scratch_cand_min_d);
             eval.sweep_linear_step_rt(
-                &self.measured_positions,
-                q,
-                &bufs.scratch_c0,
-                &mut bufs.scratch_cand_min_d,
-                budget,
-                MAX_KEEPOUT_EVALS_PER_TICK,
-                "tracking_fallback",
-                "tracking_fallback",
-                &mut bufs.scratch_c1,
-                &mut bufs.scratch_cm,
-                &mut bufs.sweep_slab,
-                &mut bufs.sweep_stack,
-                &mut bufs.sweep_free,
-                &mut bufs.geom_bounds,
-                &mut bufs.world_caps,
-            )
-            .map_err(FallbackStepErr::WorkspaceMeasuredSweepViolation)?;
+                &self.measured_positions, q, &bufs.scratch_c0, &mut bufs.scratch_cand_min_d, budget, MAX_KEEPOUT_EVALS_PER_TICK,
+                "tracking_fallback", "tracking_fallback", &mut bufs.scratch_c1, &mut bufs.scratch_cm,
+                &mut bufs.sweep_slab, &mut bufs.sweep_stack, &mut bufs.sweep_free, &mut bufs.geom_bounds, &mut bufs.world_caps,
+            ).map_err(FallbackStepErr::WorkspaceMeasuredSweepViolation)?;
             if committed.is_none() {
                 bufs.tracking_staged_ws[..n].copy_from_slice(&bufs.scratch_cand_min_d[..n]);
                 committed = Some((self.workspace_revision, n));
