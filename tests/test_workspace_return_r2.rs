@@ -545,3 +545,56 @@ async fn gripper_zero_check_and_macro_gripper_do_not_reset_arm_stream_minima() {
         assert_eq!(after.1.as_slice(), baseline.as_slice());
     }
 }
+
+/// R2 Item 5 (Major): For initially intruding slots (`start_depth > WORKSPACE_EPS`), terminal
+/// depth must satisfy `end_depth <= start_depth` EXACTLY (no `+ WORKSPACE_EPS` slack).
+/// One slot improving by 0.2 mm while another ends 0.09 mm deeper MUST be refused.
+#[test]
+fn terminal_rule_rejects_sub_eps_deepening_even_when_another_slot_improves() {
+    use armd::kinematics::{check_terminal_workspace_progress, TerminalWorkspaceReject};
+
+    // Slot 0 starts 10.00 mm outside and improves by 0.20 mm -> 9.80 mm (> WORKSPACE_EPS progress).
+    // Slot 1 starts 5.00 mm outside and ends 0.09 mm deeper -> 5.09 mm (< WORKSPACE_EPS deepening).
+    // Slot 2 starts clear (0.00 mm) and stays within WORKSPACE_EPS (0.05 mm).
+    let start_depths = [0.010_00, 0.005_00, 0.0];
+    let end_clearances = [-0.009_80, -0.005_09, -0.000_05];
+    let err = check_terminal_workspace_progress(&start_depths, &end_clearances)
+        .expect_err("slot 1 deepening by 0.09 mm must be rejected even though slot 0 improved 0.2 mm");
+    assert_eq!(
+        err,
+        TerminalWorkspaceReject::Deepened {
+            slot: 1,
+            depth: 0.005_09,
+            start_depth: 0.005_00,
+        }
+    );
+
+    // Exact equality on slot 1 (5.00 mm -> 5.00 mm) with 0.20 mm improvement on slot 0 -> ALLOWED.
+    let end_equal = [-0.009_80, -0.005_00, -0.000_05];
+    check_terminal_workspace_progress(&start_depths, &end_equal)
+        .expect("exact end_depth == start_depth on slot 1 with >EPS improvement on slot 0 must pass");
+
+    // End-to-end WorkspaceEvaluator check: verify `check_terminal_progress` and `check_terminal_progress_rt`
+    // both reject the same 0.09 mm sub-EPS deepening on a real B601-DM evaluator.
+    let cfg = ArmConfig::rebot_dm();
+    let eval = WorkspaceEvaluator::new_with_tcp(
+        &cfg.arm_model,
+        cfg.workspace.as_ref().unwrap(),
+        &cfg.camera_mount,
+        cfg.tcp_offset,
+    );
+    let mut sd = vec![0.0f64; eval.total_slots];
+    let mut ec = vec![1.0f64; eval.total_slots];
+    sd[4] = 0.010_00; // end_origin box_max_x
+    ec[4] = -0.009_80; // improved 0.20 mm
+    sd[5] = 0.005_00; // end_origin box_max_y
+    ec[5] = -0.005_09; // deepened 0.09 mm
+    let alloc_err = eval
+        .check_terminal_progress(&sd, &ec, "sweep")
+        .expect_err("allocating check_terminal_progress must reject 0.09 mm deepening");
+    assert_eq!(alloc_err.detail.constraint_id.as_deref(), Some("box_max_y"));
+    let rt_err = eval
+        .check_terminal_progress_rt(&sd, &ec, "sweep")
+        .expect_err("RT check_terminal_progress_rt must reject 0.09 mm deepening");
+    assert_eq!(rt_err.phase, "sweep");
+}

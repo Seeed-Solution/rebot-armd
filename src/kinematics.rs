@@ -1058,7 +1058,8 @@ pub enum TerminalWorkspaceReject {
 
 /// Terminal return rule for a discrete motion whose start has any intruding slot
 /// (`start_depths.iter().any(|&d| d.is_finite() && d > WORKSPACE_EPS)`):
-/// - Every slot must finish at or shallower than its start depth (within [`WORKSPACE_EPS`]).
+/// - Every initially-intruding slot must finish at or shallower than its start depth (`ed <= sd`).
+/// - Every initially-clear slot (`sd <= WORKSPACE_EPS`) must remain clear (`ed <= WORKSPACE_EPS`).
 /// - At least one initially-intruding slot must improve strictly by more than [`WORKSPACE_EPS`].
 pub fn check_terminal_workspace_progress(
     start_depths: &[f64],
@@ -1081,7 +1082,7 @@ pub fn check_terminal_workspace_progress(
             }
         } else {
             start_outside = true;
-            if ed > sd + WORKSPACE_EPS {
+            if ed > sd {
                 return Err(TerminalWorkspaceReject::Deepened { slot, depth: ed, start_depth: sd });
             }
             if sd - ed > WORKSPACE_EPS {
