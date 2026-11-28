@@ -743,13 +743,16 @@ async fn submit_prepared_executor_ws(
             }
             Ok(Ok(Ok(Reply::Refused { code, detail, .. }))) => {
                 drop(ack_guard);
-                let cur_epoch = sup
-                    .hub()
-                    .latest()
+                let latest = sup.hub().latest();
+                let cur_epoch = latest
+                    .as_ref()
                     .map_or(auth.epoch, |s| s.rt.owner.authority.epoch);
+                let ws_detail = (code == "WORKSPACE_VIOLATION")
+                    .then(|| latest.as_ref().and_then(|s| s.obs.workspace_violation.clone()))
+                    .flatten();
                 let lims = sup.hub().prep_env().map(|e| e.config.limits.clone());
                 return Err(ActionRefusal::new(code)
-                    .into_arm_error_with_detail(cur_epoch, detail, lims.as_deref()));
+                    .into_arm_error_with_workspace(cur_epoch, detail, lims.as_deref(), ws_detail));
             }
             Ok(Ok(Ok(Reply::Terminal { .. } | Reply::Lease { .. }))) => {
                 drop(ack_guard);

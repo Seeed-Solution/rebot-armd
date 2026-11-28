@@ -1094,3 +1094,212 @@ fn rt_inline_quintic_refusal_preserves_structured_witness_including_no_progress(
         }
     }
 }
+
+/// R3 Item 3 (Minor): RT Executor command replies over WebSocket MUST carry the full structured
+/// inline workspace refusal witness (`constraint_id`, `geometry_id`, `violation_phase`, `reason`,
+/// `message`) when off-thread prepare succeeds and install-time RT validation refuses (`install_move_joint_rt`
+/// deepened + `TerminalNoProgress`, and `install_move_cartesian_slot_rt` live-measured terminal check).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_ws_command_reply_carries_inline_workspace_witness() {
+    use serde_json::json;
+
+    struct PauseGuard(String);
+    impl Drop for PauseGuard {
+        fn drop(&mut self) {
+            armd::api::ws::set_test_ws_blocking_plan_paused(&self.0, false);
+        }
+    }
+
+    // Start 10 mm beyond box_max_x at q_start.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.torque_guard = None;
+    cfg.lease_timeout_ms = 60_000;
+    let q_start: [f32; 7] = [0.0, -0.90, -1.15, 0.85, 0.0, 0.0, 0.0];
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    ws.keepout_boxes.clear();
+    let check_pts = ws.check_points_end_m.clone();
+    let max_x_at = |q: &[f32]| -> f64 {
+        let pose = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts.iter().map(|c| pose.transform_point(&c.map(f64::from))[0]).fold(pose.p[0], f64::max)
+    };
+    let start_max_x = max_x_at(&q_start);
+    ws.box_max_m[0] = (start_max_x - 0.010) as f32;
+
+    let mut q_probe = q_start;
+    q_probe[1] += 0.01;
+    let inward_sign = if max_x_at(&q_probe) < start_max_x { 1.0f32 } else { -1.0f32 };
+    let dx_per_rad = (start_max_x - {
+        let mut q = q_start;
+        q[1] += 0.01 * inward_sign;
+        max_x_at(&q)
+    }) / 0.01;
+    // Live feedback shifts 3 mm inward (~15 mrad <= 20 mrad) between off-thread prepare and RT install,
+    // making a prepared -1.5 mm X move deeper than the live measured pose at RT install time.
+    let mut q_meas_deeper_refusal = q_start;
+    q_meas_deeper_refusal[1] += (0.0030 / dx_per_rad) as f32 * inward_sign;
+    assert!(
+        (q_meas_deeper_refusal[1] - q_start[1]).abs() < armd::supervisor::MEASURED_START_DRIFT_TOL_RAD
+    );
+
+    // Compute the exact joint target of `move_relative [-0.0015, 0, 0] path="joint"` from q_start
+    // so setting live measured equal to that target triggers RT inline `TerminalNoProgress`
+    // ("move makes no net return toward the workspace") through WebSocket.
+    let q_meas_no_progress = {
+        use armd::rt_core::requests::actions::{prepare_move_relative, ActionSnapshot, PreparedMoveAction};
+        let mut tmp = armd::SupervisorInner::new(cfg.clone());
+        tmp.lease_enabled = false;
+        let s0 = tmp.current_admission_stamp();
+        tmp.check_admission(s0).and_then(|a| armd::SupervisorInner::enable_torque(a)).unwrap();
+        tmp.commanded_positions = q_start.to_vec();
+        tmp.measured_positions = q_start.to_vec();
+        tmp.target_positions = q_start.to_vec();
+        let s1 = tmp.current_admission_stamp();
+        let snap = ActionSnapshot::from_inner(&tmp, s1, std::time::Instant::now() + Duration::from_secs(5));
+        let PreparedMoveAction::Joint(j) =
+            prepare_move_relative(&snap, &json!({"frame": "base", "d": [-0.0015, 0.0, 0.0], "path": "joint"}))
+                .expect("prepare joint move_relative -1.5 mm X")
+        else {
+            panic!("expected Joint prepared action");
+        };
+        let mut q = q_start;
+        q.copy_from_slice(&j.target[..7]);
+        q
+    };
+    assert!(
+        (0..6).all(|i| (q_meas_no_progress[i] - q_start[i]).abs() < armd::supervisor::MEASURED_START_DRIFT_TOL_RAD),
+        "no-progress measured shift must stay within 20 mrad"
+    );
+
+    // Driver whose reported measured pose is explicitly controlled via `drv_q` (never overwritten by
+    // idle `write_joint_targets`) so we can deterministically shift live feedback while paused.
+    struct PinnedFeedbackDriver(JitterFeedbackDriver);
+    impl ArmDriver for PinnedFeedbackDriver {
+        fn supports_rt_executor(&self) -> Result<(), &'static str> { self.0.supports_rt_executor() }
+        fn capabilities(&self) -> DriverCapabilities { self.0.capabilities() }
+        fn enable_state(&self) -> EnableState { self.0.enable_state() }
+        fn is_feedback_valid(&self) -> bool { self.0.is_feedback_valid() }
+        fn is_enabled(&self) -> bool { self.0.is_enabled() }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { self.0.feedback_ages() }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.0.feedback_ages_into(out); }
+        fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.0.feedback_all_within(dof, max_age) }
+        fn feedback_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) { self.0.feedback_instants_into(out); }
+        fn feedback_receive_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) { self.0.feedback_receive_instants_into(out); }
+        fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.0.feedback_age_ms_into(out); }
+        fn feedback_seqs_into(&self, out: &mut Vec<u64>) { self.0.feedback_seqs_into(out); }
+        fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { self.0.joint_loads_into(out) }
+        fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+            self.0.fresh_joint_positions_into(joints, max_age, out)
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> { self.0.read_joint_states() }
+        fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> { self.0.read_joint_states_into(out) }
+        fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> { self.0.read_cached_joint_states_into(out) }
+        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> { self.0.set_torque(enable) }
+    }
+
+    let drv = JitterFeedbackDriver::new(&q_start, cfg.arm_dof(), 0.0);
+    let drv_q = drv.q.clone();
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(PinnedFeedbackDriver(drv))));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = q_start.to_vec();
+        inner.measured_positions = q_start.to_vec();
+        inner.target_positions = q_start.to_vec();
+    }
+    let exec = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(20)))
+        .await
+        .expect("start_executor");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn({
+        let s = sup.clone();
+        async move { axum::serve(listener, armd::create_router(s, armd::OperatorAuth::disabled())).await.unwrap(); }
+    });
+
+    let (mut ws, gen) = common::controller(addr).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let ep = sup.get_observation().await.epoch_id;
+    let en = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(en["type"], "command_ack", "enable: {en}");
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    // First WS connection on a fresh ArmSupervisor always gets ConnectionHandle::from_ws_id(1) == "connection:1".
+    let conn_id = "connection:1".to_string();
+
+    for (case_label, path_mode, live_q, expected_phase, expected_reason_substr) in [
+        ("joint_deepened", "joint", q_meas_deeper_refusal, "sweep", "this move would go"),
+        (
+            "joint_no_progress",
+            "joint",
+            q_meas_no_progress,
+            "sweep",
+            "move makes no net return toward the workspace",
+        ),
+        ("linear_deepened", "linear", q_meas_deeper_refusal, "plan", "this move would go"),
+    ] {
+        // Reset driver live measured pose to q_start so off-thread snapshot & prepare succeed.
+        *drv_q.lock().unwrap() = q_start.to_vec();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let ep = sup.get_observation().await.epoch_id;
+
+        armd::api::ws::set_test_ws_blocking_plan_paused(&conn_id, true);
+        let _guard = PauseGuard(conn_id.clone());
+        let drv_q_bg = drv_q.clone();
+        let conn_bg = conn_id.clone();
+        let unpause_task = tokio::spawn(async move {
+            let dl = tokio::time::Instant::now() + Duration::from_secs(3);
+            while armd::api::ws::test_ws_blocking_plan_blocked_count(&conn_bg) < 1 {
+                assert!(tokio::time::Instant::now() < dl, "{case_label}: blocking planner never paused for {conn_bg}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Shift live measured pose AFTER ActionSnapshot::capture, BEFORE RT commit_action.
+            *drv_q_bg.lock().unwrap() = live_q.to_vec();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            armd::api::ws::set_test_ws_blocking_plan_paused(&conn_bg, false);
+        });
+
+        let reply = common::rpc(
+            &mut ws,
+            gen,
+            ep,
+            "/api/v1/action/move_relative",
+            json!({"frame": "base", "d": [-0.0015, 0.0, 0.0], "path": path_mode}),
+        )
+        .await;
+        unpause_task.await.unwrap();
+
+        assert_eq!(reply["type"], "command_reject", "{case_label}: expected reject: {reply}");
+        assert_eq!(reply["code"], "WORKSPACE_VIOLATION", "{case_label}: {reply}");
+        assert_eq!(
+            reply["constraint_id"], "box_max_x",
+            "{case_label}: Executor WS reply must carry constraint_id: {reply}"
+        );
+        assert!(
+            reply["geometry_id"].as_str().is_some_and(|g| !g.is_empty()),
+            "{case_label}: Executor WS reply must carry geometry_id: {reply}"
+        );
+        assert_eq!(
+            reply["violation_phase"], expected_phase,
+            "{case_label}: Executor WS reply must carry violation_phase: {reply}"
+        );
+        assert!(
+            reply["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains(expected_reason_substr)),
+            "{case_label}: Executor WS reply must carry witness reason containing '{expected_reason_substr}': {reply}"
+        );
+        assert!(
+            reply["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(expected_reason_substr)),
+            "{case_label}: Executor WS reply message must reflect witness: {reply}"
+        );
+    }
+
+    drop(ws);
+    srv.abort();
+    exec.stop_and_join();
+}

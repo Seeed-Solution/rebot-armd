@@ -856,33 +856,31 @@ impl ActionRefusal {
     }
 
     /// Translate an RT refusal code and optional per-request planning-limit diagnostic carried
-    /// directly in [`Reply::Refused`] into an [`ArmError`]. Falls back to indexed joint naming
-    /// (`joint_1`, ...) when `limits` is unavailable so the joint and bounds are never lost.
-    pub fn into_arm_error_with_detail(
-        self,
-        expected_epoch: u64,
-        detail: Option<motion::PlanningLimitViolationRt>,
-        limits: Option<&[JointLimit]>,
+    /// directly in [`Reply::Refused`] into an [`ArmError`].
+    pub fn into_arm_error_with_detail(self, expected_epoch: u64, detail: Option<motion::PlanningLimitViolationRt>, limits: Option<&[JointLimit]>) -> ArmError {
+        self.into_arm_error_with_workspace(expected_epoch, detail, limits, None)
+    }
+
+    /// Like [`Self::into_arm_error_with_detail`], preserving `ws_detail` on `WORKSPACE_VIOLATION`.
+    pub fn into_arm_error_with_workspace(
+        self, expected_epoch: u64, detail: Option<motion::PlanningLimitViolationRt>,
+        limits: Option<&[JointLimit]>, ws_detail: Option<crate::kinematics::WorkspaceViolationDetail>,
     ) -> ArmError {
-        if self.code == "IK_UNREACHABLE" {
-            if let Some(v) = detail {
-                return ArmError::Motion(v.into_motion_error(limits.unwrap_or(&[]), None));
+        if self.code == "WORKSPACE_VIOLATION" {
+            if let Some(d) = ws_detail {
+                let limit = d.constraint_id.clone().unwrap_or_else(|| "workspace".into());
+                return ArmError::Safety(SafetyError::WorkspaceViolation { limit, value: 0.0, bound: 0.0, point: 0, detail: Box::new(d) });
             }
+        }
+        if self.code == "IK_UNREACHABLE" {
+            if let Some(v) = detail { return ArmError::Motion(v.into_motion_error(limits.unwrap_or(&[]), None)); }
         }
         self.into_arm_error_with_epoch(expected_epoch)
     }
 }
 
 fn commit_refusal_to_arm_error(inner: &SupervisorInner, r: CommitRefusal) -> ArmError {
-    if r.code == "WORKSPACE_VIOLATION" {
-        if let Some(d) = inner.workspace_violation.clone() {
-            let limit = d.constraint_id.clone().unwrap_or_else(|| "workspace".into());
-            return ArmError::Safety(SafetyError::WorkspaceViolation {
-                limit, value: 0.0, bound: 0.0, point: 0, detail: Box::new(d),
-            });
-        }
-    }
-    ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))
+    ActionRefusal::new(r.code).into_arm_error_with_workspace(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits), inner.workspace_violation.clone())
 }
 
 pub(crate) fn check_cartesian_path_planning_rt(
