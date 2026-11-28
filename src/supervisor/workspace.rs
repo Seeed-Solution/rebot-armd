@@ -30,6 +30,7 @@ pub(crate) fn joint_goal_target_from(start: &[f32], q: &[f64; 6], arm_dof: usize
 #[derive(Debug, Clone)]
 pub struct JointGoalSnapshot {
     pub start: Vec<f32>,
+    pub measured: Vec<f32>,
     pub v0: Vec<f32>,
     pub limits: Vec<crate::model::JointLimit>,
     pub arm_dof: usize,
@@ -41,6 +42,7 @@ pub struct JointGoalSnapshot {
 #[derive(Debug, Clone)]
 pub struct PreparedQuintic {
     pub(crate) start: Vec<f32>,
+    pub(crate) measured: Vec<f32>,
     pub(crate) v0: Vec<f32>,
     pub(crate) target: Vec<f32>,
     pub(crate) limits: Vec<crate::model::JointLimit>,
@@ -67,11 +69,12 @@ pub fn prepare_quintic(input: &PlanInput, snap: &JointGoalSnapshot, q: &[f64; 6]
         let at = |t: f64| traj.sample(t).positions;
         let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
         let eps = crate::kinematics::WORKSPACE_EPS;
-        let samples = keepout_sweep_with_tcp_tol(&input.arm, ws, &input.cam, input.tcp_offset, eps, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN).ok()?;
-        check_path_with_tcp_tol(&input.arm, ws, &input.cam, input.tcp_offset, eps, &snap.start, samples.iter().map(Vec::as_slice)).ok()?;
+        let samples = keepout_sweep_with_tcp_measured(&input.arm, ws, &input.cam, input.tcp_offset, eps, Some(&snap.measured), &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN).ok()?;
+        check_path_with_tcp_measured(&input.arm, ws, &input.cam, input.tcp_offset, eps, Some(&snap.measured), &snap.start, samples.iter().map(Vec::as_slice)).ok()?;
     }
     Some(PreparedQuintic {
         start: snap.start.clone(),
+        measured: snap.measured.clone(),
         v0: snap.v0.clone(),
         target,
         limits: snap.limits.clone(),
@@ -85,6 +88,7 @@ pub fn prepare_quintic(input: &PlanInput, snap: &JointGoalSnapshot, q: &[f64; 6]
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn keepout_sweep_with_tcp_tol(
     model: &crate::chain::ArmModel,
     ws: &crate::model::WorkspacePolicy,
@@ -96,15 +100,31 @@ pub fn keepout_sweep_with_tcp_tol(
     knots: &[f64],
     budget: usize,
 ) -> Result<Vec<Vec<f32>>, SafetyError> {
+    keepout_sweep_with_tcp_measured(model, ws, cam, tcp_offset, escape_tol, None, at, travel, knots, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn keepout_sweep_with_tcp_measured(
+    model: &crate::chain::ArmModel,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    tcp_offset: [f64; 3],
+    escape_tol: f64,
+    measured: Option<&[f32]>,
+    at: &dyn Fn(f64) -> Vec<f32>,
+    travel: &dyn Fn(f64, f64) -> Vec<f64>,
+    knots: &[f64],
+    budget: usize,
+) -> Result<Vec<Vec<f32>>, SafetyError> {
     crate::chain::WorkspaceEvaluator::new_with_tcp(model, ws, cam, tcp_offset)
         .with_escape_tol(escape_tol)
-        .sweep_knots(at, travel, knots, budget, "sweep")
+        .sweep_knots_from_measured(measured, at, travel, knots, budget, "sweep")
         .map_err(SafetyError::from_workspace)
 }
 
 /// Workspace rule of [`SupervisorInner::check_workspace_path`] with an explicit arm model:
 /// reject a sample that worsens or newly intrudes on any `(geometry_id, constraint_id)`
-/// relative to `start` (per-constraint monotonic escape rule).
+/// relative to `start` (per-constraint monotonic escape + terminal return rule).
 pub fn check_path_with<'a>(
     model: &crate::chain::ArmModel,
     ws: &crate::model::WorkspacePolicy,
@@ -112,7 +132,7 @@ pub fn check_path_with<'a>(
     start: &[f32],
     samples: impl IntoIterator<Item = &'a [f32]>,
 ) -> Result<(), SafetyError> {
-    check_path_with_tcp_tol(model, ws, cam, [0.0; 3], crate::kinematics::WORKSPACE_EPS, start, samples)
+    check_path_with_tcp_measured(model, ws, cam, [0.0; 3], crate::kinematics::WORKSPACE_EPS, None, start, samples)
 }
 
 pub fn check_path_with_tcp_tol<'a>(
@@ -124,16 +144,52 @@ pub fn check_path_with_tcp_tol<'a>(
     start: &[f32],
     samples: impl IntoIterator<Item = &'a [f32]>,
 ) -> Result<(), SafetyError> {
+    check_path_with_tcp_measured(model, ws, cam, tcp_offset, escape_tol, None, start, samples)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn check_path_with_tcp_measured<'a>(
+    model: &crate::chain::ArmModel,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    tcp_offset: [f64; 3],
+    escape_tol: f64,
+    measured: Option<&[f32]>,
+    start: &[f32],
+    samples: impl IntoIterator<Item = &'a [f32]>,
+) -> Result<(), SafetyError> {
     let eval = crate::chain::WorkspaceEvaluator::new_with_tcp(model, ws, cam, tcp_offset)
         .with_escape_tol(escape_tol);
-    let mut c0 = eval.alloc_buf();
-    eval.eval_into(start, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
-    let mut min_depths = eval.init_min_depths(&c0);
-    let start_outside = crate::chain::WorkspaceEvaluator::any_outside(min_depths.as_slice());
-    let mut clr = eval.alloc_buf();
+    let (start_depths, mut min_depths, start_outside, mut clr, mut has_samples) =
+        if let Some(m) = crate::chain::WorkspaceEvaluator::valid_distinct_measured(measured, start) {
+            let mut cm = eval.alloc_buf();
+            eval.eval_into(m, &mut cm, "plan").map_err(SafetyError::from_workspace)?;
+            let sd = eval.init_min_depths(&cm);
+            let mut md = sd.clone();
+            let so = crate::chain::WorkspaceEvaluator::any_outside(sd.as_slice());
+            let mut rem = MAX_KEEPOUT_EVALS_PER_PLAN;
+            let c_start = eval
+                .sweep_linear_step_with_start_outside(
+                    m, start, &cm, &mut md, &mut rem, MAX_KEEPOUT_EVALS_PER_PLAN, "plan", "sweep", so,
+                )
+                .map_err(|(_, f)| SafetyError::from_workspace(f))?;
+            (sd, md, so, c_start, true)
+        } else {
+            let mut c0 = eval.alloc_buf();
+            eval.eval_into(start, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
+            let sd = eval.init_min_depths(&c0);
+            let so = crate::chain::WorkspaceEvaluator::any_outside(sd.as_slice());
+            let clr = eval.alloc_buf();
+            (sd.clone(), sd, so, clr, false)
+        };
     for q in samples {
         eval.eval_into(q, &mut clr, "plan").map_err(SafetyError::from_workspace)?;
         eval.check_and_advance_with_start_outside(&clr, &mut min_depths, "plan", start_outside)
+            .map_err(SafetyError::from_workspace)?;
+        has_samples = true;
+    }
+    if has_samples {
+        eval.check_terminal_progress(start_depths.as_slice(), clr.as_slice(), "plan")
             .map_err(SafetyError::from_workspace)?;
     }
     Ok(())
@@ -210,6 +266,36 @@ fn describe_workspace_slot_bounded(
 }
 
 impl SupervisorInner {
+    #[allow(clippy::too_many_arguments)]
+    pub fn keepout_sweep_with_tcp_measured(
+        model: &crate::chain::ArmModel,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        tcp_offset: [f64; 3],
+        escape_tol: f64,
+        measured: Option<&[f32]>,
+        at: &dyn Fn(f64) -> Vec<f32>,
+        travel: &dyn Fn(f64, f64) -> Vec<f64>,
+        knots: &[f64],
+        budget: usize,
+    ) -> Result<Vec<Vec<f32>>, SafetyError> {
+        keepout_sweep_with_tcp_measured(model, ws, cam, tcp_offset, escape_tol, measured, at, travel, knots, budget)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_path_with_tcp_measured<'a>(
+        model: &crate::chain::ArmModel,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        tcp_offset: [f64; 3],
+        escape_tol: f64,
+        measured: Option<&[f32]>,
+        start: &[f32],
+        samples: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Result<(), SafetyError> {
+        check_path_with_tcp_measured(model, ws, cam, tcp_offset, escape_tol, measured, start, samples)
+    }
+
     /// Clears `self.workspace_violation`, recycling its preallocated detail into
     /// `self.workspace_violation_spare` (0 alloc / 0 free on `armd-control`).
     pub fn clear_workspace_violation_rt(&mut self) {
@@ -222,7 +308,26 @@ impl SupervisorInner {
 
     /// Clears `self.servo_ws_min_depths`, recycling any heap `SlotBuf` back into
     /// `self.ws_eval_bufs.min_depths_spare` so `armd-control` never frees it.
+    /// Retains running minima while still torqued, operational, and outside the workspace at
+    /// the same `workspace_revision` so settled/idle stream frames cannot ratchet deeper.
     pub(crate) fn clear_servo_ws_min_depths_rt(&mut self) {
+        if let Some((rev, ref buf)) = self.servo_ws_min_depths {
+            if rev == self.workspace_revision
+                && self.is_torqued
+                && self.safety.state().is_operational()
+                && self.active_trajectory.is_none()
+                && self.macro_run.is_none()
+                && crate::chain::WorkspaceEvaluator::any_outside(buf.as_slice())
+            {
+                return;
+            }
+        }
+        self.force_clear_servo_ws_min_depths_rt();
+    }
+
+    /// Unconditionally clears and recycles `self.servo_ws_min_depths` (used when installing a
+    /// planned motion, disabling/faulting, or resetting workspace configuration).
+    pub(crate) fn force_clear_servo_ws_min_depths_rt(&mut self) {
         if let Some((_, old)) = self.servo_ws_min_depths.take() {
             if old.is_heap() {
                 if self.ws_eval_bufs.min_depths_spare.is_none() {
@@ -343,7 +448,21 @@ impl SupervisorInner {
         escape_tol: f64,
     ) -> Result<(), SafetyError> {
         let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-        check_path_with_tcp_tol(&self.config.arm_model, ws, cam, self.config.tcp_offset, escape_tol, start, samples)
+        check_path_with_tcp_measured(&self.config.arm_model, ws, cam, self.config.tcp_offset, escape_tol, None, start, samples)
+    }
+
+    /// [`check_workspace_path`](Self::check_workspace_path) evaluating from `measured` baseline
+    /// when it differs from `start`.
+    pub fn check_workspace_path_from_measured<'a>(
+        &self,
+        start: &[f32],
+        measured: Option<&[f32]>,
+        samples: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Result<(), SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        check_path_with_tcp_measured(
+            &self.config.arm_model, ws, cam, self.config.tcp_offset, crate::kinematics::WORKSPACE_EPS, measured, start, samples,
+        )
     }
 
     /// [`check_workspace_path`](Self::check_workspace_path) against the keep-out boxes only
@@ -395,6 +514,24 @@ impl SupervisorInner {
     /// [`workspace_samples`](Self::workspace_samples) with explicit escape jitter tolerance.
     pub fn workspace_samples_with_tol(&self, traj: &MultiJointQuinticTrajectory, escape_tol: f64) -> Result<Vec<Vec<f32>>, SafetyError> {
         self.workspace_samples_with_budget_tol(traj, MAX_KEEPOUT_EVALS_PER_PLAN, escape_tol)
+    }
+
+    /// [`workspace_samples`](Self::workspace_samples) evaluating from `measured` baseline when it
+    /// differs from `traj(0)`.
+    pub fn workspace_samples_from_measured(
+        &self,
+        traj: &MultiJointQuinticTrajectory,
+        measured: Option<&[f32]>,
+    ) -> Result<Vec<Vec<f32>>, SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy()
+            else { return Ok(Self::trajectory_samples(traj)); };
+        let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
+        let at = |t: f64| traj.sample(t).positions;
+        let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
+        keepout_sweep_with_tcp_measured(
+            &self.config.arm_model, ws, cam, self.config.tcp_offset, crate::kinematics::WORKSPACE_EPS,
+            measured, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN,
+        )
     }
 
     fn workspace_samples_with_budget_tol(&self, traj: &MultiJointQuinticTrajectory, budget: usize, escape_tol: f64) -> Result<Vec<Vec<f32>>, SafetyError> {
@@ -452,34 +589,45 @@ impl SupervisorInner {
         }
     }
 
-    /// Zero-allocation workspace sweep check of a joint-space quintic trajectory using
-    /// reused evaluator buffers (`ws_eval_bufs`) and stack-only adaptive subdivision.
-    /// Falls back to [`Self::workspace_samples`] + [`Self::check_workspace_path`] only when
-    /// `dof > INLINE_POLYS` or `arm_dof > MAX_CHAIN_JOINTS`.
-    pub(crate) fn check_workspace_quintic_inline(&mut self, traj: &MultiJointQuinticTrajectory) -> Result<(), SafetyError> {
+    /// Zero-allocation RT quintic sweep returning static error codes on both acceptance and
+    /// refusal; fails closed without allocating on oversized/undersized inputs on RT.
+    pub(crate) fn check_workspace_quintic_inline_rt(
+        &mut self,
+        traj: &MultiJointQuinticTrajectory,
+        check_measured: bool,
+    ) -> Result<(), &'static str> {
         if self.workspace_policy().is_none() {
             return Ok(());
         }
         if traj.polynomials.len() > crate::trajectory::INLINE_POLYS
             || self.config.arm_model.arm_dof() > crate::chain::MAX_CHAIN_JOINTS
         {
-            let samples = self.workspace_samples(traj)?;
-            return self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice));
+            if self.rt_executor_owned {
+                return Err("WORKSPACE_VIOLATION");
+            }
+            let meas = check_measured.then_some(self.measured_positions.as_slice());
+            let samples = self.workspace_samples_from_measured(traj, meas).map_err(|_| "WORKSPACE_VIOLATION")?;
+            return self
+                .check_workspace_path_from_measured(&self.commanded_positions, meas, samples.iter().map(Vec::as_slice))
+                .map_err(|_| "WORKSPACE_VIOLATION");
         }
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let result = (|| {
             let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+            if !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false) {
+                if self.rt_executor_owned {
+                    return Err("WORKSPACE_VIOLATION");
+                }
+                bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+            }
             let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
-                &self.config.arm_model,
-                ws,
-                cam,
-                self.config.tcp_offset,
-                &mut bufs,
+                &self.config.arm_model, ws, cam, self.config.tcp_offset, &mut bufs,
             )
             .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
+            let meas = check_measured.then_some(self.measured_positions.as_slice());
             let checked = eval
-                .check_quintic_inline(traj, MAX_KEEPOUT_EVALS_PER_PLAN, "sweep")
-                .map_err(SafetyError::from_workspace);
+                .check_quintic_inline_rt(meas, traj, MAX_KEEPOUT_EVALS_PER_PLAN, "sweep", &mut bufs)
+                .map_err(|_| "WORKSPACE_VIOLATION");
             eval.recycle(&mut bufs);
             checked
         })();
@@ -521,6 +669,14 @@ impl SupervisorInner {
             return Some(WorkspaceSupportViolation::EvalFailed {
                 limit: BoundedText::new("invalid"),
                 reason,
+            });
+        }
+        if self.rt_executor_owned
+            && !bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, false)
+        {
+            return Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new("invalid"),
+                reason: BoundedText::new("workspace scratch undersized"),
             });
         }
         let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
