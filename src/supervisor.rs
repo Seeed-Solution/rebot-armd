@@ -46,6 +46,11 @@ pub(crate) use driver_transitions::{
     run_with_panic_deadline_observer_until,
 };
 pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
+pub use workspace::{
+    check_path_with, check_path_with_tcp_tol, keepout_sweep_with, keepout_sweep_with_tcp_tol,
+    prepare_quintic, JointGoalSnapshot, PreparedQuintic,
+};
+pub(crate) use workspace::joint_goal_target_from;
 
 /// Global monotonic allocator for single-use [`AdmissionStamp::request_id`] values.
 static NEXT_ADMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
