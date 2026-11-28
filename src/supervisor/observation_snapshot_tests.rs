@@ -637,6 +637,86 @@ use super::*;
         }
     }
 
+    #[test]
+    fn drv_lock_major6_tx_cutoff_samples_owner_clock_at_driver_boundary() {
+        use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+        use crate::model::JointState;
+        use crate::supervisor_lock::DriverSlot;
+        use crate::transport::MockClock;
+
+        struct DeadlineProbeDriver {
+            dof: usize,
+            clock: MockClock,
+            installed_deadlines: Arc<std::sync::Mutex<Vec<Option<Instant>>>>,
+        }
+        impl ArmDriver for DeadlineProbeDriver {
+            fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+            fn clock_now(&self) -> Instant { self.clock.now() }
+            fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+                self.installed_deadlines.lock().unwrap().push(deadline);
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(vec![JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 }; self.dof])
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+            fn set_torque(&mut self, _enable: bool) -> Result<(), ArmDriverError> { Ok(()) }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn is_enabled(&self) -> bool { true }
+            fn enable_state(&self) -> EnableState { EnableState::Enabled }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(1)); self.dof] }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(self.clock.now()); self.dof] }
+            fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
+        }
+
+        let clock = MockClock::new();
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drv = DeadlineProbeDriver {
+            dof: 7,
+            clock: clock.clone(),
+            installed_deadlines: Arc::clone(&deadlines),
+        };
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.lease_enabled = false;
+        inner.is_torqued = true;
+        inner.safety.set_torque(true).unwrap();
+        inner.driver = Some(DriverSlot::exclusive(Box::new(drv)));
+
+        let t0 = Instant::now();
+        let rd = t0 + Duration::from_millis(10);
+        // Simulate clock advancing past `rd` right at the driver-boundary sample.
+        let mut calls = 0usize;
+        let mut now_fn = || {
+            calls += 1;
+            if calls == 1 { t0 } else { rd + Duration::from_millis(5) }
+        };
+        let _ = inner.tick_control_inner(0.02, Some(rd), &mut now_fn);
+        let captured = deadlines.lock().unwrap().clone();
+        // DRV-F1 conservative driver-first cutoff translation: since call #2 (`owner_now`) is
+        // already past `rd - margin`, expired cutoffs are rejected BEFORE staging any driver
+        // deadline (zero `Some(_)` deadlines staged).
+        assert!(
+            captured.iter().all(Option::is_none),
+            "expired RX/output cutoffs must reject before staging any driver deadline, got {captured:?}"
+        );
+
+        // Also verify `install_effective_tx_cutoff` directly when `owner_now` is past `rd`:
+        // must return `DriverTxCapOutcome::Expired` with zero staged deadlines.
+        deadlines.lock().unwrap().clear();
+        let mut expired_now = || rd + Duration::from_millis(10);
+        let (outcome, cutoff) = inner.install_effective_tx_cutoff(Some(rd), &mut expired_now);
+        assert_eq!(outcome, DriverTxCapOutcome::Expired);
+        assert!(cutoff.is_none());
+        assert!(deadlines.lock().unwrap().is_empty());
+
+        // When `owner_now` is still strictly before `rd - margin`, a live deadline IS staged.
+        let mut live_now = || t0;
+        let (live_outcome, live_cutoff) = inner.install_effective_tx_cutoff(Some(rd), &mut live_now);
+        assert_eq!(live_outcome, DriverTxCapOutcome::Installed);
+        let live_cutoff = live_cutoff.expect("live cutoff returned");
+        assert!(live_cutoff.drv_release_cap > clock.now());
+        assert_eq!(live_cutoff.owner_anchor, t0);
+    }
+
 // scaffold-test-mod
 mod stamp_namespace_tests {
     use super::*;
