@@ -20,7 +20,7 @@
     "src/rt_core/requests/actions.rs": 6200,
     "src/rt_core/requests/config.rs": 8088,
     "src/safety.rs": 3036,
-    "src/supervisor.rs": 23371,
+    "src/supervisor.rs": 6769,
     "src/supervisor/driver_transitions.rs": 12733,
     "src/supervisor/streams.rs": 3528,
     "src/torque/reducer.rs": 3788,

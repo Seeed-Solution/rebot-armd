@@ -45,7 +45,7 @@ pub(super) struct WsConnectionSlotPool {
 
 
 impl WsConnectionSlotPool {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             entries: std::sync::Mutex::new(std::collections::HashMap::with_capacity(
                 MAX_LIVE_CONNECTIONS,
@@ -111,7 +111,7 @@ impl WsConnectionSlotPool {
     /// Joins transferred `live_ids` against non-closing `WsSlotEntry` reply sinks for atomic
     /// executor handover seeding (omits unregistered claimed slots and already-closing slots).
     #[cfg(not(target_arch = "wasm32"))]
-    fn sinks_for_live_ids(
+    pub(super) fn sinks_for_live_ids(
         &self,
         live_ids: &[u64],
     ) -> Vec<(u64, Arc<crate::rt_core::reply_router::ConnectionReplySink>)> {

@@ -74,7 +74,7 @@ pub(crate) use admission::{
     AdmittedProof, ClosedConnections, ConsumedStamps, LiveConnections, LiveDisconnectFenceView,
 };
 #[cfg(test)]
-use admission::{BROKER_REQUEST_ID_BIT, RT_INTERNAL_REQUEST_ID_BIT};
+use admission::RT_INTERNAL_REQUEST_ID_BIT;
 pub use terminal_plumbing::{TerminalSubscription, TERMINAL_FIFO_CAPACITY};
 pub(crate) use terminal_plumbing::TerminalBroadcaster;
 pub use types::{
@@ -106,13 +106,15 @@ pub(crate) use mode_switch::{
     next_mode_switch_terminal_action_id, ModeSwitchPurpose, ModeSwitchRunner,
 };
 pub use observation::OBS_LOCK_WAIT;
-use observation::{executor_unavailable, observation_unavailable, owner_transferred, OBS_POLL};
+use observation::{executor_unavailable, observation_unavailable, owner_transferred};
 pub use ownership::{
     init_process_identity, parse_linux_process_start_unix_ns, ProcessIdentity, OWNER_EXECUTOR,
     OWNER_FAILED, OWNER_LEGACY, OWNER_TRANSFERRING,
 };
 use ownership::OwnerSlot;
 pub(crate) use resting_thermal::ThermalCooldown;
+pub use ws_lease::WriterEndpoint;
+use ws_lease::WsConnectionSlotPool;
 
 pub struct SupervisorInner {
     pub config: ArmConfig,

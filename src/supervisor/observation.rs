@@ -752,11 +752,11 @@ impl ArmSupervisor {
         s.meta.generation >= want && now <= s.meta.valid_until
     }
 
-    pub(super) async fn fresh(&self, count: bool) -> Result<Fresh<'_>, ArmError> {
+    async fn fresh(&self, count: bool) -> Result<Fresh<'_>, ArmError> {
         self.fresh_min_gen(count, None).await
     }
 
-    pub(super) async fn fresh_min_gen(&self, count: bool, min_gen: Option<u64>) -> Result<Fresh<'_>, ArmError> {
+    async fn fresh_min_gen(&self, count: bool, min_gen: Option<u64>) -> Result<Fresh<'_>, ArmError> {
         use crate::rt_core::publish::Poll;
         let mode = self.owner_mode();
         if mode == OWNER_TRANSFERRING || mode == OWNER_FAILED {
