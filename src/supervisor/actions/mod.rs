@@ -7,6 +7,10 @@
 use super::*;
 use crate::macro_action::{ChildTicket, ContactGuard, ContactWatch};
 
+mod gripper_reconcile;
+mod lifecycle;
+mod macros;
+
 impl SupervisorInner {
     /// True on a real/physical driver (non-sim, non-mock) where missing jaw calibration
     /// curves must not fall back to `JawOpening::sim_default()`.
