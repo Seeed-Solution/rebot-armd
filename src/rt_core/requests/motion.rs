@@ -294,6 +294,7 @@ pub struct PreparedMotionSlot {
     pub kind: MotionKind,
     pub dof: u8,
     pub start: [f32; MAX_MOTION_DOF],
+    pub measured_start: [f32; MAX_MOTION_DOF],
     pub v0: [f32; MAX_MOTION_DOF],
     pub requested_target: [f32; MAX_MOTION_DOF],
     pub target: [f32; MAX_MOTION_DOF],
@@ -489,10 +490,14 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         });
     }
     if req.kind == MotionKind::Park && (snap.holding_after_clear || snap.mit_active) {
+        let mut m_arr = [0.0f32; MAX_MOTION_DOF];
+        if snap.measured_positions.len() == dof {
+            m_arr[..dof].copy_from_slice(&snap.measured_positions);
+        }
         return Ok(PreparedMotionPlan {
             slot: PreparedMotionSlot {
                 kind: MotionKind::Park, dof: dof as u8,
-                start: [0.0; MAX_MOTION_DOF], v0: [0.0; MAX_MOTION_DOF], requested_target: [0.0; MAX_MOTION_DOF], target: [0.0; MAX_MOTION_DOF], vel_caps: [0.0; MAX_MOTION_DOF],
+                start: [0.0; MAX_MOTION_DOF], measured_start: m_arr, v0: [0.0; MAX_MOTION_DOF], requested_target: [0.0; MAX_MOTION_DOF], target: [0.0; MAX_MOTION_DOF], vel_caps: [0.0; MAX_MOTION_DOF],
                 has_speed_scale: false, speed_scale: 1.0, polynomials: [zero_poly(); INLINE_POLYS],
                 duration: PARK_DURATION_S, power_scale: None, power_budget_hash: cfg.power_budget_hash,
                 static_restricted: snap.static_restricted,
@@ -585,8 +590,9 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         ).map_err(map_ws)?;
     }
 
-    let (mut s_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) = (
+    let (mut s_arr, mut m_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) = (
         [0.0f32; MAX_MOTION_DOF],
+        [f32::NAN; MAX_MOTION_DOF],
         [0.0f32; MAX_MOTION_DOF],
         [0.0f32; MAX_MOTION_DOF],
         [0.0f32; MAX_MOTION_DOF],
@@ -600,13 +606,16 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         )).into());
     }
     s_arr[..dof].copy_from_slice(&start);
+    if snap.measured_positions.len() == dof {
+        m_arr[..dof].copy_from_slice(&snap.measured_positions);
+    }
     v_arr[..dof].copy_from_slice(&snap.commanded_velocities);
     r_arr[..dof].copy_from_slice(&requested_unfiltered);
     t_arr[..dof].copy_from_slice(&target);
     for i in 0..dof { vc_arr[i] = limits[i].max_velocity; p_arr[i] = traj.polynomials[i]; }
     Ok(PreparedMotionPlan {
         slot: PreparedMotionSlot {
-            kind: req.kind, dof: dof as u8, start: s_arr, v0: v_arr, requested_target: r_arr, target: t_arr, vel_caps: vc_arr,
+            kind: req.kind, dof: dof as u8, start: s_arr, measured_start: m_arr, v0: v_arr, requested_target: r_arr, target: t_arr, vel_caps: vc_arr,
             has_speed_scale: req.speed_scale.is_some(), speed_scale: req.speed_scale.unwrap_or(1.0),
             polynomials: p_arr, duration: traj.duration, power_scale,
             power_budget_hash: cfg.power_budget_hash, static_restricted: snap.static_restricted, tcp_offset: arm_cfg.tcp_offset,
@@ -791,6 +800,18 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
         || slot.power_budget_hash != power_budget_fingerprint(inner.power_budget())
         || (inner.power.is_static_restricted() && !slot.static_restricted)
     { return Err(MotionInstallError::PlanStale); }
+    if slot.checked_workspace {
+        let arm_dof = inner.config.arm_dof().min(dof);
+        if inner.measured_positions.len() != dof
+            || (0..arm_dof).any(|i| {
+                !inner.measured_positions[i].is_finite()
+                    || !slot.measured_start[i].is_finite()
+                    || (inner.measured_positions[i] - slot.measured_start[i]).abs() > EXACT_START_TOL
+            })
+        {
+            return Err(MotionInstallError::PlanStale);
+        }
+    }
     let Some((limits, lim_n)) = inner.planning_limits_inline(slot.speed_scale_opt()) else { return Err(MotionInstallError::InvalidCommand); };
     if lim_n != dof || (0..dof).any(|i| (limits[i].max_velocity - slot.vel_caps[i]).abs() > EXACT_START_TOL) {
         return Err(MotionInstallError::PlanStale);

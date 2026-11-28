@@ -279,6 +279,8 @@ pub enum StagedAction {
         kind: PreparedActionKind,
         dof: u8,
         start: [f32; MAX_DOF],
+        measured_start: [f32; MAX_DOF],
+        has_measured_start: bool,
         duration_s: f64,
         power_scale: Option<f64>,
         approach_then: Option<StagedQuinticLeg>,
@@ -1043,10 +1045,19 @@ fn check_action_authority_ex(
 /// gripper against [`START_TOLERANCE`]), shared by BOTH Legacy and RT Executor owners.
 pub fn check_start_fresh(commanded: &[f32], prepared_start: &[f32]) -> Result<(), ActionRefusal> {
     if prepared_start.len() != commanded.len()
-        || prepared_start
-            .iter()
-            .zip(commanded)
-            .any(|(s, c)| !s.is_finite() || !c.is_finite() || (s - c).abs() >= START_TOLERANCE)
+        || prepared_start.iter().zip(commanded).any(|(s, c)| !s.is_finite() || !c.is_finite() || (s - c).abs() >= START_TOLERANCE)
+    {
+        return Err(ActionRefusal::new("PLAN_STALE"));
+    }
+    Ok(())
+}
+
+/// Fences the certified `measured_positions` baseline at install when a workspace policy is active.
+pub fn check_measured_fresh(inner: &SupervisorInner, measured_start: &[f32]) -> Result<(), ActionRefusal> {
+    if inner.workspace_policy().is_none() { return Ok(()); }
+    let arm_dof = inner.config.arm_dof().min(measured_start.len());
+    if inner.measured_positions.len() != measured_start.len()
+        || (0..arm_dof).any(|i| !inner.measured_positions[i].is_finite() || !measured_start[i].is_finite() || (inner.measured_positions[i] - measured_start[i]).abs() > 1e-6)
     {
         return Err(ActionRefusal::new("PLAN_STALE"));
     }
@@ -1701,6 +1712,7 @@ pub struct PreparedCartesianAction {
     pub kind: PreparedActionKind,
     pub stamp: ActionStamp,
     pub start: Vec<f32>,
+    pub measured_start: Vec<f32>,
     pub input: PlanInput,
     pub resolved: ResolvedCartesianLegs,
     pub tag: Option<String>,
@@ -1951,17 +1963,14 @@ impl PreparedCartesianAction {
         for (q, &s) in path.q.iter().zip(&path.s) {
             slot.path.push(&q[..path.dof], s)?;
         }
-        let mut start = [0.0f32; MAX_DOF];
+        let (mut start, mut measured_start) = ([0.0f32; MAX_DOF], [f32::NAN; MAX_DOF]);
         start[..self.start.len()].copy_from_slice(&self.start);
+        let has_measured_start = self.measured_start.len() == path.dof;
+        if has_measured_start { measured_start[..path.dof].copy_from_slice(&self.measured_start); }
         slot.primitive = Primitive::Action(StagedAction::Cartesian {
-            child,
-            kind: self.kind,
-            dof: path.dof as u8,
-            start,
-            duration_s: path.duration,
-            power_scale: self.input.power.as_ref().map(|_| path.power_scale),
-            approach_then,
-            lock_j7_hold: false,
+            child, kind: self.kind, dof: path.dof as u8, start, measured_start, has_measured_start,
+            duration_s: path.duration, power_scale: self.input.power.as_ref().map(|_| path.power_scale),
+            approach_then, lock_j7_hold: false,
         });
         slot.static_restricted = self.input.static_restricted;
         Ok(slot)
@@ -2976,6 +2985,7 @@ fn prepare_move_common(
                 },
                 stamp,
                 start: snap.commanded_positions.clone(),
+                measured_start: snap.measured_positions.clone(),
                 input,
                 resolved,
                 tag,
@@ -3078,14 +3088,9 @@ pub fn prepare_child_cartesian_slot_with_options(
     let mut start_arr = [0.0f32; MAX_DOF];
     start_arr[..start.len()].copy_from_slice(start);
     slot.primitive = Primitive::Action(StagedAction::Cartesian {
-        child: Some(child),
-        kind: PreparedActionKind::MoveToLinear,
-        dof: path.dof as u8,
-        start: start_arr,
-        duration_s: path.duration,
-        power_scale,
-        approach_then,
-        lock_j7_hold,
+        child: Some(child), kind: PreparedActionKind::MoveToLinear, dof: path.dof as u8,
+        start: start_arr, measured_start: [0.0; MAX_DOF], has_measured_start: false,
+        duration_s: path.duration, power_scale, approach_then, lock_j7_hold,
     });
     Ok(slot)
 }
@@ -3450,54 +3455,23 @@ pub fn install_move_cartesian(
         .map_err(|r| r.into_arm_error(inner))?;
     match payload {
         CartesianInstallPayload::Legacy(prep) => {
-            check_start_fresh(&inner.commanded_positions, &prep.start)
-                .map_err(|r| r.into_arm_error(inner))?;
+            check_start_fresh(&inner.commanded_positions, &prep.start).map_err(|r| r.into_arm_error(inner))?;
+            check_measured_fresh(inner, &prep.measured_start).map_err(|r| r.into_arm_error(inner))?;
             check_cartesian_path_planning_legacy(inner, &inner.commanded_positions, &prep.resolved.path)?;
             if let Some(leg) = prep.resolved.approach_leg.as_ref() {
-                motion::check_quintic_planning_limits(
-                    &leg.seg,
-                    &inner.config.limits,
-                    crate::model::PlanningScope::arm_only(&inner.config),
-                )?;
+                motion::check_quintic_planning_limits(&leg.seg, &inner.config.limits, crate::model::PlanningScope::arm_only(&inner.config))?;
             }
             let epoch = inner.safety.epoch_id();
-            let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
-                .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
-            let approach_seg = prep
-                .resolved
-                .approach_leg
-                .map(|l| (l.seg, l.target, l.power_scale));
+            let admitted = consume_action_admission(inner, stamp, ctx.stop_generation).map_err(|r| r.into_arm_error_with_epoch(epoch))?;
+            let approach_seg = prep.resolved.approach_leg.map(|l| (l.seg, l.target, l.power_scale));
             SupervisorInner::install_resolved_path(
-                admitted,
-                &prep.input,
-                prep.resolved.path,
-                approach_seg,
-                prep.resolved.outcome.as_ref(),
-                prep.kind.action_kind_str(),
-                prep.tag,
+                admitted, &prep.input, prep.resolved.path, approach_seg, prep.resolved.outcome.as_ref(), prep.kind.action_kind_str(), prep.tag,
             )
         }
-        CartesianInstallPayload::Slot {
-            kind,
-            dof,
-            start,
-            slot,
-            duration_s,
-            power_scale,
-            approach_then,
-        } => install_move_cartesian_slot_rt(
-            inner,
-            stamp,
-            ctx,
-            kind,
-            dof,
-            &start,
-            slot,
-            duration_s,
-            power_scale,
-            approach_then,
-        )
-        .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits))),
+        CartesianInstallPayload::Slot { kind, dof, start, measured_start, slot, duration_s, power_scale, approach_then } => {
+            install_move_cartesian_slot_rt(inner, stamp, ctx, kind, dof, &start, measured_start.as_ref(), slot, duration_s, power_scale, approach_then)
+                .map_err(|r| ActionRefusal::new(r.code).into_arm_error_with_detail(inner.safety.epoch_id(), r.detail, Some(&inner.config.limits)))
+        }
     }
 }
 
@@ -3508,6 +3482,7 @@ pub enum CartesianInstallPayload {
         kind: PreparedActionKind,
         dof: usize,
         start: [f32; MAX_DOF],
+        measured_start: Option<[f32; MAX_DOF]>,
         slot: PlanSlotRef<PlanSlot>,
         duration_s: f64,
         power_scale: Option<f64>,
@@ -3565,17 +3540,19 @@ fn install_move_cartesian_slot_rt(
     kind: PreparedActionKind,
     dof: usize,
     start: &[f32; MAX_DOF],
+    measured_start: Option<&[f32; MAX_DOF]>,
     slot: PlanSlotRef<PlanSlot>,
     duration_s: f64,
     power_scale: Option<f64>,
     approach_then: Option<StagedQuinticLeg>,
 ) -> Result<InstalledAction, CommitRefusal> {
-    if dof == 0 || dof > MAX_DOF {
-        return Err(CommitRefusal::code("INVALID_COMMAND"));
-    }
+    if dof == 0 || dof > MAX_DOF { return Err(CommitRefusal::code("INVALID_COMMAND")); }
     let mut post_q = [0.0f32; MAX_DOF];
     let (post_dof, _) = inner.post_quiesce_commanded_positions(&mut post_q);
     check_start_fresh(&post_q[..post_dof], &start[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
+    if let Some(m) = measured_start {
+        check_measured_fresh(inner, &m[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
+    }
     inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
     check_cartesian_path_planning_rt(inner, dof, &post_q[..post_dof], slot.path.samples())?;
     if inner.gravity_comp.is_some() {
@@ -5327,12 +5304,17 @@ fn install_macro_child_slot_rt(
 
     match staged {
         StagedAction::Cartesian {
+            measured_start,
+            has_measured_start,
             duration_s,
             power_scale,
             approach_then,
             lock_j7_hold,
             ..
         } => {
+            if has_measured_start {
+                check_measured_fresh(inner, &measured_start[..dof]).map_err(|r| CommitRefusal::code(r.code))?;
+            }
             inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
             check_cartesian_path_planning_rt(inner, dof, &inner.commanded_positions, slot.path.samples())?;
             inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
@@ -5885,23 +5867,10 @@ pub fn commit_action(
             }
             let (id, _) = match staged {
                 StagedAction::Cartesian {
-                    dof,
-                    start,
-                    duration_s,
-                    power_scale,
-                    approach_then,
-                    ..
+                    dof, start, measured_start, has_measured_start, duration_s, power_scale, approach_then, ..
                 } => install_move_cartesian_slot_rt(
-                    inner,
-                    &stamp,
-                    &owner_ctx,
-                    kind,
-                    usize::from(dof),
-                    &start,
-                    slot,
-                    duration_s,
-                    power_scale,
-                    approach_then,
+                    inner, &stamp, &owner_ctx, kind, usize::from(dof), &start,
+                    has_measured_start.then_some(&measured_start), slot, duration_s, power_scale, approach_then,
                 )?,
                 StagedAction::Joint {
                     dof,

@@ -216,3 +216,154 @@ async fn park_ramp_out_deepening_floor_with_no_keepout_boxes_refused_both_owners
     );
     eval_ko.recycle(&mut bufs);
 }
+
+/// R2 Item 2 (Major): Prepared RT Home/Jog/Park plans and both linear Cartesian installers
+/// (Legacy + RT Slot) must fence the certified `measured_positions` baseline at install so
+/// inward feedback drift between prepare and install returns `PLAN_STALE` instead of installing
+/// a motion whose endpoint is deeper than the live measured pose.
+#[test]
+fn prepared_plans_fence_measured_drift_before_install() {
+    use armd::rt_core::broker::plan_slots;
+    use armd::rt_core::ops::{PlanSlot, Primitive};
+    use armd::rt_core::requests::actions::{
+        install_move_cartesian, prepare_move_relative, ActionSnapshot, ActionStamp,
+        CartesianInstallPayload, OwnerCheckCtx, PreparedMoveAction, StagedAction,
+    };
+    use armd::rt_core::requests::motion::{
+        install_home, install_jog, install_park, prepare_motion, MotionInstallError,
+        MotionPlanSnapshot, MotionRequest,
+    };
+    use serde_json::json;
+
+    // Start stretched 10 mm outside box_max_x at q_start; then feedback drifts inward by ~5 mm
+    // while commanded_positions stays fixed at q_start.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.lease_timeout_ms = 60_000;
+    let q_start: [f32; 7] = [0.0, -0.90, -1.15, 0.85, 0.0, 0.0, 0.0];
+    let ws = cfg.workspace.as_mut().unwrap();
+    ws.max_reach_m = None;
+    ws.keepout_boxes.clear();
+    let check_pts = ws.check_points_end_m.clone();
+    let max_x_at = |q: &[f32]| -> f64 {
+        let pose = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts.iter().map(|c| pose.transform_point(&c.map(f64::from))[0]).fold(pose.p[0], f64::max)
+    };
+    let start_max_x = max_x_at(&q_start);
+    ws.box_max_m[0] = (start_max_x - 0.010) as f32;
+
+    let mut q_probe = q_start;
+    q_probe[1] += 0.01;
+    let inward_sign = if max_x_at(&q_probe) < start_max_x { 1.0f32 } else { -1.0f32 };
+    let dx_per_rad = (start_max_x - {
+        let mut q = q_start;
+        q[1] += 0.01 * inward_sign;
+        max_x_at(&q)
+    }) / 0.01;
+    // Target moves 2 mm inward from q_start (valid from q_start, but 3 mm DEEPER than q_meas_inward!)
+    let mut q_jog_2mm = q_start;
+    q_jog_2mm[1] += (0.002 / dx_per_rad) as f32 * inward_sign;
+    // Feedback drifts 5 mm inward between prepare and install while commanded stays at q_start.
+    let mut q_meas_inward = q_start;
+    q_meas_inward[1] += (0.005 / dx_per_rad) as f32 * inward_sign;
+    assert!(max_x_at(&q_meas_inward) < max_x_at(&q_jog_2mm) - 0.002);
+
+    let make_armed = || {
+        let mut inner = armd::SupervisorInner::new(cfg.clone());
+        inner.lease_enabled = false;
+        let s = inner.current_admission_stamp();
+        inner.check_admission(s).and_then(|a| armd::SupervisorInner::enable_torque(a)).unwrap();
+        inner.commanded_positions = q_start.to_vec();
+        inner.measured_positions = q_start.to_vec();
+        inner.target_positions = q_start.to_vec();
+        inner
+    };
+
+    // 1. RT Jog: prepared at q_start (2 mm inward), feedback drifts 5 mm inward -> PLAN_STALE!
+    {
+        let mut inner = make_armed();
+        let snap = MotionPlanSnapshot::from_supervisor(&inner);
+        let plan = prepare_motion(&snap, &MotionRequest::jog(q_jog_2mm.to_vec(), Some(0.5), None))
+            .expect("jog prepares cleanly before drift");
+        inner.measured_positions = q_meas_inward.to_vec();
+        let s = inner.current_admission_stamp();
+        let err = install_jog(&mut inner, s, &plan.slot, plan.heap_traj, None, false)
+            .expect_err("install_jog must reject after measured_positions drifted inward");
+        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on jog, got {err:?}");
+    }
+
+    // 2. RT Home: prepared at q_start, feedback drifts inward -> PLAN_STALE!
+    {
+        let mut inner = make_armed();
+        let snap = MotionPlanSnapshot::from_supervisor(&inner);
+        let plan = prepare_motion(&snap, &MotionRequest::home(None))
+            .expect("home prepares cleanly before drift");
+        inner.measured_positions = q_meas_inward.to_vec();
+        let s = inner.current_admission_stamp();
+        let err = install_home(&mut inner, s, &plan.slot, plan.heap_traj, None, false)
+            .expect_err("install_home must reject after measured_positions drifted inward");
+        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on home, got {err:?}");
+    }
+
+    // 3. RT Park: prepared at q_start, feedback drifts inward -> PLAN_STALE!
+    {
+        let mut inner = make_armed();
+        let snap = MotionPlanSnapshot::from_supervisor(&inner);
+        let plan = prepare_motion(&snap, &MotionRequest::park())
+            .expect("park prepares cleanly before drift");
+        inner.measured_positions = q_meas_inward.to_vec();
+        let s = inner.current_admission_stamp();
+        let err = install_park(&mut inner, s, &plan.slot, plan.heap_traj, None, false)
+            .expect_err("install_park must reject after measured_positions drifted inward");
+        assert_eq!(err, MotionInstallError::PlanStale, "expected PlanStale on park, got {err:?}");
+    }
+
+    // 4 & 5. Both linear Cartesian installers (Legacy AND RT Slot): -2 mm X prepared at q_start,
+    //        feedback drifts 5 mm inward before install -> PLAN_STALE!
+    for use_slot in [false, true] {
+        let mut inner = make_armed();
+        let s = inner.current_admission_stamp();
+        let snap = ActionSnapshot::from_inner(&inner, s, std::time::Instant::now() + Duration::from_secs(5));
+        let body = json!({"frame": "base", "d": [-0.002, 0.0, 0.0], "path": "linear"});
+        let prep = match prepare_move_relative(&snap, &body)
+            .expect("linear move_relative prepares cleanly before drift")
+        {
+            PreparedMoveAction::Cartesian(c) => c,
+            _ => panic!("expected Cartesian"),
+        };
+        inner.measured_positions = q_meas_inward.to_vec();
+        let ctx = OwnerCheckCtx::for_legacy(&inner);
+        let stamp: ActionStamp = prep.stamp;
+        let (mut pw, pr) = plan_slots(1, PlanSlot::default);
+        let payload = if use_slot {
+            let slot = prep.to_plan_slot(None).expect("to_plan_slot");
+            let Primitive::Action(StagedAction::Cartesian {
+                kind, dof, start, measured_start, has_measured_start, duration_s, power_scale, approach_then, ..
+            }) = slot.primitive
+            else {
+                panic!("expected StagedAction::Cartesian");
+            };
+            let h = pw.stage(|dst| *dst = slot).expect("publish plan slot");
+            let slot_ref = pr.pin(h).expect("pin plan slot");
+            CartesianInstallPayload::Slot {
+                kind,
+                dof: usize::from(dof),
+                start,
+                measured_start: has_measured_start.then_some(measured_start),
+                slot: slot_ref,
+                duration_s,
+                power_scale,
+                approach_then,
+            }
+        } else {
+            CartesianInstallPayload::Legacy(Box::new(prep))
+        };
+        let err = install_move_cartesian(&mut inner, &stamp, &ctx, payload)
+            .expect_err("Cartesian installer must reject after measured_positions drifted inward");
+        assert!(
+            matches!(err, armd::ArmError::Motion(armd::motion::MotionError::PlanStale(_))),
+            "use_slot={use_slot}: expected PlanStale, got {err:?}"
+        );
+    }
+}
