@@ -503,7 +503,7 @@ impl JitterFeedbackDriver {
     fn fill_jittered_states(&self, out: &mut Vec<JointState>) {
         let q = self.q.lock().unwrap();
         let n = self.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let sign = if n % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        let sign = if n.is_multiple_of(2) { 1.0f32 } else { -1.0f32 };
         out.clear();
         for (i, &pos) in q.iter().enumerate() {
             let jitter = if i < self.arm_dof { sign * self.jitter_rad } else { 0.0 };
