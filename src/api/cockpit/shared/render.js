@@ -409,7 +409,7 @@ window.V = V;
     // Automatically enters the immersive full-screen video + glass HUD cockpit!
     const forceHud = isLandscape && (isTabletOrMobile || h <= 1080);
     document.body.classList.toggle('is-hud', forceHud);
-    
+
     // Sync button state if present
     const btn = $('btn-fs');
     if (btn) {
