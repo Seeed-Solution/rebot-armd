@@ -936,4 +936,3 @@ use super::*;
         assert!(!inner.last_poll_feedback_valid);
         assert!(inner.last_poll_oldest_age.is_none());
     }
-

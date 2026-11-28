@@ -714,4 +714,3 @@ fn legacy_timeout_aborts_enable_and_detaches_dispatched_disable_without_aborting
         assert!(drv.torque_transition_pending(), "protective disable must remain live");
     }
 }
-
