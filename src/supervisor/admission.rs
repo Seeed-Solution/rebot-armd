@@ -5,54 +5,479 @@ use super::*;
 
 // scaffold-impl-0
 impl AdmissionStamp {
+    /// Derives a fresh single-use child [`AdmissionStamp`] for a macro sub-motion while
+    /// preserving the parent's admission-captured `stop_gen`, `estop_epoch`, `lease_gen`, and
+    /// `connection_id` verbatim (never re-sampling live owner authority).
+    pub fn for_macro_child(self) -> Self {
+        Self {
+            request_id: if self.request_id == 0 {
+                0
+            } else {
+                next_admission_request_id()
+            },
+            ..self
+        }
+    }
+
+    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request using its broker
+    /// `RequestId` in an isolated namespace (zero-alloc; `0` stays `0` and is refused fail-closed).
+    pub(crate) fn from_broker(
+        stop_gen: u64,
+        estop_epoch: u64,
+        lease_gen: u64,
+        broker_request_id: u64,
+    ) -> Self {
+        Self::from_broker_conn(stop_gen, estop_epoch, lease_gen, 0, broker_request_id)
+    }
+
+    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request carrying the original
+    /// WS `connection_id` (`ClientId.0`, or `0` for non-WS callers) so transition authority and
+    /// closed-connection checks bind directly to the submitting connection on `armd-control`.
+    pub(crate) fn from_broker_conn(
+        stop_gen: u64,
+        estop_epoch: u64,
+        lease_gen: u64,
+        connection_id: u64,
+        broker_request_id: u64,
+    ) -> Self {
+        Self {
+            stop_gen,
+            estop_epoch,
+            lease_gen,
+            connection_id,
+            request_id: if broker_request_id == 0 {
+                0
+            } else {
+                broker_request_id | BROKER_REQUEST_ID_BIT
+            },
+        }
+    }
+
+    /// Constructs a fresh single-use [`AdmissionStamp`] for an RT-internal latest-target or
+    /// stream-handback step (zero-alloc atomic counter in an isolated namespace).
+    pub(crate) fn for_rt_internal(stop_gen: u64, estop_epoch: u64, lease_gen: u64) -> Self {
+        Self {
+            stop_gen,
+            estop_epoch,
+            lease_gen,
+            connection_id: 0,
+            request_id: next_admission_request_id() | RT_INTERNAL_REQUEST_ID_BIT,
+        }
+    }
 }
 
 // scaffold-impl-1
 impl std::fmt::Debug for Admitted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Admitted").field("stamp", &self.stamp).finish()
+    }
 }
 
 // scaffold-impl-2
 impl AdmittedProof {
+    #[inline]
+    pub(crate) fn stamp(&self) -> AdmissionStamp {
+        self.stamp
+    }
 }
 
 // scaffold-impl-3
 impl<'g> Admitted<'g> {
+    /// The validated stamp captured at request admission.
+    #[inline]
+    pub fn stamp(&self) -> AdmissionStamp {
+        self.stamp
+    }
+
+    /// Re-verifies this token against live owner state (including lock-free atomic E-stop
+    /// and urgent-stop counters) without consuming it.
+    pub(crate) fn verify_live(&self) -> Result<AdmissionStamp, SafetyError> {
+        self.inner.verify_admission_stamp(self.stamp)?;
+        Ok(self.stamp)
+    }
+
+    /// Consumes this single-use token by value, re-verifies its stamp against live owner
+    /// state, and yields `&'g mut SupervisorInner` plus a crate-private [`AdmittedProof`].
+    pub(crate) fn consume(self) -> Result<(&'g mut SupervisorInner, AdmittedProof), SafetyError> {
+        let stamp = self.stamp;
+        let inner = self.inner;
+        inner.verify_admission_stamp(stamp)?;
+        // Record the A1 admission `(stop_gen, estop_epoch)` directly from the admitted command's
+        // stamp so J7 `Target` intents carry their admission stamp and are never re-stamped later
+        // (and never stamped with `max(local, requested)`).
+        inner.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+            stop_gen: stamp.stop_gen,
+            estop_epoch: stamp.estop_epoch,
+            lease_gen: stamp.lease_gen,
+        });
+        Ok((inner, AdmittedProof { stamp }))
+    }
 }
 
 // scaffold-impl-4
 impl MotionStartKind {
+    pub const ALL: &'static [MotionStartKind] = &[
+        Self::Jog,
+        Self::Home,
+        Self::Park,
+        Self::Preset,
+        Self::MoveTo,
+        Self::MoveRelative,
+        Self::MoveToPose,
+        Self::Place,
+        Self::Grasp,
+        Self::Replay,
+        Self::Sequence,
+        Self::CalibHover,
+        Self::MeasureMultiview,
+        Self::MacroStart,
+        Self::MacroChildPath,
+        Self::MacroChildQuintic,
+        Self::MacroChildGripper,
+        Self::MacroChildReplay,
+        Self::Servo,
+        Self::PolicyShadow,
+        Self::PolicyLive,
+        Self::GravityComp,
+        Self::Gripper,
+        Self::GripperCalibrate,
+        Self::GripperZeroCheck,
+        Self::TorqueEnable,
+    ];
 }
 
 // scaffold-impl-5
 impl ArmError {
+    pub fn detailed(status: u16, code: &str, message: impl Into<String>, details: serde_json::Value) -> Self {
+        Self::Detailed { status, code: code.into(), message: message.into(), details: Box::new(details) }
+    }
+
+    pub fn workspace_detail(&self) -> Option<crate::kinematics::WorkspaceViolationDetail> {
+        match self {
+            Self::Safety(e) => e.workspace_detail(),
+            Self::Motion(MotionError::WorkspaceViolation { detail, .. }) => Some((**detail).clone()),
+            Self::WorkspaceRejected { detail, .. } => Some((**detail).clone()),
+            _ => None,
+        }
+    }
 }
 
 // scaffold-impl-6
 impl From<crate::recording::StoreError> for ArmError {
+    fn from(e: crate::recording::StoreError) -> Self {
+        let (status, code) = e.status_code();
+        ArmError::Rejected { status, code: code.into(), message: e.to_string() }
+    }
 }
 
 // scaffold-impl-7
 impl Default for LiveConnections {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // scaffold-impl-8
 impl LiveConnections {
+    pub(crate) const fn new() -> Self {
+        Self {
+            ids: [0; MAX_LIVE_CONNECTIONS],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn register(
+        &mut self,
+        id: u64,
+        closed: &ClosedConnections,
+    ) -> Result<(), &'static str> {
+        if id == 0 {
+            return Err("INVALID_CONNECTION");
+        }
+        if closed.is_closed(id) {
+            return Err("DISCONNECTED");
+        }
+        if self.contains(id) {
+            return Ok(());
+        }
+        if self.len >= MAX_LIVE_CONNECTIONS {
+            return Err("TOO_MANY_CONNECTIONS");
+        }
+        self.ids[self.len] = id;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) fn remove(&mut self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        for i in 0..self.len {
+            if self.ids[i] == id {
+                self.len -= 1;
+                self.ids[i] = self.ids[self.len];
+                self.ids[self.len] = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        id != 0 && self.ids[..self.len].contains(&id)
+    }
+
+    /// True iff any currently live connection ID lies strictly inside `(lo, hi)`.
+    #[inline]
+    pub(crate) fn any_in_open_range(&self, lo: u64, hi: u64) -> bool {
+        self.ids[..self.len].iter().any(|&id| id > lo && id < hi)
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
 }
 
 // scaffold-impl-9
 impl Default for ClosedConnections {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // scaffold-impl-10
 impl ClosedConnections {
+    pub(crate) fn new() -> Self {
+        Self {
+            watermark: 0,
+            intervals: Vec::with_capacity(CLOSED_CONNECTIONS_PREALLOC),
+        }
+    }
+
+    pub(crate) fn reserve_rt(&mut self) {
+        if self.intervals.capacity() < CLOSED_CONNECTIONS_PREALLOC {
+            self.intervals
+                .reserve(CLOSED_CONNECTIONS_PREALLOC - self.intervals.len());
+        }
+    }
+
+    pub(crate) fn mark_closed(&mut self, id: u64, live: &LiveConnections) {
+        if id == 0 || id <= self.watermark {
+            return;
+        }
+        let idx = self
+            .intervals
+            .partition_point(|&(_, end)| end.saturating_add(1) < id);
+        if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
+            let (lo, hi) = self.intervals[idx];
+            let new_lo = lo.min(id);
+            let mut new_hi = hi.max(id);
+            if idx + 1 < self.intervals.len()
+                && self.intervals[idx + 1].0 <= new_hi.saturating_add(1)
+            {
+                new_hi = new_hi.max(self.intervals[idx + 1].1);
+                self.intervals.remove(idx + 1);
+            }
+            self.intervals[idx] = (new_lo, new_hi);
+        } else {
+            // Ensure capacity BEFORE inserting: with at most `MAX_LIVE_CONNECTIONS` live IDs,
+            // whenever `intervals.len() >= MAX_LIVE_CONNECTIONS + 1` the pigeonhole principle
+            // guarantees either the prefix gap `(watermark, intervals[0].0)` or an adjacent gap
+            // `(intervals[i].1, intervals[i+1].0)` contains zero live connection IDs.
+            if self.intervals.len() >= CLOSED_CONNECTIONS_PREALLOC {
+                self.compact_against_live(live);
+            }
+            let idx = self
+                .intervals
+                .partition_point(|&(_, end)| end.saturating_add(1) < id);
+            if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
+                let (lo, hi) = self.intervals[idx];
+                self.intervals[idx] = (lo.min(id), hi.max(id));
+            } else {
+                self.intervals.insert(idx, (id, id));
+            }
+        }
+        // Collapse any contiguous prefix directly into `watermark`.
+        while let Some(&(lo, hi)) = self.intervals.first() {
+            if lo <= self.watermark.saturating_add(1) {
+                self.watermark = self.watermark.max(hi);
+                self.intervals.remove(0);
+            } else {
+                break;
+            }
+        }
+        // Keep interval count strictly <= MAX_LIVE_CONNECTIONS + 1 even under external ID gaps.
+        if self.intervals.len() > MAX_LIVE_CONNECTIONS + 1 {
+            self.compact_against_live(live);
+        }
+    }
+
+    fn compact_against_live(&mut self, live: &LiveConnections) {
+        // First fold the lowest interval into `watermark` if no live ID sits below it.
+        if let Some(&(lo, hi)) = self.intervals.first() {
+            if !live.any_in_open_range(self.watermark, lo) {
+                self.watermark = self.watermark.max(hi);
+                self.intervals.remove(0);
+                return;
+            }
+        }
+        // Otherwise merge the first adjacent pair whose gap contains zero live IDs.
+        for i in 0..self.intervals.len().saturating_sub(1) {
+            let (lo0, hi0) = self.intervals[i];
+            let (lo1, hi1) = self.intervals[i + 1];
+            if !live.any_in_open_range(hi0, lo1) {
+                self.intervals[i] = (lo0, hi1);
+                self.intervals.remove(i + 1);
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn is_closed(&self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        if id <= self.watermark {
+            return true;
+        }
+        let idx = self.intervals.partition_point(|&(_, end)| end < id);
+        idx < self.intervals.len() && self.intervals[idx].0 <= id
+    }
 }
 
 // scaffold-impl-11
 impl<'a> LiveDisconnectFenceView<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        e_stop_latched: &'a crate::rt_core::urgent::EstopLatchView,
+        pending_disconnect_hold: &'a AtomicU64,
+        atomic_fenced_lease_gen: &'a AtomicU64,
+        fenced_lease_generation: u64,
+        active_lease_conn_id: u64,
+        active_lease_gen: Option<u64>,
+        closed_connections: &'a ClosedConnections,
+        rt_closed_connections: Option<&'a crate::rt_core::requests::actions::ClosedBitset>,
+        shared_closed_bitset: &'a crate::rt_core::requests::actions::ClosedBitset,
+    ) -> Self {
+        Self {
+            e_stop_latched,
+            pending_disconnect_hold,
+            atomic_fenced_lease_gen,
+            fenced_lease_generation,
+            active_lease_conn_id,
+            active_lease_gen,
+            closed_connections,
+            rt_closed_connections,
+            shared_closed_bitset,
+        }
+    }
+
+    pub(crate) fn estop_latched(&self) -> bool {
+        self.e_stop_latched.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn blocks_non_hold(&self) -> bool {
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
+        if self.atomic_fenced_lease_gen.load(Ordering::SeqCst) > self.fenced_lease_generation {
+            return true;
+        }
+        let conn_closed = self.active_lease_conn_id != 0
+            && (self.closed_connections.is_closed(self.active_lease_conn_id)
+                || self
+                    .rt_closed_connections
+                    .is_some_and(|b| b.is_closed(self.active_lease_conn_id))
+                || self
+                    .shared_closed_bitset
+                    .is_closed(self.active_lease_conn_id));
+        conn_closed && self.active_lease_gen.is_some_and(|g| g > self.fenced_lease_generation)
+    }
 }
 
 // scaffold-impl-12
 impl ConsumedStamps {
+    pub(crate) fn new() -> Self {
+        Self {
+            watermark: 0,
+            intervals: Vec::with_capacity(CONSUMED_STAMPS_INTERVAL_CAP),
+        }
+    }
+
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        if id == 0 || id <= self.watermark {
+            return true;
+        }
+        let idx = self.intervals.partition_point(|&(_, end)| end < id);
+        idx < self.intervals.len() && self.intervals[idx].0 <= id
+    }
+
+    pub(crate) fn record(&mut self, id: u64) {
+        if id == 0 || id <= self.watermark {
+            return;
+        }
+        if id == self.watermark.saturating_add(1) {
+            self.watermark = id;
+            self.fold_contiguous_into_watermark();
+            return;
+        }
+        let mut idx = self
+            .intervals
+            .partition_point(|&(_, end)| end.saturating_add(1) < id);
+        if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
+            let (lo, hi) = self.intervals[idx];
+            let new_lo = lo.min(id);
+            let mut new_hi = hi.max(id);
+            if idx + 1 < self.intervals.len()
+                && self.intervals[idx + 1].0 <= new_hi.saturating_add(1)
+            {
+                new_hi = new_hi.max(self.intervals[idx + 1].1);
+                self.intervals.remove(idx + 1);
+            }
+            self.intervals[idx] = (new_lo, new_hi);
+            self.fold_contiguous_into_watermark();
+            return;
+        }
+        // Capacity full: fold oldest range into `watermark` fail-closed (zero allocation,
+        // never forgets any previously consumed ID).
+        if self.intervals.len() >= CONSUMED_STAMPS_INTERVAL_CAP {
+            if idx == 0 {
+                self.watermark = self.watermark.max(id);
+                self.fold_contiguous_into_watermark();
+                return;
+            }
+            let (_, oldest_hi) = self.intervals.remove(0);
+            self.watermark = self.watermark.max(oldest_hi);
+            self.fold_contiguous_into_watermark();
+            // Re-locate insertion point after folding into watermark.
+            if id <= self.watermark {
+                return;
+            }
+            if id == self.watermark.saturating_add(1) {
+                self.watermark = id;
+                self.fold_contiguous_into_watermark();
+                return;
+            }
+            idx = self
+                .intervals
+                .partition_point(|&(_, end)| end.saturating_add(1) < id);
+        }
+        self.intervals.insert(idx, (id, id));
+        self.fold_contiguous_into_watermark();
+    }
+
+    fn fold_contiguous_into_watermark(&mut self) {
+        while let Some(&(lo, hi)) = self.intervals.first() {
+            if lo <= self.watermark.saturating_add(1) {
+                self.watermark = self.watermark.max(hi);
+                self.intervals.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 // scaffold-extra-0

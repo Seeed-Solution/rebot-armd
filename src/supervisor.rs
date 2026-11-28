@@ -100,65 +100,6 @@ pub struct AdmissionStamp {
 }
 
 impl AdmissionStamp {
-    /// Derives a fresh single-use child [`AdmissionStamp`] for a macro sub-motion while
-    /// preserving the parent's admission-captured `stop_gen`, `estop_epoch`, `lease_gen`, and
-    /// `connection_id` verbatim (never re-sampling live owner authority).
-    pub fn for_macro_child(self) -> Self {
-        Self {
-            request_id: if self.request_id == 0 {
-                0
-            } else {
-                next_admission_request_id()
-            },
-            ..self
-        }
-    }
-
-    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request using its broker
-    /// `RequestId` in an isolated namespace (zero-alloc; `0` stays `0` and is refused fail-closed).
-    pub(crate) fn from_broker(
-        stop_gen: u64,
-        estop_epoch: u64,
-        lease_gen: u64,
-        broker_request_id: u64,
-    ) -> Self {
-        Self::from_broker_conn(stop_gen, estop_epoch, lease_gen, 0, broker_request_id)
-    }
-
-    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request carrying the original
-    /// WS `connection_id` (`ClientId.0`, or `0` for non-WS callers) so transition authority and
-    /// closed-connection checks bind directly to the submitting connection on `armd-control`.
-    pub(crate) fn from_broker_conn(
-        stop_gen: u64,
-        estop_epoch: u64,
-        lease_gen: u64,
-        connection_id: u64,
-        broker_request_id: u64,
-    ) -> Self {
-        Self {
-            stop_gen,
-            estop_epoch,
-            lease_gen,
-            connection_id,
-            request_id: if broker_request_id == 0 {
-                0
-            } else {
-                broker_request_id | BROKER_REQUEST_ID_BIT
-            },
-        }
-    }
-
-    /// Constructs a fresh single-use [`AdmissionStamp`] for an RT-internal latest-target or
-    /// stream-handback step (zero-alloc atomic counter in an isolated namespace).
-    pub(crate) fn for_rt_internal(stop_gen: u64, estop_epoch: u64, lease_gen: u64) -> Self {
-        Self {
-            stop_gen,
-            estop_epoch,
-            lease_gen,
-            connection_id: 0,
-            request_id: next_admission_request_id() | RT_INTERNAL_REQUEST_ID_BIT,
-        }
-    }
 }
 
 /// Opaque, single-use admission proof token created ONLY by [`SupervisorInner::check_admission`]
@@ -276,9 +217,6 @@ pub struct Admitted<'g> {
 }
 
 impl std::fmt::Debug for Admitted<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Admitted").field("stamp", &self.stamp).finish()
-    }
 }
 
 /// Crate-private, non-`Copy`, non-`Clone` witness proving a live [`Admitted`] token was
@@ -288,42 +226,9 @@ pub(crate) struct AdmittedProof {
 }
 
 impl AdmittedProof {
-    #[inline]
-    pub(crate) fn stamp(&self) -> AdmissionStamp {
-        self.stamp
-    }
 }
 
 impl<'g> Admitted<'g> {
-    /// The validated stamp captured at request admission.
-    #[inline]
-    pub fn stamp(&self) -> AdmissionStamp {
-        self.stamp
-    }
-
-    /// Re-verifies this token against live owner state (including lock-free atomic E-stop
-    /// and urgent-stop counters) without consuming it.
-    pub(crate) fn verify_live(&self) -> Result<AdmissionStamp, SafetyError> {
-        self.inner.verify_admission_stamp(self.stamp)?;
-        Ok(self.stamp)
-    }
-
-    /// Consumes this single-use token by value, re-verifies its stamp against live owner
-    /// state, and yields `&'g mut SupervisorInner` plus a crate-private [`AdmittedProof`].
-    pub(crate) fn consume(self) -> Result<(&'g mut SupervisorInner, AdmittedProof), SafetyError> {
-        let stamp = self.stamp;
-        let inner = self.inner;
-        inner.verify_admission_stamp(stamp)?;
-        // Record the A1 admission `(stop_gen, estop_epoch)` directly from the admitted command's
-        // stamp so J7 `Target` intents carry their admission stamp and are never re-stamped later
-        // (and never stamped with `max(local, requested)`).
-        inner.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
-            stop_gen: stamp.stop_gen,
-            estop_epoch: stamp.estop_epoch,
-            lease_gen: stamp.lease_gen,
-        });
-        Ok((inner, AdmittedProof { stamp }))
-    }
 }
 
 /// Complete catalog of motion/output start entry points gated by [`AdmissionStamp`].
@@ -358,34 +263,6 @@ pub enum MotionStartKind {
 }
 
 impl MotionStartKind {
-    pub const ALL: &'static [MotionStartKind] = &[
-        Self::Jog,
-        Self::Home,
-        Self::Park,
-        Self::Preset,
-        Self::MoveTo,
-        Self::MoveRelative,
-        Self::MoveToPose,
-        Self::Place,
-        Self::Grasp,
-        Self::Replay,
-        Self::Sequence,
-        Self::CalibHover,
-        Self::MeasureMultiview,
-        Self::MacroStart,
-        Self::MacroChildPath,
-        Self::MacroChildQuintic,
-        Self::MacroChildGripper,
-        Self::MacroChildReplay,
-        Self::Servo,
-        Self::PolicyShadow,
-        Self::PolicyLive,
-        Self::GravityComp,
-        Self::Gripper,
-        Self::GripperCalibrate,
-        Self::GripperZeroCheck,
-        Self::TorqueEnable,
-    ];
 }
 
 /// Single sealed execution contract for [`SupervisorInner::start_motion`]: an operation can only
@@ -448,25 +325,9 @@ pub enum ArmError {
 }
 
 impl ArmError {
-    pub fn detailed(status: u16, code: &str, message: impl Into<String>, details: serde_json::Value) -> Self {
-        Self::Detailed { status, code: code.into(), message: message.into(), details: Box::new(details) }
-    }
-
-    pub fn workspace_detail(&self) -> Option<crate::kinematics::WorkspaceViolationDetail> {
-        match self {
-            Self::Safety(e) => e.workspace_detail(),
-            Self::Motion(MotionError::WorkspaceViolation { detail, .. }) => Some((**detail).clone()),
-            Self::WorkspaceRejected { detail, .. } => Some((**detail).clone()),
-            _ => None,
-        }
-    }
 }
 
 impl From<crate::recording::StoreError> for ArmError {
-    fn from(e: crate::recording::StoreError) -> Self {
-        let (status, code) = e.status_code();
-        ArmError::Rejected { status, code: code.into(), message: e.to_string() }
-    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -630,14 +491,6 @@ pub struct UnloadSettleSample {
 }
 
 impl UnloadSettleSample {
-    pub fn from_slices(t: f64, q: &[f32], v: &[f32]) -> Self {
-        let dof = q.len().min(v.len()).min(crate::model::MAX_MOTION_DOF);
-        let mut positions = [f32::NAN; crate::model::MAX_MOTION_DOF];
-        let mut velocities = [f32::NAN; crate::model::MAX_MOTION_DOF];
-        positions[..dof].copy_from_slice(&q[..dof]);
-        velocities[..dof].copy_from_slice(&v[..dof]);
-        Self { t, dof, positions, velocities }
-    }
 }
 
 /// Settle phase of a NormalUnload after its trajectory finished.
@@ -657,12 +510,6 @@ pub struct UnloadSettle {
 }
 
 impl UnloadSettle {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            samples: std::collections::VecDeque::with_capacity(cap),
-            ..Self::default()
-        }
-    }
 }
 
 /// Servo streaming: a lead-capped joint whose measured position moves less than this
@@ -855,20 +702,6 @@ pub(crate) enum TickOutput {
 }
 
 impl TickOutput {
-    /// True when the active J7 position-force gripper was stale (> 100 ms) during this pass
-    /// (receiving a freeze frame instead of any new target); prevents J7-dependent action
-    /// completions from committing on that tick.
-    #[inline]
-    pub(crate) fn j7_stale(&self) -> bool {
-        matches!(
-            self,
-            Self::ActionDeadlineRefused { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
-                | Self::Complete { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
-                | Self::Deferred { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
-                | Self::Expired { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
-                | Self::Error { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
-        )
-    }
 }
 
 /// What [`SupervisorInner::tick_publish`] hands back.
@@ -2016,54 +1849,6 @@ pub struct ZeroCheckPersistContext {
 }
 
 impl ZeroCheckPersistContext {
-    /// Captures all heap-backed calibration persistence inputs off the RT completion path.
-    pub fn from_inner(
-        inner: &SupervisorInner,
-        operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
-    ) -> Self {
-        let path = inner
-            .gripper_calib_path
-            .clone()
-            .unwrap_or_else(crate::gripper_calib::path_from_env);
-        let gripper_limit = inner
-            .config
-            .gripper_index()
-            .and_then(|idx| inner.config.limits.get(idx))
-            .cloned();
-        Self {
-            path,
-            jaw_opening: inner.gripper_calib_jaw_opening.clone(),
-            stale: inner.gripper_calib_stale.clone(),
-            tool_id: inner.config.active_tool.id.clone(),
-            tool_config_digest: inner.config.active_tool.config_digest.clone(),
-            active_tool_is_stock: inner.config.active_tool.is_stock,
-            base_gripper_policy: inner
-                .base_gripper_policy
-                .clone()
-                .or_else(|| inner.config.gripper_policy.clone()),
-            gripper_limit,
-            operator_auth,
-            sat_msg_buf: String::with_capacity(64),
-        }
-    }
-
-    /// Serializes `GripperCalibFile` off the control thread into a [`crate::persist::PendingWrite`].
-    pub fn serialize_write(&self, offset_rad: f32) -> crate::persist::PendingWrite {
-        let file = crate::gripper_calib::GripperCalibFile {
-            offset_rad: Some(offset_rad),
-            jaw_opening: self.jaw_opening.clone(),
-            ts: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs()),
-            ),
-            stale: self.stale.clone(),
-            tool_id: Some(self.tool_id.clone()),
-            tool_config_digest: Some(self.tool_config_digest.clone()),
-        };
-        let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-        crate::persist::PendingWrite::new(self.path.clone(), text)
-    }
 }
 
 /// Parameters of a running gripper zero check action.
@@ -2132,71 +1917,9 @@ pub(crate) struct LiveConnections {
 }
 
 impl Default for LiveConnections {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl LiveConnections {
-    pub(crate) const fn new() -> Self {
-        Self {
-            ids: [0; MAX_LIVE_CONNECTIONS],
-            len: 0,
-        }
-    }
-
-    pub(crate) fn register(
-        &mut self,
-        id: u64,
-        closed: &ClosedConnections,
-    ) -> Result<(), &'static str> {
-        if id == 0 {
-            return Err("INVALID_CONNECTION");
-        }
-        if closed.is_closed(id) {
-            return Err("DISCONNECTED");
-        }
-        if self.contains(id) {
-            return Ok(());
-        }
-        if self.len >= MAX_LIVE_CONNECTIONS {
-            return Err("TOO_MANY_CONNECTIONS");
-        }
-        self.ids[self.len] = id;
-        self.len += 1;
-        Ok(())
-    }
-
-    pub(crate) fn remove(&mut self, id: u64) -> bool {
-        if id == 0 {
-            return false;
-        }
-        for i in 0..self.len {
-            if self.ids[i] == id {
-                self.len -= 1;
-                self.ids[i] = self.ids[self.len];
-                self.ids[self.len] = 0;
-                return true;
-            }
-        }
-        false
-    }
-
-    #[inline]
-    pub(crate) fn contains(&self, id: u64) -> bool {
-        id != 0 && self.ids[..self.len].contains(&id)
-    }
-
-    /// True iff any currently live connection ID lies strictly inside `(lo, hi)`.
-    #[inline]
-    pub(crate) fn any_in_open_range(&self, lo: u64, hi: u64) -> bool {
-        self.ids[..self.len].iter().any(|&id| id > lo && id < hi)
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
 }
 
 /// Preallocated capacity for [`ClosedConnections`] intervals: with at most `MAX_LIVE_CONNECTIONS`
@@ -2214,108 +1937,9 @@ pub(crate) struct ClosedConnections {
 }
 
 impl Default for ClosedConnections {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl ClosedConnections {
-    pub(crate) fn new() -> Self {
-        Self {
-            watermark: 0,
-            intervals: Vec::with_capacity(CLOSED_CONNECTIONS_PREALLOC),
-        }
-    }
-
-    pub(crate) fn reserve_rt(&mut self) {
-        if self.intervals.capacity() < CLOSED_CONNECTIONS_PREALLOC {
-            self.intervals
-                .reserve(CLOSED_CONNECTIONS_PREALLOC - self.intervals.len());
-        }
-    }
-
-    pub(crate) fn mark_closed(&mut self, id: u64, live: &LiveConnections) {
-        if id == 0 || id <= self.watermark {
-            return;
-        }
-        let idx = self
-            .intervals
-            .partition_point(|&(_, end)| end.saturating_add(1) < id);
-        if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
-            let (lo, hi) = self.intervals[idx];
-            let new_lo = lo.min(id);
-            let mut new_hi = hi.max(id);
-            if idx + 1 < self.intervals.len()
-                && self.intervals[idx + 1].0 <= new_hi.saturating_add(1)
-            {
-                new_hi = new_hi.max(self.intervals[idx + 1].1);
-                self.intervals.remove(idx + 1);
-            }
-            self.intervals[idx] = (new_lo, new_hi);
-        } else {
-            // Ensure capacity BEFORE inserting: with at most `MAX_LIVE_CONNECTIONS` live IDs,
-            // whenever `intervals.len() >= MAX_LIVE_CONNECTIONS + 1` the pigeonhole principle
-            // guarantees either the prefix gap `(watermark, intervals[0].0)` or an adjacent gap
-            // `(intervals[i].1, intervals[i+1].0)` contains zero live connection IDs.
-            if self.intervals.len() >= CLOSED_CONNECTIONS_PREALLOC {
-                self.compact_against_live(live);
-            }
-            let idx = self
-                .intervals
-                .partition_point(|&(_, end)| end.saturating_add(1) < id);
-            if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
-                let (lo, hi) = self.intervals[idx];
-                self.intervals[idx] = (lo.min(id), hi.max(id));
-            } else {
-                self.intervals.insert(idx, (id, id));
-            }
-        }
-        // Collapse any contiguous prefix directly into `watermark`.
-        while let Some(&(lo, hi)) = self.intervals.first() {
-            if lo <= self.watermark.saturating_add(1) {
-                self.watermark = self.watermark.max(hi);
-                self.intervals.remove(0);
-            } else {
-                break;
-            }
-        }
-        // Keep interval count strictly <= MAX_LIVE_CONNECTIONS + 1 even under external ID gaps.
-        if self.intervals.len() > MAX_LIVE_CONNECTIONS + 1 {
-            self.compact_against_live(live);
-        }
-    }
-
-    fn compact_against_live(&mut self, live: &LiveConnections) {
-        // First fold the lowest interval into `watermark` if no live ID sits below it.
-        if let Some(&(lo, hi)) = self.intervals.first() {
-            if !live.any_in_open_range(self.watermark, lo) {
-                self.watermark = self.watermark.max(hi);
-                self.intervals.remove(0);
-                return;
-            }
-        }
-        // Otherwise merge the first adjacent pair whose gap contains zero live IDs.
-        for i in 0..self.intervals.len().saturating_sub(1) {
-            let (lo0, hi0) = self.intervals[i];
-            let (lo1, hi1) = self.intervals[i + 1];
-            if !live.any_in_open_range(hi0, lo1) {
-                self.intervals[i] = (lo0, hi1);
-                self.intervals.remove(i + 1);
-                return;
-            }
-        }
-    }
-
-    pub(crate) fn is_closed(&self, id: u64) -> bool {
-        if id == 0 {
-            return false;
-        }
-        if id <= self.watermark {
-            return true;
-        }
-        let idx = self.intervals.partition_point(|&(_, end)| end < id);
-        idx < self.intervals.len() && self.intervals[idx].0 <= id
-    }
 }
 
 /// Borrowed snapshot of owner-side live disconnect fence & E-stop state checked immediately before
@@ -2334,52 +1958,6 @@ pub(crate) struct LiveDisconnectFenceView<'a> {
 }
 
 impl<'a> LiveDisconnectFenceView<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        e_stop_latched: &'a crate::rt_core::urgent::EstopLatchView,
-        pending_disconnect_hold: &'a AtomicU64,
-        atomic_fenced_lease_gen: &'a AtomicU64,
-        fenced_lease_generation: u64,
-        active_lease_conn_id: u64,
-        active_lease_gen: Option<u64>,
-        closed_connections: &'a ClosedConnections,
-        rt_closed_connections: Option<&'a crate::rt_core::requests::actions::ClosedBitset>,
-        shared_closed_bitset: &'a crate::rt_core::requests::actions::ClosedBitset,
-    ) -> Self {
-        Self {
-            e_stop_latched,
-            pending_disconnect_hold,
-            atomic_fenced_lease_gen,
-            fenced_lease_generation,
-            active_lease_conn_id,
-            active_lease_gen,
-            closed_connections,
-            rt_closed_connections,
-            shared_closed_bitset,
-        }
-    }
-
-    pub(crate) fn estop_latched(&self) -> bool {
-        self.e_stop_latched.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn blocks_non_hold(&self) -> bool {
-        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
-            return true;
-        }
-        if self.atomic_fenced_lease_gen.load(Ordering::SeqCst) > self.fenced_lease_generation {
-            return true;
-        }
-        let conn_closed = self.active_lease_conn_id != 0
-            && (self.closed_connections.is_closed(self.active_lease_conn_id)
-                || self
-                    .rt_closed_connections
-                    .is_some_and(|b| b.is_closed(self.active_lease_conn_id))
-                || self
-                    .shared_closed_bitset
-                    .is_closed(self.active_lease_conn_id));
-        conn_closed && self.active_lease_gen.is_some_and(|g| g > self.fenced_lease_generation)
-    }
 }
 
 /// Preallocated capacity for [`ConsumedStamps`] disjoint intervals above `watermark`.
@@ -2396,85 +1974,6 @@ pub(crate) struct ConsumedStamps {
 }
 
 impl ConsumedStamps {
-    pub(crate) fn new() -> Self {
-        Self {
-            watermark: 0,
-            intervals: Vec::with_capacity(CONSUMED_STAMPS_INTERVAL_CAP),
-        }
-    }
-
-    pub(crate) fn contains(&self, id: u64) -> bool {
-        if id == 0 || id <= self.watermark {
-            return true;
-        }
-        let idx = self.intervals.partition_point(|&(_, end)| end < id);
-        idx < self.intervals.len() && self.intervals[idx].0 <= id
-    }
-
-    pub(crate) fn record(&mut self, id: u64) {
-        if id == 0 || id <= self.watermark {
-            return;
-        }
-        if id == self.watermark.saturating_add(1) {
-            self.watermark = id;
-            self.fold_contiguous_into_watermark();
-            return;
-        }
-        let mut idx = self
-            .intervals
-            .partition_point(|&(_, end)| end.saturating_add(1) < id);
-        if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
-            let (lo, hi) = self.intervals[idx];
-            let new_lo = lo.min(id);
-            let mut new_hi = hi.max(id);
-            if idx + 1 < self.intervals.len()
-                && self.intervals[idx + 1].0 <= new_hi.saturating_add(1)
-            {
-                new_hi = new_hi.max(self.intervals[idx + 1].1);
-                self.intervals.remove(idx + 1);
-            }
-            self.intervals[idx] = (new_lo, new_hi);
-            self.fold_contiguous_into_watermark();
-            return;
-        }
-        // Capacity full: fold oldest range into `watermark` fail-closed (zero allocation,
-        // never forgets any previously consumed ID).
-        if self.intervals.len() >= CONSUMED_STAMPS_INTERVAL_CAP {
-            if idx == 0 {
-                self.watermark = self.watermark.max(id);
-                self.fold_contiguous_into_watermark();
-                return;
-            }
-            let (_, oldest_hi) = self.intervals.remove(0);
-            self.watermark = self.watermark.max(oldest_hi);
-            self.fold_contiguous_into_watermark();
-            // Re-locate insertion point after folding into watermark.
-            if id <= self.watermark {
-                return;
-            }
-            if id == self.watermark.saturating_add(1) {
-                self.watermark = id;
-                self.fold_contiguous_into_watermark();
-                return;
-            }
-            idx = self
-                .intervals
-                .partition_point(|&(_, end)| end.saturating_add(1) < id);
-        }
-        self.intervals.insert(idx, (id, id));
-        self.fold_contiguous_into_watermark();
-    }
-
-    fn fold_contiguous_into_watermark(&mut self) {
-        while let Some(&(lo, hi)) = self.intervals.first() {
-            if lo <= self.watermark.saturating_add(1) {
-                self.watermark = self.watermark.max(hi);
-                self.intervals.remove(0);
-            } else {
-                break;
-            }
-        }
-    }
 }
 
 impl SupervisorInner {
@@ -12426,335 +11925,9 @@ pub(crate) struct TerminalBroadcaster {
 }
 
 impl Default for TerminalBroadcaster {
-    fn default() -> Self {
-        Self {
-            subscriber_count: AtomicUsize::new(0),
-            pending_total: AtomicUsize::new(0),
-            max_fifo_len: AtomicUsize::new(0),
-            capacity_atomic: AtomicUsize::new(TERMINAL_FIFO_CAPACITY),
-            dispatch_paused: AtomicBool::new(false),
-            inner: std::sync::Mutex::new(TerminalBroadcasterInner {
-                next_id: 1,
-                capacity: TERMINAL_FIFO_CAPACITY,
-                sinks: Vec::new(),
-                recent_finished: std::collections::VecDeque::with_capacity(64),
-            }),
-        }
-    }
 }
 
 impl TerminalBroadcaster {
-    fn recompute_atomics(&self, g: &TerminalBroadcasterInner) {
-        self.subscriber_count.store(g.sinks.len(), Ordering::Release);
-        let mut pending = 0usize;
-        let mut max_len = 0usize;
-        for q in &g.sinks {
-            let l = q.fifo.len();
-            pending += l;
-            if l > max_len {
-                max_len = l;
-            }
-        }
-        self.pending_total.store(pending, Ordering::Release);
-        self.max_fifo_len.store(max_len, Ordering::Release);
-        self.capacity_atomic.store(g.capacity, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn subscribe(&self, sink: TerminalSinkFn) -> u64 {
-        self.subscribe_with_cutoff(sink, 0)
-    }
-
-    pub(crate) fn subscribe_with_cutoff(&self, sink: TerminalSinkFn, min_terminal_seq: u64) -> u64 {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let id = g.next_id;
-        g.next_id += 1;
-        let cap = g.capacity;
-        g.sinks.push(ConnectionTerminalQueue {
-            sub_id: id,
-            min_terminal_seq,
-            fifo: std::collections::VecDeque::with_capacity(cap.min(TERMINAL_FIFO_CAPACITY)),
-            seen: std::collections::VecDeque::with_capacity(cap.max(128)),
-            sink,
-        });
-        self.recompute_atomics(&g);
-        id
-    }
-
-    /// Atomically reads `read_cutoff()` and installs `min_terminal_seq` under `self.inner.lock()`
-    /// so no concurrent enqueue can observe the temporary `u64::MAX` filter after the cutoff is read.
-    pub(crate) fn activate_subscriber_cutoff(
-        &self,
-        sub_id: u64,
-        read_cutoff: impl FnOnce() -> u64,
-    ) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let cutoff = read_cutoff();
-        if let Some(q) = g.sinks.iter_mut().find(|q| q.sub_id == sub_id) {
-            q.min_terminal_seq = cutoff;
-        }
-    }
-
-    pub(crate) fn unsubscribe(&self, id: u64) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.sinks.retain(|q| q.sub_id != id);
-        self.recompute_atomics(&g);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn can_start_action(&self, has_running_action: bool, lock_free: bool) -> bool {
-        self.can_start_action_with_inflight(
-            has_running_action,
-            lock_free,
-            0,
-            0,
-            TERMINAL_FIFO_CAPACITY,
-        )
-    }
-
-    /// End-to-end admission check charging `staged + inflight + fifo + needed` against both the
-    /// per-connection FIFO capacity and the capture ring's admission cap.
-    ///
-    /// Caller reads `inflight` with `Acquire` strictly BEFORE this method reads `max_fifo_len`
-    /// with `Acquire`, matching the inverse write order in `TerminalCaptureChannel::drain_into`
-    /// (`max_fifo_len` Release -> `inflight` Release) so handoffs never under-count.
-    pub(crate) fn can_start_action_with_inflight(
-        &self,
-        has_running_action: bool,
-        lock_free: bool,
-        staged: usize,
-        inflight: usize,
-        ring_admission_cap: usize,
-    ) -> bool {
-        if self.subscriber_count.load(Ordering::Acquire) == 0 {
-            return true;
-        }
-        // Reserve 1 slot for the new action's eventual terminal, plus 1 immediate slot if a
-        // currently running action will be superseded right now.
-        let needed = if has_running_action { 2 } else { 1 };
-        let in_pipeline = staged.saturating_add(inflight);
-        if in_pipeline.saturating_add(needed) > ring_admission_cap {
-            return false;
-        }
-        if lock_free {
-            let cap = self.capacity_atomic.load(Ordering::Acquire);
-            let max_len = self.max_fifo_len.load(Ordering::Acquire);
-            return max_len.saturating_add(in_pipeline).saturating_add(needed) <= cap;
-        }
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.sinks.is_empty() {
-            return true;
-        }
-        g.sinks
-            .iter()
-            .all(|q| q.fifo.len().saturating_add(in_pipeline).saturating_add(needed) <= g.capacity)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_finished(&self, action: &ActionStatus) -> bool {
-        self.record_finished_with_seq(0, action.clone(), None, None)
-    }
-
-    /// Enqueues a terminal action with authoritative `terminal_seq` (0 when unassigned in direct
-    /// unit tests) into every subscriber whose `min_terminal_seq < terminal_seq` (or 0) and that
-    /// has not already seen `action.id`. Carries `required_publish_seq` through to delivery so
-    /// `drain_all` and owner reply sinks never pair a terminal with a snapshot older than its
-    /// required publication. Updates `max_fifo_len` and `pending_total` with `Release`.
-    pub(crate) fn record_finished_with_seq(
-        &self,
-        terminal_seq: u64,
-        action: ActionStatus,
-        obs_override: Option<ArmObservation>,
-        required_publish_seq: Option<u64>,
-    ) -> bool {
-        if action.is_running() {
-            return false;
-        }
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let queued = QueuedTerminal {
-            action: action.clone(),
-            obs_override: obs_override.clone(),
-            required_publish_seq,
-        };
-        if let Some(existing) = g.recent_finished.iter_mut().find(|e| e.action.id == action.id) {
-            *existing = queued.clone();
-        } else {
-            if g.recent_finished.len() >= 64 {
-                g.recent_finished.pop_front();
-            }
-            g.recent_finished.push_back(queued.clone());
-        }
-        if g.sinks.is_empty() {
-            return false;
-        }
-        let cap = g.capacity;
-        let mut enqueued = false;
-        for q in &mut g.sinks {
-            if terminal_seq != 0 && terminal_seq <= q.min_terminal_seq {
-                continue;
-            }
-            if q.seen.contains(&action.id) {
-                continue;
-            }
-            // Never drop or skip a finished action's terminal even if `q.fifo.len() >= cap`:
-            // `can_start_action_with_inflight` refuses NEW starts with `TERMINALS_BUSY` once
-            // `len >= cap`, while any already-running action's terminal is preserved in strict FIFO order.
-            let seen_cap = cap.max(128).max(q.fifo.len() + 1);
-            if q.seen.len() >= seen_cap {
-                q.seen.pop_front();
-            }
-            q.seen.push_back(action.id);
-            q.fifo.push_back(queued.clone());
-            enqueued = true;
-        }
-        if enqueued {
-            self.recompute_atomics(&g);
-        }
-        enqueued
-    }
-
-    pub(crate) fn lookup_finished_entry(&self, action_id: u64) -> Option<QueuedTerminal> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.recent_finished
-            .iter()
-            .rev()
-            .find(|e| e.action.id == action_id)
-            .cloned()
-    }
-
-    pub(crate) fn update_failed_step(&self, action_id: u64, step: Option<usize>) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = g.recent_finished.iter_mut().find(|e| e.action.id == action_id) {
-            entry.action.failed_step = step;
-            if let Some(obs) = entry.obs_override.as_mut() {
-                if let Some(a) = obs.action.as_mut().filter(|a| a.id == action_id) {
-                    a.failed_step = step;
-                }
-            }
-        }
-        for q in &mut g.sinks {
-            if let Some(entry) = q.fifo.iter_mut().find(|e| e.action.id == action_id) {
-                entry.action.failed_step = step;
-                if let Some(obs) = entry.obs_override.as_mut() {
-                    if let Some(a) = obs.action.as_mut().filter(|a| a.id == action_id) {
-                        a.failed_step = step;
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn has_pending(&self) -> bool {
-        !self.dispatch_paused.load(Ordering::Acquire)
-            && self.pending_total.load(Ordering::Acquire) > 0
-    }
-
-    /// Drains ready queued terminals onto subscriber sinks, enforcing `required_publish_seq <= base_seq`
-    /// whenever an entry relies on `base_obs`. Returns `true` if any subscriber FIFO stopped at a
-    /// head entry waiting for a newer snapshot (`base_seq < required_publish_seq`).
-    pub(crate) fn drain_all(&self, base_obs: &ArmObservation, base_seq: u64) -> bool {
-        if self.dispatch_paused.load(Ordering::Acquire)
-            || self.pending_total.load(Ordering::Acquire) == 0
-        {
-            return false;
-        }
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut blocked_on_seq = false;
-        // Pop a terminal ONLY after its sink confirms a successful enqueue. On failure
-        // (e.g., outbound queue full -> fatal close triggered) or when `base_seq < required_publish_seq`,
-        // keep the terminal at the head of the FIFO to preserve strict FIFO order and snapshot parity.
-        for q in &mut g.sinks {
-            while let Some(entry) = q.fifo.front() {
-                if let Some(req_seq) = entry.required_publish_seq {
-                    if entry.obs_override.is_none() && base_seq < req_seq {
-                        blocked_on_seq = true;
-                        break;
-                    }
-                }
-                let mut obs = match entry.obs_override.as_ref() {
-                    Some(captured) => captured.clone(),
-                    None => base_obs.clone(),
-                };
-                obs.action = Some(entry.action.clone());
-                obs.previous_action = None;
-                if (q.sink)(&obs) {
-                    q.fifo.pop_front();
-                } else {
-                    break;
-                }
-            }
-        }
-        self.recompute_atomics(&g);
-        blocked_on_seq
-    }
-
-    /// Drains queued observer terminals with `action.id < max_exclusive_id` (enforcing
-    /// `required_publish_seq <= base_seq` whenever an entry relies on `base_obs`) so an
-    /// owner-routed terminal for `max_exclusive_id` never overtakes an earlier observer terminal
-    /// on the same socket. Returns `true` when no earlier observer terminal remains blocked.
-    pub(crate) fn drain_before_action_id(
-        &self,
-        base_obs: &ArmObservation,
-        base_seq: u64,
-        max_exclusive_id: u64,
-    ) -> bool {
-        if self.dispatch_paused.load(Ordering::Acquire)
-            || self.pending_total.load(Ordering::Acquire) == 0
-        {
-            return true;
-        }
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all_earlier_flushed = true;
-        for q in &mut g.sinks {
-            while let Some(entry) = q.fifo.front() {
-                if entry.action.id >= max_exclusive_id {
-                    break;
-                }
-                if let Some(req_seq) = entry.required_publish_seq {
-                    if entry.obs_override.is_none() && base_seq < req_seq {
-                        all_earlier_flushed = false;
-                        break;
-                    }
-                }
-                let mut obs = match entry.obs_override.as_ref() {
-                    Some(captured) => captured.clone(),
-                    None => base_obs.clone(),
-                };
-                obs.action = Some(entry.action.clone());
-                obs.previous_action = None;
-                if (q.sink)(&obs) {
-                    q.fifo.pop_front();
-                } else {
-                    all_earlier_flushed = false;
-                    break;
-                }
-            }
-        }
-        self.recompute_atomics(&g);
-        all_earlier_flushed
-    }
-
-    pub(crate) fn set_capacity(&self, capacity: usize) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.capacity = capacity.max(1);
-        self.recompute_atomics(&g);
-    }
-
-    pub(crate) fn set_dispatch_paused(&self, paused: bool) {
-        self.dispatch_paused.store(paused, Ordering::Release);
-    }
-
-    pub(crate) fn pending_total(&self) -> usize {
-        self.pending_total.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn lock_for_test(&self) -> impl Drop + '_ {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    pub(crate) fn try_lock_for_test(&self) -> bool {
-        self.inner.try_lock().is_ok()
-    }
 }
 
 /// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
@@ -12765,9 +11938,6 @@ pub struct TerminalSubscription {
 }
 
 impl Drop for TerminalSubscription {
-    fn drop(&mut self) {
-        self.broadcaster.unsubscribe(self.id);
-    }
 }
 
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
