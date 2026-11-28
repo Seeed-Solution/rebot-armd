@@ -3162,52 +3162,28 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
     fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            if path.is_dir() {
-                collect_rs(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
+            if path.is_dir() { collect_rs(&path, out); }
+            else if path.extension().and_then(|e| e.to_str()) == Some("rs") { out.push(path); }
         }
     }
 
-    /// Returns `(1-based line_no, line)` for production lines in `src/`, skipping only
-    /// `#[cfg(test)]`-attributed items (tracked by brace depth) so production code following
-    /// an inline `#[cfg(test)]` helper is still inspected.
+    /// Returns `(1-based line_no, line)` for production lines in `src/`, skipping `#[cfg(test)]` items.
     fn prod_lines(src: &str) -> Vec<(usize, &str)> {
-        let mut out = Vec::new();
-        let mut pending_cfg_test = false;
-        let mut skip_depth: usize = 0;
-        let mut in_skip = false;
+        let (mut out, mut pending_cfg_test, mut skip_depth, mut in_skip) = (Vec::new(), false, 0usize, false);
         for (idx, line) in src.lines().enumerate() {
             let trimmed = line.trim();
             if in_skip {
                 for ch in line.chars() {
-                    if ch == '{' {
-                        skip_depth += 1;
-                    } else if ch == '}' {
-                        skip_depth = skip_depth.saturating_sub(1);
-                    }
+                    if ch == '{' { skip_depth += 1; } else if ch == '}' { skip_depth = skip_depth.saturating_sub(1); }
                 }
-                if skip_depth == 0 {
-                    in_skip = false;
-                }
+                if skip_depth == 0 { in_skip = false; }
                 continue;
             }
-            if trimmed == "#[cfg(test)]" {
-                pending_cfg_test = true;
-                continue;
-            }
+            if trimmed == "#[cfg(test)]" { pending_cfg_test = true; continue; }
             if pending_cfg_test {
-                if trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.is_empty() {
-                    continue;
-                }
-                let opens = line.chars().filter(|&c| c == '{').count();
-                let closes = line.chars().filter(|&c| c == '}').count();
-                if opens > closes {
-                    skip_depth = opens - closes;
-                    in_skip = true;
-                }
-                // Single-line item or `mod tests;` statement ends immediately.
+                if trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.is_empty() { continue; }
+                let (opens, closes) = (line.chars().filter(|&c| c == '{').count(), line.chars().filter(|&c| c == '}').count());
+                if opens > closes { skip_depth = opens - closes; in_skip = true; }
                 pending_cfg_test = false;
                 continue;
             }
@@ -3222,6 +3198,60 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
     collect_rs(&src_dir, &mut files);
     files.sort();
 
+    fn norm_rel(base: &str, rel: &str) -> String {
+        let mut parts: Vec<&str> = if base.is_empty() { Vec::new() } else { base.split('/').collect() };
+        for s in rel.split('/') { match s { "" | "." => {} ".." => { parts.pop(); } x => parts.push(x) } }
+        parts.join("/")
+    }
+    fn classify_test_only(src_files: &[(String, String)]) -> std::collections::BTreeSet<String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let fset: BTreeSet<&str> = src_files.iter().map(|(r, _)| r.as_str()).collect();
+        let mut incoming: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+        for (rel, full) in src_files {
+            let parent = rel.rsplit_once('/').map_or("", |(p, _)| p);
+            let stem = rel.rsplit_once('/').map_or(rel.as_str(), |(_, f)| f).strip_suffix(".rs").unwrap_or("");
+            let is_dir = matches!(rel.as_str(), "src/lib.rs" | "src/main.rs") || rel.ends_with("/mod.rs") || rel.starts_with("src/bin/");
+            let sub = if is_dir { parent.to_string() } else { format!("{parent}/{stem}") };
+            let (mut attr_cfg, mut attr_path, mut cdepth) = (false, None::<String>, 0usize);
+            for line in full.lines() {
+                let t = line.split("//").next().unwrap_or("").trim();
+                if t.is_empty() { continue; }
+                if cdepth > 0 { cdepth = (cdepth + t.chars().filter(|&c| c == '{').count()).saturating_sub(t.chars().filter(|&c| c == '}').count()); }
+                if t.starts_with("#[") {
+                    let c: String = t.chars().filter(|ch| !ch.is_ascii_whitespace()).collect();
+                    if c.contains("cfg(test)") { attr_cfg = true; }
+                    if let Some(p) = c.find("path=\"").and_then(|i| c[i + 6..].split_once('"')).map(|(v, _)| v.to_string()) { attr_path = Some(p); }
+                    if !t.contains("mod ") { continue; }
+                }
+                let after = t.rsplit(']').next().unwrap_or(t).trim();
+                let after = after.strip_prefix("pub(").and_then(|r| r.split_once(')')).map_or(after.strip_prefix("pub ").unwrap_or(after), |(_, r)| r).trim();
+                if let Some(name) = after.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')).map(str::trim) {
+                    let gated = attr_cfg || cdepth > 0;
+                    let cands = if let Some(p) = &attr_path { vec![norm_rel(parent, p), norm_rel(&sub, p)] }
+                        else { vec![norm_rel(&sub, &format!("{name}.rs")), norm_rel(&sub, &format!("{name}/mod.rs"))] };
+                    for c in cands { if fset.contains(c.as_str()) { incoming.entry(c).or_default().push((rel.clone(), gated)); } }
+                    attr_cfg = false; attr_path = None; continue;
+                }
+                if attr_cfg && cdepth == 0 {
+                    let (o, cl) = (t.chars().filter(|&c| c == '{').count(), t.chars().filter(|&c| c == '}').count());
+                    if o > cl { cdepth = o - cl; }
+                }
+                attr_cfg = false; attr_path = None;
+            }
+        }
+        let mut test_only = BTreeSet::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (rel, _) in src_files {
+                if !test_only.contains(rel) && incoming.get(rel).is_some_and(|d| !d.is_empty() && d.iter().all(|(s, g)| *g || test_only.contains(s))) {
+                    test_only.insert(rel.clone()); changed = true;
+                }
+            }
+        }
+        test_only
+    }
+
     let forbidden = [
         "EnableRollbackProven", "prior_proven_off", "motor_freshly_physically_off",
         "all_motors_watchdog_expired_or_disabled", "EnableRollbackHeld", "ENABLE_ROLLBACK_HELD",
@@ -3229,54 +3259,38 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
         "apply_refused_enable_rollback", "enable_failed_budgeted", "last_enable_write_seq",
         "OffConfirmed", "OnConfirmed", "MotorTorqueEvidence", "DisableConfirm", "DAMIAO_DISABLE_CONFIRM",
     ];
-    let scan_disable_protective = |src_files: &[(String, String)]| -> Result<(), String> {
+    let assert_disable_protective = |src_files: &[(String, String)]| {
+        let test_only = classify_test_only(src_files);
+        assert!(test_only.contains("src/driver/tx_chokepoint_tests.rs"), "src/driver/tx_chokepoint_tests.rs must be included solely via #[cfg(test)] mod declarations");
         let mut protective_constructions: Vec<(String, usize, String)> = Vec::new();
         for (rel, full) in src_files {
-            if rel == "src/driver/tx_chokepoint_tests.rs" {
-                continue;
-            }
+            if test_only.contains(rel) { continue; }
             let prod = prod_lines(full);
             for needle in forbidden {
-                if full.contains(needle) {
-                    return Err(format!("forbidden already-off symbol `{needle}` found in {rel}"));
-                }
+                assert!(!full.contains(needle), "forbidden already-off symbol `{needle}` found in {rel}");
             }
             for (pos, &(line_no, line)) in prod.iter().enumerate() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("//") { continue; }
-                if trimmed.contains("DisableProtectiveReason::Thermal")
-                    || trimmed.contains("DisableProtectiveReason::ProcessExit")
-                {
+                if trimmed.contains("DisableProtectiveReason::Thermal") || trimmed.contains("DisableProtectiveReason::ProcessExit") {
                     protective_constructions.push((rel.clone(), line_no, trimmed.to_string()));
                 }
-                if trimmed.contains("DisableProtective {")
-                    && !trimmed.starts_with("DisableProtective {")
-                    && !trimmed.contains("=>")
-                    && !trimmed.contains("matches!(")
-                    && !trimmed.contains("DisableProtective { .. }")
+                if trimmed.contains("DisableProtective {") && !trimmed.starts_with("DisableProtective {")
+                    && !trimmed.contains("=>") && !trimmed.contains("matches!(") && !trimmed.contains("DisableProtective { .. }")
                 {
-                    let is_allowed_passthrough = (rel == "src/driver/can_servo/torque.rs"
-                        && trimmed == "TxKind::DisableProtective { reason }")
-                        || (rel == "src/sim_driver.rs"
-                            && trimmed == "SendGate::DisableProtective { reason }");
+                    let is_allowed_passthrough = (rel == "src/driver/can_servo/torque.rs" && trimmed == "TxKind::DisableProtective { reason }")
+                        || (rel == "src/sim_driver.rs" && trimmed == "SendGate::DisableProtective { reason }");
                     if !is_allowed_passthrough && !trimmed.contains("DisableProtectiveReason::") {
                         let next = prod.get(pos + 1).map(|(_, l)| l.trim()).unwrap_or("");
-                        if !next.contains("DisableProtectiveReason::Thermal")
-                            && !next.contains("DisableProtectiveReason::ProcessExit")
-                        {
-                            return Err(format!("unexpected DisableProtective construction at {rel}:{line_no}: `{trimmed}` / `{next}`"));
-                        }
+                        assert!(next.contains("DisableProtectiveReason::Thermal") || next.contains("DisableProtectiveReason::ProcessExit"),
+                            "unexpected DisableProtective construction at {rel}:{line_no}: `{trimmed}` / `{next}`");
                     }
                 }
             }
         }
-        let mut actual: Vec<(String, &'static str)> = protective_constructions
-            .iter()
-            .map(|(rel, _, line)| {
-                let kind = if line.contains("DisableProtectiveReason::Thermal") { "Thermal" } else { "ProcessExit" };
-                (rel.clone(), kind)
-            })
-            .collect();
+        let mut actual: Vec<(String, &'static str)> = protective_constructions.iter().map(|(rel, _, line)| {
+            (rel.clone(), if line.contains("DisableProtectiveReason::Thermal") { "Thermal" } else { "ProcessExit" })
+        }).collect();
         actual.sort();
         let mut expected: Vec<(String, &'static str)> = vec![
             ("src/driver/can_servo/engine/recovery.rs".to_string(), "ProcessExit"),
@@ -3287,26 +3301,25 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
             ("src/supervisor/motion.rs".to_string(), "Thermal"),
         ];
         expected.sort();
-        if actual != expected {
-            return Err(format!("ONLY thermal trip and process-exit/panic paths may construct DisableProtective; found: {protective_constructions:#?}"));
-        }
-        Ok(())
+        assert_eq!(actual, expected, "ONLY thermal trip and process-exit/panic paths may construct DisableProtective; found: {protective_constructions:#?}");
     };
 
     let src_files: Vec<(String, String)> = files.iter().map(|path| {
         let rel = path.strip_prefix(manifest_dir).unwrap().to_string_lossy().replace('\\', "/");
         (rel, std::fs::read_to_string(path).unwrap())
     }).collect();
-    assert!(src_files.iter().any(|(r, s)| r == "src/driver.rs" && s.contains("#[cfg(test)]\nmod tx_chokepoint_tests;")));
-    scan_disable_protective(&src_files).unwrap_or_else(|e| panic!("{e}"));
+    assert_disable_protective(&src_files);
 
-    // Negative check: injecting a DisableProtective construction in any src/driver/** file must fail.
+    // Negative fixtures: ungated #[path] include + injected DisableProtective / passthrough in src/driver/**.
+    let mut bad_ungated = src_files.clone();
+    bad_ungated.push(("src/driver/leak_mod.rs".into(), "#[path = \"tx_chokepoint_tests.rs\"] mod leak;".into()));
+    assert!(std::panic::catch_unwind(|| assert_disable_protective(&bad_ungated)).is_err(), "must reject ungated #[path] include of tx_chokepoint_tests.rs");
     let mut bad = src_files.clone();
     bad.push(("src/driver/can_servo/injected_dp.rs".into(), "fn sneaky() { let _ = DisableKind::DisableProtective { reason: DisableProtectiveReason::Thermal }; }".into()));
-    assert!(scan_disable_protective(&bad).is_err(), "scanner must reject extra DisableProtective in src/driver/**");
+    assert!(std::panic::catch_unwind(|| assert_disable_protective(&bad)).is_err(), "must reject extra DisableProtective in src/driver/**");
     let mut bad_pt = src_files;
     bad_pt.push(("src/driver/bus_servo/injected_dp.rs".into(), "fn sneaky(reason: DisableProtectiveReason) { let _ = TxKind::DisableProtective { reason }; }".into()));
-    assert!(scan_disable_protective(&bad_pt).is_err(), "scanner must reject unlisted DisableProtective passthrough in src/driver/**");
+    assert!(std::panic::catch_unwind(|| assert_disable_protective(&bad_pt)).is_err(), "must reject unlisted DisableProtective passthrough in src/driver/**");
 }
 
 /// Round 6 (Major 3): `RobStrideArmDriver::clear_fault()` sends type-4 (`TYPE_STOP`) CAN frames
