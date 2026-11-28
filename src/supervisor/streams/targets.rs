@@ -1,7 +1,6 @@
 //! Latest-target path of servo, teleop and policy streams (armd 1.6 RT core, track D).
 
 
-// scaffold-impl-0
 impl ServoStream {
     pub fn new() -> Self { Self::default() }
 
@@ -25,7 +24,6 @@ impl ServoStream {
     pub fn last_sequence(&self) -> Option<u64> { self.last_sequence }
 }
 
-// scaffold-impl-1
 impl TargetPort {
     pub fn new(writer: TargetWriter, arm: ArmId, boot: BootId) -> Self {
         Self {
@@ -197,7 +195,6 @@ impl TargetPort {
     }
 }
 
-// scaffold-impl-2
 impl SupervisorInner {
     /// Consume the servo frames of the connection holding lease `lease_generation`
     /// (replaces the authorized stream; requires a single-use [`Admitted`] proof).

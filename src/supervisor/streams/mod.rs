@@ -1331,10 +1331,6 @@ impl SupervisorInner {
     }
 }
 
-#[cfg(feature = "policy-runtime")]
-impl SupervisorInner {
-}
-
 // Re-exported as `supervisor::targets`. The broker-side items have no production caller
 // until the WS loop and the policy runner route through the mailbox (stage 3 removes this).
 #[allow(dead_code)]
@@ -1514,9 +1510,6 @@ pub mod targets {
         lease_generation: u64,
     }
 
-    impl ServoStream {
-    }
-
     /// One WS servo message (either form), already authorized and epoch-checked by the loop.
     #[derive(Debug, Clone, Copy)]
     pub struct ServoMessage<'a> {
@@ -1559,9 +1552,6 @@ pub mod targets {
         open_policy_actions: Vec<u64>,
     }
 
-    impl TargetPort {
-    }
-
     /// What the runner stamps a policy target with, read when it samples the inputs.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PolicyStamp {
@@ -1570,8 +1560,7 @@ pub mod targets {
         pub max_input_age: Duration,
     }
 
-    impl SupervisorInner {
-    }
+    
 }
 
 #[cfg(test)]

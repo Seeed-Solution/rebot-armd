@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 #[cfg(feature = "policy-runtime")]
 impl SupervisorInner {
     /// Phase 1/3 real-arm gate: `Live` policy mode without release gate is only allowed for explicit mock or sim drivers.
