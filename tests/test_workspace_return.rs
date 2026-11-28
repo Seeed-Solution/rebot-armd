@@ -200,86 +200,109 @@ async fn incident_outside_pose_terminal_rule_and_inward_move_both_owners() {
 
     for use_executor in [false, true] {
         let label = if use_executor { "executor" } else { "legacy" };
-        let (mut ws, gen, ep, sup, srv, tick, exec) =
-            start_owner_rig(cfg.clone(), &far_pose, use_executor).await;
+        let assert_at_far_pose = |obs: &armd::model::ArmObservation, stage: &str| {
+            assert!(
+                obs.commanded_positions
+                    .iter()
+                    .zip(&far_pose)
+                    .all(|(a, b)| (a - b).abs() < 1e-5),
+                "{label} ({stage}): live commanded_positions must start at far_pose, got {:?}",
+                obs.commanded_positions
+            );
+            assert!(
+                obs.positions
+                    .iter()
+                    .zip(&far_pose)
+                    .all(|(a, b)| (a - b).abs() < 1e-5),
+                "{label} ({stage}): live measured positions must start at far_pose, got {:?}",
+                obs.positions
+            );
+        };
 
-        // 1. Nonzero arm jog with zero net improvement -> REFUSED with WORKSPACE_VIOLATION, targets unchanged.
-        let rej = common::rpc(
-            &mut ws,
-            gen,
-            ep,
-            "/api/v1/motion/jog",
-            json!({"target_positions": q_neutral}),
-        )
-        .await;
-        assert_eq!(rej["type"], "command_reject", "{label}: neutral jog must be refused: {rej}");
-        assert_eq!(rej["code"], "WORKSPACE_VIOLATION", "{label}: {rej}");
-        let obs = sup.get_observation().await;
-        assert_eq!(obs.safety_state, SafetyState::Armed, "{label}: 0 faults after refusal");
-        assert!(
-            obs.commanded_positions
-                .iter()
-                .zip(&far_pose)
-                .all(|(a, b)| (a - b).abs() < 1e-5),
-            "{label}: targets must be unchanged after neutral jog refusal"
-        );
-
-        // 2. Certified inward jog (J2 +0.1 rad) -> ADMITTED and completes with 0 faults.
-        let ack = common::rpc(
-            &mut ws,
-            gen,
-            ep,
-            "/api/v1/motion/jog",
-            json!({"target_positions": q_inward_j2}),
-        )
-        .await;
-        assert_eq!(ack["type"], "command_ack", "{label}: inward J2+0.1 jog: {ack}");
-        wait_idle_no_fault(&sup, label, 5000).await;
-
-        // Reset back to incident pose for -20 mm X Cartesian return test
+        // Rig A: neutral jog refusal + inward J2+0.1 jog from far_pose.
         {
-            let mut inner = sup.inner().write().await;
-            inner.commanded_positions = far_pose.to_vec();
-            inner.measured_positions = far_pose.to_vec();
-            inner.target_positions = far_pose.to_vec();
+            let (mut ws, gen, ep, sup, srv, tick, exec) =
+                start_owner_rig(cfg.clone(), &far_pose, use_executor).await;
+            assert_at_far_pose(&sup.get_observation().await, "neutral_and_j2");
+
+            // 1. Nonzero arm jog with zero net improvement -> REFUSED with WORKSPACE_VIOLATION, targets unchanged.
+            let rej = common::rpc(
+                &mut ws,
+                gen,
+                ep,
+                "/api/v1/motion/jog",
+                json!({"target_positions": q_neutral}),
+            )
+            .await;
+            assert_eq!(rej["type"], "command_reject", "{label}: neutral jog must be refused: {rej}");
+            assert_eq!(rej["code"], "WORKSPACE_VIOLATION", "{label}: {rej}");
+            let obs = sup.get_observation().await;
+            assert_eq!(obs.safety_state, SafetyState::Armed, "{label}: 0 faults after refusal");
+            assert_at_far_pose(&obs, "after_neutral_refusal");
+
+            // 2. Certified inward jog (J2 +0.1 rad) -> ADMITTED and completes with 0 faults.
+            let ack = common::rpc(
+                &mut ws,
+                gen,
+                ep,
+                "/api/v1/motion/jog",
+                json!({"target_positions": q_inward_j2}),
+            )
+            .await;
+            assert_eq!(ack["type"], "command_ack", "{label}: inward J2+0.1 jog: {ack}");
+            wait_idle_no_fault(&sup, label, 5000).await;
+            let obs_after_j2 = sup.get_observation().await;
+            assert!(
+                (obs_after_j2.commanded_positions[1] - q_inward_j2[1]).abs() < 1e-3,
+                "{label}: inward J2+0.1 jog did not reach target: {:?}",
+                obs_after_j2.commanded_positions
+            );
+
+            drop(ws);
+            if let Some(t) = tick { t.abort(); }
+            srv.abort();
+            if let Some(h) = exec { h.stop_and_join(); }
         }
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let ep = sup.get_observation().await.epoch_id;
 
-        // 3. Certified inward Cartesian move (-20 mm X) -> ADMITTED and completes with 0 faults.
-        let ack_x = common::rpc(
-            &mut ws,
-            gen,
-            ep,
-            "/api/v1/action/move_relative",
-            json!({"frame": "base", "d": [-0.02, 0.0, 0.0]}),
-        )
-        .await;
-        assert_eq!(ack_x["type"], "command_ack", "{label}: inward -20mm X: {ack_x}");
-        wait_idle_no_fault(&sup, label, 5000).await;
-
-        // Reset back to incident pose for Park test
+        // Rig B: fresh owner rig initialized directly at far_pose for -20 mm X Cartesian return.
         {
-            let mut inner = sup.inner().write().await;
-            inner.commanded_positions = far_pose.to_vec();
-            inner.measured_positions = far_pose.to_vec();
-            inner.target_positions = far_pose.to_vec();
-        }
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let ep = sup.get_observation().await.epoch_id;
+            let (mut ws, gen, ep, sup, srv, tick, exec) =
+                start_owner_rig(cfg.clone(), &far_pose, use_executor).await;
+            assert_at_far_pose(&sup.get_observation().await, "move_relative_-20mm_x");
 
-        // 4. Park from incident pose -> ADMITTED and completes with 0 faults.
-        let pack = common::preset(&mut ws, gen, ep, "park", None).await;
-        assert_eq!(pack["type"], "preset_ack", "{label}: park from incident pose: {pack}");
-        wait_idle_no_fault(&sup, label, 15000).await;
+            // 3. Certified inward Cartesian move (-20 mm X) -> ADMITTED and completes with 0 faults.
+            let ack_x = common::rpc(
+                &mut ws,
+                gen,
+                ep,
+                "/api/v1/action/move_relative",
+                json!({"frame": "base", "d": [-0.02, 0.0, 0.0]}),
+            )
+            .await;
+            assert_eq!(ack_x["type"], "command_ack", "{label}: inward -20mm X: {ack_x}");
+            wait_idle_no_fault(&sup, label, 5000).await;
 
-        drop(ws);
-        if let Some(t) = tick {
-            t.abort();
+            drop(ws);
+            if let Some(t) = tick { t.abort(); }
+            srv.abort();
+            if let Some(h) = exec { h.stop_and_join(); }
         }
-        srv.abort();
-        if let Some(h) = exec {
-            h.stop_and_join();
+
+        // Rig C: fresh owner rig initialized directly at far_pose for Park.
+        {
+            let (mut ws, gen, ep, sup, srv, tick, exec) =
+                start_owner_rig(cfg.clone(), &far_pose, use_executor).await;
+            assert_at_far_pose(&sup.get_observation().await, "park");
+
+            // 4. Park from incident pose -> ADMITTED and completes with 0 faults.
+            let pack = common::preset(&mut ws, gen, ep, "park", None).await;
+            assert_eq!(pack["type"], "preset_ack", "{label}: park from incident pose: {pack}");
+            wait_idle_no_fault(&sup, label, 15000).await;
+
+            drop(ws);
+            if let Some(t) = tick { t.abort(); }
+            srv.abort();
+            if let Some(h) = exec { h.stop_and_join(); }
         }
     }
 }
@@ -445,64 +468,112 @@ async fn keepout_around_current_pose_monotonic_exit_and_park_submm_deepening_ref
     let mut cfg_floor = ArmConfig::rebot_dm();
     cfg_floor.collision = None;
     cfg_floor.power_budget = None;
-    cfg_floor.workspace.as_mut().unwrap().check_points_end_m = vec![[0.0, 0.0, 0.0]];
-    // Find a joint move where Z dips ~0.5 mm mid-path before rising above floor_z.
-    // Rotate J2 across vertical-down or use J3/J4: at INSPECT, adjust J2/J3 so Z has a small 0.5 mm dip.
-    // Start at q_f_start, rest at q_f_rest where midpoint Z is ~0.5 mm below start Z, rest Z is well above.
-    let mut q_f_start = INSPECT;
-    q_f_start[3] = 1.435;
-    let p_f0 = ArmModel::REBOT_DEV_ARM.fk_f32(&q_f_start).unwrap().p;
-    // Search a tiny J4/J2 combination for rest whose quintic dips Z by 0.4..0.8 mm then rises > 20 mm
-    let mut q_f_rest = q_f_start;
-    q_f_rest[1] = -1.00; // raises Z
+    {
+        let ws = cfg_floor.workspace.as_mut().unwrap();
+        ws.check_points_end_m = vec![[0.0, 0.0, 0.0]];
+        ws.link_capsules.clear();
+        ws.self_collision_enabled = false;
+        ws.self_collision_pairs.clear();
+        ws.keepout_boxes.clear();
+        ws.max_reach_m = None;
+        ws.box_min_m = [-2.0, -2.0, -2.0];
+        ws.box_max_m = [2.0, 2.0, 2.0];
+    }
+    // Find a true interior local minimum of end_origin Z as a function of J4, then place start
+    // slightly on one side (~0.5 mm above the minimum) and rest on the opposite side (>10 mm above),
+    // so the 1-DOF Park quintic monotonically crosses the Z minimum with a deterministic ~0.5 mm dip.
+    let q_base: [f32; 7] = [0.0, -0.9, -0.8, 0.0, 0.0, 0.0, 0.0];
+    let z_at_j4 = |j4: f32| -> f64 {
+        let mut q = q_base;
+        q[3] = j4;
+        ArmModel::REBOT_DEV_ARM.fk_f32(&q).unwrap().p[2]
+    };
+    let j4_lo = cfg_floor.limits[3].min_position + 0.35;
+    let j4_hi = cfg_floor.limits[3].max_position - 0.35;
+    let mut best_j4 = j4_lo;
+    let mut best_z = f64::INFINITY;
+    let steps = 400;
+    for k in 0..=steps {
+        let j4 = j4_lo + (j4_hi - j4_lo) * (k as f32 / steps as f32);
+        let z = z_at_j4(j4);
+        if z < best_z {
+            best_z = z;
+            best_j4 = j4;
+        }
+    }
+    // Step slightly toward j4_lo until z rises by ~0.5 mm above best_z (start), and toward j4_hi
+    // until z rises by >15 mm above best_z (rest).
+    let mut q_f_start = q_base;
+    let mut q_f_rest = q_base;
     let mut found_floor_case = false;
-    for d4_i in -40..=40 {
-        let mut cand = q_f_start;
-        cand[1] = q_f_start[1] + 0.25;
-        cand[3] = q_f_start[3] + (d4_i as f32) * 0.02;
-        if let Ok(tr) = armd::trajectory::TrajectoryPlanner::plan(
-            &q_f_start,
-            &[0.0; 7],
-            &cand,
-            &[0.0; 7],
-            Some(1.5),
-            &cfg_floor.limits,
-        ) {
-            let p_end = ArmModel::REBOT_DEV_ARM.fk_f32(&cand).unwrap().p;
-            let min_z = (0..=40)
-                .map(|k| {
-                    let q = tr.sample(tr.duration * k as f64 / 40.0).positions;
-                    ArmModel::REBOT_DEV_ARM.fk_f32(&q).unwrap().p[2]
-                })
-                .fold(f64::INFINITY, f64::min);
-            let dip = p_f0[2] - min_z;
-            if dip > 0.0003 && dip < 0.0008 && p_end[2] > p_f0[2] + 0.01 {
-                q_f_rest = cand;
-                found_floor_case = true;
+    for s_i in 1..=200 {
+        let cand_start_j4 = best_j4 - (s_i as f32) * 0.002;
+        if cand_start_j4 <= cfg_floor.limits[3].min_position + 0.05 {
+            break;
+        }
+        let dip = z_at_j4(cand_start_j4) - best_z;
+        if dip > 0.0004 && dip < 0.0007 {
+            q_f_start[3] = cand_start_j4;
+            // Find rest on the opposite side of best_j4 rising > 15 mm.
+            for r_i in 1..=300 {
+                let cand_rest_j4 = best_j4 + (r_i as f32) * 0.005;
+                if cand_rest_j4 >= cfg_floor.limits[3].max_position - 0.05 {
+                    break;
+                }
+                if z_at_j4(cand_rest_j4) > z_at_j4(cand_start_j4) + 0.015 {
+                    q_f_rest[3] = cand_rest_j4;
+                    found_floor_case = true;
+                    break;
+                }
+            }
+            if found_floor_case {
                 break;
             }
         }
     }
-    if found_floor_case {
-        cfg_floor.zero_reference = None;
-        if let Some(rp) = cfg_floor.resting_pose.as_mut() {
-            rp.positions = Some(q_f_rest.to_vec());
-        }
-        cfg_floor.home_positions = q_f_rest.to_vec();
-        cfg_floor.workspace.as_mut().unwrap().floor_z_m = (p_f0[2] + 0.005) as f32;
-        let mut inner = armed(cfg_floor, &q_f_start);
-        let s = inner.current_admission_stamp();
-        let err = inner
-            .check_admission(s)
-            .map_err(ArmError::from)
-            .and_then(|a| SupervisorInner::unload_action(a))
-            .unwrap_err();
-        let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = err else {
-            panic!("expected floor_z WorkspaceViolation during Park, got {err:?}");
-        };
-        assert_eq!(detail.constraint_id.as_deref(), Some("floor_z"));
-        assert_eq!(detail.violation_phase.as_deref(), Some("park"));
+    assert!(
+        found_floor_case,
+        "Park floor fixture search must unconditionally find a sub-mm Z dip (0.4..0.7 mm) around best_j4={best_j4}"
+    );
+    let p_f0 = ArmModel::REBOT_DEV_ARM.fk_f32(&q_f_start).unwrap().p;
+    let tr = armd::trajectory::TrajectoryPlanner::plan(
+        &q_f_start,
+        &[0.0; 7],
+        &q_f_rest,
+        &[0.0; 7],
+        Some(1.5),
+        &cfg_floor.limits,
+    )
+    .expect("plan Park floor sub-mm dip quintic");
+    let min_z = (0..=80)
+        .map(|k| {
+            let q = tr.sample(tr.duration * k as f64 / 80.0).positions;
+            ArmModel::REBOT_DEV_ARM.fk_f32(&q).unwrap().p[2]
+        })
+        .fold(f64::INFINITY, f64::min);
+    let actual_dip = p_f0[2] - min_z;
+    assert!(
+        actual_dip > 0.0003 && actual_dip < 0.0008,
+        "expected 0.3..0.8 mm Park floor dip, got {actual_dip:.6} m"
+    );
+    cfg_floor.zero_reference = None;
+    if let Some(rp) = cfg_floor.resting_pose.as_mut() {
+        rp.positions = Some(q_f_rest.to_vec());
     }
+    cfg_floor.home_positions = q_f_rest.to_vec();
+    cfg_floor.workspace.as_mut().unwrap().floor_z_m = (p_f0[2] + 0.005) as f32;
+    let mut inner = armed(cfg_floor, &q_f_start);
+    let s = inner.current_admission_stamp();
+    let err = inner
+        .check_admission(s)
+        .map_err(ArmError::from)
+        .and_then(|a| SupervisorInner::unload_action(a))
+        .unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = err else {
+        panic!("expected floor_z WorkspaceViolation during Park, got {err:?}");
+    };
+    assert_eq!(detail.constraint_id.as_deref(), Some("floor_z"));
+    assert_eq!(detail.violation_phase.as_deref(), Some("park"));
 }
 
 /// Codex §Test 3 (both owners, sim):
@@ -877,10 +948,30 @@ async fn stream_no_ratcheting_across_frames_and_stationary_braking_allowed_both_
             common::servo_reject_within(&mut ws, 250).await.is_none(),
             "{label}: first +3mm servo frame must be accepted"
         );
-        // Wait enough ticks for it to reach q_step1 and settle (> 2 settled ticks).
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let obs_after_1 = sup.get_observation().await;
+        // Wait for frame 1 to actually reach q_step1 and settle (> 2 settled ticks).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut obs_after_1 = sup.get_observation().await;
+        while tokio::time::Instant::now() < deadline {
+            if (obs_after_1.commanded_positions[1] - q_step1[1]).abs() < 1e-4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            obs_after_1 = sup.get_observation().await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        obs_after_1 = sup.get_observation().await;
         assert_eq!(obs_after_1.safety_state, SafetyState::Armed, "{label}: 0 faults after step1");
+        assert!(
+            (obs_after_1.commanded_positions[1] - q_step1[1]).abs() < 1e-4,
+            "{label}: frame 1 did not reach q_step1 (got {}, expected {}, start {})",
+            obs_after_1.commanded_positions[1],
+            q_step1[1],
+            q_start[1]
+        );
+        assert!(
+            (obs_after_1.commanded_positions[1] - q_start[1]).abs() > 1e-3,
+            "{label}: frame 1 did not move meaningfully from q_start"
+        );
 
         // 3. Frame 2 (+3.2 mm more = +6.2 mm from initial running minimum) -> MUST BE REFUSED (no ratcheting)!
         common::servo(&mut ws, gen, ep, &q_step2).await;

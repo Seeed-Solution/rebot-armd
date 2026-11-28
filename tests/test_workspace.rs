@@ -675,13 +675,13 @@ fn servo_stream_persists_monotonic_escape_baseline_across_tiny_steps() {
     let epoch = inner.safety.epoch_id();
     let start_depth = floor_z - min_z_at(&inner.commanded_positions);
 
-    let mut rejected = false;
+    let mut rejected_at_intake = false;
     for k in 1..=10 {
         let mut q_next = q_start;
         q_next[1] += (k as f32) * dq_step;
         let res = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, q_next.to_vec(), epoch)) } };
         if let Err(SafetyError::WorkspaceViolation { .. }) = res {
-            rejected = true;
+            rejected_at_intake = true;
             break;
         }
         inner.tick(0.02);
@@ -690,15 +690,86 @@ fn servo_stream_persists_monotonic_escape_baseline_across_tiny_steps() {
             depth_now <= start_depth + kinematics::WORKSPACE_EPS + 1e-6,
             "step {k}: cumulative intrusion {depth_now} exceeded start_depth ({start_depth}) + WORKSPACE_EPS"
         );
-        if inner.servo_blocked_hold {
-            rejected = true;
-            break;
-        }
     }
-    assert!(rejected, "later tiny servo steps must be rejected by the persisted running minimum");
+    assert!(rejected_at_intake, "later tiny servo steps must be rejected at intake by the persisted running minimum");
     assert_eq!(
         inner.motion_limit.as_ref().map(|l| l.reason),
         Some(armd::model::MotionLimitReason::Workspace)
+    );
+}
+
+#[test]
+fn servo_tick_sweep_midstep_keepout_triggers_blocked_hold() {
+    // Separate deterministic tick-hold coverage: both start and target endpoints are strictly
+    // inside the workspace so intake (`servo()`) admits the target, while a thin keep-out box on
+    // the midpoint of the linear joint step forces tick-time `servo_blocked_hold`.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.collision = None;
+    cfg.power_budget = None;
+    cfg.servo_max_velocity = None;
+    for l in &mut cfg.limits {
+        l.max_velocity = 25.0;
+        l.max_acceleration = 1500.0;
+    }
+    let q_start = INSPECT;
+    let mut q_end = q_start;
+    q_end[0] += 0.30;
+    let mut q_mid = [0.0f32; 7];
+    for i in 0..7 {
+        q_mid[i] = 0.5 * (q_start[i] + q_end[i]);
+    }
+    let p_start = ArmModel::REBOT_DEV_ARM.fk_f32(&q_start).unwrap().p;
+    let p_mid = ArmModel::REBOT_DEV_ARM.fk_f32(&q_mid).unwrap().p;
+    let p_end = ArmModel::REBOT_DEV_ARM.fk_f32(&q_end).unwrap().p;
+    let dist = |a: [f64; 3], b: [f64; 3]| ((a[0]-b[0]).powi(2)+(a[1]-b[1]).powi(2)+(a[2]-b[2]).powi(2)).sqrt();
+    assert!(dist(p_start, p_mid) > 0.025 && dist(p_end, p_mid) > 0.025);
+    {
+        let ws = cfg.workspace.as_mut().unwrap();
+        ws.floor_z_m = -1.0;
+        ws.check_points_end_m = vec![[0.0, 0.0, 0.0]];
+        ws.link_capsules.clear();
+        ws.self_collision_enabled = false;
+        ws.self_collision_pairs.clear();
+        ws.keepout_boxes.clear();
+        ws.keepout_boxes.push(armd::model::KeepoutBox {
+            name: "midstep_box".into(),
+            min_m: [(p_mid[0] - 0.008) as f32, (p_mid[1] - 0.008) as f32, (p_mid[2] - 0.008) as f32],
+            max_m: [(p_mid[0] + 0.008) as f32, (p_mid[1] + 0.008) as f32, (p_mid[2] + 0.008) as f32],
+        });
+    }
+
+    let mut inner = armed(cfg, &q_start);
+    let epoch = inner.safety.epoch_id();
+    let s = inner.current_admission_stamp();
+    inner
+        .check_admission(s)
+        .and_then(|a| armd::SupervisorInner::servo(a, q_end.to_vec(), epoch))
+        .expect("endpoint q_end is clear so servo intake must admit it");
+    assert!(!inner.servo_blocked_hold);
+
+    for _ in 0..20 {
+        inner.tick(0.02);
+        if inner.servo_blocked_hold {
+            break;
+        }
+    }
+    assert!(
+        inner.servo_blocked_hold,
+        "mid-step keep-out sweep must trigger tick-time servo_blocked_hold"
+    );
+    assert_eq!(
+        inner.motion_limit.as_ref().map(|l| l.reason),
+        Some(armd::model::MotionLimitReason::Workspace)
+    );
+    assert_eq!(
+        inner.workspace_violation.as_ref().and_then(|d| d.constraint_id.as_deref()),
+        Some("keepout:midstep_box")
+    );
+    assert!(
+        inner.commanded_positions[0] < q_mid[0],
+        "blocked tick must stop before entering midstep_box: j1={} vs mid={}",
+        inner.commanded_positions[0],
+        q_mid[0]
     );
 }
 
@@ -2101,8 +2172,8 @@ async fn workspace_refusal_messages_three_cases_both_owners_and_rt_bounded() {
     j3_jog[2] += 0.1;
     let exp1 = "return path could not be checked (needs more than 4000 FK evaluations); press Park or make a short jog inward toward the base (near max_reach on end_origin)";
     let exp2 = "gripper (end_point:8) is 4.5 cm beyond the workspace front edge (box_max_x 0.645 m, limit 0.600 m; previous depth 0.040 m, new depth 0.045 m; this move would go 5 mm deeper); move back or press Park";
-    let exp3_rsn = "end_origin reach 0.685 m (limit 0.520 m, new depth 0.165 m over, previous depth 0.164 m; this move would go 1.5 mm deeper)";
-    let exp3_msg = format!("Path leaves the safe workspace at s=0.200: {exp3_rsn}");
+    let exp3_rsn = "end_origin reach 0.690 m (limit 0.520 m, new depth 0.170 m over, previous depth 0.164 m; this move would go 6.3 mm deeper)";
+    let exp3_msg = format!("Path leaves the safe workspace at s=0.800: {exp3_rsn}");
     let mut owner_outputs = Vec::new();
     for use_executor in [false, true] {
         let label = if use_executor { "executor" } else { "legacy" };
@@ -2121,25 +2192,21 @@ async fn workspace_refusal_messages_three_cases_both_owners_and_rt_bounded() {
         // while J3 +0.1 (box_max_x deepening) and +20 mm Z (max_reach deepening) are refused with
         // identical structured witnesses across both owners.
         let cases = [
-            ("/api/v1/motion/jog", serde_json::json!({"target_positions": j3_jog}), "box_max_x", Some((exp2, exp2))),
-            ("/api/v1/action/move_relative", serde_json::json!({"frame": "base", "d": [0.0, 0.0, 0.02]}), "max_reach", None),
+            ("/api/v1/motion/jog", serde_json::json!({"target_positions": j3_jog}), "box_max_x", (exp2, exp2)),
+            ("/api/v1/action/move_relative", serde_json::json!({"frame": "base", "d": [0.0, 0.0, 0.02]}), "max_reach", (exp3_msg.as_str(), exp3_rsn)),
         ];
         let mut outs = Vec::new();
-        for (path, body, cid, exact_pair) in cases {
+        for (path, body, cid, (exp_msg, exp_rsn)) in cases {
             let r = common::rpc(&mut ws, gen, ep, path, body).await;
             assert_eq!((r["type"].as_str(), r["code"].as_str(), r["constraint_id"].as_str()), (Some("command_reject"), Some("WORKSPACE_VIOLATION"), Some(cid)), "{label}: {r}");
             let msg = r["message"].as_str().unwrap().to_string();
             let rsn = r["reason"].as_str().unwrap().to_string();
-            if let Some((exp_msg, exp_rsn)) = exact_pair {
-                assert_eq!((msg.as_str(), rsn.as_str()), (exp_msg, exp_rsn), "{label}: {r}");
-            } else {
-                assert!(rsn.contains("end_origin reach ") && rsn.contains("limit 0.520 m"), "{label}: {r}");
-            }
+            assert_eq!((msg.as_str(), rsn.as_str()), (exp_msg, exp_rsn), "{label}: {r}");
             outs.push((cid.to_string(), msg, rsn));
         }
         let home_ack = common::rpc(&mut ws, gen, ep, "/api/v1/motion/home", serde_json::json!({})).await;
         assert_eq!(home_ack["type"], "command_ack", "{label}: Home from far_pose must be admitted: {home_ack}");
-        let _ = (exp1, &exp3_msg, exp3_rsn);
+        let _ = exp1;
         owner_outputs.push(outs);
         drop(ws);
         if let Some(t) = tick { t.abort(); }
