@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Single park terminal torque-off function routed strictly through the torque-off rest-pose
     /// gate (`may_disable_torque_while_stopped_nonblocking` / `eval_stopped_torque_off` + driver

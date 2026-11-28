@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Builds the common zero-allocation [`crate::safety::ClearContext`] baseline from current
     /// supervisor state. Callers fill in live driver freshness, thermal capability, hardware error,

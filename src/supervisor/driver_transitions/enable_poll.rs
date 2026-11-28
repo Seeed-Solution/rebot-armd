@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Advances the single budgeted enable reducer by one poll step (`Enable -> Validate -> Armed | FailedHold`).
     /// Re-verifies live [`EnableAuthority`] BEFORE any subsequent enable retry TX so a displaced

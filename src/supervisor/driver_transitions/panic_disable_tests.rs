@@ -5,7 +5,6 @@ use crate::driver::{ArmDriverError, TorqueOutcome, TorqueProgress};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-// scaffold-impl-0
 impl ArmDriver for SelectiveMockDriver {
     crate::ext_accessors!(bus_recovery);
     fn capabilities(&self) -> DriverCapabilities {
@@ -35,7 +34,6 @@ impl ArmDriver for SelectiveMockDriver {
     fn unconfirmed_disable_joints(&self) -> Vec<usize> { vec![2] }
 }
 
-// scaffold-impl-1
 impl crate::driver::BusRecoveryExt for SelectiveMockDriver {
     fn panic_disable_step(
         &mut self,
@@ -53,7 +51,6 @@ impl crate::driver::BusRecoveryExt for SelectiveMockDriver {
     }
 }
 
-// scaffold-impl-2
 impl ArmDriver for GenericMockDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities {
@@ -96,7 +93,6 @@ impl ArmDriver for GenericMockDriver {
     }
 }
 
-// scaffold-impl-3
 impl ArmDriver for ProbeThenGenericMockDriver {
     crate::ext_accessors!(bus_recovery);
     fn capabilities(&self) -> DriverCapabilities {
@@ -121,7 +117,6 @@ impl ArmDriver for ProbeThenGenericMockDriver {
     }
 }
 
-// scaffold-impl-4
 impl crate::driver::BusRecoveryExt for ProbeThenGenericMockDriver {
     fn panic_disable_step(
         &mut self,

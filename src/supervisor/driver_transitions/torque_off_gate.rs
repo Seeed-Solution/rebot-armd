@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Torque off at the resting pose. `stillness_verified` is set by the unload settle,
     /// which judged stationarity over its hold window; otherwise the current velocity

@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     pub(in crate::supervisor) fn reserve_legacy_torque_slot(
         &mut self,

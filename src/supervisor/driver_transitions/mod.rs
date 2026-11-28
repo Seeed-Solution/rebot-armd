@@ -1154,9 +1154,6 @@ impl From<crate::safety::ClearFaultError> for ClearFaultWithAuthError {
 
 impl SupervisorInner {
 
-
-
-
     /// Single unified failure transition of the enable reducer (shared by begin errors, poll
     /// errors, interruption, and post-enable validation failures; zero heap allocations on RT):
     /// 1. Preserves any unapplied pending E-stop latch before snapshotting holds.
@@ -1266,10 +1263,6 @@ impl SupervisorInner {
         msg
     }
 
-
-
-
-
     fn settle_legacy_ws_disable_failed(
         &mut self,
         token: u64,
@@ -1345,7 +1338,6 @@ enum DisableExpiryDecision {
 
 impl SupervisorInner {
 
-
     /// Handles an aborted multi-tick disable after >= 1 joint already received a disable frame.
     /// Does NOT arm background disable retries: remaining energized joints stay held (`is_torqued =
     /// true`, `torque_intent = On`), and a fault naming exact `applied` / `uncertain` / `not
@@ -1416,9 +1408,6 @@ impl SupervisorInner {
         code
     }
 
-
-
-
 }
 
 fn clear_fault_driver_error(e: &crate::driver::ArmDriverError) -> crate::safety::ClearFaultDriverError {
@@ -1439,28 +1428,15 @@ mod panic_disable_tests {
         step_result: Result<Vec<usize>, ArmDriverError>,
     }
 
-    impl ArmDriver for SelectiveMockDriver {
-    }
-    impl crate::driver::BusRecoveryExt for SelectiveMockDriver {
-    }
-
     struct GenericMockDriver {
         generic_begin_calls: Arc<AtomicUsize>,
         sleep_on_begin: Duration,
-    }
-
-    impl ArmDriver for GenericMockDriver {
     }
 
     struct ProbeThenGenericMockDriver {
         selective_calls: Arc<AtomicUsize>,
         generic_begin_calls: Arc<AtomicUsize>,
         sleep_on_probe: Duration,
-    }
-
-    impl ArmDriver for ProbeThenGenericMockDriver {
-    }
-    impl crate::driver::BusRecoveryExt for ProbeThenGenericMockDriver {
     }
 
     #[test]

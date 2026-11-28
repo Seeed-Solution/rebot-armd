@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Serves any background (non-broker) disable handshake and bounded [`BackgroundDisableRetry`]
     /// started by `request_disable_bounded` or a transport-failed broker disable under RT executor

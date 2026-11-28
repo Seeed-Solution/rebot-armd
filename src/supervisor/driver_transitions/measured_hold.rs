@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Persistent enable lifecycle owned by the transition reducer.
     pub fn enable_lifecycle(&self) -> EnableLifecycle {

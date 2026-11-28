@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     pub(in crate::supervisor) fn clear_fault_executor_inner(

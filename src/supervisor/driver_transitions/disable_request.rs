@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Bounded, zero-allocation error from [`Self::request_disable_bounded`].
     #[allow(clippy::result_large_err)] // inline bounded error keeps RT disable retry zero-alloc

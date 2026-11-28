@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Allocation-free bounded equivalent of [`Self::resting_pose_support_violation_with_driver`].
     pub(crate) fn resting_pose_support_violation_bounded(

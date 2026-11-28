@@ -5,7 +5,6 @@ use super::*;
 #[allow(unused_imports)]
 use super::super::*;
 
-// scaffold-extra-0
 impl SupervisorInner {
     pub fn enable_torque(admitted: Admitted<'_>) -> Result<SafetyState, SafetyError> {
         let (this, proof) = admitted.consume()?;
