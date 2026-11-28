@@ -701,6 +701,17 @@ async fn legacy_published_config_matches_from_inner_for_live_driver_and_mock() {
         inner.workspace_revision = 3;
         inner.operator_auth_enforced = true;
     }
+    // Regression guard: `published_config()`'s async state machine must stay small so deep
+    // tokio worker stacks (e.g. hardware motor_zero / calibration handlers) never overflow.
+    {
+        let fut = sup_hw.published_config();
+        let fut_bytes = std::mem::size_of_val(&fut);
+        assert!(
+            fut_bytes <= 512,
+            "published_config() future must stay <= 512 bytes (got {fut_bytes} bytes)"
+        );
+    }
+
     let hw_snap = sup_hw.published_config().await.expect("hw published_config");
     let hw_expected = {
         let inner = sup_hw.inner().read().await;

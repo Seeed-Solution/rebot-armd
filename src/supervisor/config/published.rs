@@ -140,20 +140,26 @@ struct PublishedConfigCapture {
 }
 
 impl PublishedConfigCapture {
-    fn try_from_inner(inner: &SupervisorInner) -> Result<Self, DriverBusy> {
+    #[inline(never)]
+    fn try_from_inner(inner: &SupervisorInner) -> Result<Box<Self>, DriverBusy> {
         let driver_caps = try_capture_driver_caps(inner.driver.as_ref())?;
         Ok(Self::from_inner_with_driver_caps(inner, driver_caps))
     }
 
-    fn blocking_from_inner(inner: &SupervisorInner) -> Self {
+    #[inline(never)]
+    fn blocking_from_inner(inner: &SupervisorInner) -> Box<Self> {
         let driver_caps = capture_driver_caps_blocking(inner.driver.as_ref());
         Self::from_inner_with_driver_caps(inner, driver_caps)
     }
 
-    fn from_inner_with_driver_caps(inner: &SupervisorInner, driver_caps: CapturedDriverCaps) -> Self {
+    #[inline(never)]
+    fn from_inner_with_driver_caps(
+        inner: &SupervisorInner,
+        driver_caps: CapturedDriverCaps,
+    ) -> Box<Self> {
         let mut sequences = inner.sequences.clone();
         sequences.pins = inner.active_sequence_pins().cloned();
-        Self {
+        Box::new(Self {
             config: inner.config.clone(),
             follower: inner.follower.clone(),
             keepout: inner.keepout.clone(),
@@ -202,7 +208,7 @@ impl PublishedConfigCapture {
             policy_ledger_path: inner.policy_ledger_path.clone(),
             fallback_measured_positions: inner.measured_positions.clone(),
             cell: inner.cell.clone(),
-        }
+        })
     }
 
     fn compute_gravity_comp_supported(&self, has_driver: bool) -> bool {
@@ -287,21 +293,23 @@ impl PublishedConfigCapture {
         })
     }
 
-    fn finalize(self) -> PublishedConfig {
-        let has_driver = !matches!(self.driver_caps, CapturedDriverCaps::None);
-        let gravity_comp_supported = self.compute_gravity_comp_supported(has_driver);
-        let effective_planned_close_speed = self.compute_effective_planned_close_speed();
-        let driver_supports_automatic_unload = self.compute_automatic_unload(has_driver);
-        let torque_guard_thresholds = self
+    #[inline(never)]
+    fn finalize(self: Box<Self>) -> PublishedConfig {
+        let this = *self;
+        let has_driver = !matches!(this.driver_caps, CapturedDriverCaps::None);
+        let gravity_comp_supported = this.compute_gravity_comp_supported(has_driver);
+        let effective_planned_close_speed = this.compute_effective_planned_close_speed();
+        let driver_supports_automatic_unload = this.compute_automatic_unload(has_driver);
+        let torque_guard_thresholds = this
             .config
             .torque_guard
-            .map(|p| p.thresholds(&self.config))
+            .map(|p| p.thresholds(&this.config))
             .unwrap_or_default();
         let policy_live_allowed = {
             #[cfg(feature = "policy-runtime")]
             {
                 matches!(
-                    (has_driver, self.follower.as_deref()),
+                    (has_driver, this.follower.as_deref()),
                     (false, None) | (false, Some("mock")) | (_, Some("sim"))
                 )
             }
@@ -316,7 +324,7 @@ impl PublishedConfigCapture {
             driver_temperature_feedback,
             driver_motor_current_cap,
             driver_motor_zero_support,
-        ) = match self.driver_caps {
+        ) = match this.driver_caps {
             CapturedDriverCaps::None => (
                 false,
                 false,
@@ -351,44 +359,44 @@ impl PublishedConfigCapture {
             ),
         };
         PublishedConfig {
-            config: self.config,
-            follower: self.follower,
-            keepout: self.keepout,
-            collision_enabled: self.collision_enabled,
-            collision_sensitivity: self.collision_sensitivity,
-            collision_runtime: self.collision_runtime,
-            collision_path: self.collision_path,
-            collision_revision: self.collision_revision,
-            collision_active: self.collision_active,
-            collision_torque_feedback: self.collision_torque_feedback,
-            base_gripper_policy: self.base_gripper_policy,
-            gripper_calib_path: self.gripper_calib_path,
-            gripper_calib_offset: self.gripper_calib_offset,
-            gripper_calib_jaw_opening: self.gripper_calib_jaw_opening,
-            gripper_calib_invalid: self.gripper_calib_invalid,
-            gripper_calib_stale: self.gripper_calib_stale,
-            gripper_calib_revision: self.gripper_calib_revision,
-            poses: self.poses,
-            sequences: self.sequences,
-            episodes: self.episodes,
-            max_episode_s: self.max_episode_s,
-            grasp_setup_revision: self.grasp_setup_revision,
-            tool_commissioning_path: self.tool_commissioning_path,
-            tool_commissioning_confirmed_at: self.tool_commissioning_confirmed_at,
-            tool_commissioning_revision: self.tool_commissioning_revision,
-            calibration: self.calibration,
-            calibration_revision: self.calibration_revision,
-            calibration_busy: self.calibration_busy,
-            calibration_txn_id: self.calibration_txn_id,
-            calibration_quarantined: self.calibration_quarantined,
-            calibration_load_error: self.calibration_load_error,
-            profile_camera_mount: self.profile_camera_mount,
-            profile_floor_z_m: self.profile_floor_z_m,
-            floor_source: self.floor_source,
-            workspace_revision: self.workspace_revision,
-            joint_zero_offsets: self.joint_zero_offsets,
-            zero_convention: self.zero_convention,
-            operator_auth_enforced: self.operator_auth_enforced,
+            config: this.config,
+            follower: this.follower,
+            keepout: this.keepout,
+            collision_enabled: this.collision_enabled,
+            collision_sensitivity: this.collision_sensitivity,
+            collision_runtime: this.collision_runtime,
+            collision_path: this.collision_path,
+            collision_revision: this.collision_revision,
+            collision_active: this.collision_active,
+            collision_torque_feedback: this.collision_torque_feedback,
+            base_gripper_policy: this.base_gripper_policy,
+            gripper_calib_path: this.gripper_calib_path,
+            gripper_calib_offset: this.gripper_calib_offset,
+            gripper_calib_jaw_opening: this.gripper_calib_jaw_opening,
+            gripper_calib_invalid: this.gripper_calib_invalid,
+            gripper_calib_stale: this.gripper_calib_stale,
+            gripper_calib_revision: this.gripper_calib_revision,
+            poses: this.poses,
+            sequences: this.sequences,
+            episodes: this.episodes,
+            max_episode_s: this.max_episode_s,
+            grasp_setup_revision: this.grasp_setup_revision,
+            tool_commissioning_path: this.tool_commissioning_path,
+            tool_commissioning_confirmed_at: this.tool_commissioning_confirmed_at,
+            tool_commissioning_revision: this.tool_commissioning_revision,
+            calibration: this.calibration,
+            calibration_revision: this.calibration_revision,
+            calibration_busy: this.calibration_busy,
+            calibration_txn_id: this.calibration_txn_id,
+            calibration_quarantined: this.calibration_quarantined,
+            calibration_load_error: this.calibration_load_error,
+            profile_camera_mount: this.profile_camera_mount,
+            profile_floor_z_m: this.profile_floor_z_m,
+            floor_source: this.floor_source,
+            workspace_revision: this.workspace_revision,
+            joint_zero_offsets: this.joint_zero_offsets,
+            zero_convention: this.zero_convention,
+            operator_auth_enforced: this.operator_auth_enforced,
             has_driver,
             driver_supports_nonblocking_mode_switch,
             driver_torque_feedback,
@@ -396,17 +404,24 @@ impl PublishedConfigCapture {
             driver_supports_automatic_unload,
             driver_motor_current_cap,
             driver_motor_zero_support,
-            driver_config_error: self.driver_config_error,
-            gravity_compensated: self.gravity_compensated,
+            driver_config_error: this.driver_config_error,
+            gravity_compensated: this.gravity_compensated,
             gravity_comp_supported,
             torque_guard_thresholds,
             effective_planned_close_speed,
             policy_live_allowed,
             #[cfg(feature = "policy-runtime")]
-            policy_ledger_path: self.policy_ledger_path,
-            fallback_measured_positions: self.fallback_measured_positions,
-            cell: self.cell,
+            policy_ledger_path: this.policy_ledger_path,
+            fallback_measured_positions: this.fallback_measured_positions,
+            cell: this.cell,
         }
+    }
+
+    /// Finalizes into a heap-allocated `Arc<PublishedConfig>` strictly inside a non-inlined
+    /// synchronous frame so `PublishedConfig` never inflates `published_config()`'s async state.
+    #[inline(never)]
+    fn finalize_arc(self: Box<Self>) -> Arc<PublishedConfig> {
+        Arc::new(self.finalize())
     }
 }
 
@@ -516,7 +531,7 @@ impl ArmSupervisor {
                 }
             };
             after_capture(gen).await;
-            let snap = Arc::new(capture.finalize());
+            let snap = capture.finalize_arc();
             match self
                 .published_config
                 .publish_legacy_arc_if_newer(snap, gen, || self.owner_mode() == OWNER_LEGACY)
