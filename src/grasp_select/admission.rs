@@ -215,6 +215,8 @@ pub struct JawAdmission {
     deferred: Option<String>,
     /// Evidence source at admission (`"contour"`, `"obb"`, `"angle"`, `"box"`, or `"deferred"`).
     evidence: &'static str,
+    /// Base-frame unit closing axis the admission fit was evaluated along.
+    closing_axis: g::V2,
     /// The error budget behind `hard_error_m` (active fallback, reported measured budget).
     error_margin: ErrorMargin,
 }
@@ -256,6 +258,18 @@ impl JawAdmission {
         self.evidence
     }
 
+    pub fn closing_axis(&self) -> g::V2 {
+        self.closing_axis
+    }
+
+    /// Whether `axis` aligns with the admission closing axis within `max_deg` degrees
+    /// (antiparallel axes are equivalent).
+    pub fn axis_within_deg(&self, axis: g::V2, max_deg: f64) -> bool {
+        let a = g::unit2(self.closing_axis);
+        let b = g::unit2(axis);
+        g::dot2(a, b).abs() >= max_deg.to_radians().cos()
+    }
+
     pub fn error_margin(&self) -> &ErrorMargin {
         &self.error_margin
     }
@@ -277,7 +291,6 @@ impl JawAdmission {
         json!({
             "candidate_id": self.candidate_id,
             "evidence": self.evidence,
-            "evidence_age": "pre_transition",
             "lo_m": self.fit.map(|f| f.lo_m),
             "hi_m": self.fit.map(|f| f.hi_m),
             "width_m": self.fit.map(|f| f.width_m),
@@ -658,7 +671,7 @@ pub fn plan_legacy_top_down(
         },
     };
     let id = top_down_id(s);
-    let make_deferred = |margin: ErrorMargin, why: String| JawAdmission {
+    let make_deferred = |margin: ErrorMargin, closing_axis: g::V2, why: String| JawAdmission {
         candidate_id: id.clone(),
         fit: None,
         hard_error_m: margin.hard_error_m,
@@ -667,6 +680,7 @@ pub fn plan_legacy_top_down(
         full_route_checked: false,
         deferred: Some(why),
         evidence: "deferred",
+        closing_axis,
         error_margin: margin,
     };
     let t = match t_res {
@@ -674,7 +688,7 @@ pub fn plan_legacy_top_down(
         Err(m) if !has_footprint_evidence(s) => {
             let (grasp_r, closing_axis, q_tool, q_grasp) =
                 resolve_top_down_alignment(s, None, &td.grasp.r, q_tool, q_grasp);
-            let jaw = make_deferred(fallback_margin(s), format!("box-only evidence: {m}"));
+            let jaw = make_deferred(fallback_margin(s), closing_axis, format!("box-only evidence: {m}"));
             return TopDownOutcome {
                 route: Ok(TopDownRoute {
                     td,
@@ -723,6 +737,7 @@ pub fn plan_legacy_top_down(
                 full_route_checked: false,
                 deferred: None,
                 evidence: fit.evidence,
+                closing_axis,
                 error_margin: t.margin.clone(),
             };
             TopDownOutcome {
@@ -744,6 +759,7 @@ pub fn plan_legacy_top_down(
         (FootprintSource::Box, Err(_)) => {
             let jaw = make_deferred(
                 t.margin.clone(),
+                closing_axis,
                 "box-only evidence: the width is checked on the measured width at close range".into(),
             );
             TopDownOutcome {
@@ -947,13 +963,17 @@ mod sealed_token_tests {
             full_route_checked: false,
             deferred: None,
             evidence: "contour",
+            closing_axis: [0.0, 1.0],
             error_margin: super::super::margin::margin(&super::super::margin::quality(None), 0.010, 0.001, 0.25, 0.5),
         };
         let pass: JawGatePass = adm.live_gate(&ok_cut, 0.085, None, "post_transition").expect("gate passes");
         assert_eq!(pass.fit(), fit);
         assert_eq!(pass.evidence_age(), "post_transition");
         assert_eq!(adm.to_json()["evidence"], "contour");
-        assert_eq!(adm.to_json()["evidence_age"], "pre_transition");
+        assert!(adm.to_json().get("evidence_age").is_none());
+        assert!(adm.axis_within_deg([0.0, 1.0], 5.0));
+        assert!(adm.axis_within_deg([0.0, -1.0], 5.0));
+        assert!(!adm.axis_within_deg([1.0, 0.0], 5.0));
         assert_eq!(adm.live_gate(&cut, 0.085, None, "post_transition").unwrap_err().code, "OPENING");
     }
 }

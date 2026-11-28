@@ -1652,15 +1652,18 @@ async fn dual_owner_grasp_action_status_diagnostics_via_stream_patch() {
         let inspect6 = [0.0_f64, -1.167, -1.565, 1.435, 0.0, 0.0];
         let r0 = grasp::look_down(&cfg.arm_model.fk(&inspect6).r);
         let start_pose = kinematics::Pose::new(r0, [0.30, 0.0, 0.25]);
-        // Calibrate grip_pixel_norm to the table point directly under the TCP at approach height
-        // (matches tests/test_grasp.rs and real profile; default [0.5, 0.5] + 54 mm lateral lens
-        // offset would centre the object 54 mm off-TCP).
+        // Calibrate grip_pixel_norm to the object top point directly under the TCP at approach
+        // height (matches tests/test_grasp.rs `calibrate_grip` and DualGraspSim's table z=0,
+        // object_h=0.05; default [0.5, 0.5] + 54 mm lateral lens offset would place the 9 mm box
+        // well off-TCP).
         if let Some(ref mut g) = cfg.grasp {
+            g.table_z_m = 0.0;
+            g.approach_height_m = 0.20;
             let tmp_cam = CamModel::assumed(&cfg.arm_model, g, &cfg.camera_mount);
             let app_pose = kinematics::Pose::new(r0, [0.30, 0.0, g.table_z_m + g.approach_height_m]);
             let grip_px = tmp_cam
-                .project(&app_pose, &[0.30, 0.0, g.table_z_m])
-                .expect("table point under TCP visible at approach height");
+                .project(&app_pose, &[0.30, 0.0, 0.05])
+                .expect("object top under TCP visible at approach height");
             g.grip_pixel_norm = tmp_cam.to_norm(grip_px);
         }
         let setup = cfg.grasp.clone().unwrap();

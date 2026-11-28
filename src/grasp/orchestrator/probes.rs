@@ -10,9 +10,16 @@ use crate::grasp::{
     box_centre, box_changed_px, calibrate_depth_why, extract_table_obs, grasp_plane,
     measure_detection_depth_with_cal_why, median, metric_table_contradicts_fk,
     rescale_frame_to_cam, table_violation, DepthCache, DepthMeasurement, Detection, GraspSetup,
-    HeightProbeMode, MaskFocus, PlannedGrasp, Tracker, YawSource, TABLE_CLEARANCE_M,
+    HeightProbeMode, MaskFocus, PlannedGrasp, Tracker, WidthSource, YawSource, TABLE_CLEARANCE_M,
     TRIGGER_WAIT_MS,
 };
+
+/// Whether two 2D axes align within `max_deg` degrees (antiparallel axes are equivalent).
+pub(super) fn axes_within_deg(a: [f64; 2], b: [f64; 2], max_deg: f64) -> bool {
+    let ua = crate::grasp_select::geometry::unit2(a);
+    let ub = crate::grasp_select::geometry::unit2(b);
+    crate::grasp_select::geometry::dot2(ua, ub).abs() >= max_deg.to_radians().cos()
+}
 
 /// Post-transition observation returned by [`Orchestrator::recheck`] when the target is expected
 /// in the post-transition camera field of view: the matched fresh detection paired with the
@@ -737,29 +744,134 @@ impl Orchestrator {
         (out.turn, out.align)
     }
 
-    /// Grasp width source `mask`: the median `grasp_width_px` of the centring frames across the
-    /// mask angle (when it is confident and consistent; else along the jaw axis), on the plane.
-    pub(super) fn mask_width_m(&self, c: &Centred, plane: f64) -> Result<f64, &'static str> {
+    /// Grasp width source `mask`: the median `grasp_width_px` of the chosen view frames projected
+    /// onto `plane`, together with its base-frame closing axis (if constrained by a mask angle).
+    ///
+    /// - Confident, consistent mask angle: projected across the mask short side (`alpha + 90°`),
+    ///   returning `Some(axis)` = world perpendicular to the projected long axis (`alpha`).
+    /// - Confident mask angle with excessive spread: returns `width_m` with `axis = Some([0.0, 0.0])`
+    ///   so callers know the elongated mask angle is unreliable and must not trust the scalar width
+    ///   along the settled closing axis.
+    /// - No confident mask angle (isotropic / round): projects along `settled_u` when provided
+    ///   (else along `cam.rec` jaw axis), returning `axis = None` (valid along `settled_u`).
+    pub(super) fn mask_width_with_axis(
+        &self,
+        c: &Centred,
+        plane: f64,
+        settled_u: Option<[f64; 2]>,
+    ) -> Result<(f64, Option<[f64; 2]>), &'static str> {
         let s = &self.setup;
         let Some(w_px) = frames_width_px(&c.frames, 0.0) else { return Err("no_width") };
+        let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
         let accepted_angle = frames_angle(&c.frames, s.align_min_angle_conf)
             .filter(|&(_alpha, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
-        let (u_x, u_y) = if let Some((alpha, _spread)) = accepted_angle {
+        let ((u_x, u_y), world_axis) = if let Some((alpha, _spread)) = accepted_angle {
+            let (ca, sa) = (alpha.to_radians().cos(), alpha.to_radians().sin());
             let closing_deg = alpha + 90.0;
-            (closing_deg.to_radians().cos(), closing_deg.to_radians().sin())
+            let axis = match (
+                self.cam.plane_point(&c.pose, centre_px, plane),
+                self.cam.plane_point(&c.pose, [centre_px[0] + 20.0 * ca, centre_px[1] + 20.0 * sa], plane),
+            ) {
+                (Some(p0), Some(p1)) => {
+                    let long = [p1[0] - p0[0], p1[1] - p0[1]];
+                    let n = long[0].hypot(long[1]);
+                    if n > 1e-9 { [-long[1] / n, long[0] / n] } else { [0.0, 0.0] }
+                }
+                _ => [0.0, 0.0],
+            };
+            ((closing_deg.to_radians().cos(), closing_deg.to_radians().sin()), Some(axis))
         } else {
-            let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
-            let n = jaw[0].hypot(jaw[1]);
-            if n > 1e-6 { (jaw[0] / n, jaw[1] / n) } else { (0.0, 1.0) }
+            let dir = settled_u
+                .and_then(|su| {
+                    let p0 = self.cam.plane_point(&c.pose, centre_px, plane)?;
+                    let p1 = self.cam.project(&c.pose, &[p0[0] + 0.01 * su[0], p0[1] + 0.01 * su[1], plane])?;
+                    let d = [p1[0] - centre_px[0], p1[1] - centre_px[1]];
+                    let n = d[0].hypot(d[1]);
+                    (n > 1e-6).then_some((d[0] / n, d[1] / n))
+                })
+                .unwrap_or_else(|| {
+                    let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
+                    let n = jaw[0].hypot(jaw[1]);
+                    if n > 1e-6 { (jaw[0] / n, jaw[1] / n) } else { (0.0, 1.0) }
+                });
+            // Projected directly along the settled jaw closing axis.
+            (dir, None)
         };
-        let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
         let half_w = w_px / 2.0;
         let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
         let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
         match (self.cam.plane_point(&c.pose, p0_px, plane), self.cam.plane_point(&c.pose, p1_px, plane)) {
-            (Some(p0), Some(p1)) => Ok(kinematics::norm(&kinematics::sub(&p1, &p0))),
+            (Some(p0), Some(p1)) => Ok((kinematics::norm(&kinematics::sub(&p1, &p0)), world_axis)),
             _ => Err("ray"),
         }
+    }
+
+    /// Evaluate `width_record` (diagnostic) and `width_sources` in priority order on `view`.
+    /// Returns `(measured_width_m, live_scalar_width_m, entries)`:
+    /// - `measured_width_m`: first accepted source value for diagnostics and pre-open.
+    /// - `live_scalar_width_m`: `Some(w)` only when the chosen source came from the chosen view
+    ///   (pre-transition `Depth` is rejected as `"stale_pre_transition"` when `post_transition` is
+    ///   true) AND its measurement closing axis aligns within 5° of `settled_u` (or is isotropic).
+    pub(super) fn evaluate_width_sources(
+        &self,
+        view: &Centred,
+        plane: f64,
+        settled_u: [f64; 2],
+        post_transition: bool,
+        depth_ran: bool,
+        depth_res: Result<&DepthMeasurement, &'static str>,
+    ) -> (Option<f64>, Option<f64>, Vec<EstimateEntry>) {
+        let s = &self.setup;
+        let width_record: Vec<WidthSource> = s
+            .width_record
+            .iter()
+            .copied()
+            .filter(|x| !s.width_sources.contains(x))
+            .collect();
+        let mut wchain = EstimateChain::new();
+        let eval = |src: WidthSource| -> Result<(f64, Option<[f64; 2]>), &'static str> {
+            match src {
+                WidthSource::Mask => self.mask_width_with_axis(view, plane, Some(settled_u)),
+                WidthSource::Depth => {
+                    if post_transition {
+                        Err("stale_pre_transition")
+                    } else {
+                        match depth_res {
+                            Ok(m) => m.width_m.map(|w| (w, m.closing_axis)).ok_or("no_width"),
+                            Err(why) => Err(if depth_ran { why } else { "unavailable" }),
+                        }
+                    }
+                }
+            }
+        };
+        let to_res = |r: Result<(f64, Option<[f64; 2]>), &'static str>| match r {
+            Ok((w, _)) => SourceResult::Accept(w),
+            Err(why) => SourceResult::Reject(why.into()),
+        };
+        for src in &width_record {
+            wchain.offer(src.name(), None, to_res(eval(*src)), true);
+        }
+        let mut chosen_axis: Option<Option<[f64; 2]>> = None;
+        for src in &s.width_sources {
+            if wchain.done() {
+                break;
+            }
+            let r = eval(*src);
+            if let Ok((_, ax)) = r {
+                chosen_axis = Some(ax);
+            }
+            wchain.offer(src.name(), None, to_res(r), false);
+        }
+        let (chosen_width, entries) = match wchain.finish() {
+            Ok(r) => r,
+            Err((_, e)) => (None, e),
+        };
+        let measured = chosen_width.map(|(w, _)| w);
+        let live_scalar = measured.filter(|_| match chosen_axis.flatten() {
+            None => true,
+            Some(ax) => ax[0].hypot(ax[1]) > 1e-9 && axes_within_deg(ax, settled_u, 5.0),
+        });
+        (measured, live_scalar, entries)
     }
 
     /// Optional TOO_WIDE cap (m) enforced independently of the opening reserve: `None` when the
@@ -838,55 +950,123 @@ impl Orchestrator {
         Some(crate::grasp_select::JawCut::new(lo, hi, "box"))
     }
 
+    /// Check whether a fresh projected box's centre `bc_xy` stays within the box's half-length
+    /// along the jaw tangent `t = perp2(u)` relative to `tcp_xy`; refuses `TARGET_DISPLACED` when
+    /// tangential displacement puts the closing line past the ends of the object.
+    fn check_box_tangential_offset(
+        &self,
+        det: &Detection,
+        pose: &Pose,
+        plane: f64,
+        tcp_xy: [f64; 2],
+        bc_xy: [f64; 2],
+        u: [f64; 2],
+    ) -> Result<(), Stop> {
+        let b = det.box_norm;
+        let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+        let Some(wpts) = corners
+            .iter()
+            .map(|v| self.cam.plane_point(pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(());
+        };
+        let t = crate::grasp_select::geometry::perp2(u);
+        let (lo_t, hi_t) = crate::grasp_select::geometry::extent_along(&wpts, bc_xy, t);
+        let half_len = (hi_t - lo_t) / 2.0;
+        let tang_off = crate::grasp_select::geometry::dot2([bc_xy[0] - tcp_xy[0], bc_xy[1] - tcp_xy[1]], t).abs();
+        if tang_off > half_len + 1e-9 {
+            return Err(fail(
+                "TARGET_DISPLACED",
+                format!(
+                    "Target tangential offset {tang_off:.4} m exceeds fresh half-length {half_len:.4} m along the jaws"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve [`crate::grasp_select::JawCut`] at the live gate using settled TCP pose
     /// `settled_tcp`:
-    /// (1) fresh contour cut along the settled closing axis `u`;
-    /// (2) fresh scalar width measured across the actual closing axis as `[off - w/2, off + w/2]`
-    ///     with `off = (fresh box centre - TCP) · u`;
+    /// (1) fresh contour cut along the settled closing axis `u` (refuses `TARGET_DISPLACED` when
+    ///     a valid projected fresh contour exists and the closing line through `tcp_xy` misses it);
+    /// (2) fresh scalar width measured in the chosen view along `u` as `[off - w/2, off + w/2]`
+    ///     with `off = (fresh box centre - TCP) · u` (refuses `TARGET_DISPLACED` when tangential
+    ///     offset exceeds the fresh box half-length);
     /// (2b, restricted Addendum 3) when no fresh contour and no fresh scalar width exist and
     ///     `admission_shifted_width_m` is `Some(w)` (`height_source == "setup"`, non-deferred
-    ///     admission, no non-clipped post-transition `FreshView`), shift `w` by live `off` as
-    ///     `"admission_shifted"`;
+    ///     admission, settled axis within 5° of admission axis, no non-clipped post-transition
+    ///     `FreshView`), shift `w` by live `off` as `"admission_shifted"` (also checks tangential
+    ///     offset);
     /// (3) fresh projected box cut (upper bound) along `u`.
-    /// Returns `None` when no evidence covers the closing axis (caller refuses `NO_WIDTH_EVIDENCE`).
+    /// Returns `Ok(None)` when no evidence covers the closing axis (caller refuses `NO_WIDTH_EVIDENCE`).
     pub(super) fn resolve_live_jaw_cut(
         &self,
         view: &Centred,
         plane: f64,
         settled_tcp: &Pose,
-        measured_width_m: Option<f64>,
-        scalar_across_actual: bool,
+        live_scalar_width_m: Option<f64>,
+        has_measured_width: bool,
         admission_shifted_width_m: Option<f64>,
-    ) -> Option<crate::grasp_select::JawCut> {
+    ) -> Result<Option<crate::grasp_select::JawCut>, Stop> {
         let tcp_xy = [settled_tcp.p[0], settled_tcp.p[1]];
+        // When `camera_mount.offset_m` is unknown (`!self.lens_known`), `self.cam` assumes zero
+        // lens offset so `plane_point` is shifted by the unmodelled mount offset; the calibrated
+        // `grip_pixel_norm` (plus any TCP shift since `view.pose`) is the TCP reference in `cam`'s
+        // assumed frame. When `self.lens_known`, `tcp_xy` is directly in base coordinates.
+        let ref_xy = if self.lens_known {
+            tcp_xy
+        } else {
+            let view_tcp = motion::end_to_tcp(&view.pose, &self.tcp_offset);
+            self.cam
+                .plane_point(&view.pose, self.cam.to_px(self.setup.grip_pixel_norm), plane)
+                .map(|q| [q[0] + (tcp_xy[0] - view_tcp.p[0]), q[1] + (tcp_xy[1] - view_tcp.p[1])])
+                .unwrap_or(tcp_xy)
+        };
         let jaw_col = kinematics::column(&settled_tcp.r, 1);
         let u = crate::grasp_select::geometry::unit2([jaw_col[0], jaw_col[1]]);
-        // Rung 1: fresh contour cut
-        if let Some(cut) = self.footprint_interval_along_axis(&view.last, &view.pose, plane, tcp_xy, u, false) {
-            return Some(cut);
+        // Rung 1: fresh contour cut (a valid projected contour missed by the closing line is
+        // TARGET_DISPLACED, matching adaptive.rs:500).
+        if let Some(Ok(ref pts)) = view.last.contour_norm {
+            let world: Option<Vec<[f64; 2]>> = pts
+                .iter()
+                .map(|v| self.cam.plane_point(&view.pose, self.cam.to_px(*v), plane).map(|q| [q[0], q[1]]))
+                .collect();
+            if let Some(mut wpts) = world.filter(|w| w.len() >= 3) {
+                crate::grasp_select::geometry::ensure_ccw(&mut wpts);
+                let Some((lo, hi)) = crate::grasp_select::candidates::cut_interval_near(&wpts, ref_xy, u, None) else {
+                    return Err(fail(
+                        "TARGET_DISPLACED",
+                        "Fresh contour no longer covers the TCP along the closing axis",
+                    ));
+                };
+                return Ok(Some(crate::grasp_select::JawCut::new(lo, hi, "contour")));
+            }
         }
-        // Rung 2: fresh scalar width across the actual closing axis
-        if scalar_across_actual {
-            if let Some(w) = measured_width_m {
-                if let Some(bc) = self.cam.plane_point(&view.pose, self.cam.to_px(box_centre(&view.last.box_norm)), plane) {
-                    let off = crate::grasp_select::geometry::dot2([bc[0] - tcp_xy[0], bc[1] - tcp_xy[1]], u);
-                    return Some(crate::grasp_select::JawCut::from_offset(off, w, "scalar"));
-                }
+        // Rung 2: fresh scalar width measured in the chosen view along the settled closing axis
+        if let Some(w) = live_scalar_width_m {
+            if let Some(bc) = self.cam.plane_point(&view.pose, self.cam.to_px(box_centre(&view.last.box_norm)), plane) {
+                let bc_xy = [bc[0], bc[1]];
+                self.check_box_tangential_offset(&view.last, &view.pose, plane, ref_xy, bc_xy, u)?;
+                let off = crate::grasp_select::geometry::dot2([bc_xy[0] - ref_xy[0], bc_xy[1] - ref_xy[1]], u);
+                return Ok(Some(crate::grasp_select::JawCut::from_offset(off, w, "scalar")));
             }
         }
         // Restricted Addendum 3 fallback: admission-checked width shifted by live offset when
-        // height_source == "setup", non-deferred admission, no non-clipped FreshView, and no
-        // fresh contour or scalar width.
-        if measured_width_m.is_none() {
+        // height_source == "setup", non-deferred admission, settled axis within 5 deg of admission
+        // axis, no non-clipped FreshView, and no fresh contour or scalar width.
+        if !has_measured_width {
             if let Some(ad_w) = admission_shifted_width_m {
                 if let Some(bc) = self.cam.plane_point(&view.pose, self.cam.to_px(box_centre(&view.last.box_norm)), plane) {
-                    let off = crate::grasp_select::geometry::dot2([bc[0] - tcp_xy[0], bc[1] - tcp_xy[1]], u);
-                    return Some(crate::grasp_select::JawCut::from_offset(off, ad_w, "admission_shifted"));
+                    let bc_xy = [bc[0], bc[1]];
+                    self.check_box_tangential_offset(&view.last, &view.pose, plane, ref_xy, bc_xy, u)?;
+                    let off = crate::grasp_select::geometry::dot2([bc_xy[0] - ref_xy[0], bc_xy[1] - ref_xy[1]], u);
+                    return Ok(Some(crate::grasp_select::JawCut::from_offset(off, ad_w, "admission_shifted")));
                 }
             }
         }
         // Rung 3: fresh projected box cut (upper bound)
-        self.footprint_interval_along_axis(&view.last, &view.pose, plane, tcp_xy, u, true)
+        Ok(self.footprint_interval_along_axis(&view.last, &view.pose, plane, ref_xy, u, true))
     }
 
     /// TOO_WIDE limit (m; 0 = off): the calibrated full opening minus `pre_open_margin_m`, at

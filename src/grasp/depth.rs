@@ -34,6 +34,9 @@ pub struct DepthMeasurement {
     pub depth_m: f64,
     pub width_m: Option<f64>,
     pub length_m: Option<f64>,
+    /// Base-frame unit closing axis along which `width_m` was measured (perpendicular to the
+    /// projected long-axis angle on the object top plane), when an orientation angle was present.
+    pub closing_axis: Option<[f64; 2]>,
     pub source: &'static str,
     pub jaw_clear: Option<bool>,
 }
@@ -365,11 +368,21 @@ pub fn measure_detection_depth_with_cal_why(
             l * z_fg / f_geom
         }
     });
+    let closing_axis = angle_deg.filter(|_| width_m.is_some()).and_then(|_| {
+        let o = cam.origin(pose);
+        let z_plane = o[2] + z_fg * ray[2];
+        let p0 = cam.plane_point(pose, centre_px, z_plane)?;
+        let p1 = cam.plane_point(pose, [centre_px[0] + 20.0 * cos_t, centre_px[1] + 20.0 * sin_t], z_plane)?;
+        let long = [p1[0] - p0[0], p1[1] - p0[1]];
+        let n = long[0].hypot(long[1]);
+        (n > 1e-9).then_some([-long[1] / n, long[0] / n])
+    });
     Ok(DepthMeasurement {
         height_m: h,
         depth_m,
         width_m,
         length_m,
+        closing_axis,
         source: cal.source,
         jaw_clear: det.jaw_clear,
     })

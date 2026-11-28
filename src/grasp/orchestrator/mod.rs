@@ -543,29 +543,23 @@ impl Orchestrator {
             self.move_arm_in(GoalFrame::Tcp, "align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false, auto_yaw: None }, s.approach_speed_mps).await?;
         }
 
+        // Settle TCP pose and closing axis after the J6 align move so width projection and the
+        // live jaw gate use the settled closing axis.
+        let settled_tcp = self.tcp_pose().await;
+        let jaw_col = kinematics::column(&settled_tcp.r, 1);
+        let settled_u = crate::grasp_select::geometry::unit2([jaw_col[0], jaw_col[1]]);
+
         // grasp width: `width_record` sources first (reported only), then `width_sources` in
-        // order until one accepts (mask width uses FreshView when available).
-        let width_record: Vec<WidthSource> = s.width_record.iter().copied().filter(|x| !s.width_sources.contains(x)).collect();
-        let mut wchain = EstimateChain::new();
-        let width_of = |src: WidthSource| -> SourceResult {
-            let r = match src {
-                WidthSource::Mask => self.mask_width_m(&view, plane),
-                WidthSource::Depth => match depth_res {
-                    Ok(m) => m.width_m.ok_or("no_width"),
-                    Err(why) => Err(if depth { why } else { "unavailable" }),
-                },
-            };
-            match r { Ok(w) => SourceResult::Accept(w), Err(why) => SourceResult::Reject(why.into()) }
-        };
-        for src in &width_record {
-            wchain.offer(src.name(), None, width_of(*src), true);
-        }
-        for src in &s.width_sources {
-            if wchain.done() { break; }
-            wchain.offer(src.name(), None, width_of(*src), false);
-        }
-        let (chosen_width, width_entries) = match wchain.finish() { Ok(r) => r, Err((_, e)) => (None, e) };
-        let measured_width_m = chosen_width.map(|(w, _)| w);
+        // order until one accepts (measured in the chosen view; pre-transition depth width is
+        // rejected when a non-clipped post-transition FreshView decides).
+        let (measured_width_m, live_scalar_width_m, width_entries) = self.evaluate_width_sources(
+            &view,
+            plane,
+            settled_u,
+            evidence_age == "post_transition",
+            depth,
+            depth_res,
+        );
         self.emit_estimates(
             crate::rt_core::action_diag::EstimateListKind::Width,
             &width_entries,
@@ -581,14 +575,11 @@ impl Orchestrator {
         }).await;
 
         // Live legacy jaw gate AFTER the J6 align move, using the SETTLED TCP pose and closing
-        // axis and fresh evidence (rungs 1 contour, 2 scalar across actual axis, restricted
-        // Addendum 3 admission_shifted when height_source == "setup" & non-deferred & no
-        // non-clipped FreshView, 3 box; else NO_WIDTH_EVIDENCE).
-        let settled_tcp = self.tcp_pose().await;
-        let aligned_to_angle = matches!(align.as_str(), "turned:angle" | "kept:angle" | "turned:depth" | "kept:depth");
-        let consistent_elongated_angle = frames_angle(&view.frames, s.align_min_angle_conf)
-            .is_some_and(|(_a, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
-        let scalar_across_actual = aligned_to_angle || !consistent_elongated_angle;
+        // axis and fresh evidence (rungs 1 contour, 2 scalar in chosen view along settled axis,
+        // restricted Addendum 3 admission_shifted when height_source == "setup" & non-deferred &
+        // settled axis within 5 deg of admission axis & no non-clipped FreshView, 3 box; else
+        // NO_WIDTH_EVIDENCE).
+        let aligned_to_angle = matches!(align.as_str(), "turned:angle" | "kept:angle");
         let width_cap = self.effective_max_grasp_width_cap().await;
         let jaw = planned.jaw.as_ref().ok_or_else(|| {
             fail("NO_WIDTH_EVIDENCE", "Legacy grasp is missing its jaw admission state")
@@ -596,6 +587,7 @@ impl Orchestrator {
         let admission_shifted_width_m = if height_is_setup
             && evidence_age != "post_transition"
             && !jaw.is_deferred()
+            && jaw.axis_within_deg(settled_u, 5.0)
         {
             jaw.fit().map(|f| f.width_m)
         } else {
@@ -605,10 +597,10 @@ impl Orchestrator {
             &view,
             plane,
             &settled_tcp,
-            measured_width_m,
-            scalar_across_actual,
+            live_scalar_width_m,
+            measured_width_m.is_some(),
             admission_shifted_width_m,
-        );
+        )?;
         let Some(live_cut) = live_cut else {
             return Err(fail(
                 "NO_WIDTH_EVIDENCE",
@@ -733,8 +725,23 @@ impl Orchestrator {
             }
             if let Some(rec_c) = rec_view {
                 let rec_tcp = self.tcp_pose().await;
-                let rec_width_m = if s.width_sources.contains(&WidthSource::Mask) {
-                    self.mask_width_m(&rec_c, plane).ok()
+                let rec_jaw = kinematics::column(&rec_tcp.r, 1);
+                let rec_u = crate::grasp_select::geometry::unit2([rec_jaw[0], rec_jaw[1]]);
+                let rec_mask = if s.width_sources.contains(&WidthSource::Mask) {
+                    self.mask_width_with_axis(&rec_c, plane, Some(rec_u)).ok()
+                } else {
+                    None
+                };
+                let rec_live_scalar = rec_mask.and_then(|(w, ax)| match ax {
+                    None => Some(w),
+                    Some(a) if a[0].hypot(a[1]) > 1e-9 && probes::axes_within_deg(a, rec_u, 5.0) => Some(w),
+                    Some(_) => None,
+                });
+                let rec_adm_shifted = if height_is_setup
+                    && !jaw.is_deferred()
+                    && jaw.axis_within_deg(rec_u, 5.0)
+                {
+                    jaw.fit().map(|f| f.width_m)
                 } else {
                     None
                 };
@@ -742,10 +749,10 @@ impl Orchestrator {
                     &rec_c,
                     plane,
                     &rec_tcp,
-                    rec_width_m,
-                    scalar_across_actual,
-                    admission_shifted_width_m,
-                ) else {
+                    rec_live_scalar,
+                    rec_mask.is_some(),
+                    rec_adm_shifted,
+                )? else {
                     return Err(fail(
                         "NO_WIDTH_EVIDENCE",
                         "No fresh object width evidence along the closing axis after mid-descent recentre",
