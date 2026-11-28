@@ -35,6 +35,8 @@ const BUSY_RETRY_SLEEP: Duration = Duration::from_millis(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DriverBusy;
 
+// Transient stack capture value: keep unboxed to avoid an extra heap allocation under SupervisorLock::read().
+#[allow(clippy::large_enum_variant)]
 enum CapturedDriverCaps {
     None,
     Poisoned,
