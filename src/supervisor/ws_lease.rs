@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 impl WsConnectionSlotPool {
     fn new() -> Self {
         Self {
@@ -142,7 +141,6 @@ impl WsConnectionSlotPool {
     }
 }
 
-// scaffold-extra-0
 impl ArmSupervisor {
     /// Claims one off-thread WS connection slot (`<= MAX_LIVE_CONNECTIONS`) and allocates a
     /// strictly monotonic connection ID without touching the RT executor. Rejected upgrades

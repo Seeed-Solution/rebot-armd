@@ -1148,7 +1148,6 @@ use super::*;
         );
     }
 
-// scaffold-test-mod
 mod stamp_namespace_tests {
     use super::*;
 

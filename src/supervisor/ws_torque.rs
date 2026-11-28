@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-extra-0
 impl ArmSupervisor {
     /// Unified owner-routed WS `/api/v1/torque` and `/api/v1/arm` across legacy and RT executor.
     ///

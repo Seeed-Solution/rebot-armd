@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-extra-0
 impl ArmSupervisor {
     /// Owner-aware storage of a `measure_multiview` measurement payload for action `id`.
     /// On `OWNER_EXECUTOR`, stores in `self.hub` (never touching `SupervisorLock` or `armd-control`)

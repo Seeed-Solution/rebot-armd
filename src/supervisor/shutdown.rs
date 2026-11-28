@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-extra-0
 impl ArmSupervisor {
     pub async fn shutdown_ready(&self) -> bool {
         match self.owner_mode() {

@@ -6813,36 +6813,9 @@ struct WsConnectionSlotPool {
     notify: tokio::sync::Notify,
 }
 
-impl WsConnectionSlotPool {
-}
-
-impl ArmSupervisor {
-
-
-
-
-
-
-
-
-
-}
-
 #[cfg(test)]
 #[path = "supervisor_servo_order_tests.rs"]
 mod servo_order_tests;
 
 #[cfg(test)]
-mod observation_snapshot_tests {
-    use super::*;
-
-
-
-
-
-
-}
-
-#[cfg(test)]
-mod stamp_namespace_tests {
-}
+mod observation_snapshot_tests;
