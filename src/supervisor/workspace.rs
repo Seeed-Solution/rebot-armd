@@ -789,6 +789,99 @@ impl SupervisorInner {
         result
     }
 
+    /// Non-latching workspace hold when an operator Park tracking ramp-out target would violate a
+    /// hard workspace slot (`floor_z`, keep-out box, or self-collision). Records the structured
+    /// witness (`constraint_id`, `geometry_id`, `violation_phase = "park"`, `reason`) in
+    /// `workspace_violation` and on the running Park action, fails that Park action with
+    /// `WORKSPACE_VIOLATION`, clears Park/motion state without latching a fault, and leaves torque
+    /// on in `SafetyState::Armed` so the operator can jog away and Park again.
+    ///
+    /// Leaves `self.tracking` intact for the caller's `apply_tracking_fallback_step_inline` to
+    /// emit the hold frame at the last certified target (`last_issued`) and preserve park escape
+    /// depths.
+    pub(super) fn enter_park_workspace_hold_rt(&mut self, f: crate::chain::WorkspaceFailureRt) {
+        use crate::chain::{WorkspaceEvaluator, WorkspaceFailureRt};
+        let f_park = WorkspaceFailureRt { kind: f.kind, phase: "park" };
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let mut detail = self
+            .workspace_violation
+            .take()
+            .or_else(|| self.workspace_violation_spare.take())
+            .unwrap_or_else(crate::kinematics::WorkspaceViolationDetail::preallocated_rt);
+        if let Some((ws, cam)) = self.workspace_policy() {
+            if !self.rt_executor_owned
+                || bufs.can_eval_rt(&self.config.arm_model, ws, cam, self.config.tcp_offset, true)
+            {
+                let eval = WorkspaceEvaluator::new_with_tcp_in_mode(
+                    &self.config.arm_model,
+                    ws,
+                    cam,
+                    self.config.tcp_offset,
+                    &mut bufs,
+                    true,
+                );
+                eval.write_failure_detail_rt(&f_park, &mut detail);
+                eval.recycle(&mut bufs);
+            } else {
+                WorkspaceEvaluator::write_failure_detail_without_eval_rt(&f_park, &mut detail);
+            }
+        }
+        self.ws_eval_bufs = bufs;
+        let park_action_id = self
+            .active_trajectory
+            .as_ref()
+            .and_then(|t| t.action_id)
+            .or_else(|| {
+                self.last_action
+                    .as_ref()
+                    .filter(|a| a.is_running() && a.kind == "park")
+                    .map(|a| a.id)
+            });
+        if let Some(id) = park_action_id {
+            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+                a.constraint_id.clone_from(&detail.constraint_id);
+                a.geometry_id.clone_from(&detail.geometry_id);
+                a.violation_phase.clone_from(&detail.violation_phase);
+                a.reason.clone_from(&detail.reason);
+            }
+            let mut msg = self.take_action_msg_buf(id, 384);
+            msg.clear();
+            let reason_text = detail
+                .reason
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Park stopped by workspace violation");
+            let _ = core::fmt::Write::write_str(&mut msg, reason_text);
+            self.finish_action(
+                id,
+                "failed",
+                Some("WORKSPACE_VIOLATION"),
+                Some(msg),
+                None,
+                None,
+                None,
+            );
+        }
+        self.workspace_violation = Some(detail);
+        self.replace_active_trajectory(None);
+        self.pending_normal_unload = false;
+        self.clear_unload_settle();
+        self.unload_planned_duration = None;
+        self.park_continuation = None;
+        self.park_gripper_contact = false;
+        self.park_release = None;
+        self.quintic_settle = None;
+        self.release_servo_target();
+        self.servo_settled_ticks.fill(0);
+        self.servo_stream_active = false;
+        self.clear_servo_ws_min_depths_rt();
+        self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
+        self.following_error_since = None;
+        self.servo_lead_stall.fill(None);
+        self.safety.mark_motion_finished();
+        self.note_motion_limit(MotionLimitReason::Workspace, None);
+    }
+
     pub(super) fn measured_workspace_violation_bounded(
         &self,
         bufs: &mut crate::chain::EvalBufs,

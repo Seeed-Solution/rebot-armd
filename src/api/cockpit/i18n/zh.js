@@ -269,6 +269,7 @@ I18N.zh = {
   'toast.homing': '回零中', 'toast.stop_no_control': '当前页面未持有控制权，未能向机械臂发送停止；如需立即停机请按急停', 'toast.stop_unconfirmed': '停止未确认，请使用急停', 'toast.stopped': '已停止，位置保持', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
   'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.motor_err_cleared': '电机错误已清除，电机保持未使能', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
   'toast.stow_failed': '收起失败: ', 'toast.stow_unconfirmed': '设备未确认收纳，请检查机械臂状态', 'toast.parked_off': '已收纳并关闭力矩',
+  'toast.park_ws_blocked': '停靠已中止（{geom}）：请先点动远离 {geom}，再重新点击停靠（Park）', 'toast.park_ws_blocked_cid': '停靠已中止（{geom}，{cid}）：请先点动远离 {geom}，再重新点击停靠（Park）',
   'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
   'toast.torque_off_unconfirmed': '关闭力矩请求未确认，请检查连接和机械臂状态', 'toast.stowing': '正在平稳回零收起...', 'toast.enabled': '控制已开启，请确认机械臂反馈状态',
   'toast.enable_fail': '使能失败：', 'toast.enable_fail_def': '电机未就绪/通讯超时', 'toast.preset_fail': '预设指令执行失败: ', 'toast.rec_start': '开始录制 ',

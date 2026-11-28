@@ -15,89 +15,17 @@ use armd::tracking::{JointTrackingConfig, TrackingStrategy};
 use armd::ArmSupervisor;
 use common::INSPECT;
 
-#[derive(Clone)]
-struct FixedPoseDriver {
-    q: Arc<Mutex<Vec<f32>>>,
-    enabled: Arc<Mutex<EnableState>>,
-    written: Arc<Mutex<Vec<Vec<JointTarget>>>>,
-}
-
-impl FixedPoseDriver {
-    fn new(q0: &[f32]) -> Self {
-        Self {
-            q: Arc::new(Mutex::new(q0.to_vec())),
-            enabled: Arc::new(Mutex::new(EnableState::Enabled)),
-            written: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-    fn written_frames(&self) -> Vec<Vec<JointTarget>> {
-        self.written.lock().unwrap().clone()
-    }
-}
-
-impl ArmDriver for FixedPoseDriver {
-    fn supports_rt_executor(&self) -> Result<(), &'static str> {
-        Ok(())
-    }
-    fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities {
-            velocity_feedback: true,
-            torque_feedback: true,
-            temperature_feedback: true,
-            torque_feedforward: false,
-            enable_feedback: true,
-            load_feedback: true,
-        }
-    }
-    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
-        let n = self.q.lock().unwrap().len();
-        out.clear();
-        out.resize(n, 0.0);
-        true
-    }
-    fn enable_state(&self) -> EnableState {
-        *self.enabled.lock().unwrap()
-    }
-    fn is_feedback_valid(&self) -> bool {
-        true
-    }
-    fn is_enabled(&self) -> bool {
-        *self.enabled.lock().unwrap() == EnableState::Enabled
-    }
-    fn feedback_ages(&self) -> Vec<Option<Duration>> {
-        vec![Some(Duration::ZERO); self.q.lock().unwrap().len()]
-    }
-    fn fresh_joint_positions_into(&self, joints: &[usize], _max_age: Duration, out: &mut [f32]) -> bool {
-        let q = self.q.lock().unwrap();
-        if out.len() < joints.len() {
-            return false;
-        }
-        for (dst, &j) in out.iter_mut().zip(joints) {
-            let Some(&v) = q.get(j) else { return false };
-            *dst = v;
-        }
-        true
-    }
-    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-        let q = self.q.lock().unwrap();
-        Ok(q.iter()
-            .map(|&position| JointState { position, velocity: 0.0, torque: 0.0, temperature: 30.0 })
-            .collect())
-    }
-    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-        self.written.lock().unwrap().push(targets.to_vec());
-        Ok(())
-    }
-    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
-        *self.enabled.lock().unwrap() = if enable { EnableState::Enabled } else { EnableState::Disabled };
-        Ok(())
-    }
-}
-
-/// R2 Item 1 (Blocker): Park tracking ramp-out (`pending_normal_unload` -> `keepout_only`)
-/// must enforce `floor_z` and `self_collision` hard slots even with NO named keep-out boxes.
+/// R2 Item 1 (Blocker) + R3 Item 2 (Major): Park tracking ramp-out (`pending_normal_unload` ->
+/// `keepout_only`) must enforce `floor_z` and `self_collision` hard slots even with NO named
+/// keep-out boxes, AND on refusal must hold at the last certified target WITHOUT latching a fault:
+/// - Park action fails with `WORKSPACE_VIOLATION` carrying `(constraint_id, geometry_id, violation_phase, reason)`
+/// - No fault latched (`SafetyState::Armed`), torque stays ON, torque-off off-rest still refused
+/// - Jog moving away from the floor is admitted and completes with 0 faults
+/// - Park afterwards succeeds and turns torque off at rest (both Legacy and RT Executor owners)
 #[tokio::test]
 async fn park_ramp_out_deepening_floor_with_no_keepout_boxes_refused_both_owners() {
+    use serde_json::json;
+
     let q0 = INSPECT;
     let p0 = ArmModel::REBOT_DEV_ARM.fk_f32(&q0).unwrap().p;
     let mut q_probe = q0;
@@ -111,9 +39,15 @@ async fn park_ramp_out_deepening_floor_with_no_keepout_boxes_refused_both_owners
     q_deeper[1] += down_sign * 0.025;
     let p_deeper = ArmModel::REBOT_DEV_ARM.fk_f32(&q_deeper).unwrap().p;
     assert!(p_deeper[2] < p0[2] - 0.003, "setup must move end_origin >3 mm downward");
+    let mut q_away = q0;
+    q_away[1] -= down_sign * 0.25;
+    let p_away = ArmModel::REBOT_DEV_ARM.fk_f32(&q_away).unwrap().p;
+    let floor_z = (p0[2] + 0.005) as f32;
+    assert!(p_away[2] > f64::from(floor_z) + 0.02, "q_away must clear floor_z comfortably");
 
-    // 1. Both owners (Legacy and Executor): Park with residual tracking lead and NO named keep-out
-    //    boxes where ramping toward nominal target deepens a floor_z intrusion -> refused/held.
+    // 1. Both owners (Legacy and Executor): Park ramp-out deepening floor_z with no keepout boxes
+    //    -> holds at last certified target (no fault), fails Park action with WORKSPACE_VIOLATION
+    //    witness, refuses off-rest torque-off, admits retreat jog, and succeeds on subsequent Park.
     for use_executor in [false, true] {
         let label = if use_executor { "executor" } else { "legacy" };
         let mut cfg = ArmConfig::rebot_dm();
@@ -136,20 +70,64 @@ async fn park_ramp_out_deepening_floor_with_no_keepout_boxes_refused_both_owners
         ws.self_collision_enabled = false;
         ws.self_collision_pairs.clear();
         ws.check_points_end_m = vec![[0.0, 0.0, 0.0]];
-        ws.floor_z_m = (p0[2] + 0.005) as f32;
+        ws.floor_z_m = floor_z;
+        // Make resting pose well above floor_z and distinct from q0/q_away so off-rest torque-off
+        // is refused and post-jog Park smoothly travels to rest and cuts torque.
+        let mut q_rest = q_away;
+        q_rest[1] -= down_sign * 0.25;
+        let p_rest = ArmModel::REBOT_DEV_ARM.fk_f32(&q_rest).unwrap().p;
+        assert!(p_rest[2] > f64::from(floor_z) + 0.02, "rest pose must be above floor_z");
+        cfg.zero_reference = None;
+        cfg.home_positions = q_rest.to_vec();
+        if let Some(rp) = cfg.resting_pose.as_mut() {
+            rp.positions = Some(q_rest.to_vec());
+        }
 
-        let drv = FixedPoseDriver::new(&q0);
-        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv.clone())));
+        let drv = JitterFeedbackDriver::new(&q0, cfg.arm_dof(), 0.0);
+        *drv.enabled.lock().unwrap() = EnableState::Enabled;
+        let written: Arc<Mutex<Vec<Vec<JointTarget>>>> = Arc::new(Mutex::new(Vec::new()));
+        struct RecordingFollowDriver {
+            inner: JitterFeedbackDriver,
+            written: Arc<Mutex<Vec<Vec<JointTarget>>>>,
+        }
+        impl ArmDriver for RecordingFollowDriver {
+            fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
+            fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+            fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+            fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
+            fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out); }
+            fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
+            fn feedback_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) { self.inner.feedback_instants_into(out); }
+            fn feedback_receive_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) { self.inner.feedback_receive_instants_into(out); }
+            fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out); }
+            fn feedback_seqs_into(&self, out: &mut Vec<u64>) { self.inner.feedback_seqs_into(out); }
+            fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { self.inner.joint_loads_into(out) }
+            fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+                self.inner.fresh_joint_positions_into(joints, max_age, out)
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> { self.inner.read_joint_states() }
+            fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> { self.inner.read_joint_states_into(out) }
+            fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> { self.inner.read_cached_joint_states_into(out) }
+            fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                self.written.lock().unwrap().push(targets.to_vec());
+                self.inner.write_joint_targets(targets)
+            }
+            fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enable) }
+        }
+        let rec_drv = RecordingFollowDriver { inner: drv, written: written.clone() };
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(rec_drv)));
         {
             let mut inner = sup.inner().write().await;
-            inner.lease_enabled = false;
             let s = inner.current_admission_stamp();
             inner
                 .check_admission(s)
                 .and_then(|a| armd::SupervisorInner::enable_torque(a))
                 .unwrap();
             inner.measured_positions = q0.to_vec();
-            // Residual lead at q0 while nominal Park commanded_positions sits deeper below floor_z.
+            // Active Park action + residual lead at q0 while nominal Park commanded sits deeper below floor_z.
+            let _ = inner.begin_action("park", None);
             inner.tracking.record_issued(q0.to_vec(), vec![0.0; 7]);
             inner.commanded_positions = q_deeper.to_vec();
             inner.target_positions = q_deeper.to_vec();
@@ -165,24 +143,52 @@ async fn park_ramp_out_deepening_floor_with_no_keepout_boxes_refused_both_owners
         } else {
             None
         };
-        if use_executor {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-        } else {
-            for _ in 0..5 {
-                sup.tick(0.02).await;
-            }
-        }
-        let obs = sup.get_observation().await;
-        if let Some(h) = exec {
-            h.stop_and_join();
-        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn({
+            let s = sup.clone();
+            async move { axum::serve(listener, armd::create_router(s, armd::OperatorAuth::disabled())).await.unwrap(); }
+        });
+        let tick = (!use_executor).then(|| {
+            let t = sup.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_millis(20));
+                loop { iv.tick().await; t.tick(0.02).await; }
+            })
+        });
 
-        assert!(
-            matches!(obs.safety_state, SafetyState::Fault(_)),
-            "{label}: Park ramp-out deepening floor_z with no keepout boxes must refuse/fault, got {:?}",
-            obs.safety_state
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        let obs = sup.get_observation().await;
+
+        // 1a. Non-latching hold: NO fault latched, SafetyState::Armed, torque stays ON.
+        assert_eq!(
+            obs.safety_state,
+            SafetyState::Armed,
+            "{label}: Park ramp-out deepening floor_z must hold Armed without latching fault, got {:?} (fault={:?})",
+            obs.safety_state,
+            obs.fault
         );
-        for (idx, frame) in drv.written_frames().iter().enumerate() {
+        assert!(obs.fault.is_none(), "{label}: no fault may be latched: {:?}", obs.fault);
+        assert!(obs.is_torqued, "{label}: torque must remain on off-rest");
+
+        // 1b. Park action failed with WORKSPACE_VIOLATION carrying full structured witness.
+        let act = obs.action.as_ref().expect("failed park action must be reported");
+        assert_eq!(act.kind.as_str(), "park", "{label}: {act:?}");
+        assert_eq!(act.state.as_str(), "failed", "{label}: {act:?}");
+        assert_eq!(act.code.as_deref(), Some("WORKSPACE_VIOLATION"), "{label}: {act:?}");
+        assert_eq!(act.constraint_id.as_deref(), Some("floor_z"), "{label}: {act:?}");
+        assert_eq!(act.geometry_id.as_deref(), Some("end_origin"), "{label}: {act:?}");
+        assert_eq!(act.violation_phase.as_deref(), Some("park"), "{label}: {act:?}");
+        assert!(act.reason.as_deref().is_some_and(|r| !r.is_empty()), "{label}: {act:?}");
+        let ws_v = obs.workspace_violation.as_ref().expect("obs.workspace_violation populated");
+        assert_eq!(ws_v.constraint_id.as_deref(), Some("floor_z"), "{label}: {ws_v:?}");
+        assert_eq!(ws_v.geometry_id.as_deref(), Some("end_origin"), "{label}: {ws_v:?}");
+        assert_eq!(ws_v.violation_phase.as_deref(), Some("park"), "{label}: {ws_v:?}");
+
+        // 1c. No emitted frame deepened the floor intrusion (held at last certified target q0).
+        let frames_before_jog = written.lock().unwrap().clone();
+        assert!(!frames_before_jog.is_empty(), "{label}: hold frame must be emitted");
+        for (idx, frame) in frames_before_jog.iter().enumerate() {
             let qf: Vec<f32> = frame.iter().map(|t| t.position).collect();
             let z = ArmModel::REBOT_DEV_ARM.fk_f32(&qf).unwrap().p[2];
             assert!(
@@ -191,9 +197,66 @@ async fn park_ramp_out_deepening_floor_with_no_keepout_boxes_refused_both_owners
                 p0[2]
             );
         }
+
+        // 1d. Torque-off rule unchanged: off-rest torque-off is still refused.
+        let (mut ws, gen) = common::controller(addr).await;
+        let ep = sup.get_observation().await.epoch_id;
+        let tq_off = common::rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": false})).await;
+        assert_eq!(tq_off["type"], "command_reject", "{label}: off-rest torque-off must stay refused: {tq_off}");
+        assert_eq!(tq_off["code"], "ARM_NOT_AT_RESTING_POSE", "{label}: {tq_off}");
+
+        // 1e. Jog moving away from floor_z is ADMITTED and completes with 0 faults.
+        let ep = sup.get_observation().await.epoch_id;
+        let jog_ack = common::rpc(
+            &mut ws, gen, ep, "/api/v1/motion/jog",
+            json!({"target_positions": q_away, "duration_secs": 0.4}),
+        ).await;
+        assert_eq!(jog_ack["type"], "command_ack", "{label}: retreat jog must be admitted: {jog_ack}");
+        let dl_jog = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let o = sup.get_observation().await;
+            assert!(matches!(o.safety_state, SafetyState::Armed | SafetyState::Moving), "{label}: fault during jog: {:?}", o.safety_state);
+            if o.safety_state == SafetyState::Armed && o.action.as_ref().is_none_or(|a| !a.is_running()) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < dl_jog, "{label}: timeout waiting retreat jog");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // 1f. Park afterwards succeeds and turns torque off at rest with 0 faults.
+        let ep = sup.get_observation().await.epoch_id;
+        let park_ack = common::preset(&mut ws, gen, ep, "park", None).await;
+        assert_eq!(park_ack["type"], "preset_ack", "{label}: Park after retreat jog must be admitted: {park_ack}");
+        let dl_park = tokio::time::Instant::now() + Duration::from_secs(12);
+        let final_obs = loop {
+            let o = sup.get_observation().await;
+            assert!(
+                !matches!(o.safety_state, SafetyState::Fault(_) | SafetyState::EStop),
+                "{label}: unexpected fault during second Park: {:?}", o.safety_state
+            );
+            if !o.is_torqued && o.action.as_ref().is_some_and(|a| a.kind == "park" && a.state == "done") {
+                break o;
+            }
+            assert!(tokio::time::Instant::now() < dl_park, "{label}: timeout waiting second Park; obs.action={:?} torqued={}", o.action, o.is_torqued);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert!(!final_obs.is_torqued, "{label}: Park must turn torque off at rest");
+
+        drop(ws);
+        if let Some(t) = tick { t.abort(); }
+        srv.abort();
+        if let Some(h) = exec { h.stop_and_join(); }
     }
 
-    // 2. Unit check: `WorkspaceEvaluator::new_with_tcp_in_mode(..., keepout_only = true)`
+    // 2. Cockpit i18n & safety.js message check (en + zh): names blocking geometry and gives recovery step.
+    let en_js = include_str!("../src/api/cockpit/i18n/en.js");
+    let zh_js = include_str!("../src/api/cockpit/i18n/zh.js");
+    let safety_js = include_str!("../src/api/cockpit/panels/motion/safety.js");
+    assert!(en_js.contains("jog away from {geom}, then Park again"), "en.js must include Park workspace guidance");
+    assert!(zh_js.contains("toast.park_ws_blocked") && zh_js.contains("{geom}"), "zh.js must include Park workspace guidance");
+    assert!(safety_js.contains("formatParkWorkspaceBlocked") && safety_js.contains("WORKSPACE_VIOLATION"), "safety.js must render Park workspace guidance");
+
+    // 3. Unit check: `WorkspaceEvaluator::new_with_tcp_in_mode(..., keepout_only = true)`
     //    must keep both `floor_z` AND `self_collision` hard slots active even when `keepout_boxes` is empty.
     let mut cfg_sc = ArmConfig::rebot_dm();
     let ws_sc = cfg_sc.workspace.as_mut().unwrap();
