@@ -5,7 +5,6 @@ use super::super::*;
 #[allow(unused_imports)]
 use crate::macro_action::{ChildTicket, ContactGuard, ContactWatch};
 
-// scaffold-extra-0
 impl SupervisorInner {
     /// Start a gripper action. Returns (action id, expected duration).
     pub fn start_gripper(admitted: Admitted<'_>, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
