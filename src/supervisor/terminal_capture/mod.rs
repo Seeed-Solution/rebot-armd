@@ -29,6 +29,12 @@ use crate::safety::{BoundedFaultReason, BoundedText, FaultInfo, FaultReason, Saf
 use super::{SupervisorInner, TerminalBroadcaster, TERMINAL_FIFO_CAPACITY};
 
 mod channel;
+pub(crate) use channel::{
+    compute_cached_feedback_state, SequenceCommitGuard, StagedTerminal, StagedTerminalBuf,
+    TerminalCaptureChannel, TerminalCaptureTx, TerminalEdgeTracker,
+};
+#[cfg(test)]
+pub(crate) use channel::evaluate_cached_feedback_fresh;
 
 /// Physical SPSC ring capacity (2x `TERMINAL_FIFO_CAPACITY` for in-flight headroom).
 pub const TERMINAL_CAPTURE_RING_CAPACITY: usize = TERMINAL_FIFO_CAPACITY * 2;
