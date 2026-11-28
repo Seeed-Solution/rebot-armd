@@ -276,14 +276,42 @@ impl ArmSupervisor {
     }
 
     pub async fn set_operator_auth_enforced(&self, enforced: bool) {
+        self.set_operator_auth_enforced_with_after_drop_hook(enforced, |_| std::future::ready(()))
+            .await;
+    }
+
+    /// Test-accessible entry point for `set_operator_auth_enforced` that invokes `after_drop(gen)`
+    /// immediately after releasing `SupervisorLock::write()` and before publishing the captured
+    /// Legacy snapshot into `PublishedConfigHub`.
+    #[doc(hidden)]
+    pub async fn set_operator_auth_enforced_with_after_drop_hook<F, Fut>(
+        &self,
+        enforced: bool,
+        mut after_drop: F,
+    ) where
+        F: FnMut(u64) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         if self.owner_mode() == OWNER_LEGACY {
-            let mut inner = self.inner.write().await;
-            if self.check_legacy_under_guard(&inner).is_ok() {
-                inner.operator_auth_enforced = enforced;
-                let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
-                let gen = self.inner.generation();
-                drop(inner);
-                self.published_config.publish(snap, gen);
+            let captured = {
+                let mut inner = self.inner.write().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    inner.operator_auth_enforced = enforced;
+                    let snap =
+                        crate::rt_core::requests::config::PublishedConfig::from_inner_arc(&inner);
+                    let gen = self.inner.generation();
+                    Some((snap, gen))
+                } else {
+                    None
+                }
+            };
+            if let Some((snap, gen)) = captured {
+                after_drop(gen).await;
+                let _ = self.published_config.publish_legacy_arc_if_newer(
+                    snap,
+                    gen,
+                    || self.owner_mode() == OWNER_LEGACY,
+                );
                 return;
             }
         }
@@ -296,9 +324,9 @@ impl ArmSupervisor {
                     )
                 })
                 .await;
+            self.published_config
+                .update(|cfg| cfg.operator_auth_enforced = enforced);
         }
-        self.published_config
-            .update(|cfg| cfg.operator_auth_enforced = enforced);
     }
 
     /// Snapshot of shadow `TorqueController` diagnostics (lock-free / off-RT; never touches RT owner).
