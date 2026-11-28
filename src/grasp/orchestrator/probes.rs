@@ -21,6 +21,16 @@ pub(super) fn axes_within_deg(a: [f64; 2], b: [f64; 2], max_deg: f64) -> bool {
     crate::grasp_select::geometry::dot2(ua, ub).abs() >= max_deg.to_radians().cos()
 }
 
+/// Outcome metadata returned when [`Orchestrator::centre_tracked`] stops before converging.
+pub(super) struct CentreAttempt {
+    /// Number of horizontal corrections that actually executed.
+    pub moves: u32,
+    /// Fresh frames captured at the final settled pose before stopping (`Some` on unconverged
+    /// `CENTRING_FAILED` or pre-move rejection like `WORKSPACE_VIOLATION`; `None` when
+    /// `TARGET_LOST` prevented fresh frames at the final pose).
+    pub last_view: Option<Centred>,
+}
+
 /// Post-transition observation returned by [`Orchestrator::recheck`] when the target is expected
 /// in the post-transition camera field of view: the matched fresh detection paired with the
 /// end-link pose at which it was captured.
@@ -72,9 +82,30 @@ impl Orchestrator {
     /// `report`: publish `iteration` / `error_px` in the action status.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn centre(&self, phase: &str, progress: f32, tracker: &mut Tracker, aim_px: [f64; 2], aim_name: &str, plane: f64,
-                    mut since: Instant, after: &mut Option<u64>, max_iter: u32, report: bool) -> Result<Centred, Stop> {
+                    since: Instant, after: &mut Option<u64>, max_iter: u32, report: bool) -> Result<Centred, Stop> {
+        self.centre_tracked(phase, progress, tracker, aim_px, aim_name, plane, since, after, max_iter, report)
+            .await
+            .map_err(|(stop, _)| stop)
+    }
+
+    /// Same as [`Self::centre`], additionally returning the number of completed horizontal moves
+    /// and any fresh frames captured at the final settled pose on error.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn centre_tracked(
+        &self,
+        phase: &str,
+        progress: f32,
+        tracker: &mut Tracker,
+        aim_px: [f64; 2],
+        aim_name: &str,
+        plane: f64,
+        mut since: Instant,
+        after: &mut Option<u64>,
+        max_iter: u32,
+        report: bool,
+    ) -> Result<Centred, (Stop, CentreAttempt)> {
         let s = &self.setup;
-        let mut iteration = 0u32;
+        let mut moves = 0u32;
         let mut last_focus_box = tracker.predicted;
         loop {
             let pose = self.pose().await;
@@ -83,7 +114,10 @@ impl Orchestrator {
             let mut frames = Vec::new();
             let mut consecutive = 0u32;
             let decision = loop {
-                let d = self.fresh_match(tracker, since, after).await?;
+                let d = match self.fresh_match(tracker, since, after).await {
+                    Ok(d) => d,
+                    Err(stop) => return Err((stop, CentreAttempt { moves, last_view: None })),
+                };
                 tracker.gate_px = s.match_dist_px;
                 tracker.predicted = d.box_norm;
                 if self.triggered {
@@ -98,7 +132,7 @@ impl Orchestrator {
                 ys.push(c[1]);
                 let err = (c[0] - aim_px[0]).hypot(c[1] - aim_px[1]);
                 if err <= s.centre_tol_px { consecutive += 1; } else { consecutive = 0; }
-                let (it, e) = if report { (Some(iteration), Some(err as f32)) } else { (None, None) };
+                let (it, e) = if report { (Some(moves), Some(err as f32)) } else { (None, None) };
                 if self.is_executor() {
                     self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Phase {
                         phase: crate::rt_core::action_diag::ShortLabel::new_truncated(phase),
@@ -118,17 +152,23 @@ impl Orchestrator {
                     if xs.len() >= m + s.stable_frames as usize { break None; }
                 }
             };
+            let last = frames.last().cloned().expect("at least one matched frame");
+            let view_here = Centred { last, frames, pose, iterations: moves };
             let Some(med) = decision else {
-                let last = frames.last().cloned().expect("at least one matched frame");
-                return Ok(Centred { last, frames, pose, iterations: iteration });
+                return Ok(view_here);
             };
-            if iteration >= max_iter {
+            if moves >= max_iter {
                 let err = (med[0] - aim_px[0]).hypot(med[1] - aim_px[1]);
-                return Err(fail("CENTRING_FAILED", format!("Target still {err:.0} px from {aim_name} after {iteration} corrections")));
+                return Err((
+                    fail("CENTRING_FAILED", format!("Target still {err:.0} px from {aim_name} after {moves} corrections")),
+                    CentreAttempt { moves, last_view: Some(view_here) },
+                ));
             }
-            iteration += 1;
             let (Some(pt), Some(pg)) = (self.cam.plane_point(&pose, med, plane), self.cam.plane_point(&pose, aim_px, plane)) else {
-                return Err(fail("CENTRING_FAILED", "Pixel error cannot be mapped onto the table plane"));
+                return Err((
+                    fail("CENTRING_FAILED", "Pixel error cannot be mapped onto the table plane"),
+                    CentreAttempt { moves, last_view: Some(view_here) },
+                ));
             };
             let mut step = [(pt[0] - pg[0]) * s.servo_gain, (pt[1] - pg[1]) * s.servo_gain, 0.0];
             let len = step[0].hypot(step[1]);
@@ -136,7 +176,11 @@ impl Orchestrator {
             // predict where the target lands after the step (same rough model)
             let moved = Pose::new(pose.r, kinematics::add(&pose.p, &step));
             if let Some(p) = self.cam.project(&moved, &pt) { tracker.predict_at(self.cam.to_norm(p)); }
-            let done = self.move_arm(phase, GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None }, s.approach_speed_mps).await?;
+            let done = match self.move_arm(phase, GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None }, s.approach_speed_mps).await {
+                Ok(done) => done,
+                Err(stop) => return Err((stop, CentreAttempt { moves, last_view: Some(view_here) })),
+            };
+            moves += 1;
             since = done.at;
         }
     }
@@ -531,9 +575,13 @@ impl Orchestrator {
     /// Look-down mid-height re-centre: descend to `recentre_height_m`, then centre the target
     /// on the grip pixel for that height: the model's projection of the point under the TCP on
     /// the plane z = `plane`, plus the calibration offset (`grip_pixel_norm` minus the model's
-    /// projection of that point at the centring pose). Returns the `recentre` status, the
-    /// corrections, and `Some(Centred)` when fresh frames were produced (for re-running the live
-    /// jaw gate); target lost, table clearance or an unusable aim skip it without horizontal shift.
+    /// projection of that point at the centring pose). Returns `(status, iterations, moved,
+    /// fresh_view)`:
+    /// - `moved`: true whenever ≥1 horizontal correction executed during `recentre`.
+    /// - `fresh_view`: `Some(Centred)` whenever fresh frames were captured at the final settled
+    ///   pose (on convergence, or after ≥1 move before stopping unconverged / table-clearance).
+    ///   When `moved` is true and `fresh_view` is `None` (e.g. target lost after moving), the
+    ///   caller MUST refuse `NO_WIDTH_EVIDENCE` rather than reusing the pre-correction gate pass.
     pub(super) async fn recentre(
         &self,
         c: &Centred,
@@ -541,9 +589,9 @@ impl Orchestrator {
         close_h: f64,
         label: &str,
         after: &mut Option<u64>,
-    ) -> Result<(String, Option<u32>, Option<Centred>), Stop> {
+    ) -> Result<(String, Option<u32>, bool, Option<Centred>), Stop> {
         let s = &self.setup;
-        let skip = |r: &str| Ok((format!("skipped:{r}"), None, None));
+        let skip = |r: &str| Ok((format!("skipped:{r}"), None, false, None));
         if s.recentre_height_m <= 0.0 { return skip("disabled"); }
         if !self.lens_known { return skip("no_lens_centre"); }
         let pose = self.pose().await;
@@ -566,15 +614,27 @@ impl Orchestrator {
         self.phase("recentre", 0.7).await?;
         let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
         if let Some(p) = self.cam.project(&now, &t3) { tracker.predict_at(self.cam.to_norm(p)); }
-        match self.centre("recentre", 0.7, &mut tracker, aim, "the grip point", plane, done.at, after, s.recentre_max_iterations, false).await {
+        match self.centre_tracked("recentre", 0.7, &mut tracker, aim, "the grip point", plane, done.at, after, s.recentre_max_iterations, false).await {
             Ok(r) => {
                 let iters = r.iterations;
-                Ok(("done".into(), Some(iters), Some(r)))
+                Ok(("done".into(), Some(iters), iters > 0, Some(r)))
             }
-            Err(Stop::Fail(code, _)) if code == "TARGET_LOST" => skip("target_lost"),
-            Err(Stop::Fail(code, _)) if code == "WORKSPACE_VIOLATION" => skip("table_clearance"),
-            Err(Stop::Fail(code, _)) if code == "CENTRING_FAILED" => Ok(("unconverged".into(), Some(s.recentre_max_iterations), None)),
-            Err(e) => Err(e),
+            Err((Stop::Fail(code, _), att)) if code == "TARGET_LOST" => {
+                let iters = (att.moves > 0).then_some(att.moves);
+                Ok(("skipped:target_lost".into(), iters, att.moves > 0, att.last_view))
+            }
+            Err((Stop::Fail(code, _), att)) if code == "WORKSPACE_VIOLATION" => {
+                if att.moves > 0 {
+                    Ok(("skipped:table_clearance".into(), Some(att.moves), true, att.last_view))
+                } else {
+                    skip("table_clearance")
+                }
+            }
+            Err((Stop::Fail(code, _), att)) if code == "CENTRING_FAILED" => {
+                let view = (att.moves > 0).then_some(att.last_view).flatten();
+                Ok(("unconverged".into(), Some(s.recentre_max_iterations), att.moves > 0, view))
+            }
+            Err((e, _)) => Err(e),
         }
     }
 

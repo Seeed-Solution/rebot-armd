@@ -15,7 +15,7 @@ use super::{
     approach_pose, box_centre, camera_down_pose, envelope_with_contact, grasp_mode, grasp_plane,
     median, rescale_frame_to_cam, table_violation, transition_pose, CamModel, DepthCache,
     Detection, DetectionFrame, DetectionSource, GraspSetup, HeightSource, MaskFocus, PlannedGrasp,
-    PreOpen, Tracker, VisionMode, WidthSource, YawSource, GRASP_PIPELINES, TABLE_CLEARANCE_M,
+    PreOpen, Tracker, VisionMode, YawSource, GRASP_PIPELINES, TABLE_CLEARANCE_M,
     TRIGGER_WAIT_MS,
 };
 
@@ -713,7 +713,7 @@ impl Orchestrator {
         // descend (look-down: re-centre at mid height on the way), close, check
         self.phase("descend", 0.65).await?;
         if !camera_down {
-            let (recentre, iterations, rec_view) = self.recentre(&c, plane, close_h, &planned.request.label, &mut after).await?;
+            let (recentre, iterations, rec_moved, rec_view) = self.recentre(&c, plane, close_h, &planned.request.label, &mut after).await?;
             if self.is_executor() {
                 let status = self.sup.hub().intern_action_diag_str(self.id, &recentre);
                 self.emit_diag(crate::rt_core::action_diag::ActionDiagKind::Recentre {
@@ -727,16 +727,14 @@ impl Orchestrator {
                 let rec_tcp = self.tcp_pose().await;
                 let rec_jaw = kinematics::column(&rec_tcp.r, 1);
                 let rec_u = crate::grasp_select::geometry::unit2([rec_jaw[0], rec_jaw[1]]);
-                let rec_mask = if s.width_sources.contains(&WidthSource::Mask) {
-                    self.mask_width_with_axis(&rec_c, plane, Some(rec_u)).ok()
-                } else {
-                    None
-                };
-                let rec_live_scalar = rec_mask.and_then(|(w, ax)| match ax {
-                    None => Some(w),
-                    Some(a) if a[0].hypot(a[1]) > 1e-9 && probes::axes_within_deg(a, rec_u, 5.0) => Some(w),
-                    Some(_) => None,
-                });
+                let (rec_measured_width_m, rec_live_scalar_width_m, _) = self.evaluate_width_sources(
+                    &rec_c,
+                    plane,
+                    rec_u,
+                    false,
+                    depth,
+                    depth_res,
+                );
                 let rec_adm_shifted = if height_is_setup
                     && !jaw.is_deferred()
                     && jaw.axis_within_deg(rec_u, 5.0)
@@ -749,8 +747,8 @@ impl Orchestrator {
                     &rec_c,
                     plane,
                     &rec_tcp,
-                    rec_live_scalar,
-                    rec_mask.is_some(),
+                    rec_live_scalar_width_m,
+                    rec_measured_width_m.is_some(),
                     rec_adm_shifted,
                 )? else {
                     return Err(fail(
@@ -769,6 +767,11 @@ impl Orchestrator {
                     rec_cut.hi_m,
                     gate_pass.fit().reserve_m,
                 );
+            } else if rec_moved {
+                return Err(fail(
+                    "NO_WIDTH_EVIDENCE",
+                    "Mid-descent recentre moved horizontally without fresh frames at the settled pose",
+                ));
             }
             self.phase("descend", 0.75).await?;
         }
