@@ -919,4 +919,176 @@ impl ArmSupervisor {
             }
         }
     }
+
+    pub(super) async fn handback_to_legacy_inner(
+        &self,
+        timeout: Duration,
+        live_receiver: Option<(
+            &Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>,
+            &Arc<AtomicBool>,
+        )>,
+    ) -> Result<(), ArmError> {
+        let deadline = Instant::now() + timeout;
+        let handle = {
+            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            match std::mem::replace(&mut *slot, OwnerSlot::Transferring) {
+                OwnerSlot::Executor(h) => {
+                    self.owner_mode.store(OWNER_TRANSFERRING, Ordering::Release);
+                    h
+                }
+                other => {
+                    *slot = other;
+                    return Err(ArmError::Rejected {
+                        status: 409,
+                        code: "OWNER_NOT_EXECUTOR".into(),
+                        message: "Handback requires active RT executor ownership".into(),
+                    });
+                }
+            }
+        };
+
+        struct HandbackGuard<'a> {
+            sup: &'a ArmSupervisor,
+            handle: Option<crate::rt_core::executor::RtExecutorHandle>,
+        }
+        impl Drop for HandbackGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(h) = self.handle.take() {
+                    let mut slot = self.sup.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(*slot, OwnerSlot::Transferring) {
+                        *slot = OwnerSlot::Executor(h);
+                        self.sup.owner_mode.store(OWNER_EXECUTOR, Ordering::Release);
+                    }
+                }
+            }
+        }
+        let mut hb_guard = HandbackGuard {
+            sup: self,
+            handle: Some(handle.clone()),
+        };
+
+        // Acquire the legacy shell write lock BEFORE signaling `armd-control` to stop.
+        // If cancelled or timed out here, `HandbackGuard` restores `OWNER_EXECUTOR` cleanly.
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return Err(ArmError::Rejected {
+                status: 503,
+                code: "HANDBACK_TIMED_OUT".into(),
+                message: "Handback deadline expired before acquiring legacy shell".into(),
+            });
+        }
+        let mut guard = match tokio::time::timeout(rem, self.inner.write()).await {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "HANDBACK_TIMED_OUT".into(),
+                    message: "Handback timed out waiting for legacy shell lock".into(),
+                });
+            }
+        };
+
+        // Reject bare energized handback without a prepared live receiver BEFORE signaling stop (B2).
+        if live_receiver.is_none() && !handle.shutdown_ready().unwrap_or(false) {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "HANDBACK_REQUIRES_LIVE_RECEIVER".into(),
+                message: "Energized handback requires a prepared live legacy receiver (use handback_to_legacy_with_live_loop)".into(),
+            });
+        }
+
+        // Zero `.await` points below: commit handback request on `armd-control` within the SAME
+        // deadline, carrying `live_receiver.is_some()` to the owner-side commit point (DRV-F1 B4).
+        match handle.take_handback_core_until(deadline, live_receiver.is_some()) {
+            Ok(mut core) => {
+                if let Some(slot) = core.driver.take() {
+                    core.driver = Some(slot.into_legacy(Arc::clone(&self.driver_lock_attempts)));
+                }
+                core.detached = false;
+                core.rt_executor_owned = false;
+                core.advance_owner_generation();
+                core.internal_fault_lane = Arc::clone(&self.internal_fault_lane);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    core.flush_torque_shadow();
+                    core.torque_shadow
+                        .set_owner(crate::torque::shadow::ShadowOwner::Legacy);
+                    self.torque_shadow.wake();
+                }
+                *guard = *core;
+                guard.refresh_schema_cache();
+                guard.hover_jobs = self
+                    .executor_hover_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
+                guard.purge_closed_live_connections();
+                *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Legacy;
+                    self.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+                }
+                {
+                    let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    *w = WriterEndpoint::Legacy {
+                        control_stop: live_receiver.map(|(_, stop)| Arc::clone(stop)),
+                        safe_hold: Arc::clone(&self.legacy_safe_hold),
+                    };
+                }
+                hb_guard.handle = None;
+                drop(guard);
+                // Release the pre-spawned live legacy receiver IMMEDIATELY after dropping `guard`
+                // and BEFORE running bounded worker teardown so energized holds continue with
+                // minimal inter-frame gap (B2).
+                if let Some((ready, _)) = live_receiver {
+                    let (lock, cv) = &**ready;
+                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+                    cv.notify_all();
+                }
+                handle.finish_handback_cleanup_until(deadline);
+                self.try_drain_pending_disconnects_legacy();
+                Ok(())
+            }
+            Err(crate::rt_core::executor::HandbackFailure::TimedOutSafeHold) => {
+                self.published_config.set_available(false);
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Failed;
+                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                {
+                    let mut w = self.active_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    *w = WriterEndpoint::DetachedSafeHold {
+                        safe_hold: handle.safe_hold_control(),
+                        control_stop: Arc::new(AtomicBool::new(true)),
+                    };
+                }
+                hb_guard.handle = None;
+                drop(guard);
+                Err(ArmError::Rejected {
+                    status: 503,
+                    code: "HANDBACK_STALLED_SAFE_HOLD".into(),
+                    message: "Energized handback timed out; exclusive driver retained in SAFE-HOLD"
+                        .into(),
+                })
+            }
+            Err(crate::rt_core::executor::HandbackFailure::ExecutorExited) => {
+                self.published_config.set_available(false);
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Failed;
+                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                hb_guard.handle = None;
+                drop(guard);
+                Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_STOPPED".into(),
+                    message: "RT executor exited before handback completed".into(),
+                })
+            }
+        }
+    }
 }
