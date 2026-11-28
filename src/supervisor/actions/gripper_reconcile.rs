@@ -18,7 +18,7 @@ impl SupervisorInner {
         this.start_gripper_with_baseline_inner(request, epoch, baseline_cmd)
     }
 
-    pub(super) fn start_gripper_with_baseline_inner(&mut self, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
+    pub(in crate::supervisor) fn start_gripper_with_baseline_inner(&mut self, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
         self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
@@ -74,7 +74,7 @@ impl SupervisorInner {
         this.start_gripper_zero_check_with_auth_inner(body, epoch, operator_auth)
     }
 
-    pub(super) fn start_gripper_zero_check_with_auth_inner(&mut self, body: &serde_json::Value, epoch: u64, operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>) -> Result<(u64, f64), ArmError> {
+    pub(in crate::supervisor) fn start_gripper_zero_check_with_auth_inner(&mut self, body: &serde_json::Value, epoch: u64, operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>) -> Result<(u64, f64), ArmError> {
         self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper zero check needs a profile with a gripper joint".into())
@@ -196,7 +196,7 @@ impl SupervisorInner {
     }
 
     /// Single place that ends a running action whose reference went away (spec 2.3).
-    pub(super) fn reconcile_action(&mut self, dt: f64, tick_output_accepted: bool, now: Instant) {
+    pub(in crate::supervisor) fn reconcile_action(&mut self, dt: f64, tick_output_accepted: bool, now: Instant) {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
         let (id, is_park, is_replay) = (action.id, action.kind == "park", action.kind == "replay");
         let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
@@ -410,7 +410,7 @@ impl SupervisorInner {
     /// Always returns a deferred completion payload on `StepStatus::Done` (both tracking enabled
     /// and disabled) so `"done"` and `releasing = false` are only published after that tick's
     /// output is accepted (`Complete`) by the driver without an intervening stop or supersession.
-    pub(super) fn apply_action_step(&mut self, action_id: Option<u64>, mut out: StepOut) -> Option<DeferredActionDone> {
+    pub(in crate::supervisor) fn apply_action_step(&mut self, action_id: Option<u64>, mut out: StepOut) -> Option<DeferredActionDone> {
         // swap: the previous command's vectors go back to the scratch for the next step
         std::mem::swap(&mut self.commanded_positions, &mut out.positions);
         std::mem::swap(&mut self.commanded_velocities, &mut out.velocities);

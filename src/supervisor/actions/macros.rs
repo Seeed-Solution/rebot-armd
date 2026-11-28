@@ -155,7 +155,7 @@ impl SupervisorInner {
 
     /// True when macro action `id`'s current child owns either `active_trajectory` or a
     /// pending deferred completion awaiting bus TX acceptance.
-    pub(super) fn macro_child_active_or_pending(&self, id: u64) -> bool {
+    pub(in crate::supervisor) fn macro_child_active_or_pending(&self, id: u64) -> bool {
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) {
             return true;
         }
@@ -170,7 +170,7 @@ impl SupervisorInner {
     /// Stop the running sub-motion of macro action `id` where the arm is (J1..J6 commanded to
     /// the measured positions, the gripper keeps its command) without publishing `SubState::Done`.
     /// False when no sub-motion of `id` is running or pending deferred TX acceptance.
-    pub(super) fn stop_macro_motion_at_measured(&mut self, id: u64) -> bool {
+    pub(in crate::supervisor) fn stop_macro_motion_at_measured(&mut self, id: u64) -> bool {
         if !self.macro_alive(id) || !self.macro_child_active_or_pending(id) { return false; }
         self.stop_motion();
         let n = self.measured_positions.len().min(self.commanded_positions.len()).min(6);
@@ -307,7 +307,7 @@ impl SupervisorInner {
 
     /// True when macro `action_id` has an elapsed parent deadline or elapsed running-child
     /// deadline at `now` (inclusive `now >= deadline`, matching the driver TX cutoff).
-    pub(super) fn macro_deadline_elapsed(&self, action_id: u64, now: Instant) -> bool {
+    pub(in crate::supervisor) fn macro_deadline_elapsed(&self, action_id: u64, now: Instant) -> bool {
         self.macro_run.as_ref().is_some_and(|m| {
             m.id == action_id
                 && !m.stop_requested
@@ -357,7 +357,7 @@ impl SupervisorInner {
         }
     }
 
-    pub(super) fn finish_expired_macro_parent(
+    pub(in crate::supervisor) fn finish_expired_macro_parent(
         &mut self,
         id: u64,
         timeout_code: crate::safety::BoundedText<48>,
@@ -376,7 +376,7 @@ impl SupervisorInner {
         .is_ok()
     }
 
-    pub(super) fn finish_expired_macro_child(&mut self, id: u64) -> bool {
+    pub(in crate::supervisor) fn finish_expired_macro_child(&mut self, id: u64) -> bool {
         let _ = self.quiesce_macro_children_rt(id);
         let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else {
             return false;
@@ -427,7 +427,7 @@ impl SupervisorInner {
     /// peaks, and a residual above its joint's bound (0: unguarded) ends the child at the
     /// measured position, done (`stop_code` None, a descent meant to touch) or failed with
     /// `stop_code`.
-    pub(super) fn step_macro_contact(&mut self) {
+    pub(in crate::supervisor) fn step_macro_contact(&mut self) {
         let Some((id, guard)) = self.macro_run.as_ref()
             .filter(|m| !m.stop_requested && m.sub == SubState::Running)
             .and_then(|m| m.child.guard.map(|g| (m.id, g))) else { return; };
@@ -673,7 +673,7 @@ impl SupervisorInner {
 
     /// Keeps the terminal record of macro `id` (outcome with its code, child count) in the
     /// core, so it outlives the action record (`CoreOps::action_outcome`, `action_children`).
-    pub(super) fn record_macro_terminal(&mut self, id: u64, state: &str, code: Option<&str>) {
+    pub(in crate::supervisor) fn record_macro_terminal(&mut self, id: u64, state: &str, code: Option<&str>) {
         let Some(children) = self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.children) else { return; };
         let outcome = crate::rt_core::ops::outcome_of(state, code).unwrap_or(crate::rt_core::broker::Outcome::Failed("FAILED"));
         self.core.record_macro_terminal(crate::rt_core::MacroTerminal { action: crate::rt_core::broker::ActionId(id), children, outcome });

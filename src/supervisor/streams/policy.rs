@@ -274,7 +274,7 @@ impl SupervisorInner {
         this.begin_policy_run_inner(req)
     }
 
-    pub(super) fn begin_policy_run_inner(&mut self, req: crate::policy_runtime::PolicyRunStart) -> Result<u64, ArmError> {
+    pub(in crate::supervisor) fn begin_policy_run_inner(&mut self, req: crate::policy_runtime::PolicyRunStart) -> Result<u64, ArmError> {
         use crate::policy_runtime::{PolicyMode, PolicyRun, DEFAULT_MAX_FIRST_STEP_RAD};
 
         self.check_policy_start_preconditions_with(
@@ -1219,7 +1219,7 @@ impl SupervisorInner {
         self.set_action_policy_stats(action_id, stats);
     }
 
-    pub(super) fn set_action_policy_stats(&mut self, action_id: u64, stats: crate::motion::PolicyStats) {
+    pub(in crate::supervisor) fn set_action_policy_stats(&mut self, action_id: u64, stats: crate::motion::PolicyStats) {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             a.policy_stats = Some(stats);
         }
@@ -1276,7 +1276,7 @@ impl SupervisorInner {
 
     /// Append the outcome of a supervised_first_run live run on real hardware to the device
     /// qualification ledger. Passed = ran to its deadline (`MAX_SECONDS`, action done).
-    pub(super) fn record_policy_qualification(&self, run: &crate::policy_runtime::PolicyRun, stop_reason: &str, action_state: &str) {
+    pub(in crate::supervisor) fn record_policy_qualification(&self, run: &crate::policy_runtime::PolicyRun, stop_reason: &str, action_state: &str) {
         use crate::policy_runtime::{qualification, AuthorizationTier, PolicyMode};
         if run.mode != PolicyMode::Live || self.policy_live_allowed() { return; }
         let Some(gate) = run.verified_release_gate.as_ref().filter(|g| g.authorization_tier() == AuthorizationTier::SupervisedFirstRun) else { return; };

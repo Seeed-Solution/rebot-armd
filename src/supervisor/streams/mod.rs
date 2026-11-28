@@ -9,12 +9,12 @@ use super::*;
 mod policy;
 
 #[inline]
-fn buf_len_ok(v: &[f64], n: usize) -> bool {
+pub(super) fn buf_len_ok(v: &[f64], n: usize) -> bool {
     v.len() >= n
 }
 
 /// Copies `src` into `dst`, reusing its memory when it holds a vector.
-fn set_vec(dst: &mut Option<Vec<f32>>, src: &[f32]) {
+pub(super) fn set_vec(dst: &mut Option<Vec<f32>>, src: &[f32]) {
     match dst {
         Some(v) => copy_into(v, src),
         None => *dst = Some(src.to_vec()),
@@ -33,7 +33,7 @@ impl SupervisorInner {
 
     /// Sets the servo target, in the existing or the spare buffer (no allocation while one
     /// has the capacity).
-    fn set_servo_target(&mut self, src: &[f32]) {
+    pub(super) fn set_servo_target(&mut self, src: &[f32]) {
         if self.servo_target.is_none() {
             self.bump_motion_generation();
             let mut v = std::mem::take(&mut self.servo_target_spare);
@@ -47,7 +47,7 @@ impl SupervisorInner {
 
 /// Copies `src` into `dst`, reusing `vec_spare` for `last_shadow_target` (0 RT alloc/free).
 #[cfg(feature = "policy-runtime")]
-fn copy_policy_obs_with_vec_spare(
+pub(super) fn copy_policy_obs_with_vec_spare(
     dst: &mut crate::model::PolicyObservation,
     src: &crate::model::PolicyObservation,
     vec_spare: &mut Vec<f32>,
@@ -100,7 +100,7 @@ pub(crate) fn push_str_bounded(buf: &mut String, text: &str) {
 
 /// The run's observation into `dst`, reusing its memory.
 #[cfg(feature = "policy-runtime")]
-fn set_policy_obs(dst: &mut Option<crate::model::PolicyObservation>, run: &crate::policy_runtime::PolicyRun) {
+pub(super) fn set_policy_obs(dst: &mut Option<crate::model::PolicyObservation>, run: &crate::policy_runtime::PolicyRun) {
     match dst {
         Some(o) => run.to_observation_into(true, o),
         None => *dst = Some(run.to_observation(true)),
@@ -470,7 +470,7 @@ impl SupervisorInner {
     /// scratch slices from `self.ws_eval_bufs` (zero heap allocations for any legal workspace
     /// size, including 32 end points + multiple keep-out boxes, and never builds allocating
     /// [`crate::chain::WorkspaceFailure`] strings on refusal).
-    fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), crate::rt_core::mailbox::Refusal> {
+    pub(super) fn servo_target_workspace_rt(&mut self, target: &[f32]) -> Result<(), crate::rt_core::mailbox::Refusal> {
         use crate::rt_core::mailbox::Refusal;
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
         let result = (|| {
@@ -631,12 +631,12 @@ impl SupervisorInner {
     /// copying its connection id.
     #[cfg(feature = "policy-runtime")]
     #[cfg(feature = "policy-runtime")]
-    fn validate_policy_lease(&mut self, action_id: u64, generation: u64) -> bool {
+    pub(super) fn validate_policy_lease(&mut self, action_id: u64, generation: u64) -> bool {
         self.validate_policy_lease_at(action_id, generation, Instant::now())
     }
 
     #[cfg(feature = "policy-runtime")]
-    fn validate_policy_lease_at(&mut self, action_id: u64, generation: u64, now: Instant) -> bool {
+    pub(super) fn validate_policy_lease_at(&mut self, action_id: u64, generation: u64, now: Instant) -> bool {
         let timeout = self.lease_timeout;
         let fenced = self.effective_fenced_lease_generation();
         if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
@@ -661,7 +661,7 @@ impl SupervisorInner {
         }
     }
 
-    fn clamp_j7_if_stale(&self, targets: &mut [f32], j7_gate: crate::supervisor::J7PosForceGate) {
+    pub(super) fn clamp_j7_if_stale(&self, targets: &mut [f32], j7_gate: crate::supervisor::J7PosForceGate) {
         if j7_gate.stale {
             if let Some(g) = self.config.gripper_index() {
                 if targets.len() > g {
@@ -684,7 +684,7 @@ impl SupervisorInner {
         self.validate_and_filter_servo_targets_with_gate(targets, epoch_id, j7_gate)
     }
 
-    fn validate_and_filter_servo_targets_with_gate(
+    pub(super) fn validate_and_filter_servo_targets_with_gate(
         &mut self,
         targets: &mut [f32],
         epoch_id: u64,
@@ -745,7 +745,7 @@ impl SupervisorInner {
     }
 
     /// Zero-allocation RT validation & filtering for mailbox servo targets (`armd-control`).
-    fn validate_and_filter_servo_targets_rt(
+    pub(super) fn validate_and_filter_servo_targets_rt(
         &mut self,
         targets: &mut [f32],
         epoch_id: u64,
@@ -815,7 +815,7 @@ impl SupervisorInner {
         self.release_gripper_stall_on_reverse_with_gate(targets, j7_gate);
     }
 
-    fn release_gripper_stall_on_reverse_with_gate(
+    pub(super) fn release_gripper_stall_on_reverse_with_gate(
         &mut self,
         targets: &[f32],
         j7_gate: crate::supervisor::J7PosForceGate,
@@ -845,7 +845,7 @@ impl SupervisorInner {
         }
     }
 
-    fn frame_moves_j7(&self, targets: &[f32], prev_cmd_j7: f32, prev_tgt_j7: f32) -> bool {
+    pub(super) fn frame_moves_j7(&self, targets: &[f32], prev_cmd_j7: f32, prev_tgt_j7: f32) -> bool {
         self.config.gripper_index().is_some_and(|g| {
             g < targets.len()
                 && ((targets[g] - prev_cmd_j7).abs() > 1e-6 || (targets[g] - prev_tgt_j7).abs() > 1e-6)
@@ -867,7 +867,7 @@ impl SupervisorInner {
         this.servo_slice_inner(targets_in, epoch_id, j7_gate, proof.stamp())
     }
 
-    fn servo_slice_inner(
+    pub(super) fn servo_slice_inner(
         &mut self,
         targets_in: &[f32],
         epoch_id: u64,
@@ -990,7 +990,7 @@ impl SupervisorInner {
     }
 
     /// More joints than a target frame carries: the same checks refuse it (dimension).
-    fn servo_slice_oversized(&mut self, mut targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+    pub(super) fn servo_slice_oversized(&mut self, mut targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
@@ -1334,35 +1334,7 @@ impl SupervisorInner {
 // Re-exported as `supervisor::targets`. The broker-side items have no production caller
 // until the WS loop and the policy runner route through the mailbox (stage 3 removes this).
 #[allow(dead_code)]
-pub mod targets {
-    //! Latest-target path of servo, teleop and policy streams (armd 1.6 RT core, track D).
-    //!
-    //! **Broker side** ([`TargetPort`], normal priority): applies the WS servo sequence rules
-    //! of both servo forms (`servo` and `cartesian_joint_stream`) per connection
-    //! ([`ServoStream`]), stamps each target with the arm and boot, its stream, the authority
-    //! it was received under, its original input / camera times and frame id and a deadline,
-    //! and submits it under the port's strictly increasing sequence (a client sequence that
-    //! wraps stays valid). Servo frames are replaceable (a burst coalesces to the newest);
-    //! policy frames are not (each live step is checked against the step before it). The
-    //! RT's outcomes come back through [`TargetPort::outcomes`]; [`servo_outcome_reply`] turns
-    //! a refusal into the WS reply the legacy loop sends for the same condition.
-    //!
-    //! **RT side** ([`SupervisorInner::consume_target_frame`], the body of
-    //! `CoreOps::consume_target`): [`TargetFrame::check`] (dof, identity, deadline, stop,
-    //! epoch, lease valid now, the authorized stream, policy generation, input and camera
-    //! ages), then a lease when leases are enforced, the config hold, and the existing servo /
-    //! policy step checks (lead, braking, workspace, jump caps). Streams are authorized by
-    //! the core: [`SupervisorInner::authorize_servo_stream`] when a connection holds the lease,
-    //! the policy stream while a run is active (its generation follows the run's
-    //! [`crate::policy_runtime::PolicyAuthorization`], so a vision hold or invalidation
-    //! refuses its buffered targets). A refused policy target holds or ends the run where the
-    //! legacy commit holds or ends it. Shadow runs keep no output authority. Accepted targets
-    //! are applied without allocating once the servo buffers hold a target.
-    //!
-    //! Targets carry no plan revision: they are checked against the active workspace when
-    //! applied, so a workspace change does not refuse a buffered target as `PLAN_STALE`.
-
-}
+pub mod targets;
 
 #[cfg(test)]
 mod target_tests;

@@ -5,3 +5,5 @@
 mod gripper_reconcile;
 mod lifecycle;
 mod macros;
+
+use super::{DeferredActionDone, DeferredCompletionTarget};

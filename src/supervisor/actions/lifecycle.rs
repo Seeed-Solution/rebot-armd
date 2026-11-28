@@ -94,7 +94,7 @@ impl SupervisorInner {
         self.begin_action_inner(kind, None, false)
     }
 
-    pub(super) fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
+    pub(in crate::supervisor) fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
         self.bump_motion_generation();
         let now = self.now_s();
         // Clean up old macro bookkeeping without overwriting the newly prepared motion's
@@ -319,7 +319,7 @@ impl SupervisorInner {
 
     /// Zero-allocation in-place finalization for a running `gripper_zero_check` action aborted
     /// by PR0B session revocation or deadline expiry during motion (before persistence handoff).
-    pub(super) fn finish_zero_check_session_abort_rt(
+    pub(in crate::supervisor) fn finish_zero_check_session_abort_rt(
         &mut self,
         action_id: u64,
         terminal_state: &str,
@@ -593,7 +593,7 @@ impl SupervisorInner {
         }
     }
 
-    pub(super) fn zero_check_revoke_terminal(reason: &'static str) -> (&'static str, &'static str, &'static str) {
+    pub(in crate::supervisor) fn zero_check_revoke_terminal(reason: &'static str) -> (&'static str, &'static str, &'static str) {
         match reason {
             "STOPPED" => ("cancelled", "STOPPED", "Motion stopped"),
             "LEASE_LOST" => ("cancelled", "LEASE_LOST", "Control lease lost or released"),

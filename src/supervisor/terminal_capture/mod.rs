@@ -30,7 +30,7 @@ use super::{SupervisorInner, TerminalBroadcaster, TERMINAL_FIFO_CAPACITY};
 
 mod channel;
 pub(crate) use channel::{
-    compute_cached_feedback_state, SequenceCommitGuard, StagedTerminal, StagedTerminalBuf,
+    compute_cached_feedback_state, StagedTerminal, StagedTerminalBuf,
     TerminalCaptureChannel, TerminalCaptureTx, TerminalEdgeTracker,
 };
 #[cfg(test)]
