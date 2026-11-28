@@ -6,6 +6,9 @@
 #[allow(unused_imports)]
 use super::*;
 
+mod dispatch;
+mod published;
+
 impl SupervisorInner {
     /// Reject ordinary motion/action dispatch while a newly installed non-stock tool awaits commissioning.
     pub fn check_commissioning_for_ordinary_motion(&self, op: &str) -> Result<(), ArmError> {
