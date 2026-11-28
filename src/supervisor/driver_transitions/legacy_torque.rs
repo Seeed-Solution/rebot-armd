@@ -712,7 +712,7 @@ impl SupervisorInner {
     /// - Acquired single driver borrow -> clears `deadline` ONLY when `disable_frames_dispatched()`
     ///   proves at least one disable frame was already sent; otherwise attempts
     ///   `abort_pending_disable()` and keeps `deadline` intact if abort is refused.
-    pub(in crate::supervisor) fn try_abort_expired_undispatched_disable(
+    pub(super) fn try_abort_expired_undispatched_disable(
         &mut self,
         kind: crate::driver::DisableKind,
         deadline: Option<Instant>,

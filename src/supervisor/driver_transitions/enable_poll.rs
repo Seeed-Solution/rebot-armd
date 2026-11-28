@@ -10,7 +10,7 @@ impl SupervisorInner {
     /// Re-verifies live [`EnableAuthority`] BEFORE any subsequent enable retry TX so a displaced
     /// lease, disconnect, E-stop, fault, or epoch change transitions immediately to `FailedHold`
     /// without sending rollback disable frames.
-    pub(in crate::supervisor) fn poll_enable_reducer(
+    pub(super) fn poll_enable_reducer(
         &mut self,
         reducer: EnableReducer,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,
@@ -21,7 +21,7 @@ impl SupervisorInner {
         self.poll_enable_reducer_with_clock(reducer, budget, &mut live_now)
     }
 
-    pub(in crate::supervisor) fn poll_enable_reducer_with_clock(
+    pub(super) fn poll_enable_reducer_with_clock(
         &mut self,
         reducer: EnableReducer,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,
@@ -435,7 +435,7 @@ impl SupervisorInner {
     /// Post-enable validation phase of the single enable reducer (`Validate -> Armed | FailedHold`).
     /// Any validation failure or interruption routes through [`Self::enter_failed_hold`] (zero
     /// automatic rollback at any pose).
-    pub(in crate::supervisor) fn step_enable_validate(
+    pub(super) fn step_enable_validate(
         &mut self,
         reducer: EnableReducer,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,

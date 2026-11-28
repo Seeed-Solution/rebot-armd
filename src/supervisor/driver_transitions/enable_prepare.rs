@@ -276,7 +276,7 @@ impl SupervisorInner {
     /// `Validate` before arming): any finite joint temperature above `max_temperature` aborts
     /// the enable through `enter_failed_hold`, latches `FaultKind::ThermalTrip`, and starts
     /// `DisableProtective { Thermal }` without ever arming.
-    pub(in crate::supervisor) fn check_enable_thermal_trip(
+    pub(super) fn check_enable_thermal_trip(
         &mut self,
         was_torqued: bool,
         temperature_available: bool,
@@ -472,7 +472,7 @@ impl SupervisorInner {
     }
 
     /// Starts the single budgeted enable reducer (`Enable -> Validate -> Armed | FailedHold`).
-    pub(in crate::supervisor) fn start_enable_reducer(
+    pub(super) fn start_enable_reducer(
         &mut self,
         origin: EnableOrigin,
         was_torqued: bool,
@@ -520,7 +520,7 @@ impl SupervisorInner {
         }
     }
 
-    pub(in crate::supervisor) fn start_enable_reducer_inner(
+    pub(super) fn start_enable_reducer_inner(
         &mut self,
         origin: EnableOrigin,
         was_torqued: bool,
@@ -677,7 +677,7 @@ impl SupervisorInner {
     /// TX (zero-lock on `DriverSlot::Exclusive`, nonblocking `try_with_mut` on `DriverSlot::Legacy`)
     /// until `drv.abort_enable()` clears the driver's `torque_hs` so stopped-hold writes can never
     /// stay blocked by `TorqueTransitionPending`.
-    pub(in crate::supervisor) fn step_enable_cancel(
+    pub(super) fn step_enable_cancel(
         &mut self,
         reducer: EnableReducer,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,
