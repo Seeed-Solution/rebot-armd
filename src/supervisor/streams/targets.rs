@@ -1,5 +1,205 @@
 //! Latest-target path of servo, teleop and policy streams (armd 1.6 RT core, track D).
 
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::rt_core::broker::{Authority, BootId};
+use crate::rt_core::ids::ArmId;
+use crate::rt_core::mailbox::{
+    Refusal, RefusalDetail, StreamId, Submitted, TargetAuthority, TargetFrame, TargetOutcome, TargetWriter, MAX_DOF,
+};
+use crate::rt_core::ops::{CommitCtx, CoreOps};
+use crate::safety::SafetyError;
+#[cfg(feature = "policy-runtime")]
+use crate::safety::SafetyState;
+use crate::supervisor::{ArmError, SupervisorInner};
+
+/// Servo stream ids carry this bit; policy stream ids are action ids (without it).
+pub const SERVO_STREAM_BIT: u64 = 1 << 63;
+/// A servo frame not applied within this time is refused (`DEADLINE_EXPIRED`): the servo
+/// motion-frame timeout.
+pub const SERVO_TARGET_TTL: Duration = Duration::from_millis(200);
+
+/// The stream of WS servo frames under lease `lease_generation`.
+pub fn servo_stream(lease_generation: u64) -> StreamId { StreamId(SERVO_STREAM_BIT | lease_generation) }
+
+/// The stream of policy run `action_id`.
+pub fn policy_stream(action_id: u64) -> StreamId { StreamId(action_id & !SERVO_STREAM_BIT) }
+
+/// Codes of the policy step that a refusal carries as they are (others: `REJECTED`).
+const POLICY_CODES: &[&str] = &[
+    "POLICY_NOT_ACTIVE", "LEASE_LOST", "BLOCKED_HOLD", "DEPLOYMENT_CHANGED", "OPERATOR_CONFIRMATION_REQUIRED",
+    "RELEASE_GATE_REQUIRED", "FEEDBACK_UNCONFIRMED", "STALE_INPUT", "JUMP_LIMIT", "STEP_LIMIT", "QUALIFICATION_REQUIRED",
+    "J7_FEEDBACK_STALE",
+];
+
+/// The protocol code of a servo error, as `ApiError::from` gives it (no allocation).
+pub fn safety_code(e: &SafetyError) -> &'static str {
+    match e {
+        SafetyError::HandoverSettling => "HANDOVER_SETTLING",
+        SafetyError::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
+        SafetyError::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+        SafetyError::TorqueOffWouldDrop { .. } => "TORQUE_OFF_WOULD_DROP",
+        SafetyError::ClearFaultRejected(_) => "CLEAR_FAULT_REJECTED",
+        SafetyError::EStopActive => "ESTOP_ACTIVE",
+        SafetyError::CollisionHold(_) => "COLLISION_HOLD",
+        SafetyError::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
+        SafetyError::MotionBusy => "MOTION_BUSY",
+        SafetyError::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
+        SafetyError::StaticLoadLimit => "STATIC_LOAD_LIMIT",
+        SafetyError::EpochMismatch { .. } => "EPOCH_MISMATCH",
+        SafetyError::SoftLimitExceeded { .. } => "SOFT_LIMIT_EXCEEDED",
+        SafetyError::FaultActive(_) => "FAULT_ACTIVE",
+        SafetyError::NotArmed(_) => "NOT_ARMED",
+        SafetyError::OwnerTransferred => "OWNER_TRANSFERRED",
+        SafetyError::Stopped => "STOPPED",
+        SafetyError::LeaseLost => "LEASE_LOST",
+        SafetyError::TerminalsBusy => "TERMINALS_BUSY",
+        SafetyError::StampAlreadyConsumed => "STAMP_REUSED",
+        _ => "SAFETY_ERROR",
+    }
+}
+
+/// The protocol code of a policy step error (no allocation).
+pub fn policy_code(e: &ArmError) -> &'static str {
+    match e {
+        ArmError::Safety(s) => safety_code(s),
+        ArmError::RejectedStatic { code, .. } => code,
+        ArmError::Rejected { code, .. } => POLICY_CODES.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED"),
+        ArmError::Internal(_) => "INTERNAL_ERROR",
+        _ => "REJECTED",
+    }
+}
+
+/// Status, `error` and `safety_state` of a refusal code, as `ApiError::from` gives them.
+pub(crate) fn reject_fields(code: &str) -> (u16, &str, Option<&'static str>) {
+    match code {
+        "ESTOP_ACTIVE" => (409, code, Some("EStop")),
+        "FAULT_ACTIVE" => (409, code, Some("Fault")),
+        "ARM_NOT_AT_RESTING_POSE" => (409, "ArmNotAtRestingPose", Some("Armed")),
+        "MOTION_FORBIDDEN_IN_FAULT_STATE" => (409, "MotionForbiddenInFaultState", Some("Fault")),
+        "TORQUE_OFF_WOULD_DROP" => (409, code, None),
+        "CLEAR_FAULT_REJECTED" => (409, "ClearFaultRejected", Some("Fault")),
+        "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" | "STATIC_LOAD_LIMIT" => (422, code, None),
+        "SOFT_LIMIT_EXCEEDED" | "SAFETY_ERROR" | "INVALID_COMMAND" => (400, code, None),
+        "NOT_ARMED" => (412, code, None),
+        "OPERATOR_CONFIRMATION_REQUIRED" | "RELEASE_GATE_REQUIRED" => (403, code, None),
+        "INTERNAL_ERROR" => (500, code, None),
+        _ => (409, code, None),
+    }
+}
+
+/// What a WS reply needs from the state at reply time.
+#[derive(Debug, Clone)]
+pub struct ReplyCtx {
+    pub epoch_id: u64,
+    pub safety_state: Value,
+    /// The connection's lease generation.
+    pub lease_generation: u64,
+}
+
+/// `servo_reject` with the legacy fields (`status`, `code`, `error`, `message`, `safety_state`, `epoch_id`).
+pub fn servo_reject(code: &str, message: &str, epoch_id: u64) -> Value {
+    let (status, error, safety_state) = reject_fields(code);
+    json!({"type":"servo_reject", "status":status, "code":code, "error":error, "message":message,
+        "safety_state":safety_state, "epoch_id":epoch_id})
+}
+
+/// The WS reply to a servo target the RT refused (None: no reply).
+///
+/// As the legacy loop answers the same conditions: a stop-preempted frame with `servo_reject`
+/// (`code: "STOPPED"`, `reason: "stopped"` matching `api/ws/servo.rs`), an unauthorized frame
+/// (lease lost, stream not authorized, no lease) with `lease_lost` (with the loss reason when
+/// known), a stale epoch with `epoch_sync`, a calibration with `servo_reject`
+/// `reason: calibration_busy`, other refusals with `servo_reject` (and `current_revision`
+/// when known). Messages match the legacy path.
+pub fn servo_outcome_reply(refusal: &Refusal, ctx: &ReplyCtx) -> Option<Value> {
+    Some(match refusal.code {
+        "STOPPED" => {
+            let mut v = servo_reject("STOPPED", "Stopped before motion began", ctx.epoch_id);
+            v["reason"] = json!("stopped");
+            v
+        }
+        "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED" => {
+            let mut v = json!({"type":"lease_lost", "generation":ctx.lease_generation});
+            if let (RefusalDetail::LeaseLoss { reason }, true) = (refusal.detail, ctx.lease_generation != 0) { v["reason"] = json!(reason); }
+            v
+        }
+        "EPOCH_MISMATCH" => json!({"type":"epoch_sync", "epoch_id":ctx.epoch_id, "safety_state":ctx.safety_state}),
+        "CALIBRATION_BUSY" => json!({"type":"servo_reject", "reason":"calibration_busy"}),
+        "STATIC_LOAD_LIMIT" => servo_reject("STATIC_LOAD_LIMIT", crate::power::STATIC_LOAD_LIMIT_MSG, ctx.epoch_id),
+        code => {
+            let mut v = servo_reject(code, "servo target refused when the control loop applied it", ctx.epoch_id);
+            if let RefusalDetail::CurrentRevision(rev) = refusal.detail {
+                v["current_revision"] = json!(rev);
+            } else {
+                crate::chain::attach_workspace_refusal_fields(&mut v, refusal.detail, "servo_target");
+            }
+            v
+        }
+    })
+}
+
+/// Per-connection servo stream state (the WS loop's `last_sequence`).
+#[derive(Debug, Default)]
+pub struct ServoStream {
+    last_sequence: Option<u64>,
+    lease_generation: u64,
+}
+
+/// One WS servo message (either form), already authorized and epoch-checked by the loop.
+#[derive(Debug, Clone, Copy)]
+pub struct ServoMessage<'a> {
+    pub sequence_id: Option<u64>,
+    pub positions: &'a [f32],
+    /// Lease generation, the message's epoch and the stop generation at receipt.
+    pub authority: Authority,
+    pub received_at: Instant,
+    /// A calibration apply / restore runs (the loop's snapshot; the RT checks again).
+    pub calibration_busy: bool,
+}
+
+/// One policy target, stamped when its inputs were sampled.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyTarget<'a> {
+    pub action_id: u64,
+    pub stamp: PolicyStamp,
+    pub targets: &'a [f32],
+    /// Capture time of the oldest joint sample the target was computed from.
+    pub input_at: Instant,
+    /// Capture time and frame id of the camera sample behind the target.
+    pub vision_at: Option<Instant>,
+    pub vision_frame_id: Option<u64>,
+}
+
+/// The broker's side of the latest-target mailbox.
+pub struct TargetPort {
+    writer: TargetWriter,
+    arm: ArmId,
+    boot: BootId,
+    seq: u64,
+    /// Monotonic high-water mark of closed servo lease generations: late submissions for any
+    /// non-zero generation `<= closed_servo_gen` are rejected immediately off-thread.
+    closed_servo_gen: u64,
+    /// Non-zero servo lease generations currently open in `writer` (bounded by `MAX_STREAMS`).
+    open_servo_gens: Vec<u64>,
+    /// Monotonic high-water mark of closed policy action IDs: durable late-submission fence.
+    closed_policy_action_id: u64,
+    /// Non-zero policy action IDs currently open in `writer` (bounded by `MAX_STREAMS`).
+    open_policy_actions: Vec<u64>,
+}
+
+/// What the runner stamps a policy target with, read when it samples the inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyStamp {
+    pub authority: Authority,
+    pub authorization: u64,
+    pub max_input_age: Duration,
+}
+
+
+
 
 impl ServoStream {
     pub fn new() -> Self { Self::default() }
