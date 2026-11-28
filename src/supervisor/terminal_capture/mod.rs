@@ -830,12 +830,6 @@ pub(crate) struct StagedTerminalBuf {
     len: usize,
 }
 
-impl Default for StagedTerminalBuf {
-}
-
-impl StagedTerminalBuf {
-}
-
 /// Fixed-size deduplication tracker for terminal edges keyed by `(action_id, terminal_seq)`.
 /// Guarantees an already-captured action slot is never re-captured during dwell ticks or
 /// after moving from `last_action` to `previous_action`.
@@ -844,9 +838,6 @@ pub(crate) struct TerminalEdgeTracker {
     /// Recent `(action_id, terminal_seq)` pairs that have emitted a terminal edge.
     seen: [(u64, u64); 16],
     head: usize,
-}
-
-impl TerminalEdgeTracker {
 }
 
 /// Exclusive-access (`&mut self` only) producer wrapper around `rtrb::Producer<TerminalCaptureRecord>`
@@ -858,10 +849,7 @@ pub(crate) struct TerminalCaptureTx {
 
 // SAFETY: `TerminalCaptureTx` exposes no `&self` access to `self.producer`; all push operations
 // require `&mut self`, enforcing single-producer exclusive access (identical to `PolicyTerminalTx`).
-unsafe impl Sync for TerminalCaptureTx {}
-
-impl TerminalCaptureTx {
-}
+unsafe 
 
 #[derive(Clone)]
 struct CachedRichEntry {
@@ -911,12 +899,6 @@ pub(crate) struct SequenceCommitGuard {
     channel: Arc<TerminalCaptureChannel>,
     hub: Arc<StateHub>,
     action_id: u64,
-}
-
-impl Drop for SequenceCommitGuard {
-}
-
-impl TerminalCaptureChannel {
 }
 
 fn match_action(cand: &ActionStatus, rec: &TerminalCaptureRecord) -> bool {
@@ -1155,8 +1137,4 @@ pub(crate) fn evaluate_cached_feedback_fresh(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-
-}
+mod tests;

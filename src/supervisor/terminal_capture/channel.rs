@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-// scaffold-impl-0
 impl Default for StagedTerminalBuf {
     fn default() -> Self {
         let mut v = Vec::with_capacity(4);
@@ -17,7 +16,6 @@ impl Default for StagedTerminalBuf {
     }
 }
 
-// scaffold-impl-1
 impl StagedTerminalBuf {
     #[inline]
     pub(crate) fn len(&self) -> usize {
@@ -91,7 +89,6 @@ impl StagedTerminalBuf {
     }
 }
 
-// scaffold-impl-2
 impl TerminalEdgeTracker {
     #[inline]
     pub(crate) fn has_seen_action(&self, action_id: u64) -> bool {
@@ -118,7 +115,6 @@ impl TerminalEdgeTracker {
     }
 }
 
-// scaffold-impl-3
 impl TerminalCaptureTx {
     /// Attempts a lock-free, allocation-free push into the preallocated SPSC ring.
     /// Charges `channel.inflight` with `Release` strictly BEFORE making the element visible to
@@ -150,7 +146,6 @@ impl TerminalCaptureTx {
     }
 }
 
-// scaffold-impl-4
 impl Drop for SequenceCommitGuard {
     fn drop(&mut self) {
         if self.action_id != 0 {
@@ -173,7 +168,6 @@ impl Drop for SequenceCommitGuard {
     }
 }
 
-// scaffold-impl-5
 impl TerminalCaptureChannel {
     pub(crate) fn new() -> (TerminalCaptureTx, Arc<Self>) {
         let (producer, consumer) = rtrb::RingBuffer::new(TERMINAL_CAPTURE_RING_CAPACITY);
