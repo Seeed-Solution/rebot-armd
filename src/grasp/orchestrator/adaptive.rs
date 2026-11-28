@@ -59,6 +59,43 @@ impl Orchestrator {
         }
         Ok(())
     }
+    /// Optional TOO_WIDE cap (m) enforced independently of the opening reserve: `None` when the
+    /// cap is disabled (`max_grasp_width_m <= 0`) on an uncalibrated policy.
+    async fn effective_max_grasp_width_cap(&self) -> Option<f64> {
+        let s = &self.setup;
+        if self.is_executor() {
+            let Some(env) = self.sup.hub().prep_env() else {
+                return (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m);
+            };
+            match env.config.gripper_policy.as_ref() {
+                Some(p) if p.is_calibrated() => {
+                    let calib_limit = f64::from(p.opening_m(p.open_rad)) - s.pre_open_margin_m;
+                    Some(if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit })
+                }
+                Some(p) if s.max_grasp_width_m > 0.0 => {
+                    let check = crate::model::check_grasp_width(p, s.max_grasp_width_m, env.requires_real_jaw_curve);
+                    Some(check.effective_max_m(s.max_grasp_width_m))
+                }
+                Some(_) => None,
+                None => (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m),
+            }
+        } else {
+            let inner = self.sup.inner().read().await;
+            match inner.config.gripper_policy.as_ref() {
+                Some(p) if p.is_calibrated() => {
+                    let calib_limit = f64::from(p.opening_m(p.open_rad)) - s.pre_open_margin_m;
+                    Some(if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit })
+                }
+                Some(_) if s.max_grasp_width_m > 0.0 => {
+                    Some(inner.grasp_width_check(s.max_grasp_width_m)
+                        .map_or(s.max_grasp_width_m, |c| c.effective_max_m(s.max_grasp_width_m)))
+                }
+                Some(_) => None,
+                None => (s.max_grasp_width_m > 0.0).then_some(s.max_grasp_width_m),
+            }
+        }
+    }
+
     pub(super) fn check_adaptive_revisions(
         phase: &str,
         env: &crate::rt_core::requests::actions::ActionPrepEnv,

@@ -1649,25 +1649,13 @@ async fn dual_owner_grasp_action_status_diagnostics_via_stream_patch() {
         if let Some(ref mut dg) = cfg.damiao_gripper {
             dg.close_speed_rad_s = 2.0;
         }
+        let setup = cfg.grasp.clone().unwrap();
+        let cam = CamModel::assumed(&cfg.arm_model, &setup, &cfg.camera_mount);
+
+        // Start from a clean look-down pose directly above a reachable table point [0.30, 0.0].
         let inspect6 = [0.0_f64, -1.167, -1.565, 1.435, 0.0, 0.0];
         let r0 = grasp::look_down(&cfg.arm_model.fk(&inspect6).r);
         let start_pose = kinematics::Pose::new(r0, [0.30, 0.0, 0.25]);
-        // Calibrate grip_pixel_norm to the object top point directly under the TCP at approach
-        // height (matches tests/test_grasp.rs `calibrate_grip` and DualGraspSim's table z=0,
-        // object_h=0.05; default [0.5, 0.5] + 54 mm lateral lens offset would place the 9 mm box
-        // well off-TCP).
-        if let Some(ref mut g) = cfg.grasp {
-            g.table_z_m = 0.0;
-            g.approach_height_m = 0.20;
-            let tmp_cam = CamModel::assumed(&cfg.arm_model, g, &cfg.camera_mount);
-            let app_pose = kinematics::Pose::new(r0, [0.30, 0.0, g.table_z_m + g.approach_height_m]);
-            let grip_px = tmp_cam
-                .project(&app_pose, &[0.30, 0.0, 0.05])
-                .expect("object top under TCP visible at approach height");
-            g.grip_pixel_norm = tmp_cam.to_norm(grip_px);
-        }
-        let setup = cfg.grasp.clone().unwrap();
-        let cam = CamModel::assumed(&cfg.arm_model, &setup, &cfg.camera_mount);
         let lo = [-3.1, -2.05, -2.6, -3.1, -2.05, -6.2];
         let hi = [3.1, 2.05, 2.6, 3.1, 2.05, 6.2];
         let mut start_q6 = inspect6;
@@ -1697,7 +1685,7 @@ async fn dual_owner_grasp_action_status_diagnostics_via_stream_patch() {
             inner.measured_positions = start_q.to_vec();
             inner.target_positions = start_q.to_vec();
             let pose0 = inner.config.arm_model.fk_f32(&start_q).unwrap();
-            let pt = cam.plane_point(&pose0, [cam.cx, cam.cy], 0.0).unwrap();
+            let pt = cam.plane_point(&pose0, cam.to_px(setup.grip_pixel_norm), 0.0).unwrap();
             [pt[0], pt[1]]
         };
         let sim = Arc::new(DualGraspSim {

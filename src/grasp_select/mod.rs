@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-pub use admission::{BestRefusal, JawCut, JawFit, JawGatePass, TopAdvisory};
+pub use admission::{BestRefusal, JawCut, JawFit, TopAdvisory};
 pub use snapshot::{capture, capture_from_env, Snapshot};
 use candidates::{Chord, DirClass, Hypothesis, Rejection};
 pub use feasibility::{

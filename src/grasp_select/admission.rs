@@ -86,24 +86,6 @@ pub struct JawFit {
     pub evidence: &'static str,
 }
 
-/// Unforgeable live-gate proof token constructed ONLY by [`JawAdmission::live_gate`]; required by
-/// legacy descent so no execution path can descend without passing the live jaw gate.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct JawGatePass {
-    fit: JawFit,
-    evidence_age: &'static str,
-}
-
-impl JawGatePass {
-    pub fn fit(&self) -> JawFit {
-        self.fit
-    }
-
-    pub fn evidence_age(&self) -> &'static str {
-        self.evidence_age
-    }
-}
-
 /// The interval jaw predicate: `[lo_m, hi_m]` relative to the contact centre along the closing
 /// axis must be finite and ordered (`hi_m > lo_m`), `width = hi_m - lo_m <= cap` when the cap is
 /// enabled, and both jaws must clear the error-shifted interval by at least
@@ -199,8 +181,7 @@ impl BestRefusal {
     }
 }
 
-/// The jaw fit a legacy grasp was admitted with; all fields are private and the live gate
-/// ([`JawAdmission::live_gate`]) is the sole constructor of [`JawGatePass`].
+/// The jaw fit a legacy grasp was admitted with; all fields are private.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JawAdmission {
     candidate_id: String,
@@ -272,19 +253,6 @@ impl JawAdmission {
 
     pub fn error_margin(&self) -> &ErrorMargin {
         &self.error_margin
-    }
-
-    /// Run the shared interval jaw predicate at the live gate and return the sealed
-    /// [`JawGatePass`] required before descent.
-    pub fn live_gate(
-        &self,
-        cut: &JawCut,
-        open_width_m: f64,
-        max_grasp_width_m: Option<f64>,
-        evidence_age: &'static str,
-    ) -> Result<JawGatePass, Rejection> {
-        let fit = jaw_check(cut, self.hard_error_m, open_width_m, max_grasp_width_m)?;
-        Ok(JawGatePass { fit, evidence_age })
     }
 
     pub fn to_json(&self) -> Value {
@@ -934,11 +902,11 @@ fn fallback_margin(s: &Snapshot) -> ErrorMargin {
 }
 
 #[cfg(test)]
-mod sealed_token_tests {
+mod interval_admission_tests {
     use super::*;
 
     #[test]
-    fn interval_jaw_check_asymmetric_cut_and_sealed_gate_pass() {
+    fn interval_jaw_check_asymmetric_cut_and_admission_axis() {
         // [-5, +45] mm at 85 mm opening, 10 mm hard error:
         // reserve_pos = 42.5 - 45 - 10 = -12.5 mm, reserve_neg = 42.5 + (-5) - 10 = +27.5 mm.
         let cut = JawCut::new(-0.005, 0.045, "contour");
@@ -947,7 +915,6 @@ mod sealed_token_tests {
         assert!((err.value.unwrap() - (-0.0125)).abs() < 1e-12, "{err:?}");
         assert!((err.bound.unwrap() - MIN_OPENING_RESERVE_M).abs() < 1e-12, "{err:?}");
 
-        // Sealed JawGatePass is only constructed by JawAdmission::live_gate.
         let ok_cut = JawCut::new(-0.010, 0.025, "contour");
         let fit = jaw_check(&ok_cut, 0.010, 0.085, None).expect("symmetric/offset fit passes");
         assert!((fit.reserve_pos_m - 0.0075).abs() < 1e-12);
@@ -966,14 +933,10 @@ mod sealed_token_tests {
             closing_axis: [0.0, 1.0],
             error_margin: super::super::margin::margin(&super::super::margin::quality(None), 0.010, 0.001, 0.25, 0.5),
         };
-        let pass: JawGatePass = adm.live_gate(&ok_cut, 0.085, None, "post_transition").expect("gate passes");
-        assert_eq!(pass.fit(), fit);
-        assert_eq!(pass.evidence_age(), "post_transition");
         assert_eq!(adm.to_json()["evidence"], "contour");
         assert!(adm.to_json().get("evidence_age").is_none());
         assert!(adm.axis_within_deg([0.0, 1.0], 5.0));
         assert!(adm.axis_within_deg([0.0, -1.0], 5.0));
         assert!(!adm.axis_within_deg([1.0, 0.0], 5.0));
-        assert_eq!(adm.live_gate(&cut, 0.085, None, "post_transition").unwrap_err().code, "OPENING");
     }
 }
