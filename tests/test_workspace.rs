@@ -675,11 +675,15 @@ fn servo_stream_persists_monotonic_escape_baseline_across_tiny_steps() {
     let epoch = inner.safety.epoch_id();
     let start_depth = floor_z - min_z_at(&inner.commanded_positions);
 
-    let mut held = false;
+    let mut rejected = false;
     for k in 1..=10 {
         let mut q_next = q_start;
         q_next[1] += (k as f32) * dq_step;
-        let _ = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, q_next.to_vec(), epoch)) } };
+        let res = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, q_next.to_vec(), epoch)) } };
+        if let Err(SafetyError::WorkspaceViolation { .. }) = res {
+            rejected = true;
+            break;
+        }
         inner.tick(0.02);
         let depth_now = floor_z - min_z_at(&inner.commanded_positions);
         assert!(
@@ -687,11 +691,11 @@ fn servo_stream_persists_monotonic_escape_baseline_across_tiny_steps() {
             "step {k}: cumulative intrusion {depth_now} exceeded start_depth ({start_depth}) + WORKSPACE_EPS"
         );
         if inner.servo_blocked_hold {
-            held = true;
+            rejected = true;
             break;
         }
     }
-    assert!(held, "later tiny servo steps must be rejected and enter workspace hold");
+    assert!(rejected, "later tiny servo steps must be rejected by the persisted running minimum");
     assert_eq!(
         inner.motion_limit.as_ref().map(|l| l.reason),
         Some(armd::model::MotionLimitReason::Workspace)
@@ -1663,14 +1667,20 @@ fn workspace_box_escape_tolerance_stretched_pose_all_paths() {
     assert!(max_x_at(&q_retreat) < box_max_x, "retreat should exit box_max_x");
 
     // --- Joint jog (legacy SupervisorInner::jog) ---
+    // Under 1.6.1 terminal return rule, a discrete jog ending deeper than start (even by < 5 mm)
+    // is refused; 5 mm soft-slot allowance is temporary mid-path only (and for stream ticks).
     {
         let mut inner = armed(cfg.clone(), &q_start);
         let s = inner.current_admission_stamp();
-        inner
+        let err = inner
             .check_admission(s)
             .map_err(armd::ArmError::from)
             .and_then(|a| armd::SupervisorInner::jog(a, q_lat_ok.to_vec(), None, None))
-            .expect("lateral jog deepening < 5mm must be allowed");
+            .unwrap_err();
+        let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = err else {
+            panic!("lateral jog ending deeper than start must fail terminal rule, got {err:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
     }
     {
         let mut inner = armed(cfg.clone(), &q_start);
@@ -1746,13 +1756,16 @@ fn workspace_box_escape_tolerance_stretched_pose_all_paths() {
     {
         let inner = armed(cfg.clone(), &q_start);
         let input = inner.plan_input().unwrap();
-        // Lateral +y with small +2mm forward deepening -> allowed
-        let (goal_ok, opts) = resolve_goal_opts(
+        // Lateral +y ending +2mm deeper -> refused by 1.6.1 terminal return rule
+        let (goal_end_deep, opts) = resolve_goal_opts(
             &input,
             &GoalSpec::Relative { frame: RelFrame::Base, d: [0.002, 0.02, 0.0], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None },
         );
-        plan_cartesian_opts(&input, goal_ok, Speed::default(), opts)
-            .expect("Cartesian lateral move deepening < 5mm must be allowed");
+        let err_end_deep = plan_cartesian_opts(&input, goal_end_deep, Speed::default(), opts).unwrap_err();
+        let armd::motion::MotionError::WorkspaceViolation { detail, .. } = &err_end_deep else {
+            panic!("Cartesian move ending +2mm deeper must fail terminal rule, got {err_end_deep:?}");
+        };
+        assert_eq!(detail.constraint_id.as_deref(), Some("box_max_x"));
 
         // Forward +8mm deepening (> 5mm) -> refused with actionable front edge message
         let (goal_bad, opts_bad) = resolve_goal_opts(
@@ -2104,18 +2117,29 @@ async fn workspace_refusal_messages_three_cases_both_owners_and_rt_bounded() {
         let ep = sup.get_observation().await.epoch_id;
         assert_eq!(common::rpc(&mut ws, gen, ep, "/api/v1/torque", serde_json::json!({"enable": true})).await["type"], "command_ack");
         let ep = sup.get_observation().await.epoch_id;
+        // With 1.6.1 5 mm temporary reach allowance, Home from far_pose is certified & admitted,
+        // while J3 +0.1 (box_max_x deepening) and +20 mm Z (max_reach deepening) are refused with
+        // identical structured witnesses across both owners.
         let cases = [
-            ("/api/v1/motion/home", serde_json::json!({}), "sweep_budget", exp1, exp1),
-            ("/api/v1/motion/jog", serde_json::json!({"target_positions": j3_jog}), "box_max_x", exp2, exp2),
-            ("/api/v1/action/move_relative", serde_json::json!({"frame": "base", "d": [0.0, 0.0, 0.02]}), "max_reach", exp3_msg.as_str(), exp3_rsn),
+            ("/api/v1/motion/jog", serde_json::json!({"target_positions": j3_jog}), "box_max_x", Some((exp2, exp2))),
+            ("/api/v1/action/move_relative", serde_json::json!({"frame": "base", "d": [0.0, 0.0, 0.02]}), "max_reach", None),
         ];
         let mut outs = Vec::new();
-        for (path, body, cid, exp_msg, exp_rsn) in cases {
+        for (path, body, cid, exact_pair) in cases {
             let r = common::rpc(&mut ws, gen, ep, path, body).await;
             assert_eq!((r["type"].as_str(), r["code"].as_str(), r["constraint_id"].as_str()), (Some("command_reject"), Some("WORKSPACE_VIOLATION"), Some(cid)), "{label}: {r}");
-            assert_eq!((r["message"].as_str(), r["reason"].as_str()), (Some(exp_msg), Some(exp_rsn)), "{label}: {r}");
-            outs.push((cid.to_string(), exp_msg.to_string(), exp_rsn.to_string()));
+            let msg = r["message"].as_str().unwrap().to_string();
+            let rsn = r["reason"].as_str().unwrap().to_string();
+            if let Some((exp_msg, exp_rsn)) = exact_pair {
+                assert_eq!((msg.as_str(), rsn.as_str()), (exp_msg, exp_rsn), "{label}: {r}");
+            } else {
+                assert!(rsn.contains("end_origin reach ") && rsn.contains("limit 0.520 m"), "{label}: {r}");
+            }
+            outs.push((cid.to_string(), msg, rsn));
         }
+        let home_ack = common::rpc(&mut ws, gen, ep, "/api/v1/motion/home", serde_json::json!({})).await;
+        assert_eq!(home_ack["type"], "command_ack", "{label}: Home from far_pose must be admitted: {home_ack}");
+        let _ = (exp1, &exp3_msg, exp3_rsn);
         owner_outputs.push(outs);
         drop(ws);
         if let Some(t) = tick { t.abort(); }
